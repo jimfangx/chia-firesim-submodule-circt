@@ -58,7 +58,7 @@ jobs:
         ((steps.filter.outputs.conda-reqs == 'true') && (steps.filter.outputs.conda-lockfile == 'true')) }}
       run-cpp-lint: ${{ steps.filter.outputs.clang == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -115,7 +115,7 @@ jobs:
     runs-on: ubuntu-22.04
     needs: filter-jobs-on-changes
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
@@ -159,7 +159,7 @@ jobs:
             rm -rf ${{ github.workspace }}/* || true
             rm -rf ${{ github.workspace }}/.* || true
             ls -alh .
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Setup repo copy
         run: |
           mkdir -p $(dirname ${{ env.REMOTE_WORK_DIR }})
@@ -177,7 +177,7 @@ jobs:
     runs-on: local-fpga
     if: needs.filter-jobs-on-changes.outputs.run-cpp-lint == 'true'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # TODO: disabled for now. clang-format error's with no modifications
       ## Run 'clang-format', comparing against the base commit hash.
       ## If anything got reformatted, fail and output a patch.
@@ -210,7 +210,7 @@ jobs:
     needs: [setup-persistent-repo]
     runs-on: local-fpga
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Scala fix + format check
         run: ./.github/scripts/invoke-make.py "scala-lint-check"
 
@@ -219,7 +219,7 @@ jobs:
     needs: [setup-persistent-repo]
     runs-on: local-fpga
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Manager Python formatting check using 'black'
         run: ./.github/scripts/invoke-script.py "./scripts/run-manager-python-reformat.sh --check"
       - name: CI Python typecheck
@@ -232,7 +232,7 @@ jobs:
     needs: [setup-persistent-repo]
     runs-on: local-fpga
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Check docs components that require manual re-generation (e.g. config_runtime.yaml example)
         run: ./.github/scripts/check-docs-generated-components.py --platform xilinx_alveo_u250
 
@@ -241,7 +241,7 @@ jobs:
     needs: [setup-persistent-repo]
     runs-on: local-fpga
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Build driver
         run: .github/scripts/build-driver.py --platform xilinx_alveo_u250
 
