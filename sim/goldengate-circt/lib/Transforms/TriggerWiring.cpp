@@ -6,6 +6,7 @@
 #include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 
 using namespace circt::firrtl;
@@ -42,6 +43,49 @@ bool boolean(Value v) {
   return type && type.getWidth() == 1;
 }
 struct Source { Value event, reset; bool credit; std::string name; };
+// BridgeTopWiring groups source events by the upstream input Clock port.
+// Prove electrical aliases using transparent FIRRTL operations only. A cone
+// with one input clock is insufficient: a mux or gate may change its edges.
+class LocalClockAliases {
+public:
+  explicit LocalClockAliases(FModuleOp top) : top(top) {
+    top.walk([&](Operation *op) {
+      Value dest, src;
+      if (auto connect = dyn_cast<ConnectOp>(op)) {
+        dest = connect.getDest(); src = connect.getSrc();
+      } else if (auto connect = dyn_cast<StrictConnectOp>(op)) {
+        dest = connect.getDest(); src = connect.getSrc();
+      }
+      if (dest && isa<ClockType>(dest.getType()))
+        drivers[dest].push_back({src, op->getBlock() == top.getBodyBlock()});
+    });
+  }
+  Value root(Value value) {
+    llvm::DenseSet<Value> visited;
+    while (value && isa<ClockType>(value.getType()) && visited.insert(value).second) {
+      if (auto arg = dyn_cast<BlockArgument>(value)) {
+        if (arg.getOwner() == top.getBodyBlock() &&
+            top.getPortDirection(arg.getArgNumber()) == Direction::In &&
+            drivers[value].empty()) return value;
+        return {};
+      }
+      auto *op = value.getDefiningOp();
+      if (!op || op->getBlock() != top.getBodyBlock()) return {};
+      if (auto node = dyn_cast<NodeOp>(op)) {
+        if (!drivers[value].empty()) return {};
+        value = node.getInput();
+      } else if (isa<WireOp>(op)) {
+        auto &assigned = drivers[value];
+        if (assigned.size() != 1 || !assigned.front().second) return {};
+        value = assigned.front().first;
+      } else return {};
+    }
+    return {};
+  }
+private:
+  FModuleOp top;
+  llvm::DenseMap<Value, SmallVector<std::pair<Value, bool>>> drivers;
+};
 } // namespace
 
 LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
@@ -93,9 +137,18 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (clock) error = "trigger base reference must be Clock";
     return failure();
   }
+  LocalClockAliases aliases(top);
+  // Local accounting uses BridgeTopWiring's root; the synchronizers and
+  // global counters retain the annotated base clock, as in Scala.
+  Value baseClock = clock;
+  clock = aliases.root(clock);
+  if (!clock) {
+    error = "trigger base clock needs an unconditional local alias of an input Clock port";
+    return failure();
+  }
   SmallVector<Source> events;
   llvm::DenseSet<Value> creditTargets, debitTargets;
-  SmallVector<NodeOp> nodes;
+  SmallVector<std::pair<NodeOp, Value>> nodes;
   llvm::DenseSet<Operation *> seen;
   for (auto a : sources) {
     auto target = a.getMember<StringAttr>("target");
@@ -103,7 +156,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!event) return failure();
     Value eventClock = resolve(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
-    if (!boolean(event) || eventClock != clock) {
+    if (!boolean(event) || aliases.root(eventClock) != clock) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
     }
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
@@ -129,13 +182,13 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     Value sinkClock = resolve(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
     auto node = value.getDefiningOp<NodeOp>();
-    if (!node || !boolean(value) || sinkClock != clock) {
+    if (!node || !boolean(value) || aliases.root(sinkClock) != clock) {
       error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
     }
-    if (!dominance.properlyDominates(clock, node.getOperation())) {
+    if (!dominance.properlyDominates(sinkClock, node.getOperation())) {
       error = "trigger sink clock must dominate its node declaration"; return failure();
     }
-    if (seen.insert(node).second) nodes.push_back(node);
+    if (seen.insert(node).second) nodes.push_back({node, sinkClock});
   }
   // All unsupported scope/type/clock cases have been rejected before mutation.
   circt::Namespace names;
@@ -149,12 +202,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   auto named = [&](Value value, StringRef name) -> Value {
     return b.create<NodeOp>(loc, value, b.getStringAttr(names.newName(name))).getResult();
   };
-  auto reg = [&](unsigned width, StringRef name) -> Value {
+  auto reg = [&](unsigned width, StringRef name, Value domain) -> Value {
     // RegZeroPreset in Scala has reset=0/init=self, with no preset annotation.
-    return b.create<RegOp>(loc, UIntType::get(b.getContext(), width), clock,
+    return b.create<RegOp>(loc, UIntType::get(b.getContext(), width), domain,
                            names.newName(name)).getResult();
   };
-  std::string clockName = baseTarget.getValue().split('>').second.str();
+  std::string clockName = top.getPortName(cast<BlockArgument>(clock).getArgNumber()).str();
   SmallVector<Value> creditSignals, debitSignals;
   for (auto event : events) {
     Value signal = event.event;
@@ -180,12 +233,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   auto local = [&](ArrayRef<Value> signals, StringRef suffix) -> Value {
     std::string stem = clockName + suffix.str();
     Value signal = reduce(signals, stem);
-    Value count = reg(16, stem);
+    Value count = reg(16, stem, clock);
     Value next = named(b.create<AddPrimOp>(loc, count, signal), stem + "_next");
     Value truncated = b.create<BitsPrimOp>(loc, next, 15, 0);
     b.create<StrictConnectOp>(loc, count, truncated);
-    Value s1 = reg(16, stem + "_next_count_sync_s1");
-    Value s2 = reg(16, stem + "_next_count_sync_s2");
+    Value s1 = reg(16, stem + "_next_count_sync_s1", baseClock);
+    Value s2 = reg(16, stem + "_next_count_sync_s2", baseClock);
     b.create<StrictConnectOp>(loc, s1, truncated);
     b.create<StrictConnectOp>(loc, s2, s1);
     // SFC infers UInt<17> subtraction, including the underflow bit at wrap.
@@ -194,7 +247,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   Value creditDiff = local(creditSignals, "_credits");
   Value debitDiff = local(debitSignals, "_debits");
   auto total = [&](Value diff, StringRef name) -> Value {
-    Value count = reg(32, name);
+    Value count = reg(32, name, baseClock);
     Value next = named(b.create<AddPrimOp>(loc, count, diff), name.str() + "_next");
     b.create<StrictConnectOp>(loc, count, b.create<BitsPrimOp>(loc, next, 31, 0));
     return next;
@@ -203,9 +256,9 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   Value debitNext = total(debitDiff, "totalDebits");
   // Compare full UInt<33> NEXT values; comparing truncated state changes wrap semantics.
   Value enable = named(b.create<NEQPrimOp>(loc, creditNext, debitNext), "trigger_source");
-  for (auto node : nodes) {
+  for (auto [node, sinkClock] : nodes) {
     b.setInsertionPoint(node);
-    Value sync = reg(1, "trigger_sync");
+    Value sync = reg(1, "trigger_sync", sinkClock);
     b.setInsertionPointToEnd(top.getBodyBlock());
     b.create<StrictConnectOp>(loc, sync, enable);
     node->setOperand(0, sync);

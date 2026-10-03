@@ -204,6 +204,88 @@ void multiple(MLIRContext &context, unsigned credits, unsigned debits, StringRef
     require(!ec, "cannot write multiple-source candidate"); root->print(out); out << '\n';
   }
 }
+void aliases(MLIRContext &context, unsigned mode, StringRef output) {
+  // Augmented Scala TriggerWiring oracle: credit reset mask, unmasked debit,
+  // distinct local aliases of one clock. SFC emits root-clock local counters,
+  // baseAlias global/sampling registers and a sinkAlias synchronizer. SFC also
+  // rejects a sink clock alias declared after the sink node (mode 6).
+  std::string body = R"mlir(
+    %baseAlias = firrtl.wire : !firrtl.clock
+    %creditAlias = firrtl.node %baseAlias : !firrtl.clock
+    %debitAlias = firrtl.wire : !firrtl.clock
+  )mlir";
+  if (mode != 6) body += "%sinkAlias = firrtl.node %debitAlias : !firrtl.clock\n";
+  body += R"mlir(
+    %zero = firrtl.constant 0 : !firrtl.uint<1>
+    %trigger = firrtl.node %zero : !firrtl.uint<1>
+    firrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>
+  )mlir";
+  if (mode == 6) body += "%sinkAlias = firrtl.node %debitAlias : !firrtl.clock\n";
+  body += "firrtl.strictconnect %baseAlias, %clock : !firrtl.clock\n";
+  if (mode == 2) body += "firrtl.strictconnect %debitAlias, %otherClock : !firrtl.clock\n";
+  if (mode != 5) {
+    if (mode == 7) body += "firrtl.when %reset : !firrtl.uint<1> {\n";
+    body += "firrtl.connect %debitAlias, %" + std::string(mode == 3 ? "sinkAlias" : mode == 4 ? "otherClock" : "creditAlias") + " : !firrtl.clock, !firrtl.clock\n";
+    if (mode == 7) body += "}\n";
+  }
+  auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
+    "firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>, "
+    "in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, "
+    "in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>) {" + body + "} } }", &context);
+  require(bool(root), "clock alias parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context);
+  auto ref = [&](StringRef name) { return b.getStringAttr(("~Top|Top>" + name).str()); };
+  SmallVector<Attribute> annotations;
+  annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("baseAlias")}))}));
+  for (bool credit : {true, false}) {
+    NamedAttrList a;
+    a.set("class", b.getStringAttr(A::InternalTriggerSource));
+    a.set("target", ref(credit ? "credit" : "debit"));
+    a.set("clock", ref(credit ? "creditAlias" : "debitAlias"));
+    a.set("sourceType", b.getBoolAttr(credit));
+    if (credit) a.set("reset", ref("reset"));
+    annotations.push_back(a.getDictionary(&context));
+  }
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+    b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref("sinkAlias"))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto before = dump(root.get());
+  unsigned consumed = 99; std::string error;
+  auto result = goldengate::wireTriggers(circuit, consumed, error);
+  if (mode) {
+    require(failed(result) && consumed == 0 && dump(root.get()) == before,
+            "clock alias rejection must be atomic: " + std::to_string(mode));
+    require(StringRef(error).contains(mode == 6 ? "dominate" : "base clock"),
+            "clock alias diagnostic: " + error);
+    return;
+  }
+  require(succeeded(result), error);
+  require(consumed == 2 && succeeded(verify(*root)), "clock alias candidate invalid");
+  std::map<std::string, Value> values;
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) values[name.getValue().str()] = op->getResult(0);
+  });
+  unsigned registers = 0;
+  top.walk([&](RegOp reg) {
+    ++registers;
+    auto name = reg.getName();
+    Value expected = name == "trigger_sync" ? values.at("sinkAlias") :
+      (name == "clock_credits" || name == "clock_debits") ? top.getBodyBlock()->getArgument(0) : values.at("baseAlias");
+    require(reg.getClockVal() == expected, "Scala alias register clock identity: " + name.str());
+  });
+  require(registers == 9, "clock aliases must merge one accounting domain");
+  require(cast<ArrayAttr>(circuit->getAttr("rawAnnotations")).size() == 1, "clock alias annotation cleanup");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "cannot write alias candidate"); root->print(out); out << '\n';
+  }
+}
+
 }
 int main(int argc, char **argv) {
   try {
@@ -215,6 +297,8 @@ int main(int argc, char **argv) {
     multiple(context, 4, 5, "");
     multiple(context, 5, 7, "");
     multiple(context, 17, 2, "");
+    aliases(context, 0, argc > 3 ? argv[3] : "");
+    for (unsigned mode : {2, 3, 4, 5, 6, 7}) aliases(context, mode, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
