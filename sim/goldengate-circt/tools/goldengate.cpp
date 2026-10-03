@@ -9,6 +9,7 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/AnnotationEmission.h"
+#include "goldengate/MetasimInterfaceHeader.h"
 #include "goldengate/XDCEmission.h"
 #include "goldengate/XilinxHostSpecialization.h"
 #include "goldengate/SimulatorRTL.h"
@@ -248,6 +249,7 @@ int main(int argc, char **argv) {
   module->walk([&](CircuitOp op) { circuit = op; });
   if (!circuit)
     return fail("input did not produce a firrtl.circuit");
+  const std::string originalTargetName = circuit.getName().str();
 
   if (disableAutoCounter || compileBaseline) {
     std::string error;
@@ -2958,6 +2960,8 @@ int main(int argc, char **argv) {
       llvm::outs() << "Specialized CIRCT abstract clocks to Xilinx BUFGCE in " << xilinxPath << '\n';
       if (failed(goldengate::prepareXDCOutput(circuit, error)))
         return fail("XDC output preparation: " + error);
+      if (failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error)))
+        return fail("metasim interface header: " + error);
       llvm::SmallString<256> xdcAnnotations(outputDir);
       llvm::sys::path::append(xdcAnnotations, "post-fame-xdc-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, xdcAnnotations, error)))

@@ -7,6 +7,7 @@ add_executable(goldengate-circt
   tools/goldengate.cpp
   lib/Support/AnnotationEmission.cpp
   lib/Support/XDCEmission.cpp
+  lib/Support/MetasimInterfaceHeader.cpp
   lib/Support/SimulatorRTL.cpp
   lib/Support/TargetUtils.cpp
   lib/Analysis/ChannelAnalysis.cpp
@@ -138,6 +139,16 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-metasim-interface-header-test
+    test/Support/MetasimInterfaceHeaderTest.cpp
+    lib/Support/MetasimInterfaceHeader.cpp lib/Support/AnnotationEmission.cpp)
+  target_compile_features(goldengate-metasim-interface-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-metasim-interface-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-metasim-interface-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-metasim-interface-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-metasim-interface-header COMMAND goldengate-metasim-interface-header-test)
   add_executable(goldengate-simulator-rtl-test
     test/Support/SimulatorRTLTest.cpp lib/Support/SimulatorRTL.cpp
     lib/Transforms/LowerTypes.cpp lib/Support/TargetUtils.cpp)
