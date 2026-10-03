@@ -37,6 +37,7 @@ add_executable(goldengate-circt
   lib/Transforms/WrapTop.cpp
   lib/Transforms/LowerTypes.cpp
   lib/Transforms/AutoCounterResetGate.cpp
+  lib/Transforms/AutoCounterPrintfValues.cpp
   lib/Transforms/CoerceAsyncToSyncReset.cpp
   lib/Transforms/LabelMultiThreadedInstances.cpp
   lib/Transforms/TriggerWiring.cpp
@@ -153,6 +154,19 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-autocounter-printf-values-test
+    test/Transforms/AutoCounterPrintfValuesTest.cpp
+    lib/Transforms/AutoCounterPrintfValues.cpp
+    lib/Transforms/AutoCounterResetGate.cpp lib/Analysis/AutoCounterAnalysis.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-autocounter-printf-values-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autocounter-printf-values-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autocounter-printf-values-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autocounter-printf-values-test PRIVATE
+    CIRCTFIRRTLTransforms CIRCTFIRRTL CIRCTHW CIRCTSupport
+    MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autocounter-printf-values COMMAND goldengate-autocounter-printf-values-test)
   add_executable(goldengate-autocounter-reset-gate-test
     test/Transforms/AutoCounterResetGateTest.cpp
     lib/Transforms/AutoCounterResetGate.cpp lib/Analysis/AutoCounterAnalysis.cpp

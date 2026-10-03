@@ -28,6 +28,7 @@
 #include "goldengate/SimulatorRTL.h"
 #include "goldengate/AutoCounterAnalysis.h"
 #include "goldengate/AutoCounterResetGate.h"
+#include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/BridgeAnalysis.h"
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/ChannelClockInfo.h"
@@ -198,6 +199,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-autocounter-events";
   bool gateSelectedAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
+  bool synthesizeAutoCounterValues =
+      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf-values";
   bool disableAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
   bool compileBaseline =
@@ -212,7 +215,7 @@ int main(int argc, char **argv) {
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
        !resolveDontTouch && !lowerTypes && !analyzeAutoCounter &&
-       !gateAutoCounter && !gateSelectedAutoCounter &&
+       !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues &&
        !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
       llvm::StringRef(argv[4]) != "--output-dir") {
@@ -232,6 +235,7 @@ int main(int argc, char **argv) {
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
                     "--lower-types | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
+                    "--synthesize-autocounter-printf-values | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3027,10 +3031,10 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (gateAutoCounter || gateSelectedAutoCounter) {
+  if (gateAutoCounter || gateSelectedAutoCounter || synthesizeAutoCounterValues) {
     // The explicit selected boundary applies Scala's generated-cover filter.
     // The original boundary continues to accept already selected records.
-    // EnableAutoCounter and counter implementation remain in the debug pipeline.
+    // Enabled AutoCounter remains an incremental debug pipeline boundary.
     std::string error;
     if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
       return fail("AutoCounter LowerTypes: " + error);
@@ -3043,7 +3047,7 @@ int main(int argc, char **argv) {
     llvm::SmallVector<goldengate::AutoCounterEvent> events;
     llvm::SmallVector<llvm::StringRef> coverModules;
     std::unique_ptr<llvm::MemoryBuffer> coverBuffer;
-    if (gateSelectedAutoCounter) {
+    if (gateSelectedAutoCounter || synthesizeAutoCounterValues) {
       llvm::SmallString<256> coverPath(outputDir);
       llvm::sys::path::append(coverPath, "autocounter-covermodules.txt");
       if (llvm::sys::fs::exists(coverPath)) {
@@ -3067,18 +3071,51 @@ int main(int argc, char **argv) {
         }
       }
     }
-    auto analyzed = gateSelectedAutoCounter
+    auto analyzed = (gateSelectedAutoCounter || synthesizeAutoCounterValues)
         ? goldengate::analyzeSelectedAutoCounterEvents(
               circuit, coverModules, events, error)
         : goldengate::analyzeAutoCounterEvents(circuit, events, error);
     if (failed(analyzed) || failed(goldengate::gateAutoCounterEventsWithReset(
                                 circuit, events, error)))
       return fail("AutoCounter reset gating: " + error);
+    if (synthesizeAutoCounterValues) {
+      // Reset gating renamed the selected targets; resolve their new SSA values
+      // before synthesizing state and comparisons against the retained records.
+      events.clear();
+      llvm::SmallVector<goldengate::AutoCounterPrintfValue> values;
+      if (failed(goldengate::analyzeSelectedAutoCounterEvents(
+              circuit, coverModules, events, error)) ||
+          failed(goldengate::synthesizeAutoCounterPrintfValues(
+              circuit, events, values, error)))
+        return fail("AutoCounter printf values: " + error);
+      llvm::json::Array summary;
+      for (auto &value : values) {
+        auto reg = cast<RegResetOp>(value.state.getDefiningOp());
+        summary.push_back(llvm::json::Object{
+            {"target", value.source.target},
+            {"clock", value.source.clockTarget},
+            {"reset", value.source.resetTarget},
+            {"label", value.source.label},
+            {"mode", value.mode == goldengate::AutoCounterMode::Accumulate
+                         ? "Accumulate" : "Identity"},
+            {"state", reg.getName().str()},
+            {"state_width", *cast<UIntType>(value.state.getType()).getWidth()},
+            {"event_width", *cast<UIntType>(value.source.event.getType()).getWidth()}});
+      }
+      llvm::SmallString<256> summaryPath(outputDir);
+      llvm::sys::path::append(summaryPath, "autocounter-printf-values.json");
+      std::error_code ec;
+      llvm::raw_fd_ostream out(summaryPath, ec);
+      if (ec) return fail("cannot write AutoCounter values: " + ec.message());
+      out << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
+    }
     if (failed(mlir::verify(*module)))
       return fail("AutoCounter reset gating produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), annoPath(outputDir);
-    llvm::sys::path::append(irPath, "post-autocounter-reset-gate.mlir");
-    llvm::sys::path::append(annoPath, "post-autocounter-reset-gate-all.json");
+    llvm::sys::path::append(irPath, synthesizeAutoCounterValues
+        ? "post-autocounter-printf-values.mlir" : "post-autocounter-reset-gate.mlir");
+    llvm::sys::path::append(annoPath, synthesizeAutoCounterValues
+        ? "post-autocounter-printf-values-all.json" : "post-autocounter-reset-gate-all.json");
     std::error_code writeError;
     llvm::raw_fd_ostream irOut(irPath, writeError);
     if (writeError)
@@ -3089,7 +3126,8 @@ int main(int argc, char **argv) {
     // multibit_mux operations that CIRCT's FIR text exporter cannot represent.
     if (failed(goldengate::emitAllAnnotations(circuit, annoPath, error)))
       return fail("cannot export AutoCounter reset-gate boundary: " + error);
-    llvm::outs() << "Gated " << events.size() << " selected AutoCounter events in " << irPath << '\n';
+    llvm::outs() << (synthesizeAutoCounterValues ? "Synthesized printf values for " : "Gated ")
+                 << events.size() << " selected AutoCounter events in " << irPath << '\n';
     return 0;
   }
 

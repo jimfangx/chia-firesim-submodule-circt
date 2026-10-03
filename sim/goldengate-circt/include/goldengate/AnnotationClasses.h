@@ -41,6 +41,10 @@ struct AnnotationClasses {
       "midas.InternalAutoCounterFirrtlAnnotation";
   static constexpr llvm::StringLiteral AutoCounterCoverModule =
       "midas.targetutils.AutoCounterCoverModuleFirrtlAnnotation";
+  static constexpr llvm::StringLiteral AutoCounterAccumulate =
+      "midas.targetutils.PerfCounterOps$Accumulate$";
+  static constexpr llvm::StringLiteral AutoCounterIdentity =
+      "midas.targetutils.PerfCounterOps$Identity$";
   static constexpr llvm::StringLiteral EnableModelMultiThreading =
       "midas.targetutils.FirrtlEnableModelMultiThreadingAnnotation";
   static constexpr llvm::StringLiteral BridgeIO =
