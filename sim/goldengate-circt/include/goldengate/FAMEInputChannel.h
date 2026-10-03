@@ -66,6 +66,15 @@ mlir::LogicalResult internalizeFAMEOutputClocks(
     circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
     llvm::StringRef instanceName, std::string &error);
 
+// Outputs absent from the model channel graph (e.g. promoted passthroughs)
+// become same-name internal wires, preserving their model-side assignments.
+// Require passive, unannotated, unsymbolized data outputs with unused results
+// at every instance. Preflight all instances before mutation; retain parent
+// wiring and metadata. Invalidates hierarchy/port analyses; emits no annotations.
+mlir::LogicalResult internalizeFAMEUnusedOutputs(
+    circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp model,
+    llvm::ArrayRef<llvm::StringRef> portNames, std::string &error);
+
 // Place host controls and the model clock sink before data sinks, followed by
 // data sources, as in the SFC FAME model interface. Keep each group's order.
 mlir::LogicalResult groupFAMEChannelPorts(

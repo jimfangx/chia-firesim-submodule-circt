@@ -872,6 +872,103 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
   return success();
 }
 
+LogicalResult goldengate::internalizeFAMEUnusedOutputs(
+    CircuitOp circuit, FModuleOp model, ArrayRef<StringRef> portNames,
+    std::string &error) {
+  if (portNames.empty())
+    return success();
+  if (model->getParentOp() != circuit.getOperation()) {
+    error = "unused output model is outside the supplied circuit";
+    return failure();
+  }
+  auto ports = model.getPorts();
+  llvm::BitVector removed(ports.size());
+  for (StringRef name : portNames) {
+    std::optional<unsigned> index;
+    for (unsigned i = 0; i < ports.size(); ++i)
+      if (ports[i].getName() == name)
+        index = i;
+    auto type = index ? dyn_cast<FIRRTLBaseType>(ports[*index].type)
+                      : FIRRTLBaseType();
+    if (name.empty() || !index || removed.test(*index) ||
+        ports[*index].direction != Direction::Out || !type ||
+        !type.isPassive() || isa<ClockType>(type) ||
+        hasPortAnnotations(model, *index) || ports[*index].sym) {
+      error = "unused output must be a unique, passive, unannotated, "
+              "unsymbolized data output: " + name.str();
+      return failure();
+    }
+    // Replacing a port with a wire must preserve its local target identity.
+    for (auto &op : *model.getBodyBlock())
+      if (auto localName = op.getAttrOfType<StringAttr>("name"))
+        if (localName.getValue() == name) {
+          error = "unused output wire name collides with a declaration: " +
+                  name.str();
+          return failure();
+        }
+    removed.set(*index);
+  }
+
+  SmallVector<InstanceOp> instances;
+  {
+    circt::igraph::InstanceGraph graph(circuit);
+    auto *node = graph.lookup(model);
+    if (!node) {
+      error = "unused output model is absent from the instance graph";
+      return failure();
+    }
+    for (auto *record : node->uses()) {
+      auto instance = record->getInstance<InstanceOp>();
+      if (!instance || instance.getNumResults() != ports.size()) {
+        error = "unused output instance has incompatible ports";
+        return failure();
+      }
+      for (unsigned i = 0; i < ports.size(); ++i) {
+        if (instance.getPortNameStr(i) != ports[i].getName() ||
+            instance.getResult(i).getType() != ports[i].type ||
+            instance.getPortDirection(i) != ports[i].direction) {
+          error = "unused output instance has incompatible ports";
+          return failure();
+        }
+        if (removed.test(i) &&
+            (!instance.getResult(i).use_empty() ||
+             !cast<ArrayAttr>(instance.getPortAnnotationsAttr()[i]).empty())) {
+          error = "unused output instance result is still used or annotated: " +
+                  ports[i].getName().str();
+          return failure();
+        }
+      }
+      instances.push_back(instance);
+    }
+  }
+
+  // SFC's unusedOutputsAsWires keeps body connects legal after passthrough
+  // promotion routes their former consumers directly from upstream sources.
+  OpBuilder declarations(model.getBodyBlock(), model.getBodyBlock()->begin());
+  for (unsigned i = 0; i < ports.size(); ++i)
+    if (removed.test(i)) {
+      auto wire = declarations.create<WireOp>(
+          ports[i].loc, ports[i].type, ports[i].getName());
+      model.getBodyBlock()->getArgument(i).replaceAllUsesWith(wire.getResult());
+    }
+  for (auto instance : instances) {
+    OpBuilder builder(instance);
+    auto replacement = instance.erasePorts(builder, removed);
+    for (auto attr : instance->getAttrs())
+      if (attr.getName() != "portNames" &&
+          attr.getName() != "portDirections" &&
+          attr.getName() != "portAnnotations")
+        replacement->setAttr(attr.getName(), attr.getValue());
+    unsigned next = 0;
+    for (unsigned i = 0; i < ports.size(); ++i)
+      if (!removed.test(i))
+        instance.getResult(i).replaceAllUsesWith(replacement.getResult(next++));
+    instance.erase();
+  }
+  model.erasePorts(removed);
+  return success();
+}
+
 LogicalResult goldengate::groupFAMEChannelPorts(
     FModuleOp top, FModuleOp model, llvm::StringRef instanceName,
     llvm::StringRef modelClockSink, std::string &error) {

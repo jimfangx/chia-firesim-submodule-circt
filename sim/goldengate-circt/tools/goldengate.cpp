@@ -3994,6 +3994,18 @@ int main(int argc, char **argv) {
       selectedPorts.push_back(&*selected);
     }
     auto oldModel = selectedPorts.front()->binding->portGroup->module;
+    // Use the complete annotation graph, including output channels that are
+    // outside this partial rewrite, to identify SFC's unusedOutputsAsWires.
+    std::set<unsigned> channelOutputPorts;
+    for (const auto &group : modelPortGroups)
+      if (group.module == oldModel && group.direction == Direction::Out)
+        channelOutputPorts.insert(group.ports.begin(), group.ports.end());
+    llvm::SmallVector<std::string> unusedOutputNames;
+    for (unsigned i = 0; i < oldModel.getNumPorts(); ++i)
+      if (oldModel.getPortDirection(i) == Direction::Out &&
+          !mlir::isa<ClockType>(oldModel.getPorts()[i].type) &&
+          !channelOutputPorts.count(i))
+        unusedOutputNames.push_back(oldModel.getPortName(i).str());
     auto firstInstance = selectedPorts.front()->binding->instance;
     std::string modelInstanceName = firstInstance.getName().str();
     struct SelectedOutput {
@@ -4466,6 +4478,12 @@ int main(int argc, char **argv) {
     if (mlir::failed(goldengate::internalizeFAMEOutputClocks(
             hierarchy->top, model, clockInstanceName, rewriteError)))
       return fail("FAME output clock internalization: " + rewriteError);
+    llvm::SmallVector<llvm::StringRef> unusedOutputs;
+    for (const auto &name : unusedOutputNames)
+      unusedOutputs.push_back(name);
+    if (mlir::failed(goldengate::internalizeFAMEUnusedOutputs(
+            circuit, model, unusedOutputs, rewriteError)))
+      return fail("FAME unused output internalization: " + rewriteError);
     // This is a partial boundary until every model output is channelized.
     if (mlir::failed(goldengate::rewriteFAMEFinishing(
             model, channelNames, outputNames, clockLocalName, rewriteError)))

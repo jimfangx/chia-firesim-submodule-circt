@@ -151,6 +151,15 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-fame-unused-outputs-test
+    test/Transforms/FAMEUnusedOutputsTest.cpp lib/Transforms/FAMEInputChannel.cpp)
+  target_compile_features(goldengate-fame-unused-outputs-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-unused-outputs-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-unused-outputs-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-unused-outputs-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-unused-outputs COMMAND goldengate-fame-unused-outputs-test)
   add_executable(goldengate-fame-clock-gate-test
     test/Transforms/FAMEClockGateTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-clock-gate-test PRIVATE cxx_std_17)
