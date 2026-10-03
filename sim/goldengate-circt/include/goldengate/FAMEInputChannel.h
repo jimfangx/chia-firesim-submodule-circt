@@ -7,8 +7,9 @@
 namespace goldengate {
 // Replace the model inputs and top-level connections belonging to one data
 // channel with the corresponding typed decoupled bundle.
-// Wrapper ground-port DontTouch annotations and inner symbols move to the
-// payload field ID; symbol names/visibility and InnerRefs stay unchanged.
+// Wrapper ground-port DontTouch annotations and wrapper/model inner symbols
+// move to payload field IDs; symbol names/visibility and InnerRefs stay unchanged.
+// Model annotations must already be consumed; identities add no protection.
 // Unsupported attached metadata is rejected before the channel is changed.
 // Callers must refresh port analyses and inner symbol tables after rewriting.
 mlir::LogicalResult rewriteFAMEInputChannel(const TopHierarchy &hierarchy,

@@ -44,7 +44,8 @@ void checkReference(CircuitOp circuit, FModuleOp top,
               target.getPort() == port && target.getField() == fieldID,
           "stable InnerRef resolved to the wrong payload");
   bool found = false;
-  for (auto property : top.getPorts()[port].sym)
+  auto symbols = top.getPorts()[port].sym;
+  for (auto property : symbols)
     if (property.getName() == reference.getName()) {
       require(property.getFieldID() == fieldID &&
                   property.getSymVisibility().getValue() == visibility,
@@ -54,7 +55,7 @@ void checkReference(CircuitOp circuit, FModuleOp top,
   require(found, "payload symbol lost");
 }
 void run(MLIRContext &context, bool output, bool grouped, unsigned rejection,
-         unsigned metadata = 0) {
+         unsigned metadata = 0, bool withModelSymbols = false) {
   bool withAnnotations = metadata != 2;
   bool withSymbols = metadata != 0;
   std::string dir = output ? "out" : "in";
@@ -73,6 +74,18 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection,
   auto model = *std::next(modules.begin());
   OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
   auto instance = b.create<InstanceOp>(top.getLoc(), model, "model");
+  instance.setInnerSymAttr(circt::hw::InnerSymAttr::get(b.getStringAttr("instance_id")));
+  auto instanceRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Top"),
+                                                b.getStringAttr("instance_id"));
+  auto checkInstance = [&] {
+    SymbolTable modules(circuit);
+    circt::hw::InnerSymbolTableCollection innerTables;
+    circt::hw::InnerRefNamespace names{modules, innerTables};
+    auto target = names.lookup(instanceRef);
+    require(target && isa<InstanceOp>(target.getOp()) && !target.isPort(),
+            "instance cloning lost its independent inner symbol");
+  };
+  checkInstance();
   b.create<StrictConnectOp>(top.getLoc(), instance.getResult(0),
                            top.getBodyBlock()->getArgument(0));
   goldengate::TopHierarchy hierarchy{top, {}};
@@ -127,26 +140,54 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection,
   top.setPortSymbolsAttr(1, circt::hw::InnerSymAttr::get(b.getStringAttr("kept_id")));
   auto dataRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("data_id"));
   auto flagRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("flag_id"));
-  auto setSymbol = [&](unsigned port, StringAttr name, unsigned fieldID,
+  auto setSymbol = [&](FModuleOp module, unsigned port, StringAttr name, unsigned fieldID,
                        StringRef visibility) {
     auto property = circt::hw::InnerSymPropertiesAttr::get(
         &context, name, fieldID, b.getStringAttr(visibility));
-    top.setPortSymbolsAttr(port, circt::hw::InnerSymAttr::get(&context, {property}));
+    module.setPortSymbolsAttr(port, circt::hw::InnerSymAttr::get(&context, {property}));
   };
+  SmallVector<Attribute> stableRefs{instanceRef};
   if (withSymbols) {
-    setSymbol(2, dataRef.getName(), 0, "private");
-    if (grouped) setSymbol(3, flagRef.getName(), 0, "public");
+    setSymbol(top, 2, dataRef.getName(), 0, "private");
+    if (grouped) setSymbol(top, 3, flagRef.getName(), 0, "public");
     checkReference(circuit, top, dataRef, 2, 0, "private");
     if (grouped) checkReference(circuit, top, flagRef, 3, 0, "public");
-    circuit->setAttr("test.stable_refs", b.getArrayAttr(
-        grouped ? SmallVector<Attribute>{dataRef, flagRef} : SmallVector<Attribute>{dataRef}));
+    stableRefs.push_back(dataRef);
+    if (grouped) stableRefs.push_back(flagRef);
   }
+  // Equal leaf names in different modules are independent identities. Model
+  // symbols preserve references without retaining consumed model DontTouches.
+  auto modelDataRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Model"), dataRef.getName());
+  auto modelFlagRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Model"), flagRef.getName());
+  auto modelClockRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Model"), b.getStringAttr("clock_id"));
+  if (withModelSymbols) {
+    setSymbol(model, 0, modelClockRef.getName(), 0, "public");
+    setSymbol(model, 1, modelDataRef.getName(), 0, "public");
+    if (grouped) setSymbol(model, 2, modelFlagRef.getName(), 0, "private");
+    checkReference(circuit, model, modelClockRef, 0, 0, "public");
+    checkReference(circuit, model, modelDataRef, 1, 0, "public");
+    if (grouped) checkReference(circuit, model, modelFlagRef, 2, 0, "private");
+    stableRefs.append({modelClockRef, modelDataRef});
+    if (grouped) stableRefs.push_back(modelFlagRef);
+  }
+  circuit->setAttr("test.stable_refs", b.getArrayAttr(stableRefs));
   auto references = circuit->getAttr("test.stable_refs");
   if (rejection == 5)
-    setSymbol(badPort, grouped ? flagRef.getName() : dataRef.getName(), 1, "public");
+    setSymbol(top, badPort, grouped ? flagRef.getName() : dataRef.getName(), 1, "public");
   auto u1 = UIntType::get(&context, 1);
   if (rejection == 6)
-    setSymbol(badPort, dataRef.getName(), 0, "public");
+    setSymbol(top, badPort, dataRef.getName(), 0, "public");
+  unsigned badModelPort = grouped ? 2 : 1;
+  if (rejection == 7)
+    setSymbol(model, badModelPort, grouped ? modelFlagRef.getName() : modelDataRef.getName(),
+              1, "private");
+  if (rejection == 8)
+    setSymbol(model, badModelPort, modelDataRef.getName(), 0, "private");
+  if (rejection == 9) {
+    SmallVector<Attribute> modelAnnos(model.getNumPorts(), b.getArrayAttr({}));
+    modelAnnos[badModelPort] = b.getArrayAttr({anno});
+    model.setPortAnnotationsAttr(b.getArrayAttr(modelAnnos));
+  }
   Type payload = UIntType::get(&context, 8);
   if (grouped) {
     SmallVector<BundleType::BundleElement> fields{
@@ -191,6 +232,22 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection,
     if (grouped) checkReference(circuit, top, flagRef, port, flagID, "public");
     require(circuit->getAttr("test.stable_refs") == references, "InnerRefs changed");
   }
+  std::string modelChannelName = output ? "m__source" : "m__sink";
+  if (withModelSymbols) {
+    unsigned port = portNamed(model, modelChannelName);
+    require(model.getPorts()[port].sym.size() == (grouped ? 2u : 1u),
+            "model payload symbols lost or duplicated");
+    unsigned previousID = 0;
+    auto symbols = model.getPorts()[port].sym;
+    for (auto property : symbols) {
+      require(property.getFieldID() > previousID, "model payload symbols not in field order");
+      previousID = property.getFieldID();
+    }
+    checkReference(circuit, model, modelDataRef, port, dataID, "public");
+    if (grouped) checkReference(circuit, model, modelFlagRef, port, flagID, "private");
+    checkReference(circuit, model, modelClockRef, portNamed(model, "clock"), 0, "public");
+  }
+  checkInstance();
   unsigned index = 0;
   for (auto annotation : annotations) {
     require(annotation.getFieldID() == (index < 2 ? dataID : flagID), "wrong payload field ID");
@@ -202,13 +259,27 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection,
   PassManager pm(&context);
   pm.addNestedPass<CircuitOp>(createLowerFIRRTLTypesPass());
   require(succeeded(pm.run(*root)), "LowerTypes failed");
-  unsigned payloadPorts = 0;
+  unsigned payloadPorts = 0, modelPayloadPorts = 0;
   for (auto module : circuit.getOps<FModuleOp>())
     for (unsigned p = 0; p < module.getNumPorts(); ++p) {
       auto attached = AnnotationSet::forPort(module, p);
       if (module != top) {
-        require(attached.empty() && (!module.getPorts()[p].sym || module.getPorts()[p].sym.empty()),
-                "wrapper metadata leaked to model");
+        require(attached.empty(), "wrapper protection leaked to model");
+        auto name = module.getPortName(p);
+        if (name == modelChannelName + "_bits" ||
+            name == modelChannelName + "_bits_data" ||
+            name == modelChannelName + "_bits_flag") {
+          ++modelPayloadPorts;
+          bool flag = name.ends_with("flag");
+          if (withModelSymbols)
+            checkReference(circuit, model, flag ? modelFlagRef : modelDataRef, p, 0,
+                           flag ? "private" : "public");
+          else require(!module.getPorts()[p].sym || module.getPorts()[p].sym.empty(),
+                       "unexpected model payload symbol");
+        } else if (name == "clock" && withModelSymbols)
+          checkReference(circuit, model, modelClockRef, p, 0, "public");
+        else require(!module.getPorts()[p].sym || module.getPorts()[p].sym.empty(),
+                     "model identity leaked onto handshake");
         continue;
       }
       auto name = module.getPortName(p);
@@ -230,6 +301,8 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection,
       } else require(attached.empty() && (!module.getPorts()[p].sym || module.getPorts()[p].sym.empty()),
                      "payload metadata leaked onto handshake");
     }
+  checkInstance();
+  require(modelPayloadPorts == (grouped ? 2u : 1u), "flattened model payload missing");
   require(payloadPorts == (grouped ? 2u : 1u), "flattened payload port missing");
   require(circuit->getAttr("test.stable_refs") == references, "LowerTypes changed InnerRefs");
 }
@@ -241,13 +314,17 @@ int main() {
     for (bool output : {false, true})
       for (bool grouped : {false, true}) {
         for (unsigned metadata = 0; metadata < 3; ++metadata)
-          run(context, output, grouped, 0, metadata);
+          for (bool modelSymbols : {false, true})
+            run(context, output, grouped, 0, metadata, modelSymbols);
         for (unsigned rejection = 1; rejection < (grouped ? 7u : 6u); ++rejection)
-          run(context, output, grouped, rejection, 1);
+          run(context, output, grouped, rejection, 1, true);
+        for (unsigned rejection : {7u, 9u})
+          run(context, output, grouped, rejection, 1, true);
+        if (grouped) run(context, output, grouped, 8, 1, true);
       }
-    llvm::outs() << "12 scalar/grouped input/output metadata transfers and LowerTypes checks passed; "
+    llvm::outs() << "24 scalar/grouped input/output metadata transfers and LowerTypes checks passed; "
                     "stable InnerRefs and symbol visibility retained; "
-                    "22 unsupported metadata plans rejected without mutation\n";
+                    "32 unsupported metadata plans rejected without mutation\n";
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

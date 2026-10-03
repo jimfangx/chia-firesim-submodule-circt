@@ -60,7 +60,7 @@ LogicalResult rewriteMultiportOutputChannel(
   };
   llvm::SmallVector<Leaf> leaves;
   llvm::SmallVector<Annotation> wrapperAnnotations;
-  llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols;
+  llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
   std::set<unsigned> topPorts;
   for (unsigned modelPort : binding.instancePorts) {
     auto modelName = model.getPortName(modelPort);
@@ -94,7 +94,9 @@ LogicalResult rewriteMultiportOutputChannel(
     }
     if (failed(goldengate::collectFAMEWrapperPayloadMetadata(
             top, *topPort, channel.type, field, wrapperAnnotations,
-            wrapperSymbols, error)))
+            wrapperSymbols, error)) ||
+        failed(goldengate::collectFAMEPayloadSymbols(
+            model, modelPort, channel.type, field, modelSymbols, error)))
       return failure();
     Value oldTop = top.getBodyBlock()->getArgument(*topPort);
     Value oldInstance = instance.getResult(modelPort);
@@ -140,6 +142,12 @@ LogicalResult rewriteMultiportOutputChannel(
                      Direction::Out);
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::Out);
+  if (!modelSymbols.empty()) {
+    llvm::sort(modelSymbols, [](auto a, auto b) {
+      return a.getFieldID() < b.getFieldID();
+    });
+    modelInfo.sym = circt::hw::InnerSymAttr::get(context, modelSymbols);
+  }
   topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
   if (!wrapperSymbols.empty()) {
     llvm::sort(wrapperSymbols, [](auto a, auto b) {
@@ -259,10 +267,12 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
     return failure();
   }
   llvm::SmallVector<Annotation> wrapperAnnotations;
-  llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols;
+  llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
   if (failed(collectFAMEWrapperPayloadMetadata(
           top, *topPort, channel.type, {}, wrapperAnnotations,
-          wrapperSymbols, error)))
+          wrapperSymbols, error)) ||
+      failed(collectFAMEPayloadSymbols(
+          model, modelPort, channel.type, {}, modelSymbols, error)))
     return failure();
   Value oldTop = top.getBodyBlock()->getArgument(*topPort);
   Value oldInstance = instance.getResult(modelPort);
@@ -291,6 +301,12 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
                      Direction::Out);
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::Out);
+  if (!modelSymbols.empty()) {
+    llvm::sort(modelSymbols, [](auto a, auto b) {
+      return a.getFieldID() < b.getFieldID();
+    });
+    modelInfo.sym = circt::hw::InnerSymAttr::get(context, modelSymbols);
+  }
   topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
   if (!wrapperSymbols.empty()) {
     llvm::sort(wrapperSymbols, [](auto a, auto b) {
