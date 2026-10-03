@@ -168,8 +168,8 @@ void hierarchy(MLIRContext &context) {
   set({annotation(b, A::GlobalResetSource, "~Top|Mid>InternalGlobalResetCondition"), sink});
   before = dump(root.get());
   require(failed(goldengate::wireGlobalReset(circuit, count, error)) &&
-          StringRef(error).contains("circuit-top source") && dump(root.get()) == before,
-          "nested source did not reject atomically");
+          StringRef(error).contains("unique source instance") && dump(root.get()) == before,
+          "shared nested source did not reject atomically");
   set({source, sink, midAnnotation, sink});
   require(succeeded(goldengate::wireGlobalReset(circuit, count, error)) && count == 2,
           "shared reset routing failed: " + error);
@@ -198,6 +198,102 @@ void hierarchy(MLIRContext &context) {
   auto completed = dump(root.get());
   require(succeeded(goldengate::wireGlobalReset(circuit, count, error)) && count == 0 &&
           dump(root.get()) == completed, "repeat hierarchy wiring changed IR");
+}
+
+// Cases mirror the installed Scala Wiring oracle: upward outputs terminate at
+// the LCA, and descendant-only sinks do not change ancestor signatures.
+void nestedHierarchy(MLIRContext &context, unsigned scope) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(out %sink: !firrtl.uint<1>) {}
+      firrtl.module @Parent(out %sink: !firrtl.uint<1>) {}
+      firrtl.module @Source(out %sink: !firrtl.uint<1>) {}
+      firrtl.module @Sink(out %sink: !firrtl.uint<1>) {}
+    }
+  })mlir", &context);
+  require(bool(root), "nested hierarchy parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = named(circuit, "Top"), parent = named(circuit, "Parent");
+  auto source = named(circuit, "Source"), sink = named(circuit, "Sink");
+  OpBuilder b(&context);
+  b.setInsertionPointToEnd(source.getBodyBlock());
+  auto value = b.create<WireOp>(source.getLoc(), UIntType::get(&context, 1), b.getStringAttr("condition"));
+  b.setInsertionPointToEnd(parent.getBodyBlock());
+  b.create<WireOp>(parent.getLoc(), value.getResult().getType(), b.getStringAttr("condition"));
+  b.create<InstanceOp>(parent.getLoc(), source, "src");
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  b.create<InstanceOp>(top.getLoc(), parent, "parent");
+  SmallVector<Attribute> attrs{annotation(b, A::GlobalResetSource, "~Top|Source>condition")};
+  auto addSink = [&](StringRef module) {
+    attrs.push_back(annotation(b, A::GlobalResetSink, "~Top|" + module.str() + ">sink"));
+  };
+  if (scope == 0) {
+    addSink("Top"); addSink("Source"); addSink("Sink");
+    b.create<InstanceOp>(top.getLoc(), sink, "sibling0");
+    b.create<InstanceOp>(top.getLoc(), sink, "sibling1");
+    b.setInsertionPointToEnd(parent.getBodyBlock());
+    b.create<InstanceOp>(parent.getLoc(), sink, "sideBranch");
+    b.setInsertionPointToEnd(source.getBodyBlock());
+    b.create<InstanceOp>(source.getLoc(), sink, "sourceChild");
+  } else if (scope == 1) addSink("Parent");
+  else {
+    addSink("Sink");
+    if (scope == 3) addSink("Source");
+    b.setInsertionPointToEnd(source.getBodyBlock());
+    b.create<InstanceOp>(source.getLoc(), sink, "descendant");
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(attrs));
+  unsigned count; std::string error;
+  if (scope == 0) {
+    // A single source-module use still has two absolute paths if its parent
+    // is reused. Check all ancestors and reject before signature mutation.
+    b.setInsertionPointToEnd(top.getBodyBlock());
+    auto duplicate = b.create<InstanceOp>(top.getLoc(), parent, "duplicateParent");
+    auto before = dump(root.get());
+    require(failed(goldengate::wireGlobalReset(circuit, count, error)) &&
+            StringRef(error).contains("unique source instance") && dump(root.get()) == before,
+            "reused source ancestry did not reject atomically");
+    duplicate.erase();
+  }
+  require(succeeded(goldengate::wireGlobalReset(circuit, count, error)) && count == attrs.size() - 1,
+          "nested routing failed: " + error);
+  require(succeeded(verify(*root)), "invalid nested reset IR");
+  require(top.getNumPorts() == 1 && parent.getNumPorts() == (scope == 0 ? 2 : 1) &&
+          source.getNumPorts() == (scope < 2 ? 2 : 1) &&
+          sink.getNumPorts() == (scope == 1 ? 1 : 2), "wrong LCA route signatures");
+  if (scope < 2) {
+    require(source.getPortDirection(1) == Direction::Out &&
+            source.getPortName(1) == (scope == 0 ? "InternalGlobalResetCondition" : "condition_0") &&
+            driver(source, source.getBodyBlock()->getArgument(1)) == value.getResult(),
+            "nested source export differs from Scala");
+    auto src = *parent.getBodyBlock()->getOps<InstanceOp>().begin();
+    if (scope == 0) {
+      require(parent.getPortDirection(1) == Direction::Out && parent.getPortName(1) == "condition_0" &&
+              driver(parent, parent.getBodyBlock()->getArgument(1)) == src.getResult(1),
+              "upward parent route is broken");
+      auto parentInst = *top.getBodyBlock()->getOps<InstanceOp>().begin();
+      auto reset = parentInst.getResult(1);
+      require(driver(top, top.getBodyBlock()->getArgument(0)) == reset &&
+              driver(source, source.getBodyBlock()->getArgument(0)) == value.getResult(),
+              "top or source-local sink broken");
+      for (auto module : {top, parent, source}) {
+        auto expected = module == top ? reset : module == parent ? src.getResult(1) : value.getResult();
+        for (auto instance : module.getBodyBlock()->getOps<InstanceOp>())
+          if (instance.getModuleName() == "Sink")
+            require(driver(module, instance.getResult(1)) == expected, "sink branch fanout broken");
+      }
+    } else require(driver(parent, parent.getBodyBlock()->getArgument(0)) == src.getResult(1),
+                   "parent LCA sink broken");
+  } else {
+    auto desc = *source.getBodyBlock()->getOps<InstanceOp>().begin();
+    require(driver(source, desc.getResult(1)) == value.getResult(), "descendant-only route broken");
+    if (scope == 3)
+      require(driver(source, source.getBodyBlock()->getArgument(0)) == value.getResult(), "local sink broken");
+  }
+  if (scope != 1)
+    require(sink.getPortDirection(1) == Direction::In &&
+            driver(sink, sink.getBodyBlock()->getArgument(0)) == sink.getBodyBlock()->getArgument(1),
+            "sink input route broken");
 }
 
 // The immutable Rocket fixture has a source but no descendant debug sinks.
@@ -259,13 +355,87 @@ void goldenHierarchy(MLIRContext &context, StringRef input, StringRef output) {
   llvm::outs() << "Rocket augmented reset hierarchy PASS: " << modules << " modules, " << edges
                << " instance edges, " << count << " sinks\n";
 }
+void goldenNestedHierarchy(MLIRContext &context, StringRef input, StringRef output) {
+  auto root = parseSourceFile<ModuleOp>(input, &context);
+  require(bool(root), "nested golden parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = named(circuit, circuit.getName()), source = named(circuit, "CSRFile");
+  OpBuilder b(&context);
+  SmallVector<Attribute> attrs;
+  for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    Annotation a(attr);
+    if (!a.isClass(A::GlobalResetSource) && !a.isClass(A::PublicGlobalResetSource)) attrs.push_back(attr);
+  }
+  b.setInsertionPointToEnd(source.getBodyBlock());
+  auto value = b.create<WireOp>(source.getLoc(), UIntType::get(&context, 1), b.getStringAttr("iteration310NestedCondition"));
+  Value reset;
+  for (unsigned i = 0; i < source.getNumPorts(); ++i)
+    if (source.getPortName(i) == "reset") reset = source.getBodyBlock()->getArgument(i);
+  require(bool(reset), "immutable CSRFile reset port missing");
+  b.create<StrictConnectOp>(source.getLoc(), value.getResult(), reset);
+  attrs.push_back(annotation(b, A::GlobalResetSource,
+      "~" + circuit.getName().str() + "|CSRFile>iteration310NestedCondition"));
+  std::map<Operation *, unsigned> oldPorts;
+  for (auto module : circuit.getOps<FModuleOp>()) oldPorts[module] = module.getNumPorts();
+  for (auto module : {top, source, named(circuit, "CLINT")}) {
+    b.setInsertionPointToEnd(module.getBodyBlock());
+    b.create<WireOp>(module.getLoc(), value.getResult().getType(), b.getStringAttr("iteration310ResetSink"));
+    attrs.push_back(annotation(b, A::GlobalResetSink,
+        "~" + circuit.getName().str() + "|" + module.getName().str() + ">iteration310ResetSink"));
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(attrs));
+  unsigned count; std::string error;
+  require(succeeded(goldengate::wireGlobalReset(circuit, count, error)) && count >= 3,
+          "nested Rocket routing failed: " + error);
+  require(succeeded(verify(*root)), "invalid nested Rocket IR");
+  unsigned outputs = 0, inputs = 0, edges = 0;
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    auto old = oldPorts.at(module);
+    if (module.getNumPorts() == old) continue;
+    require(module.getNumPorts() == old + 1, "nested Rocket has duplicate routes");
+    auto direction = module.getPortDirection(old);
+    if (direction == Direction::Out) ++outputs; else ++inputs;
+    Value reset;
+    if (module == source) reset = value.getResult();
+    else if (direction == Direction::In) reset = module.getBodyBlock()->getArgument(old);
+    else {
+      for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
+        auto child = named(circuit, instance.getModuleName());
+        auto n = oldPorts.at(child);
+        if (child.getNumPorts() > n && child.getPortDirection(n) == Direction::Out) reset = instance.getResult(n);
+      }
+    }
+    require(bool(reset), "missing nested Rocket reset value");
+    if (direction == Direction::Out)
+      require(driver(module, module.getBodyBlock()->getArgument(old)) == reset, "broken Rocket upward edge");
+  }
+  for (auto module : circuit.getOps<FModuleOp>())
+    for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
+      FModuleOp child;
+      for (auto candidate : circuit.getOps<FModuleOp>())
+        if (candidate.getName() == instance.getModuleName()) child = candidate;
+      if (!child || child.getNumPorts() == oldPorts.at(child)) continue;
+      ++edges;
+    }
+  require(outputs == 7 && inputs == 2 && edges == 9 && top.getNumPorts() == oldPorts.at(top),
+          "immutable nested CSRFile/CLINT route hierarchy changed");
+  std::error_code ec;
+  llvm::raw_fd_ostream out(output.str() + ".nested.mlir", ec);
+  require(!ec, "cannot save nested candidate"); root->print(out);
+  llvm::outs() << "Rocket augmented nested reset PASS: 7 outputs, 2 inputs, 9 instance edges, "
+               << count << " sinks\n";
+}
 } // namespace
 int main(int argc, char **argv) {
   try {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     run(context, false); run(context, true); hierarchy(context);
-    if (argc == 3) goldenHierarchy(context, argv[1], argv[2]);
+    for (unsigned scope = 0; scope < 4; ++scope) nestedHierarchy(context, scope);
+    if (argc == 3) {
+      goldenHierarchy(context, argv[1], argv[2]);
+      goldenNestedHierarchy(context, argv[1], argv[2]);
+    }
     else require(argc == 1, "expected input.mlir output.mlir or no arguments");
     llvm::outs() << "Global reset wiring PASS\n";
     return 0;

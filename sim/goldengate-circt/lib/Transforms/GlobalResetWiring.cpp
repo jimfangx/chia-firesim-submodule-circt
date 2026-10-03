@@ -8,6 +8,8 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/DenseMap.h"
+#include <algorithm>
+#include <iterator>
 #include <functional>
 #include <map>
 
@@ -28,6 +30,7 @@ struct ModuleRoute {
   FModuleOp module;
   unsigned oldPorts;
   bool needed = false;
+  bool exportsSource = false;
   SmallVector<std::pair<unsigned, PortInfo>> added;
   SmallVector<std::pair<Operation *, Operation *>> children;
 };
@@ -123,16 +126,72 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
   std::map<Operation *, ModuleRoute> modules;
   SmallVector<std::pair<InstanceOp, Operation *>> uses;
   if (crossModule) {
-    // Plan through native instance identities. No source-instance ownership
-    // ambiguity exists in this subset: the source is in the circuit top.
+    // Plan through native instance identities. A nested source must have one
+    // absolute instance path, including a unique use of every ancestor.
     // Destroy the graph before cloning instances or changing port signatures.
     circt::igraph::InstanceGraph graph(circuit);
     auto *top = graph.lookup(StringAttr::get(circuit.getContext(), circuit.getName()));
-    if (!top || !top->noUses() || top->getModule().getOperation() != source->module) {
-      error = "cross-module global reset wiring requires a circuit-top source";
+    if (!top || !top->noUses()) {
+      error = "global reset wiring requires an uninstantiated circuit top";
       return failure();
     }
-    llvm::DenseSet<Operation *> active;
+    SmallVector<circt::igraph::InstanceGraphNode *> sourcePath;
+    llvm::DenseSet<Operation *> sourceAncestors;
+    auto *sourceNode = graph.lookup(source->module);
+    while (sourceNode != top) {
+      auto *key = sourceNode->getModule().getOperation();
+      if (!sourceAncestors.insert(key).second ||
+          std::distance(sourceNode->uses().begin(), sourceNode->uses().end()) != 1) {
+        error = "cross-module global reset wiring requires a unique source instance path";
+        return failure();
+      }
+      sourcePath.push_back(sourceNode);
+      auto *use = *sourceNode->uses().begin();
+      auto instance = use->getInstance<InstanceOp>();
+      auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
+      if (!parent || instance->getBlock() != parent.getBodyBlock()) {
+        error = "global reset source path requires module-scope FIRRTL instances";
+        return failure();
+      }
+      sourceNode = graph.lookup(parent);
+    }
+    sourceAncestors.insert(top->getModule().getOperation());
+    sourcePath.push_back(top);
+    std::reverse(sourcePath.begin(), sourcePath.end());
+
+    // Pathless sinks denote every instance. Find their common ancestor with
+    // the unique source path before deciding which ports need to change.
+    unsigned lca = sourcePath.size() - 1;
+    SmallVector<circt::igraph::InstanceGraphNode *> path;
+    llvm::DenseSet<Operation *> active, reachedSinks;
+    std::function<LogicalResult(circt::igraph::InstanceGraphNode *)> findLCA =
+        [&](circt::igraph::InstanceGraphNode *node) -> LogicalResult {
+      auto *key = node->getModule().getOperation();
+      if (!active.insert(key).second) {
+        error = "recursive module hierarchy in global reset wiring";
+        return failure();
+      }
+      path.push_back(node);
+      if (sinkModules.contains(key)) {
+        reachedSinks.insert(key);
+        unsigned common = 0;
+        while (common < path.size() && common < sourcePath.size() &&
+               path[common] == sourcePath[common]) ++common;
+        lca = std::min(lca, common - 1);
+      }
+      for (auto *record : *node)
+        if (failed(findLCA(record->getTarget()))) return failure();
+      path.pop_back();
+      active.erase(key);
+      return success();
+    };
+    if (failed(findLCA(top))) return failure();
+    for (auto *key : sinkModules)
+      if (!reachedSinks.contains(key)) {
+        error = "global reset sink has no instance path from the circuit top";
+        return failure();
+      }
+    auto *routeRoot = sourcePath[lca];
     auto sourceName = sources.front().getValue().split('>').second;
     std::function<LogicalResult(circt::igraph::InstanceGraphNode *)> plan =
         [&](circt::igraph::InstanceGraphNode *node) -> LogicalResult {
@@ -144,7 +203,9 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
         error = "recursive module hierarchy in global reset wiring";
         return failure();
       }
-      ModuleRoute info{module, unsigned(module.getNumPorts()), sinkModules.contains(key), {}, {}};
+      ModuleRoute info{module, unsigned(module.getNumPorts()),
+                       sinkModules.contains(key) || sourceAncestors.contains(key),
+                       sourceAncestors.contains(key), {}, {}};
       for (auto *record : *node) {
         if (failed(plan(record->getTarget()))) return failure();
         auto *childKey = record->getTarget()->getModule().getOperation();
@@ -158,7 +219,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
         info.needed = true;
         info.children.push_back({instance.getOperation(), childKey});
       }
-      if (info.needed && module != source->module) {
+      if (info.needed && node != routeRoot) {
         circt::Namespace names;
         for (auto name : module.getPortNamesAttr())
           names.newName(cast<StringAttr>(name).getValue());
@@ -170,13 +231,14 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
         auto name = names.newName(sinkModules.contains(key) ?
                                   StringRef("InternalGlobalResetCondition") : sourceName);
         info.added.push_back({info.oldPorts,
-            PortInfo(StringAttr::get(circuit.getContext(), name), source->value.getType(), Direction::In)});
+            PortInfo(StringAttr::get(circuit.getContext(), name), source->value.getType(),
+                     info.exportsSource ? Direction::Out : Direction::In)});
       }
       active.erase(key);
       modules.emplace(key, std::move(info));
       return success();
     };
-    if (failed(plan(top))) return failure();
+    if (failed(plan(routeRoot))) return failure();
     for (auto *key : sinkModules)
       if (!modules.count(key)) {
         error = "global reset sink has no instance path from the circuit top";
@@ -212,9 +274,16 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
     replacements[instance.getOperation()] = replacement;
     instance.erase();
   }
+  // Use the native source/child SSA value at the LCA instead of introducing
+  // Scala Wiring's alias wire. This preserves the same reset identity.
   auto resetValue = [&](FModuleOp module) -> Value {
     if (module == source->module) return source->value;
-    return module.getBodyBlock()->getArgument(modules.at(module.getOperation()).oldPorts);
+    auto &info = modules.at(module.getOperation());
+    if (info.exportsSource)
+      for (auto [oldInstance, child] : info.children)
+        if (modules.at(child).exportsSource)
+          return replacements.lookup(oldInstance).getResult(modules.at(child).oldPorts);
+    return module.getBodyBlock()->getArgument(info.oldPorts);
   };
   // Replace flat placeholder drivers; this is equivalent to Scala's appended
   // last-connect drivers. Retain the source and its passthrough blocker logic.
@@ -226,9 +295,13 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
   }
   for (auto &[key, info] : modules) {
     b.setInsertionPointToEnd(info.module.getBodyBlock());
-    for (auto [oldInstance, child] : info.children)
+    if (info.exportsSource && !info.added.empty())
       b.create<StrictConnectOp>(info.module.getLoc(),
-          replacements.lookup(oldInstance).getResult(modules.at(child).oldPorts), resetValue(info.module));
+          info.module.getBodyBlock()->getArgument(info.oldPorts), resetValue(info.module));
+    for (auto [oldInstance, child] : info.children)
+      if (!modules.at(child).exportsSource)
+        b.create<StrictConnectOp>(info.module.getLoc(),
+            replacements.lookup(oldInstance).getResult(modules.at(child).oldPorts), resetValue(info.module));
   }
   wired = destinations.size();
   circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), retained));
