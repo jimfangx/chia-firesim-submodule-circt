@@ -8,7 +8,8 @@
 namespace goldengate {
 // Consume unused trigger annotations, or emit Scala-compatible local accounting
 // for distinct credit/debit sources and node sinks on the circuit top base clock,
-// including unconditional local wire/node aliases of the same input Clock port.
+// including unconditional wire/node aliases and scalar clock forwarding through
+// internal instances to the same top input Clock port.
 // Unsupported hardware cases fail before mutation.
 mlir::LogicalResult wireTriggers(
     circt::firrtl::CircuitOp circuit, unsigned &consumed,

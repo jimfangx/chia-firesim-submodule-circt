@@ -8,6 +8,7 @@
 #include "mlir/IR/Dominance.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -48,42 +49,70 @@ struct Source { Value event, reset; bool credit; std::string name; };
 // with one input clock is insufficient: a mux or gate may change its edges.
 class LocalClockAliases {
 public:
-  explicit LocalClockAliases(FModuleOp top) : top(top) {
-    top.walk([&](Operation *op) {
-      Value dest, src;
-      if (auto connect = dyn_cast<ConnectOp>(op)) {
-        dest = connect.getDest(); src = connect.getSrc();
-      } else if (auto connect = dyn_cast<StrictConnectOp>(op)) {
-        dest = connect.getDest(); src = connect.getSrc();
-      }
-      if (dest && isa<ClockType>(dest.getType()))
-        drivers[dest].push_back({src, op->getBlock() == top.getBodyBlock()});
-    });
+  LocalClockAliases(CircuitOp circuit, FModuleOp top) : top(top) {
+    for (auto module : circuit.getOps<FModuleOp>()) {
+      modules[module.getName()] = module;
+      module.walk([&](Operation *op) {
+        Value dest, src;
+        if (auto connect = dyn_cast<ConnectOp>(op)) {
+          dest = connect.getDest(); src = connect.getSrc();
+        } else if (auto connect = dyn_cast<StrictConnectOp>(op)) {
+          dest = connect.getDest(); src = connect.getSrc();
+        }
+        if (dest && isa<ClockType>(dest.getType()))
+          drivers[dest].push_back({src, op->getBlock() == module.getBodyBlock()});
+      });
+    }
   }
   Value root(Value value) {
-    llvm::DenseSet<Value> visited;
-    while (value && isa<ClockType>(value.getType()) && visited.insert(value).second) {
-      if (auto arg = dyn_cast<BlockArgument>(value)) {
-        if (arg.getOwner() == top.getBodyBlock() &&
-            top.getPortDirection(arg.getArgNumber()) == Direction::In &&
-            drivers[value].empty()) return value;
-        return {};
-      }
-      auto *op = value.getDefiningOp();
-      if (!op || op->getBlock() != top.getBodyBlock()) return {};
-      if (auto node = dyn_cast<NodeOp>(op)) {
-        if (!drivers[value].empty()) return {};
-        value = node.getInput();
-      } else if (isa<WireOp>(op)) {
-        auto &assigned = drivers[value];
-        if (assigned.size() != 1 || !assigned.front().second) return {};
-        value = assigned.front().first;
-      } else return {};
-    }
-    return {};
+    llvm::DenseSet<Value> active;
+    return trace(top, value, active);
   }
 private:
+  Value trace(FModuleOp module, Value value, llvm::DenseSet<Value> &active) {
+    if (!value || !isa<ClockType>(value.getType()) ||
+        !active.insert(value).second) return {};
+    auto followDriver = [&]() -> Value {
+      auto &assigned = drivers[value];
+      if (assigned.size() != 1 || !assigned.front().second) return {};
+      return trace(module, assigned.front().first, active);
+    };
+    Value result;
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      if (arg.getOwner() == module.getBodyBlock()) {
+        if (module.getPortDirection(arg.getArgNumber()) == Direction::In) {
+          if (drivers[value].empty()) result = value;
+        } else result = followDriver();
+      }
+    } else if (auto *op = value.getDefiningOp();
+               op && op->getBlock() == module.getBodyBlock()) {
+      if (auto node = dyn_cast<NodeOp>(op)) {
+        if (drivers[value].empty()) result = trace(module, node.getInput(), active);
+      } else if (isa<WireOp>(op)) {
+        result = followDriver();
+      } else if (auto instance = dyn_cast<InstanceOp>(op)) {
+        auto child = modules.find(instance.getModuleName());
+        auto port = cast<OpResult>(value).getResultNumber();
+        if (child != modules.end() && port < child->second.getNumPorts()) {
+          if (child->second.getPortDirection(port) == Direction::In) {
+            result = followDriver();
+          } else if (drivers[value].empty()) {
+            // Resolve a child output to that child's input, then return through
+            // this specific instance. Shared module definitions must not merge
+            // clocks connected to different parent inputs.
+            auto childRoot = dyn_cast_or_null<BlockArgument>(trace(
+                child->second, child->second.getBodyBlock()->getArgument(port), active));
+            if (childRoot && childRoot.getArgNumber() < instance.getNumResults())
+              result = trace(module, instance.getResult(childRoot.getArgNumber()), active);
+          }
+        }
+      }
+    }
+    active.erase(value);
+    return result;
+  }
   FModuleOp top;
+  llvm::StringMap<FModuleOp> modules;
   llvm::DenseMap<Value, SmallVector<std::pair<Value, bool>>> drivers;
 };
 } // namespace
@@ -137,13 +166,13 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (clock) error = "trigger base reference must be Clock";
     return failure();
   }
-  LocalClockAliases aliases(top);
+  LocalClockAliases aliases(circuit, top);
   // Local accounting uses BridgeTopWiring's root; the synchronizers and
   // global counters retain the annotated base clock, as in Scala.
   Value baseClock = clock;
   clock = aliases.root(clock);
   if (!clock) {
-    error = "trigger base clock needs an unconditional local alias of an input Clock port";
+    error = "trigger base clock needs an unconditional alias of a top input Clock port";
     return failure();
   }
   SmallVector<Source> events;

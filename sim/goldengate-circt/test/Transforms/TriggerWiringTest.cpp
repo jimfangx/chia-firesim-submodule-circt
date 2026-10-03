@@ -204,12 +204,46 @@ void multiple(MLIRContext &context, unsigned credits, unsigned debits, StringRef
     require(!ec, "cannot write multiple-source candidate"); root->print(out); out << '\n';
   }
 }
-void aliases(MLIRContext &context, unsigned mode, StringRef output) {
+void aliases(MLIRContext &context, unsigned mode, StringRef output,
+             unsigned hierarchy = 0) {
   // Augmented Scala TriggerWiring oracle: credit reset mask, unmasked debit,
   // distinct local aliases of one clock. SFC emits root-clock local counters,
   // baseAlias global/sampling registers and a sinkAlias synchronizer. SFC also
   // rejects a sink clock alias declared after the sink node (mode 6).
-  std::string body = R"mlir(
+  std::string body, children;
+  if (hierarchy) {
+    body = R"mlir(
+      %left:2 = firrtl.instance left @Forward(in clock_in: !firrtl.clock, out clock_out: !firrtl.clock)
+      %right:2 = firrtl.instance right @Forward(in clock_in: !firrtl.clock, out clock_out: !firrtl.clock)
+      firrtl.strictconnect %left#0, %clock : !firrtl.clock
+    )mlir";
+    if (hierarchy != 4)
+      body += "firrtl.strictconnect %right#0, %" + std::string(hierarchy == 3 ? "otherClock" : "clock") + " : !firrtl.clock\n";
+    children = "firrtl.module @Forward(in %clock_in: !firrtl.clock, out %clock_out: !firrtl.clock) {\n";
+    if (hierarchy == 2) {
+      children += R"mlir(
+        %relay:2 = firrtl.instance relay @Relay(in clock_in: !firrtl.clock, out clock_out: !firrtl.clock)
+        firrtl.strictconnect %relay#0, %clock_in : !firrtl.clock
+        firrtl.strictconnect %clock_out, %relay#1 : !firrtl.clock
+      } firrtl.module @Relay(in %clock_in: !firrtl.clock, out %clock_out: !firrtl.clock) {
+        %alias = firrtl.node %clock_in : !firrtl.clock
+        firrtl.strictconnect %clock_out, %alias : !firrtl.clock
+      )mlir";
+    } else if (hierarchy == 6) {
+      children += "firrtl.connect %clock_out, %clock_out : !firrtl.clock, !firrtl.clock\n";
+    } else {
+      if (hierarchy == 7)
+        children += "%one = firrtl.constant 1 : !firrtl.uint<1>\nfirrtl.when %one : !firrtl.uint<1> {\n";
+      children += "firrtl.strictconnect %clock_out, %clock_in : !firrtl.clock\n";
+      if (hierarchy == 7) children += "}\n";
+      if (hierarchy == 5)
+        children += "firrtl.strictconnect %clock_out, %clock_in : !firrtl.clock\n";
+    }
+    children += "}\n";
+    if (hierarchy == 8)
+      children = "firrtl.extmodule @Forward(in clock_in: !firrtl.clock, out clock_out: !firrtl.clock)\n";
+  }
+  body += R"mlir(
     %baseAlias = firrtl.wire : !firrtl.clock
     %creditAlias = firrtl.node %baseAlias : !firrtl.clock
     %debitAlias = firrtl.wire : !firrtl.clock
@@ -221,17 +255,17 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output) {
     firrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>
   )mlir";
   if (mode == 6) body += "%sinkAlias = firrtl.node %debitAlias : !firrtl.clock\n";
-  body += "firrtl.strictconnect %baseAlias, %clock : !firrtl.clock\n";
+  body += "firrtl.strictconnect %baseAlias, %" + std::string(hierarchy ? "left#1" : "clock") + " : !firrtl.clock\n";
   if (mode == 2) body += "firrtl.strictconnect %debitAlias, %otherClock : !firrtl.clock\n";
   if (mode != 5) {
     if (mode == 7) body += "firrtl.when %reset : !firrtl.uint<1> {\n";
-    body += "firrtl.connect %debitAlias, %" + std::string(mode == 3 ? "sinkAlias" : mode == 4 ? "otherClock" : "creditAlias") + " : !firrtl.clock, !firrtl.clock\n";
+    body += "firrtl.connect %debitAlias, %" + std::string(hierarchy ? "right#1" : mode == 3 ? "sinkAlias" : mode == 4 ? "otherClock" : "creditAlias") + " : !firrtl.clock, !firrtl.clock\n";
     if (mode == 7) body += "}\n";
   }
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
     "firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>, "
     "in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, "
-    "in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>) {" + body + "} } }", &context);
+    "in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>) {" + body + "}" + children + "} }", &context);
   require(bool(root), "clock alias parse");
   auto circuit = *root->getOps<CircuitOp>().begin();
   auto top = *circuit.getOps<FModuleOp>().begin();
@@ -257,9 +291,9 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output) {
   auto before = dump(root.get());
   unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode) {
+  if (mode || hierarchy > 2) {
     require(failed(result) && consumed == 0 && dump(root.get()) == before,
-            "clock alias rejection must be atomic: " + std::to_string(mode));
+            "clock alias rejection must be atomic: " + std::to_string(mode) + ":" + std::to_string(hierarchy));
     require(StringRef(error).contains(mode == 6 ? "dominate" : "base clock"),
             "clock alias diagnostic: " + error);
     return;
@@ -299,6 +333,9 @@ int main(int argc, char **argv) {
     multiple(context, 17, 2, "");
     aliases(context, 0, argc > 3 ? argv[3] : "");
     for (unsigned mode : {2, 3, 4, 5, 6, 7}) aliases(context, mode, "");
+    aliases(context, 0, argc > 4 ? argv[4] : "", 1);
+    aliases(context, 0, argc > 5 ? argv[5] : "", 2);
+    for (unsigned hierarchy : {3, 4, 5, 6, 7, 8}) aliases(context, 0, "", hierarchy);
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
