@@ -1,0 +1,15 @@
+{
+  "channel_connections": [],
+  "channel_ports": [
+    {
+      "module": "Hub",
+      "name": "tick",
+      "direction": "input",
+      "clock_port": null
+    }
+  ],
+  "local_channel_dependencies": [],
+  "transformed_modules": [
+    "Hub"
+  ]
+}

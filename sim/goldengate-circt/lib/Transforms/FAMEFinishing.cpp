@@ -46,6 +46,12 @@ LogicalResult goldengate::rewriteFAMEFinishing(
     FModuleOp module, llvm::ArrayRef<std::string> inputChannels,
     llvm::ArrayRef<std::string> outputChannels, llvm::StringRef clockChannel,
     std::string &error) {
+  // Scala BinaryBooleanOp.reduce rejects an empty data-channel reduction;
+  // a real or virtual clock token is applied only after this reduction.
+  if (inputChannels.empty() && outputChannels.empty()) {
+    error = "FAME model has no data channels";
+    return failure();
+  }
   Value finishing;
   module.walk([&](WireOp op) {
     if (op.getName() == "targetCycleFinishing")
@@ -207,9 +213,6 @@ LogicalResult goldengate::rewriteFAMEFinishing(
     Value valid = builder.create<SubfieldOp>(loc, channel.port, "valid");
     addCondition(valid);
   }
-  if (!allReady)
-    allReady = builder.create<ConstantOp>(
-        loc, UIntType::get(module.getContext(), 1, false), APInt(1, 1));
   Value clockValid;
   if (virtualClock)
     clockValid = builder.create<ConstantOp>(

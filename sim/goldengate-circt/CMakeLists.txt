@@ -193,6 +193,12 @@ if(BUILD_TESTING)
   set_tests_properties(goldengate-fame-input-only-models PROPERTIES FIXTURES_SETUP fame-input-only-models)
   set_tests_properties(goldengate-fame-input-only-models-check goldengate-fame-input-only-clock-gates-check
     PROPERTIES FIXTURES_REQUIRED fame-input-only-models)
+  add_test(NAME goldengate-fame-model-selection COMMAND ${CMAKE_COMMAND}
+    -DCOMPILER=$<TARGET_FILE:goldengate-circt>
+    -DCHECKER=$<TARGET_FILE:goldengate-fame-fired-state-test>
+    -DFIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms
+    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/model-selection
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelSelection.cmake)
   add_executable(goldengate-fame-virtual-clock-port-test
     test/Transforms/FAMEVirtualClockPortTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-virtual-clock-port-test PRIVATE cxx_std_17)

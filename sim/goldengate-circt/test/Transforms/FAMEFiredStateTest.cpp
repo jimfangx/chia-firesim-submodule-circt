@@ -82,6 +82,8 @@ unsigned eval(Value v, const llvm::DenseMap<Value, unsigned> &values) {
                                     : eval(p.getLow(), values);
   if (auto p = v.getDefiningOp<AsUIntPrimOp>())
     return eval(p.getInput(), values);
+  if (auto p = v.getDefiningOp<ConstCastOp>())
+    return eval(p.getInput(), values);
   throw std::runtime_error("unexpected transition operation");
 }
 void behavior(MLIRContext &context) {
@@ -306,6 +308,33 @@ void finishingBehavior(MLIRContext &context) {
                << " clocked/virtual completion cases and six atomic coverage "
                   "rejections\n";
 }
+void noDataFinishingRejections(MLIRContext &context) {
+  for (bool explicitClock : {false, true}) {
+    std::string text = R"mlir(
+      module { firrtl.circuit "Model" {
+        firrtl.module @Model(in %hostClock: !firrtl.clock,
+          in %hostReset: !firrtl.uint<1>) {
+          %targetCycleFinishing = firrtl.wire : !firrtl.uint<1>
+          firrtl.strictconnect %targetCycleFinishing, %hostReset : !firrtl.uint<1>
+        }
+      } }
+    )mlir";
+    if (explicitClock)
+      text.insert(text.find(") {"),
+                  ", in %tick_sink: !firrtl.bundle<ready flip: uint<1>, "
+                  "valid: uint<1>, bits: clock>");
+    auto root = parseSourceString<ModuleOp>(text, &context);
+    require(bool(root), "no-data model fixture parse failed");
+    auto before = dump(*root);
+    std::string error;
+    require(failed(goldengate::rewriteFAMEFinishing(
+                model(*root), {}, {}, explicitClock ? "tick" : "", error)) &&
+                error == "FAME model has no data channels",
+            "empty completion reduction did not reject like Scala And.reduce");
+    require(before == dump(*root), "no-data rejection mutated FIRRTL IR");
+  }
+  llvm::outs() << "Passed two atomic no-data completion rejections\n";
+}
 // Emit named boolean operations for a structured comparison with optimized
 // SFC RTL. This preserves operands and channel identity while ignoring SSA IDs.
 std::string predicate(FModuleOp m, Value value) {
@@ -483,7 +512,7 @@ void virtualControls(MLIRContext &context, const char *path) {
 // A hub clock channel and a non-hub data channel deliberately share "tick".
 // Evaluate emitted SSA controls against FAMETransformer's per-model rules.
 void mixedControls(MLIRContext &context, const char *path,
-                   bool inputOnly = false) {
+                   bool inputOnly = false, llvm::StringRef onlyModel = {}) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
   require(bool(root), "mixed control boundary parse failed");
   unsigned models = 0, cases = 0, declarations = 0;
@@ -493,6 +522,8 @@ void mixedControls(MLIRContext &context, const char *path,
   });
   require(declarations == 1, "mixed models did not share the clock-gate symbol");
   root->walk([&](FModuleOp m) {
+    if (!onlyModel.empty() && m.getName() != onlyModel)
+      return;
     bool hub = m.getName() == "Hub";
     if (!hub && m.getName() != "Other")
       return;
@@ -628,11 +659,30 @@ void mixedControls(MLIRContext &context, const char *path,
       ++cases;
     }
   });
-  require(models == 2 && succeeded(verify(*root)),
+  require(models == (onlyModel.empty() ? 2 : 1) && succeeded(verify(*root)),
           "mixed circuit models missing or invalid");
   llvm::outs() << "Passed " << cases
                << (inputOnly ? " input-only" : " mixed")
                << " hub/virtual control cases\n";
+}
+void selectedControls(MLIRContext &context, const char *path) {
+  auto root = parseSourceFile<ModuleOp>(path, &context);
+  require(bool(root), "selected model boundary parse failed");
+  bool found = false;
+  root->walk([&](FModuleOp m) {
+    if (m.getName() != "Hub")
+      return;
+    found = true;
+    for (auto reg : m.getOps<RegResetOp>())
+      require(reg.getName() == "tick_enabled",
+              "unselected model acquired channel fired registers");
+    for (auto wire : m.getOps<WireOp>())
+      if (wire.getName() == "targetCycleFinishing")
+        require(eval(wire.getResult(), {}) == 0,
+                "unselected model completion was rewritten");
+  });
+  require(found, "unselected model missing");
+  mixedControls(context, path, true, "Other");
 }
 // Emit the actual CIRCT buffer/gate truth table for comparison with the SFC
 // RTL boundary. Token substitution also tests the virtual constant-one case.
@@ -828,6 +878,7 @@ int main(int argc, char **argv) {
     behavior(context);
     rejections(context);
     finishingBehavior(context);
+    noDataFinishingRejections(context);
     if (argc == 3 && std::string(argv[1]) == "--virtual-controls")
       virtualControls(context, argv[2]);
     else if (argc == 3 && std::string(argv[1]) == "--clock-controls")
@@ -836,6 +887,8 @@ int main(int argc, char **argv) {
       mixedControls(context, argv[2]);
     else if (argc == 3 && std::string(argv[1]) == "--input-only-controls")
       mixedControls(context, argv[2], true);
+    else if (argc == 3 && std::string(argv[1]) == "--selected-controls")
+      selectedControls(context, argv[2]);
     else if (argc == 2)
       boundary(context, argv[1]);
     else
@@ -843,7 +896,8 @@ int main(int argc, char **argv) {
               "usage: FAMEFiredStateTest [candidate.mlir | --virtual-controls "
               "candidate.mlir | --clock-controls candidate.mlir | "
               "--mixed-controls candidate.mlir | "
-              "--input-only-controls candidate.mlir]");
+              "--input-only-controls candidate.mlir | "
+              "--selected-controls candidate.mlir]");
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

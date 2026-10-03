@@ -1,0 +1,35 @@
+{
+  "channel_connections": [
+    {
+      "name": "globalClock",
+      "kind": "target_clock",
+      "sinks": [
+        "tick"
+      ]
+    }
+  ],
+  "channel_ports": [
+    {
+      "module": "Hub",
+      "name": "tick",
+      "direction": "input",
+      "clock_port": null
+    },
+    {
+      "module": "Hub",
+      "name": "input",
+      "direction": "input",
+      "clock_port": "tick"
+    },
+    {
+      "module": "Other",
+      "name": "tick",
+      "direction": "input",
+      "clock_port": null
+    }
+  ],
+  "local_channel_dependencies": [],
+  "transformed_modules": [
+    "Other"
+  ]
+}

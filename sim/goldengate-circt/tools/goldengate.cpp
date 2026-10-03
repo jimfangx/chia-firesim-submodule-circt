@@ -3167,6 +3167,25 @@ int main(int argc, char **argv) {
       return fail("analysis has no local dependencies or channels");
     std::map<std::string,
              llvm::SmallVector<goldengate::LocalChannelDependency>> byModule;
+    // FAMETransformAnnotation selects models independently of their channels.
+    // Older boundary reports omit this field and derive selection from rows.
+    std::optional<std::set<std::string>> selectedModules;
+    if (auto *selection = object->get("transformed_modules")) {
+      auto *names = selection->getAsArray();
+      if (!names)
+        return fail("malformed FAME transformed module analysis");
+      selectedModules.emplace();
+      for (const auto &name : *names) {
+        auto spelling = name.getAsString();
+        if (!spelling || spelling->empty())
+          return fail("malformed FAME transformed module name");
+        selectedModules->insert(spelling->str());
+        byModule.try_emplace(spelling->str());
+      }
+    }
+    auto isSelected = [&](llvm::StringRef name) {
+      return !selectedModules || selectedModules->count(name.str());
+    };
     std::map<std::string, llvm::SmallVector<std::string>> inputsByModule;
     std::map<std::string, llvm::SmallVector<std::string>> outputsByModule;
     std::map<std::string, std::map<std::string, std::optional<std::string>>>
@@ -3192,7 +3211,8 @@ int main(int argc, char **argv) {
       // Scala transforms selected models even when they have no outputs.
       // Such models have no local output dependency rows, but still need
       // input fired state, completion/readies, and buffered target clocks.
-      byModule.try_emplace(moduleName->str());
+      if (isSelected(*moduleName))
+        byModule.try_emplace(moduleName->str());
     }
     for (auto &row : *rows) {
       auto *entry = row.getAsObject();
@@ -3220,7 +3240,8 @@ int main(int argc, char **argv) {
           !copyStrings(*unresolved, dependency.unresolvedPorts) ||
           !copyStrings(*causes, dependency.unresolvedCauses))
         return fail("malformed local channel dependency names");
-      byModule[moduleName->str()].push_back(std::move(dependency));
+      if (isSelected(*moduleName))
+        byModule[moduleName->str()].push_back(std::move(dependency));
     }
     for (auto &[moduleName, dependencies] : byModule) {
       FModuleOp model;
@@ -3258,6 +3279,12 @@ int main(int argc, char **argv) {
         }
       }
       inputsByModule[moduleName] = std::move(dataInputs);
+      // FAMETransformer uses And.reduce on data channel conditions, whose
+      // Scala implementation requires a nonempty sequence. A clock channel
+      // alone does not satisfy that contract. Diagnose before clock rewrites.
+      if (inputsByModule[moduleName].empty() &&
+          outputsByModule[moduleName].empty())
+        return fail("FAME model has no data channels: " + moduleName);
       // No explicit target-clock channel denotes a non-hub single-clock
       // model. SFC gives its VirtualClockChannel constant valid/enable bits.
       // Preserve each data channel's optional clock association: Some(clock)
