@@ -44,37 +44,48 @@ int main(int argc, char **argv) {
     context.loadDialect<circt::comb::CombDialect, circt::sv::SVDialect>();
     auto checkMemoryInit = [&](unsigned bits, bool dynamicRows,
                                unsigned chunkLimit, bool otherMacro,
-                               unsigned expected, bool decrement = false) {
+                               unsigned expected, bool decrement = false,
+                               unsigned lowBit = 0, bool extraUse = false,
+                               bool wrongGuard = false) {
       std::string word = "i" + std::to_string(bits);
+      bool narrow = bits <= 32;
       std::string source = "module { sv.macro.decl @RANDOM\n"
         "sv.macro.decl @OTHER\nsv.macro.decl @RANDOMIZE_MEM_INIT\n"
         "hw.module @MemoryInit(in %limit: i4) {\n"
         "%Memory = sv.reg : !hw.inout<uarray<8x" + word + ">>\n"
-        "%_RANDOM_MEM = sv.reg : !hw.inout<" + word + ">\n"
+        "%_RANDOM_MEM = sv.reg : !hw.inout<" + (narrow ? "i32" : word) + ">\n"
         "%zero = hw.constant 0 : i4\n%rows = hw.constant 8 : i4\n"
         "%one = hw.constant 1 : i4\n%start = hw.constant 0 : i10\n"
         "%bits = hw.constant " + std::to_string(chunkLimit) + " : i10\n"
         "%step = hw.constant 32 : i10\nsv.initial {\n"
-        "sv.ifdef.procedural @RANDOMIZE_MEM_INIT {\n"
+        "sv.ifdef.procedural @" + (wrongGuard ? "OTHER" : "RANDOMIZE_MEM_INIT") + " {\n"
         "sv.for %i = %zero to " + (dynamicRows ? "%limit" : "%rows") +
-        " step %one : i4 {\n"
-        "sv.for %j = %start to %bits step %step : i10 {\n"
+        " step %one : i4 {\n" +
+        (narrow ? "" : "sv.for %j = %start to %bits step %step : i10 {\n") +
         "%random = sv.macro.ref.se @" + (otherMacro ? "OTHER" : "RANDOM") +
-        "() : () -> i32\n"
-        "%part = sv.indexed_part_select_inout %_RANDOM_MEM[%j " +
+        "() : () -> i32\n" +
+        (narrow ? "sv.bpassign %_RANDOM_MEM, %random : i32\n" :
+        std::string("%part = sv.indexed_part_select_inout %_RANDOM_MEM[%j ") +
         (decrement ? "decrement " : "") + ": 32] : !hw.inout<" +
-        word + ">, i10\nsv.bpassign %part, %random : i32\n}\n"
+        word + ">, i10\nsv.bpassign %part, %random : i32\n}\n") +
         "%index = comb.extract %i from 0 : (i4) -> i3\n"
         "%element = sv.array_index_inout %Memory[%index] : !hw.inout<uarray<8x" +
         word + ">>, i3\n%value = sv.read_inout %_RANDOM_MEM : !hw.inout<" +
-        word + ">\nsv.bpassign %element, %value : " + word + "\n}\n}\n}\n"
+        (narrow ? "i32" : word) + ">\n" +
+        (narrow && bits < 32 ? "%low = comb.extract %value from " +
+          std::to_string(lowBit) + " : (i32) -> " + word + "\n" : "") +
+        "sv.bpassign %element, " + (narrow && bits < 32 ? "%low" : "%value") +
+        " : " + word + "\n" +
+        (extraUse ? "%extra = sv.read_inout %_RANDOM_MEM : !hw.inout<i32>\n" : "") +
+        "}\n}\n}\n"
         "hw.output\n} }";
       auto memory = parseSourceString<ModuleOp>(source, &context);
       require(bool(memory), "memory initializer fixture parse");
       auto before = dump(*memory);
       SmallVector<circt::sv::ForOp> loops;
       memory->walk<WalkOrder::PreOrder>([&](circt::sv::ForOp op) { loops.push_back(op); });
-      auto rows = loops[0], chunks = loops[1];
+      auto rows = loops[0];
+      auto chunks = narrow ? rows : loops[1];
       SmallVector<Value> rowBounds(rows->getOperands()), chunkBounds(chunks->getOperands());
       require(goldengate::normalizeMemoryInitialization(*memory) == expected,
               "memory initializer accepted/rejected the wrong pattern");
@@ -85,8 +96,8 @@ int main(int argc, char **argv) {
       if (expected) {
         circt::sv::MacroRefExprSEOp random;
         memory->walk([&](circt::sv::MacroRefExprSEOp op) { random = op; });
-        require(chunks->getBlock() == rows->getBlock() &&
-                chunks->isBeforeInBlock(rows) &&
+        require((narrow || (chunks->getBlock() == rows->getBlock() &&
+                chunks->isBeforeInBlock(rows))) &&
                 random->getBlock() == rows->getBlock() &&
                 random->isBeforeInBlock(chunks) && random.getResult().hasOneUse(),
                 "random draw or chunk fill remains inside a row/chunk loop");
@@ -107,6 +118,14 @@ int main(int argc, char **argv) {
     checkMemoryInit(64, false, 32, false, 0);
     checkMemoryInit(64, false, 64, true, 0);
     checkMemoryInit(64, false, 64, false, 0, true);
+    checkMemoryInit(1, false, 1, false, 1);
+    checkMemoryInit(3, false, 3, false, 1);
+    checkMemoryInit(32, false, 32, false, 1);
+    checkMemoryInit(3, true, 3, false, 0);
+    checkMemoryInit(3, false, 3, true, 0);
+    checkMemoryInit(3, false, 3, false, 0, false, 1);
+    checkMemoryInit(3, false, 3, false, 0, false, 0, true);
+    checkMemoryInit(3, false, 3, false, 0, false, 0, false, true);
     llvm::outs() << "Memory initialization: one guarded seed shared across chunks/rows, including partial words; dynamic bounds, partial fills and other macros unchanged\n";
     auto checkIndex = [&](unsigned wordBits, unsigned bound, bool dynamicBound,
                           bool unboundedIndex, bool initial, unsigned expected) {

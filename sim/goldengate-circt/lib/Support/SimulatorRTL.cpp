@@ -45,6 +45,69 @@ unsigned goldengate::normalizeMemoryInitialization(ModuleOp module) {
     SmallVector<Operation *> body;
     for (auto &op : rows->getRegion(0).front())
       body.push_back(&op);
+    // For words <= 32 bits, CIRCT writes a 32-bit temporary inside the row
+    // loop and optionally extracts its low bits. SFC samples that temporary
+    // once before the loop. Match the complete body before hoisting the draw
+    // and assignment together; bounds, index, extraction and guards survive.
+    if (body.size() >= 5 && body.size() <= 7 &&
+        isa<sv::MacroRefExprSEOp>(body[0])) {
+      auto random = cast<sv::MacroRefExprSEOp>(body[0]);
+      auto fill = dyn_cast<sv::BPAssignOp>(body[1]);
+      auto temporary = fill ? fill.getDest().getDefiningOp<sv::RegOp>() : nullptr;
+      if (!fill || !temporary || temporary.getName() != "_RANDOM_MEM" ||
+          temporary.getElementType() != IntegerType::get(module.getContext(), 32) ||
+          random.getMacroName() != "RANDOM" || random.getNumOperands() ||
+          random.getResult().getType() != temporary.getElementType() ||
+          fill.getSrc() != random.getResult() || !random.getResult().hasOneUse() ||
+          !llvm::hasNItems(temporary.getResult().getUses(), 2))
+        return;
+      unsigned next = 2;
+      Value index = rows.getInductionVar();
+      auto indexExtract = dyn_cast<comb::ExtractOp>(body[next]);
+      if (indexExtract) {
+        if (indexExtract.getInput() != index || indexExtract.getLowBit() != 0 ||
+            !indexExtract.getResult().hasOneUse())
+          return;
+        index = indexExtract.getResult();
+        ++next;
+      }
+      if (next + 3 > body.size())
+        return;
+      auto element = dyn_cast<sv::ArrayIndexInOutOp>(body[next++]);
+      auto word = dyn_cast<sv::ReadInOutOp>(body[next++]);
+      auto memory = element ? element.getInput().getDefiningOp<sv::RegOp>() : nullptr;
+      auto array = memory ? dyn_cast<hw::UnpackedArrayType>(memory.getElementType()) : nullptr;
+      auto bits = array ? dyn_cast<IntegerType>(array.getElementType()) : nullptr;
+      if (!element || !word || !memory || memory.getName() != "Memory" ||
+          !bits || bits.getWidth() > 32 || !array.getNumElements() ||
+          element.getIndex() != index || word.getInput() != temporary.getResult() ||
+          !element.getResult().hasOneUse() || !word.getResult().hasOneUse() ||
+          !isConstant(rows.getLowerBound(), 0) ||
+          !isConstant(rows.getUpperBound(), array.getNumElements()) ||
+          !isConstant(rows.getStep(), 1) ||
+          (indexExtract && index.getType().getIntOrFloatBitWidth() !=
+              std::max(1u, llvm::Log2_64_Ceil(array.getNumElements()))))
+        return;
+      Value value = word.getResult();
+      if (bits.getWidth() < 32) {
+        if (next + 2 > body.size())
+          return;
+        auto extract = dyn_cast<comb::ExtractOp>(body[next++]);
+        if (!extract || extract.getInput() != value || extract.getLowBit() != 0 ||
+            extract.getResult().getType() != bits || !extract.getResult().hasOneUse())
+          return;
+        value = extract.getResult();
+      }
+      if (next + 1 != body.size())
+        return;
+      auto store = dyn_cast<sv::BPAssignOp>(body[next]);
+      if (!store || store.getDest() != element.getResult() || store.getSrc() != value)
+        return;
+      random->moveBefore(rows);
+      fill->moveBefore(rows);
+      ++changed;
+      return;
+    }
     if (body.size() != 4 && body.size() != 5)
       return;
     auto chunks = dyn_cast<sv::ForOp>(body[0]);

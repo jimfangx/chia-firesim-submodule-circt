@@ -5,7 +5,7 @@
 #include <string>
 
 namespace goldengate {
-// Match CIRCT's generated wide-memory initializer and share one 32-bit random
+// Match CIRCT's generated memory initializer and share one 32-bit random
 // draw across chunks and rows, as SFC's replicated initialization word does.
 // Unknown loop shapes, guards, bounds and extra consumers remain unchanged.
 unsigned normalizeMemoryInitialization(mlir::ModuleOp module);
