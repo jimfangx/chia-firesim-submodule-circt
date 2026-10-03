@@ -57,14 +57,23 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) 
 		-DCIRCT_DIR=$(GOLDENGATE_CIRCT_PREFIX)/lib/cmake/circt \
 		-DZLIB_ROOT=$(abspath $(GOLDENGATE_CIRCT_PREFIX)/..)
 	cmake --build $(goldengate_circt_build)
+	rm -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f
 	$(goldengate_circt_build)/goldengate-circt $(FIRRTL_FILE) \
 		--annotation-file $(ANNO_FILE) --output-dir $(GENERATED_DIR)/circt-ingestion \
 		--compile-baseline --output-filename-base $(BASE_FILE_NAME)
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).sv $(simulator_verilog)
+	@if test -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; then \
+		while IFS= read -r blackbox || test -n "$$blackbox"; do \
+			if test -n "$$blackbox"; then \
+				cat "$$blackbox" >> $(simulator_verilog) || exit 1; \
+				printf '\n' >> $(simulator_verilog) || exit 1; \
+			fi; \
+		done < $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; \
+	fi
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).synthesis.xdc $(simulator_xdc)
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).implementation.xdc $(GENERATED_DIR)/$(BASE_FILE_NAME).implementation.xdc
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).defines.vh $(GENERATED_DIR)/$(BASE_FILE_NAME).defines.vh
-	@echo 'CIRCT Golden Gate emitted simulator RTL and XDC; driver headers and blackbox collateral remain unported, so compilation stops here.' >&2
+	@echo 'CIRCT Golden Gate emitted simulator RTL, inline blackboxes and XDC; driver headers remain unported, so compilation stops here.' >&2
 	@exit 1
 else ifeq ($(GOLDENGATE_COMPILER),sfc)
 $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
