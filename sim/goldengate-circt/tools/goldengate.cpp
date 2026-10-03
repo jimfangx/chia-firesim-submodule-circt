@@ -4134,6 +4134,10 @@ int main(int argc, char **argv) {
         annotation.setMember(member, mlir::ArrayAttr::get(&context, updated));
       return changed;
     };
+    if (llvm::StringRef(argv[7]) == "all" && rewriteInputsWithOutput)
+      if (mlir::failed(goldengate::removeFAMEAncillaryTopClockConnects(
+              hierarchy->top, firstInstance, rewriteError)))
+        return fail("FAME ancillary top clock removal: " + rewriteError);
     llvm::SmallVector<std::string> channelNames;
     for (const auto *selected : selectedPorts) {
       // Each port replacement clones the instance. Rebuild the hierarchy so

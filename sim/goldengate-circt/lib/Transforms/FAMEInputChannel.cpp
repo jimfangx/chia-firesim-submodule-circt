@@ -1071,6 +1071,40 @@ LogicalResult goldengate::groupFAMEChannelPorts(
   return success();
 }
 
+LogicalResult goldengate::removeFAMEAncillaryTopClockConnects(
+    FModuleOp top, InstanceOp modelInstance, std::string &error) {
+  if (!modelInstance || modelInstance->getBlock() != top.getBodyBlock()) {
+    error = "ancillary clock removal requires a direct wrapper model instance";
+    return failure();
+  }
+  SmallVector<Operation *> connections;
+  top.walk([&](Operation *op) {
+    Value dest, src;
+    if (auto connect = dyn_cast<StrictConnectOp>(op)) {
+      dest = connect.getDest();
+      src = connect.getSrc();
+    } else if (auto connect = dyn_cast<ConnectOp>(op)) {
+      dest = connect.getDest();
+      src = connect.getSrc();
+    }
+    if (!dest || !isa<ClockType>(dest.getType()))
+      return;
+    auto isWrapperPort = [&](Value value) {
+      auto arg = dyn_cast<BlockArgument>(value);
+      return arg && arg.getOwner() == top.getBodyBlock();
+    };
+    // These original direct port connects are required by the staged scalar
+    // clock removal helpers. They are erased there, before the final boundary.
+    if ((dest.getDefiningOp() == modelInstance && isWrapperPort(src)) ||
+        (src.getDefiningOp() == modelInstance && isWrapperPort(dest)))
+      return;
+    connections.push_back(op);
+  });
+  for (auto *connect : connections)
+    connect->erase();
+  return success();
+}
+
 LogicalResult goldengate::removeFAMEStaleTopClocks(FModuleOp top,
                                                 std::string &error) {
   auto ports = top.getPorts();

@@ -75,6 +75,14 @@ mlir::LogicalResult internalizeFAMEUnusedOutputs(
     circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp model,
     llvm::ArrayRef<llvm::StringRef> portNames, std::string &error);
 
+// Before adding FAME wiring, remove original scalar Clock-destination connects
+// throughout the wrapper. Temporarily retain direct wrapper/model clock port
+// connects for the later target/output clock port helpers to consume. Preserve
+// declarations, data connects and model bodies; consumes no annotations.
+mlir::LogicalResult removeFAMEAncillaryTopClockConnects(
+    circt::firrtl::FModuleOp top, circt::firrtl::InstanceOp modelInstance,
+    std::string &error);
+
 // After model clock/channel rewriting, drop remaining scalar wrapper clocks
 // other than hostClock and their direct ancillary clock connects. Require an
 // uninstantiated top and unannotated, unsymbolized ports used only by clock

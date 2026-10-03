@@ -122,12 +122,73 @@ void run(MLIRContext &context) {
                   "preserved host/token clocks, data wiring and metadata; "
                   "rejected five unsafe cases without mutation\n";
 }
+void runAncillary(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(
+    module { firrtl.circuit "Top" {
+      firrtl.module @Top(in %hostClock: !firrtl.clock,
+                        in %reset: !firrtl.uint<1>,
+                        in %targetClock: !firrtl.clock,
+                        out %clockOut: !firrtl.clock,
+                        in %data: !firrtl.uint<8>,
+                        out %dataOut: !firrtl.uint<8>) {
+        %a = firrtl.wire : !firrtl.clock
+        %b = firrtl.wire : !firrtl.clock
+        %derived = firrtl.node %hostClock : !firrtl.clock
+        firrtl.strictconnect %a, %derived : !firrtl.clock
+        firrtl.when %reset : !firrtl.uint<1> {
+          firrtl.strictconnect %b, %a : !firrtl.clock
+        }
+        firrtl.strictconnect %dataOut, %data : !firrtl.uint<8>
+      }
+      firrtl.module @Model(in %clock: !firrtl.clock,
+                          out %clockOut: !firrtl.clock) {
+        firrtl.strictconnect %clockOut, %clock : !firrtl.clock
+      }
+    } }
+  )mlir", &context);
+  require(bool(root), "ancillary fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  auto model = *std::next(circuit.getOps<FModuleOp>().begin());
+  OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
+  auto instance = b.create<InstanceOp>(top.getLoc(), model, "model");
+  auto args = top.getBodyBlock()->getArguments();
+  auto input = b.create<StrictConnectOp>(top.getLoc(), instance.getResult(0), args[2]);
+  auto output = b.create<StrictConnectOp>(top.getLoc(), args[3], instance.getResult(1));
+  auto wire = *top.getOps<WireOp>().begin();
+  b.create<ConnectOp>(top.getLoc(), wire.getResult(), instance.getResult(1));
+  std::string error, before = dump(*root), modelBefore = dump(model);
+  require(failed(goldengate::removeFAMEAncillaryTopClockConnects(top, {}, error)) &&
+              dump(*root) == before, "invalid instance mutated wrapper");
+  require(failed(goldengate::removeFAMEAncillaryTopClockConnects(model, instance, error)) &&
+              dump(*root) == before, "foreign instance mutated model");
+  require(succeeded(goldengate::removeFAMEAncillaryTopClockConnects(top, instance, error)) &&
+              succeeded(verify(*root)), "ancillary cleanup failed verification");
+  unsigned connects = 0;
+  top.walk([&](StrictConnectOp) { ++connects; });
+  require(connects == 3 && top.getOps<ConnectOp>().empty() &&
+              wire.getResult().use_empty(), "original ancillary connects remain");
+  require(input.getSrc() == args[2] && output.getDest() == args[3] &&
+              dump(model) == modelBefore && top.getNumPorts() == 6 &&
+              std::distance(top.getOps<WireOp>().begin(), top.getOps<WireOp>().end()) == 2,
+          "staged port connects, model body or declarations changed");
+  before = dump(*root);
+  require(succeeded(goldengate::removeFAMEAncillaryTopClockConnects(top, instance, error)) &&
+              dump(*root) == before, "repeated ancillary cleanup changed IR");
+  // Generated host and token wiring is added after cleanup, as in the CLI.
+  b.create<StrictConnectOp>(top.getLoc(), wire.getResult(), args[0]);
+  require(succeeded(verify(*root)) && !wire.getResult().use_empty(),
+          "later host clock wiring was not preserved");
+  llvm::outs() << "Removed original internal/conditional clock connects; retained "
+                  "staged port connects, data and model body; later host wiring survives\n";
+}
 } // namespace
 int main() {
   try {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     run(context);
+    runAncillary(context);
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';
