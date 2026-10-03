@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEOutputChannel.h"
+#include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "llvm/ADT/BitVector.h"
 #include "mlir/IR/Builders.h"
@@ -58,6 +59,7 @@ LogicalResult rewriteMultiportOutputChannel(
     Operation *connection;
   };
   llvm::SmallVector<Leaf> leaves;
+  llvm::SmallVector<Annotation> wrapperAnnotations;
   std::set<unsigned> topPorts;
   for (unsigned modelPort : binding.instancePorts) {
     auto modelName = model.getPortName(modelPort);
@@ -85,11 +87,13 @@ LogicalResult rewriteMultiportOutputChannel(
         top.getPortDirection(*topPort) != Direction::Out ||
         top.getPorts()[*topPort].type != model.getPorts()[modelPort].type ||
         removeCommonPrefix(top.getPortName(*topPort), binding.globalName) !=
-            field ||
-        hasPortAnnotations(top, *topPort)) {
-      error = "FAME output bundle field has no matching unannotated top port";
+            field) {
+      error = "FAME output bundle field has no matching top port";
       return failure();
     }
+    if (failed(goldengate::collectFAMEWrapperPayloadAnnotations(
+            top, *topPort, channel.type, field, wrapperAnnotations, error)))
+      return failure();
     Value oldTop = top.getBodyBlock()->getArgument(*topPort);
     Value oldInstance = instance.getResult(modelPort);
     Operation *oldConnection = nullptr;
@@ -134,8 +138,9 @@ LogicalResult rewriteMultiportOutputChannel(
                      Direction::Out);
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::Out);
+  topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
   model.insertPorts({{modelInsert, modelInfo}});
-  OpBuilder body(&model.getBodyBlock()->front());
+  OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
   Value bits = body.create<SubfieldOp>(
       model.getLoc(), model.getBodyBlock()->getArgument(modelInsert), "bits");
   for (const auto &leaf : leaves) {
@@ -241,11 +246,14 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
       topPort = connection.topPort;
     }
   if (!topPort || top.getPortDirection(*topPort) != Direction::Out ||
-      top.getPorts()[*topPort].type != payloadType ||
-      hasPortAnnotations(top, *topPort)) {
-    error = "FAME output channel has no unannotated matching top port";
+      top.getPorts()[*topPort].type != payloadType) {
+    error = "FAME output channel has no matching top port";
     return failure();
   }
+  llvm::SmallVector<Annotation> wrapperAnnotations;
+  if (failed(collectFAMEWrapperPayloadAnnotations(
+          top, *topPort, channel.type, {}, wrapperAnnotations, error)))
+    return failure();
   Value oldTop = top.getBodyBlock()->getArgument(*topPort);
   Value oldInstance = instance.getResult(modelPort);
   Operation *oldConnection = nullptr;
@@ -273,9 +281,10 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
                      Direction::Out);
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::Out);
+  topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
   model.insertPorts({{modelPort, modelInfo}});
   Value oldModel = model.getBodyBlock()->getArgument(modelPort + 1);
-  OpBuilder body(&model.getBodyBlock()->front());
+  OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
   Value bits = body.create<SubfieldOp>(model.getLoc(),
       model.getBodyBlock()->getArgument(modelPort), "bits");
   oldModel.replaceAllUsesWith(bits);

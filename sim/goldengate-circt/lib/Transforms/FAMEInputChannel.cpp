@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEInputChannel.h"
+#include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Support/InstanceGraph.h"
 #include "llvm/ADT/BitVector.h"
@@ -56,6 +57,7 @@ LogicalResult rewriteMultiportInputChannel(
     Operation *connection;
   };
   llvm::SmallVector<Leaf> leaves;
+  llvm::SmallVector<Annotation> wrapperAnnotations;
   std::set<unsigned> topPorts;
   for (unsigned modelPort : binding.instancePorts) {
     auto modelName = model.getPortName(modelPort);
@@ -83,11 +85,13 @@ LogicalResult rewriteMultiportInputChannel(
         top.getPortDirection(*topPort) != Direction::In ||
         top.getPorts()[*topPort].type != model.getPorts()[modelPort].type ||
         removeCommonPrefix(top.getPortName(*topPort), binding.globalName) !=
-            field ||
-        hasPortAnnotations(top, *topPort)) {
-      error = "FAME input bundle field has no matching unannotated top port";
+            field) {
+      error = "FAME input bundle field has no matching top port";
       return failure();
     }
+    if (failed(goldengate::collectFAMEWrapperPayloadAnnotations(
+            top, *topPort, channel.type, field, wrapperAnnotations, error)))
+      return failure();
     Value oldTop = top.getBodyBlock()->getArgument(*topPort);
     Value oldInstance = instance.getResult(modelPort);
     Operation *oldConnection = nullptr;
@@ -133,8 +137,9 @@ LogicalResult rewriteMultiportInputChannel(
                      Direction::In);
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::In);
+  topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
   model.insertPorts({{modelInsert, modelInfo}});
-  OpBuilder body(&model.getBodyBlock()->front());
+  OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
   Value bits = body.create<SubfieldOp>(
       model.getLoc(), model.getBodyBlock()->getArgument(modelInsert), "bits");
   for (const auto &leaf : leaves) {
@@ -238,11 +243,14 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
       topPort = connection.topPort;
     }
   if (!topPort || top.getPortDirection(*topPort) != Direction::In ||
-      top.getPorts()[*topPort].type != payloadType ||
-      hasPortAnnotations(top, *topPort)) {
-    error = "FAME input channel has no unannotated matching top port";
+      top.getPorts()[*topPort].type != payloadType) {
+    error = "FAME input channel has no matching top port";
     return failure();
   }
+  llvm::SmallVector<Annotation> wrapperAnnotations;
+  if (failed(collectFAMEWrapperPayloadAnnotations(
+          top, *topPort, channel.type, {}, wrapperAnnotations, error)))
+    return failure();
   Value oldTop = top.getBodyBlock()->getArgument(*topPort);
   Value oldInstance = instance.getResult(modelPort);
   Operation *oldConnection = nullptr;
@@ -272,11 +280,12 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
                      Direction::In);
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::In);
+  topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
   // The insertion position is in the original port list, as in the host
   // control rewrite. The old scalar moves one slot right and is then erased.
   model.insertPorts({{modelPort, modelInfo}});
   Value oldModel = model.getBodyBlock()->getArgument(modelPort + 1);
-  OpBuilder body(&model.getBodyBlock()->front());
+  OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
   Value bits = body.create<SubfieldOp>(model.getLoc(),
                                        model.getBodyBlock()->getArgument(modelPort),
                                        "bits");
