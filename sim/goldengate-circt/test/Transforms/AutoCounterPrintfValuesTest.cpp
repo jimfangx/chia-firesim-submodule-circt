@@ -2,6 +2,7 @@
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/TargetUtils.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "mlir/IR/Builders.h"
@@ -57,6 +58,8 @@ struct Interpreter {
     else if (isa<AddPrimOp>(op))
       result = eval(op->getOperand(0)).zextOrTrunc(width(value)) +
                eval(op->getOperand(1)).zextOrTrunc(width(value));
+    else if (isa<AndPrimOp>(op))
+      result = eval(op->getOperand(0)) & eval(op->getOperand(1));
     else if (isa<NEQPrimOp>(op)) {
       auto a = eval(op->getOperand(0)), b = eval(op->getOperand(1));
       unsigned w = std::max(a.getBitWidth(), b.getBitWidth());
@@ -101,6 +104,56 @@ void checkStructure(ModuleOp root,
             "printf enable does not compare the selected event");
   }
 }
+void checkPrints(CircuitOp circuit, ArrayRef<goldengate::AutoCounterPrintf> prints,
+                 ArrayAttr original) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(raw.size() == original.size() + 2 * prints.size(), "annotation count mismatch");
+  for (unsigned i = 0; i < original.size(); ++i)
+    require(raw[i] == original[i], "original annotation payload changed");
+  std::set<std::pair<Operation *, std::string>> names;
+  for (auto [i, record] : llvm::enumerate(prints)) {
+    auto print = record.print;
+    auto trigger = record.trigger;
+    auto value = record.value;
+    auto condition = dyn_cast<AndPrimOp>(print.getCond().getDefiningOp());
+    require(condition && condition.getLhs() == trigger.getResult() &&
+        condition.getRhs() == value.printEnable && print.getClock() == value.source.clock &&
+        print.getSubstitutions().size() == 1 &&
+        print.getSubstitutions()[0] == value.valueToPrint &&
+        print.getFormatString() == "[AutoCounter] " + value.source.label + ": %d\n",
+        "Scala printf operands/format mismatch");
+    auto suffix = value.mode == goldengate::AutoCounterMode::Accumulate
+        ? "_print" : "_identity_print";
+    auto suggested = StringRef(value.source.target).split('>').second.str() + suffix;
+    require(print.getName().starts_with(suggested), "printf suggested name mismatch");
+    require(names.emplace(value.source.module.getOperation(), print.getName().str()).second &&
+        names.emplace(value.source.module.getOperation(), trigger.getName().str()).second,
+        "generated printf/trigger names collide");
+    auto sink = cast<DictionaryAttr>(raw[original.size() + 2*i]);
+    auto anno = cast<DictionaryAttr>(raw[original.size() + 2*i + 1]);
+    require(sink.getAs<StringAttr>("class").getValue() == goldengate::AnnotationClasses::InternalTriggerSink &&
+        sink.getAs<StringAttr>("clock").getValue() == value.source.clockTarget &&
+        anno.getAs<StringAttr>("class").getValue() == goldengate::AnnotationClasses::SynthPrintf,
+        "generated annotation class/clock mismatch");
+    std::string error;
+    require(goldengate::resolveInternalAnnotationTarget(circuit,
+        sink.getAs<StringAttr>("target").getValue(), error) == trigger.getOperation(),
+        "trigger annotation identity mismatch: " + error);
+    require(goldengate::resolveInternalAnnotationTarget(circuit,
+        anno.getAs<StringAttr>("target").getValue(), error) == print.getOperation(),
+        "printf statement annotation identity mismatch: " + error);
+    Interpreter sim(value.source.module);
+    require(sim.eval(trigger.getResult()).getBoolValue(), "trigger default is not true");
+    for (bool active : {false, true})
+      for (bool enabled : {false, true}) {
+        sim.inputs[trigger.getResult()] = llvm::APInt(1, active);
+        sim.inputs[value.printEnable] = llvm::APInt(1, enabled);
+        sim.memo.clear();
+        require(sim.eval(print.getCond()).getBoolValue() == (active && enabled),
+                "trigger/enable truth table mismatch");
+      }
+  }
+}
 void run(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
@@ -111,6 +164,12 @@ void run(MLIRContext &context) {
         %counter_counter = firrtl.wire : !firrtl.uint<1>
         %counter_reg = firrtl.wire : !firrtl.uint<1>
         %counter_next = firrtl.wire : !firrtl.uint<1>
+        %trigger = firrtl.wire : !firrtl.uint<1>
+        %counter_print = firrtl.wire : !firrtl.uint<1>
+        %counter_0_identity_print = firrtl.wire : !firrtl.uint<1>
+        firrtl.strictconnect %trigger, %reset : !firrtl.uint<1>
+        firrtl.strictconnect %counter_print, %reset : !firrtl.uint<1>
+        firrtl.strictconnect %counter_0_identity_print, %reset : !firrtl.uint<1>
         firrtl.strictconnect %counter_counter, %reset : !firrtl.uint<1>
         firrtl.strictconnect %counter_reg, %reset : !firrtl.uint<1>
         firrtl.strictconnect %counter_next, %reset : !firrtl.uint<1>
@@ -171,8 +230,15 @@ void run(MLIRContext &context) {
   changed.front() = defaultMode.getDictionary(&context);
   raw = b.getArrayAttr(changed);
   circuit->setAttr("rawAnnotations", raw);
-  require(succeeded(goldengate::synthesizeAutoCounterPrintfValues(circuit, events, values, error)), error);
-  require(raw == circuit->getAttr("rawAnnotations"), "synthesis changed retained annotations");
+  SmallVector<goldengate::AutoCounterPrintf> prints;
+  before = dump(*root);
+  require(failed(goldengate::synthesizeAutoCounterPrintf(circuit, stale, prints, error)) &&
+      prints.empty() && before == dump(*root), "invalid printf selection mutated IR/results");
+  require(succeeded(goldengate::synthesizeAutoCounterPrintf(circuit, events, prints, error)), error);
+  for (auto &print : prints) values.push_back(print.value);
+  checkPrints(circuit, prints, raw);
+  require(prints.front().trigger.getName() != "trigger" &&
+      prints.front().print.getName() != "counter_print", "printf reused existing name");
   checkStructure(*root, values);
   for (auto &value : values) {
     auto name = cast<RegResetOp>(value.state.getDefiningOp()).getName();
@@ -214,6 +280,9 @@ void run(MLIRContext &context) {
           : event.zextOrTrunc(expected[i].getBitWidth()) != expected[i];
       require(sim.eval(value.printEnable).getBoolValue() == enabled,
               "printf enable differs from Scala rule at cycle " + std::to_string(cycle));
+      require(sim.eval(prints[i].print.getCond()).getBoolValue() == enabled &&
+          sim.eval(prints[i].print.getSubstitutions()[0]) ==
+              (accumulate ? expected[i] : event), "printf emission timing mismatch");
       if (value.source.clock == clock)
         expected[i] = reset ? llvm::APInt(expected[i].getBitWidth(), 0)
             : accumulate ? expected[i] + event.zextOrTrunc(64)
@@ -223,6 +292,7 @@ void run(MLIRContext &context) {
     for (auto [i, value] : llvm::enumerate(values))
       require(sim.state.lookup(value.state) == expected[i], "register update mismatch");
   }
+  require(succeeded(verify(*root)), "invalid printf FIRRTL");
 }
 void runGolden(MLIRContext &context, StringRef path) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
@@ -242,11 +312,15 @@ void runGolden(MLIRContext &context, StringRef path) {
       circuit, {"CSRFile", "CLINT"}, events, error)), error);
   auto raw = circuit->getAttr("rawAnnotations");
   SmallVector<goldengate::AutoCounterPrintfValue> values;
-  require(succeeded(goldengate::synthesizeAutoCounterPrintfValues(circuit, events, values, error)), error);
+  SmallVector<goldengate::AutoCounterPrintf> prints;
+  require(succeeded(goldengate::synthesizeAutoCounterPrintf(circuit, events, prints, error)), error);
+  for (auto &print : prints) values.push_back(print.value);
   checkStructure(*root, values);
-  require(raw == circuit->getAttr("rawAnnotations"), "golden annotation payload changed");
   for (auto &value : values)
     require(value.mode == goldengate::AutoCounterMode::Accumulate, "golden mode mismatch");
+  checkPrints(circuit, prints, cast<ArrayAttr>(raw));
+  require(succeeded(verify(*root)), "invalid golden printf FIRRTL");
+  llvm::outs() << "Checked " << prints.size() << " golden printf operations and annotation pairs\n";
   llvm::outs() << "Checked " << values.size() << " golden candidate printf value graphs\n";
 }
 } // namespace

@@ -146,7 +146,7 @@ mlir::Operation *goldengate::resolveInternalAnnotationTarget(
   mlir::Operation *match = nullptr;
   bool ambiguous = false;
   resolved->module.getOperation()->walk([&](mlir::Operation *op) {
-    if (!mlir::isa<NodeOp, WireOp, RegOp, RegResetOp, MemOp>(op))
+    if (!mlir::isa<NodeOp, WireOp, RegOp, RegResetOp, MemOp, PrintFOp>(op))
       return;
     auto name = op->getAttrOfType<mlir::StringAttr>("name");
     if (!name || name.getValue() != moduleAndRef.second)

@@ -124,3 +124,52 @@ LogicalResult goldengate::synthesizeAutoCounterPrintfValues(
   }
   return success();
 }
+
+LogicalResult goldengate::synthesizeAutoCounterPrintf(
+    CircuitOp circuit, ArrayRef<AutoCounterEvent> selected,
+    SmallVectorImpl<AutoCounterPrintf> &prints, std::string &error) {
+  SmallVector<AutoCounterPrintfValue> values;
+  // All fallible selection/mode/SSA checks precede mutation in this helper.
+  if (failed(synthesizeAutoCounterPrintfValues(circuit, selected, values, error)))
+    return failure();
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  std::map<Operation *, circt::Namespace> namespaces;
+  for (auto value : values) {
+    auto module = value.source.module;
+    auto [entry, inserted] = namespaces.try_emplace(module.getOperation());
+    auto &names = entry->second;
+    if (inserted) {
+      for (auto name : module.getPortNamesAttr())
+        names.newName(cast<StringAttr>(name).getValue());
+      module.walk([&](Operation *op) {
+        if (auto name = op->getAttrOfType<StringAttr>("name"))
+          names.newName(name.getValue());
+      });
+    }
+    OpBuilder b(module.getContext());
+    b.setInsertionPointToEnd(module.getBodyBlock());
+    auto loc = module.getLoc();
+    auto bit = UIntType::get(b.getContext(), 1);
+    auto trigger = b.create<WireOp>(loc, bit, names.newName("trigger"));
+    auto one = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
+    b.create<StrictConnectOp>(loc, trigger.getResult(), one.getResult());
+    auto enable = b.create<AndPrimOp>(loc, trigger.getResult(), value.printEnable);
+    auto ref = StringRef(value.source.target).split('>').second;
+    auto print = b.create<PrintFOp>(loc, value.source.clock, enable.getResult(),
+        "[AutoCounter] " + value.source.label + ": %d\n",
+        ValueRange{value.valueToPrint}, names.newName(ref.str() +
+            (value.mode == AutoCounterMode::Accumulate ? "_print" : "_identity_print")));
+    auto prefix = "~" + circuit.getName().str() + "|" + module.getName().str() + ">";
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::InternalTriggerSink)),
+        b.getNamedAttr("target", b.getStringAttr(prefix + trigger.getName().str())),
+        b.getNamedAttr("clock", b.getStringAttr(value.source.clockTarget))}));
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::SynthPrintf)),
+        b.getNamedAttr("target", b.getStringAttr(prefix + print.getName().str()))}));
+    prints.push_back({value, trigger, print});
+  }
+  circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), annotations));
+  return success();
+}
