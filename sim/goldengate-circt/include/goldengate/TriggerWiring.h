@@ -7,7 +7,7 @@
 
 namespace goldengate {
 // Consume unused trigger annotations, or emit Scala-compatible local accounting
-// for one credit/debit pair and node sinks on the circuit top base clock.
+// for distinct credit/debit sources and node sinks on the circuit top base clock.
 // Unsupported hardware cases fail before mutation.
 mlir::LogicalResult wireTriggers(
     circt::firrtl::CircuitOp circuit, unsigned &consumed,

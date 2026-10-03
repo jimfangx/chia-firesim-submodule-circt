@@ -72,10 +72,6 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), retained));
     return success();
   }
-  if (credits != 1 || debits != 1) {
-    error = "trigger hardware currently supports one credit and one debit source";
-    return failure();
-  }
   FModuleOp top;
   for (auto module : circuit.getOps<FModuleOp>())
     if (module.getName() == circuit.getName()) top = module;
@@ -98,6 +94,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     return failure();
   }
   SmallVector<Source> events;
+  llvm::DenseSet<Value> creditTargets, debitTargets;
   SmallVector<NodeOp> nodes;
   llvm::DenseSet<Operation *> seen;
   for (auto a : sources) {
@@ -109,6 +106,11 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!boolean(event) || eventClock != clock) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
     }
+    bool credit = a.getMember<BoolAttr>("sourceType").getValue();
+    if (!(credit ? creditTargets : debitTargets).insert(event).second) {
+      error = "trigger hardware currently needs distinct source targets per sourceType";
+      return failure();
+    }
     Value reset;
     if (auto resetTarget = a.getMember<StringAttr>("reset")) {
       reset = resolve(circuit, top, resetTarget, error);
@@ -118,7 +120,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       error = "trigger reset must be a reference when present"; return failure();
     }
     auto name = target.getValue().split('>').second.str();
-    events.push_back({event, reset, a.getMember<BoolAttr>("sourceType").getValue(), name});
+    events.push_back({event, reset, credit, name});
   }
   DominanceInfo dominance(circuit);
   for (auto a : sinks) {
@@ -153,14 +155,31 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
                            names.newName(name)).getResult();
   };
   std::string clockName = baseTarget.getValue().split('>').second.str();
-  Value creditDiff, debitDiff;
+  SmallVector<Value> creditSignals, debitSignals;
   for (auto event : events) {
     Value signal = event.event;
     if (event.reset) {
       Value active = b.create<NotPrimOp>(loc, event.reset);
       signal = named(b.create<AndPrimOp>(loc, active, signal), event.name + "_masked");
     }
-    std::string stem = clockName + (event.credit ? "_credits" : "_debits");
+    (event.credit ? creditSignals : debitSignals).push_back(signal);
+  }
+  auto reduce = [&](ArrayRef<Value> signals, StringRef stem) -> Value {
+    // Scala DensePrefixSum uses the previous layer for every addition at an
+    // offset. A ripple sum would grow FIRRTL widths differently for N > 3.
+    SmallVector<Value> layer(signals);
+    for (size_t offset = 1; offset < layer.size(); offset *= 2) {
+      SmallVector<Value> next(layer);
+      for (size_t i = offset; i < layer.size(); ++i)
+        next[i] = named(b.create<AddPrimOp>(loc, layer[i - offset], layer[i]),
+                        stem.str() + "_sum");
+      layer.swap(next);
+    }
+    return layer.back();
+  };
+  auto local = [&](ArrayRef<Value> signals, StringRef suffix) -> Value {
+    std::string stem = clockName + suffix.str();
+    Value signal = reduce(signals, stem);
     Value count = reg(16, stem);
     Value next = named(b.create<AddPrimOp>(loc, count, signal), stem + "_next");
     Value truncated = b.create<BitsPrimOp>(loc, next, 15, 0);
@@ -170,9 +189,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     b.create<StrictConnectOp>(loc, s1, truncated);
     b.create<StrictConnectOp>(loc, s2, s1);
     // SFC infers UInt<17> subtraction, including the underflow bit at wrap.
-    Value diff = named(b.create<SubPrimOp>(loc, s1, s2), stem + "_next_diff");
-    (event.credit ? creditDiff : debitDiff) = diff;
-  }
+    return named(b.create<SubPrimOp>(loc, s1, s2), stem + "_next_diff");
+  };
+  Value creditDiff = local(creditSignals, "_credits");
+  Value debitDiff = local(debitSignals, "_debits");
   auto total = [&](Value diff, StringRef name) -> Value {
     Value count = reg(32, name);
     Value next = named(b.create<AddPrimOp>(loc, count, diff), name.str() + "_next");

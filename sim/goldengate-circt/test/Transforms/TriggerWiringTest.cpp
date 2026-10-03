@@ -8,6 +8,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+#include <functional>
 #include <stdexcept>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -58,7 +59,7 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
       dump(root.get()) == before && StringRef(error).contains(reason), "non-atomic rejection: " + error);
   };
   reject({source(true, "clock"), sink}, "both");
-  reject({source(true, "clock"), source(true, "clock"), source(false, "clock"), sink}, "one credit");
+  reject({channel, source(true, "clock"), source(true, "clock"), source(false, "clock"), sink}, "distinct source");
   reject({channel, source(true, "otherClock"), source(false, "clock"), sink}, "base clock");
   reject({channel, source(true, "clock"), source(false, "clock"),
     b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TriggerSink)),
@@ -123,12 +124,97 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
   require(succeeded(goldengate::wireTriggers(circuit, consumed, error)) && consumed == 0 &&
     completed == dump(root.get()), "non-idempotent cleanup");
 }
+void multiple(MLIRContext &context, unsigned credits, unsigned debits, StringRef output) {
+  std::string text = "module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
+    "firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>";
+  for (bool credit : {true, false})
+    for (unsigned i = 0; i < (credit ? credits : debits); ++i)
+      text += ", in %" + std::string(credit ? "credit" : "debit") + std::to_string(i) + ": !firrtl.uint<1>";
+  text += ", out %enabled: !firrtl.uint<1>) {} } }";
+  auto root = parseSourceString<ModuleOp>(text, &context);
+  require(bool(root), "multiple-source parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context); b.setInsertionPointToEnd(top.getBodyBlock());
+  auto zero = b.create<ConstantOp>(top.getLoc(), UIntType::get(&context, 1), llvm::APInt(1, 0));
+  auto node = b.create<NodeOp>(top.getLoc(), zero.getResult(), b.getStringAttr("trigger"));
+  b.create<StrictConnectOp>(top.getLoc(), top.getBodyBlock()->getArguments().back(), node.getResult());
+  auto ref = [&](StringRef name) { return b.getStringAttr(("~Top|Top>" + name).str()); };
+  SmallVector<Attribute> annotations;
+  annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("clock")}))}));
+  for (bool credit : {true, false})
+    for (unsigned i = 0; i < (credit ? credits : debits); ++i) {
+      NamedAttrList a;
+      a.set("class", b.getStringAttr(A::TriggerSource));
+      a.set("target", ref(std::string(credit ? "credit" : "debit") + std::to_string(i)));
+      a.set("clock", ref("clock")); a.set("sourceType", b.getBoolAttr(credit));
+      if (i % 2 == 0) a.set("reset", ref("reset"));
+      annotations.push_back(a.getDictionary(&context));
+    }
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TriggerSink)),
+    b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref("clock"))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  unsigned consumed; std::string error;
+  require(succeeded(goldengate::wireTriggers(circuit, consumed, error)), error);
+  require(consumed == credits + debits && succeeded(verify(*root)), "multiple-source verification");
+  std::map<std::string, Value> values;
+  unsigned regs = 0, adds = 0;
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) values[name.getValue().str()] = op->getResult(0);
+    regs += isa<RegOp>(op); adds += isa<AddPrimOp>(op);
+  });
+  unsigned prefixAdds = 0;
+  for (unsigned n : {credits, debits})
+    for (unsigned offset = 1; offset < n; offset *= 2) prefixAdds += n - offset;
+  require(regs == 9 && adds == prefixAdds + 4, "Scala prefix topology/register count");
+  // Evaluate the generated CIRCT reduction for every input/reset pattern in
+  // small cases and 4096 patterns in larger cases. All-one patterns detect
+  // accidentally truncated intermediate sums.
+  uint64_t pattern = 0;
+  std::function<uint64_t(Value)> eval = [&](Value v) -> uint64_t {
+    uint64_t result;
+    if (auto arg = dyn_cast<BlockArgument>(v)) result = (pattern >> (arg.getArgNumber() - 1)) & 1;
+    else if (auto n = v.getDefiningOp<NodeOp>()) result = eval(n.getInput());
+    else if (auto n = v.getDefiningOp<NotPrimOp>()) result = ~eval(n.getInput());
+    else if (auto n = v.getDefiningOp<AndPrimOp>()) result = eval(n.getLhs()) & eval(n.getRhs());
+    else if (auto n = v.getDefiningOp<AddPrimOp>()) result = eval(n.getLhs()) + eval(n.getRhs());
+    else throw std::runtime_error("unexpected reduction operation");
+    return result & ((uint64_t(1) << *cast<UIntType>(v.getType()).getWidth()) - 1);
+  };
+  unsigned patterns = 1u << std::min(credits + debits + 1, 12u);
+  for (unsigned p = 0; p <= patterns; ++p) {
+    pattern = p == patterns ? (uint64_t(1) << (credits + debits + 1)) - 2 : p;
+    unsigned index = 1;
+    for (bool credit : {true, false}) {
+      unsigned sum = 0, n = credit ? credits : debits, width = 1;
+      for (unsigned i = 0; i < n; ++i, ++index)
+        sum += ((pattern >> index) & 1) && (i % 2 || !(pattern & 1));
+      for (unsigned capacity = 1; capacity < n; capacity *= 2) ++width;
+      auto add = values.at(credit ? "clock_credits_next" : "clock_debits_next")
+        .getDefiningOp<NodeOp>().getInput().getDefiningOp<AddPrimOp>();
+      require(*cast<UIntType>(add.getRhs().getType()).getWidth() == width && eval(add.getRhs()) == sum,
+              "multiple-source sum/reset/width differs from Scala oracle");
+    }
+  }
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "cannot write multiple-source candidate"); root->print(out); out << '\n';
+  }
+}
 }
 int main(int argc, char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     run(context, true, true, argc > 1 ? argv[1] : "");
     run(context, false, false, "");
+    multiple(context, 3, 5, argc > 2 ? argv[2] : "");
+    multiple(context, 2, 3, "");
+    multiple(context, 4, 5, "");
+    multiple(context, 5, 7, "");
+    multiple(context, 17, 2, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
