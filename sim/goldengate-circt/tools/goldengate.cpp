@@ -37,6 +37,7 @@
 #include "goldengate/WrapTop.h"
 #include "goldengate/LabelMultiThreadedInstances.h"
 #include "goldengate/LowerTypes.h"
+#include "goldengate/CoerceAsyncToSyncReset.h"
 #include "goldengate/ChannelExcision.h"
 #include "goldengate/InferModelPorts.h"
 #include "goldengate/FAMEFinishing.h"
@@ -310,6 +311,11 @@ int main(int argc, char **argv) {
     if (mlir::failed(goldengate::lowerTypesWithRetainedTargets(
             *module, circuit, error)))
       return fail("AutoCounter LowerTypes: " + error);
+    if (compileBaseline) {
+      // SFC normalizes target resets before FAME introduces gated clocks.
+      goldengate::coerceAsyncToSyncReset(circuit);
+      llvm::outs() << "Coerced CIRCT target resets to synchronous Bool resets\n";
+    }
     unsigned removed = 0;
     if (mlir::failed(goldengate::dropDisabledAutoCounterAnnotations(
             circuit, removed, error)))

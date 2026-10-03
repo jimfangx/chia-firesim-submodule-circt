@@ -13,6 +13,7 @@
 #include "circt/Dialect/SV/SVDialect.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Firtool/Firtool.h"
+#include "circt/Support/LoweringOptions.h"
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/ScopeExit.h"
@@ -140,6 +141,15 @@ LogicalResult goldengate::emitSimulatorRTL(ModuleOp source,
   if (failed(attachInlineBlackBoxes(circuit, outputFilename, error)))
     return failure();
   circuit->removeAttr("rawAnnotations");
+
+  // SFC emits width-declared mux temporaries. Keep that boundary in CIRCT's
+  // exporter: inlining a narrow mux in an array index gives it a wider
+  // SystemVerilog expression context and produces Verilator width diagnostics.
+  // Explicit casts likewise retain the bit widths established by FIRRTL/HW.
+  LoweringOptions lowering(*lowered);
+  lowering.disallowMuxInlining = true;
+  lowering.explicitBitcast = true;
+  lowering.setAsAttribute(*lowered);
 
   firtool::FirtoolOptions options;
   options.setOutputFilename(outputFilename)

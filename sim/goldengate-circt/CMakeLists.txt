@@ -36,6 +36,7 @@ add_executable(goldengate-circt
   lib/Transforms/ExtractModel.cpp
   lib/Transforms/WrapTop.cpp
   lib/Transforms/LowerTypes.cpp
+  lib/Transforms/CoerceAsyncToSyncReset.cpp
   lib/Transforms/LabelMultiThreadedInstances.cpp
   lib/Transforms/TriggerWiring.cpp
   lib/Transforms/ChannelExcision.cpp
@@ -150,6 +151,17 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-coerce-reset-test
+    test/Transforms/CoerceAsyncToSyncResetTest.cpp
+    lib/Transforms/CoerceAsyncToSyncReset.cpp lib/Support/SimulatorRTL.cpp)
+  target_compile_features(goldengate-coerce-reset-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-coerce-reset-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-coerce-reset-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-coerce-reset-test PRIVATE
+    CIRCTFirtool CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-coerce-reset COMMAND goldengate-coerce-reset-test
+    ${CMAKE_CURRENT_BINARY_DIR}/coerce-reset.sv)
   add_executable(goldengate-fased-header-test
     test/Support/FASEDHeaderTest.cpp
     lib/Support/FASEDHeader.cpp lib/Support/MetasimInterfaceHeader.cpp

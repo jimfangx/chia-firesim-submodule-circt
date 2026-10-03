@@ -71,6 +71,27 @@ int main(int argc, char **argv) {
             before == dump(*invalid) && read(unitPath) == rtl,
             "failed backend replaced source or existing RTL");
     llvm::outs() << "Standard pipeline: BUFGCE/control and attached dont-touch retained; source archive unchanged; incomplete connection fails without replacing RTL\n";
+    auto muxIndex = parseSourceString<ModuleOp>(R"mlir(module {
+      firrtl.circuit "MuxIndex" {
+        firrtl.module @MuxIndex(in %data: !firrtl.uint<32>, in %select: !firrtl.uint<1>, in %index: !firrtl.uint<3>, out %bit: !firrtl.uint<1>) {
+          %zero = firrtl.constant 0 : !firrtl.const.uint<3>
+          %choice = firrtl.mux(%select, %index, %zero) : (!firrtl.uint<1>, !firrtl.uint<3>, !firrtl.const.uint<3>) -> !firrtl.uint<3>
+          %shift = firrtl.dshr %data, %choice : (!firrtl.uint<32>, !firrtl.uint<3>) -> !firrtl.uint<32>
+          %low = firrtl.bits %shift 0 to 0 : (!firrtl.uint<32>) -> !firrtl.uint<1>
+          firrtl.strictconnect %bit, %low : !firrtl.uint<1>
+        }
+      }
+    })mlir", &context);
+    require(bool(muxIndex), "mux index fixture parse");
+    auto muxPath = unitPath + ".mux.sv";
+    require(succeeded(goldengate::emitSimulatorRTL(*muxIndex, "", muxPath, error)), error);
+    auto muxRTL = read(muxPath);
+    auto choice = muxRTL.find("select ? index : 3'h0");
+    require(choice != std::string::npos &&
+            muxRTL.rfind("wire [2:0]", choice) != std::string::npos &&
+            muxRTL.find("data[select ?") == std::string::npos,
+            "mux index lost its declared three-bit width");
+    llvm::outs() << "Mux index keeps a three-bit temporary before wider expression context\n";
     auto blackboxes = parseSourceString<ModuleOp>(R"mlir(module {
       firrtl.circuit "Wrapped" {
         firrtl.extmodule private @Inline<DEFAULT: ui32 = 0>(out O: !firrtl.uint<1>) attributes {defname = "inline_fixture"}
