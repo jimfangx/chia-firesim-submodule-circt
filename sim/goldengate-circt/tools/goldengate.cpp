@@ -14,6 +14,7 @@
 #include "goldengate/ClockBridgeHeader.h"
 #include "goldengate/ResetPulseHeader.h"
 #include "goldengate/LoadMemHeader.h"
+#include "goldengate/PeekPokeHeader.h"
 #include "goldengate/XDCEmission.h"
 #include "goldengate/XilinxHostSpecialization.h"
 #include "goldengate/SimulatorRTL.h"
@@ -2974,6 +2975,8 @@ int main(int argc, char **argv) {
         return fail("ResetPulseBridge driver header: " + error);
       if (failed(goldengate::prepareLoadMemHeader(circuit, error)))
         return fail("LoadMem driver header: " + error);
+      if (failed(goldengate::preparePeekPokeHeader(circuit, error)))
+        return fail("PeekPoke driver header: " + error);
       llvm::SmallString<256> xdcAnnotations(outputDir);
       llvm::sys::path::append(xdcAnnotations, "post-fame-xdc-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, xdcAnnotations, error)))
