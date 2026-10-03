@@ -4,6 +4,7 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/HW/InnerSymbolTable.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
@@ -30,7 +31,32 @@ unsigned portNamed(FModuleOp module, StringRef name) {
     if (module.getPortName(i) == name) return i;
   throw std::runtime_error("expected port absent: " + name.str());
 }
-void run(MLIRContext &context, bool output, bool grouped, unsigned rejection) {
+void checkReference(CircuitOp circuit, FModuleOp top,
+                    circt::hw::InnerRefAttr reference, unsigned port,
+                    unsigned fieldID, StringRef visibility) {
+  // Port insertion/erasure invalidates cached symbol tables. Resolve the same
+  // reference using fresh tables at each boundary, including after LowerTypes.
+  SymbolTable modules(circuit);
+  circt::hw::InnerSymbolTableCollection innerTables;
+  circt::hw::InnerRefNamespace names{modules, innerTables};
+  auto target = names.lookup(reference);
+  require(target && target.isPort() && target.getOp() == top &&
+              target.getPort() == port && target.getField() == fieldID,
+          "stable InnerRef resolved to the wrong payload");
+  bool found = false;
+  for (auto property : top.getPorts()[port].sym)
+    if (property.getName() == reference.getName()) {
+      require(property.getFieldID() == fieldID &&
+                  property.getSymVisibility().getValue() == visibility,
+              "symbol field or visibility changed");
+      found = true;
+    }
+  require(found, "payload symbol lost");
+}
+void run(MLIRContext &context, bool output, bool grouped, unsigned rejection,
+         unsigned metadata = 0) {
+  bool withAnnotations = metadata != 2;
+  bool withSymbols = metadata != 0;
   std::string dir = output ? "out" : "in";
   auto fixture = "module { firrtl.circuit \"Top\" { firrtl.module @Top("
       "in %hostClock: !firrtl.clock, in %kept: !firrtl.uint<1>, " + dir +
@@ -84,10 +110,12 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection) {
   explicitZero.push_back(b.getNamedAttr("circt.fieldID", b.getI32IntegerAttr(0)));
   // Both root encodings must become the same payload field, without dropping
   // duplicate protections or custom members.
-  portAnnos[2] = b.getArrayAttr({anno, b.getDictionaryAttr(explicitZero)});
-  if (grouped) portAnnos[3] = b.getArrayAttr({flagAnno});
+  if (withAnnotations) {
+    portAnnos[2] = b.getArrayAttr({anno, b.getDictionaryAttr(explicitZero)});
+    if (grouped) portAnnos[3] = b.getArrayAttr({flagAnno});
+  }
   unsigned badPort = grouped ? 3 : 2; // Late leaf failures must also be atomic.
-  if (rejection && rejection != 5) {
+  if (rejection && rejection < 5) {
     SmallVector<NamedAttribute> members(anno.getValue());
     if (rejection == 1) members[0] = b.getNamedAttr("class", b.getStringAttr("test.Unknown"));
     if (rejection == 2) members.push_back(b.getNamedAttr("circt.fieldID", b.getI32IntegerAttr(1)));
@@ -97,13 +125,38 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection) {
   }
   top.setPortAnnotationsAttr(b.getArrayAttr(portAnnos));
   top.setPortSymbolsAttr(1, circt::hw::InnerSymAttr::get(b.getStringAttr("kept_id")));
+  auto dataRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("data_id"));
+  auto flagRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("flag_id"));
+  auto setSymbol = [&](unsigned port, StringAttr name, unsigned fieldID,
+                       StringRef visibility) {
+    auto property = circt::hw::InnerSymPropertiesAttr::get(
+        &context, name, fieldID, b.getStringAttr(visibility));
+    top.setPortSymbolsAttr(port, circt::hw::InnerSymAttr::get(&context, {property}));
+  };
+  if (withSymbols) {
+    setSymbol(2, dataRef.getName(), 0, "private");
+    if (grouped) setSymbol(3, flagRef.getName(), 0, "public");
+    checkReference(circuit, top, dataRef, 2, 0, "private");
+    if (grouped) checkReference(circuit, top, flagRef, 3, 0, "public");
+    circuit->setAttr("test.stable_refs", b.getArrayAttr(
+        grouped ? SmallVector<Attribute>{dataRef, flagRef} : SmallVector<Attribute>{dataRef}));
+  }
+  auto references = circuit->getAttr("test.stable_refs");
   if (rejection == 5)
-    top.setPortSymbolsAttr(badPort, circt::hw::InnerSymAttr::get(b.getStringAttr("data_id")));
+    setSymbol(badPort, grouped ? flagRef.getName() : dataRef.getName(), 1, "public");
   auto u1 = UIntType::get(&context, 1);
+  if (rejection == 6)
+    setSymbol(badPort, dataRef.getName(), 0, "public");
   Type payload = UIntType::get(&context, 8);
-  if (grouped) payload = BundleType::get(&context, {
-      {b.getStringAttr("data"), false, cast<FIRRTLBaseType>(payload)},
-      {b.getStringAttr("flag"), false, u1}});
+  if (grouped) {
+    SmallVector<BundleType::BundleElement> fields{
+        {b.getStringAttr("data"), false, cast<FIRRTLBaseType>(payload)},
+        {b.getStringAttr("flag"), false, u1}};
+    // The payload layout can differ from model/top port visitation order.
+    // Symbols must use named leaf IDs and be sorted by the resulting IDs.
+    if (metadata == 2) std::swap(fields[0], fields[1]);
+    payload = BundleType::get(&context, fields);
+  }
   auto type = BundleType::get(&context, {
       {b.getStringAttr("ready"), true, u1},
       {b.getStringAttr("valid"), false, u1},
@@ -119,9 +172,25 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection) {
   }
   require(succeeded(result) && succeeded(verify(*root)), "channel rewrite failed verification");
   auto annotations = AnnotationSet::forPort(top, portNamed(top, "g_channel"));
-  auto dataID = type.getFieldID(2) + (grouped ? cast<BundleType>(payload).getFieldID(0) : 0);
-  auto flagID = grouped ? type.getFieldID(2) + cast<BundleType>(payload).getFieldID(1) : 0;
-  require(annotations.size() == (grouped ? 3 : 2), "annotations lost");
+  auto payloadBundle = dyn_cast<BundleType>(payload);
+  auto dataID = type.getFieldID(2) +
+      (grouped ? payloadBundle.getFieldID(*payloadBundle.getElementIndex("data")) : 0);
+  auto flagID = grouped ? type.getFieldID(2) +
+      payloadBundle.getFieldID(*payloadBundle.getElementIndex("flag")) : 0;
+  require(annotations.size() == (withAnnotations ? (grouped ? 3 : 2) : 0), "annotations lost");
+  if (withSymbols) {
+    auto port = portNamed(top, "g_channel");
+    auto symbols = top.getPorts()[port].sym;
+    require(symbols.size() == (grouped ? 2u : 1u), "symbols lost or duplicated");
+    unsigned previousID = 0;
+    for (auto property : symbols) {
+      require(property.getFieldID() > previousID, "payload symbols not in field order");
+      previousID = property.getFieldID();
+    }
+    checkReference(circuit, top, dataRef, port, dataID, "private");
+    if (grouped) checkReference(circuit, top, flagRef, port, flagID, "public");
+    require(circuit->getAttr("test.stable_refs") == references, "InnerRefs changed");
+  }
   unsigned index = 0;
   for (auto annotation : annotations) {
     require(annotation.getFieldID() == (index < 2 ? dataID : flagID), "wrong payload field ID");
@@ -137,20 +206,32 @@ void run(MLIRContext &context, bool output, bool grouped, unsigned rejection) {
   for (auto module : circuit.getOps<FModuleOp>())
     for (unsigned p = 0; p < module.getNumPorts(); ++p) {
       auto attached = AnnotationSet::forPort(module, p);
-      if (module != top) { require(attached.empty(), "wrapper annotations leaked to model"); continue; }
+      if (module != top) {
+        require(attached.empty() && (!module.getPorts()[p].sym || module.getPorts()[p].sym.empty()),
+                "wrapper metadata leaked to model");
+        continue;
+      }
       auto name = module.getPortName(p);
       if (name == "g_channel_bits" || name == "g_channel_bits_data" || name == "g_channel_bits_flag") {
         ++payloadPorts;
-        require(attached.size() == (name.ends_with("flag") ? 1 : 2), "lowered payload annotation lost");
+        bool flag = name.ends_with("flag");
+        require(attached.size() == (withAnnotations ? (flag ? 1 : 2) : 0), "lowered payload annotation lost");
+        if (withSymbols)
+          checkReference(circuit, top, flag ? flagRef : dataRef, p, 0,
+                         flag ? "public" : "private");
+        else require(!module.getPorts()[p].sym || module.getPorts()[p].sym.empty(),
+                     "unexpected payload symbol");
         for (auto annotation : attached)
           require(annotation.getFieldID() == 0 &&
                       annotation.isClass("firrtl.transforms.DontTouchAnnotation"), "lowered leaf identity wrong");
       } else if (name == "kept") {
         require(attached.getArrayAttr() == portAnnos[1] && module.getPorts()[p].sym.getSymName() == "kept_id",
                 "unrelated metadata changed");
-      } else require(attached.empty(), "payload protection leaked onto handshake");
+      } else require(attached.empty() && (!module.getPorts()[p].sym || module.getPorts()[p].sym.empty()),
+                     "payload metadata leaked onto handshake");
     }
   require(payloadPorts == (grouped ? 2u : 1u), "flattened payload port missing");
+  require(circuit->getAttr("test.stable_refs") == references, "LowerTypes changed InnerRefs");
 }
 } // namespace
 int main() {
@@ -158,11 +239,15 @@ int main() {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     for (bool output : {false, true})
-      for (bool grouped : {false, true})
-        for (unsigned rejection = 0; rejection < 6; ++rejection)
-          run(context, output, grouped, rejection);
-    llvm::outs() << "Four scalar/grouped input/output payload transfers and LowerTypes checks passed; "
-                    "20 unsupported metadata plans rejected without mutation\n";
+      for (bool grouped : {false, true}) {
+        for (unsigned metadata = 0; metadata < 3; ++metadata)
+          run(context, output, grouped, 0, metadata);
+        for (unsigned rejection = 1; rejection < (grouped ? 7u : 6u); ++rejection)
+          run(context, output, grouped, rejection, 1);
+      }
+    llvm::outs() << "12 scalar/grouped input/output metadata transfers and LowerTypes checks passed; "
+                    "stable InnerRefs and symbol visibility retained; "
+                    "22 unsupported metadata plans rejected without mutation\n";
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

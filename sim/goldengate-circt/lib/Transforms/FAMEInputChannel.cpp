@@ -58,6 +58,7 @@ LogicalResult rewriteMultiportInputChannel(
   };
   llvm::SmallVector<Leaf> leaves;
   llvm::SmallVector<Annotation> wrapperAnnotations;
+  llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols;
   std::set<unsigned> topPorts;
   for (unsigned modelPort : binding.instancePorts) {
     auto modelName = model.getPortName(modelPort);
@@ -89,8 +90,9 @@ LogicalResult rewriteMultiportInputChannel(
       error = "FAME input bundle field has no matching top port";
       return failure();
     }
-    if (failed(goldengate::collectFAMEWrapperPayloadAnnotations(
-            top, *topPort, channel.type, field, wrapperAnnotations, error)))
+    if (failed(goldengate::collectFAMEWrapperPayloadMetadata(
+            top, *topPort, channel.type, field, wrapperAnnotations,
+            wrapperSymbols, error)))
       return failure();
     Value oldTop = top.getBodyBlock()->getArgument(*topPort);
     Value oldInstance = instance.getResult(modelPort);
@@ -138,6 +140,12 @@ LogicalResult rewriteMultiportInputChannel(
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::In);
   topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
+  if (!wrapperSymbols.empty()) {
+    llvm::sort(wrapperSymbols, [](auto a, auto b) {
+      return a.getFieldID() < b.getFieldID();
+    });
+    topInfo.sym = circt::hw::InnerSymAttr::get(context, wrapperSymbols);
+  }
   model.insertPorts({{modelInsert, modelInfo}});
   OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
   Value bits = body.create<SubfieldOp>(
@@ -248,8 +256,10 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
     return failure();
   }
   llvm::SmallVector<Annotation> wrapperAnnotations;
-  if (failed(collectFAMEWrapperPayloadAnnotations(
-          top, *topPort, channel.type, {}, wrapperAnnotations, error)))
+  llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols;
+  if (failed(collectFAMEWrapperPayloadMetadata(
+          top, *topPort, channel.type, {}, wrapperAnnotations,
+          wrapperSymbols, error)))
     return failure();
   Value oldTop = top.getBodyBlock()->getArgument(*topPort);
   Value oldInstance = instance.getResult(modelPort);
@@ -281,6 +291,12 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
   PortInfo topInfo(StringAttr::get(context, channel.portName), channel.type,
                    Direction::In);
   topInfo.annotations = AnnotationSet(wrapperAnnotations, context);
+  if (!wrapperSymbols.empty()) {
+    llvm::sort(wrapperSymbols, [](auto a, auto b) {
+      return a.getFieldID() < b.getFieldID();
+    });
+    topInfo.sym = circt::hw::InnerSymAttr::get(context, wrapperSymbols);
+  }
   // The insertion position is in the original port list, as in the host
   // control rewrite. The old scalar moves one slot right and is then erased.
   model.insertPorts({{modelPort, modelInfo}});
