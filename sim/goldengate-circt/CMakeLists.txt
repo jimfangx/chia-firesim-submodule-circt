@@ -17,6 +17,7 @@ add_executable(goldengate-circt
   lib/Support/TSIHeader.cpp
   lib/Support/BlockDevHeader.cpp
   lib/Support/TracerVHeader.cpp
+  lib/Support/CPUManagedStreamHeader.cpp
   lib/Support/SimulatorRTL.cpp
   lib/Support/TargetUtils.cpp
   lib/Analysis/ChannelAnalysis.cpp
@@ -148,6 +149,19 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-cpu-managed-stream-header-test
+    test/Support/CPUManagedStreamHeaderTest.cpp
+    lib/Support/CPUManagedStreamHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
+    lib/Support/AnnotationEmission.cpp
+    lib/Transforms/TracerVStreamQueue.cpp lib/Transforms/CPUStreamRead.cpp
+    lib/Transforms/CPUStreamCountBank.cpp lib/Transforms/EmptyCPUStreamWrite.cpp)
+  target_compile_features(goldengate-cpu-managed-stream-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-cpu-managed-stream-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-cpu-managed-stream-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-cpu-managed-stream-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-cpu-managed-stream-header COMMAND goldengate-cpu-managed-stream-header-test)
   add_executable(goldengate-tracerv-header-test
     test/Support/TracerVHeaderTest.cpp
     lib/Support/TracerVHeader.cpp lib/Support/BlockDevHeader.cpp
