@@ -8,6 +8,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/APSInt.h"
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -168,6 +169,65 @@ void run(MLIRContext &context) {
   for(auto [i,attr]:llvm::enumerate(annos))
     require(completed[routes.size()+i]==attr,"unconsumed annotation changed");
   require(succeeded(verify(*root)),"invalid FIRRTL after printf clock loopbacks");
+  // Reject incomplete contracts and global name conflicts without adding even
+  // a reset port. The completed output records remain for bridge construction.
+  auto malformed=SmallVector<Attribute>(completed.begin(),completed.end());
+  NamedAttrList fields(cast<DictionaryAttr>(malformed.back()));
+  fields.set("class",b.getStringAttr(goldengate::AnnotationClasses::BridgeTopWiringOutput));
+  malformed.back()=fields.getDictionary(&context);
+  c->setAttr("rawAnnotations",b.getArrayAttr(malformed));before=dump(*root);
+  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+      "malformed completed printf binding partially created channels");
+  malformed.assign(completed.begin(),completed.end());
+  fields=NamedAttrList(cast<DictionaryAttr>(malformed.front()));
+  fields.set("sinkClockPort",b.getStringAttr("~Top|Top>old"));
+  malformed.front()=fields.getDictionary(&context);
+  c->setAttr("rawAnnotations",b.getArrayAttr(malformed));before=dump(*root);
+  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+      "non-Clock channel binding partially added reset state");
+  malformed.assign(completed.begin(),completed.end());
+  malformed.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+      b.getNamedAttr("globalName",b.getStringAttr(
+          top.getPortName(cast<BlockArgument>(routes.front().topPort).getArgNumber()).str()+"_enable"))}));
+  c->setAttr("rawAnnotations",b.getArrayAttr(malformed));before=dump(*root);
+  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+      "printf channel collision failure mutated circuit");
+  c->setAttr("rawAnnotations",completed);
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  b.create<WireOp>(top.getLoc(),UIntType::get(&context,1),
+      b.getStringAttr("synthesizedPrintf_clock_0_globalReset"));
+  require(succeeded(goldengate::synthesizePrintChannels(c,stubs,error)),error);
+  require(top.getNumPorts()==15 && top.getPortName(14)=="synthesizedPrintf_clock_0_globalReset_0" &&
+      top.getPortDirection(14)==Direction::Out && isa<UIntType>(top.getPortType(14)),
+      "printf reset output namespace or direction changed");
+  auto zero=driver(top,top.getBodyBlock()->getArgument(14)).getDefiningOp<ConstantOp>();
+  require(zero && zero.getValue().isZero(),"printf reset placeholder is not native zero");
+  auto channelAnnos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(channelAnnos.size()==28,"printf field/reset channel count mismatch");
+  for(auto [i,attr]:llvm::enumerate(completed))
+    require(channelAnnos[i]==attr,"pending bridge inputs or unrelated annotations changed");
+  require(Annotation(channelAnnos[10]).isClass(goldengate::AnnotationClasses::GlobalResetSink),
+      "global reset sink was not emitted");
+  unsigned channelCount=0;
+  std::set<std::string> channelNames;
+  for(auto attr:channelAnnos) {
+    Annotation anno(attr);
+    if(!anno.isClass(goldengate::AnnotationClasses::ChannelConnection))continue;
+    auto info=anno.getMember<DictionaryAttr>("channelInfo");
+    auto targets=anno.getMember<ArrayAttr>("sources");
+    require(info && info.getAs<StringAttr>("class").getValue()==goldengate::AnnotationClasses::PipeChannel &&
+        info.getAs<IntegerAttr>("latency").getInt()==0 && !anno.getMember<Attribute>("sinks") &&
+        anno.getMember<StringAttr>("clock").getValue()=="~Top|Top>synthesizedPrintf_clock_0" &&
+        targets && targets.size()==1 &&
+        channelNames.insert(anno.getMember<StringAttr>("globalName").getValue().str()).second,
+        "printf source WireChannel schema, clock, or identity mismatch");
+    ++channelCount;
+  }
+  require(channelCount==17 && succeeded(verify(*root)),"printf channel/reset IR invalid");
+  before=dump(*root);
+  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+      "repeated printf channel synthesis duplicated state");
   before=dump(*root);SmallVector<goldengate::WiredPrint> empty;
   require(succeeded(goldengate::wirePrintStubsToTop(c,{},empty,error)) && empty.empty() && dump(*root)==before,
           "empty selection mutated circuit");
@@ -223,6 +283,25 @@ void runTwoClockWiring(MLIRContext &context) {
         "absolute instance context lost its distinct clock loopback");
   }
   require(succeeded(verify(*root)),"invalid two clock loopback FIRRTL");
+  // Reverse output annotations: domain order must still follow clock names.
+  c->setAttr("rawAnnotations",b.getArrayAttr({raw[1],raw[0],raw[2]}));
+  require(succeeded(goldengate::synthesizePrintChannels(c,stubs,error)),error);
+  require(top.getNumPorts()==9 &&
+      top.getPortName(7)=="synthesizedPrintf_clock0_globalReset" &&
+      top.getPortName(8)=="synthesizedPrintf_clock1_globalReset",
+      "printf domains did not sort by clock identity");
+  auto channels=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(channels.size()==9,"two domain channel count mismatch");
+  for(unsigned i=0;i<2;++i) {
+    auto reset=top.getPortName(7+i).str();
+    auto clock="~Top|Top>synthesizedPrintf_clock"+std::to_string(i);
+    Annotation resetAnno(channels[3+i*3]),resetChannel(channels[4+i*3]),printChannel(channels[5+i*3]);
+    require(resetAnno.getMember<StringAttr>("target").getValue()=="~Top|Top>"+reset &&
+        resetChannel.getMember<StringAttr>("clock").getValue()==clock &&
+        printChannel.getMember<StringAttr>("clock").getValue()==clock,
+        "shared module prints lost per-instance clock domain");
+  }
+  require(succeeded(verify(*root)),"two domain printf channel/reset IR invalid");
 }
 void runClocks(MLIRContext &context) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {

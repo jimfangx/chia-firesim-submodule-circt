@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/PrintWiring.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Support/InstanceGraph.h"
 #include "circt/Support/Namespace.h"
@@ -187,6 +188,142 @@ LogicalResult goldengate::wirePrintStubsToTop(
         "~" + circuit.getName().str() + "|" + top.getName().str() + ">" + route.name.getValue().str()});
   }
   outputs.append(result.begin(), result.end());
+  return success();
+}
+
+LogicalResult goldengate::synthesizePrintChannels(
+    CircuitOp circuit, ArrayRef<PrintStub> stubs, std::string &error) {
+  FModuleOp top;
+  {
+    circt::igraph::InstanceGraph graph(circuit);
+    auto *node = graph.lookup(StringAttr::get(circuit.getContext(), circuit.getName()));
+    if (!node || !node->noUses() ||
+        !(top = dyn_cast<FModuleOp>(node->getModule().getOperation()))) {
+      error = "printf channels need an uninstantiated internal circuit top";
+      return failure();
+    }
+  }
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) { error = "printf channels need retained annotations"; return failure(); }
+  OpBuilder b(circuit.getContext());
+  std::map<std::string, BundleType> stubTypes;
+  for (auto stub : stubs) {
+    auto type = stub.bundle ? dyn_cast<BundleType>(stub.bundle.getResult().getType()) : BundleType();
+    auto owner = stub.bundle ? stub.bundle->getParentOfType<FModuleOp>() : FModuleOp();
+    if (!type || !owner || owner->getParentOp() != circuit.getOperation() ||
+        stub.target != "~" + circuit.getName().str() + "|" + owner.getName().str() +
+            ">" + stub.bundle.getName().str() ||
+        !stubTypes.emplace(stub.target, type).second) {
+      error = "printf channels need distinct native bundle sources";
+      return failure();
+    }
+  }
+  // Map ordering matches Scala's sortBy(sinkClockPort.ref); record ordering
+  // within each domain follows the completed annotation sequence.
+  struct Domain { SmallVector<Attribute> channels; std::string resetName; };
+  std::map<std::string, Domain> domains;
+  std::set<std::string> channelNames, sources, sinks;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (anno.isClass(AnnotationClasses::ChannelConnection)) {
+      auto name = anno.getMember<StringAttr>("globalName");
+      if (!name || !channelNames.insert(name.getValue().str()).second) {
+        error = "printf channels found malformed or duplicate existing channel names";
+        return failure();
+      }
+    }
+  }
+  auto channel = [&](StringRef name, StringRef clock, StringRef source) {
+    return b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr(name)),
+        b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+            b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::PipeChannel)),
+            b.getNamedAttr("latency", b.getI64IntegerAttr(0))})),
+        b.getNamedAttr("clock", b.getStringAttr(clock)),
+        b.getNamedAttr("sources", b.getArrayAttr({b.getStringAttr(source)}))});
+  };
+  std::string topPrefix = "~" + circuit.getName().str() + "|" + top.getName().str() + ">";
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (!anno.isClass(AnnotationClasses::BridgeTopWiringOutput)) continue;
+    auto source = anno.getMember<StringAttr>("pathlessSource");
+    auto sink = anno.getMember<StringAttr>("topSink");
+    auto clock = anno.getMember<StringAttr>("sinkClockPort");
+    auto found = source ? stubTypes.find(source.getValue().str()) : stubTypes.end();
+    auto port = sink ? resolveAnnotationTarget(circuit, sink.getValue(), error) : std::nullopt;
+    auto clk = clock ? resolveAnnotationTarget(circuit, clock.getValue(), error) : std::nullopt;
+    if (found == stubTypes.end() || !port || !clk || !port->port || !clk->port ||
+        port->module.getOperation() != top.getOperation() ||
+        clk->module.getOperation() != top.getOperation() ||
+        port->fieldID.value_or(0) != 0 || clk->fieldID.value_or(0) != 0 ||
+        top.getPortDirection(*port->port) != Direction::Out ||
+        top.getPortDirection(*clk->port) != Direction::Out ||
+        top.getPortType(*port->port) != found->second ||
+        !isa<ClockType>(top.getPortType(*clk->port)) ||
+        !sinks.insert(sink.getValue().str()).second) {
+      error = "printf channels need distinct top bundle outputs and an output Clock";
+      return failure();
+    }
+    sources.insert(found->first);
+    auto portName = top.getPortName(*port->port).str();
+    auto clockName = top.getPortName(*clk->port).str();
+    auto &domain = domains[clockName];
+    if (found->second.getElements().empty()) {
+      error = "printf bundle has no fields"; return failure();
+    }
+    for (auto [i, field] : llvm::enumerate(found->second.getElements())) {
+      auto intType = dyn_cast<IntType>(field.type);
+      if (field.isFlip || !intType || intType.getWidthOrSentinel() < 0 ||
+          (i == 0 && (field.name.getValue() != "enable" ||
+                     !isa<UIntType>(field.type) || intType.getWidthOrSentinel() != 1))) {
+        error = "printf channels need passive, sized integer fields and a boolean enable";
+        return failure();
+      }
+      auto name = portName + "_" + field.name.getValue().str();
+      if (!channelNames.insert(name).second) {
+        error = "printf channel name collides with an existing channel: " + name;
+        return failure();
+      }
+      domain.channels.push_back(channel(name, topPrefix + clockName,
+          topPrefix + portName + "." + field.name.getValue().str()));
+    }
+  }
+  if (sources.size() != stubs.size()) {
+    error = "printf channels are missing completed source bindings";
+    return failure();
+  }
+  circt::Namespace names;
+  for (auto name : top.getPortNamesAttr()) names.newName(cast<StringAttr>(name).getValue());
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) names.newName(name.getValue());
+  });
+  SmallVector<std::pair<unsigned, PortInfo>> added;
+  SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  unsigned oldPorts = top.getNumPorts();
+  for (auto &[clockName, domain] : domains) {
+    domain.resetName = names.newName(clockName + "_globalReset");
+    if (!channelNames.insert(domain.resetName).second) {
+      error = "printf reset channel name collides with an existing channel";
+      return failure();
+    }
+    added.push_back({oldPorts, PortInfo(b.getStringAttr(domain.resetName),
+        UIntType::get(circuit.getContext(), 1), Direction::Out)});
+    auto target = topPrefix + domain.resetName;
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::GlobalResetSink)),
+        b.getNamedAttr("target", b.getStringAttr(target))}));
+    annotations.push_back(channel(domain.resetName, topPrefix + clockName, target));
+    annotations.append(domain.channels.begin(), domain.channels.end());
+  }
+  if (!added.empty()) top.insertPorts(added);
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  for (unsigned i = 0; i < added.size(); ++i) {
+    auto zero = b.create<ConstantOp>(top.getLoc(), UIntType::get(circuit.getContext(), 1),
+                                   llvm::APInt(1, 0));
+    b.create<StrictConnectOp>(top.getLoc(), top.getBodyBlock()->getArgument(oldPorts + i), zero);
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   return success();
 }
 

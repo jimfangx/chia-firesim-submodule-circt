@@ -47,6 +47,8 @@ struct AnnotationClasses {
       "midas.passes.BridgeTopWiringOutputAnnotation";
   static constexpr llvm::StringLiteral SynthPrintf =
       "midas.targetutils.SynthPrintfAnnotation";
+  static constexpr llvm::StringLiteral GlobalResetSink =
+      "midas.InternalGlobalResetConditionSink";
   static constexpr llvm::StringLiteral AutoCounterAccumulate =
       "midas.targetutils.PerfCounterOps$Accumulate$";
   static constexpr llvm::StringLiteral AutoCounterIdentity =

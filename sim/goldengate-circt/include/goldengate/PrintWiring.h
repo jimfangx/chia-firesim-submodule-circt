@@ -34,4 +34,11 @@ mlir::LogicalResult analyzePrintClockSources(
 mlir::LogicalResult completePrintClockWiring(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
     llvm::ArrayRef<WiredPrint> routes, std::string &error);
+// PrintSynthesis channel step: group completed exports by their native output
+// Clock, add a source WireChannel per bundle field and a zero-driven global
+// reset output per domain. Keep wiring/selection annotations for the subsequent
+// bridge constructor step. Invalid contracts fail before mutation.
+mlir::LogicalResult synthesizePrintChannels(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
+    std::string &error);
 } // namespace goldengate
