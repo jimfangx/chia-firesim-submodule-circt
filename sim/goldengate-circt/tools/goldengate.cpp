@@ -16,6 +16,7 @@
 #include "goldengate/LoadMemHeader.h"
 #include "goldengate/PeekPokeHeader.h"
 #include "goldengate/UARTHeader.h"
+#include "goldengate/TSIHeader.h"
 #include "goldengate/XDCEmission.h"
 #include "goldengate/XilinxHostSpecialization.h"
 #include "goldengate/SimulatorRTL.h"
@@ -2980,6 +2981,8 @@ int main(int argc, char **argv) {
         return fail("PeekPoke driver header: " + error);
       if (failed(goldengate::prepareUARTHeader(circuit, error)))
         return fail("UART driver header: " + error);
+      if (failed(goldengate::prepareTSIHeader(circuit, error)))
+        return fail("TSI driver header: " + error);
       llvm::SmallString<256> xdcAnnotations(outputDir);
       llvm::sys::path::append(xdcAnnotations, "post-fame-xdc-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, xdcAnnotations, error)))

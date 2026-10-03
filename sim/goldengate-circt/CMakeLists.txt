@@ -14,6 +14,7 @@ add_executable(goldengate-circt
   lib/Support/LoadMemHeader.cpp
   lib/Support/PeekPokeHeader.cpp
   lib/Support/UARTHeader.cpp
+  lib/Support/TSIHeader.cpp
   lib/Support/SimulatorRTL.cpp
   lib/Support/TargetUtils.cpp
   lib/Analysis/ChannelAnalysis.cpp
@@ -145,6 +146,20 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-tsi-header-test
+    test/Support/TSIHeaderTest.cpp
+    lib/Support/TSIHeader.cpp lib/Support/UARTHeader.cpp lib/Support/PeekPokeHeader.cpp lib/Support/LoadMemHeader.cpp
+    lib/Support/ResetPulseHeader.cpp lib/Support/ClockBridgeHeader.cpp
+    lib/Support/SimulationMasterHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
+    lib/Support/AnnotationEmission.cpp lib/Support/TargetUtils.cpp
+    lib/Transforms/TSITokenEngine.cpp lib/Transforms/TSIWordQueues.cpp lib/Transforms/TSIMMIOBank.cpp)
+  target_compile_features(goldengate-tsi-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-tsi-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-tsi-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-tsi-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-tsi-header COMMAND goldengate-tsi-header-test)
   add_executable(goldengate-uart-header-test
     test/Support/UARTHeaderTest.cpp
     lib/Support/UARTHeader.cpp lib/Support/PeekPokeHeader.cpp lib/Support/LoadMemHeader.cpp
