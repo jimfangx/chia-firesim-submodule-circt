@@ -1,0 +1,65 @@
+// See LICENSE for license details.
+#pragma once
+
+#include "goldengate/FAMEPortAnalysis.h"
+#include <string>
+
+namespace goldengate {
+// Replace the model inputs and top-level connections belonging to one data
+// channel with the corresponding typed decoupled bundle.
+mlir::LogicalResult rewriteFAMEInputChannel(const TopHierarchy &hierarchy,
+                                             const FAMETopChannelPort &channel,
+                                             std::string &error);
+
+// Introduce the clock token alongside the original target clock so the gate
+// can replace its uses before the scalar port is removed.
+mlir::LogicalResult addFAMEClockChannelToken(
+    circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
+    llvm::StringRef instanceName, llvm::StringRef topClockName,
+    llvm::StringRef modelClockName, llvm::StringRef topChannelName,
+    llvm::StringRef modelChannelName, circt::firrtl::BundleType channelType,
+    std::string &error);
+
+// Latch the next target-clock token at the end of a simulated target cycle.
+// The register is subsequently used by the abstract target clock gate.
+mlir::LogicalResult addFAMEClockEnable(circt::firrtl::FModuleOp model,
+                                       llvm::StringRef modelClockName,
+                                       mlir::Value clockTokenBits,
+                                       std::string &error);
+
+// Instantiate the SFC abstract clock gate and replace model uses of the target
+// clock with its gated host clock output. When the clock is already a channel,
+// preserve the raw token bits used by the clock-enable register.
+mlir::LogicalResult addFAMEClockGate(circt::firrtl::CircuitOp circuit,
+                                     circt::firrtl::FModuleOp model,
+                                     llvm::StringRef modelClockName,
+                                     std::string &error,
+                                     mlir::Value rawClockTokenBits = {});
+
+// Remove the original target clock from the top, model, and model instance
+// after all model uses have been replaced with the gated host clock.
+mlir::LogicalResult removeFAMETargetClockPort(
+    circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
+    llvm::StringRef instanceName, llvm::StringRef topClockName,
+    llvm::StringRef modelClockName, std::string &error);
+
+// Clock outputs used to identify channel domains are no longer simulator
+// ports after FAME. Keep their model-side connects by turning each into a wire.
+mlir::LogicalResult internalizeFAMEOutputClocks(
+    circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
+    llvm::StringRef instanceName, std::string &error);
+
+// Place host controls and the model clock sink before data sinks, followed by
+// data sources, as in the SFC FAME model interface. Keep each group's order.
+mlir::LogicalResult groupFAMEChannelPorts(
+    circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
+    llvm::StringRef instanceName, llvm::StringRef modelClockSink,
+    std::string &error);
+
+// The wrapper's channels follow the original ChannelConnectionAnnotation
+// order, with all sinks before sources.  Reorder the actual FIRRTL ports and
+// their SSA block arguments after every channel has been rewritten.
+mlir::LogicalResult orderFAMETopPorts(
+    circt::firrtl::FModuleOp top,
+    llvm::ArrayRef<llvm::StringRef> channelPortNames, std::string &error);
+} // namespace goldengate

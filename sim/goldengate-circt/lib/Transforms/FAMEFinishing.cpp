@@ -1,0 +1,213 @@
+// See LICENSE for license details.
+#include "goldengate/FAMEFinishing.h"
+#include "mlir/IR/Builders.h"
+#include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/DenseSet.h"
+#include <map>
+#include <set>
+
+using namespace circt::firrtl;
+using namespace mlir;
+
+namespace {
+struct ChannelValues {
+  Value port;
+  Value fired;
+};
+
+bool isBit(Type type) {
+  auto uint = dyn_cast<UIntType>(type);
+  return uint && uint.getWidth() == 1;
+}
+
+bool hasDecoupledFields(Value port) {
+  auto bundle = dyn_cast<BundleType>(port.getType());
+  if (!bundle)
+    return false;
+  auto ready = bundle.getElementIndex("ready");
+  auto valid = bundle.getElementIndex("valid");
+  return ready && valid && bundle.getElements()[*ready].isFlip &&
+         !bundle.getElements()[*valid].isFlip &&
+         isBit(bundle.getElements()[*ready].type) &&
+         isBit(bundle.getElements()[*valid].type);
+}
+
+bool hasClockToken(Value port) {
+  auto bundle = dyn_cast<BundleType>(port.getType());
+  if (!bundle || !hasDecoupledFields(port))
+    return false;
+  auto bits = bundle.getElementIndex("bits");
+  return bits && !bundle.getElements()[*bits].isFlip &&
+         isa<ClockType>(bundle.getElements()[*bits].type);
+}
+} // namespace
+
+LogicalResult goldengate::rewriteFAMEFinishing(
+    FModuleOp module, llvm::ArrayRef<std::string> inputChannels,
+    llvm::ArrayRef<std::string> outputChannels, llvm::StringRef clockChannel,
+    std::string &error) {
+  Value finishing;
+  module.walk([&](WireOp op) {
+    if (op.getName() == "targetCycleFinishing")
+      finishing = op.getResult();
+  });
+  if (!finishing || !isBit(finishing.getType())) {
+    error = "missing one-bit targetCycleFinishing wire";
+    return failure();
+  }
+
+  std::map<std::string, unsigned> ports;
+  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
+    ports.emplace(module.getPortName(i).str(), i);
+  auto lookupPort = [&](const std::string &name, Direction direction) -> Value {
+    auto found = ports.find(name);
+    if (found == ports.end() || module.getPortDirection(found->second) != direction)
+      return {};
+    return module.getBodyBlock()->getArgument(found->second);
+  };
+  Value clockPort = lookupPort((clockChannel + "_sink").str(), Direction::In);
+  if (!clockPort || !hasClockToken(clockPort)) {
+    error = "missing Clock-typed target clock sink " + clockChannel.str();
+    return failure();
+  }
+
+  std::map<std::string, Value> firedRegisters;
+  module.walk([&](RegResetOp op) {
+    firedRegisters.emplace(op.getName().str(), op.getResult());
+  });
+  // Scala selects a clock channel whose payload ports all have ClockType;
+  // counting it again as a data input would make its valid gate appear twice.
+  std::set<std::string> seen{clockChannel.str()};
+  SmallVector<ChannelValues> inputs, outputs;
+  auto collect = [&](llvm::ArrayRef<std::string> names, bool input,
+                     SmallVectorImpl<ChannelValues> &values) -> bool {
+    for (const auto &name : names) {
+      if (!seen.insert(name).second) {
+        error = "duplicate FAME channel " + name;
+        return false;
+      }
+      Value port = lookupPort(name + (input ? "_sink" : "_source"),
+                              input ? Direction::In : Direction::Out);
+      if (!port || !hasDecoupledFields(port)) {
+        error = "missing decoupled FAME port for " + name;
+        return false;
+      }
+      Value fired;
+      auto found = firedRegisters.find(name + "_fired_0");
+      if (found == firedRegisters.end())
+        found = firedRegisters.find(name + "_fired");
+      if (found != firedRegisters.end())
+        fired = found->second;
+      if (!fired || !isBit(fired.getType())) {
+        error = "missing one-bit fired register for " + name;
+        return false;
+      }
+      values.push_back({port, fired});
+    }
+    return true;
+  };
+  if (!collect(outputChannels, false, outputs) ||
+      !collect(inputChannels, true, inputs))
+    return failure();
+
+  // The clock token and every converted data channel must participate in
+  // cycle completion.  A missing channel would otherwise leave its ready or
+  // valid handshake outside the finishing equation while producing valid IR.
+  llvm::DenseSet<Value> coveredPorts{clockPort};
+  for (const auto &channel : inputs)
+    coveredPorts.insert(channel.port);
+  for (const auto &channel : outputs)
+    coveredPorts.insert(channel.port);
+  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i) {
+    Value port = module.getBodyBlock()->getArgument(i);
+    if (!hasDecoupledFields(port) || coveredPorts.count(port))
+      continue;
+    error = "decoupled FAME port omitted from cycle completion: " +
+            module.getPortName(i).str();
+    return failure();
+  }
+
+  Operation *finishingConnect = nullptr, *clockReadyConnect = nullptr;
+  unsigned finishingCount = 0, clockReadyCount = 0;
+  auto inspect = [&](Operation *op, Value destination) {
+    if (destination == finishing) {
+      finishingConnect = op;
+      ++finishingCount;
+    }
+    auto field = destination.getDefiningOp<SubfieldOp>();
+    if (field && field.getInput() == clockPort &&
+        field.getFieldName() == "ready") {
+      clockReadyConnect = op;
+      ++clockReadyCount;
+    }
+  };
+  module.walk([&](ConnectOp op) { inspect(op.getOperation(), op.getDest()); });
+  module.walk([&](StrictConnectOp op) {
+    inspect(op.getOperation(), op.getDest());
+  });
+  if (finishingCount > 1 || clockReadyCount > 1) {
+    error = "finishing and clock ready each have multiple connects";
+    return failure();
+  }
+  if (finishingConnect && clockReadyConnect &&
+      finishingConnect->getBlock() != clockReadyConnect->getBlock()) {
+    error = "finishing and clock ready must be in the same FIRRTL block";
+    return failure();
+  }
+  if ((!finishingConnect || !clockReadyConnect) &&
+      ((finishingConnect &&
+        finishingConnect->getBlock() != module.getBodyBlock()) ||
+       (clockReadyConnect &&
+        clockReadyConnect->getBlock() != module.getBodyBlock()))) {
+    error = "new finishing or clock ready connect needs a module-body peer";
+    return failure();
+  }
+
+  Operation *insertionPoint = finishingConnect;
+  if (clockReadyConnect &&
+      (!insertionPoint || clockReadyConnect->isBeforeInBlock(insertionPoint)))
+    insertionPoint = clockReadyConnect;
+  OpBuilder builder(module.getContext());
+  if (insertionPoint)
+    builder.setInsertionPoint(insertionPoint);
+  else
+    builder.setInsertionPointToEnd(module.getBodyBlock());
+  Location loc = insertionPoint ? insertionPoint->getLoc() : module.getLoc();
+  // Scala's And.reduce begins with the first channel condition.  Preserve
+  // that shape so an ordinary FAME model does not gain an extra AND gate.
+  Value allReady;
+  auto addCondition = [&](Value condition) {
+    allReady = allReady
+                   ? builder.create<AndPrimOp>(loc, allReady, condition)
+                         .getResult()
+                   : condition;
+  };
+  for (const auto &channel : outputs) {
+    Value ready = builder.create<SubfieldOp>(loc, channel.port, "ready");
+    Value valid = builder.create<SubfieldOp>(loc, channel.port, "valid");
+    Value firing = builder.create<AndPrimOp>(loc, ready, valid).getResult();
+    Value satisfied =
+        builder.create<OrPrimOp>(loc, channel.fired, firing).getResult();
+    addCondition(satisfied);
+  }
+  for (const auto &channel : inputs) {
+    Value valid = builder.create<SubfieldOp>(loc, channel.port, "valid");
+    addCondition(valid);
+  }
+  if (!allReady)
+    allReady = builder.create<ConstantOp>(
+        loc, UIntType::get(module.getContext(), 1, false), APInt(1, 1));
+  Value clockValid = builder.create<SubfieldOp>(loc, clockPort, "valid");
+  Value nextCycle = builder.create<AndPrimOp>(loc, allReady, clockValid);
+  if (finishingConnect)
+    finishingConnect->setOperand(1, nextCycle);
+  else
+    builder.create<StrictConnectOp>(loc, finishing, nextCycle);
+  if (clockReadyConnect)
+    clockReadyConnect->setOperand(1, allReady);
+  else {
+    Value ready = builder.create<SubfieldOp>(loc, clockPort, "ready");
+    builder.create<StrictConnectOp>(loc, ready, allReady);
+  }
+  return success();
+}
