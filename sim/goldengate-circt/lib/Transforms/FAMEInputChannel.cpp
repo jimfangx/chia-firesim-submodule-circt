@@ -1072,43 +1072,43 @@ LogicalResult goldengate::groupFAMEChannelPorts(
 }
 
 LogicalResult goldengate::orderFAMETopPorts(
-    FModuleOp top, ArrayRef<llvm::StringRef> channelPortNames,
-    std::string &error) {
+    FModuleOp top, ArrayRef<llvm::StringRef> retainedPortNames,
+    ArrayRef<llvm::StringRef> channelPortNames, std::string &error) {
   SmallVector<unsigned> order;
   std::set<unsigned> used;
   for (llvm::StringRef name : {"hostClock", "hostReset"}) {
-    std::optional<unsigned> found;
-    for (unsigned i = 0; i < top.getNumPorts(); ++i)
-      if (top.getPortName(i) == name) {
-        found = i;
-        break;
-      }
-    if (!found) {
-      error = "FAME top is missing host port " + name.str();
+    if (!llvm::is_contained(retainedPortNames, name)) {
+      error = "FAME retained top ports are missing host port " + name.str();
       return failure();
     }
-    order.push_back(*found);
-    used.insert(*found);
   }
-  for (llvm::StringRef name : channelPortNames) {
-    bool found = false;
-    for (unsigned i = 0; i < top.getNumPorts(); ++i)
-      if (top.getPortName(i) == name) {
-        if (!used.insert(i).second) {
-          error = "FAME top channel is duplicated: " + name.str();
-          return failure();
+  auto appendPorts = [&](ArrayRef<llvm::StringRef> names,
+                         StringRef kind) -> LogicalResult {
+    for (llvm::StringRef name : names) {
+      bool found = false;
+      for (unsigned i = 0; i < top.getNumPorts(); ++i)
+        if (!name.empty() && top.getPortName(i) == name) {
+          if (!used.insert(i).second) {
+            error = "FAME top " + kind.str() + " port is duplicated: " +
+                    name.str();
+            return failure();
+          }
+          order.push_back(i);
+          found = true;
+          break;
         }
-        order.push_back(i);
-        found = true;
-        break;
+      if (!found) {
+        error = "FAME top " + kind.str() + " port is missing: " + name.str();
+        return failure();
       }
-    if (!found) {
-      error = "FAME top channel is missing: " + name.str();
-      return failure();
     }
-  }
+    return success();
+  };
+  if (failed(appendPorts(retainedPortNames, "retained")) ||
+      failed(appendPorts(channelPortNames, "channel")))
+    return failure();
   if (order.size() != top.getNumPorts()) {
-    error = "FAME top has ports outside the channel plan";
+    error = "FAME top has ports outside the retained/channel plan";
     return failure();
   }
   if (llvm::all_of(llvm::enumerate(order),

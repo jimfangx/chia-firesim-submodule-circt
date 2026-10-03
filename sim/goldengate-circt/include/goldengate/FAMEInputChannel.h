@@ -82,10 +82,12 @@ mlir::LogicalResult groupFAMEChannelPorts(
     llvm::StringRef instanceName, llvm::StringRef modelClockSink,
     std::string &error);
 
-// The wrapper's channels follow the original ChannelConnectionAnnotation
-// order, with all sinks before sources.  Reorder the actual FIRRTL ports and
-// their SSA block arguments after every channel has been rewritten.
+// Retain non-stale wrapper ports in their original pre-FAME order, then append
+// channels in ChannelConnectionAnnotation order, with sinks before sources.
+// Both lists form the complete final interface; reject missing/duplicate ports
+// before mutation. Reorder metadata and SSA block arguments together.
 mlir::LogicalResult orderFAMETopPorts(
     circt::firrtl::FModuleOp top,
+    llvm::ArrayRef<llvm::StringRef> retainedPortNames,
     llvm::ArrayRef<llvm::StringRef> channelPortNames, std::string &error);
 } // namespace goldengate

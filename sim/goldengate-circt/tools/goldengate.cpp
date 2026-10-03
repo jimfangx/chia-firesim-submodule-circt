@@ -3961,6 +3961,13 @@ int main(int argc, char **argv) {
     return 0;
   }
   if (rewriteInputChannel || rewriteInputsWithOutput) {
+    // transformTop keeps non-stale ports before newly decoupled channels.
+    // Capture their original order before the channel/host-port rewrites and
+    // grouping mutate port indices and interleave inputs with outputs.
+    llvm::SmallVector<std::string> retainedTopPortNames;
+    for (unsigned i = 0; i < hierarchy->top.getNumPorts(); ++i)
+      if (!llvm::is_contained(famePlan->staleTopPorts, i))
+        retainedTopPortNames.push_back(hierarchy->top.getPortName(i).str());
     llvm::SmallVector<llvm::StringRef> requestedNames;
     if (rewriteInputsWithOutput || llvm::StringRef(argv[7]) == "all") {
       // Preserve FAME's channel order when creating ports and fired state,
@@ -4493,13 +4500,16 @@ int main(int argc, char **argv) {
             clockModelPortName + "_sink", rewriteError)))
       return fail("FAME channel port grouping: " + rewriteError);
     if (llvm::StringRef(argv[7]) == "all" && rewriteInputsWithOutput) {
+      llvm::SmallVector<llvm::StringRef> retainedTopPorts;
+      for (const auto &name : retainedTopPortNames)
+        retainedTopPorts.push_back(name);
       llvm::SmallVector<llvm::StringRef> orderedTopPorts;
       for (const auto &port : famePlan->sinks)
         orderedTopPorts.push_back(port.portName);
       for (const auto &port : famePlan->sources)
         orderedTopPorts.push_back(port.portName);
       if (mlir::failed(goldengate::orderFAMETopPorts(
-              hierarchy->top, orderedTopPorts, rewriteError)))
+              hierarchy->top, retainedTopPorts, orderedTopPorts, rewriteError)))
         return fail("FAME top port ordering: " + rewriteError);
     }
     if (mlir::failed(mlir::verify(*module)))
