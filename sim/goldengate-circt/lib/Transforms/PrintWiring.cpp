@@ -171,7 +171,8 @@ LogicalResult goldengate::wirePrintStubsToTop(
   for (auto &route : modules.at(top.getOperation()).routes) {
     auto bundle = stubs[route.stubIndex].bundle;
     std::string absolute = "~" + circuit.getName().str() + "|" + top.getName().str();
-    SmallVector<Operation *> path;
+    // Returned paths contain live rebuilt instances, unlike the planning keys.
+    SmallVector<InstanceOp> path;
     for (auto *old : route.path) {
       auto instance = replacements.lookup(old);
       path.push_back(instance);
