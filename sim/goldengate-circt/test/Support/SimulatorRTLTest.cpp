@@ -147,6 +147,27 @@ int main(int argc, char **argv) {
             muxRTL.find("data[select ?") == std::string::npos,
             "mux index lost its declared three-bit width");
     llvm::outs() << "Mux index keeps a three-bit temporary before wider expression context\n";
+    auto orIndex = parseSourceString<ModuleOp>(R"mlir(module {
+      firrtl.circuit "OrIndex" {
+        firrtl.module @OrIndex(in %data: !firrtl.vector<uint<1>, 32>, in %a: !firrtl.uint<3>, in %b: !firrtl.uint<3>, out %bit: !firrtl.uint<1>) {
+          %index = firrtl.or %a, %b : (!firrtl.uint<3>, !firrtl.uint<3>) -> !firrtl.uint<3>
+          %low = firrtl.subaccess %data[%index] : !firrtl.vector<uint<1>, 32>, !firrtl.uint<3>
+          firrtl.strictconnect %bit, %low : !firrtl.uint<1>
+        }
+      }
+    })mlir", &context);
+    require(bool(orIndex), "OR index fixture parse");
+    before = dump(*orIndex);
+    auto orPath = unitPath + ".or.sv";
+    require(succeeded(goldengate::emitSimulatorRTL(*orIndex, "", orPath, error)), error);
+    auto orRTL = read(orPath);
+    auto expression = orRTL.find("{2'h0, a | b}");
+    require(expression != std::string::npos &&
+            orRTL.rfind("wire [4:0]", expression) != std::string::npos &&
+            orRTL.find("_GEN[a | b]") == std::string::npos &&
+            before == dump(*orIndex),
+            "OR index lost its three-bit arithmetic/explicit zero extension or changed source IR");
+    llvm::outs() << "OR index preserves three-bit arithmetic inside explicit zero extension to a five-bit index wire\n";
     auto blackboxes = parseSourceString<ModuleOp>(R"mlir(module {
       firrtl.circuit "Wrapped" {
         firrtl.extmodule private @Inline<DEFAULT: ui32 = 0>(out O: !firrtl.uint<1>) attributes {defname = "inline_fixture"}

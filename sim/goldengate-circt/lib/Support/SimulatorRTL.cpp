@@ -187,6 +187,11 @@ LogicalResult goldengate::emitSimulatorRTL(ModuleOp source,
   LoweringOptions lowering(*lowered);
   lowering.disallowMuxInlining = true;
   lowering.explicitBitcast = true;
+  // Keep the complete index expression width-declared as well. A spilled mux
+  // alone does not protect a narrow OR tree from a wider SV bit-select context.
+  // Use CIRCT's standard index spilling, including its Vivado keep attribute,
+  // so the U250 synthesis flow retains this boundary too.
+  lowering.mitigateVivadoArrayIndexConstPropBug = true;
   lowering.setAsAttribute(*lowered);
 
   firtool::FirtoolOptions options;
