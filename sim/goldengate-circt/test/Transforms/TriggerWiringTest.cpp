@@ -211,7 +211,8 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
   // baseAlias global/sampling registers and a sinkAlias synchronizer. SFC also
   // rejects a sink clock alias declared after the sink node (mode 6).
   std::string body, children;
-  if (hierarchy) {
+  std::string leftClock = "left#1", rightClock = "right#1";
+  if (hierarchy && hierarchy < 9) {
     body = R"mlir(
       %left:2 = firrtl.instance left @Forward(in clock_in: !firrtl.clock, out clock_out: !firrtl.clock)
       %right:2 = firrtl.instance right @Forward(in clock_in: !firrtl.clock, out clock_out: !firrtl.clock)
@@ -243,6 +244,56 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
     if (hierarchy == 8)
       children = "firrtl.extmodule @Forward(in clock_in: !firrtl.clock, out clock_out: !firrtl.clock)\n";
   }
+  if (hierarchy >= 9) {
+    // The immutable Rocket handoff uses trace.traces[0].clock. Aggregate
+    // connects and repeated projections must retain each leaf's identity.
+    const std::string traceType = "!firrtl.bundle<traces: vector<bundle<clock: clock>, 2>>";
+    body = "%left:3 = firrtl.instance left @Forward(in clock_in: !firrtl.clock, in other: !firrtl.clock, out trace: " + traceType + ")\n";
+    body += "%right:3 = firrtl.instance right @Forward(in clock_in: !firrtl.clock, in other: !firrtl.clock, out trace: " + traceType + ")\n";
+    for (auto name : {"left", "right"}) {
+      body += "firrtl.strictconnect %" + std::string(name) + "#0, %clock : !firrtl.clock\n";
+      body += "firrtl.strictconnect %" + std::string(name) + "#1, %otherClock : !firrtl.clock\n";
+    }
+    // Parent and child whole-bundle forwarding exercise recursive indexing.
+    body += "%forwarded = firrtl.wire : " + traceType + "\n";
+    if (hierarchy == 14) body += "firrtl.when %reset : !firrtl.uint<1> {\n";
+    body += "firrtl.strictconnect %forwarded, %left#2 : " + traceType + "\n";
+    if (hierarchy == 14) body += "}\n";
+    auto project = [&](std::string name, std::string value, unsigned index) {
+      body += "%" + name + "_traces = firrtl.subfield %" + value + "[traces] : " + traceType + "\n";
+      body += "%" + name + "_entry = firrtl.subindex %" + name + "_traces[" + std::to_string(index) + "] : !firrtl.vector<bundle<clock: clock>, 2>\n";
+      body += "%" + name + " = firrtl.subfield %" + name + "_entry[clock] : !firrtl.bundle<clock: clock>\n";
+    };
+    body += "%forwardedNode = firrtl.node %forwarded : " + traceType + "\n";
+    project("leftClock", "forwardedNode", 0);
+    project("rightClock", "right#2", hierarchy == 11 ? 1 : 0);
+    leftClock = "leftClock"; rightClock = "rightClock";
+    children = "firrtl.module @Forward(in %clock_in: !firrtl.clock, in %other: !firrtl.clock, out %trace: " + traceType + ") {\n";
+    children += "%wire = firrtl.wire : " + traceType + "\nfirrtl.strictconnect %trace, %wire : " + traceType + "\n";
+    children += "%traces = firrtl.subfield %wire[traces] : " + traceType + "\n";
+    children += "%entry0 = firrtl.subindex %traces[0] : !firrtl.vector<bundle<clock: clock>, 2>\n";
+    children += "%entry1 = firrtl.subindex %traces[1] : !firrtl.vector<bundle<clock: clock>, 2>\n";
+    children += "%field0 = firrtl.subfield %entry0[clock] : !firrtl.bundle<clock: clock>\n";
+    children += "%field1 = firrtl.subfield %entry1[clock] : !firrtl.bundle<clock: clock>\n";
+    if (hierarchy != 12) children += "firrtl.strictconnect %field0, %clock_in : !firrtl.clock\n";
+    children += "firrtl.strictconnect %field1, %other : !firrtl.clock\n";
+    // Same leaf, different SSA projection: duplicate driver is still ambiguous.
+    if (hierarchy == 13) children += "%duplicate = firrtl.subfield %entry0[clock] : !firrtl.bundle<clock: clock>\nfirrtl.strictconnect %duplicate, %clock_in : !firrtl.clock\n";
+    children += "}\n";
+    if (hierarchy == 10) {
+      // The flipped input leaf of an output bundle is an input to the child.
+      const std::string flipped = "!firrtl.bundle<in flip: clock, out: clock>";
+      body = "%left = firrtl.instance left @Forward(out io: " + flipped + ")\n%right = firrtl.instance right @Forward(out io: " + flipped + ")\n";
+      for (auto name : {"left", "right"}) {
+        body += "%" + std::string(name) + "Wire = firrtl.wire : " + flipped + "\n";
+        body += "firrtl.connect %" + std::string(name) + "Wire, %" + name + " : " + flipped + ", " + flipped + "\n";
+        body += "%" + std::string(name) + "Input = firrtl.subfield %" + name + "Wire[in] : " + flipped + "\n";
+        body += "firrtl.strictconnect %" + std::string(name) + "Input, %clock : !firrtl.clock\n";
+        body += "%" + std::string(name) + "Clock = firrtl.subfield %" + name + "Wire[out] : " + flipped + "\n";
+      }
+      children = "firrtl.module @Forward(out %io: " + flipped + ") {\n%input = firrtl.subfield %io[in] : " + flipped + "\n%output = firrtl.subfield %io[out] : " + flipped + "\nfirrtl.strictconnect %output, %input : !firrtl.clock\n}\n";
+    }
+  }
   body += R"mlir(
     %baseAlias = firrtl.wire : !firrtl.clock
     %creditAlias = firrtl.node %baseAlias : !firrtl.clock
@@ -255,11 +306,11 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
     firrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>
   )mlir";
   if (mode == 6) body += "%sinkAlias = firrtl.node %debitAlias : !firrtl.clock\n";
-  body += "firrtl.strictconnect %baseAlias, %" + std::string(hierarchy ? "left#1" : "clock") + " : !firrtl.clock\n";
+  body += "firrtl.strictconnect %baseAlias, %" + std::string(hierarchy ? leftClock : "clock") + " : !firrtl.clock\n";
   if (mode == 2) body += "firrtl.strictconnect %debitAlias, %otherClock : !firrtl.clock\n";
   if (mode != 5) {
     if (mode == 7) body += "firrtl.when %reset : !firrtl.uint<1> {\n";
-    body += "firrtl.connect %debitAlias, %" + std::string(hierarchy ? "right#1" : mode == 3 ? "sinkAlias" : mode == 4 ? "otherClock" : "creditAlias") + " : !firrtl.clock, !firrtl.clock\n";
+    body += "firrtl.connect %debitAlias, %" + std::string(hierarchy ? rightClock : mode == 3 ? "sinkAlias" : mode == 4 ? "otherClock" : "creditAlias") + " : !firrtl.clock, !firrtl.clock\n";
     if (mode == 7) body += "}\n";
   }
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
@@ -291,7 +342,7 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
   auto before = dump(root.get());
   unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode || hierarchy > 2) {
+  if (mode || (hierarchy > 2 && hierarchy != 9 && hierarchy != 10)) {
     require(failed(result) && consumed == 0 && dump(root.get()) == before,
             "clock alias rejection must be atomic: " + std::to_string(mode) + ":" + std::to_string(hierarchy));
     require(StringRef(error).contains(mode == 6 ? "dominate" : "base clock"),
@@ -336,6 +387,9 @@ int main(int argc, char **argv) {
     aliases(context, 0, argc > 4 ? argv[4] : "", 1);
     aliases(context, 0, argc > 5 ? argv[5] : "", 2);
     for (unsigned hierarchy : {3, 4, 5, 6, 7, 8}) aliases(context, 0, "", hierarchy);
+    aliases(context, 0, argc > 6 ? argv[6] : "", 9);
+    aliases(context, 0, argc > 7 ? argv[7] : "", 10);
+    for (unsigned hierarchy : {11, 12, 13, 14}) aliases(context, 0, "", hierarchy);
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

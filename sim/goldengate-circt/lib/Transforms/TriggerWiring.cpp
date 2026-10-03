@@ -3,6 +3,7 @@
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
@@ -48,6 +49,7 @@ struct Source { Value event, reset; bool credit; std::string name; };
 // Prove electrical aliases using transparent FIRRTL operations only. A cone
 // with one input clock is insufficient: a mux or gate may change its edges.
 class LocalClockAliases {
+  using Field = circt::FieldRef;
 public:
   LocalClockAliases(CircuitOp circuit, FModuleOp top) : top(top) {
     for (auto module : circuit.getOps<FModuleOp>()) {
@@ -59,61 +61,124 @@ public:
         } else if (auto connect = dyn_cast<StrictConnectOp>(op)) {
           dest = connect.getDest(); src = connect.getSrc();
         }
-        if (dest && isa<ClockType>(dest.getType()))
-          drivers[dest].push_back({src, op->getBlock() == module.getBodyBlock()});
+        if (dest)
+          indexConnect(getFieldRefFromValue(dest), getFieldRefFromValue(src),
+                       dest.getType(), src.getType(),
+                       op->getBlock() == module.getBodyBlock());
       });
     }
   }
   Value root(Value value) {
-    llvm::DenseSet<Value> active;
-    return trace(top, value, active);
+    if (!value) return {};
+    llvm::DenseSet<Field> active;
+    auto field = trace(top, getFieldRefFromValue(value), active);
+    // Accounting register names and operands currently require a scalar top
+    // input port. Child input and output ports may contain aggregate clocks.
+    return field && field.getFieldID() == 0 ? field.getValue() : Value();
   }
 private:
-  Value trace(FModuleOp module, Value value, llvm::DenseSet<Value> &active) {
-    if (!value || !isa<ClockType>(value.getType()) ||
-        !active.insert(value).second) return {};
-    auto followDriver = [&]() -> Value {
-      auto &assigned = drivers[value];
+  // Index clock leaves without creating Subfield/Subindex operations. Two
+  // projections of the same field have different SSA values but one driver.
+  // Whole aggregate connects contribute drivers to each selected clock leaf;
+  // flipped fields reverse the connection direction.
+  void indexConnect(Field dest, Field src, Type destType, Type srcType,
+                    bool unconditional, bool flipped = false) {
+    if (isa<ClockType>(destType) && isa<ClockType>(srcType)) {
+      drivers[flipped ? src : dest].push_back(
+          {flipped ? dest : src, unconditional});
+    } else if (auto bundle = dyn_cast<BundleType>(destType)) {
+      auto source = dyn_cast<BundleType>(srcType);
+      if (!source) return;
+      for (unsigned i = 0; i < bundle.getNumElements(); ++i) {
+        auto element = bundle.getElement(i);
+        auto j = source.getElementIndex(element.name);
+        if (!j) continue;
+        indexConnect(dest.getSubField(bundle.getFieldID(i)),
+                     src.getSubField(source.getFieldID(*j)), element.type,
+                     source.getElementType(*j), unconditional,
+                     flipped ^ element.isFlip);
+      }
+    } else if (auto vector = dyn_cast<FVectorType>(destType)) {
+      auto source = dyn_cast<FVectorType>(srcType);
+      if (!source || source.getNumElements() != vector.getNumElements()) return;
+      for (unsigned i = 0; i < vector.getNumElements(); ++i)
+        indexConnect(dest.getSubField(vector.getFieldID(i)),
+                     src.getSubField(source.getFieldID(i)), vector.getElementType(),
+                     source.getElementType(), unconditional, flipped);
+    }
+  }
+  // Return the selected leaf type and its accumulated bundle orientation.
+  std::pair<Type, bool> leaf(Field field) {
+    Type type = field.getValue().getType();
+    unsigned id = field.getFieldID();
+    bool flipped = false;
+    while (id) {
+      if (auto bundle = dyn_cast<BundleType>(type)) {
+        if (id > bundle.getMaxFieldID()) return {};
+        auto [index, childID] = bundle.getIndexAndSubfieldID(id);
+        auto element = bundle.getElement(index);
+        flipped ^= element.isFlip;
+        type = element.type; id = childID;
+      } else if (auto vector = dyn_cast<FVectorType>(type)) {
+        if (id > vector.getMaxFieldID()) return {};
+        auto childID = vector.getIndexAndSubfieldID(id).second;
+        type = vector.getElementType(); id = childID;
+      } else return {};
+    }
+    return {type, flipped};
+  }
+  Field trace(FModuleOp module, Field field, llvm::DenseSet<Field> &active) {
+    if (!field) return {};
+    auto [type, flipped] = leaf(field);
+    if (!isa_and_nonnull<ClockType>(type) || !active.insert(field).second) return {};
+    Value value = field.getValue();
+    auto followDriver = [&]() -> Field {
+      auto &assigned = drivers[field];
       if (assigned.size() != 1 || !assigned.front().second) return {};
       return trace(module, assigned.front().first, active);
     };
-    Value result;
+    Field result;
     if (auto arg = dyn_cast<BlockArgument>(value)) {
       if (arg.getOwner() == module.getBodyBlock()) {
-        if (module.getPortDirection(arg.getArgNumber()) == Direction::In) {
-          if (drivers[value].empty()) result = value;
+        if ((module.getPortDirection(arg.getArgNumber()) == Direction::In) ^ flipped) {
+          if (drivers[field].empty()) result = field;
         } else result = followDriver();
       }
     } else if (auto *op = value.getDefiningOp();
                op && op->getBlock() == module.getBodyBlock()) {
       if (auto node = dyn_cast<NodeOp>(op)) {
-        if (drivers[value].empty()) result = trace(module, node.getInput(), active);
+        if (drivers[field].empty())
+          result = trace(module,
+              getFieldRefFromValue(node.getInput()).getSubField(field.getFieldID()), active);
       } else if (isa<WireOp>(op)) {
         result = followDriver();
       } else if (auto instance = dyn_cast<InstanceOp>(op)) {
         auto child = modules.find(instance.getModuleName());
         auto port = cast<OpResult>(value).getResultNumber();
         if (child != modules.end() && port < child->second.getNumPorts()) {
-          if (child->second.getPortDirection(port) == Direction::In) {
+          if ((child->second.getPortDirection(port) == Direction::In) ^ flipped) {
             result = followDriver();
-          } else if (drivers[value].empty()) {
+          } else if (drivers[field].empty()) {
             // Resolve a child output to that child's input, then return through
             // this specific instance. Shared module definitions must not merge
             // clocks connected to different parent inputs.
-            auto childRoot = dyn_cast_or_null<BlockArgument>(trace(
-                child->second, child->second.getBodyBlock()->getArgument(port), active));
-            if (childRoot && childRoot.getArgNumber() < instance.getNumResults())
-              result = trace(module, instance.getResult(childRoot.getArgNumber()), active);
+            auto childRoot = trace(child->second,
+                Field(child->second.getBodyBlock()->getArgument(port), field.getFieldID()), active);
+            auto argument = childRoot ? dyn_cast<BlockArgument>(childRoot.getValue())
+                                      : BlockArgument();
+            if (argument && argument.getArgNumber() < instance.getNumResults())
+              result = trace(module, Field(instance.getResult(argument.getArgNumber()),
+                                           childRoot.getFieldID()), active);
           }
         }
       }
     }
-    active.erase(value);
+    active.erase(field);
     return result;
   }
   FModuleOp top;
   llvm::StringMap<FModuleOp> modules;
-  llvm::DenseMap<Value, SmallVector<std::pair<Value, bool>>> drivers;
+  llvm::DenseMap<Field, SmallVector<std::pair<Field, bool>>> drivers;
 };
 } // namespace
 
