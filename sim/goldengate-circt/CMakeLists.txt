@@ -18,6 +18,7 @@ add_executable(goldengate-circt
   lib/Support/BlockDevHeader.cpp
   lib/Support/TracerVHeader.cpp
   lib/Support/CPUManagedStreamHeader.cpp
+  lib/Support/FASEDHeader.cpp
   lib/Support/SimulatorRTL.cpp
   lib/Support/TargetUtils.cpp
   lib/Analysis/ChannelAnalysis.cpp
@@ -149,6 +150,18 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-fased-header-test
+    test/Support/FASEDHeaderTest.cpp
+    lib/Support/FASEDHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
+    lib/Support/AnnotationEmission.cpp
+    lib/Transforms/FASEDMMIOBank.cpp lib/Transforms/ClockBridgeControl.cpp)
+  target_compile_features(goldengate-fased-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fased-header COMMAND goldengate-fased-header-test)
   add_executable(goldengate-cpu-managed-stream-header-test
     test/Support/CPUManagedStreamHeaderTest.cpp
     lib/Support/CPUManagedStreamHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
