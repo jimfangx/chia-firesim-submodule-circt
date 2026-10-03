@@ -742,8 +742,10 @@ LogicalResult goldengate::removeFAMETargetClockPort(
       !isa<ClockType>(top.getPorts()[*topClock].type) ||
       !isa<ClockType>(model.getPorts()[*modelClock].type) ||
       hasPortAnnotations(top, *topClock) ||
-      hasPortAnnotations(model, *modelClock)) {
-    error = "target clock scalar ports are missing, incompatible, or annotated";
+      hasPortAnnotations(model, *modelClock) ||
+      top.getPorts()[*topClock].sym || model.getPorts()[*modelClock].sym) {
+    error = "target clock scalar ports are missing, incompatible, annotated, "
+            "or symbolized";
     return failure();
   }
   Value topClockValue = top.getBodyBlock()->getArgument(*topClock);
@@ -768,6 +770,10 @@ LogicalResult goldengate::removeFAMETargetClockPort(
     error = "target clock model instance has incompatible ports";
     return failure();
   }
+  if (!cast<ArrayAttr>(instance.getPortAnnotationsAttr()[*modelClock]).empty()) {
+    error = "target clock instance port has annotations without a deletion policy";
+    return failure();
+  }
   Value instanceClock = instance.getResult(*modelClock);
   StrictConnectOp connection;
   for (OpOperand &use : instanceClock.getUses()) {
@@ -789,6 +795,11 @@ LogicalResult goldengate::removeFAMETargetClockPort(
   eraseInstance.set(*modelClock);
   OpBuilder builder(instance);
   InstanceOp replacement = instance.erasePorts(builder, eraseInstance);
+  for (auto attr : instance->getAttrs())
+    if (attr.getName() != "portNames" &&
+        attr.getName() != "portDirections" &&
+        attr.getName() != "portAnnotations")
+      replacement->setAttr(attr.getName(), attr.getValue());
   for (unsigned i = 0; i < instance.getNumResults(); ++i) {
     if (i == *modelClock)
       continue;
@@ -835,6 +846,7 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
     unsigned modelPort;
     unsigned topPort;
     StrictConnectOp connection;
+    circt::hw::InnerSymAttr symbol;
   };
   SmallVector<ClockOutput> clocks;
   std::set<unsigned> topPorts;
@@ -852,11 +864,26 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
         top.getPorts()[*topPort].type != model.getPorts()[modelPort].type ||
         instance.getPortNameStr(modelPort) != name ||
         hasPortAnnotations(top, *topPort) ||
-        hasPortAnnotations(model, modelPort)) {
-      error = "FAME output clock has no matching unannotated top port: " +
+        hasPortAnnotations(model, modelPort) || top.getPorts()[*topPort].sym ||
+        !cast<ArrayAttr>(instance.getPortAnnotationsAttr()[modelPort]).empty()) {
+      error = "FAME output clock metadata has no transfer policy: " +
               name.str();
       return failure();
     }
+    auto symbol = model.getPorts()[modelPort].sym;
+    if (symbol)
+      for (auto property : symbol)
+        if (property.getFieldID() != 0) {
+          error = "FAME ground clock output symbol has a nonzero field ID";
+          return failure();
+        }
+    for (auto &op : *model.getBodyBlock())
+      if (auto localName = op.getAttrOfType<StringAttr>("name"))
+        if (localName.getValue() == name) {
+          error = "FAME output clock wire name collides with a declaration: " +
+                  name.str();
+          return failure();
+        }
     Value topClock = top.getBodyBlock()->getArgument(*topPort);
     Value instanceClock = instance.getResult(modelPort);
     StrictConnectOp connection;
@@ -874,15 +901,42 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
               name.str();
       return failure();
     }
-    clocks.push_back({modelPort, *topPort, connection});
+    clocks.push_back({modelPort, *topPort, connection, symbol});
   }
   if (clocks.empty())
     return success();
 
+  // The model interface can only be changed here when this is its only use.
+  // Refresh the instance graph after the rewrite, like port/symbol analyses.
+  if (top->getParentOp() != model->getParentOp()) {
+    error = "FAME output clock model is outside the wrapper circuit";
+    return failure();
+  }
+  {
+    circt::igraph::InstanceGraph graph(top->getParentOp());
+    auto *node = graph.lookup(model);
+    if (!node) {
+      error = "FAME output clock model is absent from the instance graph";
+      return failure();
+    }
+    unsigned uses = 0;
+    for (auto *record : node->uses()) {
+      if (record->getInstance<InstanceOp>() != instance) {
+        error = "FAME output clock model has another instance";
+        return failure();
+      }
+      ++uses;
+    }
+    if (uses != 1) {
+      error = "FAME output clock model instance is absent from the graph";
+      return failure();
+    }
+  }
+
   // SFC's unusedOutputsAsWires preserves model-body connects to these
   // former clock ports. The MLIR block argument has the same role until the
   // replacement wire takes over all its uses.
-  OpBuilder declarations(&model.getBodyBlock()->front());
+  OpBuilder declarations(model.getBodyBlock(), model.getBodyBlock()->begin());
   llvm::BitVector eraseModel(model.getNumPorts());
   llvm::BitVector eraseTop(top.getNumPorts());
   llvm::BitVector eraseInstance(instance.getNumResults());
@@ -890,6 +944,8 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
     auto name = model.getPortName(clock.modelPort);
     auto wire = declarations.create<WireOp>(
         model.getLoc(), model.getPorts()[clock.modelPort].type, name);
+    if (clock.symbol)
+      wire.setInnerSymAttr(clock.symbol);
     model.getBodyBlock()->getArgument(clock.modelPort)
         .replaceAllUsesWith(wire.getResult());
     clock.connection.erase();
@@ -900,6 +956,11 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
 
   OpBuilder builder(instance);
   InstanceOp replacement = instance.erasePorts(builder, eraseInstance);
+  for (auto attr : instance->getAttrs())
+    if (attr.getName() != "portNames" &&
+        attr.getName() != "portDirections" &&
+        attr.getName() != "portAnnotations")
+      replacement->setAttr(attr.getName(), attr.getValue());
   unsigned replacementPort = 0;
   for (unsigned oldPort = 0; oldPort < instance.getNumResults(); ++oldPort) {
     if (eraseInstance.test(oldPort))

@@ -50,7 +50,10 @@ mlir::LogicalResult addFAMEClockGate(circt::firrtl::CircuitOp circuit,
                                      mlir::Value rawClockTokenBits = {});
 
 // Remove the original target clock from the top, model, and model instance
-// after all model uses have been replaced with the gated host clock.
+// after all model uses have been replaced with the gated host clock. Require
+// unannotated, unsymbolized scalar ports; clock-input identity transfer is not
+// defined by SFC's hostDecouplingRenames. Reject instance-port annotations before
+// mutation and preserve unrelated instance metadata when rebuilding its ports.
 mlir::LogicalResult removeFAMETargetClockPort(
     circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
     llvm::StringRef instanceName, llvm::StringRef topClockName,
@@ -67,6 +70,12 @@ mlir::LogicalResult removeFAMEVirtualClockPort(
 
 // Clock outputs used to identify channel domains are no longer simulator
 // ports after FAME. Keep their model-side connects by turning each into a wire.
+// Require one model instance and exclusively connected, unannotated clock
+// outputs. Transfer model ground-port inner symbols to same-name Clock wires,
+// preserving names/visibility and InnerRefs. Wrapper symbols and instance-port
+// annotations need a deletion policy and are rejected before mutation. Preserve
+// unrelated ports and instance metadata; refresh hierarchy and symbol analyses.
+// Consumes/produces no annotations.
 mlir::LogicalResult internalizeFAMEOutputClocks(
     circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
     llvm::StringRef instanceName, std::string &error);
