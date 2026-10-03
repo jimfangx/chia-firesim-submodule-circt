@@ -16,6 +16,7 @@ add_executable(goldengate-circt
   lib/Support/UARTHeader.cpp
   lib/Support/TSIHeader.cpp
   lib/Support/BlockDevHeader.cpp
+  lib/Support/TracerVHeader.cpp
   lib/Support/SimulatorRTL.cpp
   lib/Support/TargetUtils.cpp
   lib/Analysis/ChannelAnalysis.cpp
@@ -147,6 +148,23 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-tracerv-header-test
+    test/Support/TracerVHeaderTest.cpp
+    lib/Support/TracerVHeader.cpp lib/Support/BlockDevHeader.cpp
+    lib/Support/TSIHeader.cpp lib/Support/UARTHeader.cpp
+    lib/Support/PeekPokeHeader.cpp lib/Support/LoadMemHeader.cpp
+    lib/Support/ResetPulseHeader.cpp lib/Support/ClockBridgeHeader.cpp
+    lib/Support/SimulationMasterHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
+    lib/Support/AnnotationEmission.cpp lib/Support/TargetUtils.cpp
+    lib/Transforms/TracerVTokenEngine.cpp lib/Transforms/TracerVTriggerConfig.cpp
+    lib/Transforms/TracerVStreamQueue.cpp lib/Transforms/CPUStreamRead.cpp)
+  target_compile_features(goldengate-tracerv-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-tracerv-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-tracerv-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-tracerv-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-tracerv-header COMMAND goldengate-tracerv-header-test)
   add_executable(goldengate-blockdev-header-test
     test/Support/BlockDevHeaderTest.cpp
     lib/Support/BlockDevHeader.cpp lib/Support/TSIHeader.cpp lib/Support/UARTHeader.cpp lib/Support/PeekPokeHeader.cpp lib/Support/LoadMemHeader.cpp
