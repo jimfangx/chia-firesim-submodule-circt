@@ -11,6 +11,7 @@ add_executable(goldengate-circt
   lib/Support/SimulationMasterHeader.cpp
   lib/Support/ClockBridgeHeader.cpp
   lib/Support/ResetPulseHeader.cpp
+  lib/Support/LoadMemHeader.cpp
   lib/Support/SimulatorRTL.cpp
   lib/Support/TargetUtils.cpp
   lib/Analysis/ChannelAnalysis.cpp
@@ -142,6 +143,21 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-loadmem-header-test
+    test/Support/LoadMemHeaderTest.cpp
+    lib/Support/LoadMemHeader.cpp lib/Support/ResetPulseHeader.cpp
+    lib/Support/ClockBridgeHeader.cpp lib/Support/SimulationMasterHeader.cpp
+    lib/Support/MetasimInterfaceHeader.cpp lib/Support/AnnotationEmission.cpp
+    lib/Transforms/LoadMemWriter.cpp lib/Transforms/LoadMemRequests.cpp
+    lib/Transforms/LoadMemWriteMMIO.cpp lib/Transforms/LoadMemWriteData.cpp
+    lib/Transforms/LoadMemReadRequests.cpp lib/Transforms/LoadMemReadData.cpp)
+  target_compile_features(goldengate-loadmem-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-loadmem-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-loadmem-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-loadmem-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-loadmem-header COMMAND goldengate-loadmem-header-test)
   add_executable(goldengate-reset-pulse-header-test
     test/Support/ResetPulseHeaderTest.cpp
     lib/Support/ResetPulseHeader.cpp lib/Support/ClockBridgeHeader.cpp lib/Support/SimulationMasterHeader.cpp
