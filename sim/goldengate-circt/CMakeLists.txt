@@ -10,6 +10,7 @@ add_executable(goldengate-circt
   lib/Support/MetasimInterfaceHeader.cpp
   lib/Support/SimulationMasterHeader.cpp
   lib/Support/ClockBridgeHeader.cpp
+  lib/Support/ResetPulseHeader.cpp
   lib/Support/SimulatorRTL.cpp
   lib/Support/TargetUtils.cpp
   lib/Analysis/ChannelAnalysis.cpp
@@ -141,6 +142,18 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-reset-pulse-header-test
+    test/Support/ResetPulseHeaderTest.cpp
+    lib/Support/ResetPulseHeader.cpp lib/Support/ClockBridgeHeader.cpp lib/Support/SimulationMasterHeader.cpp
+    lib/Support/MetasimInterfaceHeader.cpp lib/Transforms/ResetPulseBridge.cpp
+    lib/Support/TargetUtils.cpp lib/Support/AnnotationEmission.cpp)
+  target_compile_features(goldengate-reset-pulse-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-reset-pulse-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-reset-pulse-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-reset-pulse-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-reset-pulse-header COMMAND goldengate-reset-pulse-header-test)
   add_executable(goldengate-clock-bridge-header-test
     test/Support/ClockBridgeHeaderTest.cpp
     lib/Support/ClockBridgeHeader.cpp lib/Support/SimulationMasterHeader.cpp
