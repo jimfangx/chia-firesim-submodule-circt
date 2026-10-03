@@ -4223,6 +4223,10 @@ int main(int argc, char **argv) {
       if (mlir::failed(goldengate::rewriteFAMEInputChannel(
               *currentHierarchy, port, rewriteError)))
         return fail("FAME input channel rewrite: " + rewriteError);
+      for (const auto &rename : renames)
+        if (mlir::failed(goldengate::transferFAMEWrapperDontTouch(
+                circuit, rename.oldTop, rename.newTop, rewriteError)))
+          return fail("FAME wrapper DontTouch transfer: " + rewriteError);
       // SFC's RenameMap moves each selected channel leaf to its payload
       // field. Retain unrelated bridge and channel annotations.
       llvm::SmallVector<mlir::Attribute> updatedAnnotations;
@@ -4359,6 +4363,10 @@ int main(int argc, char **argv) {
       if (mlir::failed(goldengate::rewriteFAMEOutputChannel(
               *currentHierarchy, port, rewriteError)))
         return fail("FAME output channel rewrite: " + rewriteError);
+      for (const auto &rename : renames)
+        if (mlir::failed(goldengate::transferFAMEWrapperDontTouch(
+                circuit, rename.oldTop, rename.newTop, rewriteError)))
+          return fail("FAME wrapper DontTouch transfer: " + rewriteError);
       llvm::SmallVector<mlir::Attribute> updatedAnnotations;
       unsigned topTargets = 0, modelTargets = 0;
       for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {

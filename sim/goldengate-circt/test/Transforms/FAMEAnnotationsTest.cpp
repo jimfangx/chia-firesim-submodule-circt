@@ -26,7 +26,9 @@ std::string dump(Operation *op) {
 void run(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(
     module { firrtl.circuit "Top" {
-      firrtl.module @Top(in %clock: !firrtl.clock) {}
+      firrtl.module @Top(in %clock: !firrtl.clock,
+        in %input_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<data: uint<8>, flag: uint<1>>>,
+        out %output_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<8>>) {}
       firrtl.module @Model(in %clock: !firrtl.clock,
                            in %data: !firrtl.uint<8>) {
         %state = firrtl.wire {name = "state"} : !firrtl.uint<8>
@@ -66,7 +68,7 @@ void run(MLIRContext &context) {
   auto parentInstance = wrapper.create<InstanceOp>(top.getLoc(), other, "other");
   parentInstance.setPortAnnotationsAttr(b.getArrayAttr({attached}));
   other.setPortAnnotationsAttr(b.getArrayAttr({attached}));
-  top.setPortAnnotationsAttr(b.getArrayAttr({attached}));
+  top.setPortAnnotationsAttr(b.getArrayAttr({attached, b.getArrayAttr({}), b.getArrayAttr({})}));
   model.setPortSymbolsAttr(1, circt::hw::InnerSymAttr::get(b.getStringAttr("data_id")));
   std::string before = dump(*root), error;
   require(failed(goldengate::consumeFAMEModelDontTouches(circuit, {top}, error)) &&
@@ -100,6 +102,37 @@ void run(MLIRContext &context) {
   before = dump(*root);
   require(succeeded(goldengate::consumeFAMEModelDontTouches(circuit, {model}, error)) &&
               dump(*root) == before, "DontTouch consumption is not idempotent");
+  auto input = dt("~Top|Top>data");
+  auto output = dt("~Top|Top>result");
+  auto unrelated = annotation("test.Retained", "~Top|Top>data");
+  auto hierarchy = dt("~Top|Top/model:Model>data");
+  auto otherModule = dt("~Top|Other>data");
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(
+      {input, output, unrelated, hierarchy, otherModule, input}));
+  before = dump(*root);
+  for (StringRef invalid : {"~Top|Top>input_sink", "~Top|Top>input_sink.ready",
+                            "~Top|Top>input_sink.bits.missing", "~Top|Model>data",
+                            "~Foreign|Top>input_sink.bits"})
+    require(failed(goldengate::transferFAMEWrapperDontTouch(
+                circuit, "~Top|Top>data", invalid, error)) && dump(*root) == before,
+            "invalid replacement mutated retained targets");
+  require(failed(goldengate::transferFAMEWrapperDontTouch(
+              circuit, "~Top|Top/model:Model>data", "~Top|Top>input_sink.bits.data", error)) &&
+              dump(*root) == before, "hierarchical source accepted or mutated archive");
+  require(succeeded(goldengate::transferFAMEWrapperDontTouch(
+              circuit, "~Top|Top>data", "~Top|Top>input_sink.bits.data", error)) &&
+          succeeded(goldengate::transferFAMEWrapperDontTouch(
+              circuit, "~Top|Top>result", "~Top|Top>output_source.bits", error)),
+          "wrapper payload transfer failed");
+  auto newInput = dt("~Top|Top>input_sink.bits.data");
+  require(circuit->getAttrOfType<ArrayAttr>("rawAnnotations") == b.getArrayAttr(
+              {newInput, dt("~Top|Top>output_source.bits"), unrelated,
+               hierarchy, otherModule, newInput}),
+          "wrong class/target transferred or duplicates/order lost");
+  before = dump(*root);
+  require(succeeded(goldengate::transferFAMEWrapperDontTouch(
+              circuit, "~Top|Top>data", "~Top|Top>input_sink.bits.data", error)) &&
+              dump(*root) == before, "wrapper transfer is not idempotent");
   llvm::outs() << "Consumed transformed-model reference protections; retained wrapper, "
                   "other-module, foreign-circuit and other-class annotations; atomic rejects pass\n";
 }

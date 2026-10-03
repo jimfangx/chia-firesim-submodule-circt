@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEAnnotations.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/TargetUtils.h"
 #include "llvm/ADT/SmallPtrSet.h"
 
 using namespace mlir;
@@ -80,5 +81,54 @@ LogicalResult goldengate::consumeFAMEModelDontTouches(
       }
     });
   }
+  return success();
+}
+
+LogicalResult goldengate::transferFAMEWrapperDontTouch(
+    CircuitOp circuit, llvm::StringRef oldTarget,
+    llvm::StringRef payloadTarget, std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  std::string prefix = "~" + circuit.getName().str() + "|" +
+                       circuit.getName().str() + ">";
+  auto oldPort = oldTarget;
+  if (!raw || !oldPort.consume_front(prefix) || oldPort.empty() ||
+      oldPort.find_first_of(".[]/>|") != llvm::StringRef::npos) {
+    error = "FAME DontTouch transfer requires a local wrapper ground port";
+    return failure();
+  }
+  auto replacement = resolveAnnotationTarget(circuit, payloadTarget, error);
+  auto payload = payloadTarget;
+  if (!replacement || !replacement->port || !replacement->fieldID ||
+      *replacement->fieldID == 0 ||
+      replacement->module.getModuleName() != circuit.getName() ||
+      !payload.consume_front(prefix)) {
+    error = "FAME DontTouch replacement must resolve to a wrapper payload field";
+    return failure();
+  }
+  auto firstField = payload.find('.');
+  auto field = firstField == llvm::StringRef::npos
+                   ? llvm::StringRef() : payload.drop_front(firstField);
+  if (field != ".bits" && !field.starts_with(".bits.")) {
+    error = "FAME DontTouch replacement is not a channel bits field";
+    return failure();
+  }
+  SmallVector<Attribute> updated;
+  for (Attribute attr : raw) {
+    if (isDontTouch(attr)) {
+      auto dict = cast<DictionaryAttr>(attr);
+      auto target = dict.getAs<StringAttr>("target");
+      if (!target) {
+        error = "DontTouchAnnotation has no reference target";
+        return failure();
+      }
+      if (target.getValue() == oldTarget) {
+        NamedAttrList transferred(dict);
+        transferred.set("target", StringAttr::get(circuit.getContext(), payloadTarget));
+        attr = transferred.getDictionary(circuit.getContext());
+      }
+    }
+    updated.push_back(attr);
+  }
+  circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), updated));
   return success();
 }

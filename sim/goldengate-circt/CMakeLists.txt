@@ -153,7 +153,8 @@ target_link_libraries(goldengate-circt PRIVATE
 include(CTest)
 if(BUILD_TESTING)
   add_executable(goldengate-fame-annotations-test
-    test/Transforms/FAMEAnnotationsTest.cpp lib/Transforms/FAMEAnnotations.cpp)
+    test/Transforms/FAMEAnnotationsTest.cpp lib/Transforms/FAMEAnnotations.cpp
+    lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-fame-annotations-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fame-annotations-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fame-annotations-test PRIVATE
