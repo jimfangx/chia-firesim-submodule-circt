@@ -36,6 +36,7 @@ add_executable(goldengate-circt
   lib/Transforms/ExtractModel.cpp
   lib/Transforms/WrapTop.cpp
   lib/Transforms/LowerTypes.cpp
+  lib/Transforms/AutoCounterResetGate.cpp
   lib/Transforms/CoerceAsyncToSyncReset.cpp
   lib/Transforms/LabelMultiThreadedInstances.cpp
   lib/Transforms/TriggerWiring.cpp
@@ -152,6 +153,18 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-autocounter-reset-gate-test
+    test/Transforms/AutoCounterResetGateTest.cpp
+    lib/Transforms/AutoCounterResetGate.cpp lib/Analysis/AutoCounterAnalysis.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-autocounter-reset-gate-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autocounter-reset-gate-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autocounter-reset-gate-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autocounter-reset-gate-test PRIVATE
+    CIRCTFIRRTLTransforms CIRCTFIRRTL CIRCTHW CIRCTSupport
+    MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autocounter-reset-gate COMMAND goldengate-autocounter-reset-gate-test)
   add_executable(goldengate-fame-output-clocks-test
     test/Transforms/FAMEOutputClocksTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-output-clocks-test PRIVATE cxx_std_17)

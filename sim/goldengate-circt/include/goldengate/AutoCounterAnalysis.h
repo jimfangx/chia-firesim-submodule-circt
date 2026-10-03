@@ -17,9 +17,10 @@ struct AutoCounterEvent {
   std::string clockTarget;
   std::string resetTarget;
   std::string label;
+  unsigned annotationIndex;
 };
 
-// Resolve retained AutoCounter targets to FIRRTL SSA values. The values are
+// Resolve retained public and internal AutoCounter targets to FIRRTL SSA values. The values are
 // the operands needed by the later reset gating and counter synthesis passes.
 mlir::LogicalResult analyzeAutoCounterEvents(
     circt::firrtl::CircuitOp circuit,

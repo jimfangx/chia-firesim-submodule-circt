@@ -6,6 +6,8 @@
 #include "circt/Dialect/FIRRTL/FIREmitter.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Dialect/FIRRTL/Passes.h"
+#include "mlir/Pass/PassManager.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/AnnotationEmission.h"
@@ -25,6 +27,7 @@
 #include "goldengate/XilinxHostSpecialization.h"
 #include "goldengate/SimulatorRTL.h"
 #include "goldengate/AutoCounterAnalysis.h"
+#include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/BridgeAnalysis.h"
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/ChannelClockInfo.h"
@@ -191,6 +194,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--lower-types";
   bool analyzeAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter";
+  bool gateAutoCounter =
+      argc == 7 && llvm::StringRef(argv[6]) == "--gate-autocounter-events";
   bool disableAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
   bool compileBaseline =
@@ -205,7 +210,7 @@ int main(int argc, char **argv) {
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
        !resolveDontTouch && !lowerTypes && !analyzeAutoCounter &&
-       !disableAutoCounter && !compileBaseline) ||
+       !gateAutoCounter && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
       llvm::StringRef(argv[4]) != "--output-dir") {
     llvm::errs() << "usage: goldengate-circt input.fir --annotation-file "
@@ -222,7 +227,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--lower-types | --analyze-autocounter | "
+                    "--lower-types | --analyze-autocounter | --gate-autocounter-events | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3015,6 +3020,41 @@ int main(int argc, char **argv) {
         return fail("simulator RTL: " + error);
       llvm::outs() << "Emitted CIRCT simulator RTL in " << rtlPath << '\n';
     }
+    return 0;
+  }
+
+  if (gateAutoCounter) {
+    // This boundary accepts already selected records. EnableAutoCounter and
+    // cover-module selection belong to the later complete debug pipeline.
+    std::string error;
+    if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
+      return fail("AutoCounter LowerTypes: " + error);
+    // SFC MiddleFirrtlToLowFirrtl expands whens before AutoCounter: named
+    // events declared inside a when must dominate the appended reset gates.
+    mlir::PassManager lowForm(module->getContext());
+    lowForm.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+    if (failed(lowForm.run(*module)))
+      return fail("AutoCounter ExpandWhens failed");
+    llvm::SmallVector<goldengate::AutoCounterEvent> events;
+    if (failed(goldengate::analyzeAutoCounterEvents(circuit, events, error)) ||
+        failed(goldengate::gateAutoCounterEventsWithReset(circuit, events, error)))
+      return fail("AutoCounter reset gating: " + error);
+    if (failed(mlir::verify(*module)))
+      return fail("AutoCounter reset gating produced invalid FIRRTL IR");
+    llvm::SmallString<256> irPath(outputDir), annoPath(outputDir);
+    llvm::sys::path::append(irPath, "post-autocounter-reset-gate.mlir");
+    llvm::sys::path::append(annoPath, "post-autocounter-reset-gate-all.json");
+    std::error_code writeError;
+    llvm::raw_fd_ostream irOut(irPath, writeError);
+    if (writeError)
+      return fail("cannot write AutoCounter IR: " + writeError.message());
+    module->print(irOut);
+    irOut << '\n';
+    // Keep the lowered boundary in the FIRRTL dialect: LowerTypes may emit
+    // multibit_mux operations that CIRCT's FIR text exporter cannot represent.
+    if (failed(goldengate::emitAllAnnotations(circuit, annoPath, error)))
+      return fail("cannot export AutoCounter reset-gate boundary: " + error);
+    llvm::outs() << "Gated " << events.size() << " selected AutoCounter events in " << irPath << '\n';
     return 0;
   }
 

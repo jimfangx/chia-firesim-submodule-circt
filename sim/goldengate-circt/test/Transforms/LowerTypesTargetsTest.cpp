@@ -395,14 +395,14 @@ void run(MLIRContext &context) {
   require(counterRaw.size() == counters.size(), "AutoCounter exact rename fanned out");
   SmallVector<goldengate::AutoCounterEvent> resolved;
   require(succeeded(goldengate::analyzeAutoCounterEvents(ac, resolved, error)) &&
-              resolved.size() == 4, error);
-  const unsigned resetWidths[] = {1, 1, 2, 4};
+              resolved.size() == 5, error);
+  const unsigned resetWidths[] = {1, 1, 2, 4, 1};
   for (auto [i, event] : llvm::enumerate(resolved)) {
     require(cast<UIntType>(event.event.getType()).getWidth() == 8 &&
                 isa<ClockType>(event.clock.getType()) &&
                 cast<UIntType>(event.reset.getType()).getWidth() == resetWidths[i],
             "AutoCounter operand selected the wrong scalar leaf");
-    if (i == 0 || i == 2)
+    if (i == 0 || i == 2 || i == 4)
       require(isa<BlockArgument>(event.event) && isa<BlockArgument>(event.clock) &&
                   isa<BlockArgument>(event.reset), "AutoCounter port reference became internal");
     else

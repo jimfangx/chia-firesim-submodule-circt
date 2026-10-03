@@ -51,9 +51,10 @@ LogicalResult goldengate::analyzeAutoCounterEvents(
     error = "AutoCounter analysis needs retained annotations";
     return failure();
   }
-  for (auto attr : raw) {
+  for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
-    if (!annotation.isClass(AnnotationClasses::AutoCounter))
+    if (!annotation.isClass(AnnotationClasses::AutoCounter) &&
+        !annotation.isClass(AnnotationClasses::InternalAutoCounter))
       continue;
     auto target = annotation.getMember<StringAttr>("target");
     auto clock = annotation.getMember<StringAttr>("clock");
@@ -89,7 +90,8 @@ LogicalResult goldengate::analyzeAutoCounterEvents(
     events.push_back(AutoCounterEvent{
         eventValue->module, eventValue->value, clockValue->value,
         resetValue->value, target.getValue().str(), clock.getValue().str(),
-        reset.getValue().str(), label.getValue().str()});
+        reset.getValue().str(), label.getValue().str(),
+        static_cast<unsigned>(index)});
   }
   return success();
 }
