@@ -386,9 +386,21 @@ int main(int argc, char **argv) {
                  << "; lowered FIRRTL in " << irPath << '\n';
     if (compileBaseline) {
       unsigned consumedTriggerSources = 0;
-      if (mlir::failed(goldengate::consumeUnobservedTriggerSources(
+      if (mlir::failed(goldengate::wireTriggers(
               circuit, consumedTriggerSources, error)))
         return fail("TriggerWiring: " + error);
+      llvm::SmallString<256> triggerIRPath(outputDir);
+      llvm::sys::path::append(triggerIRPath, "post-trigger-wiring.mlir");
+      std::error_code triggerEC;
+      llvm::raw_fd_ostream triggerIROut(triggerIRPath, triggerEC);
+      if (triggerEC) return fail("cannot write post-trigger wiring IR: " + triggerEC.message());
+      module->print(triggerIROut);
+      triggerIROut.close();
+      llvm::SmallString<256> triggerAllAnnotationPath(outputDir);
+      llvm::sys::path::append(triggerAllAnnotationPath, "post-trigger-wiring-all.json");
+      if (mlir::failed(goldengate::emitAllAnnotations(
+              circuit, triggerAllAnnotationPath, error)))
+        return fail("cannot export all trigger wiring annotations: " + error);
       llvm::SmallString<256> triggerAnnotationPath(outputDir);
       llvm::sys::path::append(triggerAnnotationPath,
                               "post-trigger-wiring.json");
@@ -396,7 +408,7 @@ int main(int argc, char **argv) {
               circuit, triggerAnnotationPath, error)))
         return fail("cannot export trigger wiring annotations: " + error);
       llvm::outs() << "Consumed " << consumedTriggerSources
-                   << " unwired CIRCT trigger sources in "
+                   << " CIRCT trigger source annotations in "
                    << triggerAnnotationPath << '\n';
 
       if (mlir::failed(goldengate::wrapTop(circuit, error)))

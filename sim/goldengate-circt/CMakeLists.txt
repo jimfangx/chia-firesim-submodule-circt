@@ -158,6 +158,16 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-trigger-wiring-test
+    test/Transforms/TriggerWiringTest.cpp lib/Transforms/TriggerWiring.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-trigger-wiring-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-trigger-wiring-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-trigger-wiring-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-trigger-wiring-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-trigger-wiring COMMAND goldengate-trigger-wiring-test)
   add_executable(goldengate-global-reset-wiring-test
     test/Transforms/GlobalResetWiringTest.cpp lib/Transforms/GlobalResetWiring.cpp
     lib/Support/TargetUtils.cpp)

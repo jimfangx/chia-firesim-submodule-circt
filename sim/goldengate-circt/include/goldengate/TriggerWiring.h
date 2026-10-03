@@ -6,10 +6,10 @@
 #include <string>
 
 namespace goldengate {
-// Scala TriggerWiring consumes source annotations without changing the circuit
-// when there are no trigger sinks. Reject the hardware-generating case until
-// its counter and sink wiring semantics are implemented in CIRCT.
-mlir::LogicalResult consumeUnobservedTriggerSources(
+// Consume unused trigger annotations, or emit Scala-compatible local accounting
+// for one credit/debit pair and node sinks on the circuit top base clock.
+// Unsupported hardware cases fail before mutation.
+mlir::LogicalResult wireTriggers(
     circt::firrtl::CircuitOp circuit, unsigned &consumed,
     std::string &error);
 } // namespace goldengate
