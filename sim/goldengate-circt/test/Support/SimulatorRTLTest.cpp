@@ -13,6 +13,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
+#include "llvm/Support/Regex.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
 
@@ -126,6 +127,28 @@ int main(int argc, char **argv) {
             before == dump(*invalid) && read(unitPath) == rtl,
             "failed backend replaced source or existing RTL");
     llvm::outs() << "Standard pipeline: BUFGCE/control and attached dont-touch retained; source archive unchanged; incomplete connection fails without replacing RTL\n";
+    auto unusedOutput = parseSourceString<ModuleOp>(R"mlir(module {
+      firrtl.circuit "UnusedOutput" {
+        firrtl.extmodule @Peripheral(in request: !firrtl.uint<1>, out live: !firrtl.uint<8>, out unused: !firrtl.uint<8>)
+        firrtl.module @UnusedOutput(in %request: !firrtl.uint<1>, out %response: !firrtl.uint<8>) {
+          %device:3 = firrtl.instance device @Peripheral(in request: !firrtl.uint<1>, out live: !firrtl.uint<8>, out unused: !firrtl.uint<8>)
+          firrtl.strictconnect %device#0, %request : !firrtl.uint<1>
+          firrtl.strictconnect %response, %device#1 : !firrtl.uint<8>
+        }
+      }
+    })mlir", &context);
+    require(bool(unusedOutput), "unused output fixture parse");
+    before = dump(*unusedOutput);
+    auto unusedPath = unitPath + ".unused.sv";
+    require(succeeded(goldengate::emitSimulatorRTL(*unusedOutput, "", unusedPath, error)), error);
+    auto unusedRTL = read(unusedPath);
+    require(before == dump(*unusedOutput) &&
+            unusedRTL.find("wire [7:0] device_unused_unused;") != std::string::npos &&
+            llvm::Regex("\\.unused[[:space:]]*\\(device_unused_unused\\)").match(unusedRTL) &&
+            llvm::Regex("\\.request[[:space:]]*\\(request\\)").match(unusedRTL) &&
+            llvm::Regex("\\.live[[:space:]]*\\(response\\)").match(unusedRTL),
+            "unused output sink changed live connectivity or source IR");
+    llvm::outs() << "Unused instance outputs terminate in width-declared wires; live inputs/outputs and source IR unchanged\n";
     auto muxIndex = parseSourceString<ModuleOp>(R"mlir(module {
       firrtl.circuit "MuxIndex" {
         firrtl.module @MuxIndex(in %data: !firrtl.uint<32>, in %select: !firrtl.uint<1>, in %index: !firrtl.uint<3>, out %bit: !firrtl.uint<1>) {

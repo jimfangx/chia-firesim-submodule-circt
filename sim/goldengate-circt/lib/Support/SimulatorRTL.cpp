@@ -64,6 +64,26 @@ unsigned goldengate::normalizeInitializationIndices(ModuleOp module) {
 }
 
 namespace {
+// SFC connects even unused instance outputs to declared wires. Preserve that
+// boundary in the backend clone: open output connections otherwise trigger
+// Verilator PINCONNECTEMPTY with FireSim's fatal warning policy. Only SSA
+// results without consumers are terminated; inputs and live outputs are intact.
+void terminateUnusedInstanceOutputs(ModuleOp module) {
+  module.walk([&](hw::InstanceOp instance) {
+    OpBuilder builder(instance);
+    builder.setInsertionPointAfter(instance);
+    for (auto result : instance.getResults()) {
+      if (!result.use_empty())
+        continue;
+      auto name = (instance.getInstanceName() + "_unused_" +
+                   instance.getResultName(result.getResultNumber()).getValue()).str();
+      auto sink = builder.create<sv::WireOp>(instance.getLoc(), result.getType(),
+                                            name);
+      builder.create<sv::AssignOp>(instance.getLoc(), sink, result);
+    }
+  });
+}
+
 // Golden Gate retains source annotations across circuit wrapping. Transfer only
 // these module-local sources to the backend clone; replaying the entire archive
 // would resolve obsolete targets and repeat Golden Gate transforms.
@@ -210,8 +230,9 @@ LogicalResult goldengate::emitSimulatorRTL(ModuleOp source,
   if (failed(passes.run(*lowered)))
     return reject("CIRCT simulator RTL lowering failed; see pass diagnostics");
   normalizeInitializationIndices(*lowered);
+  terminateUnusedInstanceOutputs(*lowered);
   if (failed(verify(*lowered)))
-    return reject("CIRCT initialization index normalization produced invalid IR");
+    return reject("CIRCT simulator RTL normalization produced invalid IR");
 
   // The single-file exporter includes emit.file payloads in its stream, even
   // resource lists that are not Verilog. Export those operations separately
