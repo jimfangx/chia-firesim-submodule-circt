@@ -211,6 +211,17 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
     MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-unused-outputs COMMAND goldengate-fame-unused-outputs-test)
+  add_executable(goldengate-lower-types-targets-test
+    test/Transforms/LowerTypesTargetsTest.cpp lib/Transforms/LowerTypes.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-lower-types-targets-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-lower-types-targets-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-lower-types-targets-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-lower-types-targets-test PRIVATE
+    CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
+    MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-lower-types-targets COMMAND goldengate-lower-types-targets-test)
   add_executable(goldengate-fame-clock-gate-test
     test/Transforms/FAMEClockGateTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-clock-gate-test PRIVATE cxx_std_17)

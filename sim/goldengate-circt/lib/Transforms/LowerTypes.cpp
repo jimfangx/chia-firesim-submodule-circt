@@ -4,10 +4,31 @@
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "circt/Dialect/HW/HWTypeInterfaces.h"
 #include "mlir/Pass/PassManager.h"
+#include "llvm/ADT/StringMap.h"
 
 using namespace circt::firrtl;
 using namespace mlir;
+
+namespace {
+// SFC DestructTypes records each aggregate reference as referring to all of
+// its ground children. Walk the selected CIRCT subtype in declaration order,
+// including vector indices, to apply that one-to-many rename to raw metadata.
+void collectGroundPorts(FIRRTLBaseType type, const std::string &name,
+                        SmallVectorImpl<std::string> &names) {
+  if (auto bundle = dyn_cast<BundleType>(type)) {
+    for (auto element : bundle.getElements())
+      collectGroundPorts(element.type, name + "_" + element.name.str(), names);
+  } else if (auto vector = dyn_cast<FVectorType>(type)) {
+    for (unsigned i = 0; i < vector.getNumElements(); ++i)
+      collectGroundPorts(vector.getElementType(), name + "_" + std::to_string(i),
+                         names);
+  } else {
+    names.push_back(name);
+  }
+}
+} // namespace
 
 LogicalResult goldengate::lowerTypesWithRetainedTargets(
     ModuleOp module, CircuitOp circuit, std::string &error) {
@@ -17,7 +38,9 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     return failure();
   }
   const std::string circuitName = circuit.getName().str();
-  SmallVector<std::string> replacements(raw.size());
+  // An engaged, empty plan removes an annotation on an empty aggregate;
+  // an absent plan leaves unrelated or internal ground targets untouched.
+  SmallVector<std::optional<SmallVector<std::string>>> replacements(raw.size());
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
@@ -38,9 +61,38 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     auto target = resolveAnnotationTarget(circuit, spelling.getValue(),
                                           resolutionError);
     if (target && target->port) {
-      replacements[index] = "~" + circuitName + "|" +
-                            target->module.getModuleName().str() + ">" +
-                            target->groundPortName;
+      auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
+          target->module.getPortType(*target->port), *target->fieldID));
+      if (autoCounter && !type.isGround()) {
+        error = "AutoCounter event target must select a ground value: " +
+                spelling.getValue().str();
+        return failure();
+      }
+      replacements[index].emplace();
+      SmallVector<std::string> names;
+      collectGroundPorts(type, target->groundPortName, names);
+      // LowerTypes may uniquify colliding port spellings. Until retained
+      // targets follow that namespace rename, reject ambiguity before lowering
+      // rather than accidentally binding the annotation to another source port.
+      llvm::StringMap<unsigned> portNames;
+      for (const auto &port : target->module.getPorts()) {
+        SmallVector<std::string> leaves;
+        if (auto portType = dyn_cast<FIRRTLBaseType>(port.type))
+          collectGroundPorts(portType, port.name.str(), leaves);
+        else
+          leaves.push_back(port.name.str());
+        for (const auto &leaf : leaves)
+          ++portNames[leaf];
+      }
+      for (const auto &name : names) {
+        if (portNames.lookup(name) != 1) {
+          error = "retained target needs a LowerTypes namespace rename: " +
+                  spelling.getValue().str();
+          return failure();
+        }
+        replacements[index]->push_back("~" + circuitName + "|" +
+            target->module.getModuleName().str() + ">" + name);
+      }
       continue;
     }
     if (autoCounter ||
@@ -69,22 +121,24 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   SmallVector<Attribute> rewritten;
   rewritten.reserve(raw.size());
   for (auto [index, attr] : llvm::enumerate(raw)) {
-    if (replacements[index].empty()) {
+    if (!replacements[index]) {
       rewritten.push_back(attr);
       continue;
     }
-    auto spelling = llvm::StringRef(replacements[index]);
-    std::string resolutionError;
-    auto lowered = resolveAnnotationTarget(circuit, spelling, resolutionError);
-    if (!lowered || !lowered->port || *lowered->fieldID != 0) {
-      error = "LowerTypes did not create annotated ground port " +
-              spelling.str() + ": " + resolutionError;
-      return failure();
+    for (const auto &replacement : *replacements[index]) {
+      auto spelling = llvm::StringRef(replacement);
+      std::string resolutionError;
+      auto lowered = resolveAnnotationTarget(circuit, spelling, resolutionError);
+      if (!lowered || !lowered->port || *lowered->fieldID != 0 ||
+          !cast<FIRRTLBaseType>(lowered->module.getPortType(*lowered->port)).isGround()) {
+        error = "LowerTypes did not create annotated ground port " +
+                spelling.str() + ": " + resolutionError;
+        return failure();
+      }
+      Annotation annotation(attr);
+      annotation.setMember("target", StringAttr::get(module.getContext(), spelling));
+      rewritten.push_back(annotation.getAttr());
     }
-    Annotation annotation(attr);
-    annotation.setMember("target", StringAttr::get(module.getContext(),
-                                                    spelling));
-    rewritten.push_back(annotation.getAttr());
   }
   circuit->setAttr("rawAnnotations", ArrayAttr::get(module.getContext(),
                                                      rewritten));
