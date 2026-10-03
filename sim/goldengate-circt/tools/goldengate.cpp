@@ -43,6 +43,7 @@
 #include "goldengate/FAMEFinishing.h"
 #include "goldengate/FAMEHostControl.h"
 #include "goldengate/FAMEInputChannel.h"
+#include "goldengate/FAMEAnnotations.h"
 #include "goldengate/FAMEInputReady.h"
 #include "goldengate/FAMEPortAnalysis.h"
 #include "goldengate/FAMEOutputValid.h"
@@ -4134,10 +4135,15 @@ int main(int argc, char **argv) {
         annotation.setMember(member, mlir::ArrayAttr::get(&context, updated));
       return changed;
     };
-    if (llvm::StringRef(argv[7]) == "all" && rewriteInputsWithOutput)
+    if (llvm::StringRef(argv[7]) == "all" && rewriteInputsWithOutput) {
+      auto model = mlir::dyn_cast<FModuleOp>(oldModel.getOperation());
+      if (mlir::failed(goldengate::consumeFAMEModelDontTouches(
+              circuit, {model}, rewriteError)))
+        return fail("FAME model DontTouch consumption: " + rewriteError);
       if (mlir::failed(goldengate::removeFAMEAncillaryTopClockConnects(
               hierarchy->top, firstInstance, rewriteError)))
         return fail("FAME ancillary top clock removal: " + rewriteError);
+    }
     llvm::SmallVector<std::string> channelNames;
     for (const auto *selected : selectedPorts) {
       // Each port replacement clones the instance. Rebuild the hierarchy so
@@ -4538,6 +4544,11 @@ int main(int argc, char **argv) {
     if (mlir::failed(goldengate::emitFAMEAnnotations(circuit, annotationPath,
                                                      rewriteError)))
       return fail("FAME annotation emission: " + rewriteError);
+    llvm::sys::path::remove_filename(annotationPath);
+    llvm::sys::path::append(annotationPath, "post-fame-transform-all.json");
+    if (mlir::failed(goldengate::emitAllAnnotations(circuit, annotationPath,
+                                                    rewriteError)))
+      return fail("FAME retained annotation emission: " + rewriteError);
     llvm::SmallString<256> rewrittenPath(outputDir);
     llvm::sys::path::append(rewrittenPath, !outputNames.empty()
                                               ? "input-output-channel.mlir"

@@ -45,6 +45,7 @@ add_executable(goldengate-circt
   lib/Transforms/FAMEFinishing.cpp
   lib/Transforms/FAMEHostControl.cpp
   lib/Transforms/FAMEInputChannel.cpp
+  lib/Transforms/FAMEAnnotations.cpp
   lib/Transforms/FAMEOutputChannel.cpp
   lib/Transforms/FAMEPipeChannel.cpp
   lib/Transforms/FAMEReadyValidChannel.cpp
@@ -151,6 +152,15 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-fame-annotations-test
+    test/Transforms/FAMEAnnotationsTest.cpp lib/Transforms/FAMEAnnotations.cpp)
+  target_compile_features(goldengate-fame-annotations-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-annotations-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-annotations-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-annotations-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-annotations COMMAND goldengate-fame-annotations-test)
   add_executable(goldengate-fame-stale-top-clocks-test
     test/Transforms/FAMEStaleTopClocksTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-stale-top-clocks-test PRIVATE cxx_std_17)
