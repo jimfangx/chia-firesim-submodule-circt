@@ -8,6 +8,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
 
@@ -225,7 +226,113 @@ void run(MLIRContext &context) {
   before = dump(*collision);
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*collision, cc, error)) &&
               dump(*collision) == before, "collision lowering is not idempotent");
-  llvm::outs() << "DontTouch aggregates expand in declaration order; fields, flips and unrelated targets preserved; three invalid selectors reject atomically; namespace collisions follow leaf identities and preserve native InnerRefs without temporary symbol leakage\n";
+  // Internal declarations use the same field IDs and one-to-many renames as
+  // ports. Collisions span the port/declaration namespace, not SSA spellings.
+  const char *internalFixture = R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>,
+          in %data: !firrtl.bundle<a: bundle<b: uint<8>>, a_b: uint<9>, v: vector<uint<11>, 1>, v_0: uint<12>>,
+          in %agg_v_0: !firrtl.uint<15>) {
+        %agg = firrtl.wire : !firrtl.bundle<a: bundle<b: uint<8>>, a_b: uint<9>, v: vector<uint<11>, 1>, v_0: uint<12>>
+        %agg_a_b = firrtl.wire : !firrtl.uint<10>
+        %agg_a_b_0 = firrtl.wire : !firrtl.uint<13>
+        %alias = firrtl.node %data : !firrtl.bundle<a: bundle<b: uint<8>>, a_b: uint<9>, v: vector<uint<11>, 1>, v_0: uint<12>>
+        %state = firrtl.reg %clock : !firrtl.clock, !firrtl.bundle<a: bundle<b: uint<8>>, a_b: uint<9>, v: vector<uint<11>, 1>, v_0: uint<12>>
+        %resetState = firrtl.regreset %clock, %reset, %data : !firrtl.clock, !firrtl.uint<1>, !firrtl.bundle<a: bundle<b: uint<8>>, a_b: uint<9>, v: vector<uint<11>, 1>, v_0: uint<12>>, !firrtl.bundle<a: bundle<b: uint<8>>, a_b: uint<9>, v: vector<uint<11>, 1>, v_0: uint<12>>
+        %empty = firrtl.wire : !firrtl.bundle<>
+      }
+    }
+  })mlir";
+  auto internal = parseSourceString<ModuleOp>(internalFixture, &context);
+  require(bool(internal), "internal aggregate fixture parse failed");
+  auto ic = *internal->getOps<CircuitOp>().begin();
+  auto im = *ic.getOps<FModuleOp>().begin();
+  auto aggregate = *im.getOps<WireOp>().begin();
+  aggregate.setInnerSymAttr(InnerSymAttr::get(&context, {
+      property("wire_leaf", 2, "public")}));
+  auto state = *im.getOps<RegOp>().begin();
+  state.setInnerSymAttr(InnerSymAttr::get(&context, {
+      property("state_leaf", 3, "private")}));
+  auto internalRefs = b.getArrayAttr({
+      InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("wire_leaf")),
+      InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("state_leaf"))});
+  ic->setAttr("test.stable_refs", internalRefs);
+  SmallVector<Attribute> internalAnnotations{
+      annotation("~Top|Top>agg", "wire"),
+      annotation("~Top|Top>agg.a.b", "wire-leaf"),
+      annotation("~Top|Top>agg.v.0", "wire-vector"),
+      annotation("~Top|Top>agg_a_b", "scalar-wire"),
+      annotation("~Top|Top>alias", "node"),
+      annotation("~Top|Top>state", "reg"),
+      annotation("~Top|Top>resetState", "reset-reg"),
+      annotation("~Top|Top>empty", "empty-wire"),
+      annotation("~Top|Top>agg.v[0]", "event", goldengate::AnnotationClasses::AutoCounter)};
+  ic->setAttr("rawAnnotations", b.getArrayAttr(internalAnnotations));
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*internal, ic, error)) &&
+              succeeded(verify(*internal)), "internal aggregate lowering failed: " + error);
+  auto ia = ic->getAttrOfType<ArrayAttr>("rawAnnotations");
+  SmallVector<unsigned> internalWidths{8, 9, 11, 12, 8, 11, 10,
+                                      8, 9, 11, 12, 8, 9, 11, 12,
+                                      8, 9, 11, 12, 11};
+  require(ia.size() == internalWidths.size(), "internal expansion count changed");
+  llvm::DenseSet<StringAttr> wireNames;
+  for (auto [index, attr] : llvm::enumerate(ia)) {
+    Annotation result(attr);
+    auto spelling = result.getMember<StringAttr>("target");
+    auto target = goldengate::resolveInternalFieldTarget(ic, spelling.getValue(), error);
+    require(target && target->fieldID == 0 &&
+                cast<UIntType>(target->type).getWidth() == internalWidths[index],
+            "internal target lost leaf identity: " + spelling.getValue().str());
+    require(result.getMember<ArrayAttr>("test.payload") ==
+                Annotation(internalAnnotations.front()).getMember<ArrayAttr>("test.payload"),
+            "internal annotation payload changed");
+    if (index < 4 || index == 6)
+      require(wireNames.insert(spelling).second, "colliding internal leaves share a name");
+    require(index < 7 || index == 19 ? isa<WireOp>(target->declaration) :
+            index < 11 ? isa<NodeOp>(target->declaration) :
+            index < 15 ? isa<RegOp>(target->declaration) :
+                         isa<RegResetOp>(target->declaration),
+            "lowering changed internal declaration kind");
+  }
+  require(Annotation(ia[0]).getMember<StringAttr>("target") ==
+              Annotation(ia[4]).getMember<StringAttr>("target") &&
+              Annotation(ia[2]).getMember<StringAttr>("target") ==
+              Annotation(ia[5]).getMember<StringAttr>("target") &&
+              Annotation(ia[5]).getMember<StringAttr>("target") ==
+              Annotation(ia[19]).getMember<StringAttr>("target"),
+          "overlapping internal selectors disagree");
+  InnerSymbolTable internalSymbols(im);
+  for (auto [name, width, visibility] : {
+      std::tuple<StringRef, unsigned, StringRef>{"wire_leaf", 8, "public"},
+      {"state_leaf", 9, "private"}}) {
+    auto target = internalSymbols.lookup(name);
+    require(target && !target.isPort() && target.getField() == 0 &&
+                cast<UIntType>(target.getOp()->getResult(0).getType()).getWidth() == width,
+            "native internal leaf identity changed");
+    auto symbols = cast<InnerSymbolOpInterface>(target.getOp()).getInnerSymAttr();
+    require(symbols.size() == 1 &&
+                symbols.getProps().front().getSymVisibility().getValue() == visibility,
+            "native internal symbol visibility changed");
+  }
+  symbolCount = 0;
+  InnerSymbolTable::walkSymbols(im, [&](StringAttr, const InnerSymTarget &) { ++symbolCount; });
+  require(symbolCount == 2 && ic->getAttr("test.stable_refs") == internalRefs,
+          "temporary internal symbols leaked or native references changed");
+  before = dump(*internal);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*internal, ic, error)) &&
+              dump(*internal) == before, "internal lowering is not idempotent");
+  for (auto bad : {annotation("~Top|Top>agg.v[1]", "bad"),
+                   annotation("~Top|Top>state.absent", "bad"),
+                   annotation("~Top|Top>alias.a", "bad-event",
+                              goldengate::AnnotationClasses::AutoCounter)}) {
+    auto invalid = parseSourceString<ModuleOp>(internalFixture, &context);
+    auto circuit = *invalid->getOps<CircuitOp>().begin();
+    circuit->setAttr("rawAnnotations", b.getArrayAttr({internalAnnotations.front(), bad}));
+    before = dump(*invalid);
+    require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, circuit, error)) &&
+                dump(*invalid) == before, "invalid internal selector mutated IR");
+  }
+  llvm::outs() << "DontTouch aggregates expand in declaration order; fields, flips and unrelated targets preserved; three invalid selectors reject atomically; namespace collisions follow leaf identities and preserve native InnerRefs without temporary symbol leakage; internal wire/node/register targets expand and follow declaration namespace renames\n";
 
 }
 } // namespace

@@ -3,6 +3,67 @@
 
 using namespace circt::firrtl;
 
+namespace {
+// Select a typed local reference using CIRCT field IDs. Ports and internal
+// declarations share the same bundle/vector path semantics.
+bool selectField(FIRRTLBaseType &type, llvm::StringRef path,
+                 uint64_t &fieldID, std::string &groundName,
+                 std::string &error) {
+  while (!path.empty()) {
+    if (path.consume_front(".")) {
+      auto end = path.find_first_of(".[");
+      llvm::StringRef field = path.take_front(end);
+      if (field.empty()) {
+        error = "empty aggregate field in target";
+        return false;
+      }
+      if (auto bundle = mlir::dyn_cast<BundleType>(type)) {
+        auto index = bundle.getElementIndex(field);
+        if (!index) {
+          error = "target bundle field does not exist: " + field.str();
+          return false;
+        }
+        fieldID += bundle.getFieldID(*index);
+        type = bundle.getElements()[*index].type;
+      } else if (auto vector = mlir::dyn_cast<FVectorType>(type)) {
+        unsigned index;
+        if (field.getAsInteger(10, index) ||
+            index >= vector.getNumElements()) {
+          error = "target vector index is invalid: " + field.str();
+          return false;
+        }
+        fieldID += vector.getFieldID(index);
+        type = vector.getElementType();
+      } else {
+        error = "target selects a field of a ground value";
+        return false;
+      }
+      groundName += "_" + field.str();
+      path = path.drop_front(field.size());
+    } else if (path.consume_front("[")) {
+      auto close = path.find(']');
+      llvm::StringRef indexText = path.take_front(close);
+      auto vector = mlir::dyn_cast<FVectorType>(type);
+      unsigned index;
+      if (!vector || close == llvm::StringRef::npos ||
+          indexText.getAsInteger(10, index) ||
+          index >= vector.getNumElements()) {
+        error = "target vector index is invalid: " + indexText.str();
+        return false;
+      }
+      fieldID += vector.getFieldID(index);
+      type = vector.getElementType();
+      groundName += "_" + indexText.str();
+      path = path.drop_front(close + 1);
+    } else {
+      error = "invalid aggregate target path";
+      return false;
+    }
+  }
+  return true;
+}
+} // namespace
+
 std::optional<goldengate::GGTarget>
 goldengate::resolveAnnotationTarget(CircuitOp circuit, llvm::StringRef spelling,
                                     std::string &error) {
@@ -49,58 +110,9 @@ goldengate::resolveAnnotationTarget(CircuitOp circuit, llvm::StringRef spelling,
     }
     uint64_t fieldID = 0;
     std::string groundName = portName.str();
-    llvm::StringRef path = portAndPath.drop_front(portName.size());
-    while (!path.empty()) {
-      if (path.consume_front(".")) {
-        auto end = path.find_first_of(".[");
-        llvm::StringRef field = path.take_front(end);
-        if (field.empty()) {
-          error = "empty aggregate field in target";
-          return std::nullopt;
-        }
-        if (auto bundle = mlir::dyn_cast<BundleType>(type)) {
-          auto index = bundle.getElementIndex(field);
-          if (!index) {
-            error = "target bundle field does not exist: " + field.str();
-            return std::nullopt;
-          }
-          fieldID += bundle.getFieldID(*index);
-          type = bundle.getElements()[*index].type;
-        } else if (auto vector = mlir::dyn_cast<FVectorType>(type)) {
-          unsigned index;
-          if (field.getAsInteger(10, index) ||
-              index >= vector.getNumElements()) {
-            error = "target vector index is invalid: " + field.str();
-            return std::nullopt;
-          }
-          fieldID += vector.getFieldID(index);
-          type = vector.getElementType();
-        } else {
-          error = "target selects a field of a ground port";
-          return std::nullopt;
-        }
-        groundName += "_" + field.str();
-        path = path.drop_front(field.size());
-      } else if (path.consume_front("[")) {
-        auto close = path.find(']');
-        llvm::StringRef indexText = path.take_front(close);
-        auto vector = mlir::dyn_cast<FVectorType>(type);
-        unsigned index;
-        if (!vector || close == llvm::StringRef::npos ||
-            indexText.getAsInteger(10, index) ||
-            index >= vector.getNumElements()) {
-          error = "target vector index is invalid: " + indexText.str();
-          return std::nullopt;
-        }
-        fieldID += vector.getFieldID(index);
-        type = vector.getElementType();
-        groundName += "_" + indexText.str();
-        path = path.drop_front(close + 1);
-      } else {
-        error = "invalid aggregate target path";
-        return std::nullopt;
-      }
-    }
+    if (!selectField(type, portAndPath.drop_front(portName.size()), fieldID,
+                     groundName, error))
+      return std::nullopt;
     return GGTarget{circuit, module, i, fieldID, std::move(groundName)};
   }
   error = "target port does not exist: " + portName.str();
@@ -152,4 +164,29 @@ mlir::Operation *goldengate::resolveInternalAnnotationTarget(
     error = "target declaration does not exist: " +
             moduleAndRef.second.str();
   return match;
+}
+
+std::optional<goldengate::GGInternalTarget>
+goldengate::resolveInternalFieldTarget(CircuitOp circuit,
+                                        llvm::StringRef spelling,
+                                        std::string &error) {
+  auto split = spelling.split('>');
+  auto local = split.second;
+  auto root = local.take_front(local.find_first_of(".["));
+  auto *op = resolveInternalAnnotationTarget(
+      circuit, split.first.str() + ">" + root.str(), error);
+  if (!op)
+    return std::nullopt;
+  // Memory references need separate multi-result/data-field target handling.
+  if (!mlir::isa<NodeOp, WireOp, RegOp, RegResetOp>(op)) {
+    error = "target is not a wire, node, or register";
+    return std::nullopt;
+  }
+  auto type = mlir::dyn_cast<FIRRTLBaseType>(op->getResult(0).getType());
+  uint64_t fieldID = 0;
+  std::string groundName = root.str();
+  if (!type || !selectField(type, local.drop_front(root.size()), fieldID,
+                            groundName, error))
+    return std::nullopt;
+  return GGInternalTarget{op->getParentOfType<FModuleOp>(), op, fieldID, type};
 }

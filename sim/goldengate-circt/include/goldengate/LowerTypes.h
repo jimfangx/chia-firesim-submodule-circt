@@ -7,11 +7,11 @@
 
 namespace goldengate {
 // Resolve CHIRRTL and infer widths/resets before lowering aggregate operations.
-// Expand retained DontTouch port targets to all selected ground descendants,
-// preserving annotation fields and declaration order. AutoCounter event
+// Expand retained DontTouch port, wire, node, and register targets to all
+// selected ground descendants, preserving fields and declaration order. Event
 // selectors must select one ground value. Leaf inner symbols carry identity
-// through expansion and namespace renames. Module/instance port names stay
-// consistent; temporary identities are removed afterward.
+// through expansion and namespace renames. Declaration names are unique,
+// module/instance interfaces agree, and temporary identities are removed.
 // Native aggregate inner symbols remain subject to CIRCT LowerTypes validation.
 mlir::LogicalResult lowerTypesWithRetainedTargets(
     mlir::ModuleOp module, circt::firrtl::CircuitOp circuit,

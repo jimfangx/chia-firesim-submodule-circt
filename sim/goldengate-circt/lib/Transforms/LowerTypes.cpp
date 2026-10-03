@@ -17,33 +17,35 @@ namespace {
 // SFC DestructTypes records each aggregate reference as referring to all of
 // its ground children. Walk the selected CIRCT subtype in declaration order,
 // including vector indices, to apply that one-to-many rename to raw metadata.
-struct GroundPortTarget {
+struct GroundTarget {
   FModuleLike module;
-  unsigned port;
+  std::optional<unsigned> port;
+  Operation *declaration;
   uint64_t fieldID;
   StringAttr symbol;
 };
 
-void collectGroundPorts(FIRRTLBaseType type, FModuleLike module, unsigned port,
-                        uint64_t fieldID,
-                        SmallVectorImpl<GroundPortTarget> &targets) {
+void collectGroundTargets(FIRRTLBaseType type, FModuleLike module,
+                          std::optional<unsigned> port, Operation *declaration,
+                          uint64_t fieldID,
+                          SmallVectorImpl<GroundTarget> &targets) {
   if (auto bundle = dyn_cast<BundleType>(type)) {
     for (auto [i, element] : llvm::enumerate(bundle.getElements()))
-      collectGroundPorts(element.type, module, port,
-                         fieldID + bundle.getFieldID(i), targets);
+      collectGroundTargets(element.type, module, port, declaration,
+                           fieldID + bundle.getFieldID(i), targets);
   } else if (auto vector = dyn_cast<FVectorType>(type)) {
     for (unsigned i = 0; i < vector.getNumElements(); ++i)
-      collectGroundPorts(vector.getElementType(), module, port,
-                         fieldID + vector.getFieldID(i), targets);
+      collectGroundTargets(vector.getElementType(), module, port, declaration,
+                           fieldID + vector.getFieldID(i), targets);
   } else {
-    targets.push_back({module, port, fieldID, {}});
+    targets.push_back({module, port, declaration, fieldID, {}});
   }
 }
-// LowerTypes can leave duplicate portNames even though its printed SSA names
-// are distinct. Reserve all existing spellings, then rename duplicate ports in
-// declaration order using CIRCT's namespace. Instances bind by result index;
-// update their portNames as well so exported FIRRTL connects the same leaves.
-void uniquifyLoweredPortNames(CircuitOp circuit) {
+// LowerTypes can leave duplicate declaration/port names even though its
+// printed SSA names are distinct. Reserve all existing spellings, then rename
+// duplicates in declaration order using CIRCT's namespace. Instances bind by
+// result index; update their portNames so exported connects use the same leaves.
+void uniquifyLoweredNames(CircuitOp circuit) {
   llvm::DenseMap<StringAttr, ArrayAttr> renamed;
   for (auto owner : circuit.getOps<FModuleLike>()) {
     circt::Namespace names;
@@ -52,12 +54,28 @@ void uniquifyLoweredPortNames(CircuitOp circuit) {
     for (auto attr : original)
       if (seen.insert(attr).second)
         names.newName(cast<StringAttr>(attr).getValue());
+    SmallVector<Operation *> declarations;
+    owner->walk([&](Operation *op) {
+      if (isa<NodeOp, WireOp, RegOp, RegResetOp, MemOp, InstanceOp,
+              InstanceChoiceOp>(op)) {
+        declarations.push_back(op);
+        auto name = op->getAttrOfType<StringAttr>("name");
+        if (seen.insert(name).second)
+          names.newName(name.getValue());
+      }
+    });
     seen.clear();
     SmallVector<Attribute> ports;
     for (auto attr : original)
       ports.push_back(seen.insert(attr).second ? attr :
           StringAttr::get(circuit.getContext(),
                          names.newName(cast<StringAttr>(attr).getValue())));
+    for (auto *op : declarations) {
+      auto name = op->getAttrOfType<StringAttr>("name");
+      if (!seen.insert(name).second)
+        op->setAttr("name", StringAttr::get(circuit.getContext(),
+                                          names.newName(name.getValue())));
+    }
     auto updated = ArrayAttr::get(circuit.getContext(), ports);
     if (updated != original) {
       owner->setAttr("portNames", updated);
@@ -87,8 +105,8 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   }
   const std::string circuitName = circuit.getName().str();
   // An engaged, empty plan removes an annotation on an empty aggregate;
-  // an absent plan leaves unrelated or internal ground targets untouched.
-  SmallVector<std::optional<SmallVector<GroundPortTarget>>> replacements(raw.size());
+  // an absent plan leaves unrelated targets untouched.
+  SmallVector<std::optional<SmallVector<GroundTarget>>> replacements(raw.size());
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
@@ -113,12 +131,25 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         return failure();
       }
       replacements[index].emplace();
-      collectGroundPorts(type, target->module, *target->port, *target->fieldID,
-                         *replacements[index]);
+      collectGroundTargets(type, target->module, *target->port, nullptr,
+                           *target->fieldID, *replacements[index]);
       continue;
     }
-    // Preserve the handoff's internal ground AutoCounter events. Port events
-    // above follow namespace renames just like selected aggregate leaves.
+    if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
+                                                   resolutionError)) {
+      if (autoCounter && !internal->type.isGround()) {
+        error = "AutoCounter event target must select a ground value: " +
+                spelling.getValue().str();
+        return failure();
+      }
+      replacements[index].emplace();
+      collectGroundTargets(internal->type, internal->module, std::nullopt,
+                           internal->declaration, internal->fieldID,
+                           *replacements[index]);
+      continue;
+    }
+    // Preserve the handoff's unresolved ground AutoCounter metadata and
+    // root-only memory DontTouches; memory selectors need a separate port map.
     if (autoCounter && !local.contains('.') && !local.contains('['))
       continue;
     if (autoCounter ||
@@ -141,7 +172,10 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     if (!replacement)
       continue;
     for (auto &target : *replacement) {
-      auto symbols = target.module.getPortSymbolAttr(target.port);
+      auto symbols = target.port
+          ? target.module.getPortSymbolAttr(*target.port)
+          : cast<circt::hw::InnerSymbolOpInterface>(target.declaration)
+                .getInnerSymAttr();
       if (symbols)
         target.symbol = symbols.getSymIfExists(target.fieldID);
       if (target.symbol)
@@ -154,16 +188,21 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
       properties.push_back(circt::hw::InnerSymPropertiesAttr::get(
           module.getContext(), target.symbol, target.fieldID,
           StringAttr::get(module.getContext(), "private")));
-      target.module.setPortSymbolsAttr(target.port,
-          circt::hw::InnerSymAttr::get(module.getContext(), properties));
+      auto updated = circt::hw::InnerSymAttr::get(module.getContext(), properties);
+      if (target.port)
+        target.module.setPortSymbolsAttr(*target.port, updated);
+      else
+        cast<circt::hw::InnerSymbolOpInterface>(target.declaration)
+            .setInnerSymbolAttr(updated);
       temporarySymbols[target.module].push_back(target.symbol);
     }
   }
   // Remove only identities introduced here, also on a downstream pass failure.
   // Existing symbol properties and native InnerRefs remain untouched.
   auto cleanup = llvm::make_scope_exit([&] {
-    for (auto &[op, names] : temporarySymbols) {
-      auto owner = cast<FModuleLike>(op);
+    for (auto &entry : temporarySymbols) {
+      auto owner = cast<FModuleLike>(entry.first);
+      auto &names = entry.second;
       for (unsigned port = 0; port < owner.getNumPorts(); ++port) {
         auto symbols = owner.getPortSymbolAttr(port);
         if (!symbols)
@@ -176,6 +215,23 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
           owner.setPortSymbolsAttr(port,
               circt::hw::InnerSymAttr::get(module.getContext(), properties));
       }
+      owner->walk([&](circt::hw::InnerSymbolOpInterface declaration) {
+        auto symbols = declaration.getInnerSymAttr();
+        if (!symbols)
+          return;
+        SmallVector<circt::hw::InnerSymPropertiesAttr> properties;
+        for (auto property : symbols)
+          if (!llvm::is_contained(names, property.getName()))
+            properties.push_back(property);
+        if (properties.size() != symbols.size()) {
+          if (properties.empty())
+            declaration->removeAttr(
+                circt::hw::InnerSymbolTable::getInnerSymbolAttrName());
+          else
+            declaration.setInnerSymbolAttr(
+                circt::hw::InnerSymAttr::get(module.getContext(), properties));
+        }
+      });
     }
   });
 
@@ -193,7 +249,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     return failure();
   }
 
-  uniquifyLoweredPortNames(circuit);
+  uniquifyLoweredNames(circuit);
   circt::hw::InnerSymbolTableCollection tables;
   SmallVector<Attribute> rewritten;
   rewritten.reserve(raw.size());
@@ -205,15 +261,28 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     for (auto &replacement : *replacements[index]) {
       auto lowered = tables.getInnerSymbolTable(replacement.module)
                          .lookup(replacement.symbol);
-      if (!lowered || !lowered.isPort() || lowered.getField() != 0 ||
-          !cast<FIRRTLBaseType>(replacement.module.getPortType(lowered.getPort())).isGround()) {
-        error = "LowerTypes did not preserve annotated ground port identity " +
+      if (!lowered || lowered.getField() != 0) {
+        error = "LowerTypes did not preserve annotated ground identity " +
                 replacement.symbol.getValue().str();
         return failure();
       }
+      FIRRTLBaseType type;
+      StringAttr name;
+      if (lowered.isPort()) {
+        type = dyn_cast<FIRRTLBaseType>(
+            replacement.module.getPortType(lowered.getPort()));
+        name = replacement.module.getPortNameAttr(lowered.getPort());
+      } else {
+        auto declaration = cast<circt::hw::InnerSymbolOpInterface>(lowered.getOp());
+        type = dyn_cast<FIRRTLBaseType>(declaration.getTargetResult().getType());
+        name = declaration->getAttrOfType<StringAttr>("name");
+      }
+      if (!type || !type.isGround() || !name) {
+        error = "LowerTypes annotated identity is not a named ground value";
+        return failure();
+      }
       auto spelling = "~" + circuitName + "|" +
-          replacement.module.getModuleName().str() + ">" +
-          replacement.module.getPortName(lowered.getPort()).str();
+          replacement.module.getModuleName().str() + ">" + name.getValue().str();
       Annotation annotation(attr);
       annotation.setMember("target", StringAttr::get(module.getContext(), spelling));
       rewritten.push_back(annotation.getAttr());

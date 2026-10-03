@@ -33,4 +33,16 @@ std::optional<GGTarget> resolveAnnotationTarget(circt::firrtl::CircuitOp circuit
 mlir::Operation *resolveInternalAnnotationTarget(
     circt::firrtl::CircuitOp circuit, llvm::StringRef spelling,
     std::string &error);
+
+// Typed local selectors for single-result declarations, kept separate from
+// the root-only resolver used by consumers of already lowered values.
+struct GGInternalTarget {
+  circt::firrtl::FModuleLike module;
+  mlir::Operation *declaration;
+  uint64_t fieldID;
+  circt::firrtl::FIRRTLBaseType type;
+};
+std::optional<GGInternalTarget> resolveInternalFieldTarget(
+    circt::firrtl::CircuitOp circuit, llvm::StringRef spelling,
+    std::string &error);
 } // namespace goldengate
