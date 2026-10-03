@@ -30,6 +30,95 @@
 using namespace mlir;
 using namespace circt;
 
+unsigned goldengate::normalizeMemoryInitialization(ModuleOp module) {
+  unsigned changed = 0;
+  auto isConstant = [](Value value, uint64_t expected) {
+    auto constant = value.getDefiningOp<hw::ConstantOp>();
+    return constant && constant.getValue().getLimitedValue() == expected;
+  };
+  module.walk([&](sv::ForOp rows) {
+    auto guard = dyn_cast<sv::IfDefProceduralOp>(rows->getParentOp());
+    if (!guard || guard.getCond().getName() != "RANDOMIZE_MEM_INIT" ||
+        rows->getBlock()->getParent() != &guard.getThenRegion() ||
+        !rows->getParentOfType<sv::InitialOp>())
+      return;
+    SmallVector<Operation *> body;
+    for (auto &op : rows->getRegion(0).front())
+      body.push_back(&op);
+    if (body.size() != 4 && body.size() != 5)
+      return;
+    auto chunks = dyn_cast<sv::ForOp>(body[0]);
+    auto element = dyn_cast<sv::ArrayIndexInOutOp>(body[body.size() - 3]);
+    auto word = dyn_cast<sv::ReadInOutOp>(body[body.size() - 2]);
+    auto store = dyn_cast<sv::BPAssignOp>(body.back());
+    if (!chunks || !element || !word || !store ||
+        store.getDest() != element.getResult() || store.getSrc() != word.getResult())
+      return;
+    auto memory = element.getInput().getDefiningOp<sv::RegOp>();
+    auto temporary = word.getInput().getDefiningOp<sv::RegOp>();
+    if (!memory || !temporary || memory.getName() != "Memory" ||
+        temporary.getName() != "_RANDOM_MEM")
+      return;
+    auto array = dyn_cast<hw::UnpackedArrayType>(memory.getElementType());
+    auto bits = dyn_cast<IntegerType>(temporary.getElementType());
+    if (!array || !bits || bits.getWidth() <= 32 ||
+        array.getElementType() != bits || !array.getNumElements() ||
+        !isConstant(rows.getLowerBound(), 0) ||
+        !isConstant(rows.getUpperBound(), array.getNumElements()) ||
+        !isConstant(rows.getStep(), 1) ||
+        !isConstant(chunks.getLowerBound(), 0) ||
+        !isConstant(chunks.getUpperBound(), bits.getWidth()) ||
+        !isConstant(chunks.getStep(), 32))
+      return;
+    Value index = rows.getInductionVar();
+    if (body.size() == 5) {
+      auto extract = dyn_cast<comb::ExtractOp>(body[1]);
+      if (!extract || extract.getInput() != index || extract.getLowBit() != 0 ||
+          extract.getResult().getType().getIntOrFloatBitWidth() !=
+              std::max(1u, llvm::Log2_64_Ceil(array.getNumElements())))
+        return;
+      index = extract.getResult();
+    }
+    if (element.getIndex() != index)
+      return;
+    SmallVector<Operation *> chunkBody;
+    for (auto &op : chunks->getRegion(0).front())
+      chunkBody.push_back(&op);
+    if (chunkBody.size() != 3)
+      return;
+    auto random = dyn_cast<sv::MacroRefExprSEOp>(chunkBody[0]);
+    auto part = dyn_cast<sv::IndexedPartSelectInOutOp>(chunkBody[1]);
+    auto fill = dyn_cast<sv::BPAssignOp>(chunkBody[2]);
+    if (!random || random.getMacroName() != "RANDOM" || random.getNumOperands() ||
+        random.getResult().getType() != IntegerType::get(module.getContext(), 32) ||
+        !part || !fill || part.getDecrement() ||
+        part.getInput() != temporary.getResult() ||
+        part.getBase() != chunks.getInductionVar() ||
+        part.getResult().getType().getElementType() != random.getResult().getType() ||
+        fill.getDest() != part.getResult() || fill.getSrc() != random.getResult() ||
+        !random.getResult().hasOneUse() || !part.getResult().hasOneUse() ||
+        !word.getResult().hasOneUse() || !element.getResult().hasOneUse() ||
+        !llvm::hasNItems(temporary.getResult().getUses(), 2))
+      return;
+
+    // SFC's {N{`RANDOM}} evaluates RANDOM once, then reuses that word for
+    // every row. Materialize the draw in a register so ExportVerilog cannot
+    // inline the side-effecting macro back into the chunk loop.
+    OpBuilder declarations(temporary);
+    auto seed = declarations.create<sv::RegOp>(temporary.getLoc(),
+        random.getResult().getType(), declarations.getStringAttr("_RANDOM_MEM_SEED"));
+    random->moveBefore(rows);
+    OpBuilder initialization(rows);
+    initialization.create<sv::BPAssignOp>(rows.getLoc(), seed, random.getResult());
+    OpBuilder readSeed(fill);
+    auto sampled = readSeed.create<sv::ReadInOutOp>(fill.getLoc(), seed);
+    fill.getSrcMutable().assign(sampled.getResult());
+    chunks->moveBefore(rows);
+    ++changed;
+  });
+  return changed;
+}
+
 unsigned goldengate::normalizeInitializationIndices(ModuleOp module) {
   unsigned changed = 0;
   module.walk([&](sv::IndexedPartSelectInOutOp select) {
@@ -229,6 +318,7 @@ LogicalResult goldengate::emitSimulatorRTL(ModuleOp source,
     return reject("cannot construct CIRCT simulator RTL pipeline");
   if (failed(passes.run(*lowered)))
     return reject("CIRCT simulator RTL lowering failed; see pass diagnostics");
+  normalizeMemoryInitialization(*lowered);
   normalizeInitializationIndices(*lowered);
   terminateUnusedInstanceOutputs(*lowered);
   if (failed(verify(*lowered)))
