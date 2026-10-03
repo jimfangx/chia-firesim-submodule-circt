@@ -31,6 +31,7 @@
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/PrintStubs.h"
 #include "goldengate/PrintWiring.h"
+#include "goldengate/GlobalResetWiring.h"
 #include "goldengate/BridgeAnalysis.h"
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/ChannelClockInfo.h"
@@ -203,8 +204,10 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
   bool synthesizeAutoCounterValues =
       argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf-values";
-  bool completeAutoCounterPrintSynthesis =
-      argc == 7 && llvm::StringRef(argv[6]) == "--complete-autocounter-print-synthesis";
+  bool wireAutoCounterPrintReset =
+      argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-reset";
+  bool completeAutoCounterPrintSynthesis = wireAutoCounterPrintReset ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--complete-autocounter-print-synthesis");
   bool synthesizeAutoCounterPrintChannels = completeAutoCounterPrintSynthesis ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-print-channels");
   bool completeAutoCounterPrintWiring = synthesizeAutoCounterPrintChannels ||
@@ -263,6 +266,7 @@ int main(int argc, char **argv) {
                     "--complete-autocounter-print-wiring | "
                     "--synthesize-autocounter-print-channels | "
                     "--complete-autocounter-print-synthesis | "
+                    "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3169,6 +3173,24 @@ int main(int argc, char **argv) {
             llvm::outs() << (completeAutoCounterPrintSynthesis
                 ? "Completed printf channels and bridge constructors\n"
                 : "Constructed printf field and reset channels; bridge parameters pending\n");
+            if (wireAutoCounterPrintReset) {
+              unsigned wiredResetSinks = 0;
+              if (failed(goldengate::wireLocalGlobalReset(circuit, wiredResetSinks, error)))
+                return fail("GlobalResetConditionWiring: " + error);
+              if (failed(mlir::verify(*module)))
+                return fail("GlobalResetConditionWiring produced invalid FIRRTL IR");
+              llvm::SmallString<256> resetIR(outputDir), resetAnnos(outputDir), resetFAME(outputDir);
+              llvm::sys::path::append(resetIR, "post-global-reset-wiring.mlir");
+              llvm::sys::path::append(resetAnnos, "post-global-reset-wiring-all.json");
+              llvm::sys::path::append(resetFAME, "post-global-reset-wiring.json");
+              llvm::raw_fd_ostream reset(resetIR, ec);
+              if (ec) return fail("cannot write global reset wiring IR: " + ec.message());
+              module->print(reset); reset << '\n';
+              if (failed(goldengate::emitAllAnnotations(circuit, resetAnnos, error)) ||
+                  failed(goldengate::emitFAMEAnnotations(circuit, resetFAME, error)))
+                return fail("cannot export global reset wiring annotations: " + error);
+              llvm::outs() << "Wired " << wiredResetSinks << " global reset sinks\n";
+            }
           }
         }
       }

@@ -49,6 +49,12 @@ struct AnnotationClasses {
       "midas.targetutils.SynthPrintfAnnotation";
   static constexpr llvm::StringLiteral GlobalResetSink =
       "midas.InternalGlobalResetConditionSink";
+  static constexpr llvm::StringLiteral GlobalResetSource =
+      "midas.InternalGlobalResetCondition";
+  static constexpr llvm::StringLiteral PublicGlobalResetSource =
+      "midas.targetutils.GlobalResetCondition";
+  static constexpr llvm::StringLiteral PublicGlobalResetSink =
+      "midas.targetutils.GlobalResetConditionSink";
   static constexpr llvm::StringLiteral PrintBridgeParameters =
       "midas.widgets.PrintBridgeParameters";
   static constexpr llvm::StringLiteral PrintBridgeModule =
