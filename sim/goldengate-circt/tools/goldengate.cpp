@@ -3169,6 +3169,8 @@ int main(int argc, char **argv) {
              llvm::SmallVector<goldengate::LocalChannelDependency>> byModule;
     std::map<std::string, llvm::SmallVector<std::string>> inputsByModule;
     std::map<std::string, llvm::SmallVector<std::string>> outputsByModule;
+    std::map<std::string, std::map<std::string, std::optional<std::string>>>
+        channelClocksByModule;
     std::set<std::string> clockChannelPorts;
     for (auto &row : *channelConnections) {
       auto *entry = row.getAsObject();
@@ -3191,6 +3193,13 @@ int main(int argc, char **argv) {
       auto direction = entry ? entry->getString("direction") : std::nullopt;
       if (!moduleName || !channelName || !direction)
         return fail("malformed channel port analysis");
+      auto *clock = entry->get("clock_port");
+      if (!clock || (!clock->getAsNull() && !clock->getAsString()))
+        return fail("malformed channel clock analysis");
+      channelClocksByModule[moduleName->str()][channelName->str()] =
+          clock->getAsString()
+              ? std::optional<std::string>(clock->getAsString()->str())
+              : std::nullopt;
       if (*direction == "input" &&
           !clockChannelPorts.count(channelName->str()))
         inputsByModule[moduleName->str()].push_back(channelName->str());
@@ -3234,38 +3243,76 @@ int main(int argc, char **argv) {
       if (!model)
         return fail("FAME model module missing: " + moduleName);
       std::string rewriteError;
-      // The current reference has a single target clock token and one
-      // host-clocked enable register. Resolve the two channel enable values
-      // from the clock port and register; the fired-state rewrite itself does
-      // not depend on the SFC expression that drove the original registers.
-      if (clockChannelPorts.size() != 1)
-        return fail("FAME fired-state boundary requires one target clock port");
-      llvm::StringRef clockName = *clockChannelPorts.begin();
-      std::string clockSinkName = (clockName + "_sink").str();
-      std::string clockEnableName = (clockName + "_enabled").str();
-      mlir::Value clockPort;
-      for (unsigned i = 0, n = model.getPorts().size(); i < n; ++i)
-        if (model.getPortName(i) == clockSinkName &&
-            model.getPortDirection(i) == Direction::In)
-          clockPort = model.getBodyBlock()->getArgument(i);
-      mlir::Value outputEnable;
-      model.walk([&](RegResetOp op) {
-        if (op.getName() == clockEnableName)
-          outputEnable = op.getResult();
-      });
-      if (!clockPort || !outputEnable)
-        return fail("FAME clock port or enable register missing in " +
-                    moduleName);
+      // No explicit target-clock channel denotes a non-hub single-clock
+      // model. SFC gives its VirtualClockChannel constant valid/enable bits.
+      // Preserve each data channel's optional clock association: Some(clock)
+      // inputs reset fired, whereas None channels reset unfired.
+      if (clockChannelPorts.size() > 1)
+        return fail("FAME control boundary supports one target clock channel");
+      bool virtualClock = clockChannelPorts.empty();
+      llvm::StringRef clockName = virtualClock ? llvm::StringRef()
+                                               : *clockChannelPorts.begin();
+      mlir::Value inputEnable, outputEnable;
       mlir::OpBuilder builder(&model.getBodyBlock()->front());
-      mlir::Value clockBits =
-          builder.create<SubfieldOp>(model.getLoc(), clockPort, "bits");
-      mlir::Value inputEnable =
-          builder.create<AsUIntPrimOp>(model.getLoc(), clockBits).getResult();
+      if (virtualClock) {
+        std::set<std::string> clocks;
+        for (const auto &[name, clock] : channelClocksByModule[moduleName])
+          if (clock)
+            clocks.insert(*clock);
+        if (clocks.size() > 1)
+          return fail("virtual-clock model has multiple channel clocks: " +
+                      moduleName);
+        inputEnable = builder.create<ConstantOp>(
+            model.getLoc(), UIntType::get(&context, 1), llvm::APInt(1, 1));
+      } else {
+        std::string clockSinkName = (clockName + "_sink").str();
+        std::string clockEnableName = (clockName + "_enabled").str();
+        mlir::Value clockPort;
+        for (unsigned i = 0, n = model.getPorts().size(); i < n; ++i)
+          if (model.getPortName(i) == clockSinkName &&
+              model.getPortDirection(i) == Direction::In)
+            clockPort = model.getBodyBlock()->getArgument(i);
+        model.walk([&](RegResetOp op) {
+          if (op.getName() == clockEnableName)
+            outputEnable = op.getResult();
+        });
+        if (!clockPort || !outputEnable)
+          return fail("FAME clock port or enable register missing in " +
+                      moduleName);
+        mlir::Value clockBits =
+            builder.create<SubfieldOp>(model.getLoc(), clockPort, "bits");
+        inputEnable =
+            builder.create<AsUIntPrimOp>(model.getLoc(), clockBits).getResult();
+      }
       llvm::SmallVector<goldengate::FAMEFiredChannel> firedChannels;
+      auto addFiredChannel = [&](const std::string &name, bool isInput) {
+        const auto &clock = channelClocksByModule[moduleName].at(name);
+        if (!clock && !virtualClock) {
+          rewriteError = "channel has no associated clock: " + name;
+          return false;
+        }
+        mlir::Value enable = inputEnable;
+        if (clock && !isInput) {
+          enable = outputEnable;
+          if (virtualClock)
+            model.walk([&](RegResetOp op) {
+              if (op.getName() == *clock + "_enabled")
+                enable = op.getResult();
+            });
+          if (!enable) {
+            rewriteError = "missing buffered channel clock enable for " + name;
+            return false;
+          }
+        }
+        firedChannels.push_back({name, isInput, enable, bool(clock)});
+        return true;
+      };
       for (const auto &name : inputsByModule[moduleName])
-        firedChannels.push_back({name, true, inputEnable});
+        if (!addFiredChannel(name, true))
+          return fail("FAME fired-state metadata: " + rewriteError);
       for (const auto &name : outputsByModule[moduleName])
-        firedChannels.push_back({name, false, outputEnable});
+        if (!addFiredChannel(name, false))
+          return fail("FAME fired-state metadata: " + rewriteError);
       if (mlir::failed(goldengate::ensureFAMEFiredRegisters(
               model, firedChannels, rewriteError)))
         return fail("FAME fired-register creation: " + rewriteError);

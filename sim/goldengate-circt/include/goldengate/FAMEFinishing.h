@@ -11,7 +11,12 @@ namespace goldengate {
 // fired or can fire now, and the target clock token is valid. The clock token
 // becomes ready when all data channels can advance. Existing FIRRTL connects
 // for the finishing wire and clock ready field are replaced in place.
-// Annotations consumed/produced: none.
+// An empty clockChannel explicitly selects SFC VirtualClockChannel: clock
+// valid is constant one and no clock-ready connect or port is created.
+// Requires decoupled data ports with one-bit fired registers and resolved
+// module-body connect semantics. All data ports must be listed exactly once.
+// Annotations consumed/produced: none. Analyses required/preserved: none.
+// Output: finishing is driven by all data conditions AND clock valid.
 mlir::LogicalResult rewriteFAMEFinishing(
     circt::firrtl::FModuleOp module,
     llvm::ArrayRef<std::string> inputChannels,

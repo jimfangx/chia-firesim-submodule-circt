@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEFiredState.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "goldengate/FAMEFinishing.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
@@ -8,6 +9,7 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include <map>
 #include <stdexcept>
 
 using namespace mlir;
@@ -23,8 +25,8 @@ std::string dump(Operation *op) {
   op->print(out);
   return text;
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
-  return parseSourceString<ModuleOp>(R"mlir(
+OwningOpRef<ModuleOp> fixture(MLIRContext &context, bool clockToken = false) {
+  std::string text = R"mlir(
     module { firrtl.circuit "Model" {
       firrtl.module @Model(in %hostClock: !firrtl.clock,
         in %hostReset: !firrtl.uint<1>, in %enable: !firrtl.uint<1>,
@@ -37,8 +39,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         firrtl.strictconnect %targetCycleFinishing, %done : !firrtl.uint<1>
       }
     } }
-  )mlir",
-                                     &context);
+  )mlir";
+  if (clockToken) {
+    auto pos = text.find(") {");
+    text.insert(pos,
+                ", in %tick_sink: !firrtl.bundle<ready flip: uint<1>, valid: "
+                "uint<1>, bits: clock>");
+  }
+  return parseSourceString<ModuleOp>(text, &context);
 }
 FModuleOp model(ModuleOp root) {
   auto circuit = *root.getOps<CircuitOp>().begin();
@@ -187,6 +195,254 @@ void rejections(MLIRContext &context) {
   llvm::outs()
       << "Passed seven atomic reset/host-control/virtual-enable rejections\n";
 }
+// FAMETransform topRules: VirtualClockChannel.isValid = 1 and
+// VirtualClockChannel.setReady = EmptyStmt. Exercise the same data predicate
+// with both a real clock token and the virtual channel.
+void finishingBehavior(MLIRContext &context) {
+  unsigned cases = 0;
+  for (bool clockToken : {false, true}) {
+    auto root = fixture(context, clockToken);
+    require(bool(root), "finishing fixture parse failed");
+    auto m = model(*root);
+    auto cs = channels(m);
+    std::string error;
+    require(succeeded(goldengate::ensureFAMEFiredRegisters(m, cs, error)),
+            error.c_str());
+    unsigned ports = m.getNumPorts();
+    require(
+        succeeded(goldengate::rewriteFAMEFinishing(m,
+                                                   {"input", "virtualInput"},
+                                                   {"output", "virtualOutput"},
+                                                   clockToken ? "tick" : "",
+                                                   error)),
+        error.c_str());
+    require(succeeded(verify(*root)), "finishing IR failed verification");
+    require(m.getNumPorts() == ports, "virtual clock created a model port");
+    Value next, clockReady;
+    for (auto c : m.getOps<StrictConnectOp>()) {
+      if (auto w = c.getDest().getDefiningOp<WireOp>();
+          w && w.getName() == "targetCycleFinishing")
+        next = c.getSrc();
+      if (auto f = c.getDest().getDefiningOp<SubfieldOp>();
+          clockToken && f && f.getInput() == m.getBodyBlock()->getArgument(8) &&
+          f.getFieldName() == "ready")
+        clockReady = c.getSrc();
+    }
+    require(bool(next) && bool(clockReady) == clockToken,
+            "wrong finishing/clock ready controls");
+    for (unsigned flags = 0; flags < (clockToken ? 512u : 256u); ++flags) {
+      unsigned inputValid = flags & 1, virtualValid = (flags >> 1) & 1;
+      unsigned outFired = (flags >> 2) & 1, outReady = (flags >> 3) & 1,
+               outValid = (flags >> 4) & 1;
+      unsigned virtualFired = (flags >> 5) & 1, virtualReady = (flags >> 6) & 1,
+               virtualOutValid = (flags >> 7) & 1;
+      unsigned tickValid = clockToken ? (flags >> 8) & 1 : 1;
+      llvm::DenseMap<Value, unsigned> values;
+      for (auto r : m.getOps<RegResetOp>()) {
+        if (r.getName() == "output_fired_0")
+          values[r.getResult()] = outFired;
+        if (r.getName() == "virtualOutput_fired_0")
+          values[r.getResult()] = virtualFired;
+      }
+      for (auto f : m.getOps<SubfieldOp>()) {
+        auto port = dyn_cast<BlockArgument>(f.getInput());
+        if (!port)
+          continue;
+        unsigned i = port.getArgNumber();
+        if (i == 4 && f.getFieldName() == "valid")
+          values[f.getResult()] = inputValid;
+        if (i == 6 && f.getFieldName() == "valid")
+          values[f.getResult()] = virtualValid;
+        if (i == 5)
+          values[f.getResult()] =
+              f.getFieldName() == "ready" ? outReady : outValid;
+        if (i == 7)
+          values[f.getResult()] =
+              f.getFieldName() == "ready" ? virtualReady : virtualOutValid;
+        if (i == 8 && f.getFieldName() == "valid")
+          values[f.getResult()] = tickValid;
+      }
+      unsigned dataReady = inputValid & virtualValid &
+                           (outFired | (outReady & outValid)) &
+                           (virtualFired | (virtualReady & virtualOutValid));
+      require(eval(next, values) == (dataReady & tickValid),
+              "finishing differs from SFC topRules");
+      if (clockToken)
+        require(eval(clockReady, values) == dataReady,
+                "clock ready must not depend on clock valid");
+      ++cases;
+    }
+  }
+  for (unsigned bad = 0; bad < 6; ++bad) {
+    auto root = fixture(context, bad == 3 || bad == 5);
+    require(bool(root), "rejection fixture parse failed");
+    auto m = model(*root);
+    auto cs = channels(m);
+    if (bad == 5)
+      cs.push_back({"tick", true, m.getBodyBlock()->getArgument(2)});
+    std::string error;
+    require(succeeded(goldengate::ensureFAMEFiredRegisters(m, cs, error)),
+            error.c_str());
+    SmallVector<std::string> inputs{"input", "virtualInput"},
+        outputs{"output", "virtualOutput"};
+    if (bad == 0)
+      inputs.pop_back();
+    if (bad == 1)
+      inputs.push_back("input");
+    if (bad == 4)
+      outputs.pop_back();
+    if (bad == 5)
+      inputs.push_back("tick");
+    auto before = dump(*root);
+    require(failed(goldengate::rewriteFAMEFinishing(
+                m, inputs, outputs, bad == 2 ? "missing" : "", error)) &&
+                !error.empty(),
+            "invalid finishing channel coverage accepted");
+    require(before == dump(*root), "failed finishing rewrite mutated IR");
+  }
+  llvm::outs() << "Passed " << cases
+               << " clocked/virtual completion cases and six atomic coverage "
+                  "rejections\n";
+}
+// Emit named boolean operations for a structured comparison with optimized
+// SFC RTL. This preserves operands and channel identity while ignoring SSA IDs.
+std::string predicate(FModuleOp m, Value value) {
+  if (auto f = value.getDefiningOp<SubfieldOp>()) {
+    if (auto port = dyn_cast<BlockArgument>(f.getInput()))
+      return m.getPortName(port.getArgNumber()).str() + "_" +
+             f.getFieldName().str();
+  }
+  if (auto r = value.getDefiningOp<RegResetOp>())
+    return r.getName().str();
+  if (auto c = value.getDefiningOp<ConstantOp>())
+    return std::to_string(c.getValue().getZExtValue());
+  if (auto a = value.getDefiningOp<AndPrimOp>())
+    return "(" + predicate(m, a.getLhs()) + " & " + predicate(m, a.getRhs()) +
+           ")";
+  if (auto o = value.getDefiningOp<OrPrimOp>())
+    return "(" + predicate(m, o.getLhs()) + " | " + predicate(m, o.getRhs()) +
+           ")";
+  throw std::runtime_error("unexpected completion operation");
+}
+void virtualControls(MLIRContext &context, const char *path) {
+  auto root = parseSourceFile<ModuleOp>(path, &context);
+  require(bool(root), "virtual control boundary parse failed");
+  auto m = model(*root);
+  require(m.getNumPorts() == 6, "virtual clock gained a model port");
+  std::map<std::string, Value> registers, ports;
+  for (auto r : m.getOps<RegResetOp>()) {
+    registers[r.getName().str()] = r.getResult();
+    if (r.getName().ends_with("_fired_0"))
+      require(eval(r.getResetValue(), {}) ==
+                  unsigned(r.getName() == "input_fired_0"),
+              "clock association did not select the SFC reset value");
+  }
+  require(registers.size() == 5, "missing channel state or clock buffer");
+  for (unsigned i = 0; i < m.getNumPorts(); ++i)
+    ports[m.getPortName(i).str()] = m.getBodyBlock()->getArgument(i);
+  auto drive = [&](Value dest) -> Value {
+    auto sameDestination = [&](Value candidate) {
+      if (dest == candidate)
+        return true;
+      auto a = dest.getDefiningOp<SubfieldOp>();
+      auto b = candidate.getDefiningOp<SubfieldOp>();
+      return a && b && a.getInput() == b.getInput() &&
+             a.getFieldIndex() == b.getFieldIndex();
+    };
+    for (auto c : m.getOps<ConnectOp>())
+      if (sameDestination(c.getDest()))
+        return c.getSrc();
+    for (auto c : m.getOps<StrictConnectOp>())
+      if (sameDestination(c.getDest()))
+        return c.getSrc();
+    throw std::runtime_error("control destination is undriven");
+  };
+  Value finishing;
+  for (auto w : m.getOps<WireOp>())
+    if (w.getName() == "targetCycleFinishing")
+      finishing = w.getResult();
+  require(bool(finishing), "missing virtual cycle completion");
+  for (unsigned flags = 0; flags < 256; ++flags) {
+    unsigned inValid = flags & 1, virtualValid = (flags >> 1) & 1;
+    unsigned fired = (flags >> 2) & 1, virtualFired = (flags >> 3) & 1;
+    unsigned ready = (flags >> 4) & 1, virtualReady = (flags >> 5) & 1;
+    unsigned inFired = (flags >> 6) & 1, virtualInFired = (flags >> 7) & 1;
+    unsigned outValid = inValid & !fired,
+             virtualOutValid = virtualValid & !virtualFired;
+    unsigned complete = inValid & virtualValid & (fired | ready) &
+                        (virtualFired | virtualReady);
+    llvm::DenseMap<Value, unsigned> values{
+        {finishing, complete},
+        {registers.at("input_fired_0"), inFired},
+        {registers.at("virtualInput_fired_0"), virtualInFired},
+        {registers.at("output_fired_0"), fired},
+        {registers.at("virtualOutput_fired_0"), virtualFired}};
+    for (auto f : m.getOps<SubfieldOp>()) {
+      if (f.getFieldName() == "valid") {
+        if (f.getInput() == ports.at("input_sink"))
+          values[f.getResult()] = inValid;
+        if (f.getInput() == ports.at("virtualInput_sink"))
+          values[f.getResult()] = virtualValid;
+        if (f.getInput() == ports.at("output_source"))
+          values[f.getResult()] = outValid;
+        if (f.getInput() == ports.at("virtualOutput_source"))
+          values[f.getResult()] = virtualOutValid;
+      }
+      if (f.getFieldName() == "ready") {
+        if (f.getInput() == ports.at("output_source"))
+          values[f.getResult()] = ready;
+        if (f.getInput() == ports.at("virtualOutput_source"))
+          values[f.getResult()] = virtualReady;
+        if (f.getInput() == ports.at("input_sink"))
+          values[f.getResult()] = complete & !inFired;
+        if (f.getInput() == ports.at("virtualInput_sink"))
+          values[f.getResult()] = complete & !virtualInFired;
+      }
+    }
+    for (unsigned enabled = 0; enabled < 2; ++enabled) {
+      values[registers.at("target_enabled")] = enabled;
+      auto transition = [&](const char *name,
+                            unsigned old,
+                            unsigned handshake,
+                            unsigned enable) {
+        require(eval(drive(registers.at(name)), values) ==
+                    (complete ? !enable : old | handshake),
+                "compiler-emitted fired transition has wrong clock enable");
+      };
+      transition("input_fired_0", inFired, inValid & (complete & !inFired), 1);
+      transition("virtualInput_fired_0",
+                 virtualInFired,
+                 virtualValid & (complete & !virtualInFired),
+                 1);
+      transition("output_fired_0", fired, ready & outValid, enabled);
+      transition("virtualOutput_fired_0",
+                 virtualFired,
+                 virtualReady & virtualOutValid,
+                 1);
+    }
+    require(eval(drive(finishing), values) == complete,
+            "virtual finishing differs from SFC topRules");
+    for (auto f : m.getOps<SubfieldOp>()) {
+      Value port = f.getInput();
+      if (f.getFieldName() == "valid" && port == ports.at("output_source"))
+        require(eval(drive(f.getResult()), values) == outValid,
+                "clocked output valid differs");
+      if (f.getFieldName() == "valid" &&
+          port == ports.at("virtualOutput_source"))
+        require(eval(drive(f.getResult()), values) == virtualOutValid,
+                "clockless output valid differs");
+      if (f.getFieldName() == "ready" && port == ports.at("input_sink"))
+        require(eval(drive(f.getResult()), values) == (complete & !inFired),
+                "clocked input ready differs");
+      if (f.getFieldName() == "ready" && port == ports.at("virtualInput_sink"))
+        require(eval(drive(f.getResult()), values) ==
+                    (complete & !virtualInFired),
+                "clockless input ready differs");
+    }
+  }
+  llvm::outs() << "Passed 256 compiler-emitted virtual channel-control cases "
+                  "and 2048 fired transitions\n";
+}
 void boundary(MLIRContext &context, const char *path) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
   require(bool(root), "candidate boundary parse failed");
@@ -225,6 +481,24 @@ void boundary(MLIRContext &context, const char *path) {
   require(before == dump(m), "oracle boundary register declaration changed");
   require(succeeded(goldengate::rewriteFAMEFiredStates(m, cs, error)),
           error.c_str());
+  SmallVector<std::string> inputs, outputs;
+  for (const auto &ch : cs)
+    (ch.isInput ? inputs : outputs).push_back(ch.name);
+  require(succeeded(goldengate::rewriteFAMEFinishing(
+              m, inputs, outputs, "clockBridge_clocks_0", error)),
+          error.c_str());
+  auto emitPredicate = [&](Value dest, Value src) {
+    if (auto w = dest.getDefiningOp<WireOp>();
+        w && w.getName() == "targetCycleFinishing")
+      llvm::outs() << "COMPLETION " << predicate(m, src) << "\n";
+    if (auto f = dest.getDefiningOp<SubfieldOp>();
+        f && f.getInput() == clockPort && f.getFieldName() == "ready")
+      llvm::outs() << "CLOCK_READY " << predicate(m, src) << "\n";
+  };
+  for (auto c : m.getOps<ConnectOp>())
+    emitPredicate(c.getDest(), c.getSrc());
+  for (auto c : m.getOps<StrictConnectOp>())
+    emitPredicate(c.getDest(), c.getSrc());
   require(succeeded(verify(m)), "candidate model failed verification");
   for (auto reg : m.getOps<RegResetOp>())
     if (reg.getName().ends_with("_fired_0")) {
@@ -294,10 +568,15 @@ int main(int argc, char **argv) {
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     behavior(context);
     rejections(context);
-    if (argc == 2)
+    finishingBehavior(context);
+    if (argc == 3 && std::string(argv[1]) == "--virtual-controls")
+      virtualControls(context, argv[2]);
+    else if (argc == 2)
       boundary(context, argv[1]);
     else
-      require(argc == 1, "usage: FAMEFiredStateTest [candidate.mlir]");
+      require(argc == 1,
+              "usage: FAMEFiredStateTest [candidate.mlir | --virtual-controls "
+              "candidate.mlir]");
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

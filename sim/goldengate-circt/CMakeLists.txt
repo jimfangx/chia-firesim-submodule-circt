@@ -152,7 +152,8 @@ target_link_libraries(goldengate-circt PRIVATE
 include(CTest)
 if(BUILD_TESTING)
   add_executable(goldengate-fame-fired-state-test
-    test/Transforms/FAMEFiredStateTest.cpp lib/Transforms/FAMEFiredState.cpp)
+    test/Transforms/FAMEFiredStateTest.cpp lib/Transforms/FAMEFiredState.cpp
+    lib/Transforms/FAMEFinishing.cpp)
   target_compile_features(goldengate-fame-fired-state-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fame-fired-state-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fame-fired-state-test PRIVATE
@@ -160,6 +161,15 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-fame-fired-state-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-fired-state COMMAND goldengate-fame-fired-state-test)
+  add_test(NAME goldengate-fame-virtual-clock-controls COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/virtual-clock-controls
+    --rewrite-fame-output-valid-from ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.json)
+  add_test(NAME goldengate-fame-virtual-clock-controls-check COMMAND goldengate-fame-fired-state-test
+    --virtual-controls ${CMAKE_CURRENT_BINARY_DIR}/virtual-clock-controls/output-valid.mlir)
+  set_tests_properties(goldengate-fame-virtual-clock-controls PROPERTIES FIXTURES_SETUP fame-virtual-controls)
+  set_tests_properties(goldengate-fame-virtual-clock-controls-check PROPERTIES FIXTURES_REQUIRED fame-virtual-controls)
   add_executable(goldengate-coerce-reset-test
     test/Transforms/CoerceAsyncToSyncResetTest.cpp
     lib/Transforms/CoerceAsyncToSyncReset.cpp lib/Support/SimulatorRTL.cpp)

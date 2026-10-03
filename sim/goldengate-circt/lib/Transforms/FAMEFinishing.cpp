@@ -65,8 +65,13 @@ LogicalResult goldengate::rewriteFAMEFinishing(
       return {};
     return module.getBodyBlock()->getArgument(found->second);
   };
-  Value clockPort = lookupPort((clockChannel + "_sink").str(), Direction::In);
-  if (!clockPort || !hasClockToken(clockPort)) {
+  // VirtualClockChannel has no model port, is always valid, and setReady
+  // emits no statement. An empty channel name explicitly selects that case.
+  bool virtualClock = clockChannel.empty();
+  Value clockPort;
+  if (!virtualClock)
+    clockPort = lookupPort((clockChannel + "_sink").str(), Direction::In);
+  if (!virtualClock && (!clockPort || !hasClockToken(clockPort))) {
     error = "missing Clock-typed target clock sink " + clockChannel.str();
     return failure();
   }
@@ -77,7 +82,9 @@ LogicalResult goldengate::rewriteFAMEFinishing(
   });
   // Scala selects a clock channel whose payload ports all have ClockType;
   // counting it again as a data input would make its valid gate appear twice.
-  std::set<std::string> seen{clockChannel.str()};
+  std::set<std::string> seen;
+  if (!virtualClock)
+    seen.insert(clockChannel.str());
   SmallVector<ChannelValues> inputs, outputs;
   auto collect = [&](llvm::ArrayRef<std::string> names, bool input,
                      SmallVectorImpl<ChannelValues> &values) -> bool {
@@ -90,6 +97,10 @@ LogicalResult goldengate::rewriteFAMEFinishing(
                               input ? Direction::In : Direction::Out);
       if (!port || !hasDecoupledFields(port)) {
         error = "missing decoupled FAME port for " + name;
+        return false;
+      }
+      if (input && hasClockToken(port)) {
+        error = "Clock-typed sink requires an explicit target clock channel: " + name;
         return false;
       }
       Value fired;
@@ -113,7 +124,9 @@ LogicalResult goldengate::rewriteFAMEFinishing(
   // The clock token and every converted data channel must participate in
   // cycle completion.  A missing channel would otherwise leave its ready or
   // valid handshake outside the finishing equation while producing valid IR.
-  llvm::DenseSet<Value> coveredPorts{clockPort};
+  llvm::DenseSet<Value> coveredPorts;
+  if (clockPort)
+    coveredPorts.insert(clockPort);
   for (const auto &channel : inputs)
     coveredPorts.insert(channel.port);
   for (const auto &channel : outputs)
@@ -135,7 +148,7 @@ LogicalResult goldengate::rewriteFAMEFinishing(
       ++finishingCount;
     }
     auto field = destination.getDefiningOp<SubfieldOp>();
-    if (field && field.getInput() == clockPort &&
+    if (clockPort && field && field.getInput() == clockPort &&
         field.getFieldName() == "ready") {
       clockReadyConnect = op;
       ++clockReadyCount;
@@ -154,7 +167,7 @@ LogicalResult goldengate::rewriteFAMEFinishing(
     error = "finishing and clock ready must be in the same FIRRTL block";
     return failure();
   }
-  if ((!finishingConnect || !clockReadyConnect) &&
+  if ((!finishingConnect || (!virtualClock && !clockReadyConnect)) &&
       ((finishingConnect &&
         finishingConnect->getBlock() != module.getBodyBlock()) ||
        (clockReadyConnect &&
@@ -197,7 +210,12 @@ LogicalResult goldengate::rewriteFAMEFinishing(
   if (!allReady)
     allReady = builder.create<ConstantOp>(
         loc, UIntType::get(module.getContext(), 1, false), APInt(1, 1));
-  Value clockValid = builder.create<SubfieldOp>(loc, clockPort, "valid");
+  Value clockValid;
+  if (virtualClock)
+    clockValid = builder.create<ConstantOp>(
+        loc, UIntType::get(module.getContext(), 1, false), APInt(1, 1));
+  else
+    clockValid = builder.create<SubfieldOp>(loc, clockPort, "valid");
   Value nextCycle = builder.create<AndPrimOp>(loc, allReady, clockValid);
   if (finishingConnect)
     finishingConnect->setOperand(1, nextCycle);
@@ -205,7 +223,7 @@ LogicalResult goldengate::rewriteFAMEFinishing(
     builder.create<StrictConnectOp>(loc, finishing, nextCycle);
   if (clockReadyConnect)
     clockReadyConnect->setOperand(1, allReady);
-  else {
+  else if (!virtualClock) {
     Value ready = builder.create<SubfieldOp>(loc, clockPort, "ready");
     builder.create<StrictConnectOp>(loc, ready, allReady);
   }

@@ -1,0 +1,49 @@
+{
+  "channel_connections": [],
+  "channel_ports": [
+    {
+      "module": "Model",
+      "name": "input",
+      "direction": "input",
+      "clock_port": "target"
+    },
+    {
+      "module": "Model",
+      "name": "virtualInput",
+      "direction": "input",
+      "clock_port": null
+    },
+    {
+      "module": "Model",
+      "name": "output",
+      "direction": "output",
+      "clock_port": "target"
+    },
+    {
+      "module": "Model",
+      "name": "virtualOutput",
+      "direction": "output",
+      "clock_port": null
+    }
+  ],
+  "local_channel_dependencies": [
+    {
+      "module": "Model",
+      "output_channel": "output",
+      "input_channels": [
+        "input"
+      ],
+      "unresolved_ports": [],
+      "unresolved_causes": []
+    },
+    {
+      "module": "Model",
+      "output_channel": "virtualOutput",
+      "input_channels": [
+        "virtualInput"
+      ],
+      "unresolved_ports": [],
+      "unresolved_causes": []
+    }
+  ]
+}
