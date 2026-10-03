@@ -39,7 +39,7 @@ jobs:
       needs-scala-doc: ${{ steps.filter.outputs.scala-docs }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -54,7 +54,7 @@ jobs:
     if: needs.change-filters.outputs.needs-scala-doc == 'true'
     runs-on: ubuntu-20.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/repo-setup
       - uses: ./.github/actions/build-scala-doc
       - name: "Push ScalaDoc to remote"

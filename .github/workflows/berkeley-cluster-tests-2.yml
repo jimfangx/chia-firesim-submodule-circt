@@ -63,7 +63,7 @@ jobs:
         ((steps.filter.outputs.conda-reqs == 'true') && (steps.filter.outputs.conda-lockfile == 'true')) }}
       run-cpp-lint: ${{ steps.filter.outputs.clang == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v3
         id: filter
         with:
@@ -114,7 +114,7 @@ jobs:
             rm -rf ${{ github.workspace }}/* || true
             rm -rf ${{ github.workspace }}/.* || true
             ls -alh .
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Setup repo copy
         run: |
           mkdir -p $(dirname ${{ env.REMOTE_WORK_DIR }})
@@ -135,7 +135,7 @@ jobs:
     if: ${{ contains(github.event.pull_request.labels.*.name, 'ci:disable-scala-tests') != true }}
     runs-on: local-fpga-shared # since this is a longer lived job, can run on either runner
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Precompile scala sources needed for tests
         run: ./.github/scripts/invoke-make.py "FIRESIM_SBT_PROJECT=firesim SBT_COMMAND=test:compile sbt"
 
@@ -144,7 +144,7 @@ jobs:
     needs: [start-scalatests]
     runs-on: local-fpga-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run firesimlib scala tests
         run: ./.github/scripts/invoke-make.py "FIRESIM_SBT_PROJECT=firesimLib test"
 
@@ -153,7 +153,7 @@ jobs:
     needs: [start-scalatests]
     runs-on: local-fpga-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run midas and midas-targetutils scala tests
         run: ./.github/scripts/invoke-make.py "FIRESIM_SBT_PROJECT=midas test"
 
@@ -162,7 +162,7 @@ jobs:
     needs: [start-scalatests]
     runs-on: local-fpga-shared # since this is a longer lived job, can run on either runner
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run CIGroupA Scala tests
         run: ./.github/scripts/invoke-make.py "SCALA_TEST=firesim.midasexamples.CIGroupA testOnly"
 
@@ -171,7 +171,7 @@ jobs:
     needs: [start-scalatests]
     runs-on: local-fpga-shared # since this is a longer lived job, can run on either runner
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run CIGroupB Scala tests
         run: ./.github/scripts/invoke-make.py "SCALA_TEST=firesim.midasexamples.CIGroupB testOnly"
 
@@ -180,7 +180,7 @@ jobs:
     needs: [start-scalatests]
     runs-on: local-fpga-2
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Run simple counter top-level example
         continue-on-error: true
         run: ./.github/scripts/invoke-make.py "TARGET_PROJECT=examples run-vcs" 2>&1 | tee out.log
