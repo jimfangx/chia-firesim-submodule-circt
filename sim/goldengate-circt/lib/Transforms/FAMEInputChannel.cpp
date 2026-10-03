@@ -2,6 +2,7 @@
 #include "goldengate/FAMEInputChannel.h"
 #include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Dialect/HW/HWTypeInterfaces.h"
 #include "circt/Support/InstanceGraph.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/APInt.h"
@@ -995,11 +996,31 @@ LogicalResult goldengate::internalizeFAMEUnusedOutputs(
     if (name.empty() || !index || removed.test(*index) ||
         ports[*index].direction != Direction::Out || !type ||
         !type.isPassive() || isa<ClockType>(type) ||
-        hasPortAnnotations(model, *index) || ports[*index].sym) {
-      error = "unused output must be a unique, passive, unannotated, "
-              "unsymbolized data output: " + name.str();
+        hasPortAnnotations(model, *index)) {
+      error = "unused output must be a unique, passive, unannotated "
+              "data output: " + name.str();
       return failure();
     }
+    // The wire has the identical type, so ground identities keep their field
+    // IDs. CIRCT LowerTypes cannot preserve symbols targeting aggregates.
+    // Validate both the range and target type before changing any IR.
+    auto fields = dyn_cast<circt::hw::FieldIDTypeInterface>(type);
+    uint64_t maxFieldID = fields ? fields.getMaxFieldID() : 0;
+    if (auto symbol = ports[*index].sym)
+      for (auto property : symbol) {
+        if (property.getFieldID() > maxFieldID) {
+          error = "unused output inner symbol has an invalid field ID: " +
+                  name.str();
+          return failure();
+        }
+        auto targetType = circt::hw::FieldIdImpl::getFinalTypeByFieldID(
+            type, property.getFieldID());
+        if (isa<BundleType, FVectorType>(targetType)) {
+          error = "unused output inner symbol targets an aggregate unsupported "
+                  "by LowerTypes: " + name.str();
+          return failure();
+        }
+      }
     // Replacing a port with a wire must preserve its local target identity.
     for (auto &op : *model.getBodyBlock())
       if (auto localName = op.getAttrOfType<StringAttr>("name"))
@@ -1051,6 +1072,8 @@ LogicalResult goldengate::internalizeFAMEUnusedOutputs(
     if (removed.test(i)) {
       auto wire = declarations.create<WireOp>(
           ports[i].loc, ports[i].type, ports[i].getName());
+      if (ports[i].sym)
+        wire.setInnerSymAttr(ports[i].sym);
       model.getBodyBlock()->getArgument(i).replaceAllUsesWith(wire.getResult());
     }
   for (auto instance : instances) {

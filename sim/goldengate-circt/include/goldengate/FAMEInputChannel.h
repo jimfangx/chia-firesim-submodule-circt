@@ -82,9 +82,12 @@ mlir::LogicalResult internalizeFAMEOutputClocks(
 
 // Outputs absent from the model channel graph (e.g. promoted passthroughs)
 // become same-name internal wires, preserving their model-side assignments.
-// Require passive, unannotated, unsymbolized data outputs with unused results
-// at every instance. Preflight all instances before mutation; retain parent
-// wiring and metadata. Invalidates hierarchy/port analyses; emits no annotations.
+// Require passive, unannotated data outputs with unused results at every
+// instance. Transfer scalar and aggregate-leaf inner symbols unchanged to the
+// same-type wires. Aggregate-root/sub-bundle symbols require a LowerTypes
+// policy and are rejected. Preflight all identities and instances before mutation;
+// retain parent wiring and metadata. Refresh hierarchy, port and inner-symbol
+// analyses after rewriting; emits no annotations.
 mlir::LogicalResult internalizeFAMEUnusedOutputs(
     circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp model,
     llvm::ArrayRef<llvm::StringRef> portNames, std::string &error);
