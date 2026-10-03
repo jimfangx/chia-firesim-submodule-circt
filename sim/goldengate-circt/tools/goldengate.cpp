@@ -30,6 +30,7 @@
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/PrintStubs.h"
+#include "goldengate/PrintWiring.h"
 #include "goldengate/BridgeAnalysis.h"
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/ChannelClockInfo.h"
@@ -202,10 +203,14 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
   bool synthesizeAutoCounterValues =
       argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf-values";
+  bool wireAutoCounterStubs =
+      argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs";
+  bool wirePrintStubs =
+      argc == 7 && llvm::StringRef(argv[6]) == "--wire-print-stubs";
   bool synthesizeAutoCounterStubs =
-      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-print-stubs";
+      wireAutoCounterStubs || (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-print-stubs");
   bool synthesizePrintStubs =
-      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-print-stubs";
+      wirePrintStubs || (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-print-stubs");
   bool synthesizeAutoCounterPrints =
       synthesizeAutoCounterStubs ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf");
@@ -245,6 +250,7 @@ int main(int argc, char **argv) {
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
+                    "--wire-print-stubs | --wire-autocounter-print-stubs | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3073,6 +3079,31 @@ int main(int argc, char **argv) {
     if (failed(goldengate::emitAllAnnotations(circuit, annoPath, error)))
       return fail("cannot export print stub annotations: " + error);
     llvm::outs() << "Synthesized " << stubs.size() << " printf bundles in " << irPath << '\n';
+    if (wireAutoCounterStubs || wirePrintStubs) {
+      llvm::SmallVector<goldengate::WiredPrint> routes;
+      if (failed(goldengate::wirePrintStubsToTop(circuit, stubs, routes, error)))
+        return fail("PrintSynthesis bundle top wiring: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("PrintSynthesis bundle top wiring produced invalid FIRRTL IR");
+      llvm::SmallString<256> wiredIR(outputDir), wiredAnnos(outputDir), wiredSummary(outputDir);
+      llvm::sys::path::append(wiredIR, "post-print-wiring.mlir");
+      llvm::sys::path::append(wiredAnnos, "post-print-wiring-all.json");
+      llvm::sys::path::append(wiredSummary, "print-wiring.json");
+      llvm::raw_fd_ostream wired(wiredIR, ec);
+      if (ec) return fail("cannot write print wiring IR: " + ec.message());
+      module->print(wired); wired << '\n';
+      llvm::json::Array routing;
+      for (auto &route : routes)
+        routing.push_back(llvm::json::Object{{"source", stubs[route.stubIndex].target},
+            {"absoluteSource", route.absoluteSource}, {"topTarget", route.topTarget},
+            {"depth", int64_t(route.instancePath.size())}});
+      llvm::raw_fd_ostream metadata(wiredSummary, ec);
+      if (ec) return fail("cannot write print wiring summary: " + ec.message());
+      metadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(routing)));
+      if (failed(goldengate::emitAllAnnotations(circuit, wiredAnnos, error)))
+        return fail("cannot export pending print wiring annotations: " + error);
+      llvm::outs() << "Routed " << routes.size() << " printf bundles to top; clock binding pending\n";
+    }
     return 0;
   };
   if (synthesizePrintStubs) {
