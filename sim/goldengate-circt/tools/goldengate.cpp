@@ -10,6 +10,7 @@
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/AnnotationEmission.h"
 #include "goldengate/MetasimInterfaceHeader.h"
+#include "goldengate/SimulationMasterHeader.h"
 #include "goldengate/XDCEmission.h"
 #include "goldengate/XilinxHostSpecialization.h"
 #include "goldengate/SimulatorRTL.h"
@@ -2962,6 +2963,8 @@ int main(int argc, char **argv) {
         return fail("XDC output preparation: " + error);
       if (failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error)))
         return fail("metasim interface header: " + error);
+      if (failed(goldengate::prepareSimulationMasterHeader(circuit, error)))
+        return fail("SimulationMaster driver header: " + error);
       llvm::SmallString<256> xdcAnnotations(outputDir);
       llvm::sys::path::append(xdcAnnotations, "post-fame-xdc-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, xdcAnnotations, error)))
