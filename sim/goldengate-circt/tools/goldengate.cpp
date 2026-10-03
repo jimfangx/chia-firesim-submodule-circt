@@ -3171,21 +3171,6 @@ int main(int argc, char **argv) {
     std::map<std::string, llvm::SmallVector<std::string>> outputsByModule;
     std::map<std::string, std::map<std::string, std::optional<std::string>>>
         channelClocksByModule;
-    std::set<std::string> clockChannelPorts;
-    for (auto &row : *channelConnections) {
-      auto *entry = row.getAsObject();
-      if (!entry || entry->getString("kind") != "target_clock")
-        continue;
-      auto *sinks = entry->getArray("sinks");
-      if (!sinks)
-        return fail("target clock channel has no sinks");
-      for (auto &sink : *sinks) {
-        auto name = sink.getAsString();
-        if (!name)
-          return fail("malformed target clock sink");
-        clockChannelPorts.insert(name->str());
-      }
-    }
     for (auto &row : *channelPorts) {
       auto *entry = row.getAsObject();
       auto moduleName = entry ? entry->getString("module") : std::nullopt;
@@ -3200,8 +3185,7 @@ int main(int argc, char **argv) {
           clock->getAsString()
               ? std::optional<std::string>(clock->getAsString()->str())
               : std::nullopt;
-      if (*direction == "input" &&
-          !clockChannelPorts.count(channelName->str()))
+      if (*direction == "input")
         inputsByModule[moduleName->str()].push_back(channelName->str());
       if (*direction == "output")
         outputsByModule[moduleName->str()].push_back(channelName->str());
@@ -3243,12 +3227,40 @@ int main(int argc, char **argv) {
       if (!model)
         return fail("FAME model module missing: " + moduleName);
       std::string rewriteError;
+      // FAMETransformer.isClockChannel examines this model's input payloads,
+      // not names from circuit-wide channel connections. A data channel in a
+      // non-hub may share a name with another model's explicit clock channel.
+      std::set<std::string> clockChannelPorts;
+      llvm::SmallVector<std::string> dataInputs;
+      for (const auto &name : inputsByModule[moduleName]) {
+        BundleType payload;
+        for (unsigned i = 0; i < model.getNumPorts(); ++i)
+          if (model.getPortName(i) == name + "_sink" &&
+              model.getPortDirection(i) == Direction::In)
+            payload = mlir::dyn_cast<BundleType>(model.getPorts()[i].type);
+        if (!payload)
+          return fail("missing decoupled input channel in " + moduleName +
+                      ": " + name);
+        auto bits = payload.getElementIndex("bits");
+        bool clockPayload = bits &&
+            mlir::isa<ClockType>(payload.getElements()[*bits].type);
+        if (clockPayload) {
+          if (channelClocksByModule[moduleName].at(name))
+            return fail("clock channel has an associated clock in " +
+                        moduleName + ": " + name);
+          clockChannelPorts.insert(name);
+        } else {
+          dataInputs.push_back(name);
+        }
+      }
+      inputsByModule[moduleName] = std::move(dataInputs);
       // No explicit target-clock channel denotes a non-hub single-clock
       // model. SFC gives its VirtualClockChannel constant valid/enable bits.
       // Preserve each data channel's optional clock association: Some(clock)
       // inputs reset fired, whereas None channels reset unfired.
       if (clockChannelPorts.size() > 1)
-        return fail("FAME control boundary supports one target clock channel");
+        return fail("FAME control boundary supports one target clock channel "
+                    "per model: " + moduleName);
       bool virtualClock = clockChannelPorts.empty();
       llvm::StringRef clockName = virtualClock ? llvm::StringRef()
                                                : *clockChannelPorts.begin();

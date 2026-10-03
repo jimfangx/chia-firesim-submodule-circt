@@ -1,0 +1,63 @@
+{
+  "channel_connections": [
+    {
+      "name": "globalClock",
+      "kind": "target_clock",
+      "sinks": [
+        "tick"
+      ]
+    }
+  ],
+  "channel_ports": [
+    {
+      "module": "Hub",
+      "name": "tick",
+      "direction": "input",
+      "clock_port": null
+    },
+    {
+      "module": "Hub",
+      "name": "input",
+      "direction": "input",
+      "clock_port": "tick"
+    },
+    {
+      "module": "Hub",
+      "name": "output",
+      "direction": "output",
+      "clock_port": "tick"
+    },
+    {
+      "module": "Other",
+      "name": "tick",
+      "direction": "input",
+      "clock_port": null
+    },
+    {
+      "module": "Other",
+      "name": "output",
+      "direction": "output",
+      "clock_port": "target"
+    }
+  ],
+  "local_channel_dependencies": [
+    {
+      "module": "Hub",
+      "output_channel": "output",
+      "input_channels": [
+        "input"
+      ],
+      "unresolved_ports": [],
+      "unresolved_causes": []
+    },
+    {
+      "module": "Other",
+      "output_channel": "output",
+      "input_channels": [
+        "tick"
+      ],
+      "unresolved_ports": [],
+      "unresolved_causes": []
+    }
+  ]
+}

@@ -169,6 +169,18 @@ if(BUILD_TESTING)
     --clock-controls ${CMAKE_CURRENT_BINARY_DIR}/multiple-virtual-clocks/output-valid.mlir)
   set_tests_properties(goldengate-fame-multiple-virtual-clocks PROPERTIES FIXTURES_SETUP fame-multiple-virtual-clocks)
   set_tests_properties(goldengate-fame-multiple-virtual-clocks-check PROPERTIES FIXTURES_REQUIRED fame-multiple-virtual-clocks)
+  add_test(NAME goldengate-fame-mixed-clock-models COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMixedClockModels.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMixedClockModels.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/mixed-clock-models
+    --rewrite-fame-output-valid-from ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMixedClockModels.json)
+  add_test(NAME goldengate-fame-mixed-clock-models-check COMMAND goldengate-fame-fired-state-test
+    --mixed-controls ${CMAKE_CURRENT_BINARY_DIR}/mixed-clock-models/output-valid.mlir)
+  add_test(NAME goldengate-fame-mixed-clock-gates-check COMMAND goldengate-fame-fired-state-test
+    --clock-controls ${CMAKE_CURRENT_BINARY_DIR}/mixed-clock-models/output-valid.mlir)
+  set_tests_properties(goldengate-fame-mixed-clock-models PROPERTIES FIXTURES_SETUP fame-mixed-clock-models)
+  set_tests_properties(goldengate-fame-mixed-clock-models-check goldengate-fame-mixed-clock-gates-check
+    PROPERTIES FIXTURES_REQUIRED fame-mixed-clock-models)
   add_executable(goldengate-fame-virtual-clock-port-test
     test/Transforms/FAMEVirtualClockPortTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-virtual-clock-port-test PRIVATE cxx_std_17)
