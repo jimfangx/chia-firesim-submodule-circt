@@ -14,7 +14,12 @@ using namespace mlir;
 using namespace circt::firrtl;
 namespace {
 void require(bool ok, const std::string &why) { if (!ok) throw std::runtime_error(why); }
-std::string dump(Operation *op) { std::string s; llvm::raw_string_ostream out(s); op->print(out); return s; }
+std::string dump(Operation *op) {
+  // Generic printing avoids expensive FIRRTL SSA name generation for the
+  // recorded target while retaining every operand, type and attribute.
+  std::string s; llvm::raw_string_ostream out(s);
+  op->print(out, OpPrintingFlags().printGenericOpForm()); return s;
+}
 FModuleOp named(CircuitOp c, StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
