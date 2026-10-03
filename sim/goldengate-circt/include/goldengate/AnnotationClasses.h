@@ -49,6 +49,10 @@ struct AnnotationClasses {
       "midas.targetutils.SynthPrintfAnnotation";
   static constexpr llvm::StringLiteral GlobalResetSink =
       "midas.InternalGlobalResetConditionSink";
+  static constexpr llvm::StringLiteral PrintBridgeParameters =
+      "midas.widgets.PrintBridgeParameters";
+  static constexpr llvm::StringLiteral PrintBridgeModule =
+      "midas.widgets.PrintBridgeModule";
   static constexpr llvm::StringLiteral AutoCounterAccumulate =
       "midas.targetutils.PerfCounterOps$Accumulate$";
   static constexpr llvm::StringLiteral AutoCounterIdentity =

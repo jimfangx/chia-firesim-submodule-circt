@@ -58,7 +58,7 @@ void check(CircuitOp c, ArrayRef<goldengate::PrintStub> stubs,
         "expanded source/top target mismatch");
   }
 }
-void run(MLIRContext &context) {
+void run(MLIRContext &context, bool complete = false) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
       firrtl.module @Top(in %clock: !firrtl.clock, in %enable: !firrtl.uint<1>,
@@ -79,7 +79,8 @@ void run(MLIRContext &context) {
   OpBuilder b(&context); SmallVector<Attribute> annos;
   auto print=[&](FModuleOp m,StringRef name,bool args) {
     b.setInsertionPointToEnd(m.getBodyBlock()); auto arg=[&](unsigned i){return m.getBodyBlock()->getArgument(i);};
-    b.create<PrintFOp>(m.getLoc(),arg(0),arg(1),"%d %d %x\n",args?ValueRange{arg(2),arg(3),arg(4)}:ValueRange{},name);
+    b.create<PrintFOp>(m.getLoc(),arg(0),arg(1),"%d %d %x\n\t\r\b\f\"\\ café 😀\x01\x7f",
+        args?ValueRange{arg(2),arg(3),arg(4)}:ValueRange{},name);
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::SynthPrintf)),
       b.getNamedAttr("target",b.getStringAttr("~Top|"+m.getName().str()+">"+name.str()))}));
   };
@@ -97,6 +98,10 @@ void run(MLIRContext &context) {
   b.setInsertionPointToEnd(leaf.getBodyBlock());b.create<StrictConnectOp>(leaf.getLoc(),leaf.getBodyBlock()->getArgument(5),leaf.getBodyBlock()->getArgument(2));
   c->setAttr("rawAnnotations",b.getArrayAttr(annos)); std::string error;
   SmallVector<goldengate::PrintStub> stubs;require(succeeded(goldengate::synthesizePrintStubs(c,stubs,error)),error);
+  auto synthesize = [&]() {
+    return complete ? goldengate::completePrintSynthesis(c, stubs, error) :
+                      goldengate::synthesizePrintChannels(c, stubs, error);
+  };
   auto annotations=c->getAttrOfType<ArrayAttr>("rawAnnotations");SmallVector<goldengate::WiredPrint> routes;
   auto before=dump(*root);SmallVector<goldengate::PrintStub> bad(stubs);bad.push_back(stubs[0]);
   require(failed(goldengate::wirePrintStubsToTop(c,bad,routes,error)) && routes.empty() && dump(*root)==before,
@@ -176,14 +181,14 @@ void run(MLIRContext &context) {
   fields.set("class",b.getStringAttr(goldengate::AnnotationClasses::BridgeTopWiringOutput));
   malformed.back()=fields.getDictionary(&context);
   c->setAttr("rawAnnotations",b.getArrayAttr(malformed));before=dump(*root);
-  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+  require(failed(synthesize()) && dump(*root)==before,
       "malformed completed printf binding partially created channels");
   malformed.assign(completed.begin(),completed.end());
   fields=NamedAttrList(cast<DictionaryAttr>(malformed.front()));
   fields.set("sinkClockPort",b.getStringAttr("~Top|Top>old"));
   malformed.front()=fields.getDictionary(&context);
   c->setAttr("rawAnnotations",b.getArrayAttr(malformed));before=dump(*root);
-  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+  require(failed(synthesize()) && dump(*root)==before,
       "non-Clock channel binding partially added reset state");
   malformed.assign(completed.begin(),completed.end());
   malformed.push_back(b.getDictionaryAttr({
@@ -191,23 +196,41 @@ void run(MLIRContext &context) {
       b.getNamedAttr("globalName",b.getStringAttr(
           top.getPortName(cast<BlockArgument>(routes.front().topPort).getArgNumber()).str()+"_enable"))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(malformed));before=dump(*root);
-  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+  require(failed(synthesize()) && dump(*root)==before,
       "printf channel collision failure mutated circuit");
   c->setAttr("rawAnnotations",completed);
+  if (complete) {
+    auto print = stubs.front().print;
+    stubs.front().print = {}; before = dump(*root);
+    require(failed(synthesize()) && dump(*root)==before,
+        "missing native printf partially created bridge/reset state");
+    stubs.front().print = print;
+    auto withArgs=llvm::find_if(stubs, [](auto &stub) {
+      return !stub.print.getSubstitutions().empty();
+    });
+    require(withArgs!=stubs.end(),"mixed printf fixture has no operands");
+    print=withArgs->print;
+    auto arg = print.getSubstitutions()[0];
+    auto owner=print->getParentOfType<FModuleOp>();
+    print->setOperand(2, owner.getBodyBlock()->getArgument(3)); before = dump(*root);
+    require(failed(synthesize()) && dump(*root)==before,
+        "mismatched native printf operand partially created bridge/reset state");
+    print->setOperand(2, arg);
+  }
   b.setInsertionPointToEnd(top.getBodyBlock());
   b.create<WireOp>(top.getLoc(),UIntType::get(&context,1),
       b.getStringAttr("synthesizedPrintf_clock_0_globalReset"));
-  require(succeeded(goldengate::synthesizePrintChannels(c,stubs,error)),error);
+  require(succeeded(synthesize()),error);
   require(top.getNumPorts()==15 && top.getPortName(14)=="synthesizedPrintf_clock_0_globalReset_0" &&
       top.getPortDirection(14)==Direction::Out && isa<UIntType>(top.getPortType(14)),
       "printf reset output namespace or direction changed");
   auto zero=driver(top,top.getBodyBlock()->getArgument(14)).getDefiningOp<ConstantOp>();
   require(zero && zero.getValue().isZero(),"printf reset placeholder is not native zero");
   auto channelAnnos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
-  require(channelAnnos.size()==28,"printf field/reset channel count mismatch");
-  for(auto [i,attr]:llvm::enumerate(completed))
+  require(channelAnnos.size()==(complete?19:28),"printf field/reset channel count mismatch");
+  if (!complete) for(auto [i,attr]:llvm::enumerate(completed))
     require(channelAnnos[i]==attr,"pending bridge inputs or unrelated annotations changed");
-  require(Annotation(channelAnnos[10]).isClass(goldengate::AnnotationClasses::GlobalResetSink),
+  require(Annotation(channelAnnos[complete?0:10]).isClass(goldengate::AnnotationClasses::GlobalResetSink),
       "global reset sink was not emitted");
   unsigned channelCount=0;
   std::set<std::string> channelNames;
@@ -225,8 +248,52 @@ void run(MLIRContext &context) {
     ++channelCount;
   }
   require(channelCount==17 && succeeded(verify(*root)),"printf channel/reset IR invalid");
+  if (complete) {
+    Annotation bridge(channelAnnos[1]);
+    auto key=bridge.getMember<DictionaryAttr>("widgetConstructorKey");
+    auto mapping=bridge.getMember<DictionaryAttr>("channelMapping");
+    require(bridge.isClass(goldengate::AnnotationClasses::BridgeIO) &&
+        bridge.getMember<StringAttr>("target").getValue()=="~Top|Top>synthesizedPrintf" &&
+        bridge.getMember<StringAttr>("widgetClass").getValue()==goldengate::AnnotationClasses::PrintBridgeModule &&
+        !bridge.getMember<Attribute>("clockInfo") && key && mapping && mapping.size()==17 &&
+        key.getAs<StringAttr>("class").getValue()==goldengate::AnnotationClasses::PrintBridgeParameters &&
+        key.getAs<StringAttr>("resetPortName").getValue()==top.getPortName(14),
+        "printf bridge constructor or mapping schema mismatch");
+    for (auto field : mapping)
+      require(channelNames.count(field.getName().str()) &&
+          cast<StringAttr>(field.getValue()).getValue()==field.getName().getValue(),
+          "printf bridge channel mapping is not identity");
+    auto ports=key.getAs<ArrayAttr>("printPorts");
+    require(ports && ports.size()==routes.size(),"printf bridge lost exported print instances");
+    for (auto [i,attr] : llvm::enumerate(ports)) {
+      auto port=cast<DictionaryAttr>(attr);
+      auto nativeType=cast<BundleType>(routes[i].topPort.getType());
+      auto fields=port.getAs<ArrayAttr>("ports");
+      require(!port.get("class") &&
+          port.getAs<StringAttr>("name").getValue()==top.getPortName(cast<BlockArgument>(routes[i].topPort).getArgNumber()) &&
+          port.getAs<StringAttr>("format").getValue()==
+              "%d %d %x\\n\\t\\r\\b\\f\\\"\\\\ caf\\u00E9 \\uD83D\\uDE00\\u0001\x7f" &&
+          fields.size()==nativeType.getElements().size(),
+          "printf bridge instance order or Java format serialization mismatch");
+      for (auto [j,field] : llvm::enumerate(nativeType.getElements())) {
+        auto tuple=cast<DictionaryAttr>(fields[j]);
+        auto type=(isa<UIntType>(field.type)?"UInt<":"SInt<")+
+            std::to_string(cast<IntType>(field.type).getWidthOrSentinel())+">";
+        require(tuple.size()==1 && tuple.getAs<StringAttr>(field.name.getValue()).getValue()==type,
+            "printf field tuple is not SFC singleton-object/type schema");
+      }
+    }
+    for (auto attr : channelAnnos) {
+      Annotation anno(attr);
+      require(!anno.isClass(goldengate::AnnotationClasses::SynthPrintf) &&
+          !anno.isClass(goldengate::AnnotationClasses::BridgeTopWiringOutput),
+          "consumed printf annotation survived completed synthesis");
+    }
+    unsigned prints=0; c.walk([&](PrintFOp){++prints;});
+    require(prints==3,"completed synthesis removed original printf operations");
+  }
   before=dump(*root);
-  require(failed(goldengate::synthesizePrintChannels(c,stubs,error)) && dump(*root)==before,
+  require(failed(synthesize()) && dump(*root)==before,
       "repeated printf channel synthesis duplicated state");
   before=dump(*root);SmallVector<goldengate::WiredPrint> empty;
   require(succeeded(goldengate::wirePrintStubsToTop(c,{},empty,error)) && empty.empty() && dump(*root)==before,
@@ -234,7 +301,7 @@ void run(MLIRContext &context) {
   require(succeeded(goldengate::completePrintClockWiring(c,{},empty,error)) && dump(*root)==before,
           "empty clock wiring mutated circuit");
 }
-void runTwoClockWiring(MLIRContext &context) {
+void runTwoClockWiring(MLIRContext &context, bool complete = false) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = [
       {class = "midas.targetutils.SynthPrintfAnnotation", target = "~Top|Leaf>message"}]} {
@@ -285,21 +352,36 @@ void runTwoClockWiring(MLIRContext &context) {
   require(succeeded(verify(*root)),"invalid two clock loopback FIRRTL");
   // Reverse output annotations: domain order must still follow clock names.
   c->setAttr("rawAnnotations",b.getArrayAttr({raw[1],raw[0],raw[2]}));
-  require(succeeded(goldengate::synthesizePrintChannels(c,stubs,error)),error);
+  require(succeeded(complete?goldengate::completePrintSynthesis(c,stubs,error):
+      goldengate::synthesizePrintChannels(c,stubs,error)),error);
   require(top.getNumPorts()==9 &&
       top.getPortName(7)=="synthesizedPrintf_clock0_globalReset" &&
       top.getPortName(8)=="synthesizedPrintf_clock1_globalReset",
       "printf domains did not sort by clock identity");
   auto channels=c->getAttrOfType<ArrayAttr>("rawAnnotations");
-  require(channels.size()==9,"two domain channel count mismatch");
+  require(channels.size()==(complete?8:9),"two domain channel count mismatch");
   for(unsigned i=0;i<2;++i) {
     auto reset=top.getPortName(7+i).str();
     auto clock="~Top|Top>synthesizedPrintf_clock"+std::to_string(i);
-    Annotation resetAnno(channels[3+i*3]),resetChannel(channels[4+i*3]),printChannel(channels[5+i*3]);
+    unsigned offset=complete?i*4:3+i*3;
+    Annotation resetAnno(channels[offset]),resetChannel(channels[offset+(complete?2:1)]),
+        printChannel(channels[offset+(complete?3:2)]);
     require(resetAnno.getMember<StringAttr>("target").getValue()=="~Top|Top>"+reset &&
         resetChannel.getMember<StringAttr>("clock").getValue()==clock &&
         printChannel.getMember<StringAttr>("clock").getValue()==clock,
         "shared module prints lost per-instance clock domain");
+    if (complete) {
+      Annotation bridge(channels[offset+1]);
+      auto key=bridge.getMember<DictionaryAttr>("widgetConstructorKey");
+      auto ports=key.getAs<ArrayAttr>("printPorts");
+      require(bridge.isClass(goldengate::AnnotationClasses::BridgeIO) &&
+          bridge.getMember<StringAttr>("target").getValue()=="~Top|Top>synthesizedPrintf" &&
+          key.getAs<StringAttr>("resetPortName").getValue()==reset && ports.size()==1 &&
+          cast<DictionaryAttr>(ports[0]).getAs<StringAttr>("name").getValue()==
+              "synthesizedPrintf_"+std::string(i?"right":"left")+"_message_wire" &&
+          bridge.getMember<DictionaryAttr>("channelMapping").size()==2,
+          "shared printf bridge constructor lost per-clock instance identity");
+    }
   }
   require(succeeded(verify(*root)),"two domain printf channel/reset IR invalid");
 }
@@ -374,6 +456,6 @@ void runGolden(MLIRContext &context,StringRef path) {
 }
 int main(int argc,char **argv) {
   MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {run(context);runClocks(context);runTwoClockWiring(context);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
+  try {run(context);run(context,true);runClocks(context);runTwoClockWiring(context);runTwoClockWiring(context,true);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
   catch(const std::exception &e){llvm::errs()<<"Print wiring FAIL: "<<e.what()<<'\n';return 1;}
 }

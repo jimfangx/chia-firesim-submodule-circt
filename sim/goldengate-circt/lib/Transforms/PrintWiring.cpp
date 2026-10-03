@@ -8,6 +8,7 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/Support/ConvertUTF.h"
 #include <functional>
 #include <map>
 #include <set>
@@ -17,6 +18,33 @@ using namespace circt::firrtl;
 
 namespace {
 constexpr llvm::StringLiteral prefix = "synthesizedPrintf_";
+// FIRRTL StringLit.serialize uses escapeJava, without surrounding quotes.
+// Escape UTF-16 code units here; the annotation JSON exporter escapes this
+// serialized format again when writing PrintBridgeParameters.
+std::optional<std::string> serializePrintFormat(StringRef format) {
+  SmallVector<llvm::UTF16> units;
+  if (!llvm::convertUTF8ToUTF16String(format, units)) return std::nullopt;
+  std::string result;
+  constexpr char hex[] = "0123456789ABCDEF";
+  for (auto unit : units) {
+    switch (unit) {
+    case '\b': result += "\\b"; break;
+    case '\t': result += "\\t"; break;
+    case '\n': result += "\\n"; break;
+    case '\f': result += "\\f"; break;
+    case '\r': result += "\\r"; break;
+    case '"': result += "\\\""; break;
+    case '\\': result += "\\\\"; break;
+    default:
+      if (unit < 0x20 || unit > 0x7f) {
+        result += "\\u";
+        for (int shift = 12; shift >= 0; shift -= 4)
+          result += hex[(unit >> shift) & 15];
+      } else result += char(unit);
+    }
+  }
+  return result;
+}
 struct Route {
   unsigned stubIndex, port;
   SmallVector<Operation *> path;
@@ -191,8 +219,11 @@ LogicalResult goldengate::wirePrintStubsToTop(
   return success();
 }
 
-LogicalResult goldengate::synthesizePrintChannels(
-    CircuitOp circuit, ArrayRef<PrintStub> stubs, std::string &error) {
+static LogicalResult synthesizePrintChannelsImpl(
+    CircuitOp circuit, ArrayRef<goldengate::PrintStub> stubs,
+    std::string &error, bool complete) {
+  using goldengate::AnnotationClasses;
+  using goldengate::resolveAnnotationTarget;
   FModuleOp top;
   {
     circt::igraph::InstanceGraph graph(circuit);
@@ -207,6 +238,7 @@ LogicalResult goldengate::synthesizePrintChannels(
   if (!raw) { error = "printf channels need retained annotations"; return failure(); }
   OpBuilder b(circuit.getContext());
   std::map<std::string, BundleType> stubTypes;
+  std::map<std::string, std::string> formats;
   for (auto stub : stubs) {
     auto type = stub.bundle ? dyn_cast<BundleType>(stub.bundle.getResult().getType()) : BundleType();
     auto owner = stub.bundle ? stub.bundle->getParentOfType<FModuleOp>() : FModuleOp();
@@ -217,10 +249,36 @@ LogicalResult goldengate::synthesizePrintChannels(
       error = "printf channels need distinct native bundle sources";
       return failure();
     }
+    if (complete) {
+      auto print = stub.print;
+      if (!print || print->getParentOfType<FModuleOp>() != owner ||
+          print->getBlock() != owner.getBodyBlock() ||
+          type.getElements().size() != print.getSubstitutions().size() + 1) {
+        error = "printf bridge constructor needs the native source printf";
+        return failure();
+      }
+      for (auto [i, arg] : llvm::enumerate(print.getSubstitutions())) {
+        auto field = type.getElements()[i + 1];
+        if (field.name.getValue() != "args_" + std::to_string(i) ||
+            field.type != arg.getType()) {
+          error = "printf bridge fields do not match native printf operands";
+          return failure();
+        }
+      }
+      auto format = serializePrintFormat(print.getFormatString());
+      if (!format) {
+        error = "printf bridge format must be valid UTF-8";
+        return failure();
+      }
+      formats.emplace(stub.target, std::move(*format));
+    }
   }
   // Map ordering matches Scala's sortBy(sinkClockPort.ref); record ordering
   // within each domain follows the completed annotation sequence.
-  struct Domain { SmallVector<Attribute> channels; std::string resetName; };
+  struct Domain {
+    SmallVector<Attribute> channels, printPorts;
+    std::string resetName;
+  };
   std::map<std::string, Domain> domains;
   std::set<std::string> channelNames, sources, sinks;
   for (auto attr : raw) {
@@ -269,6 +327,7 @@ LogicalResult goldengate::synthesizePrintChannels(
     auto portName = top.getPortName(*port->port).str();
     auto clockName = top.getPortName(*clk->port).str();
     auto &domain = domains[clockName];
+    SmallVector<Attribute> fields;
     if (found->second.getElements().empty()) {
       error = "printf bundle has no fields"; return failure();
     }
@@ -287,7 +346,19 @@ LogicalResult goldengate::synthesizePrintChannels(
       }
       domain.channels.push_back(channel(name, topPrefix + clockName,
           topPrefix + portName + "." + field.name.getValue().str()));
+      if (complete) {
+        auto type = (isa<UIntType>(field.type) ? "UInt<" : "SInt<") +
+            std::to_string(intType.getWidthOrSentinel()) + ">";
+        // json4s serializes a (String, String) tuple as a singleton object.
+        fields.push_back(b.getDictionaryAttr({b.getNamedAttr(
+            field.name.getValue(), b.getStringAttr(type))}));
+      }
     }
+    if (complete)
+      domain.printPorts.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("name", b.getStringAttr(portName)),
+          b.getNamedAttr("ports", b.getArrayAttr(fields)),
+          b.getNamedAttr("format", b.getStringAttr(formats.at(found->first)))}));
   }
   if (sources.size() != stubs.size()) {
     error = "printf channels are missing completed source bindings";
@@ -299,7 +370,13 @@ LogicalResult goldengate::synthesizePrintChannels(
     if (auto name = op->getAttrOfType<StringAttr>("name")) names.newName(name.getValue());
   });
   SmallVector<std::pair<unsigned, PortInfo>> added;
-  SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  SmallVector<Attribute> annotations;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (complete && (anno.isClass(AnnotationClasses::BridgeTopWiringOutput) ||
+                     anno.isClass(AnnotationClasses::SynthPrintf))) continue;
+    annotations.push_back(attr);
+  }
   unsigned oldPorts = top.getNumPorts();
   for (auto &[clockName, domain] : domains) {
     domain.resetName = names.newName(clockName + "_globalReset");
@@ -313,6 +390,23 @@ LogicalResult goldengate::synthesizePrintChannels(
     annotations.push_back(b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::GlobalResetSink)),
         b.getNamedAttr("target", b.getStringAttr(target))}));
+    if (complete) {
+      NamedAttrList mapping;
+      mapping.set(domain.resetName, b.getStringAttr(domain.resetName));
+      for (auto attr : domain.channels) {
+        auto name = Annotation(attr).getMember<StringAttr>("globalName");
+        mapping.set(name.getValue(), name);
+      }
+      annotations.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::BridgeIO)),
+          b.getNamedAttr("target", b.getStringAttr(topPrefix + "synthesizedPrintf")),
+          b.getNamedAttr("channelMapping", mapping.getDictionary(circuit.getContext())),
+          b.getNamedAttr("widgetClass", b.getStringAttr(AnnotationClasses::PrintBridgeModule)),
+          b.getNamedAttr("widgetConstructorKey", b.getDictionaryAttr({
+              b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::PrintBridgeParameters)),
+              b.getNamedAttr("resetPortName", b.getStringAttr(domain.resetName)),
+              b.getNamedAttr("printPorts", b.getArrayAttr(domain.printPorts))}))}));
+    }
     annotations.push_back(channel(domain.resetName, topPrefix + clockName, target));
     annotations.append(domain.channels.begin(), domain.channels.end());
   }
@@ -325,6 +419,16 @@ LogicalResult goldengate::synthesizePrintChannels(
   }
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   return success();
+}
+
+LogicalResult goldengate::synthesizePrintChannels(
+    CircuitOp circuit, ArrayRef<PrintStub> stubs, std::string &error) {
+  return synthesizePrintChannelsImpl(circuit, stubs, error, false);
+}
+
+LogicalResult goldengate::completePrintSynthesis(
+    CircuitOp circuit, ArrayRef<PrintStub> stubs, std::string &error) {
+  return synthesizePrintChannelsImpl(circuit, stubs, error, true);
 }
 
 LogicalResult goldengate::completePrintClockWiring(

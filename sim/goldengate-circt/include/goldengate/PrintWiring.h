@@ -41,4 +41,11 @@ mlir::LogicalResult completePrintClockWiring(
 mlir::LogicalResult synthesizePrintChannels(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
     std::string &error);
+// Complete the enabled PrintSynthesis boundary from completed clock wiring:
+// create channels/reset outputs and one BridgeIO constructor per clock domain,
+// then consume wiring outputs and SynthPrintf selections. This includes the
+// channel step above; all constructor inputs are checked before mutation.
+mlir::LogicalResult completePrintSynthesis(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
+    std::string &error);
 } // namespace goldengate

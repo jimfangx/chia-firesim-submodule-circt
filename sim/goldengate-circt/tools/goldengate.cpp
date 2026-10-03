@@ -203,8 +203,10 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
   bool synthesizeAutoCounterValues =
       argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf-values";
-  bool synthesizeAutoCounterPrintChannels =
-      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-print-channels";
+  bool completeAutoCounterPrintSynthesis =
+      argc == 7 && llvm::StringRef(argv[6]) == "--complete-autocounter-print-synthesis";
+  bool synthesizeAutoCounterPrintChannels = completeAutoCounterPrintSynthesis ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-print-channels");
   bool completeAutoCounterPrintWiring = synthesizeAutoCounterPrintChannels ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--complete-autocounter-print-wiring");
   bool analyzeAutoCounterPrintClocks = completeAutoCounterPrintWiring ||
@@ -260,6 +262,7 @@ int main(int argc, char **argv) {
                     "--analyze-autocounter-print-clocks | "
                     "--complete-autocounter-print-wiring | "
                     "--synthesize-autocounter-print-channels | "
+                    "--complete-autocounter-print-synthesis | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3144,21 +3147,28 @@ int main(int argc, char **argv) {
             return fail("cannot export completed print wiring FAME annotations: " + error);
           llvm::outs() << "Completed " << routes.size() << " printf clock bindings and output annotations\n";
           if (synthesizeAutoCounterPrintChannels) {
-            if (failed(goldengate::synthesizePrintChannels(circuit, stubs, error)))
+            if (failed(completeAutoCounterPrintSynthesis
+                ? goldengate::completePrintSynthesis(circuit, stubs, error)
+                : goldengate::synthesizePrintChannels(circuit, stubs, error)))
               return fail("PrintSynthesis channels: " + error);
             if (failed(mlir::verify(*module)))
               return fail("PrintSynthesis channels produced invalid FIRRTL IR");
             llvm::SmallString<256> channelsIR(outputDir), channelsAnnos(outputDir), channelsFAME(outputDir);
-            llvm::sys::path::append(channelsIR, "post-print-channels.mlir");
-            llvm::sys::path::append(channelsAnnos, "post-print-channels-all.json");
-            llvm::sys::path::append(channelsFAME, "post-print-channels.json");
+            llvm::sys::path::append(channelsIR, completeAutoCounterPrintSynthesis
+                ? "post-print-synthesis.mlir" : "post-print-channels.mlir");
+            llvm::sys::path::append(channelsAnnos, completeAutoCounterPrintSynthesis
+                ? "post-print-synthesis-all.json" : "post-print-channels-all.json");
+            llvm::sys::path::append(channelsFAME, completeAutoCounterPrintSynthesis
+                ? "post-print-synthesis.json" : "post-print-channels.json");
             llvm::raw_fd_ostream channels(channelsIR, ec);
             if (ec) return fail("cannot write print channel IR: " + ec.message());
             module->print(channels); channels << '\n';
             if (failed(goldengate::emitAllAnnotations(circuit, channelsAnnos, error)) ||
                 failed(goldengate::emitFAMEAnnotations(circuit, channelsFAME, error)))
               return fail("cannot export print channel annotations: " + error);
-            llvm::outs() << "Constructed printf field and reset channels; bridge parameters pending\n";
+            llvm::outs() << (completeAutoCounterPrintSynthesis
+                ? "Completed printf channels and bridge constructors\n"
+                : "Constructed printf field and reset channels; bridge parameters pending\n");
           }
         }
       }
