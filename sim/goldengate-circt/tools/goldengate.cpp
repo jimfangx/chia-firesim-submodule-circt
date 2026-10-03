@@ -29,6 +29,7 @@
 #include "goldengate/AutoCounterAnalysis.h"
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AutoCounterPrintfValues.h"
+#include "goldengate/PrintStubs.h"
 #include "goldengate/BridgeAnalysis.h"
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/ChannelClockInfo.h"
@@ -201,8 +202,13 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
   bool synthesizeAutoCounterValues =
       argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf-values";
+  bool synthesizeAutoCounterStubs =
+      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-print-stubs";
+  bool synthesizePrintStubs =
+      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-print-stubs";
   bool synthesizeAutoCounterPrints =
-      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf";
+      synthesizeAutoCounterStubs ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf");
   bool disableAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
   bool compileBaseline =
@@ -218,7 +224,7 @@ int main(int argc, char **argv) {
        !promoteGroundBridges && !promoteAggregateBridges &&
        !resolveDontTouch && !lowerTypes && !analyzeAutoCounter &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
-       !disableAutoCounter && !compileBaseline) ||
+       !synthesizePrintStubs && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
       llvm::StringRef(argv[4]) != "--output-dir") {
     llvm::errs() << "usage: goldengate-circt input.fir --annotation-file "
@@ -238,6 +244,7 @@ int main(int argc, char **argv) {
                     "--lower-types | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
+                    "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3033,6 +3040,51 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  auto emitPrintStubBoundary = [&]() -> int {
+    std::string error;
+    llvm::SmallVector<goldengate::PrintStub> stubs;
+    if (failed(goldengate::synthesizePrintStubs(circuit, stubs, error)))
+      return fail("PrintSynthesis stubs: " + error);
+    if (failed(mlir::verify(*module)))
+      return fail("PrintSynthesis stubs produced invalid FIRRTL IR");
+    llvm::json::Array summary;
+    for (auto &stub : stubs) {
+      llvm::json::Array fields;
+      for (auto field : cast<BundleType>(stub.bundle.getResult().getType()).getElements()) {
+        std::string type;
+        llvm::raw_string_ostream text(type);
+        field.type.print(text);
+        fields.push_back(llvm::json::Object{{"name", field.name.getValue().str()}, {"type", type}});
+      }
+      summary.push_back(llvm::json::Object{{"target", stub.target},
+          {"clock", stub.clockTarget}, {"format", stub.formatString}, {"fields", std::move(fields)}});
+    }
+    llvm::SmallString<256> irPath(outputDir), annoPath(outputDir), summaryPath(outputDir);
+    llvm::sys::path::append(irPath, "post-print-stubs.mlir");
+    llvm::sys::path::append(annoPath, "post-print-stubs-all.json");
+    llvm::sys::path::append(summaryPath, "print-stubs.json");
+    std::error_code ec;
+    llvm::raw_fd_ostream ir(irPath, ec);
+    if (ec) return fail("cannot write print stub IR: " + ec.message());
+    module->print(ir); ir << '\n';
+    llvm::raw_fd_ostream metadata(summaryPath, ec);
+    if (ec) return fail("cannot write print stub summary: " + ec.message());
+    metadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
+    if (failed(goldengate::emitAllAnnotations(circuit, annoPath, error)))
+      return fail("cannot export print stub annotations: " + error);
+    llvm::outs() << "Synthesized " << stubs.size() << " printf bundles in " << irPath << '\n';
+    return 0;
+  };
+  if (synthesizePrintStubs) {
+    std::string error;
+    if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
+      return fail("PrintSynthesis LowerTypes: " + error);
+    mlir::PassManager lowForm(module->getContext());
+    lowForm.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+    if (failed(lowForm.run(*module))) return fail("PrintSynthesis ExpandWhens failed");
+    return emitPrintStubBoundary();
+  }
+
   if (gateAutoCounter || gateSelectedAutoCounter || synthesizeAutoCounterValues || synthesizeAutoCounterPrints) {
     // The explicit selected boundary applies Scala's generated-cover filter.
     // The original boundary continues to accept already selected records.
@@ -3117,6 +3169,7 @@ int main(int argc, char **argv) {
       if (ec) return fail("cannot write AutoCounter values: " + ec.message());
       out << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
     }
+    if (synthesizeAutoCounterStubs) return emitPrintStubBoundary();
     if (failed(mlir::verify(*module)))
       return fail("AutoCounter reset gating produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), annoPath(outputDir);

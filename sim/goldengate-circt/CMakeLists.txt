@@ -38,6 +38,7 @@ add_executable(goldengate-circt
   lib/Transforms/LowerTypes.cpp
   lib/Transforms/AutoCounterResetGate.cpp
   lib/Transforms/AutoCounterPrintfValues.cpp
+  lib/Transforms/PrintStubs.cpp
   lib/Transforms/CoerceAsyncToSyncReset.cpp
   lib/Transforms/LabelMultiThreadedInstances.cpp
   lib/Transforms/TriggerWiring.cpp
@@ -154,6 +155,16 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-print-stubs-test
+    test/Transforms/PrintStubsTest.cpp lib/Transforms/PrintStubs.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-print-stubs-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-print-stubs-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-print-stubs-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-print-stubs-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-print-stubs COMMAND goldengate-print-stubs-test)
   add_executable(goldengate-autocounter-printf-values-test
     test/Transforms/AutoCounterPrintfValuesTest.cpp
     lib/Transforms/AutoCounterPrintfValues.cpp
