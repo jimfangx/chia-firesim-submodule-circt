@@ -4500,6 +4500,9 @@ int main(int argc, char **argv) {
             clockModelPortName + "_sink", rewriteError)))
       return fail("FAME channel port grouping: " + rewriteError);
     if (llvm::StringRef(argv[7]) == "all" && rewriteInputsWithOutput) {
+      if (mlir::failed(goldengate::removeFAMEStaleTopClocks(
+              hierarchy->top, rewriteError)))
+        return fail("FAME stale top clock removal: " + rewriteError);
       llvm::SmallVector<llvm::StringRef> retainedTopPorts;
       for (const auto &name : retainedTopPortNames)
         retainedTopPorts.push_back(name);

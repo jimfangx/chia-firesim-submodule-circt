@@ -75,6 +75,14 @@ mlir::LogicalResult internalizeFAMEUnusedOutputs(
     circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp model,
     llvm::ArrayRef<llvm::StringRef> portNames, std::string &error);
 
+// After model clock/channel rewriting, drop remaining scalar wrapper clocks
+// other than hostClock and their direct ancillary clock connects. Require an
+// uninstantiated top and unannotated, unsymbolized ports used only by clock
+// connects. Preflight all uses before mutation; retain host/channel clocks,
+// data wiring and declarations. Invalidates top port/hierarchy analyses.
+mlir::LogicalResult removeFAMEStaleTopClocks(
+    circt::firrtl::FModuleOp top, std::string &error);
+
 // Place host controls and the model clock sink before data sinks, followed by
 // data sources, as in the SFC FAME model interface. Keep each group's order.
 mlir::LogicalResult groupFAMEChannelPorts(

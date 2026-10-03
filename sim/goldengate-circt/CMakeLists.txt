@@ -151,6 +151,15 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-fame-stale-top-clocks-test
+    test/Transforms/FAMEStaleTopClocksTest.cpp lib/Transforms/FAMEInputChannel.cpp)
+  target_compile_features(goldengate-fame-stale-top-clocks-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-stale-top-clocks-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-stale-top-clocks-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-stale-top-clocks-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-stale-top-clocks COMMAND goldengate-fame-stale-top-clocks-test)
   add_executable(goldengate-fame-top-port-order-test
     test/Transforms/FAMETopPortOrderTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-top-port-order-test PRIVATE cxx_std_17)

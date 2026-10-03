@@ -1071,6 +1071,66 @@ LogicalResult goldengate::groupFAMEChannelPorts(
   return success();
 }
 
+LogicalResult goldengate::removeFAMEStaleTopClocks(FModuleOp top,
+                                                std::string &error) {
+  auto ports = top.getPorts();
+  llvm::BitVector removed(ports.size());
+  bool hostClockFound = false;
+  std::set<Operation *> connections;
+  for (unsigned i = 0; i < ports.size(); ++i) {
+    if (ports[i].getName() == "hostClock") {
+      hostClockFound = isa<ClockType>(ports[i].type) &&
+                       ports[i].direction == Direction::In;
+      continue;
+    }
+    if (!isa<ClockType>(ports[i].type))
+      continue;
+    if (hasPortAnnotations(top, i) || ports[i].sym) {
+      error = "stale top clock has annotations or an inner symbol: " +
+              ports[i].getName().str();
+      return failure();
+    }
+    for (auto *user : top.getBodyBlock()->getArgument(i).getUsers()) {
+      Value dest;
+      if (auto connect = dyn_cast<StrictConnectOp>(user))
+        dest = connect.getDest();
+      else if (auto connect = dyn_cast<ConnectOp>(user))
+        dest = connect.getDest();
+      if (!dest || !isa<ClockType>(dest.getType())) {
+        error = "stale top clock has a non-clock-connect use: " +
+                ports[i].getName().str();
+        return failure();
+      }
+      connections.insert(user);
+    }
+    removed.set(i);
+  }
+  if (!hostClockFound) {
+    error = "FAME top has no scalar hostClock input";
+    return failure();
+  }
+  if (removed.none())
+    return success();
+  auto circuit = top->getParentOfType<CircuitOp>();
+  if (!circuit) {
+    error = "FAME top is outside a circuit";
+    return failure();
+  }
+  circt::igraph::InstanceGraph graph(circuit);
+  auto *node = graph.lookup(top);
+  if (!node || !node->uses().empty()) {
+    error = "stale clock removal requires an uninstantiated FAME top";
+    return failure();
+  }
+  // SFC transformTop filters Clock ports, while updateNonChannelConnects
+  // drops their ancillary clock assignments. Deduplicate a connect whose
+  // source and destination are both stale ports before erasing it.
+  for (auto *connect : connections)
+    connect->erase();
+  top.erasePorts(removed);
+  return success();
+}
+
 LogicalResult goldengate::orderFAMETopPorts(
     FModuleOp top, ArrayRef<llvm::StringRef> retainedPortNames,
     ArrayRef<llvm::StringRef> channelPortNames, std::string &error) {
