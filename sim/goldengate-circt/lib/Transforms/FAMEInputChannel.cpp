@@ -5,6 +5,7 @@
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/APInt.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/SymbolTable.h"
 #include <algorithm>
 #include <set>
 
@@ -519,12 +520,6 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
     return failure();
   }
 
-  for (auto &op : circuit.getBodyBlock()->getOperations())
-    if (auto module = dyn_cast<FModuleLike>(&op);
-        module && module.getModuleName() == "AbstractClockGate") {
-      error = "AbstractClockGate already exists in the input circuit";
-      return failure();
-    }
   auto *context = circuit.getContext();
   Location loc = model.getLoc();
   auto clockType = ClockType::get(context);
@@ -533,12 +528,35 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
       PortInfo(StringAttr::get(context, "I"), clockType, Direction::In),
       PortInfo(StringAttr::get(context, "CE"), bitType, Direction::In),
       PortInfo(StringAttr::get(context, "O"), clockType, Direction::Out)};
-  OpBuilder circuitBuilder(context);
-  circuitBuilder.setInsertionPointToEnd(circuit.getBodyBlock());
-  auto gate = circuitBuilder.create<FExtModuleOp>(
-      loc, StringAttr::get(context, "AbstractClockGate"),
-      ConventionAttr::get(context, Convention::Internal), ports,
-      "AbstractClockGate");
+  // DefineAbstractClockGate in the Scala oracle defines one shared blackbox;
+  // FAMETransformer creates an independent buffer instance for each domain.
+  // Resolve and check an existing definition before mutating the model.
+  FExtModuleOp gate;
+  if (auto *existing = SymbolTable::lookupSymbolIn(circuit, "AbstractClockGate")) {
+    gate = dyn_cast<FExtModuleOp>(existing);
+    if (!gate || gate.getDefname() != "AbstractClockGate" ||
+        gate.getConvention() != Convention::Internal ||
+        !gate.getParameters().empty() || !gate.getLayers().empty() ||
+        gate.getNumPorts() != ports.size()) {
+      error = "AbstractClockGate requires an unlayered external definition "
+              "with internal convention, matching defname and no parameters";
+      return failure();
+    }
+    for (auto [index, port] : llvm::enumerate(ports))
+      if (gate.getPortName(index) != port.name.getValue() ||
+          gate.getPortType(index) != port.type ||
+          gate.getPortDirection(index) != port.direction) {
+        error = "AbstractClockGate requires I:Clock, CE:UInt<1>, O:Clock";
+        return failure();
+      }
+  } else {
+    OpBuilder circuitBuilder(context);
+    circuitBuilder.setInsertionPointToEnd(circuit.getBodyBlock());
+    gate = circuitBuilder.create<FExtModuleOp>(
+        loc, StringAttr::get(context, "AbstractClockGate"),
+        ConventionAttr::get(context, Convention::Internal), ports,
+        "AbstractClockGate");
+  }
 
   OpBuilder declarations(&model.getBodyBlock()->front());
   auto buffer = declarations.create<InstanceOp>(loc, gate, bufferName);

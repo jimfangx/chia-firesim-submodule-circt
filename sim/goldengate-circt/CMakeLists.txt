@@ -151,6 +151,24 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-fame-clock-gate-test
+    test/Transforms/FAMEClockGateTest.cpp lib/Transforms/FAMEInputChannel.cpp)
+  target_compile_features(goldengate-fame-clock-gate-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-clock-gate-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-clock-gate-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-clock-gate-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-clock-gate COMMAND goldengate-fame-clock-gate-test)
+  add_test(NAME goldengate-fame-multiple-virtual-clocks COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMultipleVirtualClocks.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMultipleVirtualClocks.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/multiple-virtual-clocks
+    --rewrite-fame-output-valid-from ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMultipleVirtualClocks.json)
+  add_test(NAME goldengate-fame-multiple-virtual-clocks-check COMMAND goldengate-fame-fired-state-test
+    --clock-controls ${CMAKE_CURRENT_BINARY_DIR}/multiple-virtual-clocks/output-valid.mlir)
+  set_tests_properties(goldengate-fame-multiple-virtual-clocks PROPERTIES FIXTURES_SETUP fame-multiple-virtual-clocks)
+  set_tests_properties(goldengate-fame-multiple-virtual-clocks-check PROPERTIES FIXTURES_REQUIRED fame-multiple-virtual-clocks)
   add_executable(goldengate-fame-virtual-clock-port-test
     test/Transforms/FAMEVirtualClockPortTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-virtual-clock-port-test PRIVATE cxx_std_17)
