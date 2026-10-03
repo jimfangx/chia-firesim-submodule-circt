@@ -9,6 +9,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/DenseSet.h"
+#include <array>
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -106,58 +107,74 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   const std::string circuitName = circuit.getName().str();
   // An engaged, empty plan removes an annotation on an empty aggregate;
   // an absent plan leaves unrelated targets untouched.
-  SmallVector<std::optional<SmallVector<GroundTarget>>> replacements(raw.size());
+  // AutoCounter annotations use exact renames for all three references in
+  // SFC. Keep separate leaf identities for event, clock and reset; only
+  // DontTouch targets may expand into more than one annotation.
+  const std::array<StringRef, 3> members{"target", "clock", "reset"};
+  using MemberPlan = std::optional<SmallVector<GroundTarget>>;
+  SmallVector<std::array<MemberPlan, 3>> replacements(raw.size());
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
-    const bool autoCounter = annotation.isClass(AnnotationClasses::AutoCounter);
+    const bool autoCounter = annotation.isClass(AnnotationClasses::AutoCounter) ||
+        annotation.isClass(AnnotationClasses::InternalAutoCounter);
     if (!dontTouch && !autoCounter)
       continue;
-    auto spelling = annotation.getMember<StringAttr>("target");
-    if (!spelling) {
-      error = "retained target annotation has no target";
-      return failure();
-    }
-    auto local = spelling.getValue().split('>').second;
-    std::string resolutionError;
-    auto target = resolveAnnotationTarget(circuit, spelling.getValue(),
-                                          resolutionError);
-    if (target && target->port) {
-      auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
-          target->module.getPortType(*target->port), *target->fieldID));
-      if (autoCounter && !type.isGround()) {
-        error = "AutoCounter event target must select a ground value: " +
-                spelling.getValue().str();
+    for (unsigned member = 0; member < (autoCounter ? members.size() : 1); ++member) {
+      auto &replacement = replacements[index][member];
+      auto spelling = annotation.getMember<StringAttr>(members[member]);
+      // Missing optional metadata remains the responsibility of the consuming
+      // AutoCounter analysis; existing partial handoffs still lower their event.
+      if (!spelling && member != 0)
+        continue;
+      if (!spelling) {
+        error = "retained target annotation has no target";
         return failure();
       }
-      replacements[index].emplace();
-      collectGroundTargets(type, target->module, *target->port, nullptr,
-                           *target->fieldID, *replacements[index]);
-      continue;
-    }
-    if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
-                                                   resolutionError)) {
-      if (autoCounter && !internal->type.isGround()) {
-        error = "AutoCounter event target must select a ground value: " +
-                spelling.getValue().str();
+      auto local = spelling.getValue().split('>').second;
+      std::string resolutionError;
+      auto target = resolveAnnotationTarget(circuit, spelling.getValue(),
+                                            resolutionError);
+      if (target && target->port) {
+        auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
+            target->module.getPortType(*target->port), *target->fieldID));
+        if (autoCounter && !type.isGround()) {
+          error = "AutoCounter " + members[member].str() +
+                  " must select a ground value: " +
+                  spelling.getValue().str();
+          return failure();
+        }
+        replacement.emplace();
+        collectGroundTargets(type, target->module, *target->port, nullptr,
+                             *target->fieldID, *replacement);
+        continue;
+      }
+      if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
+                                                     resolutionError)) {
+        if (autoCounter && !internal->type.isGround()) {
+          error = "AutoCounter " + members[member].str() +
+                  " must select a ground value: " +
+                  spelling.getValue().str();
+          return failure();
+        }
+        replacement.emplace();
+        collectGroundTargets(internal->type, internal->module, std::nullopt,
+                             internal->declaration, internal->fieldID,
+                             *replacement);
+        continue;
+      }
+      // Preserve the handoff's unresolved ground AutoCounter metadata and
+      // root-only memory DontTouches; memory selectors need a separate port map.
+      if (autoCounter && member == 0 &&
+          !local.contains('.') && !local.contains('['))
+        continue;
+      if (autoCounter ||
+          !resolveInternalAnnotationTarget(circuit, spelling.getValue(),
+                                           resolutionError)) {
+        error = "unresolved retained annotation " + members[member].str() + " " +
+                spelling.getValue().str() + ": " + resolutionError;
         return failure();
       }
-      replacements[index].emplace();
-      collectGroundTargets(internal->type, internal->module, std::nullopt,
-                           internal->declaration, internal->fieldID,
-                           *replacements[index]);
-      continue;
-    }
-    // Preserve the handoff's unresolved ground AutoCounter metadata and
-    // root-only memory DontTouches; memory selectors need a separate port map.
-    if (autoCounter && !local.contains('.') && !local.contains('['))
-      continue;
-    if (autoCounter ||
-        !resolveInternalAnnotationTarget(circuit, spelling.getValue(),
-                                         resolutionError)) {
-      error = "unresolved retained annotation target " +
-              spelling.getValue().str() + ": " + resolutionError;
-      return failure();
     }
   }
 
@@ -168,33 +185,35 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   // lowering, so never create them.
   circt::hw::InnerSymbolNamespaceCollection namespaces;
   llvm::DenseMap<Operation *, SmallVector<StringAttr>> temporarySymbols;
-  for (auto &replacement : replacements) {
-    if (!replacement)
-      continue;
-    for (auto &target : *replacement) {
-      auto symbols = target.port
-          ? target.module.getPortSymbolAttr(*target.port)
-          : cast<circt::hw::InnerSymbolOpInterface>(target.declaration)
-                .getInnerSymAttr();
-      if (symbols)
-        target.symbol = symbols.getSymIfExists(target.fieldID);
-      if (target.symbol)
+  for (auto &annotationPlan : replacements) {
+    for (auto &replacement : annotationPlan) {
+      if (!replacement)
         continue;
-      target.symbol = StringAttr::get(module.getContext(),
-          namespaces[target.module].newName("gg_lower_target"));
-      SmallVector<circt::hw::InnerSymPropertiesAttr> properties;
-      if (symbols)
-        llvm::append_range(properties, symbols.getProps());
-      properties.push_back(circt::hw::InnerSymPropertiesAttr::get(
-          module.getContext(), target.symbol, target.fieldID,
-          StringAttr::get(module.getContext(), "private")));
-      auto updated = circt::hw::InnerSymAttr::get(module.getContext(), properties);
-      if (target.port)
-        target.module.setPortSymbolsAttr(*target.port, updated);
-      else
-        cast<circt::hw::InnerSymbolOpInterface>(target.declaration)
-            .setInnerSymbolAttr(updated);
-      temporarySymbols[target.module].push_back(target.symbol);
+      for (auto &target : *replacement) {
+        auto symbols = target.port
+            ? target.module.getPortSymbolAttr(*target.port)
+            : cast<circt::hw::InnerSymbolOpInterface>(target.declaration)
+                  .getInnerSymAttr();
+        if (symbols)
+          target.symbol = symbols.getSymIfExists(target.fieldID);
+        if (target.symbol)
+          continue;
+        target.symbol = StringAttr::get(module.getContext(),
+            namespaces[target.module].newName("gg_lower_target"));
+        SmallVector<circt::hw::InnerSymPropertiesAttr> properties;
+        if (symbols)
+          llvm::append_range(properties, symbols.getProps());
+        properties.push_back(circt::hw::InnerSymPropertiesAttr::get(
+            module.getContext(), target.symbol, target.fieldID,
+            StringAttr::get(module.getContext(), "private")));
+        auto updated = circt::hw::InnerSymAttr::get(module.getContext(), properties);
+        if (target.port)
+          target.module.setPortSymbolsAttr(*target.port, updated);
+        else
+          cast<circt::hw::InnerSymbolOpInterface>(target.declaration)
+              .setInnerSymbolAttr(updated);
+        temporarySymbols[target.module].push_back(target.symbol);
+      }
     }
   }
   // Remove only identities introduced here, also on a downstream pass failure.
@@ -253,39 +272,57 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   circt::hw::InnerSymbolTableCollection tables;
   SmallVector<Attribute> rewritten;
   rewritten.reserve(raw.size());
+  auto loweredSpelling = [&](GroundTarget replacement) -> StringAttr {
+    auto lowered = tables.getInnerSymbolTable(replacement.module)
+                       .lookup(replacement.symbol);
+    if (!lowered || lowered.getField() != 0) {
+      error = "LowerTypes did not preserve annotated ground identity " +
+              replacement.symbol.getValue().str();
+      return {};
+    }
+    FIRRTLBaseType type;
+    StringAttr name;
+    if (lowered.isPort()) {
+      type = dyn_cast<FIRRTLBaseType>(
+          replacement.module.getPortType(lowered.getPort()));
+      name = replacement.module.getPortNameAttr(lowered.getPort());
+    } else {
+      auto declaration = cast<circt::hw::InnerSymbolOpInterface>(lowered.getOp());
+      type = dyn_cast<FIRRTLBaseType>(declaration.getTargetResult().getType());
+      name = declaration->getAttrOfType<StringAttr>("name");
+    }
+    if (!type || !type.isGround() || !name) {
+      error = "LowerTypes annotated identity is not a named ground value";
+      return {};
+    }
+    auto spelling = "~" + circuitName + "|" +
+        replacement.module.getModuleName().str() + ">" + name.getValue().str();
+    return StringAttr::get(module.getContext(), spelling);
+  };
   for (auto [index, attr] : llvm::enumerate(raw)) {
-    if (!replacements[index]) {
-      rewritten.push_back(attr);
+    Annotation annotation(attr);
+    // Clock and reset have exactly one ground identity each. Rewrite them
+    // before copying the event annotation, preserving every other member.
+    for (unsigned member = 1; member < members.size(); ++member) {
+      if (auto &plan = replacements[index][member]) {
+        auto spelling = loweredSpelling(plan->front());
+        if (!spelling)
+          return failure();
+        annotation.setMember(members[member], spelling);
+      }
+    }
+    auto &events = replacements[index][0];
+    if (!events) {
+      rewritten.push_back(annotation.getAttr());
       continue;
     }
-    for (auto &replacement : *replacements[index]) {
-      auto lowered = tables.getInnerSymbolTable(replacement.module)
-                         .lookup(replacement.symbol);
-      if (!lowered || lowered.getField() != 0) {
-        error = "LowerTypes did not preserve annotated ground identity " +
-                replacement.symbol.getValue().str();
+    for (auto &replacement : *events) {
+      auto spelling = loweredSpelling(replacement);
+      if (!spelling)
         return failure();
-      }
-      FIRRTLBaseType type;
-      StringAttr name;
-      if (lowered.isPort()) {
-        type = dyn_cast<FIRRTLBaseType>(
-            replacement.module.getPortType(lowered.getPort()));
-        name = replacement.module.getPortNameAttr(lowered.getPort());
-      } else {
-        auto declaration = cast<circt::hw::InnerSymbolOpInterface>(lowered.getOp());
-        type = dyn_cast<FIRRTLBaseType>(declaration.getTargetResult().getType());
-        name = declaration->getAttrOfType<StringAttr>("name");
-      }
-      if (!type || !type.isGround() || !name) {
-        error = "LowerTypes annotated identity is not a named ground value";
-        return failure();
-      }
-      auto spelling = "~" + circuitName + "|" +
-          replacement.module.getModuleName().str() + ">" + name.getValue().str();
-      Annotation annotation(attr);
-      annotation.setMember("target", StringAttr::get(module.getContext(), spelling));
-      rewritten.push_back(annotation.getAttr());
+      Annotation leaf(annotation.getAttr());
+      leaf.setMember("target", spelling);
+      rewritten.push_back(leaf.getAttr());
     }
   }
   circuit->setAttr("rawAnnotations", ArrayAttr::get(module.getContext(),

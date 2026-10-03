@@ -213,7 +213,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-fame-unused-outputs COMMAND goldengate-fame-unused-outputs-test)
   add_executable(goldengate-lower-types-targets-test
     test/Transforms/LowerTypesTargetsTest.cpp lib/Transforms/LowerTypes.cpp
-    lib/Support/TargetUtils.cpp)
+    lib/Analysis/AutoCounterAnalysis.cpp lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-lower-types-targets-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-lower-types-targets-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-lower-types-targets-test PRIVATE

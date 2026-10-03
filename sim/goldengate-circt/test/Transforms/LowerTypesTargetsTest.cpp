@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/AutoCounterAnalysis.h"
 #include "goldengate/LowerTypes.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
@@ -332,7 +333,138 @@ void run(MLIRContext &context) {
     require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, circuit, error)) &&
                 dump(*invalid) == before, "invalid internal selector mutated IR");
   }
-  llvm::outs() << "DontTouch aggregates expand in declaration order; fields, flips and unrelated targets preserved; three invalid selectors reject atomically; namespace collisions follow leaf identities and preserve native InnerRefs without temporary symbol leakage; internal wire/node/register targets expand and follow declaration namespace renames\n";
+  // Clock/reset selectors must follow the same exact leaf identities as the
+  // event. Collide aggregate leaves with scalar ports and internal declarations
+  // so a simple underscore substitution would bind the wrong value.
+  const char *counterFixture = R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %io: !firrtl.bundle<event: uint<8>, domain: vector<bundle<clock: clock, reset: uint<1>>, 1>>,
+                        in %io_domain_0_clock: !firrtl.clock,
+                        in %io_domain_0_reset: !firrtl.uint<2>,
+                        in %state_clock: !firrtl.clock,
+                        in %state_reset: !firrtl.uint<3>) {
+        %state = firrtl.node %io : !firrtl.bundle<event: uint<8>, domain: vector<bundle<clock: clock, reset: uint<1>>, 1>>
+        %state_domain_0_clock = firrtl.wire : !firrtl.clock
+        %state_domain_0_reset = firrtl.wire : !firrtl.uint<4>
+      }
+    }
+  })mlir";
+  auto counter = parseSourceString<ModuleOp>(counterFixture, &context);
+  require(bool(counter), "AutoCounter selector fixture parse failed");
+  auto ac = *counter->getOps<CircuitOp>().begin();
+  auto counterAnnotation = [&](StringRef event, StringRef clock, StringRef reset,
+                               StringRef klass = goldengate::AnnotationClasses::AutoCounter) {
+    Annotation result(annotation(event, "counter", klass));
+    result.setMember("clock", b.getStringAttr(clock));
+    result.setMember("reset", b.getStringAttr(reset));
+    result.setMember("label", b.getStringAttr("counter"));
+    return result.getAttr();
+  };
+  SmallVector<Attribute> counters{
+      counterAnnotation("~Top|Top>io.event", "~Top|Top>io.domain[0].clock",
+                        "~Top|Top>io.domain.0.reset"),
+      counterAnnotation("~Top|Top>state.event", "~Top|Top>state.domain.0.clock",
+                        "~Top|Top>state.domain[0].reset"),
+      counterAnnotation("~Top|Top>io.event", "~Top|Top>io_domain_0_clock",
+                        "~Top|Top>io_domain_0_reset"),
+      counterAnnotation("~Top|Top>state.event", "~Top|Top>state_domain_0_clock",
+                        "~Top|Top>state_domain_0_reset"),
+      counterAnnotation("~Top|Top>io.event", "~Top|Top>io.domain[0].clock",
+                        "~Top|Top>io.domain[0].reset",
+                        goldengate::AnnotationClasses::InternalAutoCounter)};
+  auto nativeClock = goldengate::resolveAnnotationTarget(
+      ac, "~Top|Top>io.domain[0].clock", error);
+  auto nativeReset = goldengate::resolveInternalFieldTarget(
+      ac, "~Top|Top>state.domain[0].reset", error);
+  require(nativeClock && nativeClock->port && nativeReset,
+          "AutoCounter native leaf selectors did not resolve");
+  nativeClock->module.setPortSymbolsAttr(*nativeClock->port,
+      InnerSymAttr::get(&context,
+          {property("counter_clock", *nativeClock->fieldID, "public")}));
+  cast<InnerSymbolOpInterface>(nativeReset->declaration).setInnerSymbolAttr(
+      InnerSymAttr::get(&context,
+          {property("counter_reset", nativeReset->fieldID, "private")}));
+  auto counterRefs = b.getArrayAttr({
+      InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("counter_clock")),
+      InnerRefAttr::get(b.getStringAttr("Top"), b.getStringAttr("counter_reset"))});
+  ac->setAttr("test.stable_refs", counterRefs);
+  ac->setAttr("rawAnnotations", b.getArrayAttr(counters));
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*counter, ac, error)), error);
+  require(succeeded(verify(*counter)), "AutoCounter lowered fixture verification failed");
+  auto counterRaw = ac->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(counterRaw.size() == counters.size(), "AutoCounter exact rename fanned out");
+  SmallVector<goldengate::AutoCounterEvent> resolved;
+  require(succeeded(goldengate::analyzeAutoCounterEvents(ac, resolved, error)) &&
+              resolved.size() == 4, error);
+  const unsigned resetWidths[] = {1, 1, 2, 4};
+  for (auto [i, event] : llvm::enumerate(resolved)) {
+    require(cast<UIntType>(event.event.getType()).getWidth() == 8 &&
+                isa<ClockType>(event.clock.getType()) &&
+                cast<UIntType>(event.reset.getType()).getWidth() == resetWidths[i],
+            "AutoCounter operand selected the wrong scalar leaf");
+    if (i == 0 || i == 2)
+      require(isa<BlockArgument>(event.event) && isa<BlockArgument>(event.clock) &&
+                  isa<BlockArgument>(event.reset), "AutoCounter port reference became internal");
+    else
+      require(isa<NodeOp>(event.event.getDefiningOp()) &&
+                  (i == 1 ? isa<NodeOp>(event.clock.getDefiningOp()) &&
+                            isa<NodeOp>(event.reset.getDefiningOp()) :
+                            isa<WireOp>(event.clock.getDefiningOp()) &&
+                            isa<WireOp>(event.reset.getDefiningOp())),
+              "AutoCounter internal declaration identity changed");
+    Annotation result(counterRaw[i]);
+    require(result.getMember<ArrayAttr>("test.payload") ==
+                Annotation(counters[i]).getMember<ArrayAttr>("test.payload") &&
+                result.getMember<StringAttr>("label").getValue() == "counter",
+            "AutoCounter payload changed");
+  }
+  require(resolved[0].clock != resolved[2].clock &&
+              resolved[1].clock != resolved[3].clock &&
+              resolved[0].reset != resolved[2].reset &&
+              resolved[1].reset != resolved[3].reset,
+          "AutoCounter clock/reset collisions alias different identities");
+  Annotation internalCounter(counterRaw[4]);
+  Annotation publicCounter(counterRaw[0]);
+  for (StringRef member : {"target", "clock", "reset"})
+    require(internalCounter.getMember<StringAttr>(member) ==
+                publicCounter.getMember<StringAttr>(member),
+            "internal/public AutoCounter exact renames disagree");
+  auto counterModule = *ac.getOps<FModuleOp>().begin();
+  symbolCount = 0;
+  InnerSymbolTable::walkSymbols(counterModule,
+      [&](StringAttr, const InnerSymTarget &) { ++symbolCount; });
+  require(symbolCount == 2 && ac->getAttr("test.stable_refs") == counterRefs,
+          "AutoCounter temporary leaf symbols leaked or native InnerRefs changed");
+  InnerSymbolTable counterSymbols(counterModule);
+  auto clockIdentity = counterSymbols.lookup("counter_clock");
+  auto resetIdentity = counterSymbols.lookup("counter_reset");
+  require(clockIdentity && clockIdentity.isPort() && clockIdentity.getField() == 0 &&
+              counterModule.getBodyBlock()->getArgument(clockIdentity.getPort()) == resolved[0].clock &&
+              resetIdentity && !resetIdentity.isPort() && resetIdentity.getField() == 0 &&
+              resetIdentity.getOp()->getResult(0) == resolved[1].reset,
+          "native clock/reset symbols no longer refer to AutoCounter operands");
+  require(counterModule.getPortSymbolAttr(clockIdentity.getPort()).getProps().front()
+                  .getSymVisibility().getValue() == "public" &&
+              cast<InnerSymbolOpInterface>(resetIdentity.getOp()).getInnerSymAttr()
+                  .getProps().front().getSymVisibility().getValue() == "private",
+          "native clock/reset symbol visibility changed");
+  before = dump(*counter);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*counter, ac, error)) &&
+              dump(*counter) == before, "AutoCounter exact renames are not idempotent");
+  for (auto bad : {
+      counterAnnotation("~Top|Top>io.event", "~Top|Top>io.domain", "~Top|Top>io.domain[0].reset"),
+      counterAnnotation("~Top|Top>io.event", "~Top|Top>io.domain[1].clock", "~Top|Top>io.domain[0].reset"),
+      counterAnnotation("~Top|Top>state.event", "~Top|Top>state.domain[0].clock", "~Top|Top>state.domain"),
+      counterAnnotation("~Top|Top>state.event", "~Top|Top>state.domain[0].clock", "~Top|Top>state.domain[0].missing"),
+      counterAnnotation("~Top|Top>io.event", "~Top|Top>absent", "~Top|Top>io.domain[0].reset")}) {
+    auto invalid = parseSourceString<ModuleOp>(counterFixture, &context);
+    auto circuit = *invalid->getOps<CircuitOp>().begin();
+    circuit->setAttr("rawAnnotations", b.getArrayAttr({counters.front(), bad}));
+    before = dump(*invalid);
+    require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, circuit, error)) &&
+                dump(*invalid) == before, "invalid AutoCounter clock/reset mutated IR");
+  }
+  llvm::outs() << "DontTouch aggregates expand in declaration order; fields, flips and unrelated targets preserved; three invalid selectors reject atomically; namespace collisions follow leaf identities and preserve native InnerRefs without temporary symbol leakage; internal wire/node/register targets expand and follow declaration namespace renames; AutoCounter event/clock/reset references preserve port and internal leaf identities\n";
 
 }
 } // namespace

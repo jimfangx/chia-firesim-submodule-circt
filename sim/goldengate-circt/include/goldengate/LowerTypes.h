@@ -6,12 +6,18 @@
 #include <string>
 
 namespace goldengate {
-// Resolve CHIRRTL and infer widths/resets before lowering aggregate operations.
-// Expand retained DontTouch port, wire, node, and register targets to all
-// selected ground descendants, preserving fields and declaration order. Event
-// selectors must select one ground value. Leaf inner symbols carry identity
-// through expansion and namespace renames. Declaration names are unique,
-// module/instance interfaces agree, and temporary identities are removed.
+// Requires: imported FIRRTL with rawAnnotations and resolvable local selectors.
+// Consumes: DontTouch references to empty aggregates; temporary leaf identities.
+// Produces: ground DontTouch targets and exact AutoCounter target/clock/reset
+// references, for both public and internal AutoCounter annotation classes.
+// Mutates: resolves CHIRRTL, infers widths/resets, lowers aggregates, uniquifies
+// declaration names, synchronizes instance ports, and transfers retained targets.
+// Requires analyses: FIRRTL subtype/field IDs and CIRCT inner symbol namespaces.
+// Preserves: annotation payload/order, unrelated annotations, native leaf symbols
+// and InnerRefs. Structural analyses must be rebuilt after lowering.
+// Outputs: ground retained selectors, unique names, matching module/instance
+// interfaces, and no temporary identities. AutoCounter selectors each name one
+// ground value; missing clock/reset metadata is checked by AutoCounter analysis.
 // Native aggregate inner symbols remain subject to CIRCT LowerTypes validation.
 mlir::LogicalResult lowerTypesWithRetainedTargets(
     mlir::ModuleOp module, circt::firrtl::CircuitOp circuit,
