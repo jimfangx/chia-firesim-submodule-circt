@@ -164,13 +164,102 @@ void run(MLIRContext &context) {
   require(succeeded(goldengate::gateAutoCounterEventsWithReset(circuit, {wide}, error)), error);
   checkGates(*root, circuit, {wide}, raw);
 }
+
+void runSelection(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>,
+                        in %event: !firrtl.uint<8>) {}
+      firrtl.module private @Child(in %clock: !firrtl.clock,
+          in %reset: !firrtl.uint<1>, in %event: !firrtl.uint<8>) {}
+      firrtl.module private @Sibling(in %clock: !firrtl.clock,
+          in %reset: !firrtl.uint<1>, in %event: !firrtl.uint<8>) {}
+    }
+  })mlir", &context);
+  require(bool(root), "selection fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context);
+  auto record = [&](StringRef module, bool generated, StringRef klass) {
+    auto base = "~Top|" + module.str() + ">";
+    NamedAttrList fields({
+        b.getNamedAttr("class", b.getStringAttr(klass)),
+        b.getNamedAttr("target", b.getStringAttr(base + "event")),
+        b.getNamedAttr("clock", b.getStringAttr(base + "clock")),
+        b.getNamedAttr("reset", b.getStringAttr(base + "reset")),
+        b.getNamedAttr("label", b.getStringAttr("selected"))});
+    if (generated) fields.set("coverGenerated", b.getBoolAttr(true));
+    return fields.getDictionary(&context);
+  };
+  // Sibling has no usable event, clock, reset, or label. It must not be resolved
+  // unless selected, even though its enclosing module identity is available.
+  NamedAttrList skipped(record("Sibling", true, goldengate::AnnotationClasses::AutoCounter));
+  skipped.set("target", b.getStringAttr("~Top|Sibling>missing"));
+  skipped.set("clock", b.getStringAttr("~Top|Sibling>missingClock"));
+  skipped.erase("reset");
+  skipped.erase("label");
+  SmallVector<Attribute> records{
+      record("Top", false, goldengate::AnnotationClasses::AutoCounter),
+      record("Top", true, goldengate::AnnotationClasses::AutoCounter),
+      record("Child", true, goldengate::AnnotationClasses::InternalAutoCounter),
+      skipped.getDictionary(&context)};
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(records));
+  std::string error;
+  SmallVector<goldengate::AutoCounterEvent> events;
+  auto original = dump(*root);
+  require(succeeded(goldengate::analyzeSelectedAutoCounterEvents(
+              circuit, {}, events, error)) && events.size() == 1 &&
+              events[0].annotationIndex == 0, "manual default selection failed: " + error);
+  require(dump(*root) == original, "selection changed IR");
+  auto manual = events.front();
+  require(failed(goldengate::analyzeAutoCounterEvents(circuit, events, error)) &&
+              events.size() == 1 && dump(*root) == original,
+          "all-event analysis did not reject an invalid late event atomically");
+  events.clear();
+  require(succeeded(goldengate::analyzeSelectedAutoCounterEvents(
+              circuit, {"Child ", "", "unknown"}, events, error)) &&
+              events.size() == 1, "file names were trimmed or matched as patterns");
+  // Annotation and file module sets are unioned, and duplicate names do not
+  // duplicate events. Selection preserves raw annotation ordering and indices.
+  auto cover = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::AutoCounterCoverModule)),
+      b.getNamedAttr("target", b.getStringAttr("~Top|Top"))});
+  records.push_back(cover);
+  records.push_back(cover);
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(records));
+  events.clear();
+  require(succeeded(goldengate::analyzeSelectedAutoCounterEvents(
+              circuit, {"Child", "Child"}, events, error)) && events.size() == 3,
+          "annotation/file union failed: " + error);
+  for (unsigned i = 0; i < events.size(); ++i)
+    require(events[i].annotationIndex == i, "selection order or identity changed");
+  require(events[0].event == manual.event, "manual event SSA identity changed");
+  original = dump(*root);
+  require(failed(goldengate::analyzeSelectedAutoCounterEvents(
+              circuit, {"Sibling"}, events, error)) && events.size() == 3 &&
+              dump(*root) == original, "invalid selected operands were accepted or mutated IR");
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(succeeded(goldengate::gateAutoCounterEventsWithReset(circuit, events, error)), error);
+  require(succeeded(verify(*root)), "selected reset gates failed verification");
+  SmallVector<goldengate::AutoCounterEvent> gated;
+  require(succeeded(goldengate::analyzeSelectedAutoCounterEvents(
+              circuit, {"Child"}, gated, error)) && gated.size() == events.size(), error);
+  for (unsigned i = 0; i < gated.size(); ++i) {
+    require(isa<WireOp>(gated[i].event.getDefiningOp()) &&
+                gated[i].clock == events[i].clock && gated[i].reset == events[i].reset,
+            "selection was not passed to the hardware reset gate");
+  }
+  auto updated = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  for (unsigned i = 3; i < raw.size(); ++i)
+    require(raw[i] == updated[i], "unselected event or cover-module annotation changed");
+}
 } // namespace
 int main(int argc, char **argv) {
   try {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     run(context);
-    if (argc == 2) {
+    runSelection(context);
+    if (argc == 2 || argc == 3) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(root), "golden candidate MLIR parse failed");
       auto circuit = *root->getOps<CircuitOp>().begin();
@@ -179,7 +268,12 @@ int main(int argc, char **argv) {
       require(succeeded(lowForm.run(*root)), "golden candidate ExpandWhens failed");
       SmallVector<goldengate::AutoCounterEvent> events;
       std::string error;
-      require(succeeded(goldengate::analyzeAutoCounterEvents(circuit, events, error)), error);
+      SmallVector<StringRef> coverModules;
+      if (argc == 3) StringRef(argv[2]).split(coverModules, ',');
+      auto analyzed = argc == 3
+          ? goldengate::analyzeSelectedAutoCounterEvents(circuit, coverModules, events, error)
+          : goldengate::analyzeAutoCounterEvents(circuit, events, error);
+      require(succeeded(analyzed), error);
       auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
       require(succeeded(goldengate::gateAutoCounterEventsWithReset(circuit, events, error)), error);
       checkGates(*root, circuit, events, raw);

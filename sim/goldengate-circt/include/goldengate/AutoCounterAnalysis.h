@@ -2,7 +2,9 @@
 #pragma once
 
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "mlir/IR/Value.h"
 #include "mlir/Support/LogicalResult.h"
 #include <string>
@@ -24,6 +26,16 @@ struct AutoCounterEvent {
 // the operands needed by the later reset gating and counter synthesis passes.
 mlir::LogicalResult analyzeAutoCounterEvents(
     circt::firrtl::CircuitOp circuit,
+    llvm::SmallVectorImpl<AutoCounterEvent> &events, std::string &error);
+
+// AutoCounterTransform selection: manual events are always included; generated
+// covers require an enclosing module selected by a cover-module annotation or
+// an exact name from autocounter-covermodules.txt. Resolve selected records to
+// SSA only after filtering. Preserves all annotations; counter synthesis owns
+// their eventual consumption. On failure, leaves events and IR unchanged.
+mlir::LogicalResult analyzeSelectedAutoCounterEvents(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<llvm::StringRef> coverModuleNames,
     llvm::SmallVectorImpl<AutoCounterEvent> &events, std::string &error);
 
 // Match AutoCounterTransform's cleanup when EnableAutoCounter is false:

@@ -196,6 +196,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter";
   bool gateAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-autocounter-events";
+  bool gateSelectedAutoCounter =
+      argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
   bool disableAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
   bool compileBaseline =
@@ -210,7 +212,8 @@ int main(int argc, char **argv) {
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
        !resolveDontTouch && !lowerTypes && !analyzeAutoCounter &&
-       !gateAutoCounter && !disableAutoCounter && !compileBaseline) ||
+       !gateAutoCounter && !gateSelectedAutoCounter &&
+       !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
       llvm::StringRef(argv[4]) != "--output-dir") {
     llvm::errs() << "usage: goldengate-circt input.fir --annotation-file "
@@ -228,6 +231,7 @@ int main(int argc, char **argv) {
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
                     "--lower-types | --analyze-autocounter | --gate-autocounter-events | "
+                    "--gate-selected-autocounter-events | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3023,9 +3027,10 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (gateAutoCounter) {
-    // This boundary accepts already selected records. EnableAutoCounter and
-    // cover-module selection belong to the later complete debug pipeline.
+  if (gateAutoCounter || gateSelectedAutoCounter) {
+    // The explicit selected boundary applies Scala's generated-cover filter.
+    // The original boundary continues to accept already selected records.
+    // EnableAutoCounter and counter implementation remain in the debug pipeline.
     std::string error;
     if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
       return fail("AutoCounter LowerTypes: " + error);
@@ -3036,8 +3041,38 @@ int main(int argc, char **argv) {
     if (failed(lowForm.run(*module)))
       return fail("AutoCounter ExpandWhens failed");
     llvm::SmallVector<goldengate::AutoCounterEvent> events;
-    if (failed(goldengate::analyzeAutoCounterEvents(circuit, events, error)) ||
-        failed(goldengate::gateAutoCounterEventsWithReset(circuit, events, error)))
+    llvm::SmallVector<llvm::StringRef> coverModules;
+    std::unique_ptr<llvm::MemoryBuffer> coverBuffer;
+    if (gateSelectedAutoCounter) {
+      llvm::SmallString<256> coverPath(outputDir);
+      llvm::sys::path::append(coverPath, "autocounter-covermodules.txt");
+      if (llvm::sys::fs::exists(coverPath)) {
+        auto file = llvm::MemoryBuffer::getFile(coverPath);
+        if (!file)
+          return fail("cannot read AutoCounter cover modules: " +
+                      file.getError().message());
+        coverBuffer = std::move(*file);
+        // Source.getLines accepts LF, CRLF, and CR. Preserve empty lines and
+        // whitespace verbatim: they select nothing unless an exact name exists.
+        llvm::StringRef remaining = coverBuffer->getBuffer();
+        while (!remaining.empty()) {
+          auto end = remaining.find_first_of("\r\n");
+          coverModules.push_back(remaining.take_front(end));
+          if (end == llvm::StringRef::npos)
+            break;
+          bool cr = remaining[end] == '\r';
+          remaining = remaining.drop_front(end + 1);
+          if (cr)
+            remaining.consume_front("\n");
+        }
+      }
+    }
+    auto analyzed = gateSelectedAutoCounter
+        ? goldengate::analyzeSelectedAutoCounterEvents(
+              circuit, coverModules, events, error)
+        : goldengate::analyzeAutoCounterEvents(circuit, events, error);
+    if (failed(analyzed) || failed(goldengate::gateAutoCounterEventsWithReset(
+                                circuit, events, error)))
       return fail("AutoCounter reset gating: " + error);
     if (failed(mlir::verify(*module)))
       return fail("AutoCounter reset gating produced invalid FIRRTL IR");

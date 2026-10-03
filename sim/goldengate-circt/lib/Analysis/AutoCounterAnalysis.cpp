@@ -3,6 +3,8 @@
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "mlir/IR/SymbolTable.h"
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -41,22 +43,45 @@ std::optional<ResolvedValue> resolveValue(CircuitOp circuit,
   }
   return ResolvedValue{op->getParentOfType<FModuleOp>(), op->getResult(0)};
 }
-} // namespace
-
-LogicalResult goldengate::analyzeAutoCounterEvents(
-    CircuitOp circuit, llvm::SmallVectorImpl<AutoCounterEvent> &events,
+LogicalResult analyzeEvents(
+    CircuitOp circuit,
+    const llvm::SmallPtrSetImpl<Operation *> *coverModules,
+    llvm::SmallVectorImpl<goldengate::AutoCounterEvent> &events,
     std::string &error) {
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw) {
     error = "AutoCounter analysis needs retained annotations";
     return failure();
   }
+  SmallVector<goldengate::AutoCounterEvent> resolvedEvents;
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
-    if (!annotation.isClass(AnnotationClasses::AutoCounter) &&
-        !annotation.isClass(AnnotationClasses::InternalAutoCounter))
+    if (!annotation.isClass(goldengate::AnnotationClasses::AutoCounter) &&
+        !annotation.isClass(goldengate::AnnotationClasses::InternalAutoCounter))
       continue;
     auto target = annotation.getMember<StringAttr>("target");
+    if (coverModules) {
+      auto generated = annotation.getMember<BoolAttr>("coverGenerated");
+      if (annotation.getDict().get("coverGenerated") && !generated) {
+        error = "AutoCounter coverGenerated must be a boolean";
+        return failure();
+      }
+      // Missing coverGenerated uses the Scala annotation's default false.
+      if (generated && generated.getValue()) {
+        if (!target || !target.getValue().contains('>')) {
+          error = "generated AutoCounter lacks an event reference target";
+          return failure();
+        }
+        // Resolve only the module identity here. Unselected generated events
+        // need not resolve their event, clock, reset, or label operands.
+        auto enclosing = goldengate::resolveAnnotationTarget(
+            circuit, target.getValue().split('>').first, error);
+        if (!enclosing)
+          return failure();
+        if (!coverModules->contains(enclosing->module.getOperation()))
+          continue;
+      }
+    }
     auto clock = annotation.getMember<StringAttr>("clock");
     auto reset = annotation.getMember<StringAttr>("reset");
     auto label = annotation.getMember<StringAttr>("label");
@@ -87,13 +112,56 @@ LogicalResult goldengate::analyzeAutoCounterEvents(
               target.getValue().str();
       return failure();
     }
-    events.push_back(AutoCounterEvent{
+    resolvedEvents.push_back(goldengate::AutoCounterEvent{
         eventValue->module, eventValue->value, clockValue->value,
         resetValue->value, target.getValue().str(), clock.getValue().str(),
         reset.getValue().str(), label.getValue().str(),
         static_cast<unsigned>(index)});
   }
+  events.append(resolvedEvents.begin(), resolvedEvents.end());
   return success();
+}
+} // namespace
+
+LogicalResult goldengate::analyzeAutoCounterEvents(
+    CircuitOp circuit, llvm::SmallVectorImpl<AutoCounterEvent> &events,
+    std::string &error) {
+  return analyzeEvents(circuit, nullptr, events, error);
+}
+
+LogicalResult goldengate::analyzeSelectedAutoCounterEvents(
+    CircuitOp circuit, llvm::ArrayRef<llvm::StringRef> coverModuleNames,
+    llvm::SmallVectorImpl<AutoCounterEvent> &events, std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "AutoCounter selection needs retained annotations";
+    return failure();
+  }
+  llvm::SmallPtrSet<Operation *, 8> coverModules;
+  for (auto name : coverModuleNames)
+    // File entries are exact module names. Unknown names simply match no
+    // event, as in Scala; do not trim whitespace or treat entries as patterns.
+    if (auto *op = SymbolTable::lookupSymbolIn(circuit, name))
+      if (isa<FModuleLike>(op))
+        coverModules.insert(op);
+  for (auto attr : raw) {
+    Annotation annotation(attr);
+    if (!annotation.isClass(AnnotationClasses::AutoCounterCoverModule))
+      continue;
+    auto target = annotation.getMember<StringAttr>("target");
+    if (!target) {
+      error = "AutoCounter cover-module annotation lacks a target";
+      return failure();
+    }
+    auto resolved = resolveAnnotationTarget(circuit, target.getValue(), error);
+    if (!resolved || resolved->port) {
+      if (resolved)
+        error = "AutoCounter cover-module target must name a module";
+      return failure();
+    }
+    coverModules.insert(resolved->module.getOperation());
+  }
+  return analyzeEvents(circuit, &coverModules, events, error);
 }
 
 LogicalResult goldengate::dropDisabledAutoCounterAnnotations(
