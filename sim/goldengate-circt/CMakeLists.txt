@@ -166,7 +166,7 @@ if(BUILD_TESTING)
   target_include_directories(goldengate-global-reset-wiring-test PRIVATE
     include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
   target_link_libraries(goldengate-global-reset-wiring-test PRIVATE
-    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-global-reset-wiring COMMAND goldengate-global-reset-wiring-test)
   add_executable(goldengate-print-wiring-test
     test/Transforms/PrintWiringTest.cpp lib/Transforms/PrintWiring.cpp

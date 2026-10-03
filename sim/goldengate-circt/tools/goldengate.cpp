@@ -3175,7 +3175,7 @@ int main(int argc, char **argv) {
                 : "Constructed printf field and reset channels; bridge parameters pending\n");
             if (wireAutoCounterPrintReset) {
               unsigned wiredResetSinks = 0;
-              if (failed(goldengate::wireLocalGlobalReset(circuit, wiredResetSinks, error)))
+              if (failed(goldengate::wireGlobalReset(circuit, wiredResetSinks, error)))
                 return fail("GlobalResetConditionWiring: " + error);
               if (failed(mlir::verify(*module)))
                 return fail("GlobalResetConditionWiring produced invalid FIRRTL IR");

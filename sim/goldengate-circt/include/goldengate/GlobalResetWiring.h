@@ -4,10 +4,12 @@
 #include <string>
 
 namespace goldengate {
-// Port of GlobalResetConditionWiring for lowered ground references in one
-// module. Public targetutils annotations have the same semantics as their
-// internal shadow annotations. Cross-module wiring is rejected before mutation.
-// With either side absent, consume both annotation classes without changing IR.
-mlir::LogicalResult wireLocalGlobalReset(circt::firrtl::CircuitOp circuit,
-                                         unsigned &wired, std::string &error);
+// Port of GlobalResetConditionWiring for local lowered UInt<1> references.
+// Supports sinks in the source module, or a circuit-top source routed downward
+// to all instances of pathless sink modules. Adds one input per route module.
+// Rejects unreachable uses, nested source ownership and conditional drivers
+// before mutation. Public annotations share their internal shadow semantics.
+// With either side absent, consume annotations without changing hardware.
+mlir::LogicalResult wireGlobalReset(circt::firrtl::CircuitOp circuit,
+                                    unsigned &wired, std::string &error);
 } // namespace goldengate
