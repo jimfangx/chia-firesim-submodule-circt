@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/PrintWiring.h"
 #include "goldengate/AnnotationClasses.h"
+#include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -126,9 +127,102 @@ void run(MLIRContext &context) {
     require(i->getAttrOfType<StringAttr>("testMetadata") &&
       i->getAttrOfType<StringAttr>("testMetadata").getValue()=="preserved" && i.getPortName(0)=="clock" &&
       i.getPortName(5)=="old", "instance metadata/old port identity changed");
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  b.create<WireOp>(top.getLoc(),UIntType::get(&context,1),b.getStringAttr("synthesizedPrintf_clock"));
+  before=dump(*root);
+  auto invalid=routes;invalid.back().topPort=top.getBodyBlock()->getArgument(0);
+  require(failed(goldengate::completePrintClockWiring(c,stubs,invalid,error)) && dump(*root)==before,
+          "invalid sink failure mutated clock ports or annotations");
+  auto duplicate=routes;duplicate.back().topPort=duplicate.front().topPort;
+  require(failed(goldengate::completePrintClockWiring(c,stubs,duplicate,error)) && dump(*root)==before,
+          "duplicate sink failure mutated circuit");
+  c->setAttr("rawAnnotations",b.getArrayAttr({}));before=dump(*root);
+  require(failed(goldengate::completePrintClockWiring(c,stubs,routes,error)) && dump(*root)==before,
+          "missing pending annotation failure mutated circuit");
+  SmallVector<Attribute> unsupported(annotations.begin(),annotations.end());
+  unsupported.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::BridgeTopWiring)),
+      b.getNamedAttr("target",b.getStringAttr("~Top|Top>unsupported")),
+      b.getNamedAttr("clock",b.getStringAttr("~Top|Top>clock"))}));
+  c->setAttr("rawAnnotations",b.getArrayAttr(unsupported));before=dump(*root);
+  require(failed(goldengate::completePrintClockWiring(c,stubs,routes,error)) && dump(*root)==before,
+          "unsupported pending annotation was lost on failure");
+  c->setAttr("rawAnnotations",annotations);
+  require(succeeded(goldengate::completePrintClockWiring(c,stubs,routes,error)),error);
+  require(top.getNumPorts()==14 && top.getPortName(13)=="synthesizedPrintf_clock_0" &&
+      top.getPortDirection(13)==Direction::Out && isa<ClockType>(top.getPortType(13)) &&
+      driver(top,top.getBodyBlock()->getArgument(13))==top.getBodyBlock()->getArgument(0),
+      "shared clock loopback deduplication, namespace or native driver mismatch");
+  auto completed=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(completed.size()==10,"output annotations lost preserved SynthPrintf records");
+  for(auto [i,route]:llvm::enumerate(routes)) {
+    Annotation anno(completed[i]);
+    require(anno.isClass(goldengate::AnnotationClasses::BridgeTopWiringOutput) &&
+        anno.getMember<StringAttr>("pathlessSource").getValue()==stubs[route.stubIndex].target &&
+        anno.getMember<StringAttr>("absoluteSource").getValue()==route.absoluteSource &&
+        anno.getMember<StringAttr>("topSink").getValue()==route.topTarget &&
+        anno.getMember<StringAttr>("srcClockPort").getValue()=="~Top|Top>clock" &&
+        anno.getMember<StringAttr>("sinkClockPort").getValue()=="~Top|Top>synthesizedPrintf_clock_0",
+        "five-field BridgeTopWiringOutput annotation mismatch");
+  }
+  for(auto [i,attr]:llvm::enumerate(annos))
+    require(completed[routes.size()+i]==attr,"unconsumed annotation changed");
+  require(succeeded(verify(*root)),"invalid FIRRTL after printf clock loopbacks");
   before=dump(*root);SmallVector<goldengate::WiredPrint> empty;
   require(succeeded(goldengate::wirePrintStubsToTop(c,{},empty,error)) && empty.empty() && dump(*root)==before,
           "empty selection mutated circuit");
+  require(succeeded(goldengate::completePrintClockWiring(c,{},empty,error)) && dump(*root)==before,
+          "empty clock wiring mutated circuit");
+}
+void runTwoClockWiring(MLIRContext &context) {
+  auto root=parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = [
+      {class = "midas.targetutils.SynthPrintfAnnotation", target = "~Top|Leaf>message"}]} {
+      firrtl.module @Top(in %clock0: !firrtl.clock, in %clock1: !firrtl.clock,
+        in %enable: !firrtl.uint<1>) {}
+      firrtl.module @Leaf(in %clock: !firrtl.clock, in %enable: !firrtl.uint<1>) {}
+    }
+  })mlir",&context);
+  require(bool(root),"two clock wiring fixture parse failed");
+  auto c=*root->getOps<CircuitOp>().begin();auto top=named(c,"Top"),leaf=named(c,"Leaf");
+  OpBuilder b(&context);b.setInsertionPointToEnd(leaf.getBodyBlock());
+  b.create<PrintFOp>(c.getLoc(),leaf.getBodyBlock()->getArgument(0),
+      leaf.getBodyBlock()->getArgument(1),"hello\n",ValueRange{},"message");
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  for(unsigned i=0;i<2;++i) {
+    auto inst=b.create<InstanceOp>(c.getLoc(),leaf,i?"right":"left");
+    b.create<StrictConnectOp>(c.getLoc(),inst.getResult(0),top.getBodyBlock()->getArgument(i));
+    b.create<StrictConnectOp>(c.getLoc(),inst.getResult(1),top.getBodyBlock()->getArgument(2));
+  }
+  std::string error;SmallVector<goldengate::PrintStub> stubs;SmallVector<goldengate::WiredPrint> routes;
+  require(succeeded(goldengate::synthesizePrintStubs(c,stubs,error)),error);
+  require(succeeded(goldengate::wirePrintStubsToTop(c,stubs,routes,error)),error);
+  // A bad local clock fails before even the first successful root is looped back.
+  auto clock=stubs[0].clock;stubs[0].clock={};auto before=dump(*root);
+  require(failed(goldengate::completePrintClockWiring(c,stubs,routes,error)) && dump(*root)==before,
+      "clock resolution failure mutated circuit");
+  stubs[0].clock=clock;
+  auto rightClock=routes[1].instancePath.front().getResult(0);
+  StrictConnectOp rightConnect;
+  for(auto connect:top.getBodyBlock()->getOps<StrictConnectOp>())
+    if(connect.getDest()==rightClock)rightConnect=connect;
+  require(bool(rightConnect),"second instance clock driver missing");
+  auto originalClock=rightConnect.getSrc();rightConnect->setOperand(1,rightClock);before=dump(*root);
+  require(failed(goldengate::completePrintClockWiring(c,stubs,routes,error)) && dump(*root)==before,
+      "later clock failure committed a partial loopback or annotation rewrite");
+  rightConnect->setOperand(1,originalClock);
+  require(succeeded(goldengate::completePrintClockWiring(c,stubs,routes,error)),error);
+  require(top.getNumPorts()==7,"distinct top clock roots were merged");
+  auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(raw.size()==3,"shared printf output expansion count mismatch");
+  for(unsigned i=0;i<2;++i) {
+    Annotation anno(raw[i]);
+    require(driver(top,top.getBodyBlock()->getArgument(5+i))==top.getBodyBlock()->getArgument(i) &&
+        anno.getMember<StringAttr>("srcClockPort").getValue()=="~Top|Top>clock"+std::to_string(i) &&
+        anno.getMember<StringAttr>("sinkClockPort").getValue()=="~Top|Top>synthesizedPrintf_clock"+std::to_string(i),
+        "absolute instance context lost its distinct clock loopback");
+  }
+  require(succeeded(verify(*root)),"invalid two clock loopback FIRRTL");
 }
 void runClocks(MLIRContext &context) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {
@@ -201,6 +295,6 @@ void runGolden(MLIRContext &context,StringRef path) {
 }
 int main(int argc,char **argv) {
   MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {run(context);runClocks(context);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
+  try {run(context);runClocks(context);runTwoClockWiring(context);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
   catch(const std::exception &e){llvm::errs()<<"Print wiring FAIL: "<<e.what()<<'\n';return 1;}
 }

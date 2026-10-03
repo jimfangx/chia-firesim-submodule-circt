@@ -203,8 +203,10 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
   bool synthesizeAutoCounterValues =
       argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf-values";
-  bool analyzeAutoCounterPrintClocks =
-      argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter-print-clocks";
+  bool completeAutoCounterPrintWiring =
+      argc == 7 && llvm::StringRef(argv[6]) == "--complete-autocounter-print-wiring";
+  bool analyzeAutoCounterPrintClocks = completeAutoCounterPrintWiring ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter-print-clocks");
   bool wireAutoCounterStubs = analyzeAutoCounterPrintClocks ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   bool wirePrintStubs =
@@ -254,6 +256,7 @@ int main(int argc, char **argv) {
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
                     "--wire-print-stubs | --wire-autocounter-print-stubs | "
                     "--analyze-autocounter-print-clocks | "
+                    "--complete-autocounter-print-wiring | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3120,6 +3123,24 @@ int main(int argc, char **argv) {
         if (ec) return fail("cannot write print clock sources: " + ec.message());
         clockMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(clocks)));
         llvm::outs() << "Resolved " << sources.size() << " absolute printf clock sources; loopbacks pending\n";
+        if (completeAutoCounterPrintWiring) {
+          if (failed(goldengate::completePrintClockWiring(circuit, stubs, routes, error)))
+            return fail("PrintSynthesis clock loopbacks: " + error);
+          if (failed(mlir::verify(*module)))
+            return fail("PrintSynthesis clock loopbacks produced invalid FIRRTL IR");
+          llvm::SmallString<256> completedIR(outputDir), completedAnnos(outputDir), completedFAME(outputDir);
+          llvm::sys::path::append(completedIR, "post-print-clock-wiring.mlir");
+          llvm::sys::path::append(completedAnnos, "post-print-clock-wiring-all.json");
+          llvm::sys::path::append(completedFAME, "post-print-clock-wiring.json");
+          llvm::raw_fd_ostream completed(completedIR, ec);
+          if (ec) return fail("cannot write completed print wiring IR: " + ec.message());
+          module->print(completed); completed << '\n';
+          if (failed(goldengate::emitAllAnnotations(circuit, completedAnnos, error)))
+            return fail("cannot export completed print wiring annotations: " + error);
+          if (failed(goldengate::emitFAMEAnnotations(circuit, completedFAME, error)))
+            return fail("cannot export completed print wiring FAME annotations: " + error);
+          llvm::outs() << "Completed " << routes.size() << " printf clock bindings and output annotations\n";
+        }
       }
     }
     return 0;

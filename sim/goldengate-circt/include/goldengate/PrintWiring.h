@@ -28,4 +28,10 @@ mlir::LogicalResult analyzePrintClockSources(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
     llvm::ArrayRef<WiredPrint> routes,
     llvm::SmallVectorImpl<PrintClockSource> &sources, std::string &error);
+// Finish BridgeTopWiring: resolve clocks, append one output Clock per native
+// top input, and replace pending input annotations with five-field outputs.
+// All clocks and annotation contracts are checked before any mutation.
+mlir::LogicalResult completePrintClockWiring(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
+    llvm::ArrayRef<WiredPrint> routes, std::string &error);
 } // namespace goldengate

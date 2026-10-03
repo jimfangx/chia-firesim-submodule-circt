@@ -43,6 +43,8 @@ struct AnnotationClasses {
       "midas.targetutils.AutoCounterCoverModuleFirrtlAnnotation";
   static constexpr llvm::StringLiteral BridgeTopWiring =
       "midas.passes.BridgeTopWiringAnnotation";
+  static constexpr llvm::StringLiteral BridgeTopWiringOutput =
+      "midas.passes.BridgeTopWiringOutputAnnotation";
   static constexpr llvm::StringLiteral SynthPrintf =
       "midas.targetutils.SynthPrintfAnnotation";
   static constexpr llvm::StringLiteral AutoCounterAccumulate =

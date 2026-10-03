@@ -1,5 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/PrintWiring.h"
+#include "goldengate/AnnotationClasses.h"
+#include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Support/InstanceGraph.h"
 #include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
@@ -7,6 +9,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include <functional>
 #include <map>
+#include <set>
 
 using namespace mlir;
 using namespace circt::firrtl;
@@ -184,5 +187,130 @@ LogicalResult goldengate::wirePrintStubsToTop(
         "~" + circuit.getName().str() + "|" + top.getName().str() + ">" + route.name.getValue().str()});
   }
   outputs.append(result.begin(), result.end());
+  return success();
+}
+
+LogicalResult goldengate::completePrintClockWiring(
+    CircuitOp circuit, ArrayRef<PrintStub> stubs, ArrayRef<WiredPrint> routes,
+    std::string &error) {
+  FModuleOp top;
+  {
+    circt::igraph::InstanceGraph graph(circuit);
+    auto *node = graph.lookup(StringAttr::get(circuit.getContext(), circuit.getName()));
+    if (!node || !node->noUses() ||
+        !(top = dyn_cast<FModuleOp>(node->getModule().getOperation()))) {
+      error = "printf clock wiring needs an uninstantiated internal circuit top";
+      return failure();
+    }
+  }
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "printf clock wiring needs retained annotations";
+    return failure();
+  }
+  std::map<std::string, std::string> pending;
+  for (auto &stub : stubs) {
+    auto bundle = stub.bundle;
+    auto module = bundle ? bundle->getParentOfType<FModuleOp>() : FModuleOp();
+    if (!module || module->getParentOp() != circuit.getOperation() ||
+        bundle->getBlock() != module.getBodyBlock() ||
+        stub.target != "~" + circuit.getName().str() + "|" +
+            module.getName().str() + ">" + bundle.getName().str() ||
+        !pending.emplace(stub.target, stub.clockTarget).second) {
+      error = "printf clock wiring needs distinct native bundle targets";
+      return failure();
+    }
+  }
+  llvm::DenseSet<Attribute> consumed;
+  std::set<std::string> annotated;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (!anno.isClass(AnnotationClasses::BridgeTopWiring)) continue;
+    auto target = anno.getMember<StringAttr>("target");
+    auto clock = anno.getMember<StringAttr>("clock");
+    auto found = target ? pending.find(target.getValue().str()) : pending.end();
+    if (found == pending.end() || !clock || clock.getValue() != found->second) {
+      error = "printf clock wiring has an unsupported pending BridgeTopWiring annotation";
+      return failure();
+    }
+    annotated.insert(found->first);
+    consumed.insert(attr);
+  }
+  if (annotated.size() != stubs.size()) {
+    error = "printf clock wiring is missing pending BridgeTopWiring annotations";
+    return failure();
+  }
+  llvm::DenseSet<Value> sinks;
+  llvm::DenseSet<unsigned> routed;
+  for (auto &route : routes) {
+    auto port = dyn_cast_or_null<BlockArgument>(route.topPort);
+    auto bundle = route.stubIndex < stubs.size() ? stubs[route.stubIndex].bundle : WireOp();
+    if (route.stubIndex >= stubs.size() || !port ||
+        port.getOwner() != top.getBodyBlock() ||
+        top.getPortDirection(port.getArgNumber()) != Direction::Out ||
+        port.getType() != bundle.getResult().getType() ||
+        !sinks.insert(port).second) {
+      error = "printf clock wiring needs distinct native top bundle outputs";
+      return failure();
+    }
+    routed.insert(route.stubIndex);
+  }
+  if (routed.size() != stubs.size()) {
+    error = "printf clock wiring has an unrouted bundle source";
+    return failure();
+  }
+  SmallVector<PrintClockSource> sources;
+  if (failed(analyzePrintClockSources(circuit, stubs, routes, sources, error)))
+    return failure();
+
+  circt::Namespace names;
+  for (auto name : top.getPortNamesAttr())
+    names.newName(cast<StringAttr>(name).getValue());
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) names.newName(name.getValue());
+  });
+  OpBuilder b(circuit.getContext());
+  llvm::DenseMap<Value, unsigned> clockPorts;
+  SmallVector<std::pair<unsigned, PortInfo>> added;
+  SmallVector<Value> drivers;
+  unsigned oldPorts = top.getNumPorts();
+  for (auto &source : sources) {
+    if (clockPorts.count(source.source)) continue;
+    auto port = cast<BlockArgument>(source.source);
+    auto name = names.newName(prefix.str() + top.getPortName(port.getArgNumber()).str());
+    clockPorts[source.source] = oldPorts + added.size();
+    added.push_back({oldPorts, PortInfo(b.getStringAttr(name),
+        ClockType::get(circuit.getContext()), Direction::Out)});
+    drivers.push_back(source.source);
+  }
+  // Serialize identities from the native bundle, instance path and port values.
+  // Do not use a dotted path or stale textual target to decide connectivity.
+  std::string topPrefix = "~" + circuit.getName().str() + "|" + top.getName().str();
+  SmallVector<Attribute> annotations;
+  for (auto &source : sources) {
+    auto &route = routes[source.routeIndex];
+    auto stub = stubs[route.stubIndex];
+    std::string absolute = topPrefix;
+    for (auto instance : route.instancePath)
+      absolute += "/" + instance.getName().str() + ":" + instance.getModuleName().str();
+    absolute += ">" + stub.bundle.getName().str();
+    auto sink = cast<BlockArgument>(route.topPort);
+    auto clockIndex = clockPorts.lookup(source.source) - oldPorts;
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::BridgeTopWiringOutput)),
+        b.getNamedAttr("pathlessSource", b.getStringAttr(stub.target)),
+        b.getNamedAttr("absoluteSource", b.getStringAttr(absolute)),
+        b.getNamedAttr("topSink", b.getStringAttr(topPrefix + ">" + top.getPortName(sink.getArgNumber()).str())),
+        b.getNamedAttr("srcClockPort", b.getStringAttr(source.sourceTarget)),
+        b.getNamedAttr("sinkClockPort", b.getStringAttr(topPrefix + ">" + added[clockIndex].second.name.getValue().str()))}));
+  }
+  for (auto attr : raw)
+    if (!consumed.contains(attr)) annotations.push_back(attr);
+  if (!added.empty()) top.insertPorts(added);
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  for (auto [i, driver] : llvm::enumerate(drivers))
+    b.create<StrictConnectOp>(top.getLoc(),
+        top.getBodyBlock()->getArgument(oldPorts + i), driver);
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   return success();
 }

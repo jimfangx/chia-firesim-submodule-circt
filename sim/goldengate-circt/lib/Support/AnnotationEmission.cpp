@@ -22,6 +22,8 @@ bool isFAMEAnnotation(llvm::StringRef name) {
       goldengate::AnnotationClasses::HostClock,
       goldengate::AnnotationClasses::HostReset,
       goldengate::AnnotationClasses::BridgeIO,
+      goldengate::AnnotationClasses::BridgeTopWiring,
+      goldengate::AnnotationClasses::BridgeTopWiringOutput,
       "firesim.lib.bridgeutils.BridgeAnnotation",
       "midas.passes.fame.PromoteSubmoduleAnnotation",
       "midas.passes.fame.ModelReadPort",
