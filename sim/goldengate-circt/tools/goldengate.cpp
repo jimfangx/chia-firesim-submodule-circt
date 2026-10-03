@@ -3262,6 +3262,29 @@ int main(int argc, char **argv) {
         if (clocks.size() > 1)
           return fail("virtual-clock model has multiple channel clocks: " +
                       moduleName);
+        // The virtual token has no decoupled port. Buffer constant one at
+        // completion and gate all reads of the original single target clock,
+        // exactly as FAMETransformer.targetClockMetadata does for non-hubs.
+        std::optional<std::string> targetClock;
+        for (unsigned i = 0; i < model.getNumPorts(); ++i)
+          if (model.getPortDirection(i) == Direction::In &&
+              model.getPortName(i) != "hostClock" &&
+              mlir::isa<ClockType>(model.getPorts()[i].type)) {
+            if (targetClock)
+              return fail("virtual-clock model has multiple target clocks: " +
+                          moduleName);
+            targetClock = model.getPortName(i).str();
+          }
+        if (!targetClock || (!clocks.empty() && *clocks.begin() != *targetClock))
+          return fail("virtual-clock model lacks its associated target clock: " +
+                      moduleName);
+        if (failed(goldengate::addFAMEClockEnable(
+                model, *targetClock, {}, rewriteError)) ||
+            failed(goldengate::addFAMEClockGate(
+                circuit, model, *targetClock, rewriteError)))
+          return fail("FAME virtual-clock construction: " + rewriteError);
+        // Keep control operands before the newly prepended declarations.
+        builder.setInsertionPoint(&model.getBodyBlock()->front());
         inputEnable = builder.create<ConstantOp>(
             model.getLoc(), UIntType::get(&context, 1), llvm::APInt(1, 1));
       } else {

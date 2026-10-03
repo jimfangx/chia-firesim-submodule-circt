@@ -446,15 +446,18 @@ LogicalResult goldengate::addFAMEClockEnable(
   };
   if (!hostClock || !isa<ClockType>(hostClock.getType()) ||
       !isBit(hostReset) || !isBit(finishing) ||
-      !isBit(clockTokenBits) || nameTaken) {
+      (clockTokenBits && !isBit(clockTokenBits)) || nameTaken) {
     error = "target clock enable lacks a host clock, finishing signal, "
-            "one-bit token, or unique name";
+            "one-bit token (when present), or unique name";
     return failure();
   }
   auto *context = model.getContext();
   auto bitType = UIntType::get(context, 1, false);
   Location loc = model.getLoc();
   OpBuilder declarations(&model.getBodyBlock()->front());
+  if (!clockTokenBits)
+    clockTokenBits = declarations.create<ConstantOp>(
+        loc, bitType, APInt(1, 1));
   Value resetZero = declarations.create<ConstantOp>(
       loc, bitType, APInt(1, 0));
   Value enabled = declarations.create<RegResetOp>(

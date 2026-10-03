@@ -21,7 +21,12 @@ mlir::LogicalResult addFAMEClockChannelToken(
     std::string &error);
 
 // Latch the next target-clock token at the end of a simulated target cycle.
-// The register is subsequently used by the abstract target clock gate.
+// The register is subsequently used by the abstract target clock gate. An
+// absent token selects SFC's VirtualClockChannel (constant one).
+// Requires hostClock: Clock, hostReset/targetCycleFinishing: UInt<1>, and a
+// unique <modelClockName>_enabled name. Consumes/produces no annotations;
+// creates a host-clocked, reset-to-zero register and its completion mux.
+// Channel/hierarchy analyses are unchanged; callers must refresh state scans.
 mlir::LogicalResult addFAMEClockEnable(circt::firrtl::FModuleOp model,
                                        llvm::StringRef modelClockName,
                                        mlir::Value clockTokenBits,

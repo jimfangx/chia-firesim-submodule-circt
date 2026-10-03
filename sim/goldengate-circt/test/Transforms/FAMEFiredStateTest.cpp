@@ -80,6 +80,8 @@ unsigned eval(Value v, const llvm::DenseMap<Value, unsigned> &values) {
   if (auto p = v.getDefiningOp<MuxPrimOp>())
     return eval(p.getSel(), values) ? eval(p.getHigh(), values)
                                     : eval(p.getLow(), values);
+  if (auto p = v.getDefiningOp<AsUIntPrimOp>())
+    return eval(p.getInput(), values);
   throw std::runtime_error("unexpected transition operation");
 }
 void behavior(MLIRContext &context) {
@@ -328,7 +330,7 @@ void virtualControls(MLIRContext &context, const char *path) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
   require(bool(root), "virtual control boundary parse failed");
   auto m = model(*root);
-  require(m.getNumPorts() == 6, "virtual clock gained a model port");
+  require(m.getNumPorts() == 7, "virtual clock gained a token port");
   std::map<std::string, Value> registers, ports;
   for (auto r : m.getOps<RegResetOp>()) {
     registers[r.getName().str()] = r.getResult();
@@ -362,6 +364,41 @@ void virtualControls(MLIRContext &context, const char *path) {
     if (w.getName() == "targetCycleFinishing")
       finishing = w.getResult();
   require(bool(finishing), "missing virtual cycle completion");
+  InstanceOp gate;
+  for (auto instance : m.getOps<InstanceOp>())
+    if (instance.getName() == "target_buffer")
+      gate = instance;
+  require(gate && gate.getModuleName() == "AbstractClockGate" &&
+              gate.getNumResults() == 3 &&
+              !gate->hasAttr("goldengate.generatedClockConstraint") &&
+              drive(gate.getResult(0)) == ports.at("hostClock"),
+          "virtual target gate has the wrong interface or input clock");
+  require(ports.at("target").use_empty(), "ungated target-clock uses remain");
+  auto state = *m.getOps<RegOp>().begin();
+  require(state.getClockVal() == gate.getResult(2),
+          "target state did not move to the gated host clock");
+  RegResetOp enabled;
+  for (auto r : m.getOps<RegResetOp>())
+    if (r.getName() == "target_enabled")
+      enabled = r;
+  require(enabled.getClockVal() == ports.at("hostClock") &&
+              enabled.getResetSignal() == ports.at("hostReset") &&
+              eval(enabled.getResetValue(), llvm::DenseMap<Value, unsigned>()) == 0,
+          "virtual enable reset/clock differs from SFC");
+  for (unsigned flags = 0; flags < 8; ++flags) {
+    unsigned old = flags & 1, done = (flags >> 1) & 1,
+             reset = (flags >> 2) & 1;
+    llvm::DenseMap<Value, unsigned> values{
+        {enabled.getResult(), old}, {finishing, done},
+        {ports.at("hostReset"), reset}};
+    require(eval(drive(gate.getResult(1)), values) == (old & done & !reset),
+            "virtual gate advances during reset/stall or before initialization");
+    require((reset ? eval(enabled.getResetValue(), values)
+                   : eval(drive(enabled.getResult()), values)) ==
+                (reset ? 0 : done ? 1 : old),
+            "virtual enable completion/hold differs from SFC");
+  }
+  llvm::outs() << "Matched 8 virtual-clock buffer/gate reset/hold/advance cases\n";
   for (unsigned flags = 0; flags < 256; ++flags) {
     unsigned inValid = flags & 1, virtualValid = (flags >> 1) & 1;
     unsigned fired = (flags >> 2) & 1, virtualFired = (flags >> 3) & 1;
@@ -442,6 +479,74 @@ void virtualControls(MLIRContext &context, const char *path) {
   }
   llvm::outs() << "Passed 256 compiler-emitted virtual channel-control cases "
                   "and 2048 fired transitions\n";
+}
+// Emit the actual CIRCT buffer/gate truth table for comparison with the SFC
+// RTL boundary. Token substitution also tests the virtual constant-one case.
+void clockControls(MLIRContext &context, const char *path) {
+  auto root = parseSourceFile<ModuleOp>(path, &context);
+  require(bool(root), "clock control boundary parse failed");
+  unsigned gates = 0;
+  root->walk([&](FModuleOp m) {
+    for (auto gate : m.getOps<InstanceOp>()) {
+      if (gate.getModuleName() != "AbstractClockGate")
+        continue;
+      require(gate.getName().ends_with("_buffer"), "unexpected clock gate name");
+      auto stem = gate.getName().drop_back(7); // _buffer
+      RegResetOp enabled;
+      Value finishing, hostClock, hostReset;
+      for (unsigned i = 0; i < m.getNumPorts(); ++i) {
+        if (m.getPortName(i) == "hostClock")
+          hostClock = m.getBodyBlock()->getArgument(i);
+        if (m.getPortName(i) == "hostReset")
+          hostReset = m.getBodyBlock()->getArgument(i);
+      }
+      for (auto r : m.getOps<RegResetOp>())
+        if (r.getName() == (stem + "_enabled").str())
+          enabled = r;
+      for (auto w : m.getOps<WireOp>())
+        if (w.getName() == "targetCycleFinishing")
+          finishing = w.getResult();
+      auto drive = [&](Value dest) -> Value {
+        for (auto c : m.getOps<StrictConnectOp>())
+          if (c.getDest() == dest)
+            return c.getSrc();
+        for (auto c : m.getOps<ConnectOp>())
+          if (c.getDest() == dest)
+            return c.getSrc();
+        throw std::runtime_error("clock control has no driver");
+      };
+      require(enabled && finishing && hostClock && hostReset &&
+                  drive(gate.getResult(0)) == hostClock &&
+                  enabled.getClockVal() == hostClock &&
+                  enabled.getResetSignal() == hostReset,
+              "clock buffer/gate host controls differ");
+      Value next = drive(enabled.getResult());
+      auto mux = next.getDefiningOp<MuxPrimOp>();
+      require(mux && mux.getSel() == finishing &&
+                  mux.getLow() == enabled.getResult(),
+              "clock buffer does not hold until completion");
+      bool virtualToken = bool(mux.getHigh().getDefiningOp<ConstantOp>());
+      for (unsigned flags = 0; flags < 16; ++flags) {
+        unsigned old = flags & 1, done = (flags >> 1) & 1,
+                 reset = (flags >> 2) & 1, token = (flags >> 3) & 1;
+        llvm::DenseMap<Value, unsigned> values{
+            {enabled.getResult(), old}, {finishing, done}, {hostReset, reset}};
+        if (!virtualToken)
+          values[mux.getHigh()] = token;
+        unsigned actualNext = reset ? eval(enabled.getResetValue(), values)
+                                    : eval(next, values);
+        unsigned ce = eval(drive(gate.getResult(1)), values);
+        require(actualNext == (reset ? 0 : done ? (virtualToken ? 1 : token) : old)
+                    && ce == (old & done & !reset),
+                "clock buffer/gate differs from SFC");
+        llvm::outs() << "CLOCK_CASE " << m.getName() << " " << flags << " "
+                     << actualNext << " " << ce << "\n";
+      }
+      ++gates;
+    }
+  });
+  require(gates != 0, "no clock gate found at boundary");
+  require(succeeded(verify(*root)), "clock control boundary does not verify");
 }
 void boundary(MLIRContext &context, const char *path) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
@@ -571,12 +676,14 @@ int main(int argc, char **argv) {
     finishingBehavior(context);
     if (argc == 3 && std::string(argv[1]) == "--virtual-controls")
       virtualControls(context, argv[2]);
+    else if (argc == 3 && std::string(argv[1]) == "--clock-controls")
+      clockControls(context, argv[2]);
     else if (argc == 2)
       boundary(context, argv[1]);
     else
       require(argc == 1,
               "usage: FAMEFiredStateTest [candidate.mlir | --virtual-controls "
-              "candidate.mlir]");
+              "candidate.mlir | --clock-controls candidate.mlir]");
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

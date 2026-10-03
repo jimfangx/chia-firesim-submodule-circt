@@ -168,8 +168,11 @@ if(BUILD_TESTING)
     --rewrite-fame-output-valid-from ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.json)
   add_test(NAME goldengate-fame-virtual-clock-controls-check COMMAND goldengate-fame-fired-state-test
     --virtual-controls ${CMAKE_CURRENT_BINARY_DIR}/virtual-clock-controls/output-valid.mlir)
+  add_test(NAME goldengate-fame-virtual-clock-gate-check COMMAND goldengate-fame-fired-state-test
+    --clock-controls ${CMAKE_CURRENT_BINARY_DIR}/virtual-clock-controls/output-valid.mlir)
   set_tests_properties(goldengate-fame-virtual-clock-controls PROPERTIES FIXTURES_SETUP fame-virtual-controls)
   set_tests_properties(goldengate-fame-virtual-clock-controls-check PROPERTIES FIXTURES_REQUIRED fame-virtual-controls)
+  set_tests_properties(goldengate-fame-virtual-clock-gate-check PROPERTIES FIXTURES_REQUIRED fame-virtual-controls)
   add_executable(goldengate-coerce-reset-test
     test/Transforms/CoerceAsyncToSyncResetTest.cpp
     lib/Transforms/CoerceAsyncToSyncReset.cpp lib/Support/SimulatorRTL.cpp)
