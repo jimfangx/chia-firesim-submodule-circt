@@ -40,6 +40,7 @@ add_executable(goldengate-circt
   lib/Transforms/AutoCounterPrintfValues.cpp
   lib/Transforms/PrintStubs.cpp
   lib/Transforms/PrintWiring.cpp
+  lib/Analysis/PrintClockSources.cpp
   lib/Transforms/CoerceAsyncToSyncReset.cpp
   lib/Transforms/LabelMultiThreadedInstances.cpp
   lib/Transforms/TriggerWiring.cpp
@@ -158,6 +159,7 @@ include(CTest)
 if(BUILD_TESTING)
   add_executable(goldengate-print-wiring-test
     test/Transforms/PrintWiringTest.cpp lib/Transforms/PrintWiring.cpp
+    lib/Analysis/PrintClockSources.cpp
     lib/Transforms/PrintStubs.cpp lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-print-wiring-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-wiring-test PRIVATE -fno-rtti)

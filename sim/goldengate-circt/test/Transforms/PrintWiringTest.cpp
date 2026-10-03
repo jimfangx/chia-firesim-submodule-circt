@@ -107,6 +107,13 @@ void run(MLIRContext &context) {
   require(routes.size()==7 && top.getNumPorts()==13 && leaf.getNumPorts()==8 && named(c,"Unused").getNumPorts()==8,
           "shared hierarchy export count mismatch");
   check(c,stubs,routes,annotations);
+  SmallVector<goldengate::PrintClockSource> clocks;
+  before=dump(*root);
+  require(succeeded(goldengate::analyzePrintClockSources(c,stubs,routes,clocks,error)),error);
+  require(clocks.size()==7 && dump(*root)==before,"clock analysis changed IR or lost routes");
+  for(auto &clock:clocks)
+    require(clock.source==top.getBodyBlock()->getArgument(0) && clock.sourceTarget=="~Top|Top>clock",
+            "hierarchical clock root mismatch");
   require(succeeded(verify(*root)),"invalid FIRRTL after signature expansion");
   auto oldDriver=cast<OpResult>(driver(top,top.getBodyBlock()->getArgument(5)));
   require(oldDriver.getResultNumber()==5 && cast<InstanceOp>(oldDriver.getOwner()).getName()=="direct",
@@ -122,6 +129,59 @@ void run(MLIRContext &context) {
   before=dump(*root);SmallVector<goldengate::WiredPrint> empty;
   require(succeeded(goldengate::wirePrintStubsToTop(c,{},empty,error)) && empty.empty() && dump(*root)==before,
           "empty selection mutated circuit");
+}
+void runClocks(MLIRContext &context) {
+  auto root=parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(in %clock0: !firrtl.clock, in %clock1: !firrtl.clock) {}
+      firrtl.module @Leaf(in %clock: !firrtl.clock) {}
+      firrtl.module @Forward(in %clock: !firrtl.clock, out %out: !firrtl.clock) {
+        %alias = firrtl.node %clock : !firrtl.clock
+        firrtl.strictconnect %out, %alias : !firrtl.clock
+      }
+    }
+  })mlir",&context);
+  require(bool(root),"clock fixture parse failed");
+  auto c=*root->getOps<CircuitOp>().begin();auto top=named(c,"Top"),leaf=named(c,"Leaf");
+  OpBuilder b(&context);b.setInsertionPointToEnd(top.getBodyBlock());
+  auto left=b.create<InstanceOp>(c.getLoc(),leaf,"left");
+  auto right=b.create<InstanceOp>(c.getLoc(),leaf,"right");
+  auto forward=b.create<InstanceOp>(c.getLoc(),named(c,"Forward"),"forward");
+  b.create<StrictConnectOp>(c.getLoc(),left.getResult(0),top.getBodyBlock()->getArgument(0));
+  b.create<StrictConnectOp>(c.getLoc(),forward.getResult(0),top.getBodyBlock()->getArgument(1));
+  auto wire=b.create<WireOp>(c.getLoc(),ClockType::get(&context),b.getStringAttr("alias"));
+  b.create<StrictConnectOp>(c.getLoc(),wire.getResult(),forward.getResult(1));
+  auto rightConnect=b.create<StrictConnectOp>(c.getLoc(),right.getResult(0),wire.getResult());
+  SmallVector<goldengate::PrintStub> stubs{{{}, {}, leaf.getBodyBlock()->getArgument(0), {}, {}, {}}};
+  SmallVector<goldengate::WiredPrint> routes{{0,{left},{},"~Top|Top/left:Leaf>data",{}},
+      {0,{right},{},"~Top|Top/right:Leaf>data",{}}};
+  SmallVector<goldengate::PrintClockSource> sources;std::string error;auto before=dump(*root);
+  require(succeeded(goldengate::analyzePrintClockSources(c,stubs,routes,sources,error)),error);
+  require(sources.size()==2 && sources[0].sourceTarget=="~Top|Top>clock0" &&
+      sources[1].sourceTarget=="~Top|Top>clock1" && dump(*root)==before,
+      "shared-module absolute contexts or internal output clock traversal failed");
+  auto failure=[&](StringRef diagnostic) {
+    sources.clear();before=dump(*root);error.clear();
+    require(failed(goldengate::analyzePrintClockSources(c,stubs,routes,sources,error)) &&
+        sources.empty() && dump(*root)==before && StringRef(error).contains(diagnostic),
+        "clock failure was not atomic: "+error);
+  };
+  // A second input Clock in the same local cone is ambiguous in the oracle.
+  b.setInsertionPoint(rightConnect);
+  auto bit0=b.create<AsUIntPrimOp>(c.getLoc(),top.getBodyBlock()->getArgument(0));
+  auto bit1=b.create<AsUIntPrimOp>(c.getLoc(),top.getBodyBlock()->getArgument(1));
+  auto both=b.create<AndPrimOp>(c.getLoc(),bit0.getResult(),bit1.getResult());
+  auto ambiguous=b.create<AsClockPrimOp>(c.getLoc(),both.getResult());
+  rightConnect->setOperand(1,ambiguous.getResult());
+  require(succeeded(verify(*root)),"ambiguous clock fixture is invalid FIRRTL");
+  failure("2 input Clock drivers");
+  rightConnect.erase();failure("0 input Clock drivers");
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  b.create<StrictConnectOp>(c.getLoc(),right.getResult(0),right.getResult(0));
+  failure("combinational cycle");
+  SmallVector<goldengate::WiredPrint> empty; sources.clear();before=dump(*root);
+  require(succeeded(goldengate::analyzePrintClockSources(c,stubs,empty,sources,error)) &&
+      sources.empty() && dump(*root)==before,"empty clock query mutated circuit");
 }
 void runGolden(MLIRContext &context,StringRef path) {
   auto root=parseSourceFile<ModuleOp>(path,&context);require(bool(root),"golden candidate parse failed");
@@ -141,6 +201,6 @@ void runGolden(MLIRContext &context,StringRef path) {
 }
 int main(int argc,char **argv) {
   MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {run(context);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
+  try {run(context);runClocks(context);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
   catch(const std::exception &e){llvm::errs()<<"Print wiring FAIL: "<<e.what()<<'\n';return 1;}
 }

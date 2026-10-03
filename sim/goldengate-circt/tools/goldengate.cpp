@@ -203,8 +203,10 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-selected-autocounter-events";
   bool synthesizeAutoCounterValues =
       argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf-values";
-  bool wireAutoCounterStubs =
-      argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs";
+  bool analyzeAutoCounterPrintClocks =
+      argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter-print-clocks";
+  bool wireAutoCounterStubs = analyzeAutoCounterPrintClocks ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   bool wirePrintStubs =
       argc == 7 && llvm::StringRef(argv[6]) == "--wire-print-stubs";
   bool synthesizeAutoCounterStubs =
@@ -251,6 +253,7 @@ int main(int argc, char **argv) {
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
                     "--wire-print-stubs | --wire-autocounter-print-stubs | "
+                    "--analyze-autocounter-print-clocks | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name]]\n";
     return 2;
@@ -3103,6 +3106,21 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, wiredAnnos, error)))
         return fail("cannot export pending print wiring annotations: " + error);
       llvm::outs() << "Routed " << routes.size() << " printf bundles to top; clock binding pending\n";
+      if (analyzeAutoCounterPrintClocks) {
+        llvm::SmallVector<goldengate::PrintClockSource> sources;
+        if (failed(goldengate::analyzePrintClockSources(circuit, stubs, routes, sources, error)))
+          return fail("PrintSynthesis absolute clock sources: " + error);
+        llvm::json::Array clocks;
+        for (auto &source : sources)
+          clocks.push_back(llvm::json::Object{{"absoluteSource", routes[source.routeIndex].absoluteSource},
+              {"srcClockPort", source.sourceTarget}});
+        llvm::SmallString<256> clockPath(outputDir);
+        llvm::sys::path::append(clockPath, "print-clock-sources.json");
+        llvm::raw_fd_ostream clockMetadata(clockPath, ec);
+        if (ec) return fail("cannot write print clock sources: " + ec.message());
+        clockMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(clocks)));
+        llvm::outs() << "Resolved " << sources.size() << " absolute printf clock sources; loopbacks pending\n";
+      }
     }
     return 0;
   };
@@ -3121,6 +3139,24 @@ int main(int argc, char **argv) {
     // The original boundary continues to accept already selected records.
     // Enabled AutoCounter remains an incremental debug pipeline boundary.
     std::string error;
+    if (analyzeAutoCounterPrintClocks) {
+      // Match MidasTransforms: extract the clock bridge before lowering and
+      // before AutoCounter/PrintSynthesis. Its clock output becomes a top input.
+      if (failed(goldengate::promoteBridgePorts(circuit, error, true)))
+        return fail("PrintSynthesis BridgeExtraction: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("PrintSynthesis BridgeExtraction produced invalid FIRRTL IR");
+      llvm::SmallString<256> firPath(outputDir), annoPath(outputDir);
+      llvm::sys::path::append(firPath, "post-bridge-extraction.fir");
+      llvm::sys::path::append(annoPath, "post-bridge-extraction-all.json");
+      std::error_code ec;
+      llvm::raw_fd_ostream firOut(firPath, ec);
+      if (ec) return fail("cannot write printf bridge extraction: " + ec.message());
+      if (failed(exportFIRFile(*module, firOut, std::nullopt, exportFIRVersion)))
+        return fail("cannot export printf bridge extraction FIRRTL");
+      if (failed(goldengate::emitAllAnnotations(circuit, annoPath, error)))
+        return fail("cannot export printf bridge extraction annotations: " + error);
+    }
     if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
       return fail("AutoCounter LowerTypes: " + error);
     // SFC MiddleFirrtlToLowFirrtl expands whens before AutoCounter: named
