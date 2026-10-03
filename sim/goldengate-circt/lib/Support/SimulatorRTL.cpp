@@ -2,6 +2,7 @@
 #include "goldengate/SimulatorRTL.h"
 #include "circt/Conversion/ExportVerilog.h"
 #include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Comb/CombOps.h"
 #include "circt/Dialect/Debug/DebugDialect.h"
 #include "circt/Dialect/Emit/EmitOps.h"
 #include "circt/Dialect/FIRRTL/AnnotationDetails.h"
@@ -9,8 +10,10 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/OM/OMDialect.h"
 #include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "circt/Dialect/Seq/SeqDialect.h"
 #include "circt/Firtool/Firtool.h"
 #include "circt/Support/LoweringOptions.h"
@@ -19,11 +22,46 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringMap.h"
 #include "llvm/Support/FileSystem.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 
 using namespace mlir;
 using namespace circt;
+
+unsigned goldengate::normalizeInitializationIndices(ModuleOp module) {
+  unsigned changed = 0;
+  module.walk([&](sv::IndexedPartSelectInOutOp select) {
+    if (!select->getParentOfType<sv::InitialOp>())
+      return;
+    auto index = dyn_cast<BlockArgument>(select.getBase());
+    if (!index)
+      return;
+    auto loop = dyn_cast<sv::ForOp>(index.getOwner()->getParentOp());
+    if (!loop || loop.getInductionVar() != index)
+      return;
+    auto upper = loop.getUpperBound().getDefiningOp<hw::ConstantOp>();
+    auto wordType = dyn_cast<IntegerType>(select.getInput().getType().getElementType());
+    auto indexType = dyn_cast<IntegerType>(index.getType());
+    if (!upper || !wordType || !indexType)
+      return;
+    unsigned bits = wordType.getWidth();
+    unsigned needed = std::max(1u, llvm::Log2_64_Ceil(bits));
+    // SV for-loop bodies execute only for unsigned induction values strictly
+    // below upperBound. Upper <= word width proves the removed high bits are
+    // zero even if a part select extends beyond the end of a partial word.
+    // Unknown bounds and unbounded indices must retain out-of-range behavior.
+    if (indexType.getWidth() <= needed ||
+        upper.getValue().getLimitedValue() > bits)
+      return;
+    OpBuilder builder(select);
+    auto base = builder.create<comb::ExtractOp>(select.getLoc(), index, 0, needed);
+    select.getBaseMutable().assign(base.getResult());
+    ++changed;
+  });
+  return changed;
+}
 
 namespace {
 // Golden Gate retains source annotations across circuit wrapping. Transfer only
@@ -166,6 +204,9 @@ LogicalResult goldengate::emitSimulatorRTL(ModuleOp source,
     return reject("cannot construct CIRCT simulator RTL pipeline");
   if (failed(passes.run(*lowered)))
     return reject("CIRCT simulator RTL lowering failed; see pass diagnostics");
+  normalizeInitializationIndices(*lowered);
+  if (failed(verify(*lowered)))
+    return reject("CIRCT initialization index normalization produced invalid IR");
 
   // The single-file exporter includes emit.file payloads in its stream, even
   // resource lists that are not Verilog. Export those operations separately

@@ -4,7 +4,12 @@
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/Comb/CombDialect.h"
+#include "circt/Dialect/Comb/CombOps.h"
+#include "circt/Dialect/SV/SVDialect.h"
+#include "circt/Dialect/SV/SVOps.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -35,6 +40,56 @@ int main(int argc, char **argv) {
       llvm::errs() << diagnostic.getLocation() << ": " << diagnostic.str() << '\n';
       return success();
     });
+    context.loadDialect<circt::comb::CombDialect, circt::sv::SVDialect>();
+    auto checkIndex = [&](unsigned wordBits, unsigned bound, bool dynamicBound,
+                          bool unboundedIndex, bool initial, unsigned expected) {
+      std::string source = "module { hw.module @Indices(in %bound: i7, in %index: i7) {\n"
+        "%word = sv.reg : !hw.inout<i" + std::to_string(wordBits) + ">\n"
+        "%zero = hw.constant 0 : i7\n%upper = hw.constant " + std::to_string(bound) +
+        " : i7\n%step = hw.constant 32 : i7\n" +
+        (initial ? "sv.initial {\n" : "sv.alwayscomb {\n") +
+        "\"sv.for\"(%zero, " + (dynamicBound ? "%bound" : "%upper") +
+        ", %step) ({\n^bb0(%j: i7):\n"
+        "%part = sv.indexed_part_select_inout %word[" +
+        (unboundedIndex ? "%index" : "%j") + ": 32] : !hw.inout<i" +
+        std::to_string(wordBits) + ">, i7\n"
+        "%value = hw.constant 0 : i32\nsv.bpassign %part, %value : i32\n"
+        "}) {inductionVarName = \"j\"} : (i7, i7, i7) -> ()\n}\nhw.output\n} }";
+      auto indices = parseSourceString<ModuleOp>(source, &context);
+      require(bool(indices), "initialization index fixture parse");
+      circt::sv::ForOp loop; circt::sv::IndexedPartSelectInOutOp part;
+      indices->walk([&](circt::sv::ForOp op) { loop = op; });
+      indices->walk([&](circt::sv::IndexedPartSelectInOutOp op) { part = op; });
+      SmallVector<Value> bounds(loop->getOperands());
+      auto iv = loop.getInductionVar();
+      auto oldBase = part.getBase();
+      auto before = dump(*indices);
+      require(goldengate::normalizeInitializationIndices(*indices) == expected,
+              "initialization index proof accepted/rejected the wrong case");
+      require(succeeded(verify(*indices)), "index normalization invalid");
+      require(llvm::equal(bounds, loop->getOperands()) &&
+              iv == loop.getInductionVar() && iv.getType().getIntOrFloatBitWidth() == 7,
+              "normalization changed loop control or its termination bit");
+      if (expected) {
+        auto extract = part.getBase().getDefiningOp<circt::comb::ExtractOp>();
+        require(extract && extract.getInput() == oldBase && extract.getLowBit() == 0 &&
+                extract.getResult().getType().getIntOrFloatBitWidth() == 6,
+                "normalized base does not preserve in-range values");
+        for (unsigned i = 0; i < bound; i += 32)
+          require(i == (i & 63), "normalization changed an executed part-select base");
+      } else {
+        require(before == dump(*indices), "unproven index was changed");
+      }
+      require(goldengate::normalizeInitializationIndices(*indices) == 0,
+              "index normalization is not idempotent");
+    };
+    checkIndex(64, 64, false, false, true, 1);
+    checkIndex(33, 33, false, false, true, 1);
+    checkIndex(64, 65, false, false, true, 0);
+    checkIndex(64, 64, true, false, true, 0);
+    checkIndex(64, 64, false, true, true, 0);
+    checkIndex(64, 64, false, false, false, 0);
+    llvm::outs() << "Initialization indices: bounded and partial words narrowed; dynamic/unbounded/out-of-range/non-initial indices retained; loop control unchanged\n";
     auto fixture = parseSourceString<ModuleOp>(R"mlir(module {
       firrtl.circuit "Top" attributes {rawAnnotations = [{class = "test.Archived", target = "~FormerTop|Removed>port"}]} {
         firrtl.extmodule @BUFGCE(in I: !firrtl.clock, in CE: !firrtl.uint<1>, out O: !firrtl.clock) attributes {defname = "BUFGCE"}

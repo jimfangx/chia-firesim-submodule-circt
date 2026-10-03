@@ -5,6 +5,10 @@
 #include <string>
 
 namespace goldengate {
+// Narrow a part-select base only when an SV initialization loop's strict
+// constant upper bound proves that every executed base fits. Loop induction
+// types/bounds/steps stay unchanged, including their termination bit.
+unsigned normalizeInitializationIndices(mlir::ModuleOp module);
 // Lower a clone of the transformed simulator through CIRCT's standard
 // FIRRTL -> HW -> SV -> ExportVerilog pipeline. Retained Golden Gate JSON
 // stays on the source IR; attached CIRCT annotations remain on the clone.
