@@ -181,6 +181,18 @@ if(BUILD_TESTING)
   set_tests_properties(goldengate-fame-mixed-clock-models PROPERTIES FIXTURES_SETUP fame-mixed-clock-models)
   set_tests_properties(goldengate-fame-mixed-clock-models-check goldengate-fame-mixed-clock-gates-check
     PROPERTIES FIXTURES_REQUIRED fame-mixed-clock-models)
+  add_test(NAME goldengate-fame-input-only-models COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEInputOnlyModels.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEInputOnlyModels.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/input-only-models
+    --rewrite-fame-output-valid-from ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEInputOnlyModels.json)
+  add_test(NAME goldengate-fame-input-only-models-check COMMAND goldengate-fame-fired-state-test
+    --input-only-controls ${CMAKE_CURRENT_BINARY_DIR}/input-only-models/output-valid.mlir)
+  add_test(NAME goldengate-fame-input-only-clock-gates-check COMMAND goldengate-fame-fired-state-test
+    --clock-controls ${CMAKE_CURRENT_BINARY_DIR}/input-only-models/output-valid.mlir)
+  set_tests_properties(goldengate-fame-input-only-models PROPERTIES FIXTURES_SETUP fame-input-only-models)
+  set_tests_properties(goldengate-fame-input-only-models-check goldengate-fame-input-only-clock-gates-check
+    PROPERTIES FIXTURES_REQUIRED fame-input-only-models)
   add_executable(goldengate-fame-virtual-clock-port-test
     test/Transforms/FAMEVirtualClockPortTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-virtual-clock-port-test PRIVATE cxx_std_17)

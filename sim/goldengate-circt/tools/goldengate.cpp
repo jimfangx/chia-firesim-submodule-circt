@@ -3189,6 +3189,10 @@ int main(int argc, char **argv) {
         inputsByModule[moduleName->str()].push_back(channelName->str());
       if (*direction == "output")
         outputsByModule[moduleName->str()].push_back(channelName->str());
+      // Scala transforms selected models even when they have no outputs.
+      // Such models have no local output dependency rows, but still need
+      // input fired state, completion/readies, and buffered target clocks.
+      byModule.try_emplace(moduleName->str());
     }
     for (auto &row : *rows) {
       auto *entry = row.getAsObject();

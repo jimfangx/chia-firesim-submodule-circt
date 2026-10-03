@@ -482,7 +482,8 @@ void virtualControls(MLIRContext &context, const char *path) {
 }
 // A hub clock channel and a non-hub data channel deliberately share "tick".
 // Evaluate emitted SSA controls against FAMETransformer's per-model rules.
-void mixedControls(MLIRContext &context, const char *path) {
+void mixedControls(MLIRContext &context, const char *path,
+                   bool inputOnly = false) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
   require(bool(root), "mixed control boundary parse failed");
   unsigned models = 0, cases = 0, declarations = 0;
@@ -504,12 +505,16 @@ void mixedControls(MLIRContext &context, const char *path) {
     for (auto reg : m.getOps<RegResetOp>())
       registers[reg.getName().str()] = reg;
     auto inputName = hub ? "input" : "tick";
+    require(registers.count(std::string(inputName) + "_fired_0"),
+            "input-only model was skipped because it has no output dependencies");
     auto inFired = registers.at(std::string(inputName) + "_fired_0");
-    auto outFired = registers.at("output_fired_0");
+    RegResetOp outFired;
+    if (!inputOnly)
+      outFired = registers.at("output_fired_0");
     auto enabled = registers.at(hub ? "tick_enabled" : "target_enabled");
-    require(registers.size() == 3 &&
+    require(registers.size() == (inputOnly ? 2 : 3) &&
                 eval(inFired.getResetValue(), {}) == unsigned(hub) &&
-                eval(outFired.getResetValue(), {}) == 0,
+                (inputOnly || eval(outFired.getResetValue(), {}) == 0),
             "local clock association did not select channel reset values");
     Value finishing;
     for (auto wire : m.getOps<WireOp>())
@@ -544,18 +549,27 @@ void mixedControls(MLIRContext &context, const char *path) {
     auto state = *m.getOps<RegOp>().begin();
     require(state.getClockVal() == gate.getResult(2),
             "mixed model target state uses an ungated clock");
-    for (unsigned flags = 0; flags < 256; ++flags) {
+    for (unsigned flags = 0; flags < (inputOnly ? 64 : 256); ++flags) {
       unsigned valid = flags & 1, fired = (flags >> 1) & 1,
                ready = (flags >> 2) & 1, oldInput = (flags >> 3) & 1,
                clockValid = (flags >> 4) & 1, token = (flags >> 5) & 1,
                oldEnable = (flags >> 6) & 1, reset = (flags >> 7) & 1;
+      if (inputOnly) {
+        oldInput = (flags >> 1) & 1;
+        clockValid = (flags >> 2) & 1;
+        token = (flags >> 3) & 1;
+        oldEnable = (flags >> 4) & 1;
+        reset = (flags >> 5) & 1;
+      }
       unsigned outValid = valid & !fired;
-      unsigned allReady = valid & (fired | ready);
+      unsigned allReady = inputOnly ? valid : valid & (fired | ready);
       unsigned done = allReady & (hub ? clockValid : 1);
       unsigned inputReady = done & !oldInput;
       llvm::DenseMap<Value, unsigned> values{
-          {inFired.getResult(), oldInput}, {outFired.getResult(), fired},
+          {inFired.getResult(), oldInput},
           {enabled.getResult(), oldEnable}, {ports.at("hostReset"), reset}};
+      if (outFired)
+        values[outFired.getResult()] = fired;
       for (auto field : m.getOps<SubfieldOp>()) {
         auto port = field.getInput();
         auto name = field.getFieldName();
@@ -563,7 +577,7 @@ void mixedControls(MLIRContext &context, const char *path) {
           if (name == "valid") values[field.getResult()] = valid;
           if (name == "ready") values[field.getResult()] = inputReady;
         }
-        if (port == ports.at("output_source")) {
+        if (!inputOnly && port == ports.at("output_source")) {
           if (name == "valid") values[field.getResult()] = outValid;
           if (name == "ready") values[field.getResult()] = ready;
         }
@@ -579,7 +593,7 @@ void mixedControls(MLIRContext &context, const char *path) {
             field.getFieldName() == "ready")
           require(eval(drive(field.getResult()), values) == allReady,
                   "hub clock ready incorrectly depends on clock valid");
-        if (field.getInput() == ports.at("output_source") &&
+        if (!inputOnly && field.getInput() == ports.at("output_source") &&
             field.getFieldName() == "valid")
           require(eval(drive(field.getResult()), values) == outValid,
                   "mixed model output dependency differs from SFC");
@@ -590,25 +604,35 @@ void mixedControls(MLIRContext &context, const char *path) {
       }
       unsigned nextInput = reset ? eval(inFired.getResetValue(), values)
                                 : eval(drive(inFired.getResult()), values);
-      unsigned nextOutput = reset ? eval(outFired.getResetValue(), values)
-                                  : eval(drive(outFired.getResult()), values);
       require(nextInput == (reset ? unsigned(hub)
                            : done ? !(hub ? token : 1)
-                                  : oldInput | (valid & inputReady)) &&
-                  nextOutput == (reset ? 0 : done ? !oldEnable
-                                               : fired | (ready & outValid)),
+                                  : oldInput | (valid & inputReady)),
               "mixed model fired transition has wrong clock association");
+      if (outFired) {
+        unsigned nextOutput = reset ? eval(outFired.getResetValue(), values)
+                                    : eval(drive(outFired.getResult()), values);
+        require(nextOutput == (reset ? 0 : done ? !oldEnable
+                                               : fired | (ready & outValid)),
+                "mixed model output fired transition differs from SFC");
+      }
       require(eval(drive(gate.getResult(1)), values) ==
                   (oldEnable & done & !reset),
               "mixed model gate ignores local completion or reset");
-      llvm::outs() << "MIXED_CASE " << m.getName() << " " << flags << " "
-                   << eval(drive(finishing), values) << " " << allReady << "\n";
+      llvm::outs() << (inputOnly ? "INPUT_ONLY_CASE " : "MIXED_CASE ")
+                   << m.getName() << " " << flags << " "
+                   << eval(drive(finishing), values) << " " << allReady;
+      if (inputOnly)
+        llvm::outs() << " " << inputReady << " " << nextInput << " "
+                     << eval(drive(gate.getResult(1)), values);
+      llvm::outs() << "\n";
       ++cases;
     }
   });
   require(models == 2 && succeeded(verify(*root)),
           "mixed circuit models missing or invalid");
-  llvm::outs() << "Passed " << cases << " mixed hub/virtual control cases\n";
+  llvm::outs() << "Passed " << cases
+               << (inputOnly ? " input-only" : " mixed")
+               << " hub/virtual control cases\n";
 }
 // Emit the actual CIRCT buffer/gate truth table for comparison with the SFC
 // RTL boundary. Token substitution also tests the virtual constant-one case.
@@ -810,13 +834,16 @@ int main(int argc, char **argv) {
       clockControls(context, argv[2]);
     else if (argc == 3 && std::string(argv[1]) == "--mixed-controls")
       mixedControls(context, argv[2]);
+    else if (argc == 3 && std::string(argv[1]) == "--input-only-controls")
+      mixedControls(context, argv[2], true);
     else if (argc == 2)
       boundary(context, argv[1]);
     else
       require(argc == 1,
               "usage: FAMEFiredStateTest [candidate.mlir | --virtual-controls "
               "candidate.mlir | --clock-controls candidate.mlir | "
-              "--mixed-controls candidate.mlir]");
+              "--mixed-controls candidate.mlir | "
+              "--input-only-controls candidate.mlir]");
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';
