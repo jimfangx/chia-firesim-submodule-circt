@@ -151,6 +151,15 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-fame-fired-state-test
+    test/Transforms/FAMEFiredStateTest.cpp lib/Transforms/FAMEFiredState.cpp)
+  target_compile_features(goldengate-fame-fired-state-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-fired-state-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-fired-state-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-fired-state-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-fired-state COMMAND goldengate-fame-fired-state-test)
   add_executable(goldengate-coerce-reset-test
     test/Transforms/CoerceAsyncToSyncResetTest.cpp
     lib/Transforms/CoerceAsyncToSyncReset.cpp lib/Support/SimulatorRTL.cpp)

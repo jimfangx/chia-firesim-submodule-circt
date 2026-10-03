@@ -85,7 +85,7 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
       fired = registers.find(channel.name + "_fired");
     if (fired != registers.end()) {
       auto resetValue = fired->second.getResetValue().getDefiningOp<ConstantOp>();
-      unsigned expectedReset = channel.isInput ? 1 : 0;
+      unsigned expectedReset = channel.isInput && channel.hasClockDomain;
       if (!isBit(fired->second.getResult()) ||
           fired->second.getClockVal() != hostClock ||
           fired->second.getResetSignal() != hostReset || !resetValue ||
@@ -101,7 +101,8 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
       return failure();
     }
     names.insert(newName);
-    toCreate.push_back({std::move(newName), channel.isInput});
+    toCreate.push_back({std::move(newName),
+                        channel.isInput && channel.hasClockDomain});
   }
 
   OpBuilder declarations(finishing);
@@ -109,10 +110,10 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
   OpBuilder connects(module.getContext());
   connects.setInsertionPointToEnd(module.getBodyBlock());
   auto bitType = UIntType::get(module.getContext(), 1, false);
-  for (const auto &[name, isInput] : toCreate) {
+  for (const auto &[name, resetFired] : toCreate) {
     Location loc = finishing.getLoc();
     Value resetValue = declarations.create<ConstantOp>(
-        loc, bitType, APInt(1, isInput ? 1 : 0)).getResult();
+        loc, bitType, APInt(1, resetFired ? 1 : 0)).getResult();
     Value fired = declarations.create<RegResetOp>(
         loc, bitType, hostClock, hostReset, resetValue, name).getResult();
     connects.create<StrictConnectOp>(loc, fired, fired);
@@ -166,6 +167,14 @@ LogicalResult goldengate::rewriteFAMEFiredStates(
       error = "missing one-bit clock enable for " + channel.name;
       return failure();
     }
+    if (!channel.hasClockDomain) {
+      auto enable = channel.clockDomainEnable.getDefiningOp<ConstantOp>();
+      if (!enable || !enable.getValue().isOne()) {
+        error = "virtual-clock channel requires constant-one enable for " +
+                channel.name;
+        return failure();
+      }
+    }
     auto port = ports.find(channel.name +
                            (channel.isInput ? "_sink" : "_source"));
     Direction direction = channel.isInput ? Direction::In : Direction::Out;
@@ -199,6 +208,12 @@ LogicalResult goldengate::rewriteFAMEFiredStates(
         registerOp.getResetSignal() != hostReset) {
       error = "fired register must use host clock and reset for " +
               channel.name;
+      return failure();
+    }
+    auto resetValue = registerOp.getResetValue().getDefiningOp<ConstantOp>();
+    if (!resetValue || resetValue.getValue().getZExtValue() !=
+                           unsigned(channel.isInput && channel.hasClockDomain)) {
+      error = "fired register has incorrect SFC reset value for " + channel.name;
       return failure();
     }
 
