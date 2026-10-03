@@ -3281,6 +3281,8 @@ int main(int argc, char **argv) {
         if (failed(goldengate::addFAMEClockEnable(
                 model, *targetClock, {}, rewriteError)) ||
             failed(goldengate::addFAMEClockGate(
+                circuit, model, *targetClock, rewriteError)) ||
+            failed(goldengate::removeFAMEVirtualClockPort(
                 circuit, model, *targetClock, rewriteError)))
           return fail("FAME virtual-clock construction: " + rewriteError);
         // Keep control operands before the newly prepended declarations.

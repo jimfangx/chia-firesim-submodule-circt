@@ -48,6 +48,15 @@ mlir::LogicalResult removeFAMETargetClockPort(
     llvm::StringRef instanceName, llvm::StringRef topClockName,
     llvm::StringRef modelClockName, std::string &error);
 
+// Remove a consumed non-hub target clock and its ancillary writes at every
+// instance of the model. The scalar model input must be unused, unannotated,
+// and have no inner symbol. Instance reads/annotations are rejected before
+// mutation. Parent clock sources are preserved for other users. Invalidates
+// hierarchy/port analyses; consumes no annotations and produces none.
+mlir::LogicalResult removeFAMEVirtualClockPort(
+    circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp model,
+    llvm::StringRef modelClockName, std::string &error);
+
 // Clock outputs used to identify channel domains are no longer simulator
 // ports after FAME. Keep their model-side connects by turning each into a wire.
 mlir::LogicalResult internalizeFAMEOutputClocks(

@@ -330,7 +330,7 @@ void virtualControls(MLIRContext &context, const char *path) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
   require(bool(root), "virtual control boundary parse failed");
   auto m = model(*root);
-  require(m.getNumPorts() == 7, "virtual clock gained a token port");
+  require(m.getNumPorts() == 6, "virtual target clock was not consumed");
   std::map<std::string, Value> registers, ports;
   for (auto r : m.getOps<RegResetOp>()) {
     registers[r.getName().str()] = r.getResult();
@@ -373,7 +373,7 @@ void virtualControls(MLIRContext &context, const char *path) {
               !gate->hasAttr("goldengate.generatedClockConstraint") &&
               drive(gate.getResult(0)) == ports.at("hostClock"),
           "virtual target gate has the wrong interface or input clock");
-  require(ports.at("target").use_empty(), "ungated target-clock uses remain");
+  require(!ports.count("target"), "scalar target-clock port remains");
   auto state = *m.getOps<RegOp>().begin();
   require(state.getClockVal() == gate.getResult(2),
           "target state did not move to the gated host clock");

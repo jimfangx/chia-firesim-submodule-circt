@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEInputChannel.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Support/InstanceGraph.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/APInt.h"
 #include "mlir/IR/Builders.h"
@@ -575,6 +576,93 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
       return failure();
     }
   }
+  return success();
+}
+
+LogicalResult goldengate::removeFAMEVirtualClockPort(
+    CircuitOp circuit, FModuleOp model, llvm::StringRef modelClockName,
+    std::string &error) {
+  std::optional<unsigned> clockPort;
+  auto ports = model.getPorts();
+  for (unsigned i = 0; i < ports.size(); ++i)
+    if (ports[i].getName() == modelClockName)
+      clockPort = i;
+  if (model->getParentOp() != circuit.getOperation() || !clockPort ||
+      ports[*clockPort].direction != Direction::In ||
+      !isa<ClockType>(ports[*clockPort].type) ||
+      hasPortAnnotations(model, *clockPort) || ports[*clockPort].sym ||
+      !model.getBodyBlock()->getArgument(*clockPort).use_empty()) {
+    error = "virtual target clock must be an unused, unannotated, "
+            "unsymbolized scalar input in the supplied circuit";
+    return failure();
+  }
+
+  SmallVector<InstanceOp> instances;
+  {
+    circt::igraph::InstanceGraph graph(circuit);
+    auto *node = graph.lookup(model);
+    if (!node) {
+      error = "virtual target clock model is absent from the instance graph";
+      return failure();
+    }
+    for (auto *record : node->uses()) {
+      auto instance = record->getInstance<InstanceOp>();
+      if (!instance || instance.getNumResults() != ports.size()) {
+        error = "virtual target clock instance has incompatible ports";
+        return failure();
+      }
+      for (unsigned i = 0; i < ports.size(); ++i)
+        if (instance.getPortNameStr(i) != ports[i].getName() ||
+            instance.getResult(i).getType() != ports[i].type ||
+            instance.getPortDirection(i) != ports[i].direction) {
+          error = "virtual target clock instance has incompatible ports";
+          return failure();
+        }
+      if (!cast<ArrayAttr>(instance.getPortAnnotationsAttr()[*clockPort]).empty()) {
+        error = "virtual target clock instance port has annotations";
+        return failure();
+      }
+      Value clock = instance.getResult(*clockPort);
+      for (OpOperand &use : clock.getUses()) {
+        auto strict = dyn_cast<StrictConnectOp>(use.getOwner());
+        auto ordinary = dyn_cast<ConnectOp>(use.getOwner());
+        // A clock read could feed other state. Only ancillary writes to the
+        // consumed input may be dropped (including conditional writes).
+        if (use.getOperandNumber() != 0 ||
+            (!strict && !ordinary)) {
+          error = "virtual target clock instance has non-write uses";
+          return failure();
+        }
+      }
+      instances.push_back(instance);
+    }
+  }
+
+  // Every use has been checked before changing any model or instance.
+  for (auto instance : instances) {
+    Value clock = instance.getResult(*clockPort);
+    for (OpOperand &use : llvm::make_early_inc_range(clock.getUses()))
+      use.getOwner()->erase();
+    llvm::BitVector removed(instance.getNumResults());
+    removed.set(*clockPort);
+    OpBuilder builder(instance);
+    auto replacement = instance.erasePorts(builder, removed);
+    // erasePorts rebuilds the declared FIRRTL attributes. Retain metadata
+    // owned by other passes; only the per-port arrays change here.
+    for (auto attr : instance->getAttrs())
+      if (attr.getName() != "portNames" &&
+          attr.getName() != "portDirections" &&
+          attr.getName() != "portAnnotations")
+        replacement->setAttr(attr.getName(), attr.getValue());
+    for (unsigned i = 0; i < instance.getNumResults(); ++i)
+      if (i != *clockPort)
+        instance.getResult(i).replaceAllUsesWith(
+            replacement.getResult(i - (i > *clockPort)));
+    instance.erase();
+  }
+  llvm::BitVector removed(model.getNumPorts());
+  removed.set(*clockPort);
+  model.erasePorts(removed);
   return success();
 }
 

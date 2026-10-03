@@ -151,6 +151,15 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-fame-virtual-clock-port-test
+    test/Transforms/FAMEVirtualClockPortTest.cpp lib/Transforms/FAMEInputChannel.cpp)
+  target_compile_features(goldengate-fame-virtual-clock-port-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-virtual-clock-port-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-virtual-clock-port-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-virtual-clock-port-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-virtual-clock-port COMMAND goldengate-fame-virtual-clock-port-test)
   add_executable(goldengate-fame-fired-state-test
     test/Transforms/FAMEFiredStateTest.cpp lib/Transforms/FAMEFiredState.cpp
     lib/Transforms/FAMEFinishing.cpp)
