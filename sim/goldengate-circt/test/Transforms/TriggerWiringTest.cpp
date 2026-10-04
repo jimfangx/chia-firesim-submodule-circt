@@ -1074,7 +1074,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // Each pathless source contributes once per complete instance path. Keep masking
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0) {
-  bool childSink = mode == 1 || mode == 5;
+  bool childSink = mode == 1 || mode == 5 || mode == 6 || mode == 7;
   std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
     "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
   if (childSink) childPorts += ", out %sinkEnabled: !firrtl.uint<1>";
@@ -1124,8 +1124,11 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   b.setInsertionPointToEnd(top.getBodyBlock());
   for (auto [index, instance] : llvm::enumerate(top.getBodyBlock()->getOps<InstanceOp>())) {
     instance->setAttr("example.metadata", b.getStringAttr("preserve"));
-    bool wrongClock = mode >= 4 || (mode == 2 && index == 1) || (mode == 3 && index == 0);
-    b.create<StrictConnectOp>(loc, instance.getResult(0), arg(top, wrongClock ? 7 : 0));
+    bool wrongClock = mode == 4 || mode == 5 ||
+                      ((mode == 2 || mode == 6) && index == 1) ||
+                      ((mode == 3 || mode == 7) && index == 0);
+    if (!(mode == 8 && index == 1))
+      b.create<StrictConnectOp>(loc, instance.getResult(0), arg(top, wrongClock ? 7 : 0));
     for (unsigned i = 1; i <= 3; ++i)
       b.create<StrictConnectOp>(loc, instance.getResult(i), arg(top, i + 3 * index));
     b.create<StrictConnectOp>(loc, arg(top, 9 + index), instance.getResult(4));
@@ -1154,9 +1157,9 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode == 2 || mode == 3) {
+  if (mode == 8) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
-            "source fanout clock mismatch must fail atomically"); return;
+            "source fanout missing clock path must fail atomically"); return;
   }
   require(succeeded(result), error);
   require(consumed == 2 && succeeded(verify(*root)), "invalid source fanout IR");
@@ -1190,14 +1193,15 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
   unsigned localCounters = 0;
   top.walk([&](RegOp reg) {
-    bool local = reg.getName() == (mode >= 4 ? "otherClock_credits" : "clock_credits") ||
-                 reg.getName() == (mode >= 4 ? "otherClock_debits" : "clock_debits");
-    localCounters += local;
-    require(reg.getClockVal() == arg(top, mode >= 4 && local ? 7 : 0),
+    bool secondary = reg.getName() == "otherClock_credits" || reg.getName() == "otherClock_debits";
+    bool base = reg.getName() == "clock_credits" || reg.getName() == "clock_debits";
+    localCounters += secondary || base;
+    require(reg.getClockVal() == arg(top, secondary ? 7 : 0),
             "source fanout local counters or base synchronizers use wrong clock");
   });
-  require(localCounters == 2, "source fanout accounting root name mismatch");
-  require(instances == 2 + relayDepth && masks == 1 && registers == 9 + childSink &&
+  bool mixed = mode == 2 || mode == 3 || mode == 6 || mode == 7;
+  require(localCounters == (mixed ? 4 : 2), "source fanout accounting root name mismatch");
+  require(instances == 2 + relayDepth && masks == 1 && registers == 9 + 6 * mixed + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1319,11 +1323,6 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode == 2 || mode == 3 || mode == 6 || mode == 8 || mode == 9) {
-    require(failed(result) && consumed == 0 && before == dump(root.get()) &&
-            error.find("one top input Clock leaf") != std::string::npos,
-            "every complete source clock route must fail atomically on mismatch"); return;
-  }
   require(succeeded(result), error);
   require(consumed == 2 && succeeded(verify(*root)), "invalid source fanout IR");
   require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + 2 + childSink,
@@ -1360,7 +1359,15 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
       require(originalDrivers == inputs && sinkDrivers == childSink, "source fanout lost or duplicated input connections");
     }
   }
-  require(instances == 2 + relayDepth + (mode >= 4) && masks == 1 && registers == 9 + childSink &&
+  bool mixed = mode == 2 || mode == 3 || mode == 6 || mode == 8 || mode == 9;
+  unsigned localCounters = 0;
+  top.walk([&](RegOp reg) {
+    bool secondary = reg.getName() == "otherClock_credits" || reg.getName() == "otherClock_debits";
+    localCounters += secondary || reg.getName() == "clock_credits" || reg.getName() == "clock_debits";
+    require(reg.getClockVal() == arg(top, secondary ? 7 : 0), "sibling source accounting clock root");
+  });
+  require(localCounters == (mixed ? 4 : 2), "sibling source domain count");
+  require(instances == 2 + relayDepth + (mode >= 4) && masks == 1 && registers == 9 + 6 * mixed + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1579,6 +1586,11 @@ int main(int argc, char **argv) {
     fanoutSources(context, 5, argc > 51 ? argv[51] : "");
     fanoutSources(context, 5, argc > 52 ? argv[52] : "", 1);
     fanoutSources(context, 5, argc > 53 ? argv[53] : "", 2);
+    fanoutSources(context, 2, argc > 54 ? argv[54] : "");
+    fanoutSources(context, 6, argc > 55 ? argv[55] : "");
+    fanoutSources(context, 6, argc > 56 ? argv[56] : "", 1);
+    fanoutSources(context, 7, argc > 57 ? argv[57] : "", 2);
+    for (unsigned depth : {0, 1, 2}) fanoutSources(context, 8, "", depth);
     nestedSiblingSources(context, 0, argc > 38 ? argv[38] : "");
     nestedSiblingSources(context, 1, argc > 39 ? argv[39] : "");
     nestedSiblingSources(context, 1, argc > 40 ? argv[40] : "", 2);

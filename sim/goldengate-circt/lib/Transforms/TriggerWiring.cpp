@@ -14,6 +14,8 @@
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
 #include <functional>
+#include <map>
+#include <vector>
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -83,7 +85,13 @@ bool boolean(circt::FieldRef field) {
   auto type = field ? dyn_cast_or_null<UIntType>(leaf(field).first) : UIntType();
   return type && type.getWidth() == 1;
 }
-struct Source { circt::FieldRef event, reset, clock; bool credit; std::string name; };
+using Route = std::vector<unsigned>;
+struct Source {
+  circt::FieldRef event, reset;
+  bool credit;
+  std::string name;
+  std::map<Route, circt::FieldRef> clocks;
+};
 // BridgeTopWiring groups source events by the upstream input Clock port.
 // Prove electrical aliases using transparent FIRRTL operations only. A cone
 // with one input clock is insufficient: a mux or gate may change its edges.
@@ -274,6 +282,9 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseMap<Operation *, unsigned> depths;
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
+  // Stable preflight IDs survive instance replacement; a relay carries the
+  // innermost-to-outermost route, without retaining erased operation handles.
+  llvm::DenseMap<Operation *, unsigned> instanceIDs;
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::MapVector<Operation *, bool> sinkModules;
   llvm::DenseMap<Operation *, unsigned> sinkAnnotations;
@@ -384,22 +395,25 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!boolean(event)) {
       error = "trigger sources must be UInt<1>"; return failure();
     }
-    // BridgeTopWiring groups exports by their upstream input Clock leaf.
-    // A descendant definition can use a secondary root without exporting its
-    // clock: prove that every absolute instance resolves to that same leaf.
-    // Distinct roots per instance need per-export grouping in a later step.
-    auto eventRoot = aliases.root(local.module, eventClock, paths.front());
-    if (!eventRoot) {
-      error = "trigger source clock needs an unconditional top input Clock alias";
-      return failure();
-    }
-    for (auto &path : paths)
-      if (!(aliases.root(local.module, eventClock, path) == eventRoot)) {
-        error = "trigger source instance clock paths must resolve to one top input Clock leaf"; return failure();
-      }
+    // BridgeTopWiring associates each absolute export with its upstream
+    // Clock leaf. Shared source definitions may span several root domains.
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
-    auto &counts = domainSources[eventRoot];
-    ++(credit ? counts.first : counts.second);
+    std::map<Route, circt::FieldRef> clocks;
+    for (auto &path : paths) {
+      auto eventRoot = aliases.root(local.module, eventClock, path);
+      if (!eventRoot) {
+        error = "trigger source clock needs an unconditional top input Clock alias on every instance path";
+        return failure();
+      }
+      Route route;
+      for (auto instance : path) {
+        auto [id, inserted] = instanceIDs.try_emplace(instance, instanceIDs.size());
+        route.push_back(id->second);
+      }
+      clocks.emplace(std::move(route), eventRoot);
+      auto &counts = domainSources[eventRoot];
+      ++(credit ? counts.first : counts.second);
+    }
     if (!(credit ? creditTargets : debitTargets).insert(event).second) {
       error = "trigger hardware currently needs distinct source targets per sourceType";
       return failure();
@@ -414,7 +428,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
     for (auto module : pathModules) childEvents[module].push_back(events.size());
-    events.push_back({event, reset, eventRoot, credit, name});
+    events.push_back({event, reset, credit, name, std::move(clocks)});
   }
   // Scala's per-domain DensePrefixSum requires both event lists to be nonempty.
   // Reject an incomplete domain before materializing any hardware.
@@ -465,7 +479,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     for (auto module : pathModules) sinkModules[module] = true;
   }
   // All unsupported scope/type/clock cases have been rejected before mutation.
-  struct RoutedEvent { Value value; std::string name; };
+  struct RoutedEvent { Value value; std::string name; Route route; };
   // Multiple uses of one source produce separate SSA values in their parent.
   // Keep those values by module and annotation until they reach top accounting.
   llvm::DenseMap<Operation *, llvm::DenseMap<unsigned, SmallVector<RoutedEvent>>> routed;
@@ -501,7 +515,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
           signal = childBuilder.create<NodeOp>(childBuilder.create<AndPrimOp>(active, signal),
                                               childBuilder.getStringAttr(signalName)).getResult();
         }
-        localSignals.push_back({signal, signalName});
+        localSignals.push_back({signal, signalName, {}});
       }
       for (auto &signal : localSignals) {
         auto portName = childNames.newName("simulationTrigger_" + signal.name);
@@ -524,8 +538,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       for (unsigned i = 0; i < signals.size(); ++i) {
         // Preserve multiplicity through relays: simultaneous sibling events
         // count separately, after each source instance applies its reset mask.
+        auto route = signals[i].route;
+        route.push_back(instanceIDs.lookup(instance));
         routed[parent][signalIndices[i]].push_back({replacement.getResult(oldPorts + i),
-          (instance.getName() + "_" + signals[i].name).str()});
+          (instance.getName() + "_" + signals[i].name).str(), std::move(route)});
       }
       // Source exports may replace an ancestor also used by a sink route.
       // Keep every sink handle live before erasing that original instance.
@@ -558,12 +574,15 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   struct DomainSignals { SmallVector<Value> credits, debits; };
   llvm::MapVector<circt::FieldRef, DomainSignals> domainSignals;
   for (auto [index, event] : llvm::enumerate(events)) {
-    auto &domain = domainSignals[event.clock];
-    auto &signals = event.credit ? domain.credits : domain.debits;
     if (auto exported = routed[top].find(index); exported != routed[top].end()) {
-      for (auto &signal : exported->second) signals.push_back(signal.value);
+      for (auto &signal : exported->second) {
+        auto &domain = domainSignals[event.clocks.at(signal.route)];
+        (event.credit ? domain.credits : domain.debits).push_back(signal.value);
+      }
       continue;
     }
+    auto &domain = domainSignals[event.clocks.at(Route{})];
+    auto &signals = event.credit ? domain.credits : domain.debits;
     Value signal = getValueByFieldID(ImplicitLocOpBuilder(loc, b),
                                     event.event.getValue(), event.event.getFieldID());
     if (event.reset) {

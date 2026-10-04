@@ -19,8 +19,8 @@ namespace goldengate {
 // samples the shared enable on its own annotated local clock.
 // Event/reset targets may select local UInt<1> bundle/vector leaves in the top
 // or a descendant with unconditional instances through multiple parent definitions
-// and unequal routes to top. All absolute instances of each descendant source
-// must resolve to one proven top input Clock leaf, which may differ from the base.
+// and unequal routes to top. Each absolute source instance resolves to its own
+// proven top input Clock leaf; repeated definitions may span multiple domains.
 // Field identity determines duplicate detection and flattened masked-event names.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor
