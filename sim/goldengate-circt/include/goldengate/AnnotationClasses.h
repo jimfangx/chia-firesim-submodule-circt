@@ -19,6 +19,8 @@ struct AnnotationClasses {
       "midas.passes.fame.FAMEHostReset";
   static constexpr llvm::StringLiteral HostClockSource =
       "midas.passes.HostClockSource";
+  static constexpr llvm::StringLiteral HostClockSink =
+      "midas.passes.HostClockSink";
   static constexpr llvm::StringLiteral OutputFile =
       "midas.stage.GoldenGateOutputFileAnnotation";
   static constexpr llvm::StringLiteral InternalXDC = "midas.InternalXDCAnnotation";

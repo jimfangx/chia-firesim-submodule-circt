@@ -105,11 +105,11 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     return failure();
   }
   const std::string circuitName = circuit.getName().str();
-  // DontTouch and FAME global signal targets may fan out. Trigger/AutoCounter
+  // DontTouch and host signal targets may fan out. Trigger/AutoCounter
   // scalar members and channel endpoints (including nested ready/valid) follow
   // SFC RTRenamer.exact. Keep endpoint indices so repeated references and clock
   // schedule order survive.
-  // An empty DontTouch plan removes an empty aggregate annotation; no plan
+  // An empty fanout plan removes an empty aggregate annotation; no plan
   // preserves a member whose identity does not need transferring.
   struct TargetPlan {
     StringRef member;
@@ -118,11 +118,16 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     bool channelInfo;
   };
   SmallVector<SmallVector<TargetPlan>> replacements(raw.size());
+  auto isHostSignal = [](Annotation annotation) {
+    return annotation.isClass(AnnotationClasses::HostClock) ||
+        annotation.isClass(AnnotationClasses::HostReset) ||
+        annotation.isClass(AnnotationClasses::HostClockSource) ||
+        annotation.isClass(AnnotationClasses::HostClockSink);
+  };
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
-    const bool hostGlobal = annotation.isClass(AnnotationClasses::HostClock) ||
-        annotation.isClass(AnnotationClasses::HostReset);
+    const bool hostSignal = isHostSignal(annotation);
     const bool autoCounter = annotation.isClass(AnnotationClasses::AutoCounter) ||
         annotation.isClass(AnnotationClasses::InternalAutoCounter);
     const bool triggerSource = annotation.isClass(AnnotationClasses::TriggerSource) ||
@@ -147,7 +152,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                            forwardChannel ? "DecoupledForwardChannel" :
                            channelPorts ? "FAMEChannelPortsAnnotation" :
                            autoCounter ? "AutoCounter" : "Trigger";
-    if (!dontTouch && !hostGlobal && !exact)
+    if (!dontTouch && !hostSignal && !exact)
       continue;
     auto planTarget = [&](StringRef member, StringAttr spelling,
                           std::optional<unsigned> element = std::nullopt,
@@ -356,12 +361,10 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   rewritten.reserve(raw.size());
   // Scala LowForm coalesces identical SingleTargetAnnotation leaves, including
   // overlapping aggregate/leaf selectors. Distinct payloads remain distinct.
-  llvm::DenseSet<Attribute> hostGlobals;
+  llvm::DenseSet<Attribute> hostSignals;
   auto appendAnnotation = [&](Attribute attr) {
     Annotation annotation(attr);
-    if ((!annotation.isClass(AnnotationClasses::HostClock) &&
-         !annotation.isClass(AnnotationClasses::HostReset)) ||
-        hostGlobals.insert(attr).second)
+    if (!isHostSignal(annotation) || hostSignals.insert(attr).second)
       rewritten.push_back(attr);
   };
   auto loweredSpelling = [&](GroundTarget replacement) -> StringAttr {

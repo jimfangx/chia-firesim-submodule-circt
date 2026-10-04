@@ -323,10 +323,12 @@ void run(MLIRContext &context) {
   before = dump(*internal);
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*internal, ic, error)) &&
               dump(*internal) == before, "internal lowering is not idempotent");
-  // Global signals use SingleTargetAnnotation fanout, unlike exact channel members.
+  // Host signals use SingleTargetAnnotation fanout, unlike exact channel members.
   // Preserve distinct payloads on overlapping selectors and internal namespaces.
   for (StringRef klass : {goldengate::AnnotationClasses::HostClock,
-                         goldengate::AnnotationClasses::HostReset}) {
+                         goldengate::AnnotationClasses::HostReset,
+                         goldengate::AnnotationClasses::HostClockSource,
+                         goldengate::AnnotationClasses::HostClockSink}) {
     auto candidate = parseSourceString<ModuleOp>(internalFixture, &context);
     auto owner = *candidate->getOps<CircuitOp>().begin();
     SmallVector<Attribute> input, expected;
@@ -339,9 +341,10 @@ void run(MLIRContext &context) {
       expected.push_back(changed.getAttr());
     }
     owner->setAttr("rawAnnotations", b.getArrayAttr(input));
+    error.clear();
     require(succeeded(goldengate::lowerTypesWithRetainedTargets(*candidate, owner, error)) &&
             succeeded(verify(*candidate)) && owner->getAttr("rawAnnotations") == b.getArrayAttr(expected),
-            "host global internal fanout/identity/payload changed: " + error);
+            "host signal internal fanout/identity/payload changed: " + error);
     InnerSymbolTable::walkSymbols(*owner.getOps<FModuleOp>().begin(), [&](StringAttr, InnerSymTarget) {
       require(false, "temporary host global identity leaked");
     });
@@ -823,7 +826,7 @@ void channelTargets(MLIRContext &context, unsigned mode, unsigned kind, StringRe
     root->print(file);
   }
 }
-void hostTargets(MLIRContext &context, unsigned mode, StringRef output) {
+void hostTargets(MLIRContext &context, unsigned mode, bool wiring, StringRef output) {
   std::string text = R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
       firrtl.module @Top(in %io: !firrtl.bundle<clocks: vector<clock, 2>, resets: vector<uint<1>, 2>>,
@@ -846,14 +849,17 @@ void hostTargets(MLIRContext &context, unsigned mode, StringRef output) {
         b.getNamedAttr("target", b.getStringAttr("~Top|Top>" + target.str()))});
   };
   using A = goldengate::AnnotationClasses;
+  StringRef source = wiring ? A::HostClockSource : A::HostClock;
+  StringRef sink = wiring ? A::HostClockSink : A::HostReset;
+  std::string sinkField = wiring ? "clocks" : "resets";
   circuit->setAttr("rawAnnotations", b.getArrayAttr({
-      annotation(A::HostClock, name + ".clocks"), annotation(A::HostReset, name + ".resets"),
-      annotation(A::HostClock, name + ".clocks[1]"), annotation(A::HostReset, "empty")}));
+      annotation(source, name + ".clocks"), annotation(sink, name + "." + sinkField),
+      annotation(source, name + ".clocks[1]"), annotation(sink, "empty")}));
   std::string error;
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
   require(succeeded(verify(*root)) && circuit->getAttr("rawAnnotations") == b.getArrayAttr({
-      annotation(A::HostClock, name + "_clocks_0"), annotation(A::HostClock, name + "_clocks_1"),
-      annotation(A::HostReset, name + "_resets_0"), annotation(A::HostReset, name + "_resets_1")}),
+      annotation(source, name + "_clocks_0"), annotation(source, name + "_clocks_1"),
+      annotation(sink, name + "_" + sinkField + "_0"), annotation(sink, name + "_" + sinkField + "_1")}),
       "host global fanout/empty target/duplicate coalescing changed");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream file(output, ec);
@@ -868,7 +874,8 @@ int main(int argc, char **argv) {
     run(context);
     for (unsigned mode = 0; mode < 3; ++mode) {
       StringRef name = mode == 0 ? "port-fields" : mode == 1 ? "node-fields" : "wire-fields";
-      hostTargets(context, mode, argc > 1 ? std::string(argv[1]) + "/host-" + name.str() + "-candidate.mlir" : "");
+      hostTargets(context, mode, false, argc > 1 ? std::string(argv[1]) + "/host-" + name.str() + "-candidate.mlir" : "");
+      hostTargets(context, mode, true, argc > 1 ? std::string(argv[1]) + "/host-wiring-" + name.str() + "-candidate.mlir" : "");
       for (unsigned kind = 0; kind < 4; ++kind) {
         std::string prefix = kind == 1 ? "reverse-" : kind == 2 ? "forward-" : kind == 3 ? "model-" : "";
         channelTargets(context, mode, kind, argc > 1 ? std::string(argv[1]) + "/" + prefix + name.str() + "-candidate.mlir" : "");
