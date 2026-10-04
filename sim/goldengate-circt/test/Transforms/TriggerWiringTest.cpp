@@ -1349,17 +1349,20 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
 }
 // Two independent top-local clocks: Scala groups aliases by root, samples
 // each local NEXT into the base clock, then sums full UInt<17> differences.
-void clockDomains(MLIRContext &context, StringRef output) {
+void clockDomains(MLIRContext &context, StringRef output, bool independentSink = false) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
       firrtl.module @Top(in %clock: !firrtl.clock, in %otherClock: !firrtl.clock,
         in %credit0: !firrtl.uint<1>, in %debit0: !firrtl.uint<1>,
         in %credit1: !firrtl.uint<1>, in %debit1: !firrtl.uint<1>,
-        in %reset: !firrtl.uint<1>, out %enabled: !firrtl.uint<1>) {
+        in %reset: !firrtl.uint<1>, out %enabled: !firrtl.uint<1>,
+        out %enabledOther: !firrtl.uint<1>) {
         %otherAlias = firrtl.node %otherClock : !firrtl.clock
         %zero = firrtl.constant 0 : !firrtl.uint<1>
         %trigger = firrtl.node %zero : !firrtl.uint<1>
+        %triggerOther = firrtl.node %zero : !firrtl.uint<1>
         firrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>
+        firrtl.strictconnect %enabledOther, %triggerOther : !firrtl.uint<1>
       }
     }
   })mlir", &context);
@@ -1380,6 +1383,9 @@ void clockDomains(MLIRContext &context, StringRef output) {
   }
   annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
     b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref("clock"))}));
+  if (independentSink)
+    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+      b.getNamedAttr("target", ref("triggerOther")), b.getNamedAttr("clock", ref("otherAlias"))}));
   auto channel = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
     b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
     b.getNamedAttr("sinks", b.getArrayAttr({ref("clock")}))});
@@ -1390,9 +1396,19 @@ void clockDomains(MLIRContext &context, StringRef output) {
   require(failed(goldengate::wireTriggers(circuit, consumed, error)) && consumed == 0 &&
           dump(root.get()) == before && error.find("each source clock domain") != std::string::npos,
           "incomplete clock domain must fail atomically");
+  if (independentSink) {
+    auto invalidSink = annotations;
+    invalidSink[5] = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+      b.getNamedAttr("target", ref("triggerOther")), b.getNamedAttr("clock", ref("reset"))});
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(invalidSink));
+    before = dump(root.get());
+    require(failed(goldengate::wireTriggers(circuit, consumed, error)) && consumed == 0 &&
+            dump(root.get()) == before && error.find("input Clock alias") != std::string::npos,
+            "invalid second sink clock must fail atomically");
+  }
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   require(succeeded(goldengate::wireTriggers(circuit, consumed, error)), error);
-  require(consumed == 4 && succeeded(verify(*root)) && top.getNumPorts() == 8 &&
+  require(consumed == 4 && succeeded(verify(*root)) && top.getNumPorts() == 9 &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "two-domain structure/cleanup");
   std::map<std::string, Value> values; SmallVector<RegOp> regs;
   llvm::DenseMap<Value, Value> drivers;
@@ -1401,11 +1417,20 @@ void clockDomains(MLIRContext &context, StringRef output) {
     if (auto reg = dyn_cast<RegOp>(op)) regs.push_back(reg);
     if (auto connect = dyn_cast<StrictConnectOp>(op)) drivers[connect.getDest()] = connect.getSrc();
   });
-  require(regs.size() == 15, "two domains need twelve local/sample plus two global and one sink registers");
+  require(regs.size() == (independentSink ? 16 : 15),
+          "two domains need twelve local/sample plus two global and one register per sink");
   for (auto reg : regs) {
     bool secondary = reg.getName() == "otherClock_credits" || reg.getName() == "otherClock_debits";
-    require(reg.getClockVal() == top.getBodyBlock()->getArgument(secondary ? 1 : 0), "domain register clock");
+    Value expected = reg.getName() == "trigger_sync_0" ? values.at("otherAlias") :
+                     top.getBodyBlock()->getArgument(secondary ? 1 : 0);
+    require(reg.getClockVal() == expected, "domain register clock");
   }
+  require(drivers.lookup(values.at("trigger_sync")) == values.at("trigger_source"),
+          "base sink samples shared trigger enable");
+  if (independentSink)
+    require(drivers.lookup(values.at("trigger_sync_0")) == values.at("trigger_source") &&
+            cast<NodeOp>(values.at("triggerOther").getDefiningOp()).getInput() == values.at("trigger_sync_0"),
+            "second sink samples the same enable through one local register");
   // Evaluate the actual generated SSA cone with independent clock edges.
   llvm::DenseMap<Value, uint64_t> state, inputs;
   std::function<uint64_t(Value)> eval = [&](Value v) -> uint64_t {
@@ -1441,9 +1466,14 @@ void clockDomains(MLIRContext &context, StringRef output) {
             eval(values.at("trigger_source")) == unsigned(cn != dn), "two-domain full NEXT aggregation");
     auto next = state;
     for (auto reg : regs) {
-      bool secondary = reg.getClockVal() == top.getBodyBlock()->getArgument(1);
+      bool secondary = reg.getClockVal() == top.getBodyBlock()->getArgument(1) ||
+                       reg.getClockVal() == values.at("otherAlias");
       if (secondary ? cycle % 3 != 0 : cycle % 2 == 0) next[reg.getResult()] = eval(drivers.lookup(reg.getResult()));
     }
+    if (independentSink)
+      require(next.lookup(values.at("trigger_sync_0")) ==
+              (cycle % 3 != 0 ? unsigned(cn != dn) : state.lookup(values.at("trigger_sync_0"))),
+              "second sink updates only on its local clock edge");
     state = std::move(next);
   }
   if (!output.empty()) { std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1456,6 +1486,7 @@ int main(int argc, char **argv) {
     run(context, true, true, argc > 1 ? argv[1] : "");
     run(context, false, false, "");
     clockDomains(context, argc > 45 ? argv[45] : "");
+    clockDomains(context, argc > 46 ? argv[46] : "", true);
     multiple(context, 3, 5, argc > 2 ? argv[2] : "");
     multiple(context, 2, 3, "");
     multiple(context, 4, 5, "");

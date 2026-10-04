@@ -432,7 +432,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     Value value = local.field.getValue();
     auto node = value.getDefiningOp<NodeOp>();
     if (!node || local.field.getFieldID() || !boolean(value)) {
-      error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
+      error = "trigger sinks must be ground local UInt<1> nodes"; return failure();
     }
     sinkAnnotations[node] = index;
   }
@@ -448,8 +448,16 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (failed(routeSinkToTop(module, paths, pathModules))) return failure();
     auto sinkClock = resolveField(circuit, module, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
+    // Scala synchronizes each sink on its annotated local clock. A top-local
+    // sink can use any proven input Clock leaf; it need not own source counters.
+    // Descendant sink paths remain restricted to the base leaf for now.
+    auto sinkRoot = module == top ? aliases.root(sinkClock) : clockRoot;
+    if (!sinkRoot) {
+      error = "trigger sink clock needs an unconditional top input Clock alias";
+      return failure();
+    }
     for (auto &path : paths)
-      if (!(aliases.root(module, sinkClock, path) == clockRoot)) {
+      if (!(aliases.root(module, sinkClock, path) == sinkRoot)) {
         error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
       }
     if (!dominance.properlyDominates(sinkClock.getValue(), node.getOperation())) {

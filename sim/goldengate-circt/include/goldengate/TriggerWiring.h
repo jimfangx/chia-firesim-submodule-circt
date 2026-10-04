@@ -14,14 +14,16 @@ namespace goldengate {
 // the annotated base clock before their full differences update global counts.
 // Clock annotation targets may select typed bundle/vector leaves of top ports,
 // wires or nodes; selected base/sink clocks remain the register clock operands.
+// Top-local sinks may use any proven input Clock leaf, independently of the
+// accounting domains. Each sink samples the shared enable on its own clock.
 // Event/reset targets may select local UInt<1> bundle/vector leaves in the top
 // or a descendant with unconditional instances through multiple parent definitions
 // and unequal routes to top. Every complete descendant source clock path resolves to the base leaf.
 // Field identity determines duplicate detection and flattened masked-event names.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor
-// instances; every ancestor route must reach top without cycles; all sink
-// instance clock paths must resolve to the same top base-clock leaf;
+// instances; every ancestor route must reach top without cycles; descendant
+// sink instance clock paths must resolve to the top base-clock leaf;
 // each sink clock dominates its node declaration.
 // Consumes: TriggerSource/TriggerSink and their internal annotation classes.
 // Produces: no annotations; preserves unrelated annotation order and top IO.
