@@ -9,6 +9,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <map>
 #include <functional>
 #include <stdexcept>
@@ -743,6 +744,139 @@ void childSources(MLIRContext &context, unsigned mode, StringRef output, unsigne
   if (!output.empty()) { std::error_code ec; llvm::raw_fd_ostream out(output, ec); require(!ec, "write child source candidate"); root->print(out); out << '\n'; }
 }
 
+// Two child sinks and an ancestor sink share one downward enable route. Scala
+// chooses the last annotation per node, then emits synchronizers in statement
+// order. Distinct local clock aliases make the naming/identity contract visible.
+void sharedSinks(MLIRContext &context, unsigned mode, StringRef output) {
+  std::string ports = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
+    "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, "
+    "out %echo: !firrtl.uint<1>, out %sinkEnabled: !firrtl.uint<1>, "
+    "out %secondEnabled: !firrtl.uint<1>, out %relayEnabled: !firrtl.uint<1>";
+  std::string instancePorts = ports;
+  instancePorts.erase(std::remove(instancePorts.begin(), instancePorts.end(), '%'), instancePorts.end());
+  auto instanceText = [&](StringRef name, StringRef module) {
+    return "%" + name.str() + ":8 = firrtl.instance " + name.str() + " @" +
+      module.str() + "(" + instancePorts + ")";
+  };
+  auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes "
+    "{rawAnnotations = []} { firrtl.module @Child(" + ports + ") {} "
+    "firrtl.module @Relay(" + ports + ") { " + instanceText("child", "Child") + " } "
+    "firrtl.module @Top(" + ports + ") { " + instanceText("relay", "Relay") + " } } }", &context);
+  require(bool(root), "parse shared sinks");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto it = circuit.getOps<FModuleOp>().begin();
+  auto child = *it++, relay = *it++, top = *it;
+  OpBuilder b(&context); auto loc = top.getLoc();
+  auto arg = [](FModuleOp module, unsigned index) { return module.getBodyBlock()->getArgument(index); };
+  b.setInsertionPointToEnd(child.getBodyBlock());
+  auto bit = UIntType::get(&context, 1);
+  auto zero = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 0));
+  auto one = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
+  auto credit = b.create<NodeOp>(loc, arg(child, 1), b.getStringAttr("creditEvent"));
+  b.create<NodeOp>(loc, arg(child, 2), b.getStringAttr("debitEvent"));
+  auto clockA = b.create<NodeOp>(loc, arg(child, 0), b.getStringAttr("clockA"));
+  auto clockB = b.create<NodeOp>(loc, arg(child, 0), b.getStringAttr("clockB"));
+  if (mode == 2) b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("trigger_sync"));
+  auto sinkA = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("triggerA"));
+  auto sinkB = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("triggerB"));
+  b.create<StrictConnectOp>(loc, arg(child, 4), credit.getResult());
+  b.create<StrictConnectOp>(loc, arg(child, 5), sinkA.getResult());
+  b.create<StrictConnectOp>(loc, arg(child, 6), sinkB.getResult());
+  b.create<StrictConnectOp>(loc, arg(child, 7), zero.getResult());
+  NodeOp sinkR, relayClock;
+  for (auto module : {relay, top}) {
+    b.setInsertionPointToEnd(module.getBodyBlock());
+    auto instance = *module.getBodyBlock()->getOps<InstanceOp>().begin();
+    instance->setAttr("example.metadata", b.getStringAttr("preserve"));
+    for (unsigned i = 0; i < 4; ++i)
+      b.create<StrictConnectOp>(loc, instance.getResult(i), arg(module, i));
+    for (unsigned i = 4; i < 8; ++i) {
+      Value signal = instance.getResult(i);
+      if (module == relay && i == 7) {
+        relayClock = b.create<NodeOp>(loc, arg(relay, 0), b.getStringAttr("relayClock"));
+        auto relayOne = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
+        sinkR = b.create<NodeOp>(loc, relayOne.getResult(), b.getStringAttr("triggerR"));
+        signal = sinkR.getResult();
+      }
+      b.create<StrictConnectOp>(loc, arg(module, i), signal);
+    }
+  }
+  auto ref = [&](StringRef module, StringRef name) { return b.getStringAttr(("~Top|" + module + ">" + name).str()); };
+  auto sink = [&](StringRef module, StringRef name, StringRef clock) {
+    return b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+      b.getNamedAttr("target", ref(module, name)), b.getNamedAttr("clock", ref(module, clock))});
+  };
+  SmallVector<Attribute> annotations;
+  for (bool credit : {true, false}) {
+    NamedAttrList attrs;
+    attrs.set("class", b.getStringAttr(A::InternalTriggerSource));
+    attrs.set("target", ref("Child", credit ? "creditEvent" : "debitEvent"));
+    attrs.set("clock", ref("Child", "clock")); attrs.set("sourceType", b.getBoolAttr(credit));
+    if (credit) attrs.set("reset", ref("Child", "reset"));
+    annotations.push_back(attrs.getDictionary(&context));
+  }
+  annotations.push_back(sink("Child", "triggerB", "clockB"));
+  if (mode == 1) annotations.push_back(sink("Child", "triggerA", "clockB"));
+  annotations.push_back(sink("Child", "triggerA", "clockA"));
+  annotations.push_back(sink("Relay", "triggerR", "relayClock"));
+  if (mode == 3) annotations.push_back(sink("Child", "triggerA", "missingClock"));
+  auto channel = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))});
+  annotations.push_back(channel);
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto before = dump(root.get()); std::string error; unsigned consumed = 99;
+  auto result = goldengate::wireTriggers(circuit, consumed, error);
+  if (mode == 3) {
+    require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
+            "last duplicate sink must be validated atomically");
+    return;
+  }
+  require(succeeded(result), error);
+  require(consumed == 2 && succeeded(verify(*root)), "invalid shared sink IR");
+  require(top.getNumPorts() == 8 && child.getNumPorts() == 11 && relay.getNumPorts() == 11,
+          "shared sinks must append exactly one enable input per module");
+  require(child.getPortName(10) == "trigger_sink" && relay.getPortName(10) == "trigger_sink",
+          "ancestor with a local sink must use the sink wiring key");
+  auto check = [&](NodeOp node, Value clock, StringRef name) {
+    auto reg = node.getInput().getDefiningOp<RegOp>();
+    require(reg && reg.getName() == name && reg.getClockVal() == clock,
+            "sink declaration order / last annotation clock mismatch: " + node.getName().str());
+    auto module = node->getParentOfType<FModuleOp>();
+    unsigned drivers = 0;
+    for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>())
+      if (connect.getDest() == reg.getResult()) {
+        ++drivers; require(connect.getSrc() == arg(module, 10), "sink enable is not shared");
+      }
+    require(drivers == 1, "sink needs one synchronizer driver");
+  };
+  check(sinkA, clockA.getResult(), mode == 2 ? "trigger_sync_0" : "trigger_sync");
+  check(sinkB, clockB.getResult(), mode == 2 ? "trigger_sync_1" : "trigger_sync_0");
+  check(sinkR, relayClock.getResult(), "trigger_sync");
+  for (auto module : {relay, top}) {
+    auto instance = *module.getBodyBlock()->getOps<InstanceOp>().begin();
+    Value expected = module == relay ? arg(relay, 10) : Value();
+    if (module == top)
+      for (auto node : top.getBodyBlock()->getOps<NodeOp>())
+        if (node.getName() == "trigger_source") expected = node.getResult();
+    require(instance.getNumResults() == 11 &&
+      instance->getAttrOfType<StringAttr>("example.metadata").getValue() == "preserve",
+      "shared route replaced instance metadata or ports");
+    unsigned drivers = 0;
+    for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>())
+      if (connect.getDest() == instance.getResult(10)) {
+        ++drivers; require(expected && connect.getSrc() == expected, "wrong shared sink route");
+      }
+    require(drivers == 1, "shared sink route needs one driver");
+  }
+  unsigned registers = 0; circuit.walk([&](RegOp) { ++registers; });
+  require(registers == 11 && circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}),
+          "shared sink register count / annotation cleanup");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "cannot write shared sink candidate"); root->print(out); out << '\n';
+  }
+}
 }
 int main(int argc, char **argv) {
   try {
@@ -789,6 +923,10 @@ int main(int argc, char **argv) {
     childSources(context, 0, "", 0, true);
     childSources(context, 0, "", 2, true);
     for (unsigned mode : {2, 3, 4, 5, 7, 9, 10}) childSources(context, mode, "", 1, true);
+    sharedSinks(context, 0, argc > 24 ? argv[24] : "");
+    sharedSinks(context, 1, argc > 25 ? argv[25] : "");
+    sharedSinks(context, 2, argc > 26 ? argv[26] : "");
+    sharedSinks(context, 3, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

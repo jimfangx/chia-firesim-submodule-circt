@@ -25,6 +25,8 @@ namespace goldengate {
 // instance retains its original attributes and port connections. Sink enables
 // flow downward through appended inputs; each sink synchronizer stays in its
 // declaring module on its annotated clock, including node aliases.
+// Duplicate sink annotations select the last clock for that node; synchronizer
+// names follow module declaration order, independently of annotation order.
 // Mutates: source event/reset projections, source/relay output ports, sink/relay
 // input ports and instances, top clock/event/reset projections, local/global counters,
 // synchronizers and sink node inputs. Uses read-only field/hierarchy driver analysis before mutation;

@@ -273,7 +273,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::MapVector<Operation *, bool> sinkModules;
-  llvm::DenseSet<Operation *> seen;
+  llvm::DenseMap<Operation *, unsigned> sinkAnnotations;
   auto routeToTop = [&](FModuleOp module, SmallVector<InstanceOp> &path,
                         SmallVector<FModuleOp> &pathModules) -> LogicalResult {
     llvm::DenseSet<Operation *> visited;
@@ -336,24 +336,39 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     events.push_back({event, reset, credit, name});
   }
   DominanceInfo dominance(circuit);
-  for (auto a : sinks) {
+  // Scala onModuleSink constructs a map by node name: the last annotation
+  // wins. Select it before resolving clocks, then visit declarations in IR
+  // order as onStmtSink does. Annotation order must not assign synchronizer
+  // identities (or clock operands) to different nodes.
+  for (auto [index, a] : llvm::enumerate(sinks)) {
     auto local = resolveLocalField(circuit, a.getMember<StringAttr>("target"), error);
     if (!local.field) return failure();
     Value value = local.field.getValue();
+    auto node = value.getDefiningOp<NodeOp>();
+    if (!node || local.field.getFieldID() || !boolean(value)) {
+      error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
+    }
+    sinkAnnotations[node] = index;
+  }
+  SmallVector<NodeOp> orderedSinks;
+  circuit.walk([&](NodeOp node) {
+    if (sinkAnnotations.count(node)) orderedSinks.push_back(node);
+  });
+  for (auto node : orderedSinks) {
+    auto module = node->getParentOfType<FModuleOp>();
+    auto a = sinks[sinkAnnotations.lookup(node)];
     SmallVector<InstanceOp> path;
     SmallVector<FModuleOp> pathModules;
-    if (failed(routeToTop(local.module, path, pathModules))) return failure();
-    auto sinkClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
+    if (failed(routeToTop(module, path, pathModules))) return failure();
+    auto sinkClock = resolveField(circuit, module, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
-    auto node = value.getDefiningOp<NodeOp>();
-    if (!node || local.field.getFieldID() || !boolean(value) ||
-        !(aliases.root(local.module, sinkClock, path) == clockRoot)) {
+    if (!(aliases.root(module, sinkClock, path) == clockRoot)) {
       error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
     }
     if (!dominance.properlyDominates(sinkClock.getValue(), node.getOperation())) {
       error = "trigger sink clock must dominate its node declaration"; return failure();
     }
-    if (seen.insert(node).second) nodes.push_back({node, sinkClock});
+    nodes.push_back({node, sinkClock});
     for (auto module : pathModules) sinkModules[module] = true;
   }
   // All unsupported scope/type/clock cases have been rejected before mutation.
