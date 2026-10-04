@@ -7,11 +7,13 @@
 
 namespace goldengate {
 // Requires: imported FIRRTL with rawAnnotations and resolvable local selectors.
-// Consumes: DontTouch/host signal references to empty aggregates; temporary
-// leaf identities and identical expanded host signal annotations.
+// Consumes: DontTouch/host signal/FPGA debug references to empty aggregates;
+// temporary leaf identities and identical expanded host signal/debug annotations.
 // Produces: ground DontTouch/FAME host clock/reset and HostClockSource/Sink
-// targets; exact AutoCounter/trigger event, clock and optional reset references,
-// for public and internal classes; exact FAME channel clock/source/sink
+// targets; public/internal FPGA debug ComponentName leaves (preserving legacy
+// JSON spelling when supplied); exact AutoCounter/trigger event, clock and
+// optional reset references for public and internal classes; exact FAME channel
+// clock/source/sink
 // references in original order, including
 // DecoupledForwardChannel optional nested ready/valid references, and exact
 // FAMEChannelPortsAnnotation optional clockPort and ordered ports references.

@@ -105,10 +105,10 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     return failure();
   }
   const std::string circuitName = circuit.getName().str();
-  // DontTouch and host signal targets may fan out. Trigger/AutoCounter
-  // scalar members and channel endpoints (including nested ready/valid) follow
-  // SFC RTRenamer.exact. Keep endpoint indices so repeated references and clock
-  // schedule order survive.
+  // DontTouch, host signal and FPGA debug targets may fan out.
+  // Trigger/AutoCounter scalar members and channel endpoints (including nested
+  // ready/valid) follow SFC RTRenamer.exact. Keep endpoint indices so repeated
+  // references and clock schedule order survive.
   // An empty fanout plan removes an empty aggregate annotation; no plan
   // preserves a member whose identity does not need transferring.
   struct TargetPlan {
@@ -116,6 +116,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     std::optional<unsigned> element;
     SmallVector<GroundTarget> targets;
     bool channelInfo;
+    bool legacyComponent = false;
   };
   SmallVector<SmallVector<TargetPlan>> replacements(raw.size());
   auto isHostSignal = [](Annotation annotation) {
@@ -124,10 +125,15 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         annotation.isClass(AnnotationClasses::HostClockSource) ||
         annotation.isClass(AnnotationClasses::HostClockSink);
   };
+  auto isFpgaDebug = [](Annotation annotation) {
+    return annotation.isClass(AnnotationClasses::FpgaDebug) ||
+        annotation.isClass(AnnotationClasses::InternalFpgaDebug);
+  };
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
     const bool hostSignal = isHostSignal(annotation);
+    const bool fpgaDebug = isFpgaDebug(annotation);
     const bool autoCounter = annotation.isClass(AnnotationClasses::AutoCounter) ||
         annotation.isClass(AnnotationClasses::InternalAutoCounter);
     const bool triggerSource = annotation.isClass(AnnotationClasses::TriggerSource) ||
@@ -152,12 +158,28 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                            forwardChannel ? "DecoupledForwardChannel" :
                            channelPorts ? "FAMEChannelPortsAnnotation" :
                            autoCounter ? "AutoCounter" : "Trigger";
-    if (!dontTouch && !hostSignal && !exact)
+    if (!dontTouch && !hostSignal && !fpgaDebug && !exact)
       continue;
     auto planTarget = [&](StringRef member, StringAttr spelling,
                           std::optional<unsigned> element = std::nullopt,
                           bool channelInfo = false) -> LogicalResult {
       TargetPlan plan{member, element, {}, channelInfo};
+      // Debug annotations use SFC ComponentName, serialized as
+      // circuit.module.component. Resolve that local identity through CIRCT
+      // field IDs, then retain its original JSON representation on each leaf.
+      // A modern reference spelling is also accepted at the native boundary.
+      if (fpgaDebug && !spelling.getValue().starts_with("~")) {
+        auto circuitAndLocal = spelling.getValue().split('.');
+        auto moduleAndRef = circuitAndLocal.second.split('.');
+        if (circuitAndLocal.first != circuitName ||
+            moduleAndRef.first.empty() || moduleAndRef.second.empty()) {
+          error = "invalid FPGA debug ComponentName: " + spelling.getValue().str();
+          return failure();
+        }
+        plan.legacyComponent = true;
+        spelling = StringAttr::get(module.getContext(), "~" + circuitName +
+            "|" + moduleAndRef.first.str() + ">" + moduleAndRef.second.str());
+      }
       auto local = spelling.getValue().split('>').second;
       std::string resolutionError;
       auto target = resolveAnnotationTarget(circuit, spelling.getValue(), resolutionError);
@@ -361,10 +383,11 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   rewritten.reserve(raw.size());
   // Scala LowForm coalesces identical SingleTargetAnnotation leaves, including
   // overlapping aggregate/leaf selectors. Distinct payloads remain distinct.
-  llvm::DenseSet<Attribute> hostSignals;
+  llvm::DenseSet<Attribute> singleTargets;
   auto appendAnnotation = [&](Attribute attr) {
     Annotation annotation(attr);
-    if (!isHostSignal(annotation) || hostSignals.insert(attr).second)
+    if ((!isHostSignal(annotation) && !isFpgaDebug(annotation)) ||
+        singleTargets.insert(attr).second)
       rewritten.push_back(attr);
   };
   auto loweredSpelling = [&](GroundTarget replacement) -> StringAttr {
@@ -422,6 +445,12 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     for (auto &replacement : events->targets) {
       auto spelling = loweredSpelling(replacement);
       if (!spelling) return failure();
+      if (events->legacyComponent) {
+        auto moduleAndRef =
+            spelling.getValue().drop_front(1).split('|').second.split('>');
+        spelling = StringAttr::get(module.getContext(), circuitName + "." +
+            moduleAndRef.first.str() + "." + moduleAndRef.second.str());
+      }
       Annotation leaf(annotation.getAttr());
       leaf.setMember("target", spelling);
       appendAnnotation(leaf.getAttr());

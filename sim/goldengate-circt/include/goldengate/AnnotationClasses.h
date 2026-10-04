@@ -21,6 +21,10 @@ struct AnnotationClasses {
       "midas.passes.HostClockSource";
   static constexpr llvm::StringLiteral HostClockSink =
       "midas.passes.HostClockSink";
+  static constexpr llvm::StringLiteral FpgaDebug =
+      "midas.targetutils.FirrtlFpgaDebugAnnotation";
+  static constexpr llvm::StringLiteral InternalFpgaDebug =
+      "midas.InternalFirrtlFpgaDebugAnnotation";
   static constexpr llvm::StringLiteral OutputFile =
       "midas.stage.GoldenGateOutputFileAnnotation";
   static constexpr llvm::StringLiteral InternalXDC = "midas.InternalXDCAnnotation";

@@ -323,12 +323,14 @@ void run(MLIRContext &context) {
   before = dump(*internal);
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*internal, ic, error)) &&
               dump(*internal) == before, "internal lowering is not idempotent");
-  // Host signals use SingleTargetAnnotation fanout, unlike exact channel members.
+  // Host signals and debug probes use SingleTargetAnnotation fanout.
   // Preserve distinct payloads on overlapping selectors and internal namespaces.
   for (StringRef klass : {goldengate::AnnotationClasses::HostClock,
                          goldengate::AnnotationClasses::HostReset,
                          goldengate::AnnotationClasses::HostClockSource,
-                         goldengate::AnnotationClasses::HostClockSink}) {
+                         goldengate::AnnotationClasses::HostClockSink,
+                         goldengate::AnnotationClasses::FpgaDebug,
+                         goldengate::AnnotationClasses::InternalFpgaDebug}) {
     auto candidate = parseSourceString<ModuleOp>(internalFixture, &context);
     auto owner = *candidate->getOps<CircuitOp>().begin();
     SmallVector<Attribute> input, expected;
@@ -344,7 +346,7 @@ void run(MLIRContext &context) {
     error.clear();
     require(succeeded(goldengate::lowerTypesWithRetainedTargets(*candidate, owner, error)) &&
             succeeded(verify(*candidate)) && owner->getAttr("rawAnnotations") == b.getArrayAttr(expected),
-            "host signal internal fanout/identity/payload changed: " + error);
+            "single-target internal fanout/identity/payload changed: " + error);
     InnerSymbolTable::walkSymbols(*owner.getOps<FModuleOp>().begin(), [&](StringAttr, InnerSymTarget) {
       require(false, "temporary host global identity leaked");
     });
@@ -866,12 +868,74 @@ void hostTargets(MLIRContext &context, unsigned mode, bool wiring, StringRef out
     require(!ec, "cannot write host global oracle: " + ec.message()); root->print(file);
   }
 }
+void debugTargets(MLIRContext &context, bool internal, bool legacy, StringRef output) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>,
+          in %io: !firrtl.bundle<a: uint<8>, nested: bundle<ready: uint<1>, data: vector<uint<4>, 2>>>,
+          in %empty: !firrtl.bundle<>) {
+        %alias = firrtl.node %io : !firrtl.bundle<a: uint<8>, nested: bundle<ready: uint<1>, data: vector<uint<4>, 2>>>
+        %wire = firrtl.wire : !firrtl.bundle<a: uint<8>, nested: bundle<ready: uint<1>, data: vector<uint<4>, 2>>>
+        firrtl.strictconnect %wire, %io : !firrtl.bundle<a: uint<8>, nested: bundle<ready: uint<1>, data: vector<uint<4>, 2>>>
+        %state = firrtl.reg %clock : !firrtl.clock, !firrtl.bundle<a: uint<8>, nested: bundle<ready: uint<1>, data: vector<uint<4>, 2>>>
+        firrtl.strictconnect %state, %io : !firrtl.bundle<a: uint<8>, nested: bundle<ready: uint<1>, data: vector<uint<4>, 2>>>
+      }
+    }
+  })mlir", &context);
+  require(bool(root), "FPGA debug fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context);
+  auto annotation = [&](StringRef target) {
+    return b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(internal ?
+        goldengate::AnnotationClasses::InternalFpgaDebug : goldengate::AnnotationClasses::FpgaDebug)),
+        b.getNamedAttr("target", b.getStringAttr((legacy ? "Top.Top." : "~Top|Top>") + target.str()))});
+  };
+  SmallVector<Attribute> input, expected;
+  for (StringRef name : {"io", "alias", "wire", "state"}) {
+    input.push_back(annotation(name));
+    input.push_back(annotation(name.str() + ".nested.data[1]"));
+    for (StringRef suffix : {"_a", "_nested_ready", "_nested_data_0", "_nested_data_1"})
+      expected.push_back(annotation(name.str() + suffix.str()));
+  }
+  input.push_back(annotation("empty"));
+  // Legacy ComponentName needs complete circuit/module/reference and selectors
+  // must resolve before any previously valid annotation is expanded.
+  for (StringRef bad : {"Other.Top.io", "Top..io", "Top.Top.",
+                        "Top.Top.io.nested.data[2]", "Top.Missing.io"}) {
+    auto invalid = cast<ModuleOp>(root->clone());
+    auto owner = *invalid.getOps<CircuitOp>().begin();
+    Annotation broken(input.front()); broken.setMember("target", b.getStringAttr(bad));
+    owner->setAttr("rawAnnotations", b.getArrayAttr({input.front(), broken.getAttr()}));
+    auto before = dump(invalid); std::string error;
+    require(failed(goldengate::lowerTypesWithRetainedTargets(invalid, owner, error)) &&
+            !error.empty() && dump(invalid) == before, "invalid debug ComponentName mutated IR");
+    invalid.erase();
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(input));
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)) && circuit->getAttr("rawAnnotations") == b.getArrayAttr(expected),
+          "FPGA debug fanout, duplicate coalescing or ComponentName representation changed");
+  auto before = dump(*root);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)) &&
+          dump(*root) == before, "debug target lowering is not idempotent");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file(output, ec);
+    require(!ec, "cannot write FPGA debug fixture: " + ec.message()); root->print(file);
+  }
+}
 } // namespace
 int main(int argc, char **argv) {
   MLIRContext context;
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
     run(context);
+    for (bool internal : {false, true})
+      for (bool legacy : {false, true}) {
+        std::string name = internal ? "internal" : "public";
+        if (!legacy) name += "-modern";
+        debugTargets(context, internal, legacy, argc > 1 ? std::string(argv[1]) + "/" + name + "-candidate.mlir" : "");
+      }
     for (unsigned mode = 0; mode < 3; ++mode) {
       StringRef name = mode == 0 ? "port-fields" : mode == 1 ? "node-fields" : "wire-fields";
       hostTargets(context, mode, false, argc > 1 ? std::string(argv[1]) + "/host-" + name.str() + "-candidate.mlir" : "");
