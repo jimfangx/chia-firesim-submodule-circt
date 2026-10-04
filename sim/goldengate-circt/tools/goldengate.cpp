@@ -355,7 +355,7 @@ int main(int argc, char **argv) {
     }
     if (mlir::failed(goldengate::lowerTypesWithRetainedTargets(
             *module, circuit, error)))
-      return fail("AutoCounter LowerTypes: " + error);
+      return fail("retained annotation LowerTypes: " + error);
     if (compileBaseline) {
       // SFC normalizes target resets before FAME introduces gated clocks.
       goldengate::coerceAsyncToSyncReset(circuit);
@@ -3243,7 +3243,7 @@ int main(int argc, char **argv) {
         return fail("cannot export printf bridge extraction annotations: " + error);
     }
     if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
-      return fail("AutoCounter LowerTypes: " + error);
+      return fail("retained annotation LowerTypes: " + error);
     // SFC MiddleFirrtlToLowFirrtl expands whens before AutoCounter: named
     // events declared inside a when must dominate the appended reset gates.
     mlir::PassManager lowForm(module->getContext());
@@ -3350,7 +3350,7 @@ int main(int argc, char **argv) {
     std::string error;
     if (mlir::failed(goldengate::lowerTypesWithRetainedTargets(
             *module, circuit, error)))
-      return fail("AutoCounter LowerTypes: " + error);
+      return fail("retained annotation LowerTypes: " + error);
     llvm::SmallVector<goldengate::AutoCounterEvent> events;
     if (mlir::failed(goldengate::analyzeAutoCounterEvents(circuit, events,
                                                           error)))

@@ -516,7 +516,7 @@ void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
 }
 // Aggregate event/reset references are renamed to these same UInt leaves by
 // Scala LowerTypes. Failed leaf selection must not leave projections behind.
-void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
+void eventTargets(MLIRContext &context, unsigned mode, StringRef output, bool normalizeFirst = false) {
   bool occupiedMask = mode >= 12;
   if (occupiedMask) mode -= 12;
   const std::string type = "!firrtl.bundle<events: vector<bundle<credit: uint<1>, debit: uint<1>, reset: uint<1>" +
@@ -561,6 +561,30 @@ void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
   annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
     b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref("clock"))}));
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  if (normalizeFirst) {
+    std::string error;
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+    for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      Annotation annotation(attr);
+      if (!annotation.isClass(A::InternalTriggerSource) && !annotation.isClass(A::InternalTriggerSink)) continue;
+      for (StringRef member : {"target", "clock", "reset"})
+        if (auto target = annotation.getMember<StringAttr>(member))
+          require(!target.getValue().contains('.') && !target.getValue().contains('['),
+                  "production LowerTypes must transfer trigger " + member.str() + " identity");
+    }
+    if (!output.empty()) {
+      std::error_code ec; llvm::raw_fd_ostream out((output + ".normalized.mlir").str(), ec);
+      require(!ec, "normalized trigger input output"); root->print(out); out << '\n';
+    }
+    unsigned consumed = 99;
+    require(succeeded(goldengate::wireTriggers(circuit, consumed, error)), error);
+    require(consumed == 2 && succeeded(verify(*root)), "normalized trigger candidate invalid");
+    unsigned registers = 0; top.walk([&](RegOp reg) { ++registers; });
+    require(registers == 9, "normalized trigger accounting state");
+    if (!output.empty()) { std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+      require(!ec, "normalized trigger output"); root->print(out); out << '\n'; }
+    return;
+  }
   auto before = dump(root.get());
   unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
@@ -1840,9 +1864,71 @@ void clockDomains(MLIRContext &context, StringRef output, bool independentSink =
     require(!ec, "two-domain output"); root->print(out); out << '\n'; }
 }
 
+
+// An original aggregate input and a trigger output can have the same raw
+// container name; normalized leaves and their SSA drivers must stay distinct.
+void aggregateInputExport(MLIRContext &context, StringRef output) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(
+module { firrtl.circuit "Top" attributes {rawAnnotations = []} {
+  firrtl.module @Child(in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>,
+    in %debit: !firrtl.uint<1>, in %simulationTrigger_creditEvent: !firrtl.bundle<neighbor: uint<1>>,
+    out %echo: !firrtl.uint<1>) {
+    %creditEvent = firrtl.node %credit : !firrtl.uint<1>
+    %debitEvent = firrtl.node %debit : !firrtl.uint<1>
+    %neighbor = firrtl.subfield %simulationTrigger_creditEvent[neighbor] : !firrtl.bundle<neighbor: uint<1>>
+    firrtl.strictconnect %echo, %neighbor : !firrtl.uint<1>
+  }
+  firrtl.module @Top(in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>,
+    in %payload: !firrtl.bundle<neighbor: uint<1>>, out %enabled: !firrtl.uint<1>, out %echo: !firrtl.uint<1>) {
+    %child:5 = firrtl.instance child @Child(in clock: !firrtl.clock, in credit: !firrtl.uint<1>,
+      in debit: !firrtl.uint<1>, in simulationTrigger_creditEvent: !firrtl.bundle<neighbor: uint<1>>, out echo: !firrtl.uint<1>)
+    firrtl.strictconnect %child#0, %clock : !firrtl.clock
+    firrtl.strictconnect %child#1, %credit : !firrtl.uint<1>
+    firrtl.strictconnect %child#2, %debit : !firrtl.uint<1>
+    firrtl.strictconnect %child#3, %payload : !firrtl.bundle<neighbor: uint<1>>
+    firrtl.strictconnect %echo, %child#4 : !firrtl.uint<1>
+    %one = firrtl.constant 1 : !firrtl.uint<1>
+    %trigger = firrtl.node %one : !firrtl.uint<1>
+    firrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>
+  }
+} })mlir", &context);
+  require(bool(root), "aggregate input export parse");
+  auto circuit = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
+  auto ref = [&](StringRef module, StringRef name) { return b.getStringAttr(("~Top|" + module + ">" + name).str()); };
+  SmallVector<Attribute> annotations;
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))}));
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::DontTouch)),
+    b.getNamedAttr("target", ref("Child", "simulationTrigger_creditEvent"))}));
+  for (bool credit : {true, false})
+    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSource)),
+      b.getNamedAttr("target", ref("Child", credit ? "creditEvent" : "debitEvent")),
+      b.getNamedAttr("clock", ref("Child", "clock")), b.getNamedAttr("sourceType", b.getBoolAttr(credit))}));
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+    b.getNamedAttr("target", ref("Top", "trigger")), b.getNamedAttr("clock", ref("Top", "clock"))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  unsigned consumed = 99; std::string error;
+  require(succeeded(goldengate::wireTriggers(circuit, consumed, error)), error);
+  require(consumed == 2 && succeeded(verify(*root)), "aggregate input export candidate invalid");
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "lowered aggregate input export candidate invalid");
+  auto child = *circuit.getOps<FModuleOp>().begin();
+  require(child.getPortName(3) == "simulationTrigger_creditEvent_neighbor" &&
+          child.getPortName(5) == "simulationTrigger_creditEvent", "aggregate input and scalar export normalized names");
+  auto retained = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(Annotation(retained[1]).getMember<StringAttr>("target") == "~Top|Child>simulationTrigger_creditEvent_neighbor",
+          "original aggregate input DontTouch identity");
+  if (!output.empty()) { std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "aggregate input export output"); root->print(out); out << '\n'; }
+}
+
 int main(int argc, char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    for (unsigned mode : {0u, 1u, 2u})
+      eventTargets(context, mode, argc > 99 + mode ? argv[99 + mode] : "", true);
+    aggregateInputExport(context, argc > 98 ? argv[98] : "");
     run(context, true, true, argc > 1 ? argv[1] : "");
     run(context, false, false, "");
     clockDomains(context, argc > 45 ? argv[45] : "");

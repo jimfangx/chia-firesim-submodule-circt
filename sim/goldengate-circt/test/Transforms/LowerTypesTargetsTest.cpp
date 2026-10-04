@@ -464,6 +464,65 @@ void run(MLIRContext &context) {
     require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, circuit, error)) &&
                 dump(*invalid) == before, "invalid AutoCounter clock/reset mutated IR");
   }
+
+  // Trigger annotations use exact renames in the same production LowerTypes
+  // boundary. Check both classes, sinks without reset, collisions and payload.
+  using A = goldengate::AnnotationClasses;
+  for (StringRef klass : {A::TriggerSource, A::InternalTriggerSource,
+                          A::TriggerSink, A::InternalTriggerSink}) {
+    auto candidate = parseSourceString<ModuleOp>(counterFixture, &context);
+    auto circuit = *candidate->getOps<CircuitOp>().begin();
+    bool source = klass == A::TriggerSource || klass == A::InternalTriggerSource;
+    SmallVector<Attribute> triggers;
+    for (unsigned i : {0u, 1u}) {
+      Annotation trigger(counters[i]);
+      trigger.setMember("class", b.getStringAttr(klass));
+      if (source) trigger.setMember("sourceType", b.getBoolAttr(i == 0));
+      else {
+        NamedAttrList fields(trigger.getDict()); fields.erase("reset");
+        trigger = Annotation(fields.getDictionary(&context));
+      }
+      triggers.push_back(trigger.getAttr());
+    }
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(triggers));
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*candidate, circuit, error)), error);
+    require(succeeded(verify(*candidate)), "lowered trigger selectors invalid");
+    auto rewritten = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    require(rewritten.size() == 2, "trigger exact rename changed annotation count");
+    for (unsigned i : {0u, 1u}) {
+      NamedAttrList expected(Annotation(triggers[i]).getDict());
+      for (StringRef member : {"target", "clock", "reset"})
+        if (source || member != "reset")
+          expected.set(member, Annotation(counterRaw[i]).getMember<StringAttr>(member));
+      require(rewritten[i] == expected.getDictionary(&context),
+              "trigger leaf identity, class, order or payload changed");
+    }
+    auto lowered = *circuit.getOps<FModuleOp>().begin(); unsigned symbols = 0;
+    InnerSymbolTable::walkSymbols(lowered, [&](StringAttr, InnerSymTarget) { ++symbols; });
+    require(symbols == 0, "temporary trigger identities leaked");
+    before = dump(*candidate);
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*candidate, circuit, error)) &&
+            dump(*candidate) == before, "trigger exact renames are not idempotent");
+    for (StringRef member : {"target", "clock", "reset"}) {
+      if (!source && member == "reset") continue;
+      Annotation bad(triggers.front()); bad.setMember(member, b.getStringAttr("~Top|Top>io.domain"));
+      auto invalid = parseSourceString<ModuleOp>(counterFixture, &context);
+      auto owner = *invalid->getOps<CircuitOp>().begin();
+      owner->setAttr("rawAnnotations", b.getArrayAttr({triggers.back(), bad.getAttr()}));
+      before = dump(*invalid);
+      require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
+              dump(*invalid) == before, "aggregate trigger selector did not reject atomically");
+    }
+  }
+  // Unused sources/sinks are consumed without resolving their ground metadata.
+  auto unused = parseSourceString<ModuleOp>(counterFixture, &context);
+  auto unusedCircuit = *unused->getOps<CircuitOp>().begin();
+  auto unresolved = counterAnnotation("~Top|Top>absent", "~Top|Top>absentClock",
+                                      "~Top|Top>absentReset", A::InternalTriggerSource);
+  unusedCircuit->setAttr("rawAnnotations", b.getArrayAttr({unresolved}));
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*unused, unusedCircuit, error)), error);
+  require(unusedCircuit->getAttr("rawAnnotations") == b.getArrayAttr({unresolved}),
+          "unresolved ground trigger metadata changed during normalization");
   llvm::outs() << "DontTouch aggregates expand in declaration order; fields, flips and unrelated targets preserved; three invalid selectors reject atomically; namespace collisions follow leaf identities and preserve native InnerRefs without temporary symbol leakage; internal wire/node/register targets expand and follow declaration namespace renames; AutoCounter event/clock/reset references preserve port and internal leaf identities\n";
 
 }

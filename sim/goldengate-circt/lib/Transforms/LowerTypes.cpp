@@ -107,8 +107,9 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   const std::string circuitName = circuit.getName().str();
   // An engaged, empty plan removes an annotation on an empty aggregate;
   // an absent plan leaves unrelated targets untouched.
-  // AutoCounter annotations use exact renames for all three references in
-  // SFC. Keep separate leaf identities for event, clock and reset; only
+  // AutoCounter and trigger annotations use exact renames for event, clock
+  // and optional reset references in SFC. Keep separate leaf identities for
+  // event, clock and reset; only
   // DontTouch targets may expand into more than one annotation.
   const std::array<StringRef, 3> members{"target", "clock", "reset"};
   using MemberPlan = std::optional<SmallVector<GroundTarget>>;
@@ -118,13 +119,20 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
     const bool autoCounter = annotation.isClass(AnnotationClasses::AutoCounter) ||
         annotation.isClass(AnnotationClasses::InternalAutoCounter);
-    if (!dontTouch && !autoCounter)
+    const bool triggerSource = annotation.isClass(AnnotationClasses::TriggerSource) ||
+        annotation.isClass(AnnotationClasses::InternalTriggerSource);
+    const bool triggerSink = annotation.isClass(AnnotationClasses::TriggerSink) ||
+        annotation.isClass(AnnotationClasses::InternalTriggerSink);
+    const bool exact = autoCounter || triggerSource || triggerSink;
+    const StringRef kind = autoCounter ? "AutoCounter" : "Trigger";
+    if (!dontTouch && !exact)
       continue;
-    for (unsigned member = 0; member < (autoCounter ? members.size() : 1); ++member) {
+    unsigned memberCount = triggerSink ? 2 : exact ? members.size() : 1;
+    for (unsigned member = 0; member < memberCount; ++member) {
       auto &replacement = replacements[index][member];
       auto spelling = annotation.getMember<StringAttr>(members[member]);
       // Missing optional metadata remains the responsibility of the consuming
-      // AutoCounter analysis; existing partial handoffs still lower their event.
+      // AutoCounter/trigger analysis; partial handoffs still lower their event.
       if (!spelling && member != 0)
         continue;
       if (!spelling) {
@@ -138,8 +146,8 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
       if (target && target->port) {
         auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
             target->module.getPortType(*target->port), *target->fieldID));
-        if (autoCounter && !type.isGround()) {
-          error = "AutoCounter " + members[member].str() +
+        if (exact && !type.isGround()) {
+          error = kind.str() + " " + members[member].str() +
                   " must select a ground value: " +
                   spelling.getValue().str();
           return failure();
@@ -151,8 +159,8 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
       }
       if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
                                                      resolutionError)) {
-        if (autoCounter && !internal->type.isGround()) {
-          error = "AutoCounter " + members[member].str() +
+        if (exact && !internal->type.isGround()) {
+          error = kind.str() + " " + members[member].str() +
                   " must select a ground value: " +
                   spelling.getValue().str();
           return failure();
@@ -163,12 +171,13 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                              *replacement);
         continue;
       }
-      // Preserve the handoff's unresolved ground AutoCounter metadata and
-      // root-only memory DontTouches; memory selectors need a separate port map.
-      if (autoCounter && member == 0 &&
+      // Defer unresolved ground trigger metadata to TriggerWiring, which skips
+      // reference resolution when no sources or sinks need hardware. Preserve
+      // ground AutoCounter events and root memory DontTouches as before.
+      if (((autoCounter && member == 0) || triggerSource || triggerSink) &&
           !local.contains('.') && !local.contains('['))
         continue;
-      if (autoCounter ||
+      if (exact ||
           !resolveInternalAnnotationTarget(circuit, spelling.getValue(),
                                            resolutionError)) {
         error = "unresolved retained annotation " + members[member].str() + " " +
