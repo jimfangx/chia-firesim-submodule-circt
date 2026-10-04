@@ -32,6 +32,7 @@
 #include "goldengate/PrintStubs.h"
 #include "goldengate/PrintWiring.h"
 #include "goldengate/GlobalResetWiring.h"
+#include "goldengate/HostClockWiring.h"
 #include "goldengate/BridgeAnalysis.h"
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/ChannelClockInfo.h"
@@ -3017,6 +3018,20 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, shimAnnotations, error)))
         return fail("F1 shim annotations: " + error);
       llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
+      unsigned wiredHostClocks = 0;
+      if (failed(goldengate::wireHostClock(circuit, wiredHostClocks, error)))
+        return fail("host clock wiring: " + error);
+      if (failed(mlir::verify(*module))) return fail("host clock wiring produced invalid FIRRTL IR");
+      llvm::SmallString<256> hostClockPath(outputDir), hostClockAnnotations(outputDir);
+      llvm::sys::path::append(hostClockPath, "post-host-clock-wiring.mlir");
+      llvm::sys::path::append(hostClockAnnotations, "post-host-clock-wiring-all.json");
+      std::error_code hostClockError;
+      llvm::raw_fd_ostream hostClockOut(hostClockPath, hostClockError);
+      if (hostClockError) return fail("cannot write host clock wiring: " + hostClockError.message());
+      module->print(hostClockOut); hostClockOut << '\n'; hostClockOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, hostClockAnnotations, error)))
+        return fail("host clock wiring annotations: " + error);
+      llvm::outs() << "Wired " << wiredHostClocks << " CIRCT host clock sinks in " << hostClockPath << '\n';
       if (failed(goldengate::specializeXilinxClockGates(circuit, error)))
         return fail("Xilinx host specialization: " + error);
       if (failed(mlir::verify(*module)))

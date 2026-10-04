@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/GlobalResetWiring.h"
+#include "goldengate/HostClockWiring.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
@@ -17,11 +18,13 @@ using namespace mlir;
 using namespace circt::firrtl;
 
 namespace {
-bool isSource(Annotation annotation) {
+bool isSource(Annotation annotation, bool hostClock) {
+  if (hostClock) return annotation.isClass(goldengate::AnnotationClasses::HostClockSource);
   return annotation.isClass(goldengate::AnnotationClasses::GlobalResetSource) ||
          annotation.isClass(goldengate::AnnotationClasses::PublicGlobalResetSource);
 }
-bool isSink(Annotation annotation) {
+bool isSink(Annotation annotation, bool hostClock) {
+  if (hostClock) return annotation.isClass(goldengate::AnnotationClasses::HostClockSink);
   return annotation.isClass(goldengate::AnnotationClasses::GlobalResetSink) ||
          annotation.isClass(goldengate::AnnotationClasses::PublicGlobalResetSink);
 }
@@ -35,13 +38,13 @@ struct ModuleRoute {
   SmallVector<std::pair<Operation *, Operation *>> children;
 };
 std::optional<Reference> resolve(CircuitOp circuit, StringRef target, bool sink,
-                               std::string &error) {
+                               const std::string &label, std::string &error) {
   std::string portError;
   if (auto port = goldengate::resolveAnnotationTarget(circuit, target, portError)) {
     auto module = dyn_cast<FModuleOp>(port->module.getOperation());
     if (!module || !port->port || port->fieldID.value_or(0) != 0 ||
         (sink && module.getPortDirection(*port->port) != Direction::Out)) {
-      error = "global reset needs a lowered ground reference; port sinks must be outputs: " + target.str();
+      error = label + " needs a lowered ground reference; port sinks must be outputs: " + target.str();
       return std::nullopt;
     }
     return Reference{module, module.getBodyBlock()->getArgument(*port->port)};
@@ -49,49 +52,62 @@ std::optional<Reference> resolve(CircuitOp circuit, StringRef target, bool sink,
   auto *op = goldengate::resolveInternalAnnotationTarget(circuit, target, error);
   if (!op || !isa<WireOp, NodeOp, RegOp, RegResetOp>(op) ||
       (sink && !isa<WireOp>(op))) {
-    error = "global reset needs a local lowered declaration; internal sinks must be wires: " + target.str();
+    error = label + " needs a local lowered declaration; internal sinks must be wires: " + target.str();
     return std::nullopt;
   }
   auto module = op->getParentOfType<FModuleOp>();
   if (!module || op->getBlock() != module.getBodyBlock()) {
-    error = "global reset declaration must be at module scope: " + target.str();
+    error = label + " declaration must be at module scope: " + target.str();
     return std::nullopt;
   }
   return Reference{module, op->getResult(0)};
 }
-} // namespace
 
-LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
-                                          std::string &error) {
+LogicalResult wireSignal(CircuitOp circuit, unsigned &wired,
+                         std::string &error, bool hostClock, bool retainSource) {
+  const std::string label = hostClock ? "host clock" : "global reset";
+  const std::string typeName = hostClock ? "Clock" : "UInt<1>";
   wired = 0;
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!raw) { error = "global reset wiring needs retained annotations"; return failure(); }
-  SmallVector<Attribute> retained;
+  if (!raw) { error = label + " wiring needs retained annotations"; return failure(); }
+  SmallVector<Attribute> retained, sourceAnnotations;
   SmallVector<StringAttr> sources, sinks;
   for (auto attr : raw) {
     Annotation annotation(attr);
-    if (!isSource(annotation) && !isSink(annotation)) {
+    if (!isSource(annotation, hostClock) && !isSink(annotation, hostClock)) {
       retained.push_back(attr);
       continue;
     }
     auto target = annotation.getMember<StringAttr>("target");
-    if (!target) { error = "global reset annotation has no target"; return failure(); }
-    (isSource(annotation) ? sources : sinks).push_back(target);
+    if (!target) { error = label + " annotation has no target"; return failure(); }
+    (isSource(annotation, hostClock) ? sources : sinks).push_back(target);
+    if (retainSource && isSource(annotation, hostClock)) sourceAnnotations.push_back(attr);
   }
   // Scala's parameterized wiring transform requires at most one source even
   // when sinks are absent. It does not resolve targets when either side is absent.
-  if (sources.size() > 1) { error = "received multiple global reset source annotations"; return failure(); }
+  if (sources.size() > 1) { error = "received multiple " + label + " source annotations"; return failure(); }
+  if (hostClock && sources.empty()) {
+    error = "host clock wiring requires exactly one source annotation";
+    return failure();
+  }
+  auto consume = [&] {
+    // HostClockWiring.apply prepends its original source for later invocations;
+    // the final compiler execute path consumes both classes.
+    sourceAnnotations.append(retained.begin(), retained.end());
+    circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), sourceAnnotations));
+  };
   if (sources.empty() || sinks.empty()) {
-    circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), retained));
+    consume();
     return success();
   }
-  auto source = resolve(circuit, sources.front().getValue(), false, error);
+  auto source = resolve(circuit, sources.front().getValue(), false, label, error);
   if (!source) return failure();
-  auto isBool = [](Value value) {
+  auto isSignal = [&](Value value) {
+    if (hostClock) return isa<ClockType>(value.getType());
     auto type = dyn_cast<UIntType>(value.getType());
     return type && type.getWidth() == 1;
   };
-  if (!isBool(source->value)) { error = "global reset source must be UInt<1>"; return failure(); }
+  if (!isSignal(source->value)) { error = label + " source must be " + typeName; return failure(); }
   SmallVector<Reference> destinations;
   llvm::DenseSet<Operation *> sinkModules;
   bool crossModule = false;
@@ -99,11 +115,11 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
   SmallVector<Operation *> oldDrivers;
   llvm::DenseSet<Operation *> seenDrivers;
   for (auto target : sinks) {
-    auto sink = resolve(circuit, target.getValue(), true, error);
+    auto sink = resolve(circuit, target.getValue(), true, label, error);
     if (!sink) return failure();
-    if (!isBool(sink->value) ||
+    if (!isSignal(sink->value) ||
         sink->value == source->value) {
-      error = "global reset wiring currently needs distinct UInt<1> source and sinks";
+      error = label + " wiring currently needs distinct " + typeName + " source and sinks";
       return failure();
     }
     if (!seen.insert(sink->value).second) continue;
@@ -117,7 +133,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
       if (auto connect = dyn_cast<ConnectOp>(op)) driver = connect.getDest() == sink->value;
       if (!driver) continue;
       if (op->getBlock() != sink->module.getBodyBlock()) {
-        error = "global reset wiring requires ExpandWhens before replacing sink drivers";
+        error = label + " wiring requires ExpandWhens before replacing sink drivers";
         return failure();
       }
       if (seenDrivers.insert(op).second) oldDrivers.push_back(op);
@@ -132,7 +148,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
     circt::igraph::InstanceGraph graph(circuit);
     auto *top = graph.lookup(StringAttr::get(circuit.getContext(), circuit.getName()));
     if (!top || !top->noUses()) {
-      error = "global reset wiring requires an uninstantiated circuit top";
+      error = label + " wiring requires an uninstantiated circuit top";
       return failure();
     }
     SmallVector<circt::igraph::InstanceGraphNode *> sourcePath;
@@ -142,7 +158,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
       auto *key = sourceNode->getModule().getOperation();
       if (!sourceAncestors.insert(key).second ||
           std::distance(sourceNode->uses().begin(), sourceNode->uses().end()) != 1) {
-        error = "cross-module global reset wiring requires a unique source instance path";
+        error = "cross-module " + label + " wiring requires a unique source instance path";
         return failure();
       }
       sourcePath.push_back(sourceNode);
@@ -150,7 +166,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
       auto instance = use->getInstance<InstanceOp>();
       auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
       if (!parent || instance->getBlock() != parent.getBodyBlock()) {
-        error = "global reset source path requires module-scope FIRRTL instances";
+        error = label + " source path requires module-scope FIRRTL instances";
         return failure();
       }
       sourceNode = graph.lookup(parent);
@@ -168,7 +184,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
         [&](circt::igraph::InstanceGraphNode *node) -> LogicalResult {
       auto *key = node->getModule().getOperation();
       if (!active.insert(key).second) {
-        error = "recursive module hierarchy in global reset wiring";
+        error = "recursive module hierarchy in " + label + " wiring";
         return failure();
       }
       path.push_back(node);
@@ -188,7 +204,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
     if (failed(findLCA(top))) return failure();
     for (auto *key : sinkModules)
       if (!reachedSinks.contains(key)) {
-        error = "global reset sink has no instance path from the circuit top";
+        error = label + " sink has no instance path from the circuit top";
         return failure();
       }
     auto *routeRoot = sourcePath[lca];
@@ -200,7 +216,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
       auto *key = module.getOperation();
       if (modules.count(key)) return success();
       if (!active.insert(key).second) {
-        error = "recursive module hierarchy in global reset wiring";
+        error = "recursive module hierarchy in " + label + " wiring";
         return failure();
       }
       ModuleRoute info{module, unsigned(module.getNumPorts()),
@@ -213,7 +229,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
         if (child == modules.end() || !child->second.needed) continue;
         auto instance = record->getInstance<InstanceOp>();
         if (!instance || instance->getBlock() != module.getBodyBlock()) {
-          error = "global reset routing requires module-scope FIRRTL instances";
+          error = label + " routing requires module-scope FIRRTL instances";
           return failure();
         }
         info.needed = true;
@@ -229,7 +245,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
         // Scala Wiring uses its annotation key at sink modules and the
         // source reference name at intermediate modules.
         auto name = names.newName(sinkModules.contains(key) ?
-                                  StringRef("InternalGlobalResetCondition") : sourceName);
+                                  StringRef(hostClock ? "HostClockSource" : "InternalGlobalResetCondition") : sourceName);
         info.added.push_back({info.oldPorts,
             PortInfo(StringAttr::get(circuit.getContext(), name), source->value.getType(),
                      info.exportsSource ? Direction::Out : Direction::In)});
@@ -241,7 +257,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
     if (failed(plan(routeRoot))) return failure();
     for (auto *key : sinkModules)
       if (!modules.count(key)) {
-        error = "global reset sink has no instance path from the circuit top";
+        error = label + " sink has no instance path from the circuit top";
         return failure();
       }
     for (auto &[key, info] : modules) {
@@ -252,7 +268,7 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
         auto parentInfo = parent ? modules.find(parent.getOperation()) : modules.end();
         if (!instance || parentInfo == modules.end() || !parentInfo->second.needed ||
             instance.getNumResults() != info.oldPorts || instance->getBlock() != parent.getBodyBlock()) {
-          error = "global reset route has an unreachable or incompatible instance use";
+          error = label + " route has an unreachable or incompatible instance use";
           return failure();
         }
         uses.push_back({instance, key});
@@ -275,8 +291,8 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
     instance.erase();
   }
   // Use the native source/child SSA value at the LCA instead of introducing
-  // Scala Wiring's alias wire. This preserves the same reset identity.
-  auto resetValue = [&](FModuleOp module) -> Value {
+  // Scala Wiring's alias wire. This preserves the same signal identity.
+  auto signalValue = [&](FModuleOp module) -> Value {
     if (module == source->module) return source->value;
     auto &info = modules.at(module.getOperation());
     if (info.exportsSource)
@@ -291,19 +307,31 @@ LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
   OpBuilder b(circuit.getContext());
   for (auto sink : destinations) {
     b.setInsertionPointToEnd(sink.module.getBodyBlock());
-    b.create<StrictConnectOp>(sink.module.getLoc(), sink.value, resetValue(sink.module));
+    b.create<StrictConnectOp>(sink.module.getLoc(), sink.value, signalValue(sink.module));
   }
   for (auto &[key, info] : modules) {
     b.setInsertionPointToEnd(info.module.getBodyBlock());
     if (info.exportsSource && !info.added.empty())
       b.create<StrictConnectOp>(info.module.getLoc(),
-          info.module.getBodyBlock()->getArgument(info.oldPorts), resetValue(info.module));
+          info.module.getBodyBlock()->getArgument(info.oldPorts), signalValue(info.module));
     for (auto [oldInstance, child] : info.children)
       if (!modules.at(child).exportsSource)
         b.create<StrictConnectOp>(info.module.getLoc(),
-            replacements.lookup(oldInstance).getResult(modules.at(child).oldPorts), resetValue(info.module));
+            replacements.lookup(oldInstance).getResult(modules.at(child).oldPorts), signalValue(info.module));
   }
   wired = destinations.size();
-  circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), retained));
+  consume();
   return success();
+}
+
+} // namespace
+
+LogicalResult goldengate::wireGlobalReset(CircuitOp circuit, unsigned &wired,
+                                          std::string &error) {
+  return wireSignal(circuit, wired, error, false, false);
+}
+
+LogicalResult goldengate::wireHostClock(CircuitOp circuit, unsigned &wired,
+                                       std::string &error, bool retainSource) {
+  return wireSignal(circuit, wired, error, true, retainSource);
 }
