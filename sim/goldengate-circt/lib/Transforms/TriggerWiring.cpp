@@ -33,6 +33,27 @@ bool boolean(Value v) {
   auto type = v ? dyn_cast<UIntType>(v.getType()) : UIntType();
   return type && type.getWidth() == 1;
 }
+// Scala runs LowerTypes before TriggerWiring. Predict its declaration namespace
+// without changing the aggregate CIRCT IR or creating field projections.
+void reserveNormalizedNames(FModuleOp module, circt::Namespace &names) {
+  std::function<void(StringRef, Type)> reserveLeaves = [&](StringRef name, Type type) {
+    if (auto bundle = dyn_cast<BundleType>(type)) {
+      for (auto element : bundle.getElements())
+        reserveLeaves((name + "_" + element.name.getValue()).str(), element.type);
+    } else if (auto vector = dyn_cast<FVectorType>(type)) {
+      for (unsigned i = 0; i < vector.getNumElements(); ++i)
+        reserveLeaves((name + "_" + Twine(i)).str(), vector.getElementType());
+    } else names.newName(name);
+  };
+  for (auto port : module.getPorts()) reserveLeaves(port.name.getValue(), port.type);
+  module.walk([&](Operation *op) {
+    if (auto opName = op->getAttrOfType<StringAttr>("name")) {
+      if (isa<NodeOp, WireOp, RegOp, RegResetOp>(op))
+        reserveLeaves(opName.getValue(), op->getResult(0).getType());
+      else names.newName(opName.getValue());
+    }
+  });
+}
 // Annotations may select aggregate leaves before LowerTypes. Resolve
 // identity without building projections: malformed targets must be atomic.
 struct LocalField { FModuleOp module; circt::FieldRef field; };
@@ -90,7 +111,8 @@ using Route = std::vector<unsigned>;
 struct Source {
   circt::FieldRef event, reset;
   bool credit, debit;
-  // Final local source identity, including any preflight-allocated mask name.
+  // Normalized source identity; a retained aggregate container can force the
+  // materialized mask node to use a different name without changing exports.
   std::string name;
   std::map<Route, circt::FieldRef> clocks;
 };
@@ -470,13 +492,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (reset) {
       auto [entry, inserted] = sourceNames.try_emplace(local.module);
       auto &ns = entry->second;
-      if (inserted) {
-        for (auto portName : local.module.getPortNamesAttr())
-          ns.newName(cast<StringAttr>(portName).getValue());
-        local.module.walk([&](Operation *op) {
-          if (auto opName = op->getAttrOfType<StringAttr>("name")) ns.newName(opName.getValue());
-        });
-      }
+      if (inserted) reserveNormalizedNames(local.module, ns);
       name = ns.newName(name + "_masked");
     }
     for (auto &path : paths) {
@@ -500,23 +516,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   // Keep this separate from the namespace used to materialize CIRCT masks:
   // CIRCT still retains the original aggregate operations at this boundary.
   circt::Namespace topNames;
-  std::function<void(StringRef, Type)> reserveLeaves = [&](StringRef name, Type type) {
-    if (auto bundle = dyn_cast<BundleType>(type)) {
-      for (auto element : bundle.getElements())
-        reserveLeaves((name + "_" + element.name.getValue()).str(), element.type);
-    } else if (auto vector = dyn_cast<FVectorType>(type)) {
-      for (unsigned i = 0; i < vector.getNumElements(); ++i)
-        reserveLeaves((name + "_" + Twine(i)).str(), vector.getElementType());
-    } else topNames.newName(name);
-  };
-  for (auto port : top.getPorts()) reserveLeaves(port.name.getValue(), port.type);
-  top.walk([&](Operation *op) {
-    if (auto opName = op->getAttrOfType<StringAttr>("name")) {
-      if (isa<NodeOp, WireOp, RegOp, RegResetOp>(op))
-        reserveLeaves(opName.getValue(), op->getResult(0).getType());
-      else topNames.newName(opName.getValue());
-    }
-  });
+  reserveNormalizedNames(top, topNames);
   for (auto &event : events)
     if (event.reset && event.event.getValue().getParentBlock() == top.getBodyBlock())
       topNames.newName(event.name);
@@ -610,9 +610,11 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
         if (event.reset) {
           Value reset = getValueByFieldID(childBuilder, event.reset.getValue(), event.reset.getFieldID());
           Value active = childBuilder.create<NotPrimOp>(reset);
-          signalName = childNames.newName(event.name);
+          // Preserve the normalized route identity even if a CIRCT aggregate
+          // container still occupies the mask node's preferred name.
+          auto nodeName = childNames.newName(event.name);
           signal = childBuilder.create<NodeOp>(childBuilder.create<AndPrimOp>(active, signal),
-                                              childBuilder.getStringAttr(signalName)).getResult();
+                                              childBuilder.getStringAttr(nodeName)).getResult();
         }
         localSignals.push_back({signal, signalName, {}});
       }

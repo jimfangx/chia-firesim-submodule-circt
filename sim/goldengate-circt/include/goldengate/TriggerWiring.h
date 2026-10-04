@@ -38,6 +38,8 @@ namespace goldengate {
 // planned top masks: Scala cannot reconstruct namespace-renamed top exports.
 // Top bundle/vector ports and wire/node/register declarations reserve flattened
 // leaf names, matching Scala normalization; aggregate container names disappear.
+// Mask identities use the same normalized declaration namespace in every source
+// module. Retained containers may rename native nodes without changing routes.
 // All source annotations are consumed.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor

@@ -516,7 +516,10 @@ void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
 // Aggregate event/reset references are renamed to these same UInt leaves by
 // Scala LowerTypes. Failed leaf selection must not leave projections behind.
 void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
-  const std::string type = "!firrtl.bundle<events: vector<bundle<credit: uint<1>, debit: uint<1>, reset: uint<1>>, 2>, wide: uint<2>, clock: clock>";
+  bool occupiedMask = mode >= 12;
+  if (occupiedMask) mode -= 12;
+  const std::string type = "!firrtl.bundle<events: vector<bundle<credit: uint<1>, debit: uint<1>, reset: uint<1>" +
+      std::string(occupiedMask ? ", credit_masked: uint<1>" : "") + ">, 2>, wide: uint<2>, clock: clock>";
   std::string body = mode == 2 ?
     "%data = firrtl.wire : " + type + "\nfirrtl.strictconnect %data, %payload : " + type + "\n" :
     "%data = firrtl.node %payload : " + type + "\n";
@@ -575,6 +578,8 @@ void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
   top.walk([&](RegOp reg) { ++registers; });
   top.walk([&](NodeOp node) {
     if (!node.getName().starts_with(stem + "_events_0_credit_masked")) return;
+    if (occupiedMask) require(node.getName() == stem + "_events_0_credit_masked_0",
+      "flattened aggregate leaf must reserve the preferred mask name");
     ++masked;
     auto gate = node.getInput().getDefiningOp<AndPrimOp>();
     require(bool(gate), "aggregate reset mask AND");
@@ -1101,7 +1106,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0,
                    bool sharedTarget = false, bool mixedMasks = false, bool collidingMasks = false,
-                   unsigned ancestorCollision = 0, unsigned topCollision = 0) {
+                   unsigned ancestorCollision = 0, unsigned topCollision = 0, bool maskContainer = false) {
   bool lastSourceClock = mode >= 13;
   bool childSink = mode >= 14 || mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
   bool duplicateMasked = mode == 11 || mode == 12;
@@ -1150,6 +1155,12 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   OpBuilder b(&context); auto loc = top.getLoc(); auto bit = UIntType::get(&context, 1);
   auto arg = [](FModuleOp m, unsigned i) { return m.getBodyBlock()->getArgument(i); };
   b.setInsertionPointToEnd(child.getBodyBlock());
+  if (maskContainer) {
+    auto type = parseType("!firrtl.bundle<neighbor: uint<1>>", &context);
+    auto wire = b.create<WireOp>(loc, type, "creditEvent_masked");
+    auto invalid = b.create<InvalidValueOp>(loc, type);
+    b.create<StrictConnectOp>(loc, wire.getResult(), invalid.getResult());
+  }
   auto credit = b.create<NodeOp>(loc, arg(child, 1), b.getStringAttr("creditEvent"));
   auto debit = b.create<NodeOp>(loc, arg(child, 2),
       b.getStringAttr(collidingMasks ? "simulationTrigger_creditEvent" : "debitEvent"));
@@ -1355,7 +1366,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       auto gate = n.getInput().getDefiningOp<AndPrimOp>();
       auto negate = gate ? gate.getLhs().getDefiningOp<NotPrimOp>() : NotPrimOp();
       require(gate && negate && gate.getRhs() == credit.getResult() &&
-              negate.getInput() == arg(child, n.getName() == "creditEvent_masked" ? 3 : 2),
+              negate.getInput() == arg(child, maskContainer || n.getName() == "creditEvent_masked" ? 3 : 2),
               "credit-before-debit mask naming must preserve independent reset identities");
     }
   });
@@ -1375,7 +1386,8 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       for (unsigned index : {0, 1}) {
         if (connect.getDest() != arg(child, originalPorts + index)) continue;
         auto mask = connect.getSrc().getDefiningOp<NodeOp>();
-        require(mask && mask.getName() == (index ? "simulationTrigger_creditEvent_masked" : "creditEvent_masked"),
+        require(mask && mask.getName() == (index ? "simulationTrigger_creditEvent_masked" :
+                    maskContainer ? "creditEvent_masked_0" : "creditEvent_masked"),
                 "renamed export must retain its original masked event driver");
         ++exportDrivers;
       }
@@ -1895,6 +1907,12 @@ int main(int argc, char **argv) {
     for (unsigned collision : {6u, 7u, 8u, 9u})
       fanoutSources(context, 14, "", 1, false, false, true, 0, collision);
     fanoutSources(context, 14, argc > 87 ? argv[87] : "", 1, false, false, true, 0, 10);
+    // Scala frees disappearing aggregate containers before allocating masks.
+    // CIRCT keeps the container, so its node name and export identity differ.
+    fanoutSources(context, 14, argc > 88 ? argv[88] : "", 1, false, false, true, 0, 0, true);
+    fanoutSources(context, 14, "", 1, false, false, true, 0, 3, true);
+    for (unsigned mode : {12u, 13u, 14u})
+      eventTargets(context, mode, argc > mode + 77 ? argv[mode + 77] : "");
     run(context, true, false, argc > 74 ? argv[74] : "", true);
     run(context, false, false, argc > 75 ? argv[75] : "", true);
     fanoutSources(context, 13, argc > 70 ? argv[70] : "", 0, true);
