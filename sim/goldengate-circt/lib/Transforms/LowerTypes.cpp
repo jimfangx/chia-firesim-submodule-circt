@@ -106,7 +106,8 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   }
   const std::string circuitName = circuit.getName().str();
   // Only DontTouch targets may fan out. Trigger/AutoCounter scalar members
-  // and each clock/pipe/reverse channel endpoint follow SFC RTRenamer.exact. Keep
+  // and channel endpoints (including nested ready/valid references) follow
+  // SFC RTRenamer.exact. Keep
   // endpoint indices so repeated references and clock schedule order survive.
   // An empty DontTouch plan removes an empty aggregate annotation; no plan
   // preserves a member whose identity does not need transferring.
@@ -114,6 +115,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     StringRef member;
     std::optional<unsigned> element;
     SmallVector<GroundTarget> targets;
+    bool channelInfo;
   };
   SmallVector<SmallVector<TargetPlan>> replacements(raw.size());
   for (auto [index, attr] : llvm::enumerate(raw)) {
@@ -132,17 +134,21 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         info && Annotation(info).isClass(AnnotationClasses::PipeChannel);
     const bool reverseChannel = annotation.isClass(AnnotationClasses::ChannelConnection) &&
         info && Annotation(info).isClass(AnnotationClasses::DecoupledReverseChannel);
-    const bool channelConnection = clockChannel || pipeChannel || reverseChannel;
+    const bool forwardChannel = annotation.isClass(AnnotationClasses::ChannelConnection) &&
+        info && Annotation(info).isClass(AnnotationClasses::DecoupledForwardChannel);
+    const bool channelConnection = clockChannel || pipeChannel || reverseChannel || forwardChannel;
     const bool exact = autoCounter || triggerSource || triggerSink || channelConnection;
     const StringRef kind = clockChannel ? "TargetClockChannel" :
                            pipeChannel ? "PipeChannel" :
                            reverseChannel ? "DecoupledReverseChannel" :
+                           forwardChannel ? "DecoupledForwardChannel" :
                            autoCounter ? "AutoCounter" : "Trigger";
     if (!dontTouch && !exact)
       continue;
     auto planTarget = [&](StringRef member, StringAttr spelling,
-                          std::optional<unsigned> element = std::nullopt) -> LogicalResult {
-      TargetPlan plan{member, element, {}};
+                          std::optional<unsigned> element = std::nullopt,
+                          bool channelInfo = false) -> LogicalResult {
+      TargetPlan plan{member, element, {}, channelInfo};
       auto local = spelling.getValue().split('>').second;
       std::string resolutionError;
       auto target = resolveAnnotationTarget(circuit, spelling.getValue(), resolutionError);
@@ -200,6 +206,18 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
           if (failed(planTarget(member, spelling, element))) return failure();
         }
       }
+      if (forwardChannel)
+        for (StringRef member : {"readySink", "validSource", "readySource", "validSink"}) {
+          auto endpoint = info.get(member);
+          if (!endpoint) continue;
+          auto spelling = dyn_cast<StringAttr>(endpoint);
+          if (!spelling) {
+            error = kind.str() + " channelInfo." + member.str() +
+                    " endpoint is not a reference target";
+            return failure();
+          }
+          if (failed(planTarget(member, spelling, std::nullopt, true))) return failure();
+        }
       continue;
     }
     const std::array<StringRef, 3> members{"target", "clock", "reset"};
@@ -339,13 +357,17 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     Annotation annotation(attr);
     const TargetPlan *events = nullptr;
     for (auto &plan : replacements[index]) {
-      if (plan.member == "target" && !plan.element) {
+      if (plan.member == "target" && !plan.element && !plan.channelInfo) {
         events = &plan;
         continue;
       }
       auto spelling = loweredSpelling(plan.targets.front());
       if (!spelling) return failure();
-      if (plan.element) {
+      if (plan.channelInfo) {
+        Annotation info(annotation.getMember<DictionaryAttr>("channelInfo"));
+        info.setMember(plan.member, spelling);
+        annotation.setMember("channelInfo", info.getAttr());
+      } else if (plan.element) {
         auto endpoints = annotation.getMember<ArrayAttr>(plan.member);
         SmallVector<Attribute> updated(endpoints.begin(), endpoints.end());
         updated[*plan.element] = spelling;

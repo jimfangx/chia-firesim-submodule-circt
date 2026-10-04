@@ -515,7 +515,7 @@ void run(MLIRContext &context) {
               dump(*invalid) == before, "aggregate trigger selector did not reject atomically");
     }
   }
-  // Clock, pipe and reverse connections use exact per-endpoint renames, including
+  // All channel connections use exact per-endpoint renames, including
   // repetitions, optional clock and both directions. Data selectors must
   // follow leaf identity even when their flattened names collide.
   auto clockInfo = b.getDictionaryAttr({
@@ -525,14 +525,20 @@ void run(MLIRContext &context) {
           b.getNamedAttr("multiplier", b.getI64IntegerAttr(1)),
           b.getNamedAttr("divisor", b.getI64IntegerAttr(1))})})),
       b.getNamedAttr("perClockMFMR", b.getArrayAttr({b.getI64IntegerAttr(3)}))});
-  for (int latency : {-2, -1, 0, 3}) {
+  for (int latency : {-3, -2, -1, 0, 3}) {
     bool pipe = latency >= 0;
     bool reverse = latency == -2;
+    bool forward = latency == -3;
     auto info = pipe ? b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(A::PipeChannel)),
         b.getNamedAttr("latency", b.getI32IntegerAttr(latency))}) : reverse ? b.getDictionaryAttr({
-        b.getNamedAttr("class", b.getStringAttr(A::DecoupledReverseChannel))}) : clockInfo;
-    StringRef endpointMember = pipe || reverse ? "target" : "clock";
+        b.getNamedAttr("class", b.getStringAttr(A::DecoupledReverseChannel))}) : forward ? b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(A::DecoupledForwardChannel)),
+        b.getNamedAttr("readySink", Annotation(counters[0]).getMember<StringAttr>("reset")),
+        b.getNamedAttr("validSource", Annotation(counters[1]).getMember<StringAttr>("reset")),
+        b.getNamedAttr("readySource", Annotation(counters[1]).getMember<StringAttr>("reset")),
+        b.getNamedAttr("validSink", Annotation(counters[0]).getMember<StringAttr>("reset"))}) : clockInfo;
+    StringRef endpointMember = pipe || reverse || forward ? "target" : "clock";
     auto channel = b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
         b.getNamedAttr("globalName", b.getStringAttr("clock")),
@@ -547,16 +553,26 @@ void run(MLIRContext &context) {
             Annotation(counters[0]).getMember<StringAttr>(endpointMember)}))});
     auto channelCandidate = parseSourceString<ModuleOp>(counterFixture, &context);
     auto channelCircuit = *channelCandidate->getOps<CircuitOp>().begin();
-    auto selected = goldengate::resolveAnnotationTarget(channelCircuit, pipe || reverse ? "~Top|Top>io.event" : "~Top|Top>io.domain[0].clock", error);
+    auto selected = goldengate::resolveAnnotationTarget(channelCircuit, pipe || reverse || forward ? "~Top|Top>io.event" : "~Top|Top>io.domain[0].clock", error);
     selected->module.setPortSymbolsAttr(*selected->port,
         InnerSymAttr::get(&context, {property("channel_endpoint", *selected->fieldID, "public")}));
     NamedAttrList emptyChannel(channel); emptyChannel.erase("clock");
     emptyChannel.erase("sources"); emptyChannel.set("sinks", b.getArrayAttr({}));
+    if (forward)
+      emptyChannel.set("channelInfo", b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(A::DecoupledForwardChannel))}));
     channelCircuit->setAttr("rawAnnotations", b.getArrayAttr({channel, emptyChannel.getDictionary(&context)}));
     require(succeeded(goldengate::lowerTypesWithRetainedTargets(*channelCandidate, channelCircuit, error)), error);
     NamedAttrList expectedChannel(channel);
     auto portEndpoint = Annotation(counterRaw[0]).getMember<StringAttr>(endpointMember);
     auto internalEndpoint = Annotation(counterRaw[1]).getMember<StringAttr>(endpointMember);
+    if (forward) {
+      NamedAttrList expectedInfo(info);
+      for (StringRef member : {"readySink", "validSource", "readySource", "validSink"})
+        expectedInfo.set(member, Annotation(counterRaw[member == "readySink" || member == "validSink" ? 0 : 1])
+                                    .getMember<StringAttr>("reset"));
+      expectedChannel.set("channelInfo", expectedInfo.getDictionary(&context));
+    }
     expectedChannel.set("clock", Annotation(counterRaw[1]).getMember<StringAttr>("clock"));
     expectedChannel.set("sources", b.getArrayAttr({portEndpoint, internalEndpoint, portEndpoint}));
     expectedChannel.set("sinks", b.getArrayAttr({internalEndpoint, portEndpoint}));
@@ -600,6 +616,22 @@ void run(MLIRContext &context) {
               error.find("endpoint is not a reference target") != std::string::npos &&
               dump(*invalid) == before, "malformed channel endpoint did not reject atomically");
     }
+    if (forward)
+      for (StringRef member : {"readySink", "validSource", "readySource", "validSink"})
+        for (Attribute spelling : {Attribute(b.getStringAttr("~Top|Top>io.domain")),
+                                   Attribute(b.getStringAttr("~Top|Top>state.domain[0]")),
+                                   Attribute(b.getStringAttr("~Top|Top>absent")),
+                                   Attribute(b.getI64IntegerAttr(0))}) {
+          NamedAttrList badInfo(info); badInfo.set(member, spelling);
+          NamedAttrList bad(channel); bad.set("channelInfo", badInfo.getDictionary(&context));
+          auto invalid = parseSourceString<ModuleOp>(counterFixture, &context);
+          auto owner = *invalid->getOps<CircuitOp>().begin();
+          owner->setAttr("rawAnnotations", b.getArrayAttr({channel, bad.getDictionary(&context)}));
+          before = dump(*invalid);
+          require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
+                  error.find(member.str()) != std::string::npos && dump(*invalid) == before,
+                  "nested ready/valid endpoint must reject before identity materialization");
+        }
   }
   // Unused sources/sinks are consumed without resolving their ground metadata.
   auto unused = parseSourceString<ModuleOp>(counterFixture, &context);
@@ -615,7 +647,9 @@ void run(MLIRContext &context) {
 }
 // Compare the native normalization boundary to Scala LowForm using the same
 // data selectors on aggregate ports, nodes and wires. Emit only when requested.
-void channelTargets(MLIRContext &context, unsigned mode, bool reverse, StringRef output) {
+void channelTargets(MLIRContext &context, unsigned mode, unsigned kind, StringRef output) {
+  bool reverse = kind == 1;
+  bool forward = kind == 2;
   std::string text = R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
       firrtl.module @Top(in %io: !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>,
@@ -640,8 +674,13 @@ void channelTargets(MLIRContext &context, unsigned mode, bool reverse, StringRef
   std::string name = mode == 0 ? "io" : "base";
   auto target = [&](StringRef field) { return b.getStringAttr("~Top|Top>" + name + field.str()); };
   auto info = reverse ? b.getDictionaryAttr({
-      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledReverseChannel))}) :
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledReverseChannel))}) : forward ?
       b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledForwardChannel)),
+          b.getNamedAttr("readySink", target(".rows[0].flag")),
+          b.getNamedAttr("validSource", target(".rows[1].flag")),
+          b.getNamedAttr("readySource", target(".rows[1].flag")),
+          b.getNamedAttr("validSink", target(".rows[0].flag"))}) : b.getDictionaryAttr({
           b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
           b.getNamedAttr("latency", b.getI32IntegerAttr(mode))});
   std::string field = reverse ? "flag" : "data";
@@ -655,11 +694,22 @@ void channelTargets(MLIRContext &context, unsigned mode, bool reverse, StringRef
       b.getNamedAttr("sinks", b.getArrayAttr({target(".rows[0].flag"), target(".rows[1]." + field)}))});
   NamedAttrList empty(channel); empty.erase("clock"); empty.erase("sources");
   empty.set("globalName", b.getStringAttr("empty")); empty.set("sinks", b.getArrayAttr({}));
+  if (forward)
+    empty.set("channelInfo", b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledForwardChannel))}));
   circuit->setAttr("rawAnnotations", b.getArrayAttr({channel, empty.getDictionary(&context)}));
   std::string error;
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
   require(succeeded(verify(*root)), "channel normalization oracle produced invalid IR");
   NamedAttrList expected(channel);
+  if (forward) {
+    NamedAttrList expectedInfo(info);
+    expectedInfo.set("readySink", target("_rows_0_flag"));
+    expectedInfo.set("validSource", target("_rows_1_flag"));
+    expectedInfo.set("readySource", target("_rows_1_flag"));
+    expectedInfo.set("validSink", target("_rows_0_flag"));
+    expected.set("channelInfo", expectedInfo.getDictionary(&context));
+  }
   expected.set("clock", target("_clock"));
   expected.set("sources", b.getArrayAttr({target("_rows_1_" + field), b.getStringAttr("~Top|Top>scalar"),
                                         target("_rows_0_" + field), target("_rows_1_" + field)}));
@@ -670,7 +720,7 @@ void channelTargets(MLIRContext &context, unsigned mode, bool reverse, StringRef
   if (!output.empty()) {
     std::error_code ec;
     llvm::raw_fd_ostream file(output, ec);
-    require(!ec, "cannot write pipe normalization fixture: " + ec.message());
+    require(!ec, "cannot write channel normalization fixture: " + ec.message());
     root->print(file);
   }
 }
@@ -682,9 +732,9 @@ int main(int argc, char **argv) {
     run(context);
     for (unsigned mode = 0; mode < 3; ++mode) {
       StringRef name = mode == 0 ? "port-fields" : mode == 1 ? "node-fields" : "wire-fields";
-      for (bool reverse : {false, true}) {
-        std::string prefix = reverse ? "reverse-" : "";
-        channelTargets(context, mode, reverse, argc > 1 ? std::string(argv[1]) + "/" + prefix + name.str() + "-candidate.mlir" : "");
+      for (unsigned kind = 0; kind < 3; ++kind) {
+        std::string prefix = kind == 1 ? "reverse-" : kind == 2 ? "forward-" : "";
+        channelTargets(context, mode, kind, argc > 1 ? std::string(argv[1]) + "/" + prefix + name.str() + "-candidate.mlir" : "");
       }
     }
   }
