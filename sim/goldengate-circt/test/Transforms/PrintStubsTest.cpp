@@ -103,6 +103,28 @@ void run(MLIRContext &context) {
   circuit->setAttr("rawAnnotations",raw);
   SmallVector<goldengate::PrintStub> stubs;
   std::string error;
+  // Disabled synthesis consumes selections without resolving targets, including
+  // duplicates and selections with unsupported clocks. All operations survive.
+  auto opaque = raw[3];
+  auto disabled = b.getArrayAttr({opaque, anno("~Top|Top>message"),
+      anno("~Top|Top>message"), anno("~Top|Top>missing"),
+      anno("~Top|Top>other"), opaque});
+  circuit->setAttr("rawAnnotations", disabled);
+  auto moduleBefore = dump(module);
+  unsigned removed = 0;
+  require(succeeded(goldengate::dropDisabledPrintAnnotations(circuit, removed, error)), error);
+  require(removed == 4 && dump(module) == moduleBefore &&
+      circuit->getAttrOfType<ArrayAttr>("rawAnnotations") == b.getArrayAttr({opaque, opaque}),
+      "disabled PrintSynthesis changed operations or retained annotation order");
+  auto cleaned = dump(*root);
+  require(succeeded(goldengate::dropDisabledPrintAnnotations(circuit, removed, error)) &&
+      removed == 0 && dump(*root) == cleaned, "disabled PrintSynthesis is not idempotent");
+  circuit->removeAttr("rawAnnotations");
+  auto missing = dump(*root);
+  removed = 19;
+  require(failed(goldengate::dropDisabledPrintAnnotations(circuit, removed, error)) &&
+      removed == 19 && dump(*root) == missing, "missing annotations mutated disabled state");
+  circuit->setAttr("rawAnnotations", raw);
   for (StringRef invalid : {"~Top|Top>message_wire", "~Top|Top>missing", "~Top|Top>other"}) {
     SmallVector<Attribute> bad(raw.begin(),raw.end());bad.push_back(anno(invalid));
     circuit->setAttr("rawAnnotations",b.getArrayAttr(bad));

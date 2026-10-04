@@ -23,6 +23,29 @@ std::string clockReference(FModuleOp module, Value clock) {
 }
 } // namespace
 
+LogicalResult goldengate::dropDisabledPrintAnnotations(
+    CircuitOp circuit, unsigned &removed, std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "disabled PrintSynthesis needs retained annotations";
+    return failure();
+  }
+  SmallVector<Attribute> retained;
+  unsigned count = 0;
+  for (auto attr : raw) {
+    // Scala filters by annotation class without looking up the selected printf
+    // when SynthPrints is false. Do not require valid target or operand identity.
+    if (Annotation(attr).isClass(AnnotationClasses::SynthPrintf))
+      ++count;
+    else
+      retained.push_back(attr);
+  }
+  if (count)
+    circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), retained));
+  removed = count;
+  return success();
+}
+
 LogicalResult goldengate::synthesizePrintStubs(
     CircuitOp circuit, SmallVectorImpl<PrintStub> &stubs, std::string &error) {
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");

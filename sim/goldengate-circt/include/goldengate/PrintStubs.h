@@ -5,6 +5,17 @@
 #include <string>
 
 namespace goldengate {
+/// Disabled PrintSynthesis, matching Scala PrintSynthesis.execute.
+/// Required input invariants: retained rawAnnotations and SynthPrints=false.
+/// Annotations consumed: all SynthPrintfAnnotation records, including duplicates.
+/// Annotations produced: none.
+/// IR mutations: rawAnnotations only; printf operations remain unchanged.
+/// Analyses required/preserved: none/all operation and hierarchy analyses.
+/// Output invariants: other annotation identities and order are preserved;
+/// disabled selections need not resolve to existing operations.
+mlir::LogicalResult dropDisabledPrintAnnotations(
+    circt::firrtl::CircuitOp circuit, unsigned &removed, std::string &error);
+
 struct PrintStub {
   circt::firrtl::PrintFOp print;
   circt::firrtl::WireOp bundle;

@@ -456,6 +456,28 @@ int main(int argc, char **argv) {
                  << " disabled AutoCounter annotations in " << annotationPath
                  << "; lowered FIRRTL in " << irPath << '\n';
     if (compileBaseline) {
+      // The default FireSim configuration has SynthPrints=false. Scala still
+      // consumes its selections before TriggerWiring, preserving printf RTL.
+      // Enabled print bridge construction is exposed by the incremental modes.
+      unsigned removedPrintSelections = 0;
+      if (failed(goldengate::dropDisabledPrintAnnotations(
+              circuit, removedPrintSelections, error)))
+        return fail("disabled PrintSynthesis: " + error);
+      llvm::SmallString<256> debugIRPath(outputDir), debugAnnotationPath(outputDir);
+      llvm::sys::path::append(debugIRPath, "post-debug-synthesis.mlir");
+      llvm::sys::path::append(debugAnnotationPath, "post-debug-synthesis-all.json");
+      std::error_code debugEC;
+      llvm::raw_fd_ostream debugIROut(debugIRPath, debugEC);
+      if (debugEC) return fail("cannot write debug synthesis MLIR: " + debugEC.message());
+      module->print(debugIROut);
+      debugIROut << '\n';
+      debugIROut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, debugAnnotationPath, error)))
+        return fail("cannot export debug synthesis annotations: " + error);
+      llvm::outs() << "Consumed " << removedPrintSelections
+                   << " disabled SynthPrintf selections in "
+                   << debugAnnotationPath << '\n';
+
       unsigned consumedTriggerSources = 0;
       if (mlir::failed(goldengate::wireTriggers(
               circuit, consumedTriggerSources, error)))
