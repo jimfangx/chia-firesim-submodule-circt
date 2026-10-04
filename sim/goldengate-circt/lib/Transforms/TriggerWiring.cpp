@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <vector>
@@ -248,6 +249,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), retained));
     return success();
   }
+  // gateEventsWithReset receives credits ++ debits in the Scala oracle.
+  // Preserve each kind's annotation order before assigning distinct mask
+  // identities, including when masked and shared unmasked targets coexist.
+  std::stable_partition(sources.begin(), sources.end(), [](Annotation a) {
+    return a.getMember<BoolAttr>("sourceType").getValue();
+  });
   FModuleOp top;
   for (auto module : circuit.getOps<FModuleOp>())
     if (module.getName() == circuit.getName()) top = module;

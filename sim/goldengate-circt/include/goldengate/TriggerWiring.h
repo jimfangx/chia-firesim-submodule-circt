@@ -23,7 +23,10 @@ namespace goldengate {
 // proven top input Clock leaf; repeated definitions may span multiple domains.
 // Field identity determines duplicate detection and flattened masked-event names.
 // Repeated reset-masked sources each contribute through a distinct mask node
-// and export. Unmasked sources share one export per target/absolute instance,
+// and export. Mask identities follow credits before debits, preserving order
+// within each kind even when both kinds mask the same target with different
+// resets and coexist with unmasked annotations. Unmasked sources share one
+// export per target/absolute instance,
 // counted once in each sourceType containing that target. Its last clock is
 // selected after grouping credits before debits, before instance-path analysis.
 // All source annotations are consumed.
