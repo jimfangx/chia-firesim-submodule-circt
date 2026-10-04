@@ -1099,7 +1099,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // Each pathless source contributes once per complete instance path. Keep masking
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0,
-                   bool sharedTarget = false, bool mixedMasks = false) {
+                   bool sharedTarget = false, bool mixedMasks = false, bool collidingMasks = false) {
   bool lastSourceClock = mode >= 13;
   bool childSink = mode >= 14 || mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
   bool duplicateMasked = mode == 11 || mode == 12;
@@ -1111,8 +1111,8 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   std::string instancePorts = childPorts;
   instancePorts.erase(std::remove(instancePorts.begin(), instancePorts.end(), '%'), instancePorts.end());
   unsigned originalPorts = (childSink ? 6 : 5) + lastSourceClock;
-  std::string creditExport = lastSourceClock && !mixedMasks ? "creditEvent" : "creditEvent_masked";
-  std::string finalExport = mixedMasks ? "creditEvent_masked_0" : sharedTarget ? "creditEvent" : "debitEvent";
+  std::string creditExport = lastSourceClock && !mixedMasks && !collidingMasks ? "creditEvent" : "creditEvent_masked";
+  std::string finalExport = collidingMasks ? "simulationTrigger_creditEvent_masked" : mixedMasks ? "creditEvent_masked_0" : sharedTarget ? "creditEvent" : "debitEvent";
   auto inst = [&](StringRef name, StringRef module) { return "%" + name.str() + ":" + std::to_string(originalPorts) +
     " = firrtl.instance " + name.str() + " @" + module.str() + "(" + instancePorts + ")"; };
   std::string relayText;
@@ -1137,7 +1137,8 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   auto arg = [](FModuleOp m, unsigned i) { return m.getBodyBlock()->getArgument(i); };
   b.setInsertionPointToEnd(child.getBodyBlock());
   auto credit = b.create<NodeOp>(loc, arg(child, 1), b.getStringAttr("creditEvent"));
-  b.create<NodeOp>(loc, arg(child, 2), b.getStringAttr("debitEvent"));
+  auto debit = b.create<NodeOp>(loc, arg(child, 2),
+      b.getStringAttr(collidingMasks ? "simulationTrigger_creditEvent" : "debitEvent"));
   b.create<StrictConnectOp>(loc, arg(child, 4), credit.getResult());
   if (childSink) {
     auto one = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
@@ -1216,6 +1217,18 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       annotations.push_back(attrs.getDictionary(&context));
     }
   }
+  if (collidingMasks) {
+    // The debit mask occupies the credit export's preferred name. Scala
+    // creates every mask before TopWiring allocates ports, including relays.
+    annotations.clear();
+    for (bool isCredit : {false, true})
+      annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSource)),
+        b.getNamedAttr("target", ref("Child", isCredit ? "creditEvent" : "simulationTrigger_creditEvent")),
+        b.getNamedAttr("clock", ref("Child", "clock")),
+        b.getNamedAttr("reset", ref("Child", isCredit ? "reset" : "credit")),
+        b.getNamedAttr("sourceType", b.getBoolAttr(isCredit))}));
+  }
   SmallVector<StringRef> sinkModules{"Top"};
   if (childSink) sinkModules.push_back("Child");
   for (StringRef module : sinkModules)
@@ -1232,10 +1245,11 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
             "source fanout missing clock path must fail atomically"); return;
   }
   require(succeeded(result), error);
-  require(consumed == (duplicateMasked ? 3 : mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
+  require(consumed == (collidingMasks ? 2 : duplicateMasked ? 3 : mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
   require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + exports + childSink,
           "source fanout must preserve top IO and share child export definitions");
-  require(child.getPortName(originalPorts) == "simulationTrigger_" + creditExport &&
+  require(child.getPortName(originalPorts) == "simulationTrigger_" + creditExport +
+              (collidingMasks ? "_0" : "") &&
           child.getPortName(originalPorts + exports - 1) ==
               "simulationTrigger_" + finalExport &&
           (!duplicateMasked || child.getPortName(originalPorts + 1) == "simulationTrigger_creditEvent_masked_0"), "source fanout export names");
@@ -1253,7 +1267,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   child.walk([&](NodeOp n) {
     if (!n.getName().starts_with("creditEvent_masked")) return;
     ++masks;
-    if (mixedMasks) {
+    if (mixedMasks || collidingMasks) {
       auto gate = n.getInput().getDefiningOp<AndPrimOp>();
       auto negate = gate ? gate.getLhs().getDefiningOp<NotPrimOp>() : NotPrimOp();
       require(gate && negate && gate.getRhs() == credit.getResult() &&
@@ -1261,6 +1275,28 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
               "credit-before-debit mask naming must preserve independent reset identities");
     }
   });
+  if (collidingMasks) {
+    unsigned debitMasks = 0;
+    child.walk([&](NodeOp node) {
+      if (node.getName() != "simulationTrigger_creditEvent_masked") return;
+      auto gate = node.getInput().getDefiningOp<AndPrimOp>();
+      auto negate = gate ? gate.getLhs().getDefiningOp<NotPrimOp>() : NotPrimOp();
+      require(gate && negate && gate.getRhs() == debit.getResult() &&
+              negate.getInput() == arg(child, 1), "export allocation displaced the debit mask identity");
+      ++debitMasks;
+    });
+    require(debitMasks == 1, "all mask names must be allocated before source export names");
+    unsigned exportDrivers = 0;
+    for (auto connect : child.getBodyBlock()->getOps<StrictConnectOp>())
+      for (unsigned index : {0, 1}) {
+        if (connect.getDest() != arg(child, originalPorts + index)) continue;
+        auto mask = connect.getSrc().getDefiningOp<NodeOp>();
+        require(mask && mask.getName() == (index ? "simulationTrigger_creditEvent_masked" : "creditEvent_masked"),
+                "renamed export must retain its original masked event driver");
+        ++exportDrivers;
+      }
+    require(exportDrivers == 2, "colliding event exports need one driver each");
+  }
   circuit.walk([&](RegOp) { ++registers; });
   for (auto module : circuit.getOps<FModuleOp>()) {
     for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
@@ -1323,7 +1359,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     // annotations put debits first. Distinct targets export once per kind/instance.
     // Reversing annotation clocks swaps the source feeding each domain,
     // without adding another export.
-    bool alternateSelected = !(mode == 15 || (mode == 14 && relayDepth));
+    bool alternateSelected = !collidingMasks && !(mode == 15 || (mode == 14 && relayDepth));
     for (auto node : top.getBodyBlock()->getOps<NodeOp>())
       for (bool secondary : {false, true})
         for (bool credit : {true, false}) {
@@ -1338,7 +1374,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
                       "last source clock must select the exported event's accounting domain");
         }
   }
-  require(instances == 2 + relayDepth && masks == (mixedMasks ? 2 : lastSourceClock ? 0 : duplicateMasked ? 2 : 1) && registers == 9 + 6 * mixed + childSink &&
+  require(instances == 2 + relayDepth && masks == (collidingMasks ? 1 : mixedMasks ? 2 : lastSourceClock ? 0 : duplicateMasked ? 2 : 1) && registers == 9 + 6 * mixed + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1751,6 +1787,10 @@ int main(int argc, char **argv) {
     fanoutSources(context, 14, argc > 77 ? argv[77] : "", 0, true, true);
     fanoutSources(context, 14, argc > 78 ? argv[78] : "", 1, true, true);
     fanoutSources(context, 14, argc > 79 ? argv[79] : "", 2, true, true);
+    fanoutSources(context, 13, argc > 80 ? argv[80] : "", 0, false, false, true);
+    fanoutSources(context, 14, argc > 81 ? argv[81] : "", 0, false, false, true);
+    fanoutSources(context, 14, argc > 82 ? argv[82] : "", 1, false, false, true);
+    fanoutSources(context, 14, argc > 83 ? argv[83] : "", 2, false, false, true);
     run(context, true, false, argc > 74 ? argv[74] : "", true);
     run(context, false, false, argc > 75 ? argv[75] : "", true);
     fanoutSources(context, 13, argc > 70 ? argv[70] : "", 0, true);

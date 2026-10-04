@@ -536,6 +536,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     SmallVector<RoutedEvent> signals;
     SmallVector<unsigned> signalIndices;
     unsigned oldPorts = child.getNumPorts();
+    // Scala gates every local source before TopWiring allocates any exports.
+    // Reserve all mask identities first: a later mask can occupy an earlier
+    // export's preferred name, including when this module relays other events.
+    llvm::DenseMap<unsigned, SmallVector<RoutedEvent>> moduleSignals;
     for (unsigned index : indices) {
       auto &event = events[index];
       auto localSignals = routed[operation].lookup(index);
@@ -551,6 +555,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
         }
         localSignals.push_back({signal, signalName, {}});
       }
+      moduleSignals[index] = std::move(localSignals);
+    }
+    for (unsigned index : indices) {
+      auto &localSignals = moduleSignals[index];
       for (auto &signal : localSignals) {
         auto portName = childNames.newName("simulationTrigger_" + signal.name);
         added.push_back({oldPorts, PortInfo(childBuilder.getStringAttr(portName),

@@ -25,7 +25,9 @@ namespace goldengate {
 // Repeated reset-masked sources each contribute through a distinct mask node
 // and export. Mask identities follow credits before debits, preserving order
 // within each kind even when both kinds mask the same target with different
-// resets and coexist with unmasked annotations. Unmasked sources share one
+// resets and coexist with unmasked annotations. All local mask names are
+// allocated before source/relay export names; export collisions rename ports
+// while routes retain the masked source identity. Unmasked sources share one
 // export per target/absolute instance,
 // counted once in each sourceType containing that target. Its last clock is
 // selected after grouping credits before debits, before instance-path analysis.
