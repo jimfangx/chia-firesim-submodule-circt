@@ -482,8 +482,35 @@ int main(int argc, char **argv) {
                    << " CIRCT trigger source annotations in "
                    << triggerAnnotationPath << '\n';
 
+      // MidasTransforms wires global reset after TriggerWiring and before
+      // WrapTop. Even with no debug sinks the pass consumes the source; its
+      // target must not survive with the pre-wrapper circuit identity.
+      {
+        unsigned wiredResetSinks = 0;
+        if (failed(goldengate::wireGlobalReset(circuit, wiredResetSinks, error)))
+          return fail("GlobalResetConditionWiring: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("GlobalResetConditionWiring produced invalid FIRRTL IR");
+        llvm::SmallString<256> resetIRPath(outputDir), resetAnnotationPath(outputDir);
+        llvm::sys::path::append(resetIRPath, "post-global-reset-wiring.mlir");
+        llvm::sys::path::append(resetAnnotationPath, "post-global-reset-wiring-all.json");
+        std::error_code resetEC;
+        llvm::raw_fd_ostream resetOut(resetIRPath, resetEC);
+        if (resetEC) return fail("cannot write global reset wiring IR: " + resetEC.message());
+        module->print(resetOut);
+        resetOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, resetAnnotationPath, error)))
+          return fail("cannot export global reset wiring annotations: " + error);
+        llvm::outs() << "Wired " << wiredResetSinks << " CIRCT global reset sinks in "
+                     << resetIRPath << '\n';
+      }
+
       if (mlir::failed(goldengate::wrapTop(circuit, error)))
         return fail("WrapTop: " + error);
+      if (enableAutoILA && failed(goldengate::prepareAutoILAAnnotations(
+              circuit, false, originalTargetName, error)))
+        return fail("WrapTop debug circuit identity: " + error);
+      const std::string fameDebugCircuit = circuit.getName().str();
       // The base Golden Gate configuration leaves model multithreading off.
       // Scala still runs this pass, consuming candidate threading annotations
       // before its post-wrap boundary.
@@ -925,6 +952,13 @@ int main(int argc, char **argv) {
         return fail("FAME clock channel annotation targets were not unique");
       circuit->setAttr("rawAnnotations",
                        mlir::ArrayAttr::get(&context, clockAnnotations));
+      if (enableAutoILA && (failed(goldengate::transferFAMEPortDebugTargets(
+              circuit, prefix + topName + ">" + oldTopClock,
+              prefix + topName + ">" + newTopClock + ".bits", error)) ||
+          failed(goldengate::transferFAMEPortDebugTargets(
+              circuit, prefix + modelName + ">" + oldModelClock,
+              prefix + modelName + ">" + newModelClock + ".bits", error))))
+        return fail("FAME clock debug target transfer: " + error);
       if (failed(mlir::verify(*module)))
         return fail("FAME clock channel produced invalid FIRRTL IR");
       llvm::SmallString<256> clockIRPath(outputDir);
@@ -1197,6 +1231,12 @@ int main(int argc, char **argv) {
         return fail("FAME data channel annotation targets were not unique");
       circuit->setAttr("rawAnnotations",
                        mlir::ArrayAttr::get(&context, rewrittenDataAnnotations));
+      for (const auto &rename : dataRenames)
+        if (enableAutoILA && (failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldTop, rename.newTop, error)) ||
+            failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldModel, rename.newModel, error))))
+          return fail("FAME input debug target transfer: " + error);
       if (failed(mlir::verify(*module)))
         return fail("FAME data channel produced invalid FIRRTL IR");
       llvm::SmallString<256> dataIRPath(outputDir);
@@ -1484,6 +1524,12 @@ int main(int argc, char **argv) {
         return fail("FAME forward output annotation targets were not unique");
       circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(
           &context, rewrittenOutputAnnotations));
+      for (const auto &rename : outputRenames)
+        if (enableAutoILA && (failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldTop, rename.newTop, error)) ||
+            failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldModel, rename.newModel, error))))
+          return fail("FAME output debug target transfer: " + error);
       if (failed(mlir::verify(*module)))
         return fail("FAME forward output produced invalid FIRRTL IR");
       llvm::SmallString<256> outputIRPath(outputDir), outputAnnotationPath(outputDir);
@@ -3093,9 +3139,63 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, shimAnnotations, error)))
         return fail("F1 shim annotations: " + error);
       llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
+      auto prepareDriverHeaders = [&]() -> int {
+        if (failed(goldengate::prepareSimulationMasterHeader(circuit, error)))
+          return fail("SimulationMaster driver header: " + error);
+        if (failed(goldengate::prepareClockBridgeHeader(circuit, error)))
+          return fail("ClockBridge driver header: " + error);
+        if (failed(goldengate::prepareResetPulseHeader(circuit, error)))
+          return fail("ResetPulseBridge driver header: " + error);
+        if (failed(goldengate::prepareLoadMemHeader(circuit, error)))
+          return fail("LoadMem driver header: " + error);
+        if (failed(goldengate::preparePeekPokeHeader(circuit, error)))
+          return fail("PeekPoke driver header: " + error);
+        if (failed(goldengate::prepareUARTHeader(circuit, error)))
+          return fail("UART driver header: " + error);
+        if (failed(goldengate::prepareTSIHeader(circuit, error)))
+          return fail("TSI driver header: " + error);
+        if (failed(goldengate::prepareBlockDevHeader(circuit, error)))
+          return fail("BlockDev driver header: " + error);
+        if (failed(goldengate::prepareTracerVHeader(circuit, error)))
+          return fail("TracerV driver header: " + error);
+        if (failed(goldengate::prepareCPUManagedStreamHeader(circuit, error)))
+          return fail("CPU managed stream driver header: " + error);
+        if (failed(goldengate::prepareFASEDHeader(circuit, error)))
+          return fail("FASED driver header: " + error);
+        return 0;
+      };
+      // MMIO header analysis uses the assembled aggregate banks. Capture its
+      // result before debug payload lowering, then publish it at the existing
+      // collateral boundary without changing annotation order.
+      mlir::DictionaryAttr ilaDriverHeader;
+      auto isDriverHeader = [](mlir::DictionaryAttr dict) {
+        auto suffix = dict ? dict.getAs<mlir::StringAttr>("fileSuffix")
+                           : mlir::StringAttr();
+        auto cls = dict ? dict.getAs<mlir::StringAttr>("class")
+                        : mlir::StringAttr();
+        return suffix && cls && suffix.getValue() == ".const.h" &&
+               cls.getValue() == goldengate::AnnotationClasses::OutputFile;
+      };
+      if (enableAutoILA) {
+        auto original = circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
+        if (int result = prepareDriverHeaders()) return result;
+        for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {
+          auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+          if (isDriverHeader(dict))
+            ilaDriverHeader = dict;
+        }
+        if (!ilaDriverHeader) return fail("AutoILA driver header capture failed");
+        circuit->setAttr("rawAnnotations", original);
+      }
       if (enableAutoILA && failed(goldengate::prepareAutoILAAnnotations(
-              circuit, false, originalTargetName, error)))
+              circuit, false, fameDebugCircuit, error)))
         return fail("AutoILA circuit identity: " + error);
+      // HostDecouplingRenames points debug selections at channel payload
+      // fields. Lower those fields and retained targets together before the
+      // ground-value TopWiring analysis.
+      if (enableAutoILA && failed(goldengate::lowerTypesWithRetainedTargets(
+              *module, circuit, error, goldengate::RetainedTargetScope::FpgaDebugOnly)))
+        return fail("AutoILA payload LowerTypes: " + error);
       if (enableAutoILA && failed(emitAutoILAAnalysis(circuit, outputDir, error)))
         return fail("AutoILA analysis: " + error);
       unsigned ilaProbes = 0;
@@ -3135,28 +3235,17 @@ int main(int argc, char **argv) {
       llvm::outs() << "Specialized CIRCT abstract clocks to Xilinx BUFGCE in " << xilinxPath << '\n';
       if (failed(goldengate::prepareXDCOutput(circuit, error)))
         return fail("XDC output preparation: " + error);
-      if (failed(goldengate::prepareSimulationMasterHeader(circuit, error)))
-        return fail("SimulationMaster driver header: " + error);
-      if (failed(goldengate::prepareClockBridgeHeader(circuit, error)))
-        return fail("ClockBridge driver header: " + error);
-      if (failed(goldengate::prepareResetPulseHeader(circuit, error)))
-        return fail("ResetPulseBridge driver header: " + error);
-      if (failed(goldengate::prepareLoadMemHeader(circuit, error)))
-        return fail("LoadMem driver header: " + error);
-      if (failed(goldengate::preparePeekPokeHeader(circuit, error)))
-        return fail("PeekPoke driver header: " + error);
-      if (failed(goldengate::prepareUARTHeader(circuit, error)))
-        return fail("UART driver header: " + error);
-      if (failed(goldengate::prepareTSIHeader(circuit, error)))
-        return fail("TSI driver header: " + error);
-      if (failed(goldengate::prepareBlockDevHeader(circuit, error)))
-        return fail("BlockDev driver header: " + error);
-      if (failed(goldengate::prepareTracerVHeader(circuit, error)))
-        return fail("TracerV driver header: " + error);
-      if (failed(goldengate::prepareCPUManagedStreamHeader(circuit, error)))
-        return fail("CPU managed stream driver header: " + error);
-      if (failed(goldengate::prepareFASEDHeader(circuit, error)))
-        return fail("FASED driver header: " + error);
+      if (enableAutoILA) {
+        auto raw = circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
+        llvm::SmallVector<mlir::Attribute> updated;
+        for (auto attr : raw) {
+          auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+          if (isDriverHeader(dict))
+            attr = ilaDriverHeader;
+          updated.push_back(attr);
+        }
+        circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(&context, updated));
+      } else if (int result = prepareDriverHeaders()) return result;
       llvm::SmallString<256> xdcAnnotations(outputDir);
       llvm::sys::path::append(xdcAnnotations, "post-fame-xdc-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, xdcAnnotations, error)))
@@ -4381,6 +4470,12 @@ int main(int argc, char **argv) {
     if (mlir::failed(goldengate::rewriteFAMEOutputChannel(
             *hierarchy, *selected, rewriteError)))
       return fail("FAME output channel rewrite: " + rewriteError);
+    for (const auto &rename : renames)
+      if (failed(goldengate::transferFAMEPortDebugTargets(
+              circuit, rename.oldTop, rename.newTop, rewriteError)) ||
+          failed(goldengate::transferFAMEPortDebugTargets(
+              circuit, rename.oldModel, rename.newModel, rewriteError)))
+        return fail("FAME output debug target transfer: " + rewriteError);
     llvm::SmallVector<mlir::Attribute> annotations;
     unsigned topTargets = 0, modelTargets = 0;
     for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {
@@ -4709,10 +4804,16 @@ int main(int argc, char **argv) {
       if (mlir::failed(goldengate::rewriteFAMEInputChannel(
               *currentHierarchy, port, rewriteError)))
         return fail("FAME input channel rewrite: " + rewriteError);
-      for (const auto &rename : renames)
+      for (const auto &rename : renames) {
         if (mlir::failed(goldengate::transferFAMEWrapperDontTouch(
                 circuit, rename.oldTop, rename.newTop, rewriteError)))
           return fail("FAME wrapper DontTouch transfer: " + rewriteError);
+        if (mlir::failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldTop, rename.newTop, rewriteError)) ||
+            mlir::failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldModel, rename.newModel, rewriteError)))
+          return fail("FAME input debug target transfer: " + rewriteError);
+      }
       // SFC's RenameMap moves each selected channel leaf to its payload
       // field. Retain unrelated bridge and channel annotations.
       llvm::SmallVector<mlir::Attribute> updatedAnnotations;
@@ -4849,10 +4950,16 @@ int main(int argc, char **argv) {
       if (mlir::failed(goldengate::rewriteFAMEOutputChannel(
               *currentHierarchy, port, rewriteError)))
         return fail("FAME output channel rewrite: " + rewriteError);
-      for (const auto &rename : renames)
+      for (const auto &rename : renames) {
         if (mlir::failed(goldengate::transferFAMEWrapperDontTouch(
                 circuit, rename.oldTop, rename.newTop, rewriteError)))
           return fail("FAME wrapper DontTouch transfer: " + rewriteError);
+        if (mlir::failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldTop, rename.newTop, rewriteError)) ||
+            mlir::failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldModel, rename.newModel, rewriteError)))
+          return fail("FAME output debug target transfer: " + rewriteError);
+      }
       llvm::SmallVector<mlir::Attribute> updatedAnnotations;
       unsigned topTargets = 0, modelTargets = 0;
       for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {

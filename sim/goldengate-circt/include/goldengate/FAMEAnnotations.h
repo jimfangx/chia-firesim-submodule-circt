@@ -22,4 +22,11 @@ mlir::LogicalResult consumeFAMEModelDontTouches(
 mlir::LogicalResult transferFAMEWrapperDontTouch(
     circt::firrtl::CircuitOp circuit, llvm::StringRef oldTarget,
     llvm::StringRef payloadTarget, std::string &error);
+
+// Carry private FPGA debug selections through hostDecouplingRenames for a
+// local wrapper/model data port. Validate the live channel payload, preserving
+// ComponentName versus ReferenceTarget spelling, duplicates and archive order.
+mlir::LogicalResult transferFAMEPortDebugTargets(
+    circt::firrtl::CircuitOp circuit, llvm::StringRef oldTarget,
+    llvm::StringRef payloadTarget, std::string &error);
 } // namespace goldengate

@@ -6,12 +6,16 @@
 #include <string>
 
 namespace goldengate {
+enum class RetainedTargetScope { All, FpgaDebugOnly };
 // Requires: imported FIRRTL with rawAnnotations and resolvable local selectors.
-// Consumes: DontTouch/host signal/FPGA debug references to empty aggregates;
-// temporary leaf identities and identical expanded host signal/debug annotations.
+// Consumes: DontTouch/host/global reset signal/FPGA debug references to empty
+// aggregates; temporary leaf identities and identical expanded signal/debug
+// annotations.
 // Produces: ground DontTouch/FAME host clock/reset and HostClockSource/Sink
 // targets; public/internal FPGA debug ComponentName leaves (preserving legacy
-// JSON spelling when supplied); exact AutoCounter/trigger event, clock and
+// JSON spelling when supplied); public/internal GlobalResetCondition source
+// and sink leaves (the wiring consumer enforces one source); exact
+// AutoCounter/trigger event, clock and
 // optional reset references for public and internal classes; exact FAME channel
 // clock/source/sink
 // references in original order, including
@@ -25,9 +29,13 @@ namespace goldengate {
 // Outputs: ground retained selectors, unique names, matching module/instance
 // interfaces, and no temporary identities. AutoCounter/trigger selectors each
 // name one ground value; their consumers check missing clock/reset metadata.
-// Unresolved ground trigger references remain for unused-annotation cleanup.
+// Unresolved ground trigger/global reset references remain for unused-annotation
+// cleanup when one side of the wiring is absent.
 // Native aggregate inner symbols remain subject to CIRCT LowerTypes validation.
+// FpgaDebugOnly is for late AutoILA lowering after FAME channel consumption:
+// transfer debug selections only and preserve the other raw records verbatim,
+// including historical channel endpoints whose ports have already been removed.
 mlir::LogicalResult lowerTypesWithRetainedTargets(
     mlir::ModuleOp module, circt::firrtl::CircuitOp circuit,
-    std::string &error);
+    std::string &error, RetainedTargetScope scope = RetainedTargetScope::All);
 } // namespace goldengate

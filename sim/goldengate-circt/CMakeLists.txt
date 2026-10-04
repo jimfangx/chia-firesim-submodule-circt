@@ -173,13 +173,14 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-trigger-wiring COMMAND goldengate-trigger-wiring-test)
   add_executable(goldengate-global-reset-wiring-test
     test/Transforms/GlobalResetWiringTest.cpp lib/Transforms/GlobalResetWiring.cpp
-    lib/Support/TargetUtils.cpp)
+    lib/Transforms/LowerTypes.cpp lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-global-reset-wiring-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-global-reset-wiring-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-global-reset-wiring-test PRIVATE
     include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
   target_link_libraries(goldengate-global-reset-wiring-test PRIVATE
-    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+    CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
+    MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-global-reset-wiring COMMAND goldengate-global-reset-wiring-test)
   add_executable(goldengate-host-clock-wiring-test
     test/Transforms/HostClockWiringTest.cpp lib/Transforms/GlobalResetWiring.cpp
@@ -260,13 +261,15 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-fame-port-annotations COMMAND goldengate-fame-port-annotations-test)
   add_executable(goldengate-fame-annotations-test
     test/Transforms/FAMEAnnotationsTest.cpp lib/Transforms/FAMEAnnotations.cpp
+    lib/Transforms/LowerTypes.cpp lib/Analysis/AutoILAAnalysis.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-fame-annotations-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fame-annotations-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fame-annotations-test PRIVATE
     include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
   target_link_libraries(goldengate-fame-annotations-test PRIVATE
-    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+    CIRCTFIRRTLTransforms CIRCTFIRRTL CIRCTHW CIRCTSupport
+    MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-annotations COMMAND goldengate-fame-annotations-test)
   add_executable(goldengate-fame-stale-top-clocks-test
     test/Transforms/FAMEStaleTopClocksTest.cpp lib/Transforms/FAMEInputChannel.cpp)

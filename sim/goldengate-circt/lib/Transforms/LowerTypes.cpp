@@ -98,14 +98,15 @@ void uniquifyLoweredNames(CircuitOp circuit) {
 } // namespace
 
 LogicalResult goldengate::lowerTypesWithRetainedTargets(
-    ModuleOp module, CircuitOp circuit, std::string &error) {
+    ModuleOp module, CircuitOp circuit, std::string &error,
+    RetainedTargetScope scope) {
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw) {
     error = "LowerTypes needs retained annotations";
     return failure();
   }
   const std::string circuitName = circuit.getName().str();
-  // DontTouch, host signal and FPGA debug targets may fan out.
+  // DontTouch, host/global reset signal and FPGA debug targets may fan out.
   // Trigger/AutoCounter scalar members and channel endpoints (including nested
   // ready/valid) follow SFC RTRenamer.exact. Keep endpoint indices so repeated
   // references and clock schedule order survive.
@@ -129,11 +130,20 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     return annotation.isClass(AnnotationClasses::FpgaDebug) ||
         annotation.isClass(AnnotationClasses::InternalFpgaDebug);
   };
+  auto isGlobalReset = [](Annotation annotation) {
+    return annotation.isClass(AnnotationClasses::GlobalResetSource) ||
+        annotation.isClass(AnnotationClasses::GlobalResetSink) ||
+        annotation.isClass(AnnotationClasses::PublicGlobalResetSource) ||
+        annotation.isClass(AnnotationClasses::PublicGlobalResetSink);
+  };
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
     const bool hostSignal = isHostSignal(annotation);
     const bool fpgaDebug = isFpgaDebug(annotation);
+    const bool globalReset = isGlobalReset(annotation);
+    if (scope == RetainedTargetScope::FpgaDebugOnly && !fpgaDebug)
+      continue;
     const bool autoCounter = annotation.isClass(AnnotationClasses::AutoCounter) ||
         annotation.isClass(AnnotationClasses::InternalAutoCounter);
     const bool triggerSource = annotation.isClass(AnnotationClasses::TriggerSource) ||
@@ -158,7 +168,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                            forwardChannel ? "DecoupledForwardChannel" :
                            channelPorts ? "FAMEChannelPortsAnnotation" :
                            autoCounter ? "AutoCounter" : "Trigger";
-    if (!dontTouch && !hostSignal && !fpgaDebug && !exact)
+    if (!dontTouch && !hostSignal && !fpgaDebug && !globalReset && !exact)
       continue;
     auto planTarget = [&](StringRef member, StringAttr spelling,
                           std::optional<unsigned> element = std::nullopt,
@@ -203,9 +213,11 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         collectGroundTargets(internal->type, internal->module, std::nullopt,
                              internal->declaration, internal->fieldID, plan.targets);
       } else {
-        // Unused ground triggers are consumed without resolution by TriggerWiring.
+        // Unused ground triggers/global resets are consumed without resolution
+        // when their wiring consumer has no source or no sinks.
         // Preserve ground AutoCounter events and root memory DontTouches as before.
-        if (((autoCounter && member == "target") || triggerSource || triggerSink) &&
+        if (((autoCounter && member == "target") || triggerSource || triggerSink ||
+             globalReset) &&
             !local.contains('.') && !local.contains('['))
           return success();
         if (exact || !resolveInternalAnnotationTarget(circuit, spelling.getValue(),
@@ -386,7 +398,9 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   llvm::DenseSet<Attribute> singleTargets;
   auto appendAnnotation = [&](Attribute attr) {
     Annotation annotation(attr);
-    if ((!isHostSignal(annotation) && !isFpgaDebug(annotation)) ||
+    if ((scope == RetainedTargetScope::FpgaDebugOnly && !isFpgaDebug(annotation)) ||
+        (!isHostSignal(annotation) && !isFpgaDebug(annotation) &&
+         !isGlobalReset(annotation)) ||
         singleTargets.insert(attr).second)
       rewritten.push_back(attr);
   };

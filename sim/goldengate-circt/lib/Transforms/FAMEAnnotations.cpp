@@ -132,3 +132,54 @@ LogicalResult goldengate::transferFAMEWrapperDontTouch(
   circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), updated));
   return success();
 }
+
+LogicalResult goldengate::transferFAMEPortDebugTargets(
+    CircuitOp circuit, llvm::StringRef oldTarget,
+    llvm::StringRef payloadTarget, std::string &error) {
+  auto reject = [&](llvm::StringRef reason) {
+    error = reason.str();
+    return failure();
+  };
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto old = oldTarget;
+  std::string circuitPrefix = "~" + circuit.getName().str() + "|";
+  if (!raw || !old.consume_front(circuitPrefix))
+    return reject("FAME debug transfer requires retained local port targets");
+  auto moduleAndPort = old.split('>');
+  if (moduleAndPort.first.empty() || moduleAndPort.first.contains('/') ||
+      moduleAndPort.second.empty() ||
+      moduleAndPort.second.find_first_of(".[]/>|") != llvm::StringRef::npos)
+    return reject("FAME debug source must name a local ground port");
+  std::string localPrefix = circuitPrefix + moduleAndPort.first.str() + ">";
+  auto payload = payloadTarget;
+  auto replacement = resolveAnnotationTarget(circuit, payloadTarget, error);
+  if (!replacement || !isa<FModuleOp>(replacement->module.getOperation()) ||
+      !replacement->port || !replacement->fieldID ||
+      *replacement->fieldID == 0 || !payload.consume_front(localPrefix))
+    return reject("FAME debug replacement must resolve to the same module's payload");
+  auto field = payload.split('.').second;
+  if (field != "bits" && !field.starts_with("bits."))
+    return reject("FAME debug replacement is not a channel bits field");
+  std::string legacyPrefix = circuit.getName().str() + "." +
+                             moduleAndPort.first.str() + ".";
+  std::string legacyOld = legacyPrefix + moduleAndPort.second.str();
+  std::string legacyPayload = legacyPrefix + payload.str();
+  SmallVector<Attribute> updated;
+  for (Attribute attr : raw) {
+    Annotation annotation(attr);
+    if (annotation.isClass(AnnotationClasses::InternalFpgaDebug)) {
+      auto target = annotation.getMember<StringAttr>("target");
+      if (!target)
+        return reject("FPGA debug annotation lacks a string target");
+      if (target.getValue() == oldTarget || target.getValue() == legacyOld) {
+        NamedAttrList transferred(cast<DictionaryAttr>(attr));
+        transferred.set("target", StringAttr::get(circuit.getContext(),
+            target.getValue() == oldTarget ? payloadTarget : StringRef(legacyPayload)));
+        attr = transferred.getDictionary(circuit.getContext());
+      }
+    }
+    updated.push_back(attr);
+  }
+  circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), updated));
+  return success();
+}

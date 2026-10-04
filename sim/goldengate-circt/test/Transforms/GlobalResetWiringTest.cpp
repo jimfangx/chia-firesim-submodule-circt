@@ -1,5 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/GlobalResetWiring.h"
+#include "goldengate/LowerTypes.h"
+#include "goldengate/TargetUtils.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
@@ -122,6 +124,97 @@ Value driver(FModuleOp module, Value dest) {
     }
   require(bool(result), "missing driver");
   return result;
+}
+void aggregateTargets(MLIRContext &context, bool publicSource, bool publicSink,
+                      bool internalSource) {
+  const char *fixture = R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %io: !firrtl.bundle<reset: uint<1>>,
+                        in %io_reset: !firrtl.uint<8>,
+                        out %sinks: !firrtl.bundle<first: uint<1>, nested: vector<uint<1>, 2>>,
+                        out %sinks_first: !firrtl.uint<8>) {
+        %condition = firrtl.wire : !firrtl.bundle<reset: uint<1>>
+        %condition_reset = firrtl.wire : !firrtl.uint<8>
+        %sink = firrtl.wire : !firrtl.bundle<reset: uint<1>>
+        %sink_reset = firrtl.wire : !firrtl.uint<8>
+      }
+    }
+  })mlir";
+  auto root = parseSourceString<ModuleOp>(fixture, &context);
+  require(bool(root), "aggregate reset fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = named(circuit, "Top");
+  OpBuilder b(&context);
+  auto sourceClass = publicSource ? A::PublicGlobalResetSource : A::GlobalResetSource;
+  auto sinkClass = publicSink ? A::PublicGlobalResetSink : A::GlobalResetSink;
+  auto source = annotation(b, sourceClass,
+      internalSource ? "~Top|Top>condition.reset" : "~Top|Top>io.reset");
+  auto sinks = annotation(b, sinkClass, "~Top|Top>sinks");
+  auto internalSink = annotation(b, sinkClass, "~Top|Top>sink.reset");
+  auto unrelated = annotation(b, "test.Keep", "~Top|Top>sinks");
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(
+      {source, sinks, internalSink, sinks, source, unrelated}));
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)),
+          "aggregate reset lowering failed: " + error);
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(raw.size() == 6 && raw[5] == unrelated,
+          "reset fanout, duplicate coalescing or unrelated metadata changed");
+  SmallVector<Value> values;
+  for (unsigned i = 0; i < 5; ++i) {
+    auto record = cast<DictionaryAttr>(raw[i]);
+    require(record.getAs<StringAttr>("class").getValue() ==
+                (i == 0 ? sourceClass : sinkClass), "reset class changed");
+    auto target = record.getAs<StringAttr>("target").getValue();
+    Value value;
+    if (auto port = goldengate::resolveAnnotationTarget(circuit, target, error)) {
+      require(port->port && port->fieldID == 0, "reset port selector was not lowered");
+      value = top.getBodyBlock()->getArgument(*port->port);
+    } else {
+      auto *op = goldengate::resolveInternalAnnotationTarget(circuit, target, error);
+      require(op && isa<WireOp>(op), "reset declaration selector was not lowered");
+      value = op->getResult(0);
+    }
+    require(value.getType() == UIntType::get(&context, 1),
+            "reset target selected an eight-bit name collision");
+    values.push_back(value);
+    llvm::outs() << "reset-target " << record.getAs<StringAttr>("class").getValue()
+                 << ' ' << target << '\n';
+  }
+  unsigned wired = 0;
+  require(succeeded(goldengate::wireGlobalReset(circuit, wired, error)) && wired == 4,
+          "lowered aggregate reset wiring failed: " + error);
+  require(succeeded(verify(*root)), "aggregate reset wiring produced invalid IR");
+  for (Value sink : ArrayRef<Value>(values).drop_front())
+    require(driver(top, sink) == values.front(), "reset sink lost its source identity");
+  require(circuit->getAttr("rawAnnotations") == b.getArrayAttr({unrelated}),
+          "reset annotations were not consumed");
+
+  // SingleTargetAnnotation.update fans out aggregate sources too; the wiring
+  // consumer, rather than type lowering, enforces the one-source contract.
+  auto multiple = parseSourceString<ModuleOp>(fixture, &context);
+  auto multiCircuit = *multiple->getOps<CircuitOp>().begin();
+  multiCircuit->setAttr("rawAnnotations", b.getArrayAttr(
+      {annotation(b, sourceClass, "~Top|Top>sinks")}));
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(
+              *multiple, multiCircuit, error)) &&
+              multiCircuit->getAttrOfType<ArrayAttr>("rawAnnotations").size() == 3,
+          "aggregate source did not fan out");
+  auto before = dump(multiple.get());
+  require(failed(goldengate::wireGlobalReset(multiCircuit, wired, error)) &&
+              StringRef(error).contains("multiple") && dump(multiple.get()) == before,
+          "multiple expanded reset sources were accepted or mutated IR");
+
+  // The Scala wiring pass consumes an unresolved scalar when no sinks exist.
+  auto unused = parseSourceString<ModuleOp>(fixture, &context);
+  auto unusedCircuit = *unused->getOps<CircuitOp>().begin();
+  auto absent = annotation(b, sourceClass, "~Top|Top>absent");
+  unusedCircuit->setAttr("rawAnnotations", b.getArrayAttr({absent}));
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(
+              *unused, unusedCircuit, error)) &&
+              unusedCircuit->getAttr("rawAnnotations") == b.getArrayAttr({absent}) &&
+              succeeded(goldengate::wireGlobalReset(unusedCircuit, wired, error)) &&
+              wired == 0, "unused reset annotation changed optional-side behavior");
 }
 void hierarchy(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
@@ -431,6 +524,10 @@ int main(int argc, char **argv) {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     run(context, false); run(context, true); hierarchy(context);
+    for (bool publicSource : {false, true})
+      for (bool publicSink : {false, true})
+        for (bool internalSource : {false, true})
+          aggregateTargets(context, publicSource, publicSink, internalSource);
     for (unsigned scope = 0; scope < 4; ++scope) nestedHierarchy(context, scope);
     if (argc == 3) {
       goldenHierarchy(context, argv[1], argv[2]);
