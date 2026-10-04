@@ -949,7 +949,12 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
               b.create<StrictConnectOp>(loc, arg(module, i), instance.getResult(i));
       } else {
         bool isLeft = instance.getName() == "left";
-        b.create<StrictConnectOp>(loc, instance.getResult(0), arg(module, ((mode == 2 && !isLeft) || ((mode == 5 || mode == 8) && isLeft)) ? 4 : 0));
+        // Modes 14/15 leave one absolute sink path unproven: missing clock
+        // or multiple unconditional drivers. All independent roots are valid.
+        if (!(mode == 14 && module == relay && !isLeft))
+          b.create<StrictConnectOp>(loc, instance.getResult(0), arg(module, ((mode == 2 && !isLeft) || ((mode == 5 || mode == 8) && isLeft)) ? 4 : 0));
+        if (mode == 15 && module == relay && !isLeft)
+          b.create<StrictConnectOp>(loc, instance.getResult(0), arg(module, 4));
         b.create<StrictConnectOp>(loc, instance.getResult(1), arg(module, isLeft ? 1 : 2));
         b.create<StrictConnectOp>(loc, arg(module, isLeft ? 5 : 7), instance.getResult(2));
         b.create<StrictConnectOp>(loc, arg(module, isLeft ? 6 : 8), instance.getResult(3));
@@ -992,10 +997,12 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
   }
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode == 2 || mode == 5 || mode == 7 || mode == 8 || mode >= 10) {
+  if (mode >= 13) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
             "unsupported sink fanout must fail atomically");
     if (mode == 13) require(StringRef(error).contains("cycle"), "sink cycle was not diagnosed");
+    else require(StringRef(error).contains("every instance path"),
+                 "unproven sink instance clock was not diagnosed");
     return;
   }
   require(succeeded(result), error);
@@ -1005,8 +1012,9 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
   unsigned relayEnable = sourceModule == relay ? 13 : 11;
   if (relay) require(relay.getNumPorts() == relayEnable + 1 && relay.getPortName(relayEnable) == "trigger_source",
                      "relay lost original ports, source exports or enable input");
-  if (outer) require(outer.getNumPorts() == 14 && outer.getPortName(13) == "trigger_source",
-                     "source-owning outer lost exports or enable input");
+  unsigned outerEnable = sourceModule == outer ? 13 : 11;
+  if (outer) require(outer.getNumPorts() == outerEnable + 1 && outer.getPortName(outerEnable) == "trigger_source",
+                     "outer lost original ports, source exports or enable input");
   for (auto [node, name] : {std::pair{sinkA, StringRef("trigger_sync")},
                             std::pair{sinkB, StringRef("trigger_sync_0")}}) {
     auto reg = node.getInput().getDefiningOp<RegOp>();
@@ -1023,13 +1031,13 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
       require(instance->getAttrOfType<StringAttr>("example.metadata").getValue() == "preserve",
               "sink fanout discarded instance metadata");
       if (instance.getModuleName() != "Leaf") {
-        unsigned enableIndex = instance.getModuleName() == "Relay" ? relayEnable : 13;
+        unsigned enableIndex = instance.getModuleName() == "Relay" ? relayEnable : outerEnable;
         require(instance.getNumResults() == enableIndex + 1, "relay instance lost appended ports");
         unsigned drivers = 0, originalDrivers = 0;
         for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>()) {
           if (connect.getDest() == instance.getResult(enableIndex)) {
             ++drivers;
-            require(connect.getSrc() == (module == top ? enable : arg(outer, 13)),
+            require(connect.getSrc() == (module == top ? enable : arg(outer, outerEnable)),
                     "each ancestor instance must receive the trigger enable");
           }
           for (unsigned i = 0; i < 5; ++i)
@@ -1533,14 +1541,16 @@ int main(int argc, char **argv) {
     sharedSinks(context, 3, "");
     fanoutSinks(context, 0, argc > 27 ? argv[27] : "");
     fanoutSinks(context, 1, argc > 28 ? argv[28] : "");
-    fanoutSinks(context, 2, "");
+    fanoutSinks(context, 2, argc > 47 ? argv[47] : "");
     fanoutSinks(context, 3, argc > 29 ? argv[29] : "");
     fanoutSinks(context, 6, argc > 30 ? argv[30] : "");
     fanoutSinks(context, 7, "");
     fanoutSinks(context, 8, "");
     fanoutSinks(context, 4, argc > 31 ? argv[31] : "");
     fanoutSinks(context, 9, argc > 32 ? argv[32] : "");
-    for (unsigned mode : {10, 11, 12, 13}) fanoutSinks(context, mode, "");
+    fanoutSinks(context, 10, argc > 48 ? argv[48] : "");
+    fanoutSinks(context, 12, argc > 49 ? argv[49] : "");
+    for (unsigned mode : {11, 13, 14, 15}) fanoutSinks(context, mode, "");
     fanoutSinks(context, 5, "");
     fanoutSources(context, 0, argc > 33 ? argv[33] : "");
     fanoutSources(context, 1, argc > 34 ? argv[34] : "");

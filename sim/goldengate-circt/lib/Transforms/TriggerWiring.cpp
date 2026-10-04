@@ -448,17 +448,13 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (failed(routeSinkToTop(module, paths, pathModules))) return failure();
     auto sinkClock = resolveField(circuit, module, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
-    // Scala synchronizes each sink on its annotated local clock. A top-local
-    // sink can use any proven input Clock leaf; it need not own source counters.
-    // Descendant sink paths remain restricted to the base leaf for now.
-    auto sinkRoot = module == top ? aliases.root(sinkClock) : clockRoot;
-    if (!sinkRoot) {
-      error = "trigger sink clock needs an unconditional top input Clock alias";
-      return failure();
-    }
+    // Scala synchronizes each sink on its annotated local clock. Shared
+    // definitions can have different input clocks at each absolute instance;
+    // only the shared enable is routed, so no clock export or grouping is needed.
     for (auto &path : paths)
-      if (!(aliases.root(module, sinkClock, path) == sinkRoot)) {
-        error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
+      if (!aliases.root(module, sinkClock, path)) {
+        error = "trigger sink clock needs an unconditional top input Clock alias on every instance path";
+        return failure();
       }
     if (!dominance.properlyDominates(sinkClock.getValue(), node.getOperation())) {
       error = "trigger sink clock must dominate its node declaration"; return failure();
