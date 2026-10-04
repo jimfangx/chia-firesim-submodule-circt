@@ -277,35 +277,52 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::MapVector<Operation *, bool> sinkModules;
   llvm::DenseMap<Operation *, unsigned> sinkAnnotations;
-  auto routeToTop = [&](FModuleOp module, SmallVector<InstanceOp> &path,
-                        SmallVector<FModuleOp> &pathModules) -> LogicalResult {
+  // A source can relay through unique descendants of a repeated top child.
+  // Record each definition once, but validate every complete instance path.
+  auto routeSourceToTop = [&](FModuleOp module,
+                              SmallVector<SmallVector<InstanceOp>> &paths,
+                              SmallVector<FModuleOp> &pathModules) -> LogicalResult {
     llvm::DenseSet<Operation *> visited;
+    SmallVector<InstanceOp> path;
     for (; module != top;) {
       if (!visited.insert(module).second) {
         error = "trigger hierarchy contains a cycle"; return failure();
       }
-      InstanceOp instance = parentInstances.lookup(module);
-      if (!instance) {
-        // Scala pathless endpoints fan out across instances. Require a unique
-        // unconditional route at every level before changing any module IO.
-        for (auto *use : graph.lookup(module)->uses()) {
-          if (instance) { error = "trigger endpoint needs a unique instance chain to top"; return failure(); }
-          instance = use->getInstance<InstanceOp>();
-          auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
-          if (!parent || instance->getBlock() != parent.getBodyBlock() ||
-              instance.getNumResults() != module.getNumPorts()) {
-            error = "trigger endpoint needs a unique instance chain to top"; return failure();
-          }
+      SmallVector<InstanceOp> instances;
+      for (auto *use : graph.lookup(module)->uses()) {
+        auto instance = use->getInstance<InstanceOp>();
+        auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
+        if (!parent || instance->getBlock() != parent.getBodyBlock() ||
+            instance.getNumResults() != module.getNumPorts()) {
+          error = "trigger source needs unconditional instances"; return failure();
         }
-        if (!instance) { error = "trigger endpoint needs a unique instance chain to top"; return failure(); }
-        parentInstances[module] = instance;
+        instances.push_back(instance);
+      }
+      if (instances.empty()) {
+        error = "trigger source needs an instance route to top"; return failure();
       }
       pathModules.push_back(module);
+      if (instances.size() > 1) {
+        for (auto instance : instances) {
+          if (instance->getParentOfType<FModuleOp>() != top) {
+            error = "trigger source fanout currently needs direct unconditional top instances";
+            return failure();
+          }
+          auto completePath = path;
+          completePath.push_back(instance);
+          paths.push_back(std::move(completePath));
+        }
+        sourceFanoutInstances[module] = instances;
+        break;
+      }
+      auto instance = instances.front();
+      parentInstances[module] = instance;
       path.push_back(instance);
       module = instance->getParentOfType<FModuleOp>();
     }
+    if (paths.empty()) paths.push_back(std::move(path));
     for (auto [index, ancestor] : llvm::enumerate(pathModules))
-      depths[ancestor] = pathModules.size() - index;
+      depths[ancestor] = std::max(depths.lookup(ancestor), unsigned(pathModules.size() - index));
     return success();
   };
   // A pathless sink applies to every instance, including instances of its
@@ -362,30 +379,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!event) return failure();
     SmallVector<SmallVector<InstanceOp>> paths;
     SmallVector<FModuleOp> pathModules;
-    // BridgeTopWiring exports each use of a pathless source separately. Start
-    // with sibling instances at top; descendant relay routes remain unique.
-    SmallVector<InstanceOp> directInstances;
-    if (local.module != top)
-      for (auto *use : graph.lookup(local.module)->uses())
-        directInstances.push_back(use->getInstance<InstanceOp>());
-    if (directInstances.size() > 1) {
-      for (auto instance : directInstances) {
-        if (!instance || instance->getParentOfType<FModuleOp>() != top ||
-            instance->getBlock() != top.getBodyBlock() ||
-            instance.getNumResults() != local.module.getNumPorts()) {
-          error = "trigger source fanout currently needs direct unconditional top instances";
-          return failure();
-        }
-        paths.push_back({instance});
-      }
-      sourceFanoutInstances[local.module] = directInstances;
-      pathModules.push_back(local.module);
-      depths[local.module] = std::max(depths.lookup(local.module), 1u);
-    } else {
-      SmallVector<InstanceOp> path;
-      if (failed(routeToTop(local.module, path, pathModules))) return failure();
-      paths.push_back(std::move(path));
-    }
+    if (failed(routeSourceToTop(local.module, paths, pathModules))) return failure();
     auto eventClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
     if (!boolean(event)) {
