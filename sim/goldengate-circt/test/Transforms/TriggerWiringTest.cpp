@@ -2,6 +2,7 @@
 #include "goldengate/TriggerWiring.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
@@ -55,8 +56,11 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
   auto set = [&](ArrayRef<Attribute> attrs) { circuit->setAttr("rawAnnotations", b.getArrayAttr(attrs)); };
   auto reject = [&](ArrayRef<Attribute> attrs, StringRef reason) {
     set(attrs); auto before = dump(root.get());
-    require(failed(goldengate::wireTriggers(circuit, consumed, error)) && consumed == 0 &&
-      dump(root.get()) == before && StringRef(error).contains(reason), "non-atomic rejection: " + error);
+    auto result = goldengate::wireTriggers(circuit, consumed, error);
+    require(failed(result) && consumed == 0 &&
+      dump(root.get()) == before && StringRef(error).contains(reason),
+      "non-atomic rejection (expected " + reason.str() + ", consumed " +
+        std::to_string(consumed) + "): " + error);
   };
   reject({source(true, "clock"), sink}, "both");
   reject({channel, source(true, "clock"), source(true, "clock"), source(false, "clock"), sink}, "distinct source");
@@ -313,8 +317,35 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
     body += "firrtl.connect %debitAlias, %" + std::string(hierarchy ? rightClock : mode == 3 ? "sinkAlias" : mode == 4 ? "otherClock" : "creditAlias") + " : !firrtl.clock, !firrtl.clock\n";
     if (mode == 7) body += "}\n";
   }
+  bool aggregateRoot = hierarchy >= 15;
+  std::string clockPort = "in %clock: !firrtl.clock";
+  if (aggregateRoot) {
+    // Actual Scala normalization followed by TriggerWiring emits local counters
+    // named clocks_traces_0_clock_{credits,debits}. Native CIRCT retains this
+    // nested aggregate input and must select its leaf, not the entire argument.
+    clockPort = "in %clocks: !firrtl.bundle<traces: vector<bundle<clock: clock>, 2>>";
+    if (hierarchy == 16) {
+      auto connect = body.find("firrtl.strictconnect %right#0, %clock :");
+      require(connect != std::string::npos, "missing aggregate-root child input");
+      body.replace(connect, std::string("firrtl.strictconnect %right#0, %clock :").size(),
+                   "firrtl.strictconnect %right#0, %otherRoot :");
+    }
+    body = R"mlir(
+      %rootTraces = firrtl.subfield %clocks[traces] : !firrtl.bundle<traces: vector<bundle<clock: clock>, 2>>
+      %rootEntry = firrtl.subindex %rootTraces[0] : !firrtl.vector<bundle<clock: clock>, 2>
+      %clock = firrtl.subfield %rootEntry[clock] : !firrtl.bundle<clock: clock>
+      %otherEntry = firrtl.subindex %rootTraces[1] : !firrtl.vector<bundle<clock: clock>, 2>
+      %otherRoot = firrtl.subfield %otherEntry[clock] : !firrtl.bundle<clock: clock>
+    )mlir" + body;
+    if (hierarchy == 17) {
+      auto index = body.find("firrtl.subindex %rootTraces[0]");
+      require(index != std::string::npos, "missing aggregate-root projection");
+      body.replace(index, std::string("firrtl.subindex %rootTraces[0]").size(),
+                   "firrtl.subindex %rootTraces[1]");
+    }
+  }
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
-    "firrtl.module @Top(in %clock: !firrtl.clock, in %reset: !firrtl.uint<1>, "
+    "firrtl.module @Top(" + clockPort + ", in %reset: !firrtl.uint<1>, "
     "in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, "
     "in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>) {" + body + "}" + children + "} }", &context);
   require(bool(root), "clock alias parse");
@@ -342,7 +373,7 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
   auto before = dump(root.get());
   unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode || (hierarchy > 2 && hierarchy != 9 && hierarchy != 10)) {
+  if (mode || (hierarchy > 2 && hierarchy != 9 && hierarchy != 10 && hierarchy != 15 && hierarchy != 17)) {
     require(failed(result) && consumed == 0 && dump(root.get()) == before,
             "clock alias rejection must be atomic: " + std::to_string(mode) + ":" + std::to_string(hierarchy));
     require(StringRef(error).contains(mode == 6 ? "dominate" : "base clock"),
@@ -356,13 +387,22 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
     if (auto name = op->getAttrOfType<StringAttr>("name")) values[name.getValue().str()] = op->getResult(0);
   });
   unsigned registers = 0;
+  std::string clockName = aggregateRoot ?
+    (hierarchy == 17 ? "clocks_traces_1_clock" : "clocks_traces_0_clock") : "clock";
+  circt::FieldRef expectedRoot(top.getBodyBlock()->getArgument(0),
+                             aggregateRoot ? (hierarchy == 17 ? 5 : 3) : 0);
   top.walk([&](RegOp reg) {
     ++registers;
     auto name = reg.getName();
-    Value expected = name == "trigger_sync" ? values.at("sinkAlias") :
-      (name == "clock_credits" || name == "clock_debits") ? top.getBodyBlock()->getArgument(0) : values.at("baseAlias");
-    require(reg.getClockVal() == expected, "Scala alias register clock identity: " + name.str());
+    if (name == clockName + "_credits" || name == clockName + "_debits")
+      require(getFieldRefFromValue(reg.getClockVal()) == expectedRoot,
+              "Scala aggregate root clock identity: " + name.str());
+    else
+      require(reg.getClockVal() == values.at(name == "trigger_sync" ? "sinkAlias" : "baseAlias"),
+              "Scala alias register clock identity: " + name.str());
   });
+  require(values.count(clockName + "_credits") && values.count(clockName + "_debits"),
+          "Scala flattened root counter names");
   require(registers == 9, "clock aliases must merge one accounting domain");
   require(cast<ArrayAttr>(circuit->getAttr("rawAnnotations")).size() == 1, "clock alias annotation cleanup");
   if (!output.empty()) {
@@ -390,6 +430,10 @@ int main(int argc, char **argv) {
     aliases(context, 0, argc > 6 ? argv[6] : "", 9);
     aliases(context, 0, argc > 7 ? argv[7] : "", 10);
     for (unsigned hierarchy : {11, 12, 13, 14}) aliases(context, 0, "", hierarchy);
+    aliases(context, 0, argc > 8 ? argv[8] : "", 15);
+    aliases(context, 0, "", 16);
+    aliases(context, 2, "", 15);
+    aliases(context, 0, argc > 9 ? argv[9] : "", 17);
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

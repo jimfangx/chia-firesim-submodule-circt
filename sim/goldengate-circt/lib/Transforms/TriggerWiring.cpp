@@ -7,6 +7,7 @@
 #include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringMap.h"
@@ -68,13 +69,12 @@ public:
       });
     }
   }
-  Value root(Value value) {
+  Field root(Value value) {
     if (!value) return {};
     llvm::DenseSet<Field> active;
-    auto field = trace(top, getFieldRefFromValue(value), active);
-    // Accounting register names and operands currently require a scalar top
-    // input port. Child input and output ports may contain aggregate clocks.
-    return field && field.getFieldID() == 0 ? field.getValue() : Value();
+    // Retain the selected input leaf. Projections have different SSA identities
+    // and must not merge distinct clocks belonging to the same aggregate port.
+    return trace(top, getFieldRefFromValue(value), active);
   }
 private:
   // Index clock leaves without creating Subfield/Subindex operations. Two
@@ -235,8 +235,8 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   // Local accounting uses BridgeTopWiring's root; the synchronizers and
   // global counters retain the annotated base clock, as in Scala.
   Value baseClock = clock;
-  clock = aliases.root(clock);
-  if (!clock) {
+  auto clockRoot = aliases.root(clock);
+  if (!clockRoot) {
     error = "trigger base clock needs an unconditional alias of a top input Clock port";
     return failure();
   }
@@ -250,7 +250,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!event) return failure();
     Value eventClock = resolve(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
-    if (!boolean(event) || aliases.root(eventClock) != clock) {
+    if (!boolean(event) || !(aliases.root(eventClock) == clockRoot)) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
     }
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
@@ -276,7 +276,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     Value sinkClock = resolve(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
     auto node = value.getDefiningOp<NodeOp>();
-    if (!node || !boolean(value) || aliases.root(sinkClock) != clock) {
+    if (!node || !boolean(value) || !(aliases.root(sinkClock) == clockRoot)) {
       error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
     }
     if (!dominance.properlyDominates(sinkClock, node.getOperation())) {
@@ -293,6 +293,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   OpBuilder b(circuit.getContext());
   b.setInsertionPointToEnd(top.getBodyBlock());
   auto loc = top.getLoc();
+  // Scala normalizes aggregate input ports before BridgeTopWiring chooses the
+  // root and uses the flattened leaf name for local accounting. CIRCT keeps
+  // the aggregate and materializes its Clock leaf only after atomic preflight.
+  std::string clockName = getFieldName(clockRoot, /*nameSafe=*/true).first;
+  clock = getValueByFieldID(ImplicitLocOpBuilder(loc, b), clockRoot.getValue(),
+                           clockRoot.getFieldID());
   auto named = [&](Value value, StringRef name) -> Value {
     return b.create<NodeOp>(loc, value, b.getStringAttr(names.newName(name))).getResult();
   };
@@ -301,7 +307,6 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     return b.create<RegOp>(loc, UIntType::get(b.getContext(), width), domain,
                            names.newName(name)).getResult();
   };
-  std::string clockName = top.getPortName(cast<BlockArgument>(clock).getArgNumber()).str();
   SmallVector<Value> creditSignals, debitSignals;
   for (auto event : events) {
     Value signal = event.event;
