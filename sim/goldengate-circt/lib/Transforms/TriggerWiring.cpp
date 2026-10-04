@@ -131,14 +131,17 @@ public:
     // and must not merge distinct clocks belonging to the same aggregate port.
     return trace(top, field, active);
   }
-  Field root(FModuleOp module, Field field, InstanceOp parent) {
-    if (module == top) return root(field);
+  Field root(FModuleOp module, Field field, ArrayRef<InstanceOp> path) {
     llvm::DenseSet<Field> active;
-    auto childRoot = trace(module, field, active);
-    auto arg = childRoot ? dyn_cast<BlockArgument>(childRoot.getValue()) : BlockArgument();
-    if (!arg || arg.getOwner() != module.getBodyBlock() ||
-        arg.getArgNumber() >= parent.getNumResults()) return {};
-    return trace(top, Field(parent.getResult(arg.getArgNumber()), childRoot.getFieldID()), active);
+    field = trace(module, field, active);
+    for (auto instance : path) {
+      auto arg = field ? dyn_cast<BlockArgument>(field.getValue()) : BlockArgument();
+      if (!arg || arg.getOwner() != module.getBodyBlock() ||
+          arg.getArgNumber() >= instance.getNumResults()) return {};
+      module = instance->getParentOfType<FModuleOp>();
+      field = trace(module, Field(instance.getResult(arg.getArgNumber()), field.getFieldID()), active);
+    }
+    return module == top ? field : Field();
   }
 private:
   // Index clock leaves without creating Subfield/Subindex operations. Two
@@ -284,6 +287,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   circt::igraph::InstanceGraph graph(circuit);
   llvm::MapVector<Operation *, InstanceOp> sourceInstances;
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
+  llvm::DenseMap<Operation *, unsigned> depths;
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::DenseSet<Operation *> seen;
@@ -292,28 +296,36 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     auto local = resolveLocalField(circuit, target, error);
     auto event = local.field;
     if (!event) return failure();
-    InstanceOp parent;
-    if (local.module != top) {
-      auto found = sourceInstances.find(local.module);
-      if (found != sourceInstances.end()) parent = found->second;
-      else {
-        // A pathless Scala source fans out across all instances. This increment
-        // handles one direct child only; reject ambiguous scope before adding IO.
-        for (auto *use : graph.lookup(local.module)->uses()) {
-          if (parent) { error = "trigger child source needs one direct top instance"; return failure(); }
-          parent = use->getInstance<InstanceOp>();
-          if (!parent || parent->getBlock() != top.getBodyBlock() ||
-              parent.getNumResults() != local.module.getNumPorts()) {
-            error = "trigger child source needs one direct top instance"; return failure();
+    SmallVector<InstanceOp> path;
+    SmallVector<FModuleOp> pathModules;
+    llvm::DenseSet<Operation *> visited;
+    for (auto module = local.module; module != top;) {
+      if (!visited.insert(module).second) {
+        error = "trigger source hierarchy contains a cycle"; return failure();
+      }
+      InstanceOp instance = sourceInstances.lookup(module);
+      if (!instance) {
+        // Scala pathless sources fan out across instances. Require a unique
+        // unconditional route at every level before changing any module IO.
+        for (auto *use : graph.lookup(module)->uses()) {
+          if (instance) { error = "trigger source needs a unique instance chain to top"; return failure(); }
+          instance = use->getInstance<InstanceOp>();
+          auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
+          if (!parent || instance->getBlock() != parent.getBodyBlock() ||
+              instance.getNumResults() != module.getNumPorts()) {
+            error = "trigger source needs a unique instance chain to top"; return failure();
           }
         }
-        if (!parent) { error = "trigger child source needs one direct top instance"; return failure(); }
-        sourceInstances[local.module] = parent;
+        if (!instance) { error = "trigger source needs a unique instance chain to top"; return failure(); }
+        sourceInstances[module] = instance;
       }
+      pathModules.push_back(module);
+      path.push_back(instance);
+      module = instance->getParentOfType<FModuleOp>();
     }
     auto eventClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
-    if (!boolean(event) || !(aliases.root(local.module, eventClock, parent) == clockRoot)) {
+    if (!boolean(event) || !(aliases.root(local.module, eventClock, path) == clockRoot)) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
     }
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
@@ -330,7 +342,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       error = "trigger reset must be a reference when present"; return failure();
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
-    if (local.module != top) childEvents[local.module].push_back(events.size());
+    for (auto [index, module] : llvm::enumerate(pathModules)) {
+      childEvents[module].push_back(events.size());
+      depths[module] = pathModules.size() - index;
+    }
     events.push_back({event, reset, credit, name});
   }
   DominanceInfo dominance(circuit);
@@ -350,7 +365,14 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   }
   // All unsupported scope/type/clock cases have been rejected before mutation.
   llvm::DenseMap<unsigned, Value> routed;
-  for (auto &[operation, indices] : childEvents) {
+  llvm::DenseMap<unsigned, std::string> routedNames;
+  SmallVector<Operation *> routingOrder;
+  for (auto &[operation, indices] : childEvents) routingOrder.push_back(operation);
+  // An ancestor can own sources as well as relay descendant events. Process
+  // descendants first, then append all ancestor exports in one replacement.
+  llvm::stable_sort(routingOrder, [&](Operation *a, Operation *b) { return depths[a] > depths[b]; });
+  for (auto operation : routingOrder) {
+    auto &indices = childEvents[operation];
     auto child = cast<FModuleOp>(operation);
     circt::Namespace childNames;
     for (auto name : child.getPortNamesAttr()) childNames.newName(cast<StringAttr>(name).getValue());
@@ -361,12 +383,14 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     childBuilder.setInsertionPointToEnd(child.getBodyBlock());
     SmallVector<std::pair<unsigned, PortInfo>> added;
     SmallVector<Value> signals;
+    SmallVector<std::string> signalNames;
     unsigned oldPorts = child.getNumPorts();
     for (unsigned index : indices) {
       auto &event = events[index];
-      Value signal = getValueByFieldID(childBuilder, event.event.getValue(), event.event.getFieldID());
-      std::string signalName = event.name;
-      if (event.reset) {
+      Value signal = routed.lookup(index);
+      std::string signalName = signal ? routedNames.lookup(index) : event.name;
+      if (!signal) signal = getValueByFieldID(childBuilder, event.event.getValue(), event.event.getFieldID());
+      if (!routed.count(index) && event.reset) {
         Value reset = getValueByFieldID(childBuilder, event.reset.getValue(), event.reset.getFieldID());
         Value active = childBuilder.create<NotPrimOp>(reset);
         signalName = childNames.newName(event.name + "_masked");
@@ -377,6 +401,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       added.push_back({oldPorts, PortInfo(childBuilder.getStringAttr(portName),
           UIntType::get(circuit.getContext(), 1), Direction::Out)});
       signals.push_back(signal);
+      signalNames.push_back(signalName);
     }
     child.insertPorts(added);
     for (unsigned i = 0; i < signals.size(); ++i)
@@ -387,8 +412,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
     for (unsigned i = 0; i < oldPorts; ++i)
       instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
-    for (unsigned i = 0; i < indices.size(); ++i)
+    for (unsigned i = 0; i < indices.size(); ++i) {
       routed[indices[i]] = replacement.getResult(oldPorts + i);
+      routedNames[indices[i]] = (instance.getName() + "_" + signalNames[i]).str();
+    }
     instance.erase();
   }
   circt::Namespace names;

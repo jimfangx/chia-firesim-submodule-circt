@@ -570,7 +570,7 @@ void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
 
 // Source events belong to the child definition; reset masking must happen there
 // before the exported event reaches the top accounting domain.
-void childSources(MLIRContext &context, unsigned mode, StringRef output) {
+void childSources(MLIRContext &context, unsigned mode, StringRef output, unsigned hierarchy = 0) {
   std::string payload = "!firrtl.bundle<events: vector<bundle<credit: uint<1>, debit: uint<1>, reset: uint<1>>, 2>>";
   std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>";
   if (mode == 1) childPorts += ", in %payload: " + payload;
@@ -578,15 +578,42 @@ void childSources(MLIRContext &context, unsigned mode, StringRef output) {
   if (mode == 1) instancePorts += ", in payload: " + payload;
   childPorts += ", out %echo: !firrtl.uint<1>";
   instancePorts += ", out echo: !firrtl.uint<1>";
-  std::string text = "module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { firrtl.module @Child(" + childPorts + ") {} firrtl.module @Top(in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>, out %echo: !firrtl.uint<1>) { %child:" + (mode == 1 ? "6" : "5") + " = firrtl.instance child @Child(" + instancePorts + ") } } }";
+  auto inst = [&](StringRef name, StringRef module) {
+    return "%" + name.str() + ":" + (mode == 1 ? "6" : "5") +
+      " = firrtl.instance " + name.str() + " @" + module.str() + "(" + instancePorts + ")";
+  };
+  std::string relays;
+  std::string lastModule = "Child";
+  for (unsigned level = 0; level < hierarchy; ++level) {
+    std::string module = level == 0 ? "Relay" : "Relay" + std::to_string(level);
+    relays += " firrtl.module @" + module + "(" + childPorts + ") { " +
+      inst(level == 0 ? "child" : "middle", lastModule) + " }";
+    lastModule = module;
+  }
+  std::string text = "module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { firrtl.module @Child(" + childPorts + ") {}" + relays + " firrtl.module @Top(in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>, out %echo: !firrtl.uint<1>) { " + inst(hierarchy ? "relay" : "child", lastModule) + " } } }";
   auto root = parseSourceString<ModuleOp>(text, &context);
   require(bool(root), "parse child source fixture");
   auto circuit = *root->getOps<CircuitOp>().begin();
   auto modules = circuit.getOps<FModuleOp>(); auto it = modules.begin();
-  auto child = *it++; auto top = *it;
+  auto child = *it++; SmallVector<FModuleOp> relayModules;
+  for (unsigned level = 0; level < hierarchy; ++level) relayModules.push_back(*it++);
+  auto top = *it;
   auto instance = *top.getBodyBlock()->getOps<InstanceOp>().begin();
   OpBuilder b(&context); auto loc = top.getLoc();
   instance->setAttr("example.metadata", b.getStringAttr("preserve"));
+  for (auto relay : relayModules) {
+    auto nested = *relay.getBodyBlock()->getOps<InstanceOp>().begin();
+    nested->setAttr("example.metadata", b.getStringAttr("preserve"));
+    b.setInsertionPointToEnd(relay.getBodyBlock());
+    for (unsigned i = 0; i < relay.getNumPorts() - 1; ++i)
+      b.create<StrictConnectOp>(loc, nested.getResult(i), relay.getBodyBlock()->getArgument(i));
+    b.create<StrictConnectOp>(loc, relay.getBodyBlock()->getArgument(relay.getNumPorts() - 1),
+                              nested.getResult(relay.getNumPorts() - 1));
+    if (mode == 8) {
+      b.create<NodeOp>(loc, relay.getBodyBlock()->getArgument(1), b.getStringAttr("relayCredit"));
+      b.create<NodeOp>(loc, relay.getBodyBlock()->getArgument(2), b.getStringAttr("relayDebit"));
+    }
+  }
   b.setInsertionPointToEnd(child.getBodyBlock());
   if (mode == 6) b.create<NodeOp>(loc, child.getBodyBlock()->getArgument(0), b.getStringAttr("clockAlias"));
   Value credit = child.getBodyBlock()->getArgument(1), debit = child.getBodyBlock()->getArgument(2);
@@ -612,12 +639,29 @@ void childSources(MLIRContext &context, unsigned mode, StringRef output) {
     auto other = cast<InstanceOp>(b.clone(*instance.getOperation()));
     other.setNameAttr(b.getStringAttr("other"));
   }
+  if (mode == 7) {
+    // The source definition itself is unique, but an ancestor is repeated.
+    auto relay = relayModules.front();
+    auto nested = *relay.getBodyBlock()->getOps<InstanceOp>().begin();
+    auto other = cast<InstanceOp>(b.clone(*nested.getOperation()));
+    other.setModuleNameAttr(FlatSymbolRefAttr::get(&context, relay.getName()));
+    other.setNameAttr(b.getStringAttr("otherRelay"));
+  }
   auto one = b.create<ConstantOp>(loc, UIntType::get(&context, 1), llvm::APInt(1, 1));
   auto trigger = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("trigger"));
   b.create<StrictConnectOp>(loc, top.getBodyBlock()->getArgument(5), trigger.getResult());
   auto ref = [&](StringRef module, StringRef name) { return b.getStringAttr(("~Top|" + module + ">" + name).str()); };
   SmallVector<Attribute> annos;
   annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)), b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})), b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))}));
+  if (mode == 8) for (bool credit : {true, false}) {
+    // Deliberately plan the ancestor before its descendant: emission must sort
+    // the modules by depth and append all of the ancestor's exports together.
+    NamedAttrList a; a.set("class", b.getStringAttr(A::InternalTriggerSource));
+    a.set("target", ref("Relay", credit ? "relayCredit" : "relayDebit"));
+    a.set("clock", ref("Relay", "clock")); a.set("sourceType", b.getBoolAttr(credit));
+    if (credit) a.set("reset", ref("Relay", "reset"));
+    annos.push_back(a.getDictionary(&context));
+  }
   for (bool credit : {true, false}) {
     NamedAttrList a; a.set("class", b.getStringAttr(A::InternalTriggerSource));
     a.set("target", ref("Child", credit ? "creditEvent" : "debitEvent"));
@@ -629,12 +673,12 @@ void childSources(MLIRContext &context, unsigned mode, StringRef output) {
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode >= 2 && mode != 6) {
+  if (mode >= 2 && mode != 6 && mode != 8) {
     require(failed(result) && consumed == 0 && !error.empty() && dump(root.get()) == before,
             "child source failure must preserve module IO, instances and annotations: " + std::to_string(mode)); return;
   }
   require(succeeded(result), error);
-  require(consumed == 2 && succeeded(verify(*root)), "invalid child trigger candidate");
+  require(consumed == (mode == 8 ? 4 : 2) && succeeded(verify(*root)), "invalid child trigger candidate");
   require(top.getNumPorts() == 7 && child.getNumPorts() == (mode == 1 ? 8 : 7), "child event exports changed original IO");
   auto replacement = *top.getBodyBlock()->getOps<InstanceOp>().begin();
   bool echoPreserved = false;
@@ -643,6 +687,25 @@ void childSources(MLIRContext &context, unsigned mode, StringRef output) {
       echoPreserved = connect.getSrc() == replacement.getResult(child.getNumPorts() - 3);
   require(echoPreserved, "existing child output result use lost during replacement");
   require(replacement->getAttrOfType<StringAttr>("example.metadata") == "preserve", "parent instance metadata lost");
+  std::string prefix = "child_";
+  for (auto relay : relayModules) {
+    require(relay.getNumPorts() == child.getNumPorts() + (mode == 8 ? 2 : 0), "relay lost appended event ports");
+    require(relay.getPortName(relay.getNumPorts() - 2) == "simulationTrigger_" + prefix + "creditEvent_masked" &&
+            relay.getPortName(relay.getNumPorts() - 1) == "simulationTrigger_" + prefix + "debitEvent",
+            "Scala intermediate event export names");
+    auto nested = *relay.getBodyBlock()->getOps<InstanceOp>().begin();
+    require(nested->getAttrOfType<StringAttr>("example.metadata") == "preserve", "nested instance metadata lost");
+    bool echoConnected = false;
+    for (auto connect : relay.getBodyBlock()->getOps<StrictConnectOp>())
+      if (connect.getDest() == relay.getBodyBlock()->getArgument(child.getNumPorts() - 3))
+        echoConnected = connect.getSrc() == nested.getResult(child.getNumPorts() - 3);
+    require(echoConnected, "relay original output connection lost");
+    unsigned relayRegisters = 0, relayMasks = 0;
+    relay.walk([&](RegOp) { ++relayRegisters; });
+    relay.walk([&](NodeOp node) { if (node.getName() == "creditEvent_masked") ++relayMasks; });
+    require(relayRegisters == 0 && relayMasks == 0, "relay duplicated masking or accounting");
+    prefix = "middle_" + prefix;
+  }
   require(child.getPortName(child.getNumPorts() - 2) == "simulationTrigger_creditEvent_masked" &&
           child.getPortName(child.getNumPorts() - 1) == "simulationTrigger_debitEvent", "Scala child event export names");
   unsigned registers = 0, masks = 0, childRegisters = 0;
@@ -689,6 +752,11 @@ int main(int argc, char **argv) {
     childSources(context, 1, argc > 17 ? argv[17] : "");
     childSources(context, 6, "");
     for (unsigned mode : {2, 3, 4, 5}) childSources(context, mode, "");
+    childSources(context, 0, argc > 18 ? argv[18] : "", 1);
+    childSources(context, 1, argc > 19 ? argv[19] : "", 1);
+    childSources(context, 0, "", 2);
+    childSources(context, 8, argc > 20 ? argv[20] : "", 1);
+    for (unsigned mode : {2, 3, 4, 5, 7}) childSources(context, mode, "", 1);
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
