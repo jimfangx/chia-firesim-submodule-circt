@@ -7,7 +7,7 @@
 
 namespace goldengate {
 // Consume unused trigger annotations, or emit Scala-compatible accounting for
-// distinct credit/debit sources and node sinks. Top-local sources are grouped
+// distinct credit/debit sources and node sinks. Sources are grouped
 // by upstream input Clock leaf, including unconditional wire/node aliases and
 // bundle/vector clock fields forwarded through internal instances. Each source
 // domain needs both credits and debits. Local NEXT counts are synchronized into
@@ -19,7 +19,8 @@ namespace goldengate {
 // samples the shared enable on its own annotated local clock.
 // Event/reset targets may select local UInt<1> bundle/vector leaves in the top
 // or a descendant with unconditional instances through multiple parent definitions
-// and unequal routes to top. Every complete descendant source clock path resolves to the base leaf.
+// and unequal routes to top. All absolute instances of each descendant source
+// must resolve to one proven top input Clock leaf, which may differ from the base.
 // Field identity determines duplicate detection and flattened masked-event names.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor

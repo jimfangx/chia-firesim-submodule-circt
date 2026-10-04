@@ -690,7 +690,7 @@ void childSources(MLIRContext &context, unsigned mode, StringRef output, unsigne
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode >= 2 && mode != 6 && mode != 8) {
+  if (mode >= 2 && mode != 3 && mode != 6 && mode != 8) {
     require(failed(result) && consumed == 0 && !error.empty() && dump(root.get()) == before,
             "child source failure must preserve module IO, instances and annotations: " + std::to_string(mode)); return;
   }
@@ -726,7 +726,12 @@ void childSources(MLIRContext &context, unsigned mode, StringRef output, unsigne
   require(child.getPortName(originalPorts) == "simulationTrigger_creditEvent_masked" &&
           child.getPortName(originalPorts + 1) == "simulationTrigger_debitEvent", "Scala child event export names");
   unsigned registers = 0, masks = 0, childRegisters = 0;
-  top.walk([&](RegOp reg) { ++registers; require(reg.getClockVal() == top.getBodyBlock()->getArgument(0), "child trigger top accounting clock"); });
+  top.walk([&](RegOp reg) {
+    ++registers;
+    bool local = reg.getName() == "otherClock_credits" || reg.getName() == "otherClock_debits";
+    require(reg.getClockVal() == top.getBodyBlock()->getArgument(mode == 3 && local ? 4 : 0),
+            "child trigger local/base accounting clock");
+  });
   child.walk([&](RegOp reg) { ++childRegisters; require(reg.getClockVal() == sinkClock, "descendant sink annotated clock lost"); });
   child.walk([&](NodeOp node) { if (node.getName() == "creditEvent_masked") ++masks; });
   require(registers == 9 - childSink && masks == 1 && childRegisters == unsigned(childSink), "child masking/top accounting placement");
@@ -1069,7 +1074,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // Each pathless source contributes once per complete instance path. Keep masking
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0) {
-  bool childSink = mode == 1;
+  bool childSink = mode == 1 || mode == 5;
   std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
     "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
   if (childSink) childPorts += ", out %sinkEnabled: !firrtl.uint<1>";
@@ -1119,7 +1124,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   b.setInsertionPointToEnd(top.getBodyBlock());
   for (auto [index, instance] : llvm::enumerate(top.getBodyBlock()->getOps<InstanceOp>())) {
     instance->setAttr("example.metadata", b.getStringAttr("preserve"));
-    bool wrongClock = (mode == 2 && index == 1) || (mode == 3 && index == 0);
+    bool wrongClock = mode >= 4 || (mode == 2 && index == 1) || (mode == 3 && index == 0);
     b.create<StrictConnectOp>(loc, instance.getResult(0), arg(top, wrongClock ? 7 : 0));
     for (unsigned i = 1; i <= 3; ++i)
       b.create<StrictConnectOp>(loc, instance.getResult(i), arg(top, i + 3 * index));
@@ -1149,7 +1154,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode >= 2) {
+  if (mode == 2 || mode == 3) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
             "source fanout clock mismatch must fail atomically"); return;
   }
@@ -1183,6 +1188,15 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       require(originalDrivers == 4 && sinkDrivers == childSink, "source fanout lost or duplicated input connections");
     }
   }
+  unsigned localCounters = 0;
+  top.walk([&](RegOp reg) {
+    bool local = reg.getName() == (mode >= 4 ? "otherClock_credits" : "clock_credits") ||
+                 reg.getName() == (mode >= 4 ? "otherClock_debits" : "clock_debits");
+    localCounters += local;
+    require(reg.getClockVal() == arg(top, mode >= 4 && local ? 7 : 0),
+            "source fanout local counters or base synchronizers use wrong clock");
+  });
+  require(localCounters == 2, "source fanout accounting root name mismatch");
   require(instances == 2 + relayDepth && masks == 1 && registers == 9 + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
   if (!output.empty()) {
@@ -1307,7 +1321,7 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
   auto result = goldengate::wireTriggers(circuit, consumed, error);
   if (mode == 2 || mode == 3 || mode == 6 || mode == 8 || mode == 9) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) &&
-            error.find("local base clock") != std::string::npos,
+            error.find("one top input Clock leaf") != std::string::npos,
             "every complete source clock route must fail atomically on mismatch"); return;
   }
   require(succeeded(result), error);
@@ -1561,6 +1575,10 @@ int main(int argc, char **argv) {
     fanoutSources(context, 1, argc > 37 ? argv[37] : "", 2);
     for (unsigned depth : {1, 2})
       for (unsigned mode : {2, 3}) fanoutSources(context, mode, "", depth);
+    fanoutSources(context, 4, argc > 50 ? argv[50] : "");
+    fanoutSources(context, 5, argc > 51 ? argv[51] : "");
+    fanoutSources(context, 5, argc > 52 ? argv[52] : "", 1);
+    fanoutSources(context, 5, argc > 53 ? argv[53] : "", 2);
     nestedSiblingSources(context, 0, argc > 38 ? argv[38] : "");
     nestedSiblingSources(context, 1, argc > 39 ? argv[39] : "");
     nestedSiblingSources(context, 1, argc > 40 ? argv[40] : "", 2);

@@ -382,18 +382,20 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     auto eventClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
     if (!boolean(event)) {
-      error = "trigger sources must be UInt<1> on the local base clock"; return failure();
+      error = "trigger sources must be UInt<1>"; return failure();
     }
-    // Top-local events may use independent root clocks. Descendant events
-    // still require the base root until clock exports accompany event exports.
-    auto eventRoot = local.module == top ? aliases.root(eventClock) : clockRoot;
+    // BridgeTopWiring groups exports by their upstream input Clock leaf.
+    // A descendant definition can use a secondary root without exporting its
+    // clock: prove that every absolute instance resolves to that same leaf.
+    // Distinct roots per instance need per-export grouping in a later step.
+    auto eventRoot = aliases.root(local.module, eventClock, paths.front());
     if (!eventRoot) {
       error = "trigger source clock needs an unconditional top input Clock alias";
       return failure();
     }
     for (auto &path : paths)
       if (!(aliases.root(local.module, eventClock, path) == eventRoot)) {
-        error = "trigger sources must be UInt<1> on the local base clock"; return failure();
+        error = "trigger source instance clock paths must resolve to one top input Clock leaf"; return failure();
       }
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
     auto &counts = domainSources[eventRoot];
