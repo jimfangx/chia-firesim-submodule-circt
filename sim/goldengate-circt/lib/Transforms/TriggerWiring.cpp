@@ -13,6 +13,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
+#include <functional>
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -306,46 +307,52 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       depths[ancestor] = pathModules.size() - index;
     return success();
   };
-  // A pathless sink applies to every instance of its module. Each direct
-  // parent must have a unique remaining route to top. Record
-  // every path for clock preflight and every instance for later input rewiring.
+  // A pathless sink applies to every instance, including instances of its
+  // ancestors. Enumerate complete paths for clock preflight, but record each
+  // module definition and direct instance only once for input rewiring.
   auto routeSinkToTop = [&](FModuleOp module,
                             SmallVector<SmallVector<InstanceOp>> &paths,
                             SmallVector<FModuleOp> &pathModules) -> LogicalResult {
-    if (module == top) { paths.emplace_back(); return success(); }
-    SmallVector<InstanceOp> instances;
-    llvm::DenseSet<Operation *> seenModules;
-    seenModules.insert(module);
-    pathModules.push_back(module);
-    unsigned maxDepth = 0;
-    for (auto *use : graph.lookup(module)->uses()) {
-      auto instance = use->getInstance<InstanceOp>();
-      auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
-      if (!parent || instance->getBlock() != parent.getBodyBlock() ||
-          instance.getNumResults() != module.getNumPorts()) {
-        error = "trigger sink fanout needs unconditional instances";
-        return failure();
+    llvm::DenseSet<Operation *> seenModules, activeModules;
+    SmallVector<InstanceOp> path;
+    SmallVector<FModuleOp> ancestors;
+    std::function<LogicalResult(FModuleOp)> visit = [&](FModuleOp current) -> LogicalResult {
+      if (current == top) {
+        paths.push_back(path);
+        // Keep the longest route across every sink. A definition may occur at
+        // different depths; all parent enables must exist before its uses.
+        for (auto [index, ancestor] : llvm::enumerate(ancestors))
+          depths[ancestor] = std::max(depths.lookup(ancestor), unsigned(path.size() - index));
+        return success();
       }
-      SmallVector<InstanceOp> tail;
-      SmallVector<FModuleOp> ancestors;
-      if (failed(routeToTop(parent, tail, ancestors))) return failure();
-      instances.push_back(instance);
-      paths.push_back({instance});
-      llvm::append_range(paths.back(), tail);
-      maxDepth = std::max(maxDepth, unsigned(paths.back().size()));
-      for (auto ancestor : ancestors) {
-        if (seenModules.insert(ancestor).second) pathModules.push_back(ancestor);
-        sinkParentInstances[ancestor] = {parentInstances.lookup(ancestor)};
+      if (!activeModules.insert(current).second) {
+        error = "trigger sink hierarchy contains a cycle"; return failure();
       }
-    }
-    if (instances.empty()) {
-      error = "trigger sink needs an instance route to top"; return failure();
-    }
-    // A direct use may be nearer top than a relay use of the same definition.
-    // Use the longest route so all relay inputs exist before leaf rewiring.
-    depths[module] = maxDepth;
-    sinkParentInstances[module] = instances;
-    return success();
+      if (seenModules.insert(current).second) pathModules.push_back(current);
+      ancestors.push_back(current);
+      bool hasUse = false;
+      for (auto *use : graph.lookup(current)->uses()) {
+        auto instance = use->getInstance<InstanceOp>();
+        auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
+        if (!parent || instance->getBlock() != parent.getBodyBlock() ||
+            instance.getNumResults() != current.getNumPorts()) {
+          error = "trigger sink fanout needs unconditional instances"; return failure();
+        }
+        hasUse = true;
+        auto &instances = sinkParentInstances[current];
+        if (!llvm::is_contained(instances, instance)) instances.push_back(instance);
+        path.push_back(instance);
+        if (failed(visit(parent))) return failure();
+        path.pop_back();
+      }
+      if (!hasUse) {
+        error = "trigger sink needs an instance route to top"; return failure();
+      }
+      ancestors.pop_back();
+      activeModules.erase(current);
+      return success();
+    };
+    return visit(module);
   };
   for (auto a : sources) {
     auto target = a.getMember<StringAttr>("target");
