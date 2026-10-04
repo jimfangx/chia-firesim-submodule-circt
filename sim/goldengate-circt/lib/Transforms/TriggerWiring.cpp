@@ -282,6 +282,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseMap<Operation *, unsigned> depths;
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
+  llvm::DenseMap<circt::FieldRef, circt::FieldRef> creditUnmaskedClocks, debitUnmaskedClocks;
   // Stable preflight IDs survive instance replacement; a relay carries the
   // innermost-to-outermost route, without retaining erased operation handles.
   llvm::DenseMap<Operation *, unsigned> instanceIDs;
@@ -398,6 +399,24 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     // BridgeTopWiring associates each absolute export with its upstream
     // Clock leaf. Shared source definitions may span several root domains.
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
+    circt::FieldRef reset;
+    if (auto resetTarget = a.getMember<StringAttr>("reset")) {
+      reset = resolveField(circuit, local.module, resetTarget, error);
+      if (!reset) return failure();
+      if (!boolean(reset)) { error = "trigger reset must be UInt<1>"; return failure(); }
+    } else if (a.getDict().get("reset")) {
+      error = "trigger reset must be a reference when present"; return failure();
+    }
+    auto &unmaskedClocks = credit ? creditUnmaskedClocks : debitUnmaskedClocks;
+    if (!(credit ? creditTargets : debitTargets).insert(event).second) {
+      // Scala creates a new node for each reset-masked annotation, but an
+      // unmasked target is exported once by TopWiring's distinct annotations.
+      // Its .exists membership test also counts that export only once.
+      if (!reset && unmaskedClocks.lookup(event) == eventClock) continue;
+      error = "trigger hardware currently needs distinct source targets unless unmasked clocks match";
+      return failure();
+    }
+    if (!reset) unmaskedClocks[event] = eventClock;
     std::map<Route, circt::FieldRef> clocks;
     for (auto &path : paths) {
       auto eventRoot = aliases.root(local.module, eventClock, path);
@@ -413,18 +432,6 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       clocks.emplace(std::move(route), eventRoot);
       auto &counts = domainSources[eventRoot];
       ++(credit ? counts.first : counts.second);
-    }
-    if (!(credit ? creditTargets : debitTargets).insert(event).second) {
-      error = "trigger hardware currently needs distinct source targets per sourceType";
-      return failure();
-    }
-    circt::FieldRef reset;
-    if (auto resetTarget = a.getMember<StringAttr>("reset")) {
-      reset = resolveField(circuit, local.module, resetTarget, error);
-      if (!reset) return failure();
-      if (!boolean(reset)) { error = "trigger reset must be UInt<1>"; return failure(); }
-    } else if (a.getDict().get("reset")) {
-      error = "trigger reset must be a reference when present"; return failure();
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
     for (auto module : pathModules) childEvents[module].push_back(events.size());

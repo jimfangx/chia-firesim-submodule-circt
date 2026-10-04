@@ -22,6 +22,8 @@ namespace goldengate {
 // and unequal routes to top. Each absolute source instance resolves to its own
 // proven top input Clock leaf; repeated definitions may span multiple domains.
 // Field identity determines duplicate detection and flattened masked-event names.
+// Repeated unmasked sources of the same sourceType and local clock share one
+// export per absolute instance and count once; all annotations are consumed.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor
 // instances; every ancestor route must reach top without cycles; descendant

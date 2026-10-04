@@ -65,7 +65,8 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
         std::to_string(consumed) + "): " + error);
   };
   reject({source(true, "clock"), sink}, "both");
-  reject({channel, source(true, "clock"), source(true, "clock"), source(false, "clock"), sink}, "distinct source");
+  if (mask) reject({channel, source(true, "clock"), source(true, "clock"), source(false, "clock"), sink}, "distinct source");
+  else reject({channel, source(true, "clock"), source(true, "otherClock"), source(false, "clock"), sink}, "distinct source");
   reject({channel, source(true, "otherClock"), source(false, "clock"), sink}, "source clock domain");
   reject({channel, source(true, "clock"), source(false, "clock"),
     b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TriggerSink)),
@@ -77,9 +78,11 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
   set({keep, source(true, "clock"), source(false, "clock")});
   require(succeeded(goldengate::wireTriggers(circuit, consumed, error)) && consumed == 2 &&
     dump(top) == body, "sink-less sources changed hardware");
-  set({keep, channel, source(true, "clock"), source(false, "clock"), sink, sink});
+  SmallVector<Attribute> finalAnnotations{keep, channel, source(true, "clock"), source(false, "clock"), sink, sink};
+  if (!mask) finalAnnotations.push_back(source(true, "clock"));
+  set(finalAnnotations);
   require(succeeded(goldengate::wireTriggers(circuit, consumed, error)), error);
-  require(consumed == 2 && succeeded(verify(*root)), "invalid trigger IR");
+  require(consumed == (mask ? 2 : 3) && succeeded(verify(*root)), "invalid trigger IR");
   require(circuit->getAttr("rawAnnotations") == b.getArrayAttr({keep, channel}), "annotation cleanup/order");
   std::map<std::string, Value> values;
   unsigned registers = 0;
@@ -1074,7 +1077,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // Each pathless source contributes once per complete instance path. Keep masking
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0) {
-  bool childSink = mode == 1 || mode == 5 || mode == 6 || mode == 7;
+  bool childSink = mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode >= 10;
   std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
     "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
   if (childSink) childPorts += ", out %sinkEnabled: !firrtl.uint<1>";
@@ -1125,7 +1128,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   for (auto [index, instance] : llvm::enumerate(top.getBodyBlock()->getOps<InstanceOp>())) {
     instance->setAttr("example.metadata", b.getStringAttr("preserve"));
     bool wrongClock = mode == 4 || mode == 5 ||
-                      ((mode == 2 || mode == 6) && index == 1) ||
+                      ((mode == 2 || mode == 6 || mode >= 9) && index == 1) ||
                       ((mode == 3 || mode == 7) && index == 0);
     if (!(mode == 8 && index == 1))
       b.create<StrictConnectOp>(loc, instance.getResult(0), arg(top, wrongClock ? 7 : 0));
@@ -1145,6 +1148,13 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     attrs.set("clock", ref("Child", "clock")); attrs.set("sourceType", b.getBoolAttr(credit));
     if (credit) attrs.set("reset", ref("Child", "reset"));
     annotations.push_back(attrs.getDictionary(&context));
+    // An unmasked duplicate shares every absolute export. Exercise both raw
+    // class spellings; consumption still counts annotations, not unique events.
+    if (!credit && mode >= 9) {
+      annotations.push_back(attrs.getDictionary(&context));
+      attrs.set("class", b.getStringAttr(A::TriggerSource));
+      annotations.push_back(attrs.getDictionary(&context));
+    }
   }
   SmallVector<StringRef> sinkModules{"Top"};
   if (childSink) sinkModules.push_back("Child");
@@ -1162,7 +1172,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
             "source fanout missing clock path must fail atomically"); return;
   }
   require(succeeded(result), error);
-  require(consumed == 2 && succeeded(verify(*root)), "invalid source fanout IR");
+  require(consumed == (mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
   require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + 2 + childSink,
           "source fanout must preserve top IO and share child export definitions");
   require(child.getPortName(originalPorts) == "simulationTrigger_creditEvent_masked" &&
@@ -1199,7 +1209,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     require(reg.getClockVal() == arg(top, secondary ? 7 : 0),
             "source fanout local counters or base synchronizers use wrong clock");
   });
-  bool mixed = mode == 2 || mode == 3 || mode == 6 || mode == 7;
+  bool mixed = mode == 2 || mode == 3 || mode == 6 || mode == 7 || mode >= 9;
   require(localCounters == (mixed ? 4 : 2), "source fanout accounting root name mismatch");
   require(instances == 2 + relayDepth && masks == 1 && registers == 9 + 6 * mixed + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
@@ -1311,6 +1321,13 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
     attrs.set("clock", ref("Child", "clock")); attrs.set("sourceType", b.getBoolAttr(credit));
     if (credit) attrs.set("reset", ref("Child", "reset"));
     annotations.push_back(attrs.getDictionary(&context));
+    // An unmasked duplicate shares every absolute export. Exercise both raw
+    // class spellings; consumption still counts annotations, not unique events.
+    if (!credit && mode >= 9) {
+      annotations.push_back(attrs.getDictionary(&context));
+      attrs.set("class", b.getStringAttr(A::TriggerSource));
+      annotations.push_back(attrs.getDictionary(&context));
+    }
   }
   SmallVector<StringRef> sinkModules{"Top"};
   if (childSink) sinkModules.push_back("Child");
@@ -1324,7 +1341,7 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
   require(succeeded(result), error);
-  require(consumed == 2 && succeeded(verify(*root)), "invalid source fanout IR");
+  require(consumed == (mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
   require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + 2 + childSink,
           "source fanout must preserve top IO and share child export definitions");
   require(child.getPortName(originalPorts) == "simulationTrigger_creditEvent_masked" &&
@@ -1591,6 +1608,10 @@ int main(int argc, char **argv) {
     fanoutSources(context, 6, argc > 56 ? argv[56] : "", 1);
     fanoutSources(context, 7, argc > 57 ? argv[57] : "", 2);
     for (unsigned depth : {0, 1, 2}) fanoutSources(context, 8, "", depth);
+    fanoutSources(context, 9, argc > 58 ? argv[58] : "");
+    fanoutSources(context, 10, argc > 59 ? argv[59] : "");
+    fanoutSources(context, 10, argc > 60 ? argv[60] : "", 1);
+    fanoutSources(context, 10, argc > 61 ? argv[61] : "", 2);
     nestedSiblingSources(context, 0, argc > 38 ? argv[38] : "");
     nestedSiblingSources(context, 1, argc > 39 ? argv[39] : "");
     nestedSiblingSources(context, 1, argc > 40 ? argv[40] : "", 2);
