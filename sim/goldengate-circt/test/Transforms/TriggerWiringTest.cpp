@@ -66,7 +66,7 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
   };
   reject({source(true, "clock"), sink}, "both");
   reject({channel, source(true, "clock"), source(true, "clock"), source(false, "clock"), sink}, "distinct source");
-  reject({channel, source(true, "otherClock"), source(false, "clock"), sink}, "base clock");
+  reject({channel, source(true, "otherClock"), source(false, "clock"), sink}, "source clock domain");
   reject({channel, source(true, "clock"), source(false, "clock"),
     b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TriggerSink)),
       b.getNamedAttr("target", reference("credit")), b.getNamedAttr("clock", reference("clock"))})}, "nodes");
@@ -378,7 +378,7 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
   if (mode || (hierarchy > 2 && hierarchy != 9 && hierarchy != 10 && hierarchy != 15 && hierarchy != 17)) {
     require(failed(result) && consumed == 0 && dump(root.get()) == before,
             "clock alias rejection must be atomic: " + std::to_string(mode) + ":" + std::to_string(hierarchy));
-    require(StringRef(error).contains(mode == 6 ? "dominate" : "base clock"),
+    require(StringRef(error).contains(mode == 6 ? "dominate" : "clock"),
             "clock alias diagnostic: " + error);
     return;
   }
@@ -1347,11 +1347,115 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
 }
 
 }
+// Two independent top-local clocks: Scala groups aliases by root, samples
+// each local NEXT into the base clock, then sums full UInt<17> differences.
+void clockDomains(MLIRContext &context, StringRef output) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %clock: !firrtl.clock, in %otherClock: !firrtl.clock,
+        in %credit0: !firrtl.uint<1>, in %debit0: !firrtl.uint<1>,
+        in %credit1: !firrtl.uint<1>, in %debit1: !firrtl.uint<1>,
+        in %reset: !firrtl.uint<1>, out %enabled: !firrtl.uint<1>) {
+        %otherAlias = firrtl.node %otherClock : !firrtl.clock
+        %zero = firrtl.constant 0 : !firrtl.uint<1>
+        %trigger = firrtl.node %zero : !firrtl.uint<1>
+        firrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>
+      }
+    }
+  })mlir", &context);
+  require(bool(root), "two-domain parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context);
+  auto ref = [&](StringRef name) { return b.getStringAttr(("~Top|Top>" + name).str()); };
+  SmallVector<Attribute> annotations;
+  for (unsigned i = 0; i < 2; ++i) for (bool credit : {true, false}) {
+    NamedAttrList a;
+    a.set("class", b.getStringAttr(A::InternalTriggerSource));
+    a.set("target", ref(std::string(credit ? "credit" : "debit") + std::to_string(i)));
+    a.set("clock", ref(i ? "otherAlias" : "clock"));
+    a.set("sourceType", b.getBoolAttr(credit));
+    if (credit) a.set("reset", ref("reset"));
+    annotations.push_back(a.getDictionary(&context));
+  }
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+    b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref("clock"))}));
+  auto channel = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("clock")}))});
+  annotations.push_back(channel);
+  auto incomplete = annotations; incomplete.erase(incomplete.begin() + 3);
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(incomplete));
+  auto before = dump(root.get()); unsigned consumed; std::string error;
+  require(failed(goldengate::wireTriggers(circuit, consumed, error)) && consumed == 0 &&
+          dump(root.get()) == before && error.find("each source clock domain") != std::string::npos,
+          "incomplete clock domain must fail atomically");
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  require(succeeded(goldengate::wireTriggers(circuit, consumed, error)), error);
+  require(consumed == 4 && succeeded(verify(*root)) && top.getNumPorts() == 8 &&
+          circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "two-domain structure/cleanup");
+  std::map<std::string, Value> values; SmallVector<RegOp> regs;
+  llvm::DenseMap<Value, Value> drivers;
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) values[name.getValue().str()] = op->getResult(0);
+    if (auto reg = dyn_cast<RegOp>(op)) regs.push_back(reg);
+    if (auto connect = dyn_cast<StrictConnectOp>(op)) drivers[connect.getDest()] = connect.getSrc();
+  });
+  require(regs.size() == 15, "two domains need twelve local/sample plus two global and one sink registers");
+  for (auto reg : regs) {
+    bool secondary = reg.getName() == "otherClock_credits" || reg.getName() == "otherClock_debits";
+    require(reg.getClockVal() == top.getBodyBlock()->getArgument(secondary ? 1 : 0), "domain register clock");
+  }
+  // Evaluate the actual generated SSA cone with independent clock edges.
+  llvm::DenseMap<Value, uint64_t> state, inputs;
+  std::function<uint64_t(Value)> eval = [&](Value v) -> uint64_t {
+    if (state.count(v)) return state.lookup(v);
+    if (inputs.count(v)) return inputs.lookup(v);
+    uint64_t n;
+    if (auto node = v.getDefiningOp<NodeOp>()) n = eval(node.getInput());
+    else if (auto c = v.getDefiningOp<ConstantOp>()) n = c.getValueAttr().getValue().getZExtValue();
+    else if (auto op = v.getDefiningOp<NotPrimOp>()) n = ~eval(op.getInput());
+    else if (auto op = v.getDefiningOp<AndPrimOp>()) n = eval(op.getLhs()) & eval(op.getRhs());
+    else if (auto op = v.getDefiningOp<AddPrimOp>()) n = eval(op.getLhs()) + eval(op.getRhs());
+    else if (auto op = v.getDefiningOp<SubPrimOp>()) n = eval(op.getLhs()) - eval(op.getRhs());
+    else if (auto op = v.getDefiningOp<NEQPrimOp>()) n = eval(op.getLhs()) != eval(op.getRhs());
+    else if (auto op = v.getDefiningOp<BitsPrimOp>()) n = eval(op.getInput()) >> op.getLo();
+    else throw std::runtime_error("unsupported two-domain evaluation");
+    return n & ((uint64_t(1) << *cast<UIntType>(v.getType()).getWidth()) - 1);
+  };
+  for (auto reg : regs) state[reg.getResult()] = 0;
+  for (unsigned cycle = 0; cycle < 4096; ++cycle) {
+    if (cycle % 128 == 0) for (auto reg : regs)
+      state[reg.getResult()] = (uint64_t(1) << *cast<UIntType>(reg.getResult().getType()).getWidth()) - 1;
+    for (unsigned i = 2; i <= 6; ++i) inputs[top.getBodyBlock()->getArgument(i)] = (cycle >> (i - 2)) & 1;
+    uint64_t creditDiff = 0, debitDiff = 0;
+    for (StringRef name : {"clock", "otherClock"}) for (bool credit : {true, false}) {
+      auto stem = name.str() + (credit ? "_credits" : "_debits");
+      uint64_t diff = (state.lookup(values.at(stem + "_next_count_sync_s1")) -
+                       state.lookup(values.at(stem + "_next_count_sync_s2"))) & 0x1ffff;
+      (credit ? creditDiff : debitDiff) += diff;
+    }
+    auto cn = state.lookup(values.at("totalCredits")) + creditDiff;
+    auto dn = state.lookup(values.at("totalDebits")) + debitDiff;
+    require(eval(values.at("totalCredits_next")) == cn && eval(values.at("totalDebits_next")) == dn &&
+            eval(values.at("trigger_source")) == unsigned(cn != dn), "two-domain full NEXT aggregation");
+    auto next = state;
+    for (auto reg : regs) {
+      bool secondary = reg.getClockVal() == top.getBodyBlock()->getArgument(1);
+      if (secondary ? cycle % 3 != 0 : cycle % 2 == 0) next[reg.getResult()] = eval(drivers.lookup(reg.getResult()));
+    }
+    state = std::move(next);
+  }
+  if (!output.empty()) { std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "two-domain output"); root->print(out); out << '\n'; }
+}
+
 int main(int argc, char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     run(context, true, true, argc > 1 ? argv[1] : "");
     run(context, false, false, "");
+    clockDomains(context, argc > 45 ? argv[45] : "");
     multiple(context, 3, 5, argc > 2 ? argv[2] : "");
     multiple(context, 2, 3, "");
     multiple(context, 4, 5, "");

@@ -83,7 +83,7 @@ bool boolean(circt::FieldRef field) {
   auto type = field ? dyn_cast_or_null<UIntType>(leaf(field).first) : UIntType();
   return type && type.getWidth() == 1;
 }
-struct Source { circt::FieldRef event, reset; bool credit; std::string name; };
+struct Source { circt::FieldRef event, reset, clock; bool credit; std::string name; };
 // BridgeTopWiring groups source events by the upstream input Clock port.
 // Prove electrical aliases using transparent FIRRTL operations only. A cone
 // with one input clock is insufficient: a mux or gate may change its edges.
@@ -267,6 +267,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     return failure();
   }
   SmallVector<Source> events;
+  llvm::MapVector<circt::FieldRef, std::pair<unsigned, unsigned>> domainSources;
   circt::igraph::InstanceGraph graph(circuit);
   llvm::MapVector<Operation *, SmallVector<InstanceOp>> sourceParentInstances;
   llvm::MapVector<Operation *, SmallVector<InstanceOp>> sinkParentInstances;
@@ -383,11 +384,20 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!boolean(event)) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
     }
+    // Top-local events may use independent root clocks. Descendant events
+    // still require the base root until clock exports accompany event exports.
+    auto eventRoot = local.module == top ? aliases.root(eventClock) : clockRoot;
+    if (!eventRoot) {
+      error = "trigger source clock needs an unconditional top input Clock alias";
+      return failure();
+    }
     for (auto &path : paths)
-      if (!(aliases.root(local.module, eventClock, path) == clockRoot)) {
+      if (!(aliases.root(local.module, eventClock, path) == eventRoot)) {
         error = "trigger sources must be UInt<1> on the local base clock"; return failure();
       }
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
+    auto &counts = domainSources[eventRoot];
+    ++(credit ? counts.first : counts.second);
     if (!(credit ? creditTargets : debitTargets).insert(event).second) {
       error = "trigger hardware currently needs distinct source targets per sourceType";
       return failure();
@@ -402,8 +412,15 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
     for (auto module : pathModules) childEvents[module].push_back(events.size());
-    events.push_back({event, reset, credit, name});
+    events.push_back({event, reset, eventRoot, credit, name});
   }
+  // Scala's per-domain DensePrefixSum requires both event lists to be nonempty.
+  // Reject an incomplete domain before materializing any hardware.
+  for (auto &[domain, counts] : domainSources)
+    if (!counts.first || !counts.second) {
+      error = "trigger accounting needs credits and debits in each source clock domain";
+      return failure();
+    }
   DominanceInfo dominance(circuit);
   // Scala onModuleSink constructs a map by node name: the last annotation
   // wins. Select it before resolving clocks, then visit declarations in IR
@@ -522,9 +539,6 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   // Scala normalizes aggregate input ports before BridgeTopWiring chooses the
   // root and uses the flattened leaf name for local accounting. CIRCT keeps
   // the aggregate and materializes its Clock leaf only after atomic preflight.
-  std::string clockName = getFieldName(clockRoot, /*nameSafe=*/true).first;
-  Value clock = getValueByFieldID(ImplicitLocOpBuilder(loc, b), clockRoot.getValue(),
-                                clockRoot.getFieldID());
   Value baseClock = getValueByFieldID(ImplicitLocOpBuilder(loc, b), baseField.getValue(),
                                     baseField.getFieldID());
   auto named = [&](Value value, StringRef name) -> Value {
@@ -535,10 +549,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     return b.create<RegOp>(loc, UIntType::get(b.getContext(), width), domain,
                            names.newName(name)).getResult();
   };
-  SmallVector<Value> creditSignals, debitSignals;
+  struct DomainSignals { SmallVector<Value> credits, debits; };
+  llvm::MapVector<circt::FieldRef, DomainSignals> domainSignals;
   for (auto [index, event] : llvm::enumerate(events)) {
+    auto &domain = domainSignals[event.clock];
+    auto &signals = event.credit ? domain.credits : domain.debits;
     if (auto exported = routed[top].find(index); exported != routed[top].end()) {
-      auto &signals = event.credit ? creditSignals : debitSignals;
       for (auto &signal : exported->second) signals.push_back(signal.value);
       continue;
     }
@@ -550,7 +566,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       Value active = b.create<NotPrimOp>(loc, reset);
       signal = named(b.create<AndPrimOp>(loc, active, signal), event.name + "_masked");
     }
-    (event.credit ? creditSignals : debitSignals).push_back(signal);
+    signals.push_back(signal);
   }
   auto reduce = [&](ArrayRef<Value> signals, StringRef stem) -> Value {
     // Scala DensePrefixSum uses the previous layer for every addition at an
@@ -565,8 +581,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     }
     return layer.back();
   };
-  auto local = [&](ArrayRef<Value> signals, StringRef suffix) -> Value {
-    std::string stem = clockName + suffix.str();
+  auto local = [&](ArrayRef<Value> signals, const std::string &stem, Value clock) -> Value {
     Value signal = reduce(signals, stem);
     Value count = reg(16, stem, clock);
     Value next = named(b.create<AddPrimOp>(loc, count, signal), stem + "_next");
@@ -579,8 +594,18 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     // SFC infers UInt<17> subtraction, including the underflow bit at wrap.
     return named(b.create<SubPrimOp>(loc, s1, s2), stem + "_next_diff");
   };
-  Value creditDiff = local(creditSignals, "_credits");
-  Value debitDiff = local(debitSignals, "_debits");
+  SmallVector<Value> creditDiffs, debitDiffs;
+  for (auto &[root, signals] : domainSignals) {
+    auto clockName = getFieldName(root, /*nameSafe=*/true).first;
+    Value clock = getValueByFieldID(ImplicitLocOpBuilder(loc, b),
+                                   root.getValue(), root.getFieldID());
+    creditDiffs.push_back(local(signals.credits, clockName + "_credits", clock));
+    debitDiffs.push_back(local(signals.debits, clockName + "_debits", clock));
+  }
+  // Reduce the UInt<17> differences without truncation. Scala retains the
+  // underflow bit for each domain before forming the full global NEXT value.
+  Value creditDiff = reduce(creditDiffs, "totalCredits");
+  Value debitDiff = reduce(debitDiffs, "totalDebits");
   auto total = [&](Value diff, StringRef name) -> Value {
     Value count = reg(32, name, baseClock);
     Value next = named(b.create<AddPrimOp>(loc, count, diff), name.str() + "_next");
