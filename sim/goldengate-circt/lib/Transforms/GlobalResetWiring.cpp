@@ -28,7 +28,14 @@ bool isSink(Annotation annotation, bool hostClock) {
   return annotation.isClass(goldengate::AnnotationClasses::GlobalResetSink) ||
          annotation.isClass(goldengate::AnnotationClasses::PublicGlobalResetSink);
 }
-struct Reference { FModuleOp module; Value value; };
+struct Reference {
+  FModuleOp module;
+  Value value;
+  // Instance results can be replaced when another sink changes the child's
+  // signature. Keep the operation identity and original port index to remap.
+  Operation *instance = nullptr;
+  unsigned port = 0;
+};
 struct ModuleRoute {
   FModuleOp module;
   unsigned oldPorts;
@@ -38,7 +45,8 @@ struct ModuleRoute {
   SmallVector<std::pair<Operation *, Operation *>> children;
 };
 std::optional<Reference> resolve(CircuitOp circuit, StringRef target, bool sink,
-                               const std::string &label, std::string &error) {
+                               bool hostClock, const std::string &label,
+                               std::string &error) {
   std::string portError;
   if (auto port = goldengate::resolveAnnotationTarget(circuit, target, portError)) {
     auto module = dyn_cast<FModuleOp>(port->module.getOperation());
@@ -48,6 +56,42 @@ std::optional<Reference> resolve(CircuitOp circuit, StringRef target, bool sink,
       return std::nullopt;
     }
     return Reference{module, module.getBodyBlock()->getArgument(*port->port)};
+  }
+  // AutoILATransform marks its wrapper input as ref(instance).field(clock).
+  // Resolve that field to the native InstanceOp result rather than treating
+  // it as a module port or a single-result declaration.
+  auto local = target.split('>');
+  auto instanceAndPort = local.second.split('.');
+  if (hostClock && sink && !instanceAndPort.second.empty()) {
+    auto resolved = goldengate::resolveAnnotationTarget(circuit, local.first, error);
+    auto module = resolved ? dyn_cast<FModuleOp>(resolved->module.getOperation()) : FModuleOp();
+    if (!module || resolved->port || instanceAndPort.first.empty() ||
+        instanceAndPort.second.find_first_of(".[]>/") != StringRef::npos) {
+      error = label + " instance sink needs a local lowered input port: " + target.str();
+      return std::nullopt;
+    }
+    InstanceOp instance;
+    bool ambiguous = false;
+    module.walk([&](InstanceOp candidate) {
+      if (candidate.getName() != instanceAndPort.first) return;
+      ambiguous |= bool(instance);
+      instance = candidate;
+    });
+    if (!instance || ambiguous || instance->getBlock() != module.getBodyBlock()) {
+      error = label + " instance sink needs an unambiguous module-scope instance: " + target.str();
+      return std::nullopt;
+    }
+    for (unsigned i = 0; i < instance.getNumResults(); ++i) {
+      if (instance.getPortName(i) != instanceAndPort.second) continue;
+      if (instance.getPortDirection(i) != Direction::In ||
+          !isa<ClockType>(instance.getResult(i).getType())) {
+        error = label + " instance sink must be a lowered Clock input: " + target.str();
+        return std::nullopt;
+      }
+      return Reference{module, instance.getResult(i), instance.getOperation(), i};
+    }
+    error = label + " instance sink port does not exist: " + target.str();
+    return std::nullopt;
   }
   auto *op = goldengate::resolveInternalAnnotationTarget(circuit, target, error);
   if (!op || !isa<WireOp, NodeOp, RegOp, RegResetOp>(op) ||
@@ -100,7 +144,7 @@ LogicalResult wireSignal(CircuitOp circuit, unsigned &wired,
     consume();
     return success();
   }
-  auto source = resolve(circuit, sources.front().getValue(), false, label, error);
+  auto source = resolve(circuit, sources.front().getValue(), false, hostClock, label, error);
   if (!source) return failure();
   auto isSignal = [&](Value value) {
     if (hostClock) return isa<ClockType>(value.getType());
@@ -115,7 +159,7 @@ LogicalResult wireSignal(CircuitOp circuit, unsigned &wired,
   SmallVector<Operation *> oldDrivers;
   llvm::DenseSet<Operation *> seenDrivers;
   for (auto target : sinks) {
-    auto sink = resolve(circuit, target.getValue(), true, label, error);
+    auto sink = resolve(circuit, target.getValue(), true, hostClock, label, error);
     if (!sink) return failure();
     if (!isSignal(sink->value) ||
         sink->value == source->value) {
@@ -307,7 +351,10 @@ LogicalResult wireSignal(CircuitOp circuit, unsigned &wired,
   OpBuilder b(circuit.getContext());
   for (auto sink : destinations) {
     b.setInsertionPointToEnd(sink.module.getBodyBlock());
-    b.create<StrictConnectOp>(sink.module.getLoc(), sink.value, signalValue(sink.module));
+    auto value = sink.value;
+    if (auto replacement = replacements.lookup(sink.instance))
+      value = replacement.getResult(sink.port);
+    b.create<StrictConnectOp>(sink.module.getLoc(), value, signalValue(sink.module));
   }
   for (auto &[key, info] : modules) {
     b.setInsertionPointToEnd(info.module.getBodyBlock());

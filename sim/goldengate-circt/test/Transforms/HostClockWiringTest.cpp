@@ -95,6 +95,7 @@ void hierarchy(MLIRContext &context) {
       firrtl.module @Top(out %sink: !firrtl.clock) {}
       firrtl.module @Source(in %clock: !firrtl.clock) {}
       firrtl.module @Sink(out %sink: !firrtl.clock) {}
+      firrtl.extmodule private @ILA(in clock: !firrtl.clock)
     }
   })mlir", &context);
   require(bool(root), "hierarchy parse failed");
@@ -105,14 +106,16 @@ void hierarchy(MLIRContext &context) {
   b.setInsertionPointToEnd(top.getBodyBlock());
   b.create<InstanceOp>(top.getLoc(), source, "source");
   b.create<InstanceOp>(top.getLoc(), sink, "sink0"); b.create<InstanceOp>(top.getLoc(), sink, "sink1");
+  auto wrapper = b.create<InstanceOp>(top.getLoc(), *circuit.getOps<FExtModuleOp>().begin(), "ila_wrapper_inst");
   auto attrs = b.getArrayAttr({annotation(b, A::HostClockSource, "~Top|Source>clock"),
                              annotation(b, A::HostClockSink, "~Top|Top>sink"),
-                             annotation(b, A::HostClockSink, "~Top|Sink>sink")});
+                             annotation(b, A::HostClockSink, "~Top|Sink>sink"),
+                             annotation(b, A::HostClockSink, "~Top|Top>ila_wrapper_inst.clock")});
   circuit->setAttr("rawAnnotations", attrs); unsigned count; std::string error;
   auto extra = b.create<InstanceOp>(top.getLoc(), source, "ambiguous"); auto before = dump(root.get());
   require(failed(goldengate::wireHostClock(circuit, count, error)) && dump(root.get()) == before &&
           StringRef(error).contains("unique source instance"), "ambiguous source accepted"); extra.erase();
-  require(succeeded(goldengate::wireHostClock(circuit, count, error)) && count == 2, "hierarchy: " + error);
+  require(succeeded(goldengate::wireHostClock(circuit, count, error)) && count == 3, "hierarchy: " + error);
   require(top.getNumPorts() == 1 && source.getNumPorts() == 2 && sink.getNumPorts() == 2 &&
           source.getPortDirection(1) == Direction::Out && source.getPortName(1) == "clock_0" &&
           sink.getPortDirection(1) == Direction::In && sink.getPortName(1) == "HostClockSource_0", "route signatures");
@@ -121,10 +124,107 @@ void hierarchy(MLIRContext &context) {
   for (auto instance : top.getBodyBlock()->getOps<InstanceOp>())
     if (instance.getModuleName() == "Source") routed = instance.getResult(1);
   require(driver(top, top.getBodyBlock()->getArgument(0)) == routed, "LCA clock");
+  require(driver(top, wrapper.getResult(0)) == routed, "AutoILA clock from nested host source");
   for (auto instance : top.getBodyBlock()->getOps<InstanceOp>())
     if (instance.getModuleName() == "Sink") require(driver(top, instance.getResult(1)) == routed, "shared sink clock");
   require(driver(sink, sink.getBodyBlock()->getArgument(0)) == sink.getBodyBlock()->getArgument(1), "sink clock");
   require(succeeded(verify(*root)), "invalid hierarchy IR");
+}
+void instanceSinks(MLIRContext &context, StringRef output = {}) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %clock: !firrtl.clock, in %other: !firrtl.clock) {}
+      firrtl.module @Mid(in %clock: !firrtl.clock, out %sink: !firrtl.clock) {}
+      firrtl.extmodule private @ILA(in clock: !firrtl.clock, in probe0: !firrtl.uint<8>,
+                                   out clockOut: !firrtl.clock)
+    }
+  })mlir", &context);
+  require(bool(root), "instance sink parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = named(circuit, "Top"), mid = named(circuit, "Mid");
+  auto ila = *circuit.getOps<FExtModuleOp>().begin();
+  OpBuilder b(&context); b.setInsertionPointToEnd(mid.getBodyBlock());
+  auto wrapper = b.create<InstanceOp>(mid.getLoc(), ila, "ila_wrapper_inst");
+  b.create<StrictConnectOp>(mid.getLoc(), wrapper.getResult(0), mid.getBodyBlock()->getArgument(0));
+  auto probe = b.create<ConstantOp>(mid.getLoc(), UIntType::get(&context, 8), llvm::APInt(8, 42));
+  auto probeDriver = b.create<StrictConnectOp>(mid.getLoc(), wrapper.getResult(1), probe.getResult());
+  b.create<StrictConnectOp>(mid.getLoc(), mid.getBodyBlock()->getArgument(1), mid.getBodyBlock()->getArgument(0));
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  auto first = b.create<InstanceOp>(top.getLoc(), mid, "mid0");
+  auto second = b.create<InstanceOp>(top.getLoc(), mid, "mid1");
+  for (auto instance : {first, second})
+    b.create<StrictConnectOp>(top.getLoc(), instance.getResult(0), top.getBodyBlock()->getArgument(1));
+  auto source = annotation(b, A::HostClockSource, "~Top|Top>clock");
+  auto sink = annotation(b, A::HostClockSink, "~Top|Mid>ila_wrapper_inst.clock");
+  unsigned count; std::string error;
+  auto reject = [&](StringRef target, StringRef expected) {
+    circuit->setAttr("rawAnnotations", b.getArrayAttr({source, annotation(b, A::HostClockSink, target)}));
+    auto before = dump(root.get());
+    require(failed(goldengate::wireHostClock(circuit, count, error)) && count == 0 &&
+            dump(root.get()) == before && StringRef(error).contains(expected), "instance preflight: " + error);
+  };
+  reject("~Top|Mid>ila_wrapper_inst.clockOut", "Clock input");
+  reject("~Top|Mid>ila_wrapper_inst.probe0", "Clock input");
+  reject("~Top|Mid>ila_wrapper_inst.missing", "port does not exist");
+  reject("~Top|Mid>missing.clock", "module-scope instance");
+  reject("~Top|Mid>ila_wrapper_inst.clock.field", "local lowered input");
+  reject("~Top|Top/mid0:Mid>ila_wrapper_inst.clock", "local lowered input");
+  // mid0 is both a direct instance sink and an instance whose signature must
+  // be cloned to reach pathless sinks in Mid. mid1.clock stays on 'other'.
+  circuit->setAttr("rawAnnotations", b.getArrayAttr({source, sink, sink,
+      annotation(b, A::HostClockSink, "~Top|Top>mid0.clock"),
+      annotation(b, A::HostClockSink, "~Top|Mid>sink")}));
+  require(succeeded(goldengate::wireHostClock(circuit, count, error, true)) && count == 3,
+          "instance sinks: " + error);
+  require(top.getNumPorts() == 2 && mid.getNumPorts() == 3 && ila.getNumPorts() == 3,
+          "wrapper signature changed or wrong parent route");
+  require(driver(mid, wrapper.getResult(0)) == mid.getBodyBlock()->getArgument(2) &&
+          driver(mid, mid.getBodyBlock()->getArgument(1)) == mid.getBodyBlock()->getArgument(2),
+          "shared ILA clock route");
+  require(probeDriver.getSrc() == probe.getResult() &&
+          driver(mid, wrapper.getResult(1)) == probe.getResult(), "probe input changed");
+  for (auto instance : top.getBodyBlock()->getOps<InstanceOp>()) {
+    require(driver(top, instance.getResult(2)) == top.getBodyBlock()->getArgument(0), "parent route");
+    require(driver(top, instance.getResult(0)) == top.getBodyBlock()->getArgument(instance.getName() == "mid0" ? 0 : 1),
+            "instance identity lost after signature replacement");
+  }
+  require(circuit->getAttr("rawAnnotations") == b.getArrayAttr({source}) && succeeded(verify(*root)),
+          "instance apply cleanup or verification failed");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec); require(!ec, "cannot save instance fixture");
+    root->print(out);
+  }
+}
+void goldenInstance(MLIRContext &context, StringRef input, StringRef output) {
+  auto root = parseSourceFile<ModuleOp>(input, &context); require(bool(root), "golden parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin(); auto top = named(circuit, circuit.getName());
+  OpBuilder b(&context); auto clockType = ClockType::get(&context);
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  auto source = b.create<WireOp>(top.getLoc(), clockType, b.getStringAttr("iteration357Clock"));
+  auto zero = b.create<ConstantOp>(top.getLoc(), UIntType::get(&context, 1), llvm::APInt(1, 0));
+  auto clock = b.create<AsClockPrimOp>(top.getLoc(), zero.getResult());
+  b.create<StrictConnectOp>(top.getLoc(), source.getResult(), clock.getResult());
+  b.setInsertionPointToEnd(circuit.getBodyBlock());
+  SmallVector<PortInfo> ports{PortInfo(b.getStringAttr("clock"), clockType, Direction::In)};
+  auto ila = b.create<FExtModuleOp>(circuit.getLoc(), b.getStringAttr("iteration357ILA"),
+      ConventionAttr::get(&context, Convention::Internal), ports, "iteration357ILA");
+  auto clint = named(circuit, "CLINT"); b.setInsertionPointToEnd(clint.getBodyBlock());
+  auto first = b.create<InstanceOp>(clint.getLoc(), ila, "ila_wrapper_inst");
+  auto second = b.create<InstanceOp>(clint.getLoc(), ila, "unselected_ila");
+  auto clintZero = b.create<ConstantOp>(clint.getLoc(), UIntType::get(&context, 1), llvm::APInt(1, 0));
+  auto placeholder = b.create<AsClockPrimOp>(clint.getLoc(), clintZero.getResult());
+  b.create<StrictConnectOp>(clint.getLoc(), first.getResult(0), placeholder.getResult());
+  b.create<StrictConnectOp>(clint.getLoc(), second.getResult(0), placeholder.getResult());
+  circuit->setAttr("rawAnnotations", b.getArrayAttr({
+      annotation(b, A::HostClockSource, "~FireSim|FireSim>iteration357Clock"),
+      annotation(b, A::HostClockSink, "~FireSim|CLINT>ila_wrapper_inst.clock")}));
+  unsigned count; std::string error;
+  require(succeeded(goldengate::wireHostClock(circuit, count, error)) && count == 1 &&
+          driver(clint, first.getResult(0)) == clint.getBodyBlock()->getArgument(clint.getNumPorts()-1) &&
+          driver(clint, second.getResult(0)) == placeholder.getResult() && succeeded(verify(*root)),
+          "Rocket instance sink: " + error);
+  std::error_code ec; llvm::raw_fd_ostream out(output, ec); require(!ec, "cannot save candidate"); root->print(out);
+  llvm::outs() << "Rocket augmented AutoILA instance Clock sink PASS\n";
 }
 // Augment the imported immutable Rocket hierarchy with explicit Clock probes.
 // These are transfer tests, not an assertion that the golden enables ILA sinks.
@@ -172,7 +272,10 @@ int main(int argc, char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     local(context); hierarchy(context);
-    if (argc == 3) golden(context, argv[1], argv[2]); else require(argc == 1, "expected input.mlir output.mlir");
+    instanceSinks(context, argc == 4 ? StringRef(argv[2]).str() + ".instances.mlir" : "");
+    if (argc == 4 && StringRef(argv[3]) == "--instance-sinks") goldenInstance(context, argv[1], argv[2]);
+    else if (argc == 3) golden(context, argv[1], argv[2]);
+    else require(argc == 1, "expected input.mlir output.mlir [--instance-sinks]");
     llvm::outs() << "Host clock wiring PASS\n"; return 0;
   } catch (const std::exception &error) { llvm::errs() << error.what() << '\n'; return 1; }
 }
