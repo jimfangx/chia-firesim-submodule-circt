@@ -411,6 +411,83 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
   }
 }
 
+// Raw aggregate clock targets correspond to Scala's renamed LowerTypes leaves.
+// Keep event/reset/sink-node targets ground and test every failure before IR
+// projection materialization, including a late aggregate sink declaration.
+void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
+  const std::string type = "!firrtl.bundle<traces: vector<bundle<clock: clock>, 2>, flag: uint<1>>";
+  std::string body;
+  if (mode == 2) {
+    body = "%base = firrtl.wire : " + type + "\nfirrtl.strictconnect %base, %clocks : " + type + "\n";
+  } else body = "%base = firrtl.node %clocks : " + type + "\n";
+  if (mode != 7) body += "%sink = firrtl.node %base : " + type + "\n";
+  body += "%one = firrtl.constant 1 : !firrtl.uint<1>\n%trigger = firrtl.node %one : !firrtl.uint<1>\nfirrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>\n";
+  if (mode == 7) body += "%sink = firrtl.node %base : " + type + "\n";
+  auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { firrtl.module @Top(in %clocks: " + type +
+    ", in %reset: !firrtl.uint<1>, in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, out %enabled: !firrtl.uint<1>) {" + body + "} } }", &context);
+  require(bool(root), "aggregate clock target parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context);
+  auto ref = [&](StringRef name) { return b.getStringAttr(("~Top|Top>" + name).str()); };
+  std::string base = mode == 0 ? "clocks.traces[0].clock" : "base.traces[0].clock";
+  if (mode == 4) base = "base.traces[2].clock";
+  if (mode == 5) base = "clocks.traces";
+  if (mode == 6) base = "clocks.flag";
+  if (mode == 8) base = "base.traces[0].missing";
+  SmallVector<Attribute> annotations;
+  annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref(base)}))}));
+  for (bool credit : {true, false}) {
+    NamedAttrList a;
+    a.set("class", b.getStringAttr(A::InternalTriggerSource));
+    a.set("target", ref(credit ? "credit" : "debit"));
+    a.set("clock", ref(credit ? "clocks.traces[0].clock" :
+                          mode == 3 ? "base.traces[1].clock" :
+                          mode == 9 ? "base.traces[-1].clock" : base));
+    a.set("sourceType", b.getBoolAttr(credit));
+    if (credit) a.set("reset", ref("reset"));
+    annotations.push_back(a.getDictionary(&context));
+  }
+  std::string sink = mode == 0 ? "clocks.traces[0].clock" :
+                     mode == 10 ? "sink.traces[0].clock.missing" : "sink.traces[0].clock";
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+    b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref(sink))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto before = dump(root.get());
+  unsigned consumed = 99; std::string error;
+  auto result = goldengate::wireTriggers(circuit, consumed, error);
+  if (mode >= 3) {
+    require(failed(result) && consumed == 0 && dump(root.get()) == before,
+            "aggregate clock target rejection must be atomic: " + std::to_string(mode));
+    require(!error.empty(), "missing aggregate clock diagnostic");
+    return;
+  }
+  require(succeeded(result), error);
+  require(consumed == 2 && succeeded(verify(*root)), "aggregate clock target candidate invalid");
+  std::map<std::string, Value> values;
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) values[name.getValue().str()] = op->getResult(0);
+  });
+  unsigned registers = 0;
+  top.walk([&](RegOp reg) {
+    ++registers;
+    bool local = reg.getName() == "clocks_traces_0_clock_credits" || reg.getName() == "clocks_traces_0_clock_debits";
+    Value expected = local || mode == 0 ? top.getBodyBlock()->getArgument(0) :
+                     values.at(reg.getName() == "trigger_sync" ? "sink" : "base");
+    require(getFieldRefFromValue(reg.getClockVal()) == circt::FieldRef(expected, 3),
+            "aggregate annotation clock operand identity: " + reg.getName().str());
+  });
+  require(registers == 9 && values.count("clocks_traces_0_clock_credits") &&
+          values.count("clocks_traces_0_clock_debits"), "aggregate clock target accounting domain");
+  require(cast<ArrayAttr>(circuit->getAttr("rawAnnotations")).size() == 1, "aggregate clock annotation cleanup");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "cannot write aggregate clock target candidate"); root->print(out); out << '\n';
+  }
+}
 }
 int main(int argc, char **argv) {
   try {
@@ -434,6 +511,10 @@ int main(int argc, char **argv) {
     aliases(context, 0, "", 16);
     aliases(context, 2, "", 15);
     aliases(context, 0, argc > 9 ? argv[9] : "", 17);
+    clockTargets(context, 0, argc > 10 ? argv[10] : "");
+    clockTargets(context, 1, argc > 11 ? argv[11] : "");
+    clockTargets(context, 2, argc > 12 ? argv[12] : "");
+    for (unsigned mode : {3, 4, 5, 6, 7, 8, 9, 10}) clockTargets(context, mode, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

@@ -10,6 +10,8 @@ namespace goldengate {
 // for distinct credit/debit sources and node sinks on the circuit top base clock,
 // including unconditional wire/node aliases and bundle/vector clock fields
 // forwarded through internal instances to the same top input Clock leaf.
+// Clock annotation targets may select typed bundle/vector leaves of top ports,
+// wires or nodes; selected base/sink clocks remain the register clock operands.
 // Requires: retained raw annotations; ground top-local UInt<1> event/reset
 // references and node sinks; each sink clock dominates its node declaration.
 // Consumes: TriggerSource/TriggerSink and their internal annotation classes.

@@ -45,6 +45,24 @@ bool boolean(Value v) {
   auto type = v ? dyn_cast<UIntType>(v.getType()) : UIntType();
   return type && type.getWidth() == 1;
 }
+// Clock annotations may select aggregate leaves before LowerTypes. Resolve
+// identity without building projections: malformed targets must be atomic.
+circt::FieldRef resolveClock(CircuitOp circuit, FModuleOp top, StringAttr target,
+                            std::string &error) {
+  if (!target) { error = "trigger annotation has a missing clock reference"; return {}; }
+  std::string portError;
+  if (auto port = goldengate::resolveAnnotationTarget(circuit, target.getValue(), portError)) {
+    if (port->module == top && port->port)
+      return circt::FieldRef(top.getBodyBlock()->getArgument(*port->port),
+                             port->fieldID.value_or(0));
+  }
+  if (auto local = goldengate::resolveInternalFieldTarget(circuit, target.getValue(), error)) {
+    if (local->module == top && local->declaration->getBlock() == top.getBodyBlock())
+      return circt::FieldRef(local->declaration->getResult(0), local->fieldID);
+  }
+  error = "trigger clock needs a local Clock leaf in the circuit top: " + target.getValue().str();
+  return {};
+}
 struct Source { Value event, reset; bool credit; std::string name; };
 // BridgeTopWiring groups source events by the upstream input Clock port.
 // Prove electrical aliases using transparent FIRRTL operations only. A cone
@@ -69,12 +87,12 @@ public:
       });
     }
   }
-  Field root(Value value) {
-    if (!value) return {};
+  Field root(Field field) {
+    if (!field) return {};
     llvm::DenseSet<Field> active;
     // Retain the selected input leaf. Projections have different SSA identities
     // and must not merge distinct clocks belonging to the same aggregate port.
-    return trace(top, getFieldRefFromValue(value), active);
+    return trace(top, field, active);
   }
 private:
   // Index clock leaves without creating Subfield/Subindex operations. Two
@@ -226,29 +244,25 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       break;
     }
   }
-  Value clock = resolve(circuit, top, baseTarget, error);
-  if (!clock || !isa<ClockType>(clock.getType())) {
-    if (clock) error = "trigger base reference must be Clock";
-    return failure();
-  }
+  auto baseField = resolveClock(circuit, top, baseTarget, error);
+  if (!baseField) return failure();
   LocalClockAliases aliases(circuit, top);
   // Local accounting uses BridgeTopWiring's root; the synchronizers and
   // global counters retain the annotated base clock, as in Scala.
-  Value baseClock = clock;
-  auto clockRoot = aliases.root(clock);
+  auto clockRoot = aliases.root(baseField);
   if (!clockRoot) {
     error = "trigger base clock needs an unconditional alias of a top input Clock port";
     return failure();
   }
   SmallVector<Source> events;
   llvm::DenseSet<Value> creditTargets, debitTargets;
-  SmallVector<std::pair<NodeOp, Value>> nodes;
+  SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::DenseSet<Operation *> seen;
   for (auto a : sources) {
     auto target = a.getMember<StringAttr>("target");
     Value event = resolve(circuit, top, target, error);
     if (!event) return failure();
-    Value eventClock = resolve(circuit, top, a.getMember<StringAttr>("clock"), error);
+    auto eventClock = resolveClock(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
     if (!boolean(event) || !(aliases.root(eventClock) == clockRoot)) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
@@ -273,13 +287,13 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   for (auto a : sinks) {
     Value value = resolve(circuit, top, a.getMember<StringAttr>("target"), error);
     if (!value) return failure();
-    Value sinkClock = resolve(circuit, top, a.getMember<StringAttr>("clock"), error);
+    auto sinkClock = resolveClock(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
     auto node = value.getDefiningOp<NodeOp>();
     if (!node || !boolean(value) || !(aliases.root(sinkClock) == clockRoot)) {
       error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
     }
-    if (!dominance.properlyDominates(sinkClock, node.getOperation())) {
+    if (!dominance.properlyDominates(sinkClock.getValue(), node.getOperation())) {
       error = "trigger sink clock must dominate its node declaration"; return failure();
     }
     if (seen.insert(node).second) nodes.push_back({node, sinkClock});
@@ -297,8 +311,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   // root and uses the flattened leaf name for local accounting. CIRCT keeps
   // the aggregate and materializes its Clock leaf only after atomic preflight.
   std::string clockName = getFieldName(clockRoot, /*nameSafe=*/true).first;
-  clock = getValueByFieldID(ImplicitLocOpBuilder(loc, b), clockRoot.getValue(),
-                           clockRoot.getFieldID());
+  Value clock = getValueByFieldID(ImplicitLocOpBuilder(loc, b), clockRoot.getValue(),
+                                clockRoot.getFieldID());
+  Value baseClock = getValueByFieldID(ImplicitLocOpBuilder(loc, b), baseField.getValue(),
+                                    baseField.getFieldID());
   auto named = [&](Value value, StringRef name) -> Value {
     return b.create<NodeOp>(loc, value, b.getStringAttr(names.newName(name))).getResult();
   };
@@ -357,7 +373,9 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   Value enable = named(b.create<NEQPrimOp>(loc, creditNext, debitNext), "trigger_source");
   for (auto [node, sinkClock] : nodes) {
     b.setInsertionPoint(node);
-    Value sync = reg(1, "trigger_sync", sinkClock);
+    Value domain = getValueByFieldID(ImplicitLocOpBuilder(loc, b), sinkClock.getValue(),
+                                   sinkClock.getFieldID());
+    Value sync = reg(1, "trigger_sync", domain);
     b.setInsertionPointToEnd(top.getBodyBlock());
     b.create<StrictConnectOp>(loc, sync, enable);
     node->setOperand(0, sync);
