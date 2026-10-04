@@ -1183,6 +1183,167 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
 }
 
+// Sibling event exports stay separate while a shared parent relays them to top.
+void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 1) {
+  bool childSink = mode == 1 || mode == 4;
+  std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
+    "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
+  if (childSink) childPorts += ", out %sinkEnabled: !firrtl.uint<1>";
+  std::string instancePorts = childPorts;
+  instancePorts.erase(std::remove(instancePorts.begin(), instancePorts.end(), '%'), instancePorts.end());
+  unsigned originalPorts = childSink ? 6 : 5;
+  auto inst = [&](StringRef name, StringRef module) { return "%" + name.str() + ":" + std::to_string(originalPorts) +
+    " = firrtl.instance " + name.str() + " @" + module.str() + "(" + instancePorts + ")"; };
+  std::string parentPorts = "in %clock: !firrtl.clock, in %credit0: !firrtl.uint<1>, "
+    "in %debit0: !firrtl.uint<1>, in %reset0: !firrtl.uint<1>, in %credit1: !firrtl.uint<1>, "
+    "in %debit1: !firrtl.uint<1>, in %reset1: !firrtl.uint<1>, in %otherClock: !firrtl.clock, "
+    "out %enabled: !firrtl.uint<1>, out %echo0: !firrtl.uint<1>, out %echo1: !firrtl.uint<1>";
+  if (childSink) parentPorts += ", out %sink0: !firrtl.uint<1>, out %sink1: !firrtl.uint<1>";
+  std::string parentInstancePorts = parentPorts;
+  parentInstancePorts.erase(std::remove(parentInstancePorts.begin(), parentInstancePorts.end(), '%'), parentInstancePorts.end());
+  unsigned parentPortsBefore = 11 + 2 * childSink;
+  auto parentInst = [&](StringRef name, StringRef module) { return "%" + name.str() + ":" +
+    std::to_string(parentPortsBefore) + " = firrtl.instance " + name.str() + " @" + module.str() +
+    "(" + parentInstancePorts + ")"; };
+  std::string relayText = "firrtl.module @Relay(" + parentPorts + ") { " +
+    inst("first", "Child") + " " + inst("second", "Child") + " } ";
+  if (relayDepth == 2)
+    relayText += "firrtl.module @Outer(" + parentPorts + ") { " + parentInst("middle", "Relay") + " } ";
+  auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
+    "firrtl.module @Child(" + childPorts + ") {} " + relayText + "firrtl.module @Top(" + parentPorts +
+    ") { " + parentInst("parent", relayDepth == 2 ? "Outer" : "Relay") + " } } }", &context);
+  require(bool(root), "parse source fanout");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto it = circuit.getOps<FModuleOp>().begin(); auto child = *it++;
+  SmallVector<FModuleOp> relays;
+  for (unsigned depth = 0; depth < relayDepth; ++depth) relays.push_back(*it++);
+  auto top = *it;
+  OpBuilder b(&context); auto loc = top.getLoc(); auto bit = UIntType::get(&context, 1);
+  auto arg = [](FModuleOp m, unsigned i) { return m.getBodyBlock()->getArgument(i); };
+  b.setInsertionPointToEnd(child.getBodyBlock());
+  auto credit = b.create<NodeOp>(loc, arg(child, 1), b.getStringAttr("creditEvent"));
+  b.create<NodeOp>(loc, arg(child, 2), b.getStringAttr("debitEvent"));
+  b.create<StrictConnectOp>(loc, arg(child, 4), credit.getResult());
+  if (childSink) {
+    auto one = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
+    auto trigger = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("trigger"));
+    b.create<StrictConnectOp>(loc, arg(child, 5), trigger.getResult());
+  }
+  for (auto [depth, relay] : llvm::enumerate(relays)) {
+    b.setInsertionPointToEnd(relay.getBodyBlock());
+    for (auto [index, instance] : llvm::enumerate(relay.getBodyBlock()->getOps<InstanceOp>())) {
+      instance->setAttr("example.metadata", b.getStringAttr("preserve"));
+      if (depth == 0) {
+        bool wrongClock = (mode == 2 && index == 1) || (mode == 3 && index == 0);
+        b.create<StrictConnectOp>(loc, instance.getResult(0), arg(relay, wrongClock ? 7 : 0));
+        for (unsigned i = 1; i <= 3; ++i)
+          b.create<StrictConnectOp>(loc, instance.getResult(i), arg(relay, i + 3 * index));
+        b.create<StrictConnectOp>(loc, arg(relay, 9 + index), instance.getResult(4));
+        if (childSink) b.create<StrictConnectOp>(loc, arg(relay, 11 + index), instance.getResult(5));
+      } else {
+        for (unsigned i = 0; i < 8; ++i)
+          b.create<StrictConnectOp>(loc, instance.getResult(i), arg(relay, i));
+        for (unsigned i = 9; i < parentPortsBefore; ++i)
+          b.create<StrictConnectOp>(loc, arg(relay, i), instance.getResult(i));
+      }
+    }
+    auto enabled = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
+    b.create<StrictConnectOp>(loc, arg(relay, 8), enabled.getResult());
+  }
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  auto parent = *top.getBodyBlock()->getOps<InstanceOp>().begin();
+  parent->setAttr("example.metadata", b.getStringAttr("preserve"));
+  SmallVector<InstanceOp> topInstances{parent};
+  if (mode == 4) {
+    auto other = cast<InstanceOp>(b.clone(*parent.getOperation()));
+    other.setNameAttr(b.getStringAttr("otherParent"));
+    topInstances.push_back(other);
+  }
+  if (mode == 5) {
+    // All instances are unconditional, but this source also occurs in another
+    // parent definition. Reject the unsupported graph before changing any IO.
+    auto nested = *relays.front().getBodyBlock()->getOps<InstanceOp>().begin();
+    auto other = cast<InstanceOp>(b.clone(*nested.getOperation()));
+    other.setNameAttr(b.getStringAttr("directChild"));
+    for (unsigned i = 0; i < 4; ++i)
+      b.create<StrictConnectOp>(loc, other.getResult(i), arg(top, i));
+  }
+  for (auto instance : topInstances)
+    for (unsigned i = 0; i < 8; ++i)
+      b.create<StrictConnectOp>(loc, instance.getResult(i), arg(top, i));
+  for (unsigned i = 9; i < parentPortsBefore; ++i)
+    b.create<StrictConnectOp>(loc, arg(top, i), parent.getResult(i));
+  auto one = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
+  auto trigger = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("trigger"));
+  b.create<StrictConnectOp>(loc, arg(top, 8), trigger.getResult());
+  auto ref = [&](StringRef module, StringRef name) { return b.getStringAttr(("~Top|" + module + ">" + name).str()); };
+  SmallVector<Attribute> annotations;
+  for (bool credit : {true, false}) {
+    NamedAttrList attrs; attrs.set("class", b.getStringAttr(A::InternalTriggerSource));
+    attrs.set("target", ref("Child", credit ? "creditEvent" : "debitEvent"));
+    attrs.set("clock", ref("Child", "clock")); attrs.set("sourceType", b.getBoolAttr(credit));
+    if (credit) attrs.set("reset", ref("Child", "reset"));
+    annotations.push_back(attrs.getDictionary(&context));
+  }
+  SmallVector<StringRef> sinkModules{"Top"};
+  if (childSink) sinkModules.push_back("Child");
+  for (StringRef module : sinkModules)
+    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+      b.getNamedAttr("target", ref(module, "trigger")), b.getNamedAttr("clock", ref(module, "clock"))}));
+  auto channel = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))});
+  annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto before = dump(root.get()); unsigned consumed = 99; std::string error;
+  auto result = goldengate::wireTriggers(circuit, consumed, error);
+  if (mode >= 2 && mode != 4) {
+    require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
+            "unsupported sibling source route must fail atomically"); return;
+  }
+  require(succeeded(result), error);
+  require(consumed == 2 && succeeded(verify(*root)), "invalid source fanout IR");
+  require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + 2 + childSink,
+          "source fanout must preserve top IO and share child export definitions");
+  require(child.getPortName(originalPorts) == "simulationTrigger_creditEvent_masked" &&
+          child.getPortName(originalPorts + 1) == "simulationTrigger_debitEvent", "source fanout export names");
+  for (auto [depth, relay] : llvm::enumerate(relays)) {
+    require(relay.getNumPorts() == parentPortsBefore + 4 + childSink,
+            "sibling parent must relay four separate event exports");
+    for (StringRef instance : {"first", "second"})
+      for (StringRef event : {"creditEvent_masked", "debitEvent"}) {
+        std::string name = "simulationTrigger_" + std::string(depth ? "middle_" : "") +
+          instance.str() + "_" + event.str();
+        bool found = false;
+        for (auto port : relay.getPorts()) found |= port.getName() == name;
+        require(found, "sibling relay export name: " + name);
+      }
+  }
+  unsigned instances = 0, masks = 0, registers = 0;
+  child.walk([&](NodeOp n) { masks += n.getName() == "creditEvent_masked"; });
+  circuit.walk([&](RegOp) { ++registers; });
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
+      ++instances;
+      require(instance.getNumResults() == (instance.getModuleName() == "Child" ? child.getNumPorts() : relays.back().getNumPorts()) &&
+              instance->getAttrOfType<StringAttr>("example.metadata") == "preserve", "source fanout instance replacement");
+      unsigned originalDrivers = 0, sinkDrivers = 0;
+      unsigned inputs = instance.getModuleName() == "Child" ? 4 : 8;
+      unsigned sinkIndex = instance.getModuleName() == "Child" ? originalPorts + 2 : parentPortsBefore + 4;
+      for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>()) {
+        for (unsigned i = 0; i < inputs; ++i) originalDrivers += connect.getDest() == instance.getResult(i);
+        if (childSink) sinkDrivers += connect.getDest() == instance.getResult(sinkIndex);
+      }
+      require(originalDrivers == inputs && sinkDrivers == childSink, "source fanout lost or duplicated input connections");
+    }
+  }
+  require(instances == 2 + relayDepth + (mode == 4) && masks == 1 && registers == 9 + childSink &&
+          circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "cannot write source fanout candidate"); root->print(out); out << '\n';
+  }
+}
+
 }
 int main(int argc, char **argv) {
   try {
@@ -1253,6 +1414,13 @@ int main(int argc, char **argv) {
     fanoutSources(context, 1, argc > 37 ? argv[37] : "", 2);
     for (unsigned depth : {1, 2})
       for (unsigned mode : {2, 3}) fanoutSources(context, mode, "", depth);
+    nestedSiblingSources(context, 0, argc > 38 ? argv[38] : "");
+    nestedSiblingSources(context, 1, argc > 39 ? argv[39] : "");
+    nestedSiblingSources(context, 1, argc > 40 ? argv[40] : "", 2);
+    nestedSiblingSources(context, 4, argc > 41 ? argv[41] : "");
+    nestedSiblingSources(context, 5, "");
+    for (unsigned depth : {1, 2})
+      for (unsigned mode : {2, 3}) nestedSiblingSources(context, mode, "", depth);
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

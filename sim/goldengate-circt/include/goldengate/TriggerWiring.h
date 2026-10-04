@@ -13,8 +13,8 @@ namespace goldengate {
 // Clock annotation targets may select typed bundle/vector leaves of top ports,
 // wires or nodes; selected base/sink clocks remain the register clock operands.
 // Event/reset targets may select local UInt<1> bundle/vector leaves in the top
-// or a descendant with a unique unconditional route to top or to an ancestor
-// repeated directly under top. Every source clock path resolves to the base leaf.
+// or a descendant with unconditional sibling instances along one parent-definition
+// chain to top. Every complete source clock path resolves to the base leaf.
 // Field identity determines duplicate detection and flattened masked-event names.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor
@@ -24,8 +24,8 @@ namespace goldengate {
 // Consumes: TriggerSource/TriggerSink and their internal annotation classes.
 // Produces: no annotations; preserves unrelated annotation order and top IO.
 // Descendant events are masked locally and exported through appended output
-// ports along unique relay routes, from the deepest module upward. Each repeated
-// ancestor instance under top contributes separately, including simultaneous events.
+// ports from the deepest module upward. Relays preserve separate event exports
+// for each sibling instance; every absolute instance contributes to accounting.
 // Parent instances retain their original attributes and port connections. Sink enables
 // flow downward through one appended input per definition and every sink
 // instance; each instance retains independent sink synchronizer state in its
