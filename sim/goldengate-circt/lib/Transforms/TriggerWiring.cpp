@@ -23,7 +23,7 @@ bool source(Annotation a) {
 bool sink(Annotation a) {
   return a.isClass(A::TriggerSink) || a.isClass(A::InternalTriggerSink);
 }
-// Hardware support starts with local, ground references in the circuit top.
+// Sink nodes remain local, ground references in the circuit top.
 // Resolve through target identity utilities rather than interpreting FIRRTL text.
 Value resolve(CircuitOp circuit, FModuleOp top, StringAttr target,
               std::string &error) {
@@ -45,11 +45,11 @@ bool boolean(Value v) {
   auto type = v ? dyn_cast<UIntType>(v.getType()) : UIntType();
   return type && type.getWidth() == 1;
 }
-// Clock annotations may select aggregate leaves before LowerTypes. Resolve
+// Annotations may select aggregate leaves before LowerTypes. Resolve
 // identity without building projections: malformed targets must be atomic.
-circt::FieldRef resolveClock(CircuitOp circuit, FModuleOp top, StringAttr target,
+circt::FieldRef resolveField(CircuitOp circuit, FModuleOp top, StringAttr target,
                             std::string &error) {
-  if (!target) { error = "trigger annotation has a missing clock reference"; return {}; }
+  if (!target) { error = "trigger annotation has a missing field reference"; return {}; }
   std::string portError;
   if (auto port = goldengate::resolveAnnotationTarget(circuit, target.getValue(), portError)) {
     if (port->module == top && port->port)
@@ -60,10 +60,34 @@ circt::FieldRef resolveClock(CircuitOp circuit, FModuleOp top, StringAttr target
     if (local->module == top && local->declaration->getBlock() == top.getBodyBlock())
       return circt::FieldRef(local->declaration->getResult(0), local->fieldID);
   }
-  error = "trigger clock needs a local Clock leaf in the circuit top: " + target.getValue().str();
+  error = "trigger reference needs a local field in the circuit top: " + target.getValue().str();
   return {};
 }
-struct Source { Value event, reset; bool credit; std::string name; };
+// Return the selected leaf type and its accumulated bundle orientation.
+std::pair<Type, bool> leaf(circt::FieldRef field) {
+  Type type = field.getValue().getType();
+  unsigned id = field.getFieldID();
+  bool flipped = false;
+  while (id) {
+    if (auto bundle = dyn_cast<BundleType>(type)) {
+      if (id > bundle.getMaxFieldID()) return {};
+      auto [index, childID] = bundle.getIndexAndSubfieldID(id);
+      auto element = bundle.getElement(index);
+      flipped ^= element.isFlip;
+      type = element.type; id = childID;
+    } else if (auto vector = dyn_cast<FVectorType>(type)) {
+      if (id > vector.getMaxFieldID()) return {};
+      auto childID = vector.getIndexAndSubfieldID(id).second;
+      type = vector.getElementType(); id = childID;
+    } else return {};
+  }
+  return {type, flipped};
+}
+bool boolean(circt::FieldRef field) {
+  auto type = field ? dyn_cast_or_null<UIntType>(leaf(field).first) : UIntType();
+  return type && type.getWidth() == 1;
+}
+struct Source { circt::FieldRef event, reset; bool credit; std::string name; };
 // BridgeTopWiring groups source events by the upstream input Clock port.
 // Prove electrical aliases using transparent FIRRTL operations only. A cone
 // with one input clock is insufficient: a mux or gate may change its edges.
@@ -124,26 +148,6 @@ private:
                      src.getSubField(source.getFieldID(i)), vector.getElementType(),
                      source.getElementType(), unconditional, flipped);
     }
-  }
-  // Return the selected leaf type and its accumulated bundle orientation.
-  std::pair<Type, bool> leaf(Field field) {
-    Type type = field.getValue().getType();
-    unsigned id = field.getFieldID();
-    bool flipped = false;
-    while (id) {
-      if (auto bundle = dyn_cast<BundleType>(type)) {
-        if (id > bundle.getMaxFieldID()) return {};
-        auto [index, childID] = bundle.getIndexAndSubfieldID(id);
-        auto element = bundle.getElement(index);
-        flipped ^= element.isFlip;
-        type = element.type; id = childID;
-      } else if (auto vector = dyn_cast<FVectorType>(type)) {
-        if (id > vector.getMaxFieldID()) return {};
-        auto childID = vector.getIndexAndSubfieldID(id).second;
-        type = vector.getElementType(); id = childID;
-      } else return {};
-    }
-    return {type, flipped};
   }
   Field trace(FModuleOp module, Field field, llvm::DenseSet<Field> &active) {
     if (!field) return {};
@@ -244,7 +248,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       break;
     }
   }
-  auto baseField = resolveClock(circuit, top, baseTarget, error);
+  auto baseField = resolveField(circuit, top, baseTarget, error);
   if (!baseField) return failure();
   LocalClockAliases aliases(circuit, top);
   // Local accounting uses BridgeTopWiring's root; the synchronizers and
@@ -255,14 +259,14 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     return failure();
   }
   SmallVector<Source> events;
-  llvm::DenseSet<Value> creditTargets, debitTargets;
+  llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::DenseSet<Operation *> seen;
   for (auto a : sources) {
     auto target = a.getMember<StringAttr>("target");
-    Value event = resolve(circuit, top, target, error);
+    auto event = resolveField(circuit, top, target, error);
     if (!event) return failure();
-    auto eventClock = resolveClock(circuit, top, a.getMember<StringAttr>("clock"), error);
+    auto eventClock = resolveField(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
     if (!boolean(event) || !(aliases.root(eventClock) == clockRoot)) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
@@ -272,22 +276,22 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       error = "trigger hardware currently needs distinct source targets per sourceType";
       return failure();
     }
-    Value reset;
+    circt::FieldRef reset;
     if (auto resetTarget = a.getMember<StringAttr>("reset")) {
-      reset = resolve(circuit, top, resetTarget, error);
+      reset = resolveField(circuit, top, resetTarget, error);
       if (!reset) return failure();
       if (!boolean(reset)) { error = "trigger reset must be UInt<1>"; return failure(); }
     } else if (a.getDict().get("reset")) {
       error = "trigger reset must be a reference when present"; return failure();
     }
-    auto name = target.getValue().split('>').second.str();
+    auto name = getFieldName(event, /*nameSafe=*/true).first;
     events.push_back({event, reset, credit, name});
   }
   DominanceInfo dominance(circuit);
   for (auto a : sinks) {
     Value value = resolve(circuit, top, a.getMember<StringAttr>("target"), error);
     if (!value) return failure();
-    auto sinkClock = resolveClock(circuit, top, a.getMember<StringAttr>("clock"), error);
+    auto sinkClock = resolveField(circuit, top, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
     auto node = value.getDefiningOp<NodeOp>();
     if (!node || !boolean(value) || !(aliases.root(sinkClock) == clockRoot)) {
@@ -325,9 +329,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   };
   SmallVector<Value> creditSignals, debitSignals;
   for (auto event : events) {
-    Value signal = event.event;
+    Value signal = getValueByFieldID(ImplicitLocOpBuilder(loc, b),
+                                    event.event.getValue(), event.event.getFieldID());
     if (event.reset) {
-      Value active = b.create<NotPrimOp>(loc, event.reset);
+      Value reset = getValueByFieldID(ImplicitLocOpBuilder(loc, b),
+                                     event.reset.getValue(), event.reset.getFieldID());
+      Value active = b.create<NotPrimOp>(loc, reset);
       signal = named(b.create<AndPrimOp>(loc, active, signal), event.name + "_masked");
     }
     (event.credit ? creditSignals : debitSignals).push_back(signal);

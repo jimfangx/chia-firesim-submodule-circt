@@ -488,6 +488,85 @@ void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
     require(!ec, "cannot write aggregate clock target candidate"); root->print(out); out << '\n';
   }
 }
+// Aggregate event/reset references are renamed to these same UInt leaves by
+// Scala LowerTypes. Failed leaf selection must not leave projections behind.
+void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
+  const std::string type = "!firrtl.bundle<events: vector<bundle<credit: uint<1>, debit: uint<1>, reset: uint<1>>, 2>, wide: uint<2>, clock: clock>";
+  std::string body = mode == 2 ?
+    "%data = firrtl.wire : " + type + "\nfirrtl.strictconnect %data, %payload : " + type + "\n" :
+    "%data = firrtl.node %payload : " + type + "\n";
+  body += "%one = firrtl.constant 1 : !firrtl.uint<1>\n%trigger = firrtl.node %one : !firrtl.uint<1>\nfirrtl.strictconnect %enabled, %trigger : !firrtl.uint<1>\n";
+  auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { firrtl.module @Top(in %clock: !firrtl.clock, in %payload: " + type + ", out %enabled: !firrtl.uint<1>) {" + body + "} } }", &context);
+  require(bool(root), "aggregate event target parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context);
+  auto ref = [&](StringRef name) { return b.getStringAttr(("~Top|Top>" + name).str()); };
+  std::string stem = mode == 0 || mode >= 3 ? "payload" : "data";
+  std::string credit = stem + ".events[0].credit", debit = stem + ".events[1].debit";
+  std::string reset = stem + ".events[0].reset";
+  if (mode == 3) credit = "payload.events";
+  if (mode == 4) credit = "payload.events[2].credit";
+  if (mode == 5) credit = "payload.events[0].missing";
+  if (mode == 6) credit = "payload.wide";
+  if (mode == 7) credit = "payload.clock";
+  if (mode == 8) reset = "payload.wide";
+  if (mode == 9) reset = "payload.events[2].reset";
+  SmallVector<Attribute> annotations;
+  annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("clock")}))}));
+  auto addSource = [&](StringRef target, bool isCredit) {
+    NamedAttrList a;
+    a.set("class", b.getStringAttr(A::InternalTriggerSource));
+    a.set("target", ref(target)); a.set("clock", ref("clock"));
+    a.set("sourceType", b.getBoolAttr(isCredit));
+    if (isCredit) a.set("reset", ref(reset));
+    annotations.push_back(a.getDictionary(&context));
+  };
+  addSource(credit, true); addSource(debit, false);
+  if (mode == 10) addSource("payload.events.0.credit", true);
+  // Two leaves of the same aggregate SSA value are distinct credit sources.
+  if (mode == 11) addSource("payload.events[1].credit", true);
+  annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+    b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref("clock"))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto before = dump(root.get());
+  unsigned consumed = 99; std::string error;
+  auto result = goldengate::wireTriggers(circuit, consumed, error);
+  if (mode >= 3 && mode != 11) {
+    require(failed(result) && consumed == 0 && dump(root.get()) == before,
+            "aggregate event/reset rejection must be atomic: " + std::to_string(mode));
+    require(!error.empty(), "missing aggregate event/reset diagnostic"); return;
+  }
+  require(succeeded(result), error);
+  require(consumed == (mode == 11 ? 3 : 2) && succeeded(verify(*root)), "aggregate event candidate invalid");
+  unsigned registers = 0, masked = 0;
+  Value eventRoot = mode == 1 || mode == 2 ? Value() : top.getBodyBlock()->getArgument(1);
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name"); name && name == "data" && (mode == 1 || mode == 2)) eventRoot = op->getResult(0);
+  });
+  top.walk([&](RegOp reg) { ++registers; });
+  top.walk([&](NodeOp node) {
+    if (node.getName() != stem + "_events_0_credit_masked") return;
+    ++masked;
+    auto gate = node.getInput().getDefiningOp<AndPrimOp>();
+    require(bool(gate), "aggregate reset mask AND");
+    auto negate = gate.getLhs().getDefiningOp<NotPrimOp>();
+    require(bool(negate), "aggregate reset mask NOT");
+    require(getFieldRefFromValue(gate.getRhs()) == circt::FieldRef(eventRoot, 3) &&
+            getFieldRefFromValue(negate.getInput()) == circt::FieldRef(eventRoot, 5),
+            "selected aggregate event/reset mask identities mode=" + std::to_string(mode) + " event=" + std::to_string(getFieldRefFromValue(gate.getRhs()).getFieldID()) + " reset=" + std::to_string(getFieldRefFromValue(negate.getInput()).getFieldID()));
+  });
+  require(registers == 9 && masked == 1, "aggregate event accounting and Scala flattened mask name");
+  require(cast<ArrayAttr>(circuit->getAttr("rawAnnotations")).size() == 1, "aggregate event annotation cleanup");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "cannot write aggregate event candidate"); root->print(out); out << '\n';
+  }
+}
+
 }
 int main(int argc, char **argv) {
   try {
@@ -515,6 +594,10 @@ int main(int argc, char **argv) {
     clockTargets(context, 1, argc > 11 ? argv[11] : "");
     clockTargets(context, 2, argc > 12 ? argv[12] : "");
     for (unsigned mode : {3, 4, 5, 6, 7, 8, 9, 10}) clockTargets(context, mode, "");
+    eventTargets(context, 0, argc > 13 ? argv[13] : "");
+    eventTargets(context, 1, argc > 14 ? argv[14] : "");
+    eventTargets(context, 2, argc > 15 ? argv[15] : "");
+    for (unsigned mode = 3; mode <= 11; ++mode) eventTargets(context, mode, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
