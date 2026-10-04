@@ -5,11 +5,13 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Support/Namespace.h"
+#include "circt/Support/InstanceGraph.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Dominance.h"
 #include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/StringMap.h"
 
 using namespace circt::firrtl;
@@ -47,20 +49,31 @@ bool boolean(Value v) {
 }
 // Annotations may select aggregate leaves before LowerTypes. Resolve
 // identity without building projections: malformed targets must be atomic.
-circt::FieldRef resolveField(CircuitOp circuit, FModuleOp top, StringAttr target,
-                            std::string &error) {
+struct LocalField { FModuleOp module; circt::FieldRef field; };
+LocalField resolveLocalField(CircuitOp circuit, StringAttr target,
+                             std::string &error) {
   if (!target) { error = "trigger annotation has a missing field reference"; return {}; }
   std::string portError;
   if (auto port = goldengate::resolveAnnotationTarget(circuit, target.getValue(), portError)) {
-    if (port->module == top && port->port)
-      return circt::FieldRef(top.getBodyBlock()->getArgument(*port->port),
-                             port->fieldID.value_or(0));
+    auto module = dyn_cast<FModuleOp>(port->module.getOperation());
+    if (module && port->port)
+      return {module, circt::FieldRef(module.getBodyBlock()->getArgument(*port->port),
+                                    port->fieldID.value_or(0))};
   }
   if (auto local = goldengate::resolveInternalFieldTarget(circuit, target.getValue(), error)) {
-    if (local->module == top && local->declaration->getBlock() == top.getBodyBlock())
-      return circt::FieldRef(local->declaration->getResult(0), local->fieldID);
+    auto module = dyn_cast<FModuleOp>(local->module.getOperation());
+    if (module && local->declaration->getBlock() == module.getBodyBlock())
+      return {module, circt::FieldRef(local->declaration->getResult(0), local->fieldID)};
   }
-  error = "trigger reference needs a local field in the circuit top: " + target.getValue().str();
+  error = "trigger reference needs a local field in an internal module: " + target.getValue().str();
+  return {};
+}
+circt::FieldRef resolveField(CircuitOp circuit, FModuleOp module, StringAttr target,
+                            std::string &error) {
+  auto local = resolveLocalField(circuit, target, error);
+  if (!local.field) return {};
+  if (local.module == module) return local.field;
+  error = "trigger clock/reset reference must belong to its accounting module: " + target.getValue().str();
   return {};
 }
 // Return the selected leaf type and its accumulated bundle orientation.
@@ -117,6 +130,15 @@ public:
     // Retain the selected input leaf. Projections have different SSA identities
     // and must not merge distinct clocks belonging to the same aggregate port.
     return trace(top, field, active);
+  }
+  Field root(FModuleOp module, Field field, InstanceOp parent) {
+    if (module == top) return root(field);
+    llvm::DenseSet<Field> active;
+    auto childRoot = trace(module, field, active);
+    auto arg = childRoot ? dyn_cast<BlockArgument>(childRoot.getValue()) : BlockArgument();
+    if (!arg || arg.getOwner() != module.getBodyBlock() ||
+        arg.getArgNumber() >= parent.getNumResults()) return {};
+    return trace(top, Field(parent.getResult(arg.getArgNumber()), childRoot.getFieldID()), active);
   }
 private:
   // Index clock leaves without creating Subfield/Subindex operations. Two
@@ -259,16 +281,39 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     return failure();
   }
   SmallVector<Source> events;
+  circt::igraph::InstanceGraph graph(circuit);
+  llvm::MapVector<Operation *, InstanceOp> sourceInstances;
+  llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::DenseSet<Operation *> seen;
   for (auto a : sources) {
     auto target = a.getMember<StringAttr>("target");
-    auto event = resolveField(circuit, top, target, error);
+    auto local = resolveLocalField(circuit, target, error);
+    auto event = local.field;
     if (!event) return failure();
-    auto eventClock = resolveField(circuit, top, a.getMember<StringAttr>("clock"), error);
+    InstanceOp parent;
+    if (local.module != top) {
+      auto found = sourceInstances.find(local.module);
+      if (found != sourceInstances.end()) parent = found->second;
+      else {
+        // A pathless Scala source fans out across all instances. This increment
+        // handles one direct child only; reject ambiguous scope before adding IO.
+        for (auto *use : graph.lookup(local.module)->uses()) {
+          if (parent) { error = "trigger child source needs one direct top instance"; return failure(); }
+          parent = use->getInstance<InstanceOp>();
+          if (!parent || parent->getBlock() != top.getBodyBlock() ||
+              parent.getNumResults() != local.module.getNumPorts()) {
+            error = "trigger child source needs one direct top instance"; return failure();
+          }
+        }
+        if (!parent) { error = "trigger child source needs one direct top instance"; return failure(); }
+        sourceInstances[local.module] = parent;
+      }
+    }
+    auto eventClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
-    if (!boolean(event) || !(aliases.root(eventClock) == clockRoot)) {
+    if (!boolean(event) || !(aliases.root(local.module, eventClock, parent) == clockRoot)) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
     }
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
@@ -278,13 +323,14 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     }
     circt::FieldRef reset;
     if (auto resetTarget = a.getMember<StringAttr>("reset")) {
-      reset = resolveField(circuit, top, resetTarget, error);
+      reset = resolveField(circuit, local.module, resetTarget, error);
       if (!reset) return failure();
       if (!boolean(reset)) { error = "trigger reset must be UInt<1>"; return failure(); }
     } else if (a.getDict().get("reset")) {
       error = "trigger reset must be a reference when present"; return failure();
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
+    if (local.module != top) childEvents[local.module].push_back(events.size());
     events.push_back({event, reset, credit, name});
   }
   DominanceInfo dominance(circuit);
@@ -303,6 +349,48 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (seen.insert(node).second) nodes.push_back({node, sinkClock});
   }
   // All unsupported scope/type/clock cases have been rejected before mutation.
+  llvm::DenseMap<unsigned, Value> routed;
+  for (auto &[operation, indices] : childEvents) {
+    auto child = cast<FModuleOp>(operation);
+    circt::Namespace childNames;
+    for (auto name : child.getPortNamesAttr()) childNames.newName(cast<StringAttr>(name).getValue());
+    child.walk([&](Operation *op) {
+      if (auto name = op->getAttrOfType<StringAttr>("name")) childNames.newName(name.getValue());
+    });
+    ImplicitLocOpBuilder childBuilder(child.getLoc(), circuit.getContext());
+    childBuilder.setInsertionPointToEnd(child.getBodyBlock());
+    SmallVector<std::pair<unsigned, PortInfo>> added;
+    SmallVector<Value> signals;
+    unsigned oldPorts = child.getNumPorts();
+    for (unsigned index : indices) {
+      auto &event = events[index];
+      Value signal = getValueByFieldID(childBuilder, event.event.getValue(), event.event.getFieldID());
+      std::string signalName = event.name;
+      if (event.reset) {
+        Value reset = getValueByFieldID(childBuilder, event.reset.getValue(), event.reset.getFieldID());
+        Value active = childBuilder.create<NotPrimOp>(reset);
+        signalName = childNames.newName(event.name + "_masked");
+        signal = childBuilder.create<NodeOp>(childBuilder.create<AndPrimOp>(active, signal),
+                                            childBuilder.getStringAttr(signalName)).getResult();
+      }
+      auto portName = childNames.newName("simulationTrigger_" + signalName);
+      added.push_back({oldPorts, PortInfo(childBuilder.getStringAttr(portName),
+          UIntType::get(circuit.getContext(), 1), Direction::Out)});
+      signals.push_back(signal);
+    }
+    child.insertPorts(added);
+    for (unsigned i = 0; i < signals.size(); ++i)
+      childBuilder.create<StrictConnectOp>(child.getBodyBlock()->getArgument(oldPorts + i), signals[i]);
+    auto instance = sourceInstances.lookup(operation);
+    auto replacement = instance.cloneAndInsertPorts(added);
+    for (auto attr : instance->getAttrs())
+      if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
+    for (unsigned i = 0; i < oldPorts; ++i)
+      instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
+    for (unsigned i = 0; i < indices.size(); ++i)
+      routed[indices[i]] = replacement.getResult(oldPorts + i);
+    instance.erase();
+  }
   circt::Namespace names;
   for (auto name : top.getPortNamesAttr()) names.newName(cast<StringAttr>(name).getValue());
   top.walk([&](Operation *op) {
@@ -328,7 +416,11 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
                            names.newName(name)).getResult();
   };
   SmallVector<Value> creditSignals, debitSignals;
-  for (auto event : events) {
+  for (auto [index, event] : llvm::enumerate(events)) {
+    if (auto signal = routed.lookup(index)) {
+      (event.credit ? creditSignals : debitSignals).push_back(signal);
+      continue;
+    }
     Value signal = getValueByFieldID(ImplicitLocOpBuilder(loc, b),
                                     event.event.getValue(), event.event.getFieldID());
     if (event.reset) {

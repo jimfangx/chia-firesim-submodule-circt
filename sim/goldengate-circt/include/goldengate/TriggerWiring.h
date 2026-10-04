@@ -12,13 +12,17 @@ namespace goldengate {
 // forwarded through internal instances to the same top input Clock leaf.
 // Clock annotation targets may select typed bundle/vector leaves of top ports,
 // wires or nodes; selected base/sink clocks remain the register clock operands.
-// Event/reset targets may select top-local UInt<1> bundle/vector leaves, with
+// Event/reset targets may select local UInt<1> bundle/vector leaves in the top
+// or a child instantiated once directly under the top, with
 // field identity used for duplicate detection and flattened masked-event names.
 // Requires: retained raw annotations; ground top-local UInt<1> node sinks;
 // each sink clock dominates its node declaration.
 // Consumes: TriggerSource/TriggerSink and their internal annotation classes.
-// Produces: no annotations; preserves unrelated annotation order and module IO.
-// Mutates: top clock/event/reset projections, local/global counters,
+// Produces: no annotations; preserves unrelated annotation order and top IO.
+// Child events are masked locally and exported through appended output ports;
+// the parent instance retains its original attributes and port connections.
+// Mutates: child event/reset projections and output ports, parent instances,
+// top clock/event/reset projections, local/global counters,
 // synchronizers and sink node inputs. Uses read-only field/hierarchy driver analysis before mutation;
 // does not preserve top dataflow or dominance analyses after adding hardware.
 // Output: nine registers for one accounting domain and one sink, with Scala's

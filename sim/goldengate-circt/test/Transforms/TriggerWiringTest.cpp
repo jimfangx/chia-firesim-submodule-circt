@@ -4,6 +4,7 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/ImplicitLocOpBuilder.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
@@ -567,6 +568,92 @@ void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
   }
 }
 
+// Source events belong to the child definition; reset masking must happen there
+// before the exported event reaches the top accounting domain.
+void childSources(MLIRContext &context, unsigned mode, StringRef output) {
+  std::string payload = "!firrtl.bundle<events: vector<bundle<credit: uint<1>, debit: uint<1>, reset: uint<1>>, 2>>";
+  std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>";
+  if (mode == 1) childPorts += ", in %payload: " + payload;
+  std::string instancePorts = "in clock: !firrtl.clock, in credit: !firrtl.uint<1>, in debit: !firrtl.uint<1>, in reset: !firrtl.uint<1>";
+  if (mode == 1) instancePorts += ", in payload: " + payload;
+  childPorts += ", out %echo: !firrtl.uint<1>";
+  instancePorts += ", out echo: !firrtl.uint<1>";
+  std::string text = "module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { firrtl.module @Child(" + childPorts + ") {} firrtl.module @Top(in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>, out %echo: !firrtl.uint<1>) { %child:" + (mode == 1 ? "6" : "5") + " = firrtl.instance child @Child(" + instancePorts + ") } } }";
+  auto root = parseSourceString<ModuleOp>(text, &context);
+  require(bool(root), "parse child source fixture");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto modules = circuit.getOps<FModuleOp>(); auto it = modules.begin();
+  auto child = *it++; auto top = *it;
+  auto instance = *top.getBodyBlock()->getOps<InstanceOp>().begin();
+  OpBuilder b(&context); auto loc = top.getLoc();
+  instance->setAttr("example.metadata", b.getStringAttr("preserve"));
+  b.setInsertionPointToEnd(child.getBodyBlock());
+  if (mode == 6) b.create<NodeOp>(loc, child.getBodyBlock()->getArgument(0), b.getStringAttr("clockAlias"));
+  Value credit = child.getBodyBlock()->getArgument(1), debit = child.getBodyBlock()->getArgument(2);
+  if (mode == 1) {
+    ImplicitLocOpBuilder fields(loc, b);
+    credit = getValueByFieldID(fields, child.getBodyBlock()->getArgument(4), 3);
+    debit = getValueByFieldID(fields, child.getBodyBlock()->getArgument(4), 8);
+  }
+  auto creditNode = b.create<NodeOp>(loc, credit, b.getStringAttr("creditEvent"));
+  b.create<StrictConnectOp>(loc, child.getBodyBlock()->getArgument(child.getNumPorts() - 1), creditNode.getResult());
+  b.create<NodeOp>(loc, debit, b.getStringAttr("debitEvent"));
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  for (unsigned i = 0; i < 4; ++i)
+    b.create<StrictConnectOp>(loc, instance.getResult(i), top.getBodyBlock()->getArgument(mode == 3 && i == 0 ? 4 : i));
+  if (mode == 1) {
+    ImplicitLocOpBuilder fields(loc, b);
+    auto zero = b.create<ConstantOp>(loc, UIntType::get(&context, 1), llvm::APInt(1, 0));
+    for (auto [id, src] : SmallVector<std::pair<unsigned, Value>>{{3, top.getBodyBlock()->getArgument(1)}, {4, zero}, {5, top.getBodyBlock()->getArgument(3)}, {7, zero}, {8, top.getBodyBlock()->getArgument(2)}, {9, zero}})
+      b.create<StrictConnectOp>(loc, getValueByFieldID(fields, instance.getResult(4), id), src);
+  }
+  b.create<StrictConnectOp>(loc, top.getBodyBlock()->getArgument(6), instance.getResult(child.getNumPorts() - 1));
+  if (mode == 2) {
+    auto other = cast<InstanceOp>(b.clone(*instance.getOperation()));
+    other.setNameAttr(b.getStringAttr("other"));
+  }
+  auto one = b.create<ConstantOp>(loc, UIntType::get(&context, 1), llvm::APInt(1, 1));
+  auto trigger = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("trigger"));
+  b.create<StrictConnectOp>(loc, top.getBodyBlock()->getArgument(5), trigger.getResult());
+  auto ref = [&](StringRef module, StringRef name) { return b.getStringAttr(("~Top|" + module + ">" + name).str()); };
+  SmallVector<Attribute> annos;
+  annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)), b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})), b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))}));
+  for (bool credit : {true, false}) {
+    NamedAttrList a; a.set("class", b.getStringAttr(A::InternalTriggerSource));
+    a.set("target", ref("Child", credit ? "creditEvent" : "debitEvent"));
+    a.set("clock", ref("Child", mode == 6 ? "clockAlias" : "clock")); a.set("sourceType", b.getBoolAttr(credit));
+    if (credit) a.set("reset", ref(mode == 4 ? "Top" : "Child", mode == 1 ? "payload.events[0].reset" : "reset"));
+    annos.push_back(a.getDictionary(&context));
+  }
+  annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)), b.getNamedAttr("target", ref("Top", mode == 5 ? "credit" : "trigger")), b.getNamedAttr("clock", ref("Top", "clock"))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
+  auto before = dump(root.get()); unsigned consumed = 99; std::string error;
+  auto result = goldengate::wireTriggers(circuit, consumed, error);
+  if (mode >= 2 && mode != 6) {
+    require(failed(result) && consumed == 0 && !error.empty() && dump(root.get()) == before,
+            "child source failure must preserve module IO, instances and annotations: " + std::to_string(mode)); return;
+  }
+  require(succeeded(result), error);
+  require(consumed == 2 && succeeded(verify(*root)), "invalid child trigger candidate");
+  require(top.getNumPorts() == 7 && child.getNumPorts() == (mode == 1 ? 8 : 7), "child event exports changed original IO");
+  auto replacement = *top.getBodyBlock()->getOps<InstanceOp>().begin();
+  bool echoPreserved = false;
+  for (auto connect : top.getBodyBlock()->getOps<StrictConnectOp>())
+    if (connect.getDest() == top.getBodyBlock()->getArgument(6))
+      echoPreserved = connect.getSrc() == replacement.getResult(child.getNumPorts() - 3);
+  require(echoPreserved, "existing child output result use lost during replacement");
+  require(replacement->getAttrOfType<StringAttr>("example.metadata") == "preserve", "parent instance metadata lost");
+  require(child.getPortName(child.getNumPorts() - 2) == "simulationTrigger_creditEvent_masked" &&
+          child.getPortName(child.getNumPorts() - 1) == "simulationTrigger_debitEvent", "Scala child event export names");
+  unsigned registers = 0, masks = 0, childRegisters = 0;
+  top.walk([&](RegOp reg) { ++registers; require(reg.getClockVal() == top.getBodyBlock()->getArgument(0), "child trigger top accounting clock"); });
+  child.walk([&](RegOp reg) { ++childRegisters; });
+  child.walk([&](NodeOp node) { if (node.getName() == "creditEvent_masked") ++masks; });
+  require(registers == 9 && masks == 1 && childRegisters == 0, "child masking/top accounting placement");
+  require(cast<ArrayAttr>(circuit->getAttr("rawAnnotations")).size() == 1, "child annotation cleanup");
+  if (!output.empty()) { std::error_code ec; llvm::raw_fd_ostream out(output, ec); require(!ec, "write child source candidate"); root->print(out); out << '\n'; }
+}
+
 }
 int main(int argc, char **argv) {
   try {
@@ -598,6 +685,10 @@ int main(int argc, char **argv) {
     eventTargets(context, 1, argc > 14 ? argv[14] : "");
     eventTargets(context, 2, argc > 15 ? argv[15] : "");
     for (unsigned mode = 3; mode <= 11; ++mode) eventTargets(context, mode, "");
+    childSources(context, 0, argc > 16 ? argv[16] : "");
+    childSources(context, 1, argc > 17 ? argv[17] : "");
+    childSources(context, 6, "");
+    for (unsigned mode : {2, 3, 4, 5}) childSources(context, mode, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
