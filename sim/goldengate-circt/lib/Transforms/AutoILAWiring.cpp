@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/AutoILAWiring.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/HostClockWiring.h"
 #include "circt/Support/InstanceGraph.h"
 #include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
@@ -27,7 +28,50 @@ struct ModuleRoutes {
   SmallVector<Route, 0> routes;
   SmallVector<std::pair<unsigned, PortInfo>> added;
 };
+bool isTemporaryILAAnnotation(Attribute attr) {
+  auto dict = dyn_cast<DictionaryAttr>(attr);
+  auto cls = dict ? dict.getAs<StringAttr>("class") : StringAttr();
+  return cls && (cls.getValue() == goldengate::AnnotationClasses::InternalFpgaDebug ||
+      cls.getValue() == "firrtl.transforms.TopWiring.TopWiringAnnotation" ||
+      cls.getValue() == "firrtl.transforms.TopWiring.TopWiringOutputFilesAnnotation");
+}
 } // namespace
+
+LogicalResult goldengate::prepareAutoILAAnnotations(
+    CircuitOp circuit, bool internalizePublic, StringRef originalCircuit,
+    std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "AutoILA preparation requires retained annotations";
+    return failure();
+  }
+  OpBuilder b(circuit.getContext()); SmallVector<Attribute> updated;
+  for (auto attr : raw) {
+    auto dict = dyn_cast<DictionaryAttr>(attr);
+    auto cls = dict ? dict.getAs<StringAttr>("class") : StringAttr();
+    bool convert = cls && internalizePublic && cls.getValue() == AnnotationClasses::FpgaDebug;
+    bool carry = cls && !originalCircuit.empty() && cls.getValue() == AnnotationClasses::InternalFpgaDebug;
+    if (!convert && !carry) { updated.push_back(attr); continue; }
+    NamedAttrList fields(dict);
+    if (convert) fields.set("class", b.getStringAttr(AnnotationClasses::InternalFpgaDebug));
+    if (carry) {
+      auto target = dict.getAs<StringAttr>("target");
+      if (!target) { error = "AutoILA debug annotation lacks a string target"; return failure(); }
+      StringRef spelling = target.getValue();
+      bool modern = spelling.starts_with("~");
+      auto split = modern ? spelling.drop_front().split('|') : spelling.split('.');
+      if ((split.first != originalCircuit && split.first != circuit.getName()) || split.second.empty()) {
+        error = "AutoILA debug target has an unexpected circuit identity";
+        return failure();
+      }
+      fields.set("target", b.getStringAttr((modern ? "~" : "") + circuit.getName().str() +
+          (modern ? "|" : ".") + split.second.str()));
+    }
+    updated.push_back(fields.getDictionary(circuit.getContext()));
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(updated));
+  return success();
+}
 
 LogicalResult goldengate::wireAutoILAProbesToTop(
     CircuitOp circuit, SmallVectorImpl<WiredILAProbe> &outputs,
@@ -248,11 +292,7 @@ LogicalResult goldengate::attachAutoILAWrapper(
     annotation(AnnotationClasses::HostClockSink, {
         b.getNamedAttr("target", b.getStringAttr("~" + circuit.getName().str() + "|" + top.getName().str() + ">" + instanceName + "." + clockName))})};
   for (auto attr : raw) {
-    auto dict = dyn_cast<DictionaryAttr>(attr);
-    auto cls = dict ? dict.getAs<StringAttr>("class") : StringAttr();
-    if (cls && (cls.getValue() == AnnotationClasses::InternalFpgaDebug ||
-        cls.getValue() == "firrtl.transforms.TopWiring.TopWiringAnnotation" ||
-        cls.getValue() == "firrtl.transforms.TopWiring.TopWiringOutputFilesAnnotation")) continue;
+    if (isTemporaryILAAnnotation(attr)) continue;
     annotations.push_back(attr);
   }
   b.setInsertionPointToEnd(circuit.getBodyBlock());
@@ -269,5 +309,44 @@ LogicalResult goldengate::attachAutoILAWrapper(
   top.erasePorts(removed);
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   wrapper = instance;
+  return success();
+}
+
+LogicalResult goldengate::runAutoILA(
+    CircuitOp circuit, bool enabled, const ILAWrapperOptions &options,
+    unsigned &probeCount, std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "AutoILA requires retained annotations";
+    return failure();
+  }
+  bool selected = llvm::any_of(raw, [](Attribute attr) {
+    auto dict = dyn_cast<DictionaryAttr>(attr);
+    auto cls = dict ? dict.getAs<StringAttr>("class") : StringAttr();
+    return cls && cls.getValue() == AnnotationClasses::InternalFpgaDebug;
+  });
+  if (!enabled || !selected) {
+    SmallVector<Attribute> retained;
+    for (auto attr : raw)
+      if (!isTemporaryILAAnnotation(attr)) retained.push_back(attr);
+    circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), retained));
+    probeCount = 0;
+    return success();
+  }
+  // Validate options before hierarchy wiring changes any module signature.
+  StringRef filename(options.outputBaseFilename);
+  if (filename.empty() || filename == "." || filename == ".." ||
+      filename.find_first_of("/\\") != StringRef::npos ||
+      filename.contains('\0') || !options.dataDepth || !options.probeTriggers) {
+    error = "AutoILA requires a local output filename and positive IP parameters";
+    return failure();
+  }
+  SmallVector<WiredILAProbe> routes;
+  if (failed(wireAutoILAProbesToTop(circuit, routes, error))) return failure();
+  InstanceOp wrapper;
+  if (failed(attachAutoILAWrapper(circuit, routes, options, wrapper, error))) return failure();
+  unsigned clocks = 0;
+  if (wrapper && failed(wireHostClock(circuit, clocks, error, true))) return failure();
+  probeCount = routes.size();
   return success();
 }

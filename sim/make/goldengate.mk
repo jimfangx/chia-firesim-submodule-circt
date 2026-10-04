@@ -24,6 +24,12 @@ goldengate_circt_build := $(GENERATED_DIR)/goldengate-circt-build
 # enabled counter synthesis is ported, an explicit enabled request must fail.
 GOLDENGATE_CIRCT_AUTOCOUNTER ?= disabled
 GOLDENGATE_CIRCT_MULTITHREADING ?= disabled
+# Translate the standard AutoILA compiler fragments; explicit variables also
+# support native invocations without a Scala compiler configuration instance.
+goldengate_circt_config_fragments := $(subst _, ,$(PLATFORM_CONFIG))
+GOLDENGATE_CIRCT_AUTOILA ?= $(if $(filter WithAutoILA,$(goldengate_circt_config_fragments)),enabled,disabled)
+GOLDENGATE_CIRCT_ILA_DEPTH ?= $(or $(patsubst ILADepth%,%,$(firstword $(filter ILADepth%,$(goldengate_circt_config_fragments)))),1024)
+GOLDENGATE_CIRCT_ILA_PROBE_TRIGGERS ?= 2
 
 .PHONY: verilog compile
 verilog: $(simulator_verilog)
@@ -33,6 +39,11 @@ compile: $(simulator_verilog)
 # Run the 1.3 version instead (checked-in). If dedup must be completely disabled,
 # pass --no-legacy-dedup as well
 ifeq ($(GOLDENGATE_COMPILER),circt)
+ifeq ($(GOLDENGATE_CIRCT_AUTOILA),enabled)
+goldengate_circt_ila_flags := --enable-autoila --ila-depth $(GOLDENGATE_CIRCT_ILA_DEPTH) --ila-probe-triggers $(GOLDENGATE_CIRCT_ILA_PROBE_TRIGGERS)
+else ifneq ($(GOLDENGATE_CIRCT_AUTOILA),disabled)
+$(error GOLDENGATE_CIRCT_AUTOILA must be enabled or disabled)
+endif
 ifneq ($(findstring WithAutoCounter,$(PLATFORM_CONFIG)),)
 $(error CIRCT Golden Gate has not ported the WithAutoCounter compiler config)
 endif
@@ -58,9 +69,11 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) 
 		-DZLIB_ROOT=$(abspath $(GOLDENGATE_CIRCT_PREFIX)/..)
 	cmake --build $(goldengate_circt_build)
 	rm -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f
+	# A disabled rebuild must not retain a previous enabled build's ILA IP.
+	rm -f $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl $(GENERATED_DIR)/$(BASE_FILE_NAME).*.ipgen.tcl
 	$(goldengate_circt_build)/goldengate-circt $(FIRRTL_FILE) \
 		--annotation-file $(ANNO_FILE) --output-dir $(GENERATED_DIR)/circt-ingestion \
-		--compile-baseline --output-filename-base $(BASE_FILE_NAME)
+		--compile-baseline --output-filename-base $(BASE_FILE_NAME) $(goldengate_circt_ila_flags)
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).sv $(simulator_verilog)
 	@if test -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; then \
 		while IFS= read -r blackbox || test -n "$$blackbox"; do \
@@ -74,6 +87,9 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) 
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).implementation.xdc $(GENERATED_DIR)/$(BASE_FILE_NAME).implementation.xdc
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).defines.vh $(GENERATED_DIR)/$(BASE_FILE_NAME).defines.vh
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).const.h $(header)
+	@for collateral in $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl; do \
+		if test -f "$$collateral"; then cp "$$collateral" $(GENERATED_DIR)/; fi; \
+	done
 	cp $(GENERATED_DIR)/circt-ingestion/post-bridge-extraction-all.json $(fame_annos)
 else ifeq ($(GOLDENGATE_COMPILER),sfc)
 $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)

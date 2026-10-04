@@ -265,7 +265,7 @@ int main(int argc, char **argv) {
   bool disableAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
   bool compileBaseline =
-      (argc == 7 || (argc == 9 && llvm::StringRef(argv[7]) == "--output-filename-base")) &&
+      argc >= 7 &&
       llvm::StringRef(argv[6]) == "--compile-baseline";
   if ((argc != 6 && !rewriteOutputValids && !addHostControl &&
        !rewriteInputChannel && !rewriteOutputChannel &&
@@ -305,13 +305,43 @@ int main(int argc, char **argv) {
                     "--complete-autocounter-print-synthesis | "
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
-                    "[--output-filename-base name]]\n";
+                    "[--output-filename-base name] [--enable-autoila] "
+                    "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
 
   llvm::StringRef firPath(argv[1]), annoPath(argv[3]), outputDir(argv[5]);
-  llvm::StringRef outputBase = compileBaseline && argc == 9
-                                  ? argv[8] : "FireSim-generated";
+  llvm::StringRef outputBase = "FireSim-generated";
+  bool enableAutoILA = false;
+  goldengate::ILAWrapperOptions ilaOptions;
+  if (compileBaseline) {
+    bool baseSeen = false, depthSeen = false, triggersSeen = false;
+    for (int i = 7; i < argc; ++i) {
+      llvm::StringRef option(argv[i]);
+      if (option == "--enable-autoila") {
+        if (enableAutoILA) return fail("duplicate --enable-autoila");
+        enableAutoILA = true;
+        continue;
+      }
+      if (i + 1 == argc) return fail("missing value for compiler option: " + option.str());
+      llvm::StringRef value(argv[++i]);
+      if (option == "--output-filename-base") {
+        if (baseSeen) return fail("duplicate --output-filename-base");
+        baseSeen = true;
+        outputBase = value;
+      } else if (option == "--ila-depth" || option == "--ila-probe-triggers") {
+        bool &seen = option == "--ila-depth" ? depthSeen : triggersSeen;
+        unsigned count = 0;
+        if (seen || value.getAsInteger(10, count) || !count)
+          return fail("ILA option requires one positive unsigned integer: " + option.str());
+        seen = true;
+        (option == "--ila-depth" ? ilaOptions.dataDepth : ilaOptions.probeTriggers) = count;
+      } else {
+        return fail("unknown compiler option: " + option.str());
+      }
+    }
+  }
+  ilaOptions.outputBaseFilename = outputBase.str();
   if (auto error = llvm::sys::fs::create_directories(outputDir))
     return fail("cannot create output directory: " + error.message());
 
@@ -348,6 +378,10 @@ int main(int argc, char **argv) {
   if (disableAutoCounter || compileBaseline) {
     std::string error;
     if (compileBaseline) {
+      // Scala ConvertExternalToInternalAnnotations gives debug selections the
+      // private Golden Gate identity before target lowering and host wrapping.
+      if (failed(goldengate::prepareAutoILAAnnotations(circuit, true, {}, error)))
+        return fail("AutoILA annotation conversion: " + error);
       // BridgeExtraction precedes the second SFC low-form lowering. Keep this
       // boundary in the normal CIRCT path as well: LowerTypes would otherwise
       // erase the aggregate bridge channel identities needed here.
@@ -3044,6 +3078,11 @@ int main(int argc, char **argv) {
       if (failed(goldengate::assembleF1Shim(circuit, error)))
         return fail("U250 F1 shim: " + error);
       if (failed(mlir::verify(*module))) return fail("U250 F1 shim produced invalid FIRRTL IR");
+      // Scala SimulationMapping generates the platform header before AutoILA
+      // appends internal probe/Clock export ports. Capture that same boundary;
+      // the metasim interface describes physical ports, not debug routes.
+      if (failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error)))
+        return fail("metasim interface header: " + error);
       llvm::SmallString<256> shimPath(outputDir), shimAnnotations(outputDir);
       llvm::sys::path::append(shimPath, "post-fame-f1-shim.mlir");
       llvm::sys::path::append(shimAnnotations, "post-fame-f1-shim-all.json");
@@ -3054,8 +3093,17 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, shimAnnotations, error)))
         return fail("F1 shim annotations: " + error);
       llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
-      if (failed(emitAutoILAAnalysis(circuit, outputDir, error)))
+      if (enableAutoILA && failed(goldengate::prepareAutoILAAnnotations(
+              circuit, false, originalTargetName, error)))
+        return fail("AutoILA circuit identity: " + error);
+      if (enableAutoILA && failed(emitAutoILAAnalysis(circuit, outputDir, error)))
         return fail("AutoILA analysis: " + error);
+      unsigned ilaProbes = 0;
+      if (failed(goldengate::runAutoILA(circuit, enableAutoILA, ilaOptions, ilaProbes, error)))
+        return fail("AutoILA host wiring: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("AutoILA host wiring produced invalid FIRRTL IR");
+      llvm::outs() << "Completed CIRCT AutoILA host wiring with " << ilaProbes << " probes\n";
       unsigned wiredHostClocks = 0;
       if (failed(goldengate::wireHostClock(circuit, wiredHostClocks, error)))
         return fail("host clock wiring: " + error);
@@ -3087,8 +3135,6 @@ int main(int argc, char **argv) {
       llvm::outs() << "Specialized CIRCT abstract clocks to Xilinx BUFGCE in " << xilinxPath << '\n';
       if (failed(goldengate::prepareXDCOutput(circuit, error)))
         return fail("XDC output preparation: " + error);
-      if (failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error)))
-        return fail("metasim interface header: " + error);
       if (failed(goldengate::prepareSimulationMasterHeader(circuit, error)))
         return fail("SimulationMaster driver header: " + error);
       if (failed(goldengate::prepareClockBridgeHeader(circuit, error)))

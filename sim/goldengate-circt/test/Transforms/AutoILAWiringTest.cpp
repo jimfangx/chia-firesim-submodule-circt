@@ -266,10 +266,85 @@ void wrapper(MLIRContext &context) {
           "host source not retained or annotation preservation/cleanup failed");
   require(succeeded(verify(*root)), "invalid wrapper IR");
 }
+void hostPhase(MLIRContext &context) {
+  OpBuilder b(&context);
+  {
+    auto root = fixture(context); auto circuit = *root->getOps<CircuitOp>().begin();
+    auto privateClass = b.getStringAttr(goldengate::AnnotationClasses::InternalFpgaDebug);
+    auto publicClass = b.getStringAttr(goldengate::AnnotationClasses::FpgaDebug);
+    auto anno = [&](StringAttr cls, StringRef target) { return b.getDictionaryAttr({
+        b.getNamedAttr("class", cls), b.getNamedAttr("target", b.getStringAttr(target))}); };
+    auto keep = anno(b.getStringAttr("example.Keep"), "Top.Leaf.a");
+    circuit->setAttr("rawAnnotations", b.getArrayAttr({anno(publicClass, "Top.Leaf.a"),
+        anno(privateClass, "~Top|Leaf>signed"), keep}));
+    std::string error;
+    require(succeeded(goldengate::prepareAutoILAAnnotations(circuit, true, {}, error)), error);
+    circuit.setNameAttr(b.getStringAttr("HostShim"));
+    require(succeeded(goldengate::prepareAutoILAAnnotations(circuit, false, "Top", error)), error);
+    require(circuit->getAttrOfType<ArrayAttr>("rawAnnotations") == b.getArrayAttr({
+        anno(privateClass, "HostShim.Leaf.a"), anno(privateClass, "~HostShim|Leaf>signed"), keep}),
+        "public conversion or circuit carry changed module/reference/unrelated identities");
+    require(succeeded(goldengate::prepareAutoILAAnnotations(circuit, false, "Foreign", error)),
+        "already carried identity should be accepted");
+    circuit->setAttr("rawAnnotations", b.getArrayAttr({anno(privateClass, "Other.Leaf.a"), keep}));
+    auto before = dump(root.get());
+    require(failed(goldengate::prepareAutoILAAnnotations(circuit, false, "Top", error)) &&
+        dump(root.get()) == before, "foreign debug target was silently carried or partially rewritten");
+  }
+  for (bool enabled : {false, true}) {
+    auto root = fixture(context); auto circuit = *root->getOps<CircuitOp>().begin();
+    auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> annotations;
+    if (!enabled) annotations.append(raw.begin(), raw.end() - 1);
+    // Disabled private targets need not be live (Scala also skips resolution).
+    if (!enabled) annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::InternalFpgaDebug)),
+        b.getNamedAttr("target", b.getStringAttr("Top.Missing.notLive"))}));
+    for (auto cls : {"firrtl.transforms.TopWiring.TopWiringAnnotation",
+                     "firrtl.transforms.TopWiring.TopWiringOutputFilesAnnotation"})
+      annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(cls))}));
+    auto keep = raw[raw.size() - 1]; annotations.push_back(keep);
+    auto publicDebug = b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::FpgaDebug)),
+        b.getNamedAttr("target", b.getStringAttr("~Top|Top>a"))});
+    annotations.push_back(publicDebug);
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+    auto body = dump(named(circuit, "Top"));
+    unsigned probes = 99; std::string error;
+    require(succeeded(goldengate::runAutoILA(circuit, enabled, {}, probes, error)), error);
+    require(probes == 0 && dump(named(circuit, "Top")) == body &&
+            circuit->getAttrOfType<ArrayAttr>("rawAnnotations") == b.getArrayAttr({keep, publicDebug}) &&
+            circuit.getOps<FExtModuleOp>().empty(), "disabled/no-selection cleanup changed hardware or unrelated annotations");
+  }
+  auto root = fixture(context); auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = named(circuit, "Top");
+  top.insertPorts({{2, PortInfo(b.getStringAttr("clock"), ClockType::get(&context), Direction::In)}});
+  SmallVector<Attribute> annotations(circuit->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+  auto source = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::HostClockSource)),
+      b.getNamedAttr("target", b.getStringAttr("~Top|Top>clock"))});
+  annotations.push_back(source); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  unsigned probes = 99; std::string error;
+  auto before = dump(root.get());
+  require(failed(goldengate::runAutoILA(circuit, true, {"../bad", 1024, 2}, probes, error)) &&
+          probes == 99 && dump(root.get()) == before, "invalid phase options changed hierarchy");
+  require(succeeded(goldengate::runAutoILA(circuit, true, {"host-output", 4096, 3}, probes, error)), error);
+  require(probes == 10 && top.getNumPorts() == 3, "host phase did not restore top interface");
+  unsigned clocks = 99;
+  require(succeeded(goldengate::wireHostClock(circuit, clocks, error)), error);
+  require(clocks == 0, "final phase rewired already wired ILA clock");
+  for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto cls = cast<DictionaryAttr>(attr).getAs<StringAttr>("class").getValue();
+    require(cls != goldengate::AnnotationClasses::HostClockSource &&
+            cls != goldengate::AnnotationClasses::HostClockSink &&
+            cls != goldengate::AnnotationClasses::InternalFpgaDebug, "final host annotations were not consumed");
+  }
+  require(succeeded(verify(*root)), "invalid complete host AutoILA phase");
+}
 } // namespace
 int main() {
   MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { routing(context); rejection(context); ambiguousNames(context); wrapper(context); }
+  try { routing(context); rejection(context); ambiguousNames(context); wrapper(context); hostPhase(context); }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
   llvm::outs() << "AutoILA hierarchy routes, shared uses, name collisions and atomic rejection passed\n";
   return 0;
