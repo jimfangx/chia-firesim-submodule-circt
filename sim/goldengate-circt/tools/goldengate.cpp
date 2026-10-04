@@ -231,6 +231,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter";
   bool analyzeAutoILA =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-ila";
+  bool wireILAWrapper =
+      argc == 7 && llvm::StringRef(argv[6]) == "--wire-ila-wrapper";
   bool wireILAProbes =
       argc == 7 && llvm::StringRef(argv[6]) == "--wire-ila-probes";
   bool gateAutoCounter =
@@ -273,7 +275,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes &&
+       !resolveDontTouch && !lowerTypes && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -292,7 +294,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--lower-types | --analyze-ila | --wire-ila-probes | --analyze-autocounter | --gate-autocounter-events | "
+                    "--lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -3397,13 +3399,13 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (analyzeAutoILA || wireILAProbes) {
+  if (analyzeAutoILA || wireILAProbes || wireILAWrapper) {
     std::string error;
     if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
       return fail("retained annotation LowerTypes: " + error);
     if (failed(emitAutoILAAnalysis(circuit, outputDir, error)))
       return fail("AutoILA analysis: " + error);
-    if (wireILAProbes) {
+    if (wireILAProbes || wireILAWrapper) {
       llvm::SmallVector<goldengate::WiredILAProbe> routes;
       if (failed(goldengate::wireAutoILAProbesToTop(circuit, routes, error)))
         return fail("AutoILA top wiring: " + error);
@@ -3413,10 +3415,35 @@ int main(int argc, char **argv) {
         summary.push_back(llvm::json::Object{
             {"index", route.source.index}, {"target", route.source.target},
             {"width", route.source.width}, {"top_target", route.topTarget}});
+      if (wireILAWrapper) {
+        goldengate::ILAWrapperOptions options{circuit.getName().str()};
+        for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {
+          auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+          auto cls = dict ? dict.getAs<mlir::StringAttr>("class") : mlir::StringAttr();
+          if (cls && cls.getValue() == "midas.stage.OutputBaseFilenameAnnotation") {
+            auto name = dict.getAs<mlir::StringAttr>("name");
+            if (!name) return fail("AutoILA output base filename is not a string");
+            options.outputBaseFilename = name.getValue().str();
+            break;
+          }
+        }
+        circt::firrtl::InstanceOp wrapper;
+        if (failed(goldengate::attachAutoILAWrapper(circuit, routes, options, wrapper, error)))
+          return fail("AutoILA wrapper: " + error);
+        unsigned clocks = 0;
+        if (wrapper && failed(goldengate::wireHostClock(circuit, clocks, error, true)))
+          return fail("AutoILA wrapper clock: " + error);
+        if (failed(mlir::verify(*module))) return fail("AutoILA wrapper produced invalid FIRRTL IR");
+        if (wrapper)
+          for (unsigned i = 0; i < routes.size(); ++i)
+            (*summary[i].getAsObject())["wrapper_target"] =
+                "~" + circuit.getName().str() + "|" + circuit.getName().str() +
+                ">" + wrapper.getName().str() + "." + wrapper.getPortName(i + 1).str();
+      }
       llvm::SmallString<256> irPath(outputDir), routePath(outputDir), annoPath(outputDir);
-      llvm::sys::path::append(irPath, "post-autoila-top-wiring.mlir");
+      llvm::sys::path::append(irPath, wireILAWrapper ? "post-autoila-wrapper.mlir" : "post-autoila-top-wiring.mlir");
       llvm::sys::path::append(routePath, "autoila-routes.json");
-      llvm::sys::path::append(annoPath, "post-autoila-top-wiring-all.json");
+      llvm::sys::path::append(annoPath, wireILAWrapper ? "post-autoila-wrapper-all.json" : "post-autoila-top-wiring-all.json");
       std::error_code ec;
       llvm::raw_fd_ostream irOut(irPath, ec);
       if (ec) return fail("cannot write AutoILA top wiring: " + ec.message());
@@ -3426,7 +3453,7 @@ int main(int argc, char **argv) {
       routeOut << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
       if (failed(goldengate::emitAllAnnotations(circuit, annoPath, error)))
         return fail("AutoILA top wiring annotations: " + error);
-      llvm::outs() << "Wired " << routes.size() << " CIRCT AutoILA probes to top outputs in " << irPath << '\n';
+      llvm::outs() << "Wired " << routes.size() << (wireILAWrapper ? " CIRCT AutoILA probes to wrapper inputs in " : " CIRCT AutoILA probes to top outputs in ") << irPath << '\n';
     }
     return 0;
   }

@@ -18,4 +18,20 @@ struct WiredILAProbe {
 mlir::LogicalResult wireAutoILAProbesToTop(
     circt::firrtl::CircuitOp circuit,
     llvm::SmallVectorImpl<WiredILAProbe> &outputs, std::string &error);
+
+struct ILAWrapperOptions {
+  std::string outputBaseFilename;
+  unsigned dataDepth = 1024;
+  unsigned probeTriggers = 2;
+};
+// Complete the hardware/collateral boundary after top wiring: replace the
+// temporary top outputs by wrapper instance inputs, restore the old interface,
+// emit inline Verilog and IP-generation annotations, and mark the Clock sink.
+// The caller subsequently runs wireHostClock with retainSource=true. Routes
+// must be the complete appended port suffix in probe order; their topPort
+// values are invalid after success. Reject malformed routes before mutation.
+mlir::LogicalResult attachAutoILAWrapper(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<WiredILAProbe> routes,
+    const ILAWrapperOptions &options, circt::firrtl::InstanceOp &wrapper,
+    std::string &error);
 } // namespace goldengate

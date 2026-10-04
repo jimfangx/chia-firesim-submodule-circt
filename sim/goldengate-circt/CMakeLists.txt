@@ -319,6 +319,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-autoila-analysis COMMAND goldengate-autoila-analysis-test)
   add_executable(goldengate-autoila-wiring-test
     test/Transforms/AutoILAWiringTest.cpp lib/Transforms/AutoILAWiring.cpp
+    lib/Transforms/GlobalResetWiring.cpp
     lib/Analysis/AutoILAAnalysis.cpp lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-autoila-wiring-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-autoila-wiring-test PRIVATE -fno-rtti)

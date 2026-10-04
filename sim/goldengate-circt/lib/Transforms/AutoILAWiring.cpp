@@ -1,10 +1,13 @@
 // See LICENSE for license details.
 #include "goldengate/AutoILAWiring.h"
+#include "goldengate/AnnotationClasses.h"
 #include "circt/Support/InstanceGraph.h"
 #include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/BitVector.h"
+#include "llvm/Support/raw_ostream.h"
 #include <functional>
 #include <map>
 
@@ -162,5 +165,109 @@ LogicalResult goldengate::wireAutoILAProbesToTop(
         "~" + circuit.getName().str() + "|" + top.getName().str() + ">" + route.name.getValue().str()});
   }
   outputs.append(result.begin(), result.end());
+  return success();
+}
+
+LogicalResult goldengate::attachAutoILAWrapper(
+    CircuitOp circuit, ArrayRef<WiredILAProbe> routes,
+    const ILAWrapperOptions &options, InstanceOp &wrapper, std::string &error) {
+  if (routes.empty()) return success();
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  FModuleOp top;
+  for (auto module : circuit.getOps<FModuleOp>())
+    if (module.getName() == circuit.getName()) top = module;
+  if (!top || !raw || routes.size() > top.getNumPorts() ||
+      options.outputBaseFilename.empty() || !options.dataDepth || !options.probeTriggers) {
+    error = "AutoILA wrapper requires top, annotations, output filename and positive IP parameters";
+    return failure();
+  }
+  unsigned oldPorts = top.getNumPorts() - routes.size();
+  SmallVector<PortInfo> ports;
+  circt::Namespace portNames, moduleNames, topNames;
+  for (auto [i, route] : llvm::enumerate(routes)) {
+    unsigned port = oldPorts + i;
+    if (route.topPort != top.getBodyBlock()->getArgument(port) ||
+        top.getPortDirection(port) != Direction::Out || route.source.index != i ||
+        route.topPort.getType() != route.source.value.getType() ||
+        !route.source.width || route.topTarget != "~" + circuit.getName().str() +
+            "|" + top.getName().str() + ">" + top.getPortName(port).str()) {
+      error = "AutoILA wrapper routes must cover the complete appended top port suffix";
+      return failure();
+    }
+    // Actual allocated names, not flattened suggestions, also name collateral.
+    // Distinct hierarchy paths can have the same flattened spelling.
+    portNames.newName(top.getPortName(port));
+    ports.emplace_back(top.getPortNameAttr(port), route.topPort.getType(), Direction::In);
+  }
+  for (auto &op : *circuit.getBodyBlock())
+    if (auto name = op.getAttrOfType<StringAttr>("sym_name")) moduleNames.newName(name.getValue());
+  for (auto name : top.getPortNamesAttr()) topNames.newName(cast<StringAttr>(name).getValue());
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) topNames.newName(name.getValue());
+  });
+  auto ipName = moduleNames.newName("ila_firesim");
+  auto moduleName = moduleNames.newName("ila_wrapper");
+  auto instanceName = topNames.newName("ila_wrapper_inst");
+  auto clockName = portNames.newName("clock");
+  OpBuilder b(circuit.getContext());
+  ports.insert(ports.begin(), PortInfo(b.getStringAttr(clockName), ClockType::get(circuit.getContext()), Direction::In));
+  std::string tcl, verilog;
+  llvm::raw_string_ostream t(tcl), v(verilog);
+  t << "create_ip -name ila \\\n  -vendor xilinx.com \\\n  -library ip \\\n  -version  6.2 \\\n  -module_name " << ipName << "\nset_property -dict [list \\\n  ";
+  for (auto [i, route] : llvm::enumerate(routes)) {
+    if (i) t << " \\\n  ";
+    t << "CONFIG.C_PROBE" << i << "_WIDTH {" << route.source.width
+      << "}  CONFIG.C_PROBE" << i << "_MU_CNT {" << options.probeTriggers << "}";
+  }
+  t << " \\\n  CONFIG.C_NUM_OF_PROBES {" << routes.size()
+    << "} \\\n  CONFIG.C_DATA_DEPTH {" << options.dataDepth
+    << "} \\\n  CONFIG.C_TRIGOUT_EN {false} \\\n  CONFIG.C_EN_STRG_QUAL {1} \\\n  CONFIG.C_ADV_TRIGGER {true} \\\n  CONFIG.C_TRIGIN_EN {false} \\\n  CONFIG.ALL_PROBE_SAME_MU_CNT {" << options.probeTriggers << "}] [get_ips " << ipName << "]\n";
+  v << "// A wrapper module around the ILA IP instance. This serves two purposes:\n"
+       "// 1. It gives the probes reasonable names in the GUI\n"
+       "// 2. Verilog ifdefs the remove the ILA instantiation in metasimulation.\nmodule "
+    << moduleName << " (\n    input " << clockName;
+  for (auto [i, route] : llvm::enumerate(routes))
+    v << ",\ninput [" << route.source.width - 1 << ":0] " << ports[i + 1].name.getValue();
+  v << "\n);\n// Don't instantiate the ILA when running under metasimulation\n`ifdef SYNTHESIS\n  "
+    << ipName << " CL_FIRESIM_DEBUG_WIRING_TRANSFORM (\n    .clk(" << clockName << ")";
+  for (unsigned i = 0; i < routes.size(); ++i)
+    v << ",\n    .probe" << i << " (" << ports[i + 1].name.getValue() << ")";
+  v << "\n  );\n`endif\nendmodule\n";
+  auto annotation = [&](StringRef cls, ArrayRef<NamedAttribute> fields) {
+    SmallVector<NamedAttribute> attrs{b.getNamedAttr("class", b.getStringAttr(cls))};
+    attrs.append(fields.begin(), fields.end()); return b.getDictionaryAttr(attrs);
+  };
+  SmallVector<Attribute> annotations{
+    annotation("midas.stage.GoldenGateOutputFileAnnotation", {
+        b.getNamedAttr("body", b.getStringAttr(tcl)),
+        b.getNamedAttr("fileSuffix", b.getStringAttr("." + ipName + ".ipgen.tcl"))}),
+    annotation("firrtl.transforms.BlackBoxInlineAnno", {
+        b.getNamedAttr("target", b.getStringAttr(circuit.getName().str() + "." + moduleName)),
+        b.getNamedAttr("name", b.getStringAttr(options.outputBaseFilename + ".ila_wrapper_inst.v")),
+        b.getNamedAttr("text", b.getStringAttr(verilog))}),
+    annotation(AnnotationClasses::HostClockSink, {
+        b.getNamedAttr("target", b.getStringAttr("~" + circuit.getName().str() + "|" + top.getName().str() + ">" + instanceName + "." + clockName))})};
+  for (auto attr : raw) {
+    auto dict = dyn_cast<DictionaryAttr>(attr);
+    auto cls = dict ? dict.getAs<StringAttr>("class") : StringAttr();
+    if (cls && (cls.getValue() == AnnotationClasses::InternalFpgaDebug ||
+        cls.getValue() == "firrtl.transforms.TopWiring.TopWiringAnnotation" ||
+        cls.getValue() == "firrtl.transforms.TopWiring.TopWiringOutputFilesAnnotation")) continue;
+    annotations.push_back(attr);
+  }
+  b.setInsertionPointToEnd(circuit.getBodyBlock());
+  auto external = b.create<FExtModuleOp>(top.getLoc(), b.getStringAttr(moduleName),
+      ConventionAttr::get(circuit.getContext(), Convention::Internal), ports, moduleName);
+  b.setInsertionPointToStart(top.getBodyBlock());
+  auto instance = b.create<InstanceOp>(top.getLoc(), external, instanceName);
+  for (auto [i, route] : llvm::enumerate(routes)) {
+    Value port = route.topPort;
+    port.replaceAllUsesWith(instance.getResult(i + 1));
+  }
+  llvm::BitVector removed(top.getNumPorts());
+  removed.set(oldPorts, top.getNumPorts());
+  top.erasePorts(removed);
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  wrapper = instance;
   return success();
 }

@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/AutoILAWiring.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/HostClockWiring.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -147,6 +148,8 @@ void ambiguousNames(MLIRContext &context) {
       }
       firrtl.module private @L(out %c: !firrtl.uint<3>) {}
       firrtl.module private @M(out %b_c: !firrtl.uint<5>) {}
+      firrtl.module private @ila_wrapper() {}
+      firrtl.module private @ila_firesim() {}
     }
   })mlir", &context);
   require(bool(root), "ambiguous name fixture parse failed");
@@ -170,11 +173,103 @@ void ambiguousNames(MLIRContext &context) {
             "flattened path collision aliased the source/type");
   }
   require(succeeded(verify(*root)), "invalid collision routing IR");
+  SmallVector<Value> drivers;
+  SmallVector<std::string> names;
+  for (auto &output : outputs) {
+    drivers.push_back(driver(top, output.topPort));
+    names.push_back(top.getPortName(cast<BlockArgument>(output.topPort).getArgNumber()).str());
+  }
+  InstanceOp wrapper;
+  require(succeeded(goldengate::attachAutoILAWrapper(circuit, outputs, {"collision"}, wrapper, error)), error);
+  require(top.getNumPorts() == 0 && wrapper.getModuleName() != "ila_wrapper",
+          "wrapper module namespace/interface collision");
+  for (unsigned i = 0; i < outputs.size(); ++i)
+    require(wrapper.getPortName(i + 1) == names[i] && driver(top, wrapper.getResult(i + 1)) == drivers[i],
+            "wrapper aliased ambiguous flattened paths");
+  for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto dict = cast<DictionaryAttr>(attr);
+    if (dict.getAs<StringAttr>("class").getValue() == "firrtl.transforms.BlackBoxInlineAnno") {
+      auto text = dict.getAs<StringAttr>("text").getValue();
+      require(text.contains(".probe0 (" + names[0] + ")") && text.contains(".probe1 (" + names[1] + ")") &&
+              !text.contains("  ila_firesim CL_FIRESIM_DEBUG"), "collateral lost allocated probe/IP names");
+    }
+  }
+  require(succeeded(verify(*root)), "invalid collision wrapper IR");
+}
+void wrapper(MLIRContext &context) {
+  auto root = fixture(context); auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = named(circuit, "Top"); OpBuilder b(&context);
+  top.insertPorts({{2, PortInfo(b.getStringAttr("clock"), ClockType::get(&context), Direction::In)}});
+  auto clock = top.getBodyBlock()->getArgument(2);
+  b.setInsertionPointToStart(top.getBodyBlock());
+  b.create<WireOp>(top.getLoc(), UIntType::get(&context, 1), "ila_wrapper_inst");
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  auto source = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::HostClockSource)),
+      b.getNamedAttr("target", b.getStringAttr("~Top|Top>clock"))});
+  annotations.push_back(source);
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  SmallVector<goldengate::WiredILAProbe> routes; std::string error;
+  require(succeeded(goldengate::wireAutoILAProbesToTop(circuit, routes, error)), error);
+  SmallVector<Value> drivers;
+  SmallVector<std::string> portNames;
+  for (auto &route : routes) {
+    drivers.push_back(driver(top, route.topPort));
+    portNames.push_back(top.getPortName(cast<BlockArgument>(route.topPort).getArgNumber()).str());
+  }
+  auto before = dump(root.get()); InstanceOp instance;
+  goldengate::ILAWrapperOptions options{"test-output", 2048, 4};
+  auto invalidOptions = options; invalidOptions.dataDepth = 0;
+  require(failed(goldengate::attachAutoILAWrapper(circuit, routes, invalidOptions, instance, error)) &&
+          !instance && dump(root.get()) == before, "invalid IP parameters mutated circuit");
+  auto invalidRoutes = routes; std::swap(invalidRoutes[0], invalidRoutes[1]);
+  require(failed(goldengate::attachAutoILAWrapper(circuit, invalidRoutes, options, instance, error)) &&
+          !instance && dump(root.get()) == before, "out-of-order routes mutated circuit");
+  require(succeeded(goldengate::attachAutoILAWrapper(circuit, routes, options, instance, error)), error);
+  require(top.getNumPorts() == 3 && top.getPortName(2) == "clock" &&
+          top.getBodyBlock()->getArgument(2) == clock, "old top interface/SSA identity lost");
+  require(instance.getName() != "ila_wrapper_inst" && instance.getNumResults() == 11,
+          "wrapper instance namespace collision or probe count");
+  auto external = *circuit.getOps<FExtModuleOp>().begin();
+  require(external.getDefname() == external.getName() && external.getNumPorts() == 11 &&
+          isa<ClockType>(external.getPortType(0)), "wrapper black box signature");
+  for (unsigned i = 0; i < drivers.size(); ++i)
+    require(instance.getPortName(i + 1) == portNames[i] &&
+            instance.getPortDirection(i + 1) == Direction::In &&
+            instance.getResult(i + 1).getType() == drivers[i].getType() &&
+            driver(top, instance.getResult(i + 1)) == drivers[i], "wrapper probe identity/order/type changed");
+  bool tcl = false, verilog = false, sink = false;
+  for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto dict = cast<DictionaryAttr>(attr); auto cls = dict.getAs<StringAttr>("class").getValue();
+    require(cls != goldengate::AnnotationClasses::InternalFpgaDebug, "private debug annotation not consumed");
+    if (cls == "midas.stage.GoldenGateOutputFileAnnotation") {
+      auto body = dict.getAs<StringAttr>("body").getValue();
+      tcl = body.contains("CONFIG.C_NUM_OF_PROBES {10}") && body.contains("CONFIG.C_DATA_DEPTH {2048}") &&
+            body.contains("CONFIG.ALL_PROBE_SAME_MU_CNT {4}") && body.contains("CONFIG.C_PROBE3_WIDTH {7}");
+    }
+    if (cls == "firrtl.transforms.BlackBoxInlineAnno") {
+      auto body = dict.getAs<StringAttr>("text").getValue();
+      verilog = dict.getAs<StringAttr>("name").getValue() == "test-output.ila_wrapper_inst.v" &&
+          body.contains("`ifdef SYNTHESIS") && body.contains(".probe3 (" + portNames[3] + ")") &&
+          body.contains("input [6:0] " + portNames[3]);
+    }
+    sink |= cls == goldengate::AnnotationClasses::HostClockSink;
+  }
+  require(tcl && verilog && sink, "ILA collateral or Clock sink missing");
+  unsigned wired = 0;
+  require(succeeded(goldengate::wireHostClock(circuit, wired, error, true)), error);
+  require(wired == 1 && driver(top, instance.getResult(0)) == clock,
+          "wrapper does not sample host clock");
+  auto finalAnnotations = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(finalAnnotations[0] == source && finalAnnotations.size() == 4,
+          "host source not retained or annotation preservation/cleanup failed");
+  require(succeeded(verify(*root)), "invalid wrapper IR");
 }
 } // namespace
 int main() {
   MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { routing(context); rejection(context); ambiguousNames(context); }
+  try { routing(context); rejection(context); ambiguousNames(context); wrapper(context); }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
   llvm::outs() << "AutoILA hierarchy routes, shared uses, name collisions and atomic rejection passed\n";
   return 0;
