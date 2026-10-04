@@ -27,6 +27,7 @@
 #include "goldengate/XilinxHostSpecialization.h"
 #include "goldengate/SimulatorRTL.h"
 #include "goldengate/AutoCounterAnalysis.h"
+#include "goldengate/AutoILAAnalysis.h"
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/PrintStubs.h"
@@ -158,6 +159,34 @@ static int fail(llvm::StringRef message) {
   return 1;
 }
 
+static mlir::LogicalResult emitAutoILAAnalysis(CircuitOp circuit,
+    llvm::StringRef outputDir, std::string &error) {
+  llvm::SmallVector<goldengate::AutoILAProbe> probes;
+  if (failed(goldengate::analyzeAutoILAProbes(circuit, probes, error)))
+    return mlir::failure();
+  llvm::json::Array summary;
+  for (auto &probe : probes) {
+    llvm::json::Array path;
+    for (auto instance : probe.path) path.push_back(instance.getName().str());
+    path.push_back(probe.leafName);
+    summary.push_back(llvm::json::Object{
+        {"index", probe.index}, {"target", probe.target},
+        {"width", probe.width}, {"is_port", probe.isPort},
+        {"path", std::move(path)}, {"suggested_name", probe.suggestedName}});
+  }
+  llvm::SmallString<256> path(outputDir);
+  llvm::sys::path::append(path, "autoila-probes.json");
+  std::error_code ec;
+  llvm::raw_fd_ostream out(path, ec);
+  if (ec) {
+    error = "cannot write AutoILA analysis: " + ec.message();
+    return mlir::failure();
+  }
+  out << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
+  llvm::outs() << "Resolved " << probes.size() << " CIRCT AutoILA probes in " << path << '\n';
+  return mlir::success();
+}
+
 int main(int argc, char **argv) {
   bool rewriteOutputValids =
       argc == 8 &&
@@ -199,6 +228,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--lower-types";
   bool analyzeAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter";
+  bool analyzeAutoILA =
+      argc == 7 && llvm::StringRef(argv[6]) == "--analyze-ila";
   bool gateAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-autocounter-events";
   bool gateSelectedAutoCounter =
@@ -239,7 +270,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !analyzeAutoCounter &&
+       !resolveDontTouch && !lowerTypes && !analyzeAutoCounter && !analyzeAutoILA &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -258,7 +289,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--lower-types | --analyze-autocounter | --gate-autocounter-events | "
+                    "--lower-types | --analyze-ila | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -3018,6 +3049,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, shimAnnotations, error)))
         return fail("F1 shim annotations: " + error);
       llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
+      if (failed(emitAutoILAAnalysis(circuit, outputDir, error)))
+        return fail("AutoILA analysis: " + error);
       unsigned wiredHostClocks = 0;
       if (failed(goldengate::wireHostClock(circuit, wiredHostClocks, error)))
         return fail("host clock wiring: " + error);
@@ -3358,6 +3391,15 @@ int main(int argc, char **argv) {
       return fail("cannot export AutoCounter reset-gate boundary: " + error);
     llvm::outs() << (synthesizeAutoCounterPrints ? "Synthesized printf operations for " : synthesizeAutoCounterValues ? "Synthesized printf values for " : "Gated ")
                  << events.size() << " selected AutoCounter events in " << irPath << '\n';
+    return 0;
+  }
+
+  if (analyzeAutoILA) {
+    std::string error;
+    if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
+      return fail("retained annotation LowerTypes: " + error);
+    if (failed(emitAutoILAAnalysis(circuit, outputDir, error)))
+      return fail("AutoILA analysis: " + error);
     return 0;
   }
 

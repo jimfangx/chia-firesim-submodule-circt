@@ -24,6 +24,7 @@ add_executable(goldengate-circt
   lib/Analysis/ChannelAnalysis.cpp
   lib/Analysis/BridgeAnalysis.cpp
   lib/Analysis/AutoCounterAnalysis.cpp
+  lib/Analysis/AutoILAAnalysis.cpp
   lib/Analysis/ChannelClockInfo.cpp
   lib/Analysis/HierarchyAnalysis.cpp
   lib/Analysis/ModelAnalysis.cpp
@@ -305,6 +306,16 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
     MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-lower-types-targets COMMAND goldengate-lower-types-targets-test)
+  add_executable(goldengate-autoila-analysis-test
+    test/Analysis/AutoILAAnalysisTest.cpp lib/Analysis/AutoILAAnalysis.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-autoila-analysis-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autoila-analysis-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autoila-analysis-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autoila-analysis-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autoila-analysis COMMAND goldengate-autoila-analysis-test)
   add_executable(goldengate-fame-clock-gate-test
     test/Transforms/FAMEClockGateTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-clock-gate-test PRIVATE cxx_std_17)
