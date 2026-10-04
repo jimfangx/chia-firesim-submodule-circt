@@ -495,15 +495,31 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   // even when TopWiring renames its port to avoid a top declaration. Scala
   // then cannot find that name in portName2WireMap. Check the namespace after
   // every local mask has been planned, before adding hardware anywhere.
-  auto [topEntry, topInserted] = sourceNames.try_emplace(top);
-  auto &topNames = topEntry->second;
-  if (topInserted) {
-    for (auto portName : top.getPortNamesAttr())
-      topNames.newName(cast<StringAttr>(portName).getValue());
-    top.walk([&](Operation *op) {
-      if (auto opName = op->getAttrOfType<StringAttr>("name")) topNames.newName(opName.getValue());
-    });
-  }
+  // The Scala pipeline reaches TriggerWiring after LowerTypes. Reserve
+  // aggregate leaves in its namespace, not their disappearing containers.
+  // Keep this separate from the namespace used to materialize CIRCT masks:
+  // CIRCT still retains the original aggregate operations at this boundary.
+  circt::Namespace topNames;
+  std::function<void(StringRef, Type)> reserveLeaves = [&](StringRef name, Type type) {
+    if (auto bundle = dyn_cast<BundleType>(type)) {
+      for (auto element : bundle.getElements())
+        reserveLeaves((name + "_" + element.name.getValue()).str(), element.type);
+    } else if (auto vector = dyn_cast<FVectorType>(type)) {
+      for (unsigned i = 0; i < vector.getNumElements(); ++i)
+        reserveLeaves((name + "_" + Twine(i)).str(), vector.getElementType());
+    } else topNames.newName(name);
+  };
+  for (auto port : top.getPorts()) reserveLeaves(port.name.getValue(), port.type);
+  top.walk([&](Operation *op) {
+    if (auto opName = op->getAttrOfType<StringAttr>("name")) {
+      if (isa<NodeOp, WireOp, RegOp, RegResetOp>(op))
+        reserveLeaves(opName.getValue(), op->getResult(0).getType());
+      else topNames.newName(opName.getValue());
+    }
+  });
+  for (auto &event : events)
+    if (event.reset && event.event.getValue().getParentBlock() == top.getBodyBlock())
+      topNames.newName(event.name);
   for (auto &entry : flattenedSources)
     if (topNames.newName(entry.getKey()) != entry.getKey()) {
       error = "top declaration collides with trigger export: " + entry.getKey().str();

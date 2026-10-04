@@ -8,6 +8,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/AsmParser/AsmParser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
 #include <map>
@@ -1116,14 +1117,23 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   std::string finalExport = collidingMasks ? "simulationTrigger_creditEvent_masked" : mixedMasks ? "creditEvent_masked_0" : sharedTarget ? "creditEvent" : "debitEvent";
   auto inst = [&](StringRef name, StringRef module) { return "%" + name.str() + ":" + std::to_string(originalPorts) +
     " = firrtl.instance " + name.str() + " @" + module.str() + "(" + instancePorts + ")"; };
+  bool vectorCollision = topCollision == 8 || topCollision == 9;
+  bool aggregateCollision = topCollision >= 6;
+  std::string relayChild = vectorCollision ? "child_0" : "child";
+  std::string aggregateType = "!firrtl.bundle<child: " +
+      std::string(vectorCollision ? "vector<bundle<creditEvent_masked: uint<1>>, 1>" : "bundle<creditEvent_masked: uint<1>>") + ">";
+  if (topCollision == 10) aggregateType = "!firrtl.bundle<neighbor: uint<1>>";
   std::string relayText;
   for (unsigned depth = 0; depth < relayDepth; ++depth)
     relayText += "firrtl.module @" + std::string(depth ? "Outer" : "Relay") + "(" + childPorts +
-      ") { " + inst(depth ? "relay" : "child", depth ? "Relay" : "Child") + " } ";
+      ") { " + inst(depth ? "relay" : relayChild, depth ? "Relay" : "Child") + " } ";
   StringRef repeatedModule = relayDepth == 2 ? "Outer" : relayDepth == 1 ? "Relay" : "Child";
   std::string topExport = "simulationTrigger_first_" +
-      std::string(relayDepth == 2 ? "relay_child_" : relayDepth == 1 ? "child_" : "") + "creditEvent_masked";
-  std::string collisionPort = topCollision == 3 ? ", in %" + topExport + ": !firrtl.uint<1>" : "";
+      std::string(relayDepth == 2 ? "relay_child_" : relayDepth == 1 ?
+                  vectorCollision ? "child_0_" : "child_" : "") + "creditEvent_masked";
+  std::string collisionPort = topCollision == 3 ? ", in %" + topExport + ": !firrtl.uint<1>" :
+      topCollision == 6 || topCollision == 8 ? ", in %simulationTrigger_first: " + aggregateType :
+      topCollision == 10 ? ", in %" + topExport + ": " + aggregateType : "";
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
     "firrtl.module @Child(" + childPorts + ") {} " + relayText + "firrtl.module @Top(in %clock: !firrtl.clock, "
     "in %credit0: !firrtl.uint<1>, in %debit0: !firrtl.uint<1>, in %reset0: !firrtl.uint<1>, "
@@ -1164,10 +1174,16 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       b.create<StrictConnectOp>(loc, arg(relay, i), instance.getResult(i));
   }
   b.setInsertionPointToEnd(top.getBodyBlock());
-  if (topCollision && topCollision != 3) {
+  if (topCollision && topCollision != 3 && topCollision != 6 && topCollision != 8 && topCollision != 10) {
     std::string collisionName = topCollision == 4 ? topExport.substr(0, topExport.size() - 7) :
                                 topCollision == 5 ? topExport + "_neighbor" : topExport;
-    if (topCollision == 2) {
+    if (aggregateCollision) {
+      auto type = parseType(aggregateType, &context);
+      require(bool(type), "parse aggregate top collision type");
+      auto wire = b.create<WireOp>(loc, type, "simulationTrigger_first");
+      auto invalid = b.create<InvalidValueOp>(loc, type);
+      b.create<StrictConnectOp>(loc, wire.getResult(), invalid.getResult());
+    } else if (topCollision == 2) {
       auto wire = b.create<WireOp>(loc, bit, collisionName);
       b.create<StrictConnectOp>(loc, wire.getResult(), arg(top, 2));
     } else b.create<NodeOp>(loc, arg(top, 2), b.getStringAttr(collisionName));
@@ -1273,10 +1289,10 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   if (topCollision) require(succeeded(verify(*root)), "top collision input must be valid FIRRTL IR");
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode == 8 || mode == 16 || ancestorCollision == 2 || (topCollision && topCollision != 5)) {
+  if (mode == 8 || mode == 16 || ancestorCollision == 2 || (topCollision && topCollision != 5 && topCollision != 10)) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
             "source fanout unsupported path must fail atomically: " + error);
-    if (topCollision) require(error.find("top declaration collides with trigger export") != std::string::npos,
+    if (topCollision) require(error == "top declaration collides with trigger export: " + topExport,
       "top export collision needs a specific diagnostic");
     if (ancestorCollision == 2) require(error.find("ambiguous flattened trigger source") != std::string::npos,
       "flattened ancestor/descendant source collision needs a specific diagnostic");
@@ -1284,7 +1300,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
   require(succeeded(result), error);
   require(consumed == (collidingMasks ? 2 + bool(ancestorCollision) : duplicateMasked ? 3 : mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
-  require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + exports + childSink,
+  require(top.getNumPorts() == 11 + 2 * childSink + (topCollision == 10) && child.getNumPorts() == originalPorts + exports + childSink,
           "source fanout must preserve top IO and share child export definitions");
   require(child.getPortName(originalPorts) == "simulationTrigger_" + creditExport +
               (collidingMasks ? "_0" : "") &&
@@ -1874,6 +1890,11 @@ int main(int argc, char **argv) {
     fanoutSources(context, 14, "", 2, false, false, true, 0, 3);
     fanoutSources(context, 14, "", 1, false, false, true, 0, 4);
     fanoutSources(context, 14, argc > 86 ? argv[86] : "", 1, false, false, true, 0, 5);
+    // SFC normalizes aggregates before TriggerWiring: leaf names collide,
+    // while an aggregate container with distinct leaves does not.
+    for (unsigned collision : {6u, 7u, 8u, 9u})
+      fanoutSources(context, 14, "", 1, false, false, true, 0, collision);
+    fanoutSources(context, 14, argc > 87 ? argv[87] : "", 1, false, false, true, 0, 10);
     run(context, true, false, argc > 74 ? argv[74] : "", true);
     run(context, false, false, argc > 75 ? argv[75] : "", true);
     fanoutSources(context, 13, argc > 70 ? argv[70] : "", 0, true);

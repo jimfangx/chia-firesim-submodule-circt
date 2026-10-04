@@ -36,6 +36,8 @@ namespace goldengate {
 // mutation, matching Scala TopWiring's nonunique port rejection. Flattened
 // top export identities must also avoid existing top declarations and all
 // planned top masks: Scala cannot reconstruct namespace-renamed top exports.
+// Top bundle/vector ports and wire/node/register declarations reserve flattened
+// leaf names, matching Scala normalization; aggregate container names disappear.
 // All source annotations are consumed.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor
