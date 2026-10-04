@@ -627,8 +627,11 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     for (unsigned index : indices) {
       auto &localSignals = moduleSignals[index];
       for (auto &signal : localSignals) {
-        auto normalizedName = exportNames.newName("simulationTrigger_" + signal.name);
-        auto portName = childNames.newName(normalizedName);
+        // A retained aggregate container can have the same spelling as this
+        // scalar output. It disappears during LowerTypes, leaving distinct
+        // leaf names. CIRCT binds connects by SSA value, so keeping SFC's
+        // normalized export name is safe and avoids a spurious suffix.
+        auto portName = exportNames.newName("simulationTrigger_" + signal.name);
         added.push_back({oldPorts, PortInfo(childBuilder.getStringAttr(portName),
             UIntType::get(circuit.getContext(), 1), Direction::Out)});
         signals.push_back(signal);

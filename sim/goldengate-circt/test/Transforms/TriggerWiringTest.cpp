@@ -1163,7 +1163,8 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
   auto reserveExportLeaf = [&](FModuleOp module, StringRef name, bool node) {
     b.setInsertionPointToEnd(module.getBodyBlock());
-    auto type = parseType("!firrtl.bundle<masked: uint<1>>", &context);
+    auto type = parseType(exportLeaf >= 4 ? "!firrtl.bundle<neighbor: uint<1>>" :
+                         "!firrtl.bundle<masked: uint<1>>", &context);
     auto invalid = b.create<InvalidValueOp>(loc, type);
     if (node) b.create<NodeOp>(loc, invalid.getResult(), b.getStringAttr(name));
     else {
@@ -1172,6 +1173,8 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     }
   };
   if (exportLeaf == 1) reserveExportLeaf(child, "simulationTrigger_simulationTrigger_creditEvent", false);
+  if (exportLeaf == 4)
+    reserveExportLeaf(child, "simulationTrigger_simulationTrigger_creditEvent_masked", false);
   auto credit = b.create<NodeOp>(loc, arg(child, 1), b.getStringAttr("creditEvent"));
   auto debit = b.create<NodeOp>(loc, arg(child, 2),
       b.getStringAttr(collidingMasks ? "simulationTrigger_creditEvent" : "debitEvent"));
@@ -1183,8 +1186,9 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
   for (auto relay : relays) {
     b.setInsertionPointToEnd(relay.getBodyBlock());
-    if (exportLeaf >= 2 && relay == relays.front())
-      reserveExportLeaf(relay, "simulationTrigger_child_creditEvent", exportLeaf == 3);
+    if (exportLeaf && exportLeaf != 1 && exportLeaf != 4 && relay == relays.front())
+      reserveExportLeaf(relay, exportLeaf >= 5 ? "simulationTrigger_child_creditEvent_masked" :
+                        "simulationTrigger_child_creditEvent", exportLeaf == 3 || exportLeaf == 6);
     if (ancestorCollision && relay == relays.front())
       b.create<NodeOp>(loc, arg(relay, 2), b.getStringAttr(ancestorCollision == 1 ?
         "simulationTrigger_child_creditEvent" : "child_creditEvent_masked"));
@@ -1336,7 +1340,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     prefix = std::string(depth ? "relay_" : "child_") + prefix;
     require(relay.getNumPorts() == originalPorts + exports + bool(ancestorCollision) + childSink &&
             relay.getPortName(originalPorts) == "simulationTrigger_" + prefix + creditExport +
-              ((ancestorCollision == 1 || exportLeaf >= 2) && !depth ? "_0" : "") &&
+              ((ancestorCollision == 1 || exportLeaf == 2 || exportLeaf == 3) && !depth ? "_0" : "") &&
             relay.getPortName(originalPorts + exports - 1) == "simulationTrigger_" + prefix +
                 finalExport &&
             (!duplicateMasked || relay.getPortName(originalPorts + 1) == "simulationTrigger_" + prefix + "creditEvent_masked_0"),
@@ -1928,7 +1932,9 @@ int main(int argc, char **argv) {
       eventTargets(context, mode, argc > mode + 77 ? argv[mode + 77] : "");
     // Existing aggregate leaves reserve descendant/relay export names after
     // Scala normalization. Port renaming must preserve the event's SSA driver.
-    for (unsigned leaf : {1u, 2u, 3u})
+    // Disappearing containers, in contrast, do not occupy their flattened
+    // namespace. Exports must retain the SFC spelling through LowerTypes.
+    for (unsigned leaf : {1u, 2u, 3u, 4u, 5u, 6u})
       fanoutSources(context, 14, argc > leaf + 91 ? argv[leaf + 91] : "",
                     1, false, false, true, 0, 0, false, leaf);
     run(context, true, false, argc > 74 ? argv[74] : "", true);
