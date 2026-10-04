@@ -633,6 +633,55 @@ void run(MLIRContext &context) {
                   "nested ready/valid endpoint must reject before identity materialization");
         }
   }
+  // Local model channel groups use the same exact identity rule as connections.
+  // Ordered repeated ports, absent clocks and empty groups survive normalization.
+  auto modelPorts = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(A::ChannelPorts)),
+      b.getNamedAttr("localName", b.getStringAttr("model_data")),
+      b.getNamedAttr("test.payload", b.getI32IntegerAttr(7)),
+      b.getNamedAttr("clockPort", Annotation(counters[1]).getMember<StringAttr>("clock")),
+      b.getNamedAttr("ports", b.getArrayAttr({
+          Annotation(counters[0]).getMember<StringAttr>("target"),
+          Annotation(counters[1]).getMember<StringAttr>("target"),
+          Annotation(counters[0]).getMember<StringAttr>("target")}))});
+  auto modelCandidate = parseSourceString<ModuleOp>(counterFixture, &context);
+  auto modelCircuit = *modelCandidate->getOps<CircuitOp>().begin();
+  NamedAttrList emptyModel(modelPorts); emptyModel.erase("clockPort");
+  emptyModel.set("ports", b.getArrayAttr({}));
+  modelCircuit->setAttr("rawAnnotations", b.getArrayAttr({modelPorts, emptyModel.getDictionary(&context)}));
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*modelCandidate, modelCircuit, error)), error);
+  NamedAttrList expectedModel(modelPorts);
+  expectedModel.set("clockPort", Annotation(counterRaw[1]).getMember<StringAttr>("clock"));
+  expectedModel.set("ports", b.getArrayAttr({
+      Annotation(counterRaw[0]).getMember<StringAttr>("target"),
+      Annotation(counterRaw[1]).getMember<StringAttr>("target"),
+      Annotation(counterRaw[0]).getMember<StringAttr>("target")}));
+  require(modelCircuit->getAttr("rawAnnotations") == b.getArrayAttr({
+      expectedModel.getDictionary(&context), emptyModel.getDictionary(&context)}) &&
+      succeeded(verify(*modelCandidate)), "local model channel target identity/order/payload/options changed");
+  auto loweredModel = *modelCircuit.getOps<FModuleOp>().begin();
+  InnerSymbolTable::walkSymbols(loweredModel, [&](StringAttr, InnerSymTarget) {
+    require(false, "temporary model channel identity leaked");
+  });
+  before = dump(*modelCandidate);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*modelCandidate, modelCircuit, error)) &&
+          dump(*modelCandidate) == before, "local model channel normalization is not idempotent");
+  for (StringRef member : {"clockPort", "ports"})
+    for (Attribute spelling : {Attribute(b.getStringAttr("~Top|Top>io.domain")),
+                               Attribute(b.getStringAttr("~Top|Top>state.domain[0]")),
+                               Attribute(b.getStringAttr("~Top|Top>absent")),
+                               Attribute(b.getI64IntegerAttr(0))}) {
+      NamedAttrList bad(modelPorts);
+      bad.set(member, member == "clockPort" ? spelling : Attribute(b.getArrayAttr({
+          Annotation(counters[0]).getMember<StringAttr>("target"), spelling})));
+      auto invalid = parseSourceString<ModuleOp>(counterFixture, &context);
+      auto owner = *invalid->getOps<CircuitOp>().begin();
+      owner->setAttr("rawAnnotations", b.getArrayAttr({modelPorts, bad.getDictionary(&context)}));
+      before = dump(*invalid);
+      require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
+              error.find(member.str()) != std::string::npos && dump(*invalid) == before,
+              "local model channel must reject before identity materialization");
+    }
   // Unused sources/sinks are consumed without resolving their ground metadata.
   auto unused = parseSourceString<ModuleOp>(counterFixture, &context);
   auto unusedCircuit = *unused->getOps<CircuitOp>().begin();
@@ -650,6 +699,7 @@ void run(MLIRContext &context) {
 void channelTargets(MLIRContext &context, unsigned mode, unsigned kind, StringRef output) {
   bool reverse = kind == 1;
   bool forward = kind == 2;
+  bool modelPorts = kind == 3;
   std::string text = R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
       firrtl.module @Top(in %io: !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>,
@@ -697,6 +747,15 @@ void channelTargets(MLIRContext &context, unsigned mode, unsigned kind, StringRe
   if (forward)
     empty.set("channelInfo", b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledForwardChannel))}));
+  if (modelPorts) {
+    channel = b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelPorts)),
+        b.getNamedAttr("localName", b.getStringAttr("data")),
+        b.getNamedAttr("clockPort", target(".clock")),
+        b.getNamedAttr("ports", Annotation(channel).getMember<ArrayAttr>("sources"))});
+    empty = NamedAttrList(channel); empty.erase("clockPort");
+    empty.set("localName", b.getStringAttr("empty")); empty.set("ports", b.getArrayAttr({}));
+  }
   circuit->setAttr("rawAnnotations", b.getArrayAttr({channel, empty.getDictionary(&context)}));
   std::string error;
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
@@ -714,6 +773,12 @@ void channelTargets(MLIRContext &context, unsigned mode, unsigned kind, StringRe
   expected.set("sources", b.getArrayAttr({target("_rows_1_" + field), b.getStringAttr("~Top|Top>scalar"),
                                         target("_rows_0_" + field), target("_rows_1_" + field)}));
   expected.set("sinks", b.getArrayAttr({target("_rows_0_flag"), target("_rows_1_" + field)}));
+  if (modelPorts) {
+    expected.erase("clock"); expected.erase("sources"); expected.erase("sinks");
+    expected.set("clockPort", target("_clock"));
+    expected.set("ports", b.getArrayAttr({target("_rows_1_data"), b.getStringAttr("~Top|Top>scalar"),
+                                        target("_rows_0_data"), target("_rows_1_data")}));
+  }
   require(circuit->getAttr("rawAnnotations") == b.getArrayAttr({
       expected.getDictionary(&context), empty.getDictionary(&context)}),
       "channel oracle endpoints/payload/options changed");
@@ -732,8 +797,8 @@ int main(int argc, char **argv) {
     run(context);
     for (unsigned mode = 0; mode < 3; ++mode) {
       StringRef name = mode == 0 ? "port-fields" : mode == 1 ? "node-fields" : "wire-fields";
-      for (unsigned kind = 0; kind < 3; ++kind) {
-        std::string prefix = kind == 1 ? "reverse-" : kind == 2 ? "forward-" : "";
+      for (unsigned kind = 0; kind < 4; ++kind) {
+        std::string prefix = kind == 1 ? "reverse-" : kind == 2 ? "forward-" : kind == 3 ? "model-" : "";
         channelTargets(context, mode, kind, argc > 1 ? std::string(argv[1]) + "/" + prefix + name.str() + "-candidate.mlir" : "");
       }
     }

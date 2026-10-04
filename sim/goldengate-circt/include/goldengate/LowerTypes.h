@@ -11,7 +11,8 @@ namespace goldengate {
 // Produces: ground DontTouch targets and exact AutoCounter/trigger event,
 // clock and optional reset references, for public and internal classes; exact
 // FAME channel clock/source/sink references in original order, including
-// DecoupledForwardChannel optional nested ready/valid references.
+// DecoupledForwardChannel optional nested ready/valid references, and exact
+// FAMEChannelPortsAnnotation optional clockPort and ordered ports references.
 // Mutates: resolves CHIRRTL, infers widths/resets, lowers aggregates, uniquifies
 // declaration names, synchronizes instance ports, and transfers retained targets.
 // Requires analyses: FIRRTL subtype/field IDs and CIRCT inner symbol namespaces.
