@@ -408,14 +408,15 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       error = "trigger reset must be a reference when present"; return failure();
     }
     auto &unmaskedClocks = credit ? creditUnmaskedClocks : debitUnmaskedClocks;
-    if (!(credit ? creditTargets : debitTargets).insert(event).second) {
-      // Scala creates a new node for each reset-masked annotation, but an
-      // unmasked target is exported once by TopWiring's distinct annotations.
+    if (!reset && !(credit ? creditTargets : debitTargets).insert(event).second) {
+      // An unmasked target is exported once by TopWiring's distinct annotations.
       // Its .exists membership test also counts that export only once.
-      if (!reset && unmaskedClocks.lookup(event) == eventClock) continue;
+      if (unmaskedClocks.lookup(event) == eventClock) continue;
       error = "trigger hardware currently needs distinct source targets unless unmasked clocks match";
       return failure();
     }
+    // Every masked annotation receives its own node and absolute exports,
+    // even when event, reset, and clock field identities are identical.
     if (!reset) unmaskedClocks[event] = eventClock;
     std::map<Route, circt::FieldRef> clocks;
     for (auto &path : paths) {

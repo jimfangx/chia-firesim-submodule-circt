@@ -65,8 +65,7 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
         std::to_string(consumed) + "): " + error);
   };
   reject({source(true, "clock"), sink}, "both");
-  if (mask) reject({channel, source(true, "clock"), source(true, "clock"), source(false, "clock"), sink}, "distinct source");
-  else reject({channel, source(true, "clock"), source(true, "otherClock"), source(false, "clock"), sink}, "distinct source");
+  if (!mask) reject({channel, source(true, "clock"), source(true, "otherClock"), source(false, "clock"), sink}, "distinct source");
   reject({channel, source(true, "otherClock"), source(false, "clock"), sink}, "source clock domain");
   reject({channel, source(true, "clock"), source(false, "clock"),
     b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TriggerSink)),
@@ -540,13 +539,13 @@ void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
   auto before = dump(root.get());
   unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode >= 3 && mode != 11) {
+  if (mode >= 3 && mode != 10 && mode != 11) {
     require(failed(result) && consumed == 0 && dump(root.get()) == before,
             "aggregate event/reset rejection must be atomic: " + std::to_string(mode));
     require(!error.empty(), "missing aggregate event/reset diagnostic"); return;
   }
   require(succeeded(result), error);
-  require(consumed == (mode == 11 ? 3 : 2) && succeeded(verify(*root)), "aggregate event candidate invalid");
+  require(consumed == (mode == 10 || mode == 11 ? 3 : 2) && succeeded(verify(*root)), "aggregate event candidate invalid");
   unsigned registers = 0, masked = 0;
   Value eventRoot = mode == 1 || mode == 2 ? Value() : top.getBodyBlock()->getArgument(1);
   top.walk([&](Operation *op) {
@@ -554,7 +553,7 @@ void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
   });
   top.walk([&](RegOp reg) { ++registers; });
   top.walk([&](NodeOp node) {
-    if (node.getName() != stem + "_events_0_credit_masked") return;
+    if (!node.getName().starts_with(stem + "_events_0_credit_masked")) return;
     ++masked;
     auto gate = node.getInput().getDefiningOp<AndPrimOp>();
     require(bool(gate), "aggregate reset mask AND");
@@ -564,7 +563,7 @@ void eventTargets(MLIRContext &context, unsigned mode, StringRef output) {
             getFieldRefFromValue(negate.getInput()) == circt::FieldRef(eventRoot, 5),
             "selected aggregate event/reset mask identities mode=" + std::to_string(mode) + " event=" + std::to_string(getFieldRefFromValue(gate.getRhs()).getFieldID()) + " reset=" + std::to_string(getFieldRefFromValue(negate.getInput()).getFieldID()));
   });
-  require(registers == 9 && masked == 1, "aggregate event accounting and Scala flattened mask name");
+  require(registers == 9 && masked == (mode == 10 ? 2 : 1), "aggregate event accounting and Scala flattened mask name");
   require(cast<ArrayAttr>(circuit->getAttr("rawAnnotations")).size() == 1, "aggregate event annotation cleanup");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1077,7 +1076,9 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // Each pathless source contributes once per complete instance path. Keep masking
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0) {
-  bool childSink = mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode >= 10;
+  bool childSink = mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
+  bool duplicateMasked = mode == 11 || mode == 12;
+  unsigned exports = duplicateMasked ? 3 : 2;
   std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
     "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
   if (childSink) childPorts += ", out %sinkEnabled: !firrtl.uint<1>";
@@ -1148,9 +1149,10 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     attrs.set("clock", ref("Child", "clock")); attrs.set("sourceType", b.getBoolAttr(credit));
     if (credit) attrs.set("reset", ref("Child", "reset"));
     annotations.push_back(attrs.getDictionary(&context));
+    if (credit && duplicateMasked) annotations.push_back(attrs.getDictionary(&context));
     // An unmasked duplicate shares every absolute export. Exercise both raw
     // class spellings; consumption still counts annotations, not unique events.
-    if (!credit && mode >= 9) {
+    if (!credit && (mode == 9 || mode == 10)) {
       annotations.push_back(attrs.getDictionary(&context));
       attrs.set("class", b.getStringAttr(A::TriggerSource));
       annotations.push_back(attrs.getDictionary(&context));
@@ -1172,21 +1174,23 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
             "source fanout missing clock path must fail atomically"); return;
   }
   require(succeeded(result), error);
-  require(consumed == (mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
-  require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + 2 + childSink,
+  require(consumed == (duplicateMasked ? 3 : mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
+  require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + exports + childSink,
           "source fanout must preserve top IO and share child export definitions");
   require(child.getPortName(originalPorts) == "simulationTrigger_creditEvent_masked" &&
-          child.getPortName(originalPorts + 1) == "simulationTrigger_debitEvent", "source fanout export names");
+          child.getPortName(originalPorts + exports - 1) == "simulationTrigger_debitEvent" &&
+          (!duplicateMasked || child.getPortName(originalPorts + 1) == "simulationTrigger_creditEvent_masked_0"), "source fanout export names");
   std::string prefix;
   for (auto [depth, relay] : llvm::enumerate(relays)) {
     prefix = std::string(depth ? "relay_" : "child_") + prefix;
-    require(relay.getNumPorts() == originalPorts + 2 + childSink &&
+    require(relay.getNumPorts() == originalPorts + exports + childSink &&
             relay.getPortName(originalPorts) == "simulationTrigger_" + prefix + "creditEvent_masked" &&
-            relay.getPortName(originalPorts + 1) == "simulationTrigger_" + prefix + "debitEvent",
+            relay.getPortName(originalPorts + exports - 1) == "simulationTrigger_" + prefix + "debitEvent" &&
+            (!duplicateMasked || relay.getPortName(originalPorts + 1) == "simulationTrigger_" + prefix + "creditEvent_masked_0"),
             "ancestor must relay each event through one export per definition");
   }
   unsigned instances = 0, masks = 0, registers = 0;
-  child.walk([&](NodeOp n) { masks += n.getName() == "creditEvent_masked"; });
+  child.walk([&](NodeOp n) { masks += n.getName().starts_with("creditEvent_masked"); });
   circuit.walk([&](RegOp) { ++registers; });
   for (auto module : circuit.getOps<FModuleOp>()) {
     for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
@@ -1196,7 +1200,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       unsigned originalDrivers = 0, sinkDrivers = 0;
       for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>()) {
         for (unsigned i = 0; i < 4; ++i) originalDrivers += connect.getDest() == instance.getResult(i);
-        if (childSink) sinkDrivers += connect.getDest() == instance.getResult(originalPorts + 2);
+        if (childSink) sinkDrivers += connect.getDest() == instance.getResult(originalPorts + exports);
       }
       require(originalDrivers == 4 && sinkDrivers == childSink, "source fanout lost or duplicated input connections");
     }
@@ -1211,7 +1215,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   });
   bool mixed = mode == 2 || mode == 3 || mode == 6 || mode == 7 || mode >= 9;
   require(localCounters == (mixed ? 4 : 2), "source fanout accounting root name mismatch");
-  require(instances == 2 + relayDepth && masks == 1 && registers == 9 + 6 * mixed + childSink &&
+  require(instances == 2 + relayDepth && masks == (duplicateMasked ? 2 : 1) && registers == 9 + 6 * mixed + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1612,6 +1616,10 @@ int main(int argc, char **argv) {
     fanoutSources(context, 10, argc > 59 ? argv[59] : "");
     fanoutSources(context, 10, argc > 60 ? argv[60] : "", 1);
     fanoutSources(context, 10, argc > 61 ? argv[61] : "", 2);
+    fanoutSources(context, 11, argc > 62 ? argv[62] : "");
+    fanoutSources(context, 12, argc > 63 ? argv[63] : "");
+    fanoutSources(context, 12, argc > 64 ? argv[64] : "", 1);
+    fanoutSources(context, 12, argc > 65 ? argv[65] : "", 2);
     nestedSiblingSources(context, 0, argc > 38 ? argv[38] : "");
     nestedSiblingSources(context, 1, argc > 39 ? argv[39] : "");
     nestedSiblingSources(context, 1, argc > 40 ? argv[40] : "", 2);
