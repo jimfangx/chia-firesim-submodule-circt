@@ -276,53 +276,52 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
   llvm::MapVector<Operation *, bool> sinkModules;
   llvm::DenseMap<Operation *, unsigned> sinkAnnotations;
-  // Sources may have sibling uses at each level of one parent-definition
-  // chain. Preserve every absolute path for clock checks and every direct use
-  // for export rewiring. Branches into different parent definitions are still
-  // unsupported and rejected before mutation.
+  // A pathless source contributes once per absolute instance, including uses
+  // in different parent definitions. Validate complete paths, but rewrite
+  // each definition and direct use only once, from descendants upward.
   auto routeSourceToTop = [&](FModuleOp module,
                               SmallVector<SmallVector<InstanceOp>> &paths,
                               SmallVector<FModuleOp> &pathModules) -> LogicalResult {
-    llvm::DenseSet<Operation *> visited;
-    paths.emplace_back();
-    for (; module != top;) {
-      if (!visited.insert(module).second) {
+    llvm::DenseSet<Operation *> seenModules, activeModules;
+    SmallVector<InstanceOp> path;
+    SmallVector<FModuleOp> ancestors;
+    std::function<LogicalResult(FModuleOp)> visit = [&](FModuleOp current) -> LogicalResult {
+      if (current == top) {
+        paths.push_back(path);
+        // Unequal routes through a shared definition must use the longest
+        // depth, so all its exports exist before any ancestor is rewritten.
+        for (auto [index, ancestor] : llvm::enumerate(ancestors))
+          depths[ancestor] = std::max(depths.lookup(ancestor), unsigned(path.size() - index));
+        return success();
+      }
+      if (!activeModules.insert(current).second) {
         error = "trigger hierarchy contains a cycle"; return failure();
       }
-      SmallVector<InstanceOp> instances;
-      FModuleOp parentModule;
-      for (auto *use : graph.lookup(module)->uses()) {
+      if (seenModules.insert(current).second) pathModules.push_back(current);
+      ancestors.push_back(current);
+      bool hasUse = false;
+      for (auto *use : graph.lookup(current)->uses()) {
         auto instance = use->getInstance<InstanceOp>();
         auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
         if (!parent || instance->getBlock() != parent.getBodyBlock() ||
-            instance.getNumResults() != module.getNumPorts()) {
+            instance.getNumResults() != current.getNumPorts()) {
           error = "trigger source needs unconditional instances"; return failure();
         }
-        if (parentModule && parent != parentModule) {
-          error = "trigger sources currently need one parent definition at each level";
-          return failure();
-        }
-        parentModule = parent;
-        instances.push_back(instance);
+        hasUse = true;
+        auto &instances = sourceParentInstances[current];
+        if (!llvm::is_contained(instances, instance)) instances.push_back(instance);
+        path.push_back(instance);
+        if (failed(visit(parent))) return failure();
+        path.pop_back();
       }
-      if (instances.empty()) {
+      if (!hasUse) {
         error = "trigger source needs an instance route to top"; return failure();
       }
-      pathModules.push_back(module);
-      sourceParentInstances[module] = instances;
-      SmallVector<SmallVector<InstanceOp>> completePaths;
-      for (auto instance : instances)
-        for (auto &path : paths) {
-          auto completePath = path;
-          completePath.push_back(instance);
-          completePaths.push_back(std::move(completePath));
-        }
-      paths = std::move(completePaths);
-      module = parentModule;
-    }
-    for (auto [index, ancestor] : llvm::enumerate(pathModules))
-      depths[ancestor] = std::max(depths.lookup(ancestor), unsigned(pathModules.size() - index));
-    return success();
+      ancestors.pop_back();
+      activeModules.erase(current);
+      return success();
+    };
+    return visit(module);
   };
   // A pathless sink applies to every instance, including instances of its
   // ancestors. Enumerate complete paths for clock preflight, but record each

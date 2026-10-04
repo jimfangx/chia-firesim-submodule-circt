@@ -1183,9 +1183,9 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
 }
 
-// Sibling event exports stay separate while a shared parent relays them to top.
+// Sibling exports and uses in different parent definitions stay separate.
 void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 1) {
-  bool childSink = mode == 1 || mode == 4;
+  bool childSink = mode == 1 || mode == 4 || mode == 7;
   std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
     "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
   if (childSink) childPorts += ", out %sinkEnabled: !firrtl.uint<1>";
@@ -1234,7 +1234,8 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
     for (auto [index, instance] : llvm::enumerate(relay.getBodyBlock()->getOps<InstanceOp>())) {
       instance->setAttr("example.metadata", b.getStringAttr("preserve"));
       if (depth == 0) {
-        bool wrongClock = (mode == 2 && index == 1) || (mode == 3 && index == 0);
+        bool wrongClock = ((mode == 2 || mode == 9) && index == 1) ||
+                          ((mode == 3 || mode == 8) && index == 0);
         b.create<StrictConnectOp>(loc, instance.getResult(0), arg(relay, wrongClock ? 7 : 0));
         for (unsigned i = 1; i <= 3; ++i)
           b.create<StrictConnectOp>(loc, instance.getResult(i), arg(relay, i + 3 * index));
@@ -1259,14 +1260,14 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
     other.setNameAttr(b.getStringAttr("otherParent"));
     topInstances.push_back(other);
   }
-  if (mode == 5) {
-    // All instances are unconditional, but this source also occurs in another
-    // parent definition. Reject the unsupported graph before changing any IO.
+  if (mode >= 5) {
+    // The same source definition occurs directly under top and under Relay.
+    // These routes have unequal depths and must each contribute one event.
     auto nested = *relays.front().getBodyBlock()->getOps<InstanceOp>().begin();
     auto other = cast<InstanceOp>(b.clone(*nested.getOperation()));
     other.setNameAttr(b.getStringAttr("directChild"));
     for (unsigned i = 0; i < 4; ++i)
-      b.create<StrictConnectOp>(loc, other.getResult(i), arg(top, i));
+      b.create<StrictConnectOp>(loc, other.getResult(i), arg(top, mode == 6 && i == 0 ? 7 : i));
   }
   for (auto instance : topInstances)
     for (unsigned i = 0; i < 8; ++i)
@@ -1296,9 +1297,10 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode >= 2 && mode != 4) {
-    require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
-            "unsupported sibling source route must fail atomically"); return;
+  if (mode == 2 || mode == 3 || mode == 6 || mode == 8 || mode == 9) {
+    require(failed(result) && consumed == 0 && before == dump(root.get()) &&
+            error.find("local base clock") != std::string::npos,
+            "every complete source clock route must fail atomically on mismatch"); return;
   }
   require(succeeded(result), error);
   require(consumed == 2 && succeeded(verify(*root)), "invalid source fanout IR");
@@ -1336,7 +1338,7 @@ void nestedSiblingSources(MLIRContext &context, unsigned mode, StringRef output,
       require(originalDrivers == inputs && sinkDrivers == childSink, "source fanout lost or duplicated input connections");
     }
   }
-  require(instances == 2 + relayDepth + (mode == 4) && masks == 1 && registers == 9 + childSink &&
+  require(instances == 2 + relayDepth + (mode >= 4) && masks == 1 && registers == 9 + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1418,9 +1420,11 @@ int main(int argc, char **argv) {
     nestedSiblingSources(context, 1, argc > 39 ? argv[39] : "");
     nestedSiblingSources(context, 1, argc > 40 ? argv[40] : "", 2);
     nestedSiblingSources(context, 4, argc > 41 ? argv[41] : "");
-    nestedSiblingSources(context, 5, "");
+    nestedSiblingSources(context, 5, argc > 42 ? argv[42] : "");
+    nestedSiblingSources(context, 7, argc > 43 ? argv[43] : "");
+    nestedSiblingSources(context, 7, argc > 44 ? argv[44] : "", 2);
     for (unsigned depth : {1, 2})
-      for (unsigned mode : {2, 3}) nestedSiblingSources(context, mode, "", depth);
+      for (unsigned mode : {2, 3, 6, 8, 9}) nestedSiblingSources(context, mode, "", depth);
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
