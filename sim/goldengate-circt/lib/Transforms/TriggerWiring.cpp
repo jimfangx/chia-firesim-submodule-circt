@@ -282,7 +282,20 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseMap<Operation *, unsigned> depths;
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
-  llvm::DenseMap<circt::FieldRef, circt::FieldRef> creditUnmaskedClocks, debitUnmaskedClocks;
+  llvm::DenseMap<circt::FieldRef, StringAttr> creditUnmaskedClocks, debitUnmaskedClocks;
+  // BridgeTopWiring's target-to-clock map selects the last annotation. Select
+  // it before tracing any instance path: a discarded clock must neither create
+  // an accounting domain nor constrain the surviving export's clock aliases.
+  // Reset-masked annotations have distinct generated targets and keep their
+  // individual clocks. Same-kind unmasked annotations share one export.
+  for (auto a : sources) {
+    if (a.getDict().get("reset")) continue;
+    auto local = resolveLocalField(circuit, a.getMember<StringAttr>("target"), error);
+    if (!local.field) return failure();
+    auto &clocks = a.getMember<BoolAttr>("sourceType").getValue()
+        ? creditUnmaskedClocks : debitUnmaskedClocks;
+    clocks[local.field] = a.getMember<StringAttr>("clock");
+  }
   // Stable preflight IDs survive instance replacement; a relay carries the
   // innermost-to-outermost route, without retaining erased operation handles.
   llvm::DenseMap<Operation *, unsigned> instanceIDs;
@@ -391,8 +404,6 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     SmallVector<SmallVector<InstanceOp>> paths;
     SmallVector<FModuleOp> pathModules;
     if (failed(routeSourceToTop(local.module, paths, pathModules))) return failure();
-    auto eventClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
-    if (!eventClock) return failure();
     if (!boolean(event)) {
       error = "trigger sources must be UInt<1>"; return failure();
     }
@@ -411,13 +422,13 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!reset && !(credit ? creditTargets : debitTargets).insert(event).second) {
       // An unmasked target is exported once by TopWiring's distinct annotations.
       // Its .exists membership test also counts that export only once.
-      if (unmaskedClocks.lookup(event) == eventClock) continue;
-      error = "trigger hardware currently needs distinct source targets unless unmasked clocks match";
-      return failure();
+      continue;
     }
     // Every masked annotation receives its own node and absolute exports,
     // even when event, reset, and clock field identities are identical.
-    if (!reset) unmaskedClocks[event] = eventClock;
+    auto eventClock = resolveField(circuit, local.module,
+        reset ? a.getMember<StringAttr>("clock") : unmaskedClocks.lookup(event), error);
+    if (!eventClock) return failure();
     std::map<Route, circt::FieldRef> clocks;
     for (auto &path : paths) {
       auto eventRoot = aliases.root(local.module, eventClock, path);

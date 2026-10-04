@@ -65,7 +65,10 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
         std::to_string(consumed) + "): " + error);
   };
   reject({source(true, "clock"), sink}, "both");
-  if (!mask) reject({channel, source(true, "clock"), source(true, "otherClock"), source(false, "clock"), sink}, "distinct source");
+  if (!mask) {
+    reject({channel, source(true, "clock"), source(true, "otherClock"), source(false, "clock"), sink}, "source clock domain");
+    reject({channel, source(true, "clock"), source(true, "missingClock"), source(false, "clock"), sink}, "local field");
+  }
   reject({channel, source(true, "otherClock"), source(false, "clock"), sink}, "source clock domain");
   reject({channel, source(true, "clock"), source(false, "clock"),
     b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TriggerSink)),
@@ -78,10 +81,13 @@ void run(MLIRContext &context, bool internal, bool mask, StringRef output) {
   require(succeeded(goldengate::wireTriggers(circuit, consumed, error)) && consumed == 2 &&
     dump(top) == body, "sink-less sources changed hardware");
   SmallVector<Attribute> finalAnnotations{keep, channel, source(true, "clock"), source(false, "clock"), sink, sink};
-  if (!mask) finalAnnotations.push_back(source(true, "clock"));
+  if (!mask) {
+    finalAnnotations.insert(finalAnnotations.begin() + 2, source(true, "otherClock"));
+    finalAnnotations.push_back(source(true, "clock"));
+  }
   set(finalAnnotations);
   require(succeeded(goldengate::wireTriggers(circuit, consumed, error)), error);
-  require(consumed == (mask ? 2 : 3) && succeeded(verify(*root)), "invalid trigger IR");
+  require(consumed == (mask ? 2 : 4) && succeeded(verify(*root)), "invalid trigger IR");
   require(circuit->getAttr("rawAnnotations") == b.getArrayAttr({keep, channel}), "annotation cleanup/order");
   std::map<std::string, Value> values;
   unsigned registers = 0;
@@ -1076,15 +1082,18 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // Each pathless source contributes once per complete instance path. Keep masking
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0) {
-  bool childSink = mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
+  bool lastSourceClock = mode >= 13;
+  bool childSink = mode >= 14 || mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
   bool duplicateMasked = mode == 11 || mode == 12;
   unsigned exports = duplicateMasked ? 3 : 2;
   std::string childPorts = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
     "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
   if (childSink) childPorts += ", out %sinkEnabled: !firrtl.uint<1>";
+  if (lastSourceClock) childPorts += ", in %alternateClock: !firrtl.clock";
   std::string instancePorts = childPorts;
   instancePorts.erase(std::remove(instancePorts.begin(), instancePorts.end(), '%'), instancePorts.end());
-  unsigned originalPorts = childSink ? 6 : 5;
+  unsigned originalPorts = (childSink ? 6 : 5) + lastSourceClock;
+  std::string creditExport = lastSourceClock ? "creditEvent" : "creditEvent_masked";
   auto inst = [&](StringRef name, StringRef module) { return "%" + name.str() + ":" + std::to_string(originalPorts) +
     " = firrtl.instance " + name.str() + " @" + module.str() + "(" + instancePorts + ")"; };
   std::string relayText;
@@ -1122,7 +1131,9 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     instance->setAttr("example.metadata", b.getStringAttr("preserve"));
     for (unsigned i = 0; i < 4; ++i)
       b.create<StrictConnectOp>(loc, instance.getResult(i), arg(relay, i));
-    for (unsigned i = 4; i < originalPorts; ++i)
+    if (lastSourceClock)
+      b.create<StrictConnectOp>(loc, instance.getResult(originalPorts - 1), arg(relay, originalPorts - 1));
+    for (unsigned i = 4; i < originalPorts - lastSourceClock; ++i)
       b.create<StrictConnectOp>(loc, arg(relay, i), instance.getResult(i));
   }
   b.setInsertionPointToEnd(top.getBodyBlock());
@@ -1133,6 +1144,10 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
                       ((mode == 3 || mode == 7) && index == 0);
     if (!(mode == 8 && index == 1))
       b.create<StrictConnectOp>(loc, instance.getResult(0), arg(top, wrongClock ? 7 : 0));
+    // The alternate clock is swapped between absolute instances. Modes 15/16
+    // omit one alias: only a selected clock may constrain source preflight.
+    if (lastSourceClock && !((mode == 15 || mode == 16) && index == 1))
+      b.create<StrictConnectOp>(loc, instance.getResult(originalPorts - 1), arg(top, index ? 0 : 7));
     for (unsigned i = 1; i <= 3; ++i)
       b.create<StrictConnectOp>(loc, instance.getResult(i), arg(top, i + 3 * index));
     b.create<StrictConnectOp>(loc, arg(top, 9 + index), instance.getResult(4));
@@ -1147,8 +1162,15 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     NamedAttrList attrs; attrs.set("class", b.getStringAttr(A::InternalTriggerSource));
     attrs.set("target", ref("Child", credit ? "creditEvent" : "debitEvent"));
     attrs.set("clock", ref("Child", "clock")); attrs.set("sourceType", b.getBoolAttr(credit));
-    if (credit) attrs.set("reset", ref("Child", "reset"));
+    if (credit && !lastSourceClock) attrs.set("reset", ref("Child", "reset"));
+    if (lastSourceClock && (mode == 15 || (mode == 14 && relayDepth)))
+      attrs.set("clock", ref("Child", "alternateClock"));
     annotations.push_back(attrs.getDictionary(&context));
+    if (lastSourceClock) {
+      attrs.set("clock", ref("Child", mode == 15 || (mode == 14 && relayDepth) ? "clock" : "alternateClock"));
+      attrs.set("class", b.getStringAttr(A::TriggerSource));
+      annotations.push_back(attrs.getDictionary(&context));
+    }
     if (credit && duplicateMasked) annotations.push_back(attrs.getDictionary(&context));
     // An unmasked duplicate shares every absolute export. Exercise both raw
     // class spellings; consumption still counts annotations, not unique events.
@@ -1169,7 +1191,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode == 8) {
+  if (mode == 8 || mode == 16) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
             "source fanout missing clock path must fail atomically"); return;
   }
@@ -1177,14 +1199,14 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   require(consumed == (duplicateMasked ? 3 : mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
   require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + exports + childSink,
           "source fanout must preserve top IO and share child export definitions");
-  require(child.getPortName(originalPorts) == "simulationTrigger_creditEvent_masked" &&
+  require(child.getPortName(originalPorts) == "simulationTrigger_" + creditExport &&
           child.getPortName(originalPorts + exports - 1) == "simulationTrigger_debitEvent" &&
           (!duplicateMasked || child.getPortName(originalPorts + 1) == "simulationTrigger_creditEvent_masked_0"), "source fanout export names");
   std::string prefix;
   for (auto [depth, relay] : llvm::enumerate(relays)) {
     prefix = std::string(depth ? "relay_" : "child_") + prefix;
     require(relay.getNumPorts() == originalPorts + exports + childSink &&
-            relay.getPortName(originalPorts) == "simulationTrigger_" + prefix + "creditEvent_masked" &&
+            relay.getPortName(originalPorts) == "simulationTrigger_" + prefix + creditExport &&
             relay.getPortName(originalPorts + exports - 1) == "simulationTrigger_" + prefix + "debitEvent" &&
             (!duplicateMasked || relay.getPortName(originalPorts + 1) == "simulationTrigger_" + prefix + "creditEvent_masked_0"),
             "ancestor must relay each event through one export per definition");
@@ -1200,9 +1222,13 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       unsigned originalDrivers = 0, sinkDrivers = 0;
       for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>()) {
         for (unsigned i = 0; i < 4; ++i) originalDrivers += connect.getDest() == instance.getResult(i);
+        if (lastSourceClock) originalDrivers += connect.getDest() == instance.getResult(originalPorts - 1);
         if (childSink) sinkDrivers += connect.getDest() == instance.getResult(originalPorts + exports);
       }
-      require(originalDrivers == 4 && sinkDrivers == childSink, "source fanout lost or duplicated input connections");
+      unsigned expectedDrivers = 4 + lastSourceClock;
+      if (mode == 15 && module == top && instance.getName() == "second") --expectedDrivers;
+      require(originalDrivers == expectedDrivers && sinkDrivers == childSink,
+              "source fanout lost or duplicated input connections");
     }
   }
   unsigned localCounters = 0;
@@ -1215,7 +1241,26 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   });
   bool mixed = mode == 2 || mode == 3 || mode == 6 || mode == 7 || mode >= 9;
   require(localCounters == (mixed ? 4 : 2), "source fanout accounting root name mismatch");
-  require(instances == 2 + relayDepth && masks == (duplicateMasked ? 2 : 1) && registers == 9 + 6 * mixed + childSink &&
+  if (lastSourceClock) {
+    // Executed Scala oracle: one export per kind/instance, even when the
+    // repeated annotations select different local clocks. Order reversal
+    // swaps the source feeding each domain, without adding another export.
+    bool alternateSelected = !(mode == 15 || (mode == 14 && relayDepth));
+    for (auto node : top.getBodyBlock()->getOps<NodeOp>())
+      for (bool secondary : {false, true})
+        for (bool credit : {true, false}) {
+          std::string name = std::string(secondary ? "otherClock_" : "clock_") +
+                             (credit ? "credits_next" : "debits_next");
+          if (node.getName() != name) continue;
+          auto add = node.getInput().getDefiningOp<AddPrimOp>();
+          StringRef instanceName = secondary == alternateSelected ? "first" : "second";
+          for (auto instance : top.getBodyBlock()->getOps<InstanceOp>())
+            if (instance.getName() == instanceName)
+              require(add && add.getRhs() == instance.getResult(originalPorts + !credit),
+                      "last source clock must select the exported event's accounting domain");
+        }
+  }
+  require(instances == 2 + relayDepth && masks == (lastSourceClock ? 0 : duplicateMasked ? 2 : 1) && registers == 9 + 6 * mixed + childSink &&
           circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
@@ -1620,6 +1665,12 @@ int main(int argc, char **argv) {
     fanoutSources(context, 12, argc > 63 ? argv[63] : "");
     fanoutSources(context, 12, argc > 64 ? argv[64] : "", 1);
     fanoutSources(context, 12, argc > 65 ? argv[65] : "", 2);
+    fanoutSources(context, 13, argc > 66 ? argv[66] : "");
+    fanoutSources(context, 14, argc > 67 ? argv[67] : "");
+    fanoutSources(context, 14, argc > 68 ? argv[68] : "", 1);
+    fanoutSources(context, 14, argc > 69 ? argv[69] : "", 2);
+    for (unsigned depth : {0, 1, 2})
+      for (unsigned mode : {15, 16}) fanoutSources(context, mode, "", depth);
     nestedSiblingSources(context, 0, argc > 38 ? argv[38] : "");
     nestedSiblingSources(context, 1, argc > 39 ? argv[39] : "");
     nestedSiblingSources(context, 1, argc > 40 ? argv[40] : "", 2);
