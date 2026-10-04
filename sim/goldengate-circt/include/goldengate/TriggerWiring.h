@@ -15,15 +15,18 @@ namespace goldengate {
 // Event/reset targets may select local UInt<1> bundle/vector leaves in the top
 // or a descendant with one unconditional instance at every level to the top, with
 // field identity used for duplicate detection and flattened masked-event names.
-// Requires: retained raw annotations; ground top-local UInt<1> node sinks;
+// Requires: retained raw annotations; ground local UInt<1> node sinks in the
+// top or a descendant with one unconditional instance at every level to top;
 // each sink clock dominates its node declaration.
 // Consumes: TriggerSource/TriggerSink and their internal annotation classes.
 // Produces: no annotations; preserves unrelated annotation order and top IO.
 // Descendant events are masked locally and exported through appended output
 // ports along the unique route, from the deepest module upward. Each parent
-// instance retains its original attributes and port connections.
-// Mutates: source event/reset projections, source/relay output ports and instances,
-// top clock/event/reset projections, local/global counters,
+// instance retains its original attributes and port connections. Sink enables
+// flow downward through appended inputs; each sink synchronizer stays in its
+// declaring module on its annotated clock, including node aliases.
+// Mutates: source event/reset projections, source/relay output ports, sink/relay
+// input ports and instances, top clock/event/reset projections, local/global counters,
 // synchronizers and sink node inputs. Uses read-only field/hierarchy driver analysis before mutation;
 // does not preserve hierarchy, top dataflow or dominance analyses after adding hardware.
 // Output: nine registers for one accounting domain and one sink, with Scala's

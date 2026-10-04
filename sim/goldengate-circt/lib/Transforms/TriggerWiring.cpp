@@ -25,24 +25,6 @@ bool source(Annotation a) {
 bool sink(Annotation a) {
   return a.isClass(A::TriggerSink) || a.isClass(A::InternalTriggerSink);
 }
-// Sink nodes remain local, ground references in the circuit top.
-// Resolve through target identity utilities rather than interpreting FIRRTL text.
-Value resolve(CircuitOp circuit, FModuleOp top, StringAttr target,
-              std::string &error) {
-  if (!target) { error = "trigger annotation has a missing reference"; return {}; }
-  std::string portError;
-  if (auto port = goldengate::resolveAnnotationTarget(circuit, target.getValue(), portError)) {
-    if (port->module == top && port->port && port->fieldID.value_or(0) == 0)
-      return top.getBodyBlock()->getArgument(*port->port);
-  }
-  auto *op = goldengate::resolveInternalAnnotationTarget(circuit, target.getValue(), error);
-  if (op && isa<WireOp, NodeOp, RegOp, RegResetOp>(op) &&
-      op->getBlock() == top.getBodyBlock())
-    return op->getResult(0);
-  error = "trigger hardware currently needs local ground references in the circuit top: " +
-          target.getValue().str();
-  return {};
-}
 bool boolean(Value v) {
   auto type = v ? dyn_cast<UIntType>(v.getType()) : UIntType();
   return type && type.getWidth() == 1;
@@ -285,12 +267,44 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   }
   SmallVector<Source> events;
   circt::igraph::InstanceGraph graph(circuit);
-  llvm::MapVector<Operation *, InstanceOp> sourceInstances;
+  llvm::MapVector<Operation *, InstanceOp> parentInstances;
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseMap<Operation *, unsigned> depths;
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
   SmallVector<std::pair<NodeOp, circt::FieldRef>> nodes;
+  llvm::MapVector<Operation *, bool> sinkModules;
   llvm::DenseSet<Operation *> seen;
+  auto routeToTop = [&](FModuleOp module, SmallVector<InstanceOp> &path,
+                        SmallVector<FModuleOp> &pathModules) -> LogicalResult {
+    llvm::DenseSet<Operation *> visited;
+    for (; module != top;) {
+      if (!visited.insert(module).second) {
+        error = "trigger hierarchy contains a cycle"; return failure();
+      }
+      InstanceOp instance = parentInstances.lookup(module);
+      if (!instance) {
+        // Scala pathless endpoints fan out across instances. Require a unique
+        // unconditional route at every level before changing any module IO.
+        for (auto *use : graph.lookup(module)->uses()) {
+          if (instance) { error = "trigger endpoint needs a unique instance chain to top"; return failure(); }
+          instance = use->getInstance<InstanceOp>();
+          auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
+          if (!parent || instance->getBlock() != parent.getBodyBlock() ||
+              instance.getNumResults() != module.getNumPorts()) {
+            error = "trigger endpoint needs a unique instance chain to top"; return failure();
+          }
+        }
+        if (!instance) { error = "trigger endpoint needs a unique instance chain to top"; return failure(); }
+        parentInstances[module] = instance;
+      }
+      pathModules.push_back(module);
+      path.push_back(instance);
+      module = instance->getParentOfType<FModuleOp>();
+    }
+    for (auto [index, ancestor] : llvm::enumerate(pathModules))
+      depths[ancestor] = pathModules.size() - index;
+    return success();
+  };
   for (auto a : sources) {
     auto target = a.getMember<StringAttr>("target");
     auto local = resolveLocalField(circuit, target, error);
@@ -298,31 +312,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (!event) return failure();
     SmallVector<InstanceOp> path;
     SmallVector<FModuleOp> pathModules;
-    llvm::DenseSet<Operation *> visited;
-    for (auto module = local.module; module != top;) {
-      if (!visited.insert(module).second) {
-        error = "trigger source hierarchy contains a cycle"; return failure();
-      }
-      InstanceOp instance = sourceInstances.lookup(module);
-      if (!instance) {
-        // Scala pathless sources fan out across instances. Require a unique
-        // unconditional route at every level before changing any module IO.
-        for (auto *use : graph.lookup(module)->uses()) {
-          if (instance) { error = "trigger source needs a unique instance chain to top"; return failure(); }
-          instance = use->getInstance<InstanceOp>();
-          auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
-          if (!parent || instance->getBlock() != parent.getBodyBlock() ||
-              instance.getNumResults() != module.getNumPorts()) {
-            error = "trigger source needs a unique instance chain to top"; return failure();
-          }
-        }
-        if (!instance) { error = "trigger source needs a unique instance chain to top"; return failure(); }
-        sourceInstances[module] = instance;
-      }
-      pathModules.push_back(module);
-      path.push_back(instance);
-      module = instance->getParentOfType<FModuleOp>();
-    }
+    if (failed(routeToTop(local.module, path, pathModules))) return failure();
     auto eventClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
     if (!boolean(event) || !(aliases.root(local.module, eventClock, path) == clockRoot)) {
@@ -342,26 +332,29 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       error = "trigger reset must be a reference when present"; return failure();
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
-    for (auto [index, module] : llvm::enumerate(pathModules)) {
-      childEvents[module].push_back(events.size());
-      depths[module] = pathModules.size() - index;
-    }
+    for (auto module : pathModules) childEvents[module].push_back(events.size());
     events.push_back({event, reset, credit, name});
   }
   DominanceInfo dominance(circuit);
   for (auto a : sinks) {
-    Value value = resolve(circuit, top, a.getMember<StringAttr>("target"), error);
-    if (!value) return failure();
-    auto sinkClock = resolveField(circuit, top, a.getMember<StringAttr>("clock"), error);
+    auto local = resolveLocalField(circuit, a.getMember<StringAttr>("target"), error);
+    if (!local.field) return failure();
+    Value value = local.field.getValue();
+    SmallVector<InstanceOp> path;
+    SmallVector<FModuleOp> pathModules;
+    if (failed(routeToTop(local.module, path, pathModules))) return failure();
+    auto sinkClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
     auto node = value.getDefiningOp<NodeOp>();
-    if (!node || !boolean(value) || !(aliases.root(sinkClock) == clockRoot)) {
+    if (!node || local.field.getFieldID() || !boolean(value) ||
+        !(aliases.root(local.module, sinkClock, path) == clockRoot)) {
       error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
     }
     if (!dominance.properlyDominates(sinkClock.getValue(), node.getOperation())) {
       error = "trigger sink clock must dominate its node declaration"; return failure();
     }
     if (seen.insert(node).second) nodes.push_back({node, sinkClock});
+    for (auto module : pathModules) sinkModules[module] = true;
   }
   // All unsupported scope/type/clock cases have been rejected before mutation.
   llvm::DenseMap<unsigned, Value> routed;
@@ -406,7 +399,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     child.insertPorts(added);
     for (unsigned i = 0; i < signals.size(); ++i)
       childBuilder.create<StrictConnectOp>(child.getBodyBlock()->getArgument(oldPorts + i), signals[i]);
-    auto instance = sourceInstances.lookup(operation);
+    auto instance = parentInstances.lookup(operation);
     auto replacement = instance.cloneAndInsertPorts(added);
     for (auto attr : instance->getAttrs())
       if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
@@ -416,6 +409,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       routed[indices[i]] = replacement.getResult(oldPorts + i);
       routedNames[indices[i]] = (instance.getName() + "_" + signalNames[i]).str();
     }
+    parentInstances[operation] = replacement;
     instance.erase();
   }
   circt::Namespace names;
@@ -497,13 +491,57 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   Value debitNext = total(debitDiff, "totalDebits");
   // Compare full UInt<33> NEXT values; comparing truncated state changes wrap semantics.
   Value enable = named(b.create<NEQPrimOp>(loc, creditNext, debitNext), "trigger_source");
+  // WiringTransform carries one shared trigger net into every module on a
+  // sink's route. Source exports have already replaced some instances; use
+  // their current handles, preserving those exports when adding input ports.
+  SmallVector<Operation *> sinkOrder;
+  for (auto &[operation, unused] : sinkModules) sinkOrder.push_back(operation);
+  llvm::stable_sort(sinkOrder, [&](Operation *a, Operation *b) { return depths[a] < depths[b]; });
+  llvm::DenseMap<Operation *, Value> sinkInputs;
+  auto moduleNamespace = [&](FModuleOp module, circt::Namespace &ns) {
+    for (auto name : module.getPortNamesAttr()) ns.newName(cast<StringAttr>(name).getValue());
+    module.walk([&](Operation *op) {
+      if (auto name = op->getAttrOfType<StringAttr>("name")) ns.newName(name.getValue());
+    });
+  };
+  // Scala WiringTransform names the final sink input by its wiring key and
+  // intermediate inputs by the source declaration. Namespace collisions are
+  // resolved independently in each module.
+  llvm::DenseSet<Operation *> sinkDefinitions;
+  for (auto [node, unused] : nodes) sinkDefinitions.insert(node->getParentOp());
+  for (auto operation : sinkOrder) {
+    auto module = cast<FModuleOp>(operation);
+    auto instance = parentInstances.lookup(operation);
+    auto parent = instance->getParentOfType<FModuleOp>();
+    circt::Namespace ns; moduleNamespace(module, ns);
+    unsigned oldPorts = module.getNumPorts();
+    SmallVector<std::pair<unsigned, PortInfo>> added{{oldPorts,
+      PortInfo(b.getStringAttr(ns.newName(sinkDefinitions.contains(operation) ? "trigger_sink" :
+          enable.getDefiningOp<NodeOp>().getName())), UIntType::get(b.getContext(), 1), Direction::In)}};
+    module.insertPorts(added);
+    auto replacement = instance.cloneAndInsertPorts(added);
+    for (auto attr : instance->getAttrs())
+      if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
+    for (unsigned i = 0; i < oldPorts; ++i)
+      instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
+    parentInstances[operation] = replacement;
+    instance.erase();
+    sinkInputs[operation] = module.getBodyBlock()->getArgument(oldPorts);
+    b.setInsertionPointToEnd(parent.getBodyBlock());
+    b.create<StrictConnectOp>(loc, replacement.getResult(oldPorts),
+                             parent == top ? enable : sinkInputs.lookup(parent));
+  }
   for (auto [node, sinkClock] : nodes) {
+    auto module = node->getParentOfType<FModuleOp>();
+    circt::Namespace ns;
+    if (module != top) moduleNamespace(module, ns);
     b.setInsertionPoint(node);
     Value domain = getValueByFieldID(ImplicitLocOpBuilder(loc, b), sinkClock.getValue(),
                                    sinkClock.getFieldID());
-    Value sync = reg(1, "trigger_sync", domain);
-    b.setInsertionPointToEnd(top.getBodyBlock());
-    b.create<StrictConnectOp>(loc, sync, enable);
+    Value sync = b.create<RegOp>(loc, UIntType::get(b.getContext(), 1), domain,
+                                (module == top ? names : ns).newName("trigger_sync")).getResult();
+    b.setInsertionPointToEnd(module.getBodyBlock());
+    b.create<StrictConnectOp>(loc, sync, module == top ? enable : sinkInputs.lookup(module));
     node->setOperand(0, sync);
   }
   consumed = sources.size();
