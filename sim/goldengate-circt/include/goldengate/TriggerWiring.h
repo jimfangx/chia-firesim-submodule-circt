@@ -51,7 +51,9 @@ namespace goldengate {
 // sink instance clock paths must each resolve to a top input Clock leaf;
 // each sink clock dominates its node declaration.
 // Consumes: TriggerSource/TriggerSink and their internal annotation classes.
-// Produces: no annotations; preserves unrelated annotation order and top IO.
+// Produces: explicit selectors for aggregate DontTouch leaves before adding
+// exports, matching SFC normalization and preventing root targets from rebinding
+// to same-named scalar ports. Preserves retained payload/order and top IO.
 // Descendant events are masked locally and exported through appended output
 // ports from the deepest module upward. Relays preserve separate event exports
 // for each sibling instance; every absolute instance contributes to accounting.

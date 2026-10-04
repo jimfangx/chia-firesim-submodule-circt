@@ -4,6 +4,7 @@
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "circt/Dialect/HW/HWTypeInterfaces.h"
 #include "circt/Support/Namespace.h"
 #include "circt/Support/InstanceGraph.h"
 #include "mlir/IR/Builders.h"
@@ -573,6 +574,40 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     nodes.push_back({node, sinkClock});
     for (auto module : pathModules) sinkModules[module] = true;
   }
+  // SFC expands aggregate DontTouches during normalization, before any
+  // trigger output exists. Keep explicit leaf selectors while the original
+  // SSA declaration is still unambiguous. A disappearing aggregate container
+  // may share its raw name with a new scalar export; leaving a root-only
+  // target would make later port-first resolution bind to that export.
+  SmallVector<Attribute> leafRetained;
+  for (auto attr : retained) {
+    Annotation annotation(attr);
+    std::string ignored;
+    auto local = annotation.isClass(A::DontTouch) ?
+        resolveLocalField(circuit, annotation.getMember<StringAttr>("target"), ignored) : LocalField{};
+    if (!local.field) { leafRetained.push_back(attr); continue; }
+    auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
+        local.field.getValue().getType(), local.field.getFieldID()));
+    if (type.isGround()) { leafRetained.push_back(attr); continue; }
+    std::function<void(FIRRTLBaseType, unsigned)> expand =
+        [&](FIRRTLBaseType selected, unsigned fieldID) {
+      if (auto bundle = dyn_cast<BundleType>(selected)) {
+        for (auto [index, element] : llvm::enumerate(bundle.getElements()))
+          expand(element.type, fieldID + bundle.getFieldID(index));
+      } else if (auto vector = dyn_cast<FVectorType>(selected)) {
+        for (unsigned index = 0; index < vector.getNumElements(); ++index)
+          expand(vector.getElementType(), fieldID + vector.getFieldID(index));
+      } else {
+        NamedAttrList copy(annotation.getDict());
+        auto name = getFieldName(circt::FieldRef(local.field.getValue(), fieldID)).first;
+        copy.set("target", StringAttr::get(circuit.getContext(),
+            "~" + circuit.getName().str() + "|" + local.module.getName().str() + ">" + name));
+        leafRetained.push_back(copy.getDictionary(circuit.getContext()));
+      }
+    };
+    expand(type, local.field.getFieldID());
+  }
+  retained = std::move(leafRetained);
   // All unsupported scope/type/clock cases have been rejected before mutation.
   struct RoutedEvent { Value value; std::string name; Route route; };
   // Multiple uses of one source produce separate SSA values in their parent.

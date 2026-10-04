@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/TriggerWiring.h"
+#include "goldengate/LowerTypes.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
@@ -1163,7 +1164,9 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
   auto reserveExportLeaf = [&](FModuleOp module, StringRef name, bool node) {
     b.setInsertionPointToEnd(module.getBodyBlock());
-    auto type = parseType(exportLeaf >= 4 ? "!firrtl.bundle<neighbor: uint<1>>" :
+    auto type = parseType(exportLeaf == 6 ?
+                         "!firrtl.bundle<neighbor: vector<bundle<data: uint<1>>, 2>, empty: bundle<>>" :
+                         exportLeaf >= 4 ? "!firrtl.bundle<neighbor: uint<1>>" :
                          "!firrtl.bundle<masked: uint<1>>", &context);
     auto invalid = b.create<InvalidValueOp>(loc, type);
     if (node) b.create<NodeOp>(loc, invalid.getResult(), b.getStringAttr(name));
@@ -1313,7 +1316,18 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   auto channel = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
     b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
     b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))});
-  annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  annotations.push_back(channel);
+  DictionaryAttr retainedAggregate;
+  if (exportLeaf >= 4) {
+    retainedAggregate = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(A::DontTouch)),
+      b.getNamedAttr("target", ref(exportLeaf == 4 ? "Child" : "Relay",
+        exportLeaf == 4 ? "simulationTrigger_simulationTrigger_creditEvent_masked" :
+                         "simulationTrigger_child_creditEvent_masked")),
+      b.getNamedAttr("example.payload", b.getStringAttr("original-container"))});
+    annotations.push_back(retainedAggregate);
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   if (topCollision) require(succeeded(verify(*root)), "top collision input must be valid FIRRTL IR");
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
@@ -1490,10 +1504,32 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
         }
   }
   require(instances == 2 + relayDepth && masks == (collidingMasks ? 1 : mixedMasks ? 2 : lastSourceClock ? 0 : duplicateMasked ? 2 : 1) && registers == 9 + 6 * mixed + childSink &&
-          circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}), "source fanout state or cleanup mismatch");
+          (!retainedAggregate || circuit->getAttrOfType<ArrayAttr>("rawAnnotations").size() == (exportLeaf == 6 ? 3 : 2)) &&
+          (retainedAggregate || circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel})),
+          "source fanout state or cleanup mismatch");
   if (!output.empty()) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec);
     require(!ec, "cannot write source fanout candidate"); root->print(out); out << '\n';
+  }
+  if (retainedAggregate) {
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+    require(succeeded(verify(*root)), "invalid lowered trigger target identity");
+    NamedAttrList expected(retainedAggregate);
+    auto original = retainedAggregate.getAs<StringAttr>("target").getValue();
+    SmallVector<Attribute> expectedAnnotations{channel};
+    SmallVector<StringRef> suffixes;
+    if (exportLeaf == 6) suffixes = {"_neighbor_0_data", "_neighbor_1_data"};
+    else suffixes = {"_neighbor"};
+    for (StringRef suffix : suffixes) {
+      expected.set("target", b.getStringAttr((original + suffix).str()));
+      expectedAnnotations.push_back(expected.getDictionary(&context));
+    }
+    require(circuit->getAttr("rawAnnotations") == b.getArrayAttr(expectedAnnotations),
+            "whole-aggregate DontTouch must follow its original leaf, not a generated trigger port");
+    if (!output.empty()) {
+      std::error_code ec; llvm::raw_fd_ostream out((output + ".lowered.mlir").str(), ec);
+      require(!ec, "cannot write lowered source fanout candidate"); root->print(out); out << '\n';
+    }
   }
 }
 
