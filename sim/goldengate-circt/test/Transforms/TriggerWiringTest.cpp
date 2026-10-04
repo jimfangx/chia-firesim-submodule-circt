@@ -877,6 +877,142 @@ void sharedSinks(MLIRContext &context, unsigned mode, StringRef output) {
     require(!ec, "cannot write shared sink candidate"); root->print(out); out << '\n';
   }
 }
+
+// Pathless sink annotations fan out into sibling instances, with independent
+// state in each instance. A source-owning ancestor is replaced before sink IO.
+void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
+  std::string leafPorts = "in %clock: !firrtl.clock, in %data: !firrtl.uint<1>, "
+    "out %first: !firrtl.uint<1>, out %second: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
+  std::string ports = "in %clock: !firrtl.clock, in %credit: !firrtl.uint<1>, "
+    "in %debit: !firrtl.uint<1>, in %reset: !firrtl.uint<1>, in %otherClock: !firrtl.clock, "
+    "out %first0: !firrtl.uint<1>, out %second0: !firrtl.uint<1>, "
+    "out %first1: !firrtl.uint<1>, out %second1: !firrtl.uint<1>, "
+    "out %echo0: !firrtl.uint<1>, out %echo1: !firrtl.uint<1>";
+  auto instanceText = [&](StringRef name, StringRef module, std::string interface, unsigned count) {
+    interface.erase(std::remove(interface.begin(), interface.end(), '%'), interface.end());
+    return "%" + name.str() + ":" + std::to_string(count) + " = firrtl.instance " +
+      name.str() + " @" + module.str() + "(" + interface + ")";
+  };
+  auto left = instanceText("left", "Leaf", leafPorts, 5);
+  auto right = instanceText("right", "Leaf", leafPorts, 5);
+  bool hasRelay = mode == 1 || mode == 3 || mode == 4;
+  auto relayText = hasRelay ? "firrtl.module @Relay(" + ports + ") { " +
+    (mode == 1 || mode == 4 ? left + " " : "") + right + " } " : "";
+  auto topText = hasRelay ? (mode == 3 ? left + " " : "") +
+    instanceText("relay", "Relay", ports, 11) : left + " " + right;
+  if (mode == 4) topText += " " + instanceText("otherRelay", "Relay", ports, 11);
+  auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes "
+    "{rawAnnotations = []} { firrtl.module @Leaf(" + leafPorts + ") {} " +
+    relayText + "firrtl.module @Top(" + ports + ") { " + topText + " } } }", &context);
+  require(bool(root), "parse sink fanout");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  FModuleOp leaf, relay, top;
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    if (module.getName() == "Leaf") leaf = module;
+    else if (module.getName() == "Relay") relay = module;
+    else top = module;
+  }
+  OpBuilder b(&context); auto loc = top.getLoc();
+  auto arg = [](FModuleOp module, unsigned index) { return module.getBodyBlock()->getArgument(index); };
+  b.setInsertionPointToEnd(leaf.getBodyBlock());
+  auto clockAlias = b.create<NodeOp>(loc, arg(leaf, 0), b.getStringAttr("clockAlias"));
+  auto bit = UIntType::get(&context, 1);
+  auto one = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
+  auto sinkA = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("triggerA"));
+  auto sinkB = b.create<NodeOp>(loc, one.getResult(), b.getStringAttr("triggerB"));
+  b.create<StrictConnectOp>(loc, arg(leaf, 2), sinkA.getResult());
+  b.create<StrictConnectOp>(loc, arg(leaf, 3), sinkB.getResult());
+  b.create<StrictConnectOp>(loc, arg(leaf, 4), arg(leaf, 1));
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    if (module == leaf) continue;
+    b.setInsertionPointToEnd(module.getBodyBlock());
+    for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
+      instance->setAttr("example.metadata", b.getStringAttr("preserve"));
+      if (instance.getModuleName() == "Relay") {
+        for (unsigned i = 0; i < 5; ++i)
+          b.create<StrictConnectOp>(loc, instance.getResult(i), arg(module, i));
+        if (instance.getName() == "relay")
+          for (unsigned i = 5; i < 11; ++i)
+            b.create<StrictConnectOp>(loc, arg(module, i), instance.getResult(i));
+      } else {
+        bool isLeft = instance.getName() == "left";
+        b.create<StrictConnectOp>(loc, instance.getResult(0), arg(module, ((mode == 2 && !isLeft) || (mode == 5 && isLeft)) ? 4 : 0));
+        b.create<StrictConnectOp>(loc, instance.getResult(1), arg(module, isLeft ? 1 : 2));
+        b.create<StrictConnectOp>(loc, arg(module, isLeft ? 5 : 7), instance.getResult(2));
+        b.create<StrictConnectOp>(loc, arg(module, isLeft ? 6 : 8), instance.getResult(3));
+        b.create<StrictConnectOp>(loc, arg(module, isLeft ? 9 : 10), instance.getResult(4));
+      }
+    }
+  }
+  auto sourceModule = mode == 1 ? relay : top;
+  b.setInsertionPointToEnd(sourceModule.getBodyBlock());
+  b.create<NodeOp>(loc, arg(sourceModule, 1), b.getStringAttr("creditEvent"));
+  b.create<NodeOp>(loc, arg(sourceModule, 2), b.getStringAttr("debitEvent"));
+  auto ref = [&](StringRef module, StringRef name) { return b.getStringAttr(("~Top|" + module + ">" + name).str()); };
+  SmallVector<Attribute> annotations;
+  for (bool credit : {true, false}) {
+    NamedAttrList attrs; attrs.set("class", b.getStringAttr(A::InternalTriggerSource));
+    attrs.set("target", ref(sourceModule.getName(), credit ? "creditEvent" : "debitEvent"));
+    attrs.set("clock", ref(sourceModule.getName(), "clock")); attrs.set("sourceType", b.getBoolAttr(credit));
+    if (credit) attrs.set("reset", ref(sourceModule.getName(), "reset"));
+    annotations.push_back(attrs.getDictionary(&context));
+  }
+  for (StringRef name : {"triggerB", "triggerA"})
+    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
+      b.getNamedAttr("target", ref("Leaf", name)), b.getNamedAttr("clock", ref("Leaf", "clockAlias"))}));
+  auto channel = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))});
+  annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto before = dump(root.get()); unsigned consumed = 99; std::string error;
+  auto result = goldengate::wireTriggers(circuit, consumed, error);
+  if (mode >= 2) {
+    require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
+            "unsupported sink fanout must fail atomically");
+    return;
+  }
+  require(succeeded(result), error);
+  require(consumed == 2 && succeeded(verify(*root)), "invalid sink fanout IR");
+  require(top.getNumPorts() == 11 && leaf.getNumPorts() == 6 && leaf.getPortName(5) == "trigger_sink",
+          "sink fanout must append one module input, preserving top IO");
+  if (relay) require(relay.getNumPorts() == 14 && relay.getPortName(13) == "trigger_source",
+                     "source-owning relay lost exports or enable input");
+  for (auto [node, name] : {std::pair{sinkA, StringRef("trigger_sync")},
+                            std::pair{sinkB, StringRef("trigger_sync_0")}}) {
+    auto reg = node.getInput().getDefiningOp<RegOp>();
+    require(reg && reg.getName() == name && reg.getClockVal() == clockAlias.getResult(),
+            "fanout synchronizers must follow sink declaration order");
+  }
+  Value enable;
+  for (auto node : top.getBodyBlock()->getOps<NodeOp>())
+    if (node.getName() == "trigger_source") enable = node.getResult();
+  unsigned leafInstances = 0, registers = 0;
+  circuit.walk([&](RegOp) { ++registers; });
+  for (auto module : circuit.getOps<FModuleOp>())
+    for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
+      require(instance->getAttrOfType<StringAttr>("example.metadata").getValue() == "preserve",
+              "sink fanout discarded instance metadata");
+      if (instance.getModuleName() != "Leaf") continue;
+      ++leafInstances; require(instance.getNumResults() == 6, "each sibling needs appended enable port");
+      unsigned drivers = 0, originalDrivers = 0;
+      for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>()) {
+        if (connect.getDest() == instance.getResult(5)) {
+          ++drivers; require(connect.getSrc() == (module == top ? enable : arg(module, 13)),
+                             "each sibling must receive the same trigger enable");
+        }
+        if (connect.getDest() == instance.getResult(0) || connect.getDest() == instance.getResult(1))
+          ++originalDrivers;
+      }
+      require(drivers == 1 && originalDrivers == 2, "fanout lost or duplicated input connections");
+    }
+  require(leafInstances == 2 && registers == 10 && circuit->getAttr("rawAnnotations") == b.getArrayAttr({channel}),
+          "fanout register definitions / annotation cleanup mismatch");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+    require(!ec, "cannot write fanout candidate"); root->print(out); out << '\n';
+  }
+}
+
 }
 int main(int argc, char **argv) {
   try {
@@ -927,6 +1063,12 @@ int main(int argc, char **argv) {
     sharedSinks(context, 1, argc > 25 ? argv[25] : "");
     sharedSinks(context, 2, argc > 26 ? argv[26] : "");
     sharedSinks(context, 3, "");
+    fanoutSinks(context, 0, argc > 27 ? argv[27] : "");
+    fanoutSinks(context, 1, argc > 28 ? argv[28] : "");
+    fanoutSinks(context, 2, "");
+    fanoutSinks(context, 3, "");
+    fanoutSinks(context, 4, "");
+    fanoutSinks(context, 5, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

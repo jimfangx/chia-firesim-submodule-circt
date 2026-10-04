@@ -268,6 +268,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   SmallVector<Source> events;
   circt::igraph::InstanceGraph graph(circuit);
   llvm::MapVector<Operation *, InstanceOp> parentInstances;
+  llvm::MapVector<Operation *, SmallVector<InstanceOp>> sinkParentInstances;
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseMap<Operation *, unsigned> depths;
   llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
@@ -303,6 +304,45 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     }
     for (auto [index, ancestor] : llvm::enumerate(pathModules))
       depths[ancestor] = pathModules.size() - index;
+    return success();
+  };
+  // A pathless sink applies to every instance of its module. Support sibling
+  // fanout under one parent, whose remaining route to top is unique. Record
+  // every path for clock preflight and every instance for later input rewiring.
+  auto routeSinkToTop = [&](FModuleOp module,
+                            SmallVector<SmallVector<InstanceOp>> &paths,
+                            SmallVector<FModuleOp> &pathModules) -> LogicalResult {
+    if (module == top) { paths.emplace_back(); return success(); }
+    SmallVector<InstanceOp> instances;
+    FModuleOp parent;
+    for (auto *use : graph.lookup(module)->uses()) {
+      auto instance = use->getInstance<InstanceOp>();
+      auto candidate = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
+      if (!candidate || instance->getBlock() != candidate.getBodyBlock() ||
+          instance.getNumResults() != module.getNumPorts() ||
+          (parent && parent != candidate)) {
+        error = "trigger sink fanout needs unconditional siblings under one parent";
+        return failure();
+      }
+      parent = candidate;
+      instances.push_back(instance);
+    }
+    if (!parent) {
+      error = "trigger sink needs an instance route to top"; return failure();
+    }
+    SmallVector<InstanceOp> tail;
+    SmallVector<FModuleOp> ancestors;
+    if (failed(routeToTop(parent, tail, ancestors))) return failure();
+    pathModules.push_back(module);
+    llvm::append_range(pathModules, ancestors);
+    depths[module] = pathModules.size();
+    sinkParentInstances[module] = instances;
+    for (auto ancestor : ancestors)
+      sinkParentInstances[ancestor] = {parentInstances.lookup(ancestor)};
+    for (auto instance : instances) {
+      paths.push_back({instance});
+      llvm::append_range(paths.back(), tail);
+    }
     return success();
   };
   for (auto a : sources) {
@@ -357,14 +397,15 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   for (auto node : orderedSinks) {
     auto module = node->getParentOfType<FModuleOp>();
     auto a = sinks[sinkAnnotations.lookup(node)];
-    SmallVector<InstanceOp> path;
+    SmallVector<SmallVector<InstanceOp>> paths;
     SmallVector<FModuleOp> pathModules;
-    if (failed(routeToTop(module, path, pathModules))) return failure();
+    if (failed(routeSinkToTop(module, paths, pathModules))) return failure();
     auto sinkClock = resolveField(circuit, module, a.getMember<StringAttr>("clock"), error);
     if (!sinkClock) return failure();
-    if (!(aliases.root(module, sinkClock, path) == clockRoot)) {
-      error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
-    }
+    for (auto &path : paths)
+      if (!(aliases.root(module, sinkClock, path) == clockRoot)) {
+        error = "trigger sinks must be UInt<1> nodes on the local base clock"; return failure();
+      }
     if (!dominance.properlyDominates(sinkClock.getValue(), node.getOperation())) {
       error = "trigger sink clock must dominate its node declaration"; return failure();
     }
@@ -425,6 +466,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       routedNames[indices[i]] = (instance.getName() + "_" + signalNames[i]).str();
     }
     parentInstances[operation] = replacement;
+    // Source exports may replace an ancestor also used by a sink route.
+    // Keep every sink handle live before erasing that original instance.
+    for (auto &sinkInstance : sinkParentInstances[operation])
+      if (sinkInstance == instance) sinkInstance = replacement;
     instance.erase();
   }
   circt::Namespace names;
@@ -526,25 +571,27 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   for (auto [node, unused] : nodes) sinkDefinitions.insert(node->getParentOp());
   for (auto operation : sinkOrder) {
     auto module = cast<FModuleOp>(operation);
-    auto instance = parentInstances.lookup(operation);
-    auto parent = instance->getParentOfType<FModuleOp>();
     circt::Namespace ns; moduleNamespace(module, ns);
     unsigned oldPorts = module.getNumPorts();
     SmallVector<std::pair<unsigned, PortInfo>> added{{oldPorts,
       PortInfo(b.getStringAttr(ns.newName(sinkDefinitions.contains(operation) ? "trigger_sink" :
           enable.getDefiningOp<NodeOp>().getName())), UIntType::get(b.getContext(), 1), Direction::In)}};
     module.insertPorts(added);
-    auto replacement = instance.cloneAndInsertPorts(added);
-    for (auto attr : instance->getAttrs())
-      if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
-    for (unsigned i = 0; i < oldPorts; ++i)
-      instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
-    parentInstances[operation] = replacement;
-    instance.erase();
     sinkInputs[operation] = module.getBodyBlock()->getArgument(oldPorts);
-    b.setInsertionPointToEnd(parent.getBodyBlock());
-    b.create<StrictConnectOp>(loc, replacement.getResult(oldPorts),
-                             parent == top ? enable : sinkInputs.lookup(parent));
+    for (auto instance : sinkParentInstances[operation]) {
+      auto parent = instance->getParentOfType<FModuleOp>();
+      auto replacement = instance.cloneAndInsertPorts(added);
+      for (auto attr : instance->getAttrs())
+        if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
+      for (unsigned i = 0; i < oldPorts; ++i)
+        instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
+      if (parentInstances.lookup(operation) == instance)
+        parentInstances[operation] = replacement;
+      instance.erase();
+      b.setInsertionPointToEnd(parent.getBodyBlock());
+      b.create<StrictConnectOp>(loc, replacement.getResult(oldPorts),
+                               parent == top ? enable : sinkInputs.lookup(parent));
+    }
   }
   for (auto [node, sinkClock] : nodes) {
     auto module = node->getParentOfType<FModuleOp>();
