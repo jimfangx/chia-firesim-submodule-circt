@@ -515,7 +515,7 @@ void run(MLIRContext &context) {
               dump(*invalid) == before, "aggregate trigger selector did not reject atomically");
     }
   }
-  // Clock and pipe connections use exact per-endpoint renames, including
+  // Clock, pipe and reverse connections use exact per-endpoint renames, including
   // repetitions, optional clock and both directions. Data selectors must
   // follow leaf identity even when their flattened names collide.
   auto clockInfo = b.getDictionaryAttr({
@@ -525,12 +525,14 @@ void run(MLIRContext &context) {
           b.getNamedAttr("multiplier", b.getI64IntegerAttr(1)),
           b.getNamedAttr("divisor", b.getI64IntegerAttr(1))})})),
       b.getNamedAttr("perClockMFMR", b.getArrayAttr({b.getI64IntegerAttr(3)}))});
-  for (int latency : {-1, 0, 3}) {
+  for (int latency : {-2, -1, 0, 3}) {
     bool pipe = latency >= 0;
+    bool reverse = latency == -2;
     auto info = pipe ? b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(A::PipeChannel)),
-        b.getNamedAttr("latency", b.getI32IntegerAttr(latency))}) : clockInfo;
-    StringRef endpointMember = pipe ? "target" : "clock";
+        b.getNamedAttr("latency", b.getI32IntegerAttr(latency))}) : reverse ? b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(A::DecoupledReverseChannel))}) : clockInfo;
+    StringRef endpointMember = pipe || reverse ? "target" : "clock";
     auto channel = b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
         b.getNamedAttr("globalName", b.getStringAttr("clock")),
@@ -545,7 +547,7 @@ void run(MLIRContext &context) {
             Annotation(counters[0]).getMember<StringAttr>(endpointMember)}))});
     auto channelCandidate = parseSourceString<ModuleOp>(counterFixture, &context);
     auto channelCircuit = *channelCandidate->getOps<CircuitOp>().begin();
-    auto selected = goldengate::resolveAnnotationTarget(channelCircuit, pipe ? "~Top|Top>io.event" : "~Top|Top>io.domain[0].clock", error);
+    auto selected = goldengate::resolveAnnotationTarget(channelCircuit, pipe || reverse ? "~Top|Top>io.event" : "~Top|Top>io.domain[0].clock", error);
     selected->module.setPortSymbolsAttr(*selected->port,
         InnerSymAttr::get(&context, {property("channel_endpoint", *selected->fieldID, "public")}));
     NamedAttrList emptyChannel(channel); emptyChannel.erase("clock");
@@ -613,7 +615,7 @@ void run(MLIRContext &context) {
 }
 // Compare the native normalization boundary to Scala LowForm using the same
 // data selectors on aggregate ports, nodes and wires. Emit only when requested.
-void pipeTargets(MLIRContext &context, unsigned mode, StringRef output) {
+void channelTargets(MLIRContext &context, unsigned mode, bool reverse, StringRef output) {
   std::string text = R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
       firrtl.module @Top(in %io: !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>,
@@ -626,36 +628,45 @@ void pipeTargets(MLIRContext &context, unsigned mode, StringRef output) {
         %base = firrtl.node %io : !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>
   )mlir";
   text += "} } }";
+  if (reverse) {
+    auto scalar = text.find("in %scalar: !firrtl.uint<8>");
+    text.replace(scalar, std::string("in %scalar: !firrtl.uint<8>").size(),
+                 "in %scalar: !firrtl.uint<1>");
+  }
   auto root = parseSourceString<ModuleOp>(text, &context);
-  require(bool(root), "pipe normalization oracle fixture parse failed");
+  require(bool(root), "channel normalization oracle fixture parse failed");
   auto circuit = *root->getOps<CircuitOp>().begin();
   OpBuilder b(&context);
   std::string name = mode == 0 ? "io" : "base";
   auto target = [&](StringRef field) { return b.getStringAttr("~Top|Top>" + name + field.str()); };
+  auto info = reverse ? b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledReverseChannel))}) :
+      b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+          b.getNamedAttr("latency", b.getI32IntegerAttr(mode))});
+  std::string field = reverse ? "flag" : "data";
   auto channel = b.getDictionaryAttr({
       b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
       b.getNamedAttr("globalName", b.getStringAttr("data")),
-      b.getNamedAttr("channelInfo", b.getDictionaryAttr({
-          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
-          b.getNamedAttr("latency", b.getI32IntegerAttr(mode))})),
+      b.getNamedAttr("channelInfo", info),
       b.getNamedAttr("clock", target(".clock")),
-      b.getNamedAttr("sources", b.getArrayAttr({target(".rows[1].data"),
-          b.getStringAttr("~Top|Top>scalar"), target(".rows[0].data"), target(".rows[1].data")})),
-      b.getNamedAttr("sinks", b.getArrayAttr({target(".rows[0].flag"), target(".rows[1].data")}))});
+      b.getNamedAttr("sources", b.getArrayAttr({target(".rows[1]." + field),
+          b.getStringAttr("~Top|Top>scalar"), target(".rows[0]." + field), target(".rows[1]." + field)})),
+      b.getNamedAttr("sinks", b.getArrayAttr({target(".rows[0].flag"), target(".rows[1]." + field)}))});
   NamedAttrList empty(channel); empty.erase("clock"); empty.erase("sources");
   empty.set("globalName", b.getStringAttr("empty")); empty.set("sinks", b.getArrayAttr({}));
   circuit->setAttr("rawAnnotations", b.getArrayAttr({channel, empty.getDictionary(&context)}));
   std::string error;
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
-  require(succeeded(verify(*root)), "pipe normalization oracle produced invalid IR");
+  require(succeeded(verify(*root)), "channel normalization oracle produced invalid IR");
   NamedAttrList expected(channel);
   expected.set("clock", target("_clock"));
-  expected.set("sources", b.getArrayAttr({target("_rows_1_data"), b.getStringAttr("~Top|Top>scalar"),
-                                        target("_rows_0_data"), target("_rows_1_data")}));
-  expected.set("sinks", b.getArrayAttr({target("_rows_0_flag"), target("_rows_1_data")}));
+  expected.set("sources", b.getArrayAttr({target("_rows_1_" + field), b.getStringAttr("~Top|Top>scalar"),
+                                        target("_rows_0_" + field), target("_rows_1_" + field)}));
+  expected.set("sinks", b.getArrayAttr({target("_rows_0_flag"), target("_rows_1_" + field)}));
   require(circuit->getAttr("rawAnnotations") == b.getArrayAttr({
       expected.getDictionary(&context), empty.getDictionary(&context)}),
-      "pipe oracle endpoints/latency/options changed");
+      "channel oracle endpoints/payload/options changed");
   if (!output.empty()) {
     std::error_code ec;
     llvm::raw_fd_ostream file(output, ec);
@@ -671,7 +682,10 @@ int main(int argc, char **argv) {
     run(context);
     for (unsigned mode = 0; mode < 3; ++mode) {
       StringRef name = mode == 0 ? "port-fields" : mode == 1 ? "node-fields" : "wire-fields";
-      pipeTargets(context, mode, argc > 1 ? std::string(argv[1]) + "/" + name.str() + "-candidate.mlir" : "");
+      for (bool reverse : {false, true}) {
+        std::string prefix = reverse ? "reverse-" : "";
+        channelTargets(context, mode, reverse, argc > 1 ? std::string(argv[1]) + "/" + prefix + name.str() + "-candidate.mlir" : "");
+      }
     }
   }
   catch (const std::exception &error) { llvm::errs() << error.what() << '\n'; return 1; }

@@ -106,7 +106,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   }
   const std::string circuitName = circuit.getName().str();
   // Only DontTouch targets may fan out. Trigger/AutoCounter scalar members
-  // and each clock/pipe channel endpoint follow SFC RTRenamer.exact. Keep
+  // and each clock/pipe/reverse channel endpoint follow SFC RTRenamer.exact. Keep
   // endpoint indices so repeated references and clock schedule order survive.
   // An empty DontTouch plan removes an empty aggregate annotation; no plan
   // preserves a member whose identity does not need transferring.
@@ -130,10 +130,13 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         info && Annotation(info).isClass(AnnotationClasses::TargetClockChannel);
     const bool pipeChannel = annotation.isClass(AnnotationClasses::ChannelConnection) &&
         info && Annotation(info).isClass(AnnotationClasses::PipeChannel);
-    const bool channelConnection = clockChannel || pipeChannel;
+    const bool reverseChannel = annotation.isClass(AnnotationClasses::ChannelConnection) &&
+        info && Annotation(info).isClass(AnnotationClasses::DecoupledReverseChannel);
+    const bool channelConnection = clockChannel || pipeChannel || reverseChannel;
     const bool exact = autoCounter || triggerSource || triggerSink || channelConnection;
     const StringRef kind = clockChannel ? "TargetClockChannel" :
                            pipeChannel ? "PipeChannel" :
+                           reverseChannel ? "DecoupledReverseChannel" :
                            autoCounter ? "AutoCounter" : "Trigger";
     if (!dontTouch && !exact)
       continue;
@@ -181,7 +184,8 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     };
     if (channelConnection) {
       // Optional members are left absent; empty arrays remain empty. Rational
-      // clocks, perClockMFMR and pipe latency contain no reference targets.
+      // clocks, perClockMFMR, pipe latency and reverse channel info contain no
+      // reference targets; ready endpoints are ordinary connection members.
       if (auto clock = annotation.getMember<StringAttr>("clock"))
         if (failed(planTarget("clock", clock))) return failure();
       for (StringRef member : {"sources", "sinks"}) {
