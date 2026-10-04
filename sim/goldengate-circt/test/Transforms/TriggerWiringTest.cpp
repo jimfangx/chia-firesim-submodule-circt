@@ -1100,7 +1100,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0,
                    bool sharedTarget = false, bool mixedMasks = false, bool collidingMasks = false,
-                   unsigned ancestorCollision = 0) {
+                   unsigned ancestorCollision = 0, unsigned topCollision = 0) {
   bool lastSourceClock = mode >= 13;
   bool childSink = mode >= 14 || mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
   bool duplicateMasked = mode == 11 || mode == 12;
@@ -1121,13 +1121,16 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     relayText += "firrtl.module @" + std::string(depth ? "Outer" : "Relay") + "(" + childPorts +
       ") { " + inst(depth ? "relay" : "child", depth ? "Relay" : "Child") + " } ";
   StringRef repeatedModule = relayDepth == 2 ? "Outer" : relayDepth == 1 ? "Relay" : "Child";
+  std::string topExport = "simulationTrigger_first_" +
+      std::string(relayDepth == 2 ? "relay_child_" : relayDepth == 1 ? "child_" : "") + "creditEvent_masked";
+  std::string collisionPort = topCollision == 3 ? ", in %" + topExport + ": !firrtl.uint<1>" : "";
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes {rawAnnotations = []} { "
     "firrtl.module @Child(" + childPorts + ") {} " + relayText + "firrtl.module @Top(in %clock: !firrtl.clock, "
     "in %credit0: !firrtl.uint<1>, in %debit0: !firrtl.uint<1>, in %reset0: !firrtl.uint<1>, "
     "in %credit1: !firrtl.uint<1>, in %debit1: !firrtl.uint<1>, in %reset1: !firrtl.uint<1>, "
     "in %otherClock: !firrtl.clock, out %enabled: !firrtl.uint<1>, out %echo0: !firrtl.uint<1>, "
     "out %echo1: !firrtl.uint<1>" + (childSink ? std::string(", out %sink0: !firrtl.uint<1>, out %sink1: !firrtl.uint<1>") : "") +
-    ") { " + inst("first", repeatedModule) + " " + inst("second", repeatedModule) + " } } }", &context);
+    collisionPort + ") { " + inst("first", repeatedModule) + " " + inst("second", repeatedModule) + " } } }", &context);
   require(bool(root), "parse source fanout");
   auto circuit = *root->getOps<CircuitOp>().begin();
   auto it = circuit.getOps<FModuleOp>().begin(); auto child = *it++;
@@ -1161,6 +1164,14 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
       b.create<StrictConnectOp>(loc, arg(relay, i), instance.getResult(i));
   }
   b.setInsertionPointToEnd(top.getBodyBlock());
+  if (topCollision && topCollision != 3) {
+    std::string collisionName = topCollision == 4 ? topExport.substr(0, topExport.size() - 7) :
+                                topCollision == 5 ? topExport + "_neighbor" : topExport;
+    if (topCollision == 2) {
+      auto wire = b.create<WireOp>(loc, bit, collisionName);
+      b.create<StrictConnectOp>(loc, wire.getResult(), arg(top, 2));
+    } else b.create<NodeOp>(loc, arg(top, 2), b.getStringAttr(collisionName));
+  }
   for (auto [index, instance] : llvm::enumerate(top.getBodyBlock()->getOps<InstanceOp>())) {
     instance->setAttr("example.metadata", b.getStringAttr("preserve"));
     bool wrongClock = mode == 4 || mode == 5 ||
@@ -1243,6 +1254,13 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     if (ancestorCollision == 1) attrs.set("reset", ref("Relay", "reset"));
     annotations.push_back(attrs.getDictionary(&context));
   }
+  if (topCollision == 4)
+    annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSource)),
+      b.getNamedAttr("target", ref("Top", topExport.substr(0, topExport.size() - 7))),
+      b.getNamedAttr("clock", ref("Top", "clock")),
+      b.getNamedAttr("reset", ref("Top", "reset0")),
+      b.getNamedAttr("sourceType", b.getBoolAttr(false))}));
   SmallVector<StringRef> sinkModules{"Top"};
   if (childSink) sinkModules.push_back("Child");
   for (StringRef module : sinkModules)
@@ -1252,11 +1270,14 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
     b.getNamedAttr("sinks", b.getArrayAttr({ref("Top", "clock")}))});
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  if (topCollision) require(succeeded(verify(*root)), "top collision input must be valid FIRRTL IR");
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode == 8 || mode == 16 || ancestorCollision == 2) {
+  if (mode == 8 || mode == 16 || ancestorCollision == 2 || (topCollision && topCollision != 5)) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
             "source fanout unsupported path must fail atomically: " + error);
+    if (topCollision) require(error.find("top declaration collides with trigger export") != std::string::npos,
+      "top export collision needs a specific diagnostic");
     if (ancestorCollision == 2) require(error.find("ambiguous flattened trigger source") != std::string::npos,
       "flattened ancestor/descendant source collision needs a specific diagnostic");
     return;
@@ -1846,6 +1867,13 @@ int main(int argc, char **argv) {
     fanoutSources(context, 14, argc > 85 ? argv[85] : "", 2, false, false, true, 1);
     fanoutSources(context, 14, "", 1, false, false, true, 2);
     fanoutSources(context, 14, "", 2, false, false, true, 2);
+    // Scala cannot reconstruct renamed top exports, including masks allocated
+    // before TopWiring. Reject these namespaces without modifying any IR.
+    fanoutSources(context, 14, "", 0, false, false, true, 0, 1);
+    fanoutSources(context, 14, "", 1, false, false, true, 0, 2);
+    fanoutSources(context, 14, "", 2, false, false, true, 0, 3);
+    fanoutSources(context, 14, "", 1, false, false, true, 0, 4);
+    fanoutSources(context, 14, argc > 86 ? argv[86] : "", 1, false, false, true, 0, 5);
     run(context, true, false, argc > 74 ? argv[74] : "", true);
     run(context, false, false, argc > 75 ? argv[75] : "", true);
     fanoutSources(context, 13, argc > 70 ? argv[70] : "", 0, true);

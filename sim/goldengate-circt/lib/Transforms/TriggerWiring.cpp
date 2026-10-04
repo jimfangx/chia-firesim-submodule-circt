@@ -491,6 +491,24 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     for (auto module : pathModules) childEvents[module].push_back(events.size());
     events.push_back({event, reset, credit, debit, name, std::move(clocks)});
   }
+  // BridgeTopWiring reconstructs topSink from the original flattened path,
+  // even when TopWiring renames its port to avoid a top declaration. Scala
+  // then cannot find that name in portName2WireMap. Check the namespace after
+  // every local mask has been planned, before adding hardware anywhere.
+  auto [topEntry, topInserted] = sourceNames.try_emplace(top);
+  auto &topNames = topEntry->second;
+  if (topInserted) {
+    for (auto portName : top.getPortNamesAttr())
+      topNames.newName(cast<StringAttr>(portName).getValue());
+    top.walk([&](Operation *op) {
+      if (auto opName = op->getAttrOfType<StringAttr>("name")) topNames.newName(opName.getValue());
+    });
+  }
+  for (auto &entry : flattenedSources)
+    if (topNames.newName(entry.getKey()) != entry.getKey()) {
+      error = "top declaration collides with trigger export: " + entry.getKey().str();
+      return failure();
+    }
   // Scala's per-domain DensePrefixSum requires both event lists to be nonempty.
   // Reject an incomplete domain before materializing any hardware.
   for (auto &[domain, counts] : domainSources)

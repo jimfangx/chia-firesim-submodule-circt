@@ -33,7 +33,9 @@ namespace goldengate {
 // selected after grouping credits before debits, before instance-path analysis.
 // Distinct sources must have distinct flattened absolute instance/source
 // identities. Ambiguous ancestor or underscore-separated paths fail before
-// mutation, matching Scala TopWiring's nonunique port rejection.
+// mutation, matching Scala TopWiring's nonunique port rejection. Flattened
+// top export identities must also avoid existing top declarations and all
+// planned top masks: Scala cannot reconstruct namespace-renamed top exports.
 // All source annotations are consumed.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor
