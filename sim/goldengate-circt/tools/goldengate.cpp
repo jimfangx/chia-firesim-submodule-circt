@@ -253,8 +253,16 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter-print-clocks");
   bool wireAutoCounterStubs = analyzeAutoCounterPrintClocks ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
-  bool wirePrintStubs =
-      argc == 7 && llvm::StringRef(argv[6]) == "--wire-print-stubs";
+  // Enabled ordinary prints currently terminate at the pre-FAME debug
+  // boundary; PrintBridge host stream synthesis is a separate porting step.
+  bool updatePrintBridgeClocks =
+      argc == 7 && llvm::StringRef(argv[6]) == "--update-print-bridge-clocks";
+  bool wirePrintReset = updatePrintBridgeClocks ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--wire-print-reset");
+  bool completePrintSynthesis = wirePrintReset ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--complete-print-synthesis");
+  bool wirePrintStubs = completePrintSynthesis ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--wire-print-stubs");
   bool synthesizeAutoCounterStubs =
       wireAutoCounterStubs || (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-print-stubs");
   bool synthesizePrintStubs =
@@ -298,7 +306,9 @@ int main(int argc, char **argv) {
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
-                    "--wire-print-stubs | --wire-autocounter-print-stubs | "
+                    "--wire-print-stubs | --complete-print-synthesis | "
+                    "--wire-print-reset | --update-print-bridge-clocks | "
+                    "--wire-autocounter-print-stubs | "
                     "--analyze-autocounter-print-clocks | "
                     "--complete-autocounter-print-wiring | "
                     "--synthesize-autocounter-print-channels | "
@@ -3341,7 +3351,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, wiredAnnos, error)))
         return fail("cannot export pending print wiring annotations: " + error);
       llvm::outs() << "Routed " << routes.size() << " printf bundles to top; clock binding pending\n";
-      if (analyzeAutoCounterPrintClocks) {
+      if (analyzeAutoCounterPrintClocks || completePrintSynthesis) {
         llvm::SmallVector<goldengate::PrintClockSource> sources;
         if (failed(goldengate::analyzePrintClockSources(circuit, stubs, routes, sources, error)))
           return fail("PrintSynthesis absolute clock sources: " + error);
@@ -3355,7 +3365,7 @@ int main(int argc, char **argv) {
         if (ec) return fail("cannot write print clock sources: " + ec.message());
         clockMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(clocks)));
         llvm::outs() << "Resolved " << sources.size() << " absolute printf clock sources; loopbacks pending\n";
-        if (completeAutoCounterPrintWiring) {
+        if (completeAutoCounterPrintWiring || completePrintSynthesis) {
           if (failed(goldengate::completePrintClockWiring(circuit, stubs, routes, error)))
             return fail("PrintSynthesis clock loopbacks: " + error);
           if (failed(mlir::verify(*module)))
@@ -3372,19 +3382,20 @@ int main(int argc, char **argv) {
           if (failed(goldengate::emitFAMEAnnotations(circuit, completedFAME, error)))
             return fail("cannot export completed print wiring FAME annotations: " + error);
           llvm::outs() << "Completed " << routes.size() << " printf clock bindings and output annotations\n";
-          if (synthesizeAutoCounterPrintChannels) {
-            if (failed(completeAutoCounterPrintSynthesis
+          if (synthesizeAutoCounterPrintChannels || completePrintSynthesis) {
+            bool complete = completeAutoCounterPrintSynthesis || completePrintSynthesis;
+            if (failed(complete
                 ? goldengate::completePrintSynthesis(circuit, stubs, error)
                 : goldengate::synthesizePrintChannels(circuit, stubs, error)))
               return fail("PrintSynthesis channels: " + error);
             if (failed(mlir::verify(*module)))
               return fail("PrintSynthesis channels produced invalid FIRRTL IR");
             llvm::SmallString<256> channelsIR(outputDir), channelsAnnos(outputDir), channelsFAME(outputDir);
-            llvm::sys::path::append(channelsIR, completeAutoCounterPrintSynthesis
+            llvm::sys::path::append(channelsIR, complete
                 ? "post-print-synthesis.mlir" : "post-print-channels.mlir");
-            llvm::sys::path::append(channelsAnnos, completeAutoCounterPrintSynthesis
+            llvm::sys::path::append(channelsAnnos, complete
                 ? "post-print-synthesis-all.json" : "post-print-channels-all.json");
-            llvm::sys::path::append(channelsFAME, completeAutoCounterPrintSynthesis
+            llvm::sys::path::append(channelsFAME, complete
                 ? "post-print-synthesis.json" : "post-print-channels.json");
             llvm::raw_fd_ostream channels(channelsIR, ec);
             if (ec) return fail("cannot write print channel IR: " + ec.message());
@@ -3392,10 +3403,15 @@ int main(int argc, char **argv) {
             if (failed(goldengate::emitAllAnnotations(circuit, channelsAnnos, error)) ||
                 failed(goldengate::emitFAMEAnnotations(circuit, channelsFAME, error)))
               return fail("cannot export print channel annotations: " + error);
-            llvm::outs() << (completeAutoCounterPrintSynthesis
+            llvm::outs() << (complete
                 ? "Completed printf channels and bridge constructors\n"
                 : "Constructed printf field and reset channels; bridge parameters pending\n");
-            if (wireAutoCounterPrintReset) {
+            if (wireAutoCounterPrintReset || wirePrintReset) {
+              // MidasTransforms wires trigger inputs before global reset sinks.
+              unsigned consumedTriggers = 0;
+              if (updatePrintBridgeClocks &&
+                  failed(goldengate::wireTriggers(circuit, consumedTriggers, error)))
+                return fail("PrintSynthesis TriggerWiring: " + error);
               unsigned wiredResetSinks = 0;
               if (failed(goldengate::wireGlobalReset(circuit, wiredResetSinks, error)))
                 return fail("GlobalResetConditionWiring: " + error);
@@ -3412,6 +3428,23 @@ int main(int argc, char **argv) {
                   failed(goldengate::emitFAMEAnnotations(circuit, resetFAME, error)))
                 return fail("cannot export global reset wiring annotations: " + error);
               llvm::outs() << "Wired " << wiredResetSinks << " global reset sinks\n";
+              if (updatePrintBridgeClocks) {
+                if (failed(goldengate::analyzeChannelClocksAndUpdateBridges(circuit, error)))
+                  return fail("PrintSynthesis channel clock analysis: " + error);
+                if (failed(mlir::verify(*module)))
+                  return fail("PrintSynthesis channel clock analysis produced invalid FIRRTL IR");
+                llvm::SmallString<256> clocksIR(outputDir), clocksAnnos(outputDir), clocksFAME(outputDir);
+                llvm::sys::path::append(clocksIR, "post-print-bridge-clocks.mlir");
+                llvm::sys::path::append(clocksAnnos, "post-print-bridge-clocks-all.json");
+                llvm::sys::path::append(clocksFAME, "post-print-bridge-clocks.json");
+                llvm::raw_fd_ostream clocks(clocksIR, ec);
+                if (ec) return fail("cannot write print bridge clock IR: " + ec.message());
+                module->print(clocks); clocks << '\n';
+                if (failed(goldengate::emitAllAnnotations(circuit, clocksAnnos, error)) ||
+                    failed(goldengate::emitFAMEAnnotations(circuit, clocksFAME, error)))
+                  return fail("cannot export print bridge clock annotations: " + error);
+                llvm::outs() << "Bound synthesized printf bridges to target clock domains\n";
+              }
             }
           }
         }
@@ -3421,6 +3454,16 @@ int main(int argc, char **argv) {
   };
   if (synthesizePrintStubs) {
     std::string error;
+    if (completePrintSynthesis) {
+      // Extract clock sources while bridge aggregates still exist, matching
+      // the Scala pre-debug boundary. Recompute the map after print channels
+      // and reset wiring exist, so newly constructed PrintBridges get domains.
+      if (failed(goldengate::promoteBridgePorts(circuit, error, true)))
+        return fail("PrintSynthesis BridgeExtraction: " + error);
+      if (updatePrintBridgeClocks &&
+          failed(goldengate::analyzeChannelClocksAndUpdateBridges(circuit, error)))
+        return fail("PrintSynthesis initial channel clock analysis: " + error);
+    }
     if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
       return fail("PrintSynthesis LowerTypes: " + error);
     mlir::PassManager lowForm(module->getContext());

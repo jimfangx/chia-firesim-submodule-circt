@@ -274,7 +274,10 @@ static LogicalResult synthesizePrintChannelsImpl(
     }
   }
   // Map ordering matches Scala's sortBy(sinkClockPort.ref); record ordering
-  // within each domain follows the completed annotation sequence.
+  // within each domain follows the completed native annotation sequence.
+  // Scala BridgeTopWiring emits records through a hash-map iteration, so its
+  // constructor order can differ. Host packing and driver offsets must use
+  // this same printPorts order when the PrintBridge host implementation lands.
   struct Domain {
     SmallVector<Attribute> channels, printPorts;
     std::string resetName;

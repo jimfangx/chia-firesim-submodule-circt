@@ -392,6 +392,11 @@ LogicalResult goldengate::analyzeChannelClocksAndUpdateBridges(
        builder.getNamedAttr("infoMap", infoMap)}));
   for (Attribute attr : raw) {
     Annotation annotation(attr);
+    // Debug synthesis can add channels after the initial aggregate clock
+    // analysis. Replace its old map when recomputing the complete boundary;
+    // downstream UpdateBridgeClockInfo requires exactly one current map.
+    if (annotation.isClass(AnnotationClasses::ChannelClockInfo))
+      continue;
     if (!annotation.isClass(AnnotationClasses::BridgeIO) ||
         annotation.getMember<DictionaryAttr>("clockInfo")) {
       rewritten.push_back(attr);

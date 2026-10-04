@@ -1,5 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/PrintWiring.h"
+#include "goldengate/ChannelClockInfo.h"
+#include "goldengate/GlobalResetWiring.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/HW/HWDialect.h"
@@ -9,6 +11,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -57,6 +60,110 @@ void check(CircuitOp c, ArrayRef<goldengate::PrintStub> stubs,
         route.topTarget=="~"+c.getName().str()+"|"+top.getName().str()+">"+top.getPortName(arg.getArgNumber()).str(),
         "expanded source/top target mismatch");
   }
+}
+// Exercise the debug boundary in MidasTransforms order. Native compilation
+// may have computed channel metadata before enabled debug channels existed;
+// refreshing it must retain exactly one complete map and bind each PrintBridge.
+void checkCompletedPrintMetadata(CircuitOp c, unsigned clockCount) {
+  auto top=named(c,"Top");
+  OpBuilder b(c.getContext());
+  auto printAnnotations=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto portValue=[&](StringRef ref) -> Value {
+    for(unsigned i=0;i<top.getNumPorts();++i)
+      if(top.getPortName(i)==ref)return top.getBodyBlock()->getArgument(i);
+    throw std::runtime_error("metadata port missing: "+ref.str());
+    return Value();
+  };
+  SmallVector<Attribute> clocks, targets;
+  for(unsigned i=0;i<clockCount;++i) {
+    clocks.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("name",b.getStringAttr(i?"slow":"base")),
+        b.getNamedAttr("multiplier",b.getI64IntegerAttr(1)),
+        b.getNamedAttr("divisor",b.getI64IntegerAttr(i?3:1))}));
+    targets.push_back(b.getStringAttr("~Top|Top>"+
+        std::string(clockCount==1?"clock":"clock"+std::to_string(i))));
+  }
+  auto clockChannel=b.getDictionaryAttr({
+      b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+      b.getNamedAttr("globalName",b.getStringAttr("targetClock")),
+      b.getNamedAttr("channelInfo",b.getDictionaryAttr({
+          b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::TargetClockChannel)),
+          b.getNamedAttr("clockInfo",b.getArrayAttr(clocks))})),
+      b.getNamedAttr("sinks",b.getArrayAttr(targets))});
+  auto resetSource=b.getDictionaryAttr({
+      b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::GlobalResetSource)),
+      b.getNamedAttr("target",b.getStringAttr("~Top|Top>enable"))});
+  auto opaque=b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Opaque"))});
+  // The first analysis has no print channels and produces an empty map.
+  c->setAttr("rawAnnotations",b.getArrayAttr({clockChannel,resetSource,opaque}));
+  std::string error;
+  require(succeeded(goldengate::analyzeChannelClocksAndUpdateBridges(c,error)),error);
+  auto early=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(early.size()==4 &&
+      Annotation(early[0]).getMember<DictionaryAttr>("infoMap").empty(),
+      "early channel metadata unexpectedly contains debug channels");
+  SmallVector<Attribute> annotations(printAnnotations.begin(),printAnnotations.end());
+  annotations.append(early.begin(),early.end());
+  // A stale earlier map must not survive recomputation alongside the empty map.
+  annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::ChannelClockInfo)),
+      b.getNamedAttr("infoMap",b.getDictionaryAttr({b.getNamedAttr("obsolete",clocks.front())}))}));
+  c->setAttr("rawAnnotations",b.getArrayAttr(annotations));
+  SmallVector<std::string> resetPorts;
+  std::map<std::string,Attribute> expected;
+  llvm::DenseMap<Value,Attribute> domains;
+  for(unsigned i=0;i<clockCount;++i)
+    domains[portValue(clockCount==1?"clock":"clock"+std::to_string(i))]=clocks[i];
+  unsigned bridgeCount=0;
+  for(auto attr:printAnnotations) {
+    Annotation anno(attr);
+    if(anno.isClass(goldengate::AnnotationClasses::GlobalResetSink))
+      resetPorts.push_back(anno.getMember<StringAttr>("target").getValue().split('>').second.str());
+    if(anno.isClass(goldengate::AnnotationClasses::BridgeIO))++bridgeCount;
+    if(!anno.isClass(goldengate::AnnotationClasses::ChannelConnection))continue;
+    auto loopback=portValue(anno.getMember<StringAttr>("clock").getValue().split('>').second);
+    auto found=domains.find(driver(top,loopback));
+    require(found!=domains.end(),"printf loopback lost target root before metadata binding");
+    expected.emplace(anno.getMember<StringAttr>("globalName").getValue().str(),found->second);
+  }
+  unsigned wired=0;
+  require(succeeded(goldengate::wireGlobalReset(c,wired,error)),error);
+  require(wired==clockCount && resetPorts.size()==clockCount,
+      "completed printf domains lost global reset sinks");
+  for(auto &port:resetPorts)
+    require(driver(top,portValue(port))==portValue("enable"),
+        "print reset remains zero instead of the native global reset source");
+  require(succeeded(goldengate::analyzeChannelClocksAndUpdateBridges(c,error)),error);
+  auto bound=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  unsigned maps=0,bridges=0,opaqueCount=0;
+  for(auto attr:bound) {
+    Annotation anno(attr);
+    require(!anno.isClass(goldengate::AnnotationClasses::GlobalResetSource) &&
+        !anno.isClass(goldengate::AnnotationClasses::GlobalResetSink),
+        "consumed debug reset annotations survived clock binding");
+    if(attr==opaque)++opaqueCount;
+    if(anno.isClass(goldengate::AnnotationClasses::ChannelClockInfo)) {
+      ++maps;auto info=anno.getMember<DictionaryAttr>("infoMap");
+      require(info && info.size()==expected.size() && !info.get("obsolete"),
+          "recomputed channel map retained stale entries or missed print fields");
+      for(auto &[name,domain]:expected)
+        require(info.get(name)==domain,"print channel RationalClock mismatch: "+name);
+    }
+    if(anno.isClass(goldengate::AnnotationClasses::BridgeIO)) {
+      ++bridges;auto mapping=anno.getMember<DictionaryAttr>("channelMapping");
+      auto clock=anno.getMember<DictionaryAttr>("clockInfo");
+      require(clock && mapping && !mapping.empty(),"PrintBridge has no resolved clock metadata");
+      for(auto member:mapping)
+        require(expected.at(cast<StringAttr>(member.getValue()).getValue().str())==clock,
+            "PrintBridge merged distinct clock domains");
+    }
+  }
+  require(maps==1 && bridges==bridgeCount && bridges==clockCount && opaqueCount==1,
+      "clock refresh duplicated maps, lost print bridges, or changed unrelated annotations");
+  auto before=dump(c);
+  require(succeeded(goldengate::analyzeChannelClocksAndUpdateBridges(c,error)) && dump(c)==before,
+      "repeated completed debug clock analysis changed operations or annotations");
+  require(succeeded(verify(c)),"completed print/reset/clock boundary contains invalid FIRRTL");
 }
 void run(MLIRContext &context, bool complete = false) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {
@@ -300,6 +407,7 @@ void run(MLIRContext &context, bool complete = false) {
           "empty selection mutated circuit");
   require(succeeded(goldengate::completePrintClockWiring(c,{},empty,error)) && dump(*root)==before,
           "empty clock wiring mutated circuit");
+  if(complete)checkCompletedPrintMetadata(c,1);
 }
 void runTwoClockWiring(MLIRContext &context, bool complete = false) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {
@@ -384,6 +492,7 @@ void runTwoClockWiring(MLIRContext &context, bool complete = false) {
     }
   }
   require(succeeded(verify(*root)),"two domain printf channel/reset IR invalid");
+  if(complete)checkCompletedPrintMetadata(c,2);
 }
 void runClocks(MLIRContext &context) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {

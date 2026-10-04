@@ -194,7 +194,8 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-host-clock-wiring COMMAND goldengate-host-clock-wiring-test)
   add_executable(goldengate-print-wiring-test
     test/Transforms/PrintWiringTest.cpp lib/Transforms/PrintWiring.cpp
-    lib/Analysis/PrintClockSources.cpp
+    lib/Analysis/PrintClockSources.cpp lib/Analysis/ChannelClockInfo.cpp
+    lib/Transforms/GlobalResetWiring.cpp
     lib/Transforms/PrintStubs.cpp lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-print-wiring-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-wiring-test PRIVATE -fno-rtti)
