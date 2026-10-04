@@ -586,7 +586,10 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   for (auto operation : routingOrder) {
     auto &indices = childEvents[operation];
     auto child = cast<FModuleOp>(operation);
-    circt::Namespace childNames;
+    circt::Namespace childNames, exportNames;
+    // SFC allocates exports after LowerTypes. Reserve aggregate leaves in its
+    // normalized namespace separately from names still present in native IR.
+    reserveNormalizedNames(child, exportNames);
     for (auto name : child.getPortNamesAttr()) childNames.newName(cast<StringAttr>(name).getValue());
     child.walk([&](Operation *op) {
       if (auto name = op->getAttrOfType<StringAttr>("name")) childNames.newName(name.getValue());
@@ -612,6 +615,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
           Value active = childBuilder.create<NotPrimOp>(reset);
           // Preserve the normalized route identity even if a CIRCT aggregate
           // container still occupies the mask node's preferred name.
+          exportNames.newName(event.name);
           auto nodeName = childNames.newName(event.name);
           signal = childBuilder.create<NodeOp>(childBuilder.create<AndPrimOp>(active, signal),
                                               childBuilder.getStringAttr(nodeName)).getResult();
@@ -623,7 +627,8 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     for (unsigned index : indices) {
       auto &localSignals = moduleSignals[index];
       for (auto &signal : localSignals) {
-        auto portName = childNames.newName("simulationTrigger_" + signal.name);
+        auto normalizedName = exportNames.newName("simulationTrigger_" + signal.name);
+        auto portName = childNames.newName(normalizedName);
         added.push_back({oldPorts, PortInfo(childBuilder.getStringAttr(portName),
             UIntType::get(circuit.getContext(), 1), Direction::Out)});
         signals.push_back(signal);

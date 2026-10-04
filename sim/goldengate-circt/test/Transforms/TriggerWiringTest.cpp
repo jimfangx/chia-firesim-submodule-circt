@@ -1106,7 +1106,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0,
                    bool sharedTarget = false, bool mixedMasks = false, bool collidingMasks = false,
-                   unsigned ancestorCollision = 0, unsigned topCollision = 0, bool maskContainer = false) {
+                   unsigned ancestorCollision = 0, unsigned topCollision = 0, bool maskContainer = false, unsigned exportLeaf = 0) {
   bool lastSourceClock = mode >= 13;
   bool childSink = mode >= 14 || mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
   bool duplicateMasked = mode == 11 || mode == 12;
@@ -1161,6 +1161,17 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
     auto invalid = b.create<InvalidValueOp>(loc, type);
     b.create<StrictConnectOp>(loc, wire.getResult(), invalid.getResult());
   }
+  auto reserveExportLeaf = [&](FModuleOp module, StringRef name, bool node) {
+    b.setInsertionPointToEnd(module.getBodyBlock());
+    auto type = parseType("!firrtl.bundle<masked: uint<1>>", &context);
+    auto invalid = b.create<InvalidValueOp>(loc, type);
+    if (node) b.create<NodeOp>(loc, invalid.getResult(), b.getStringAttr(name));
+    else {
+      auto wire = b.create<WireOp>(loc, type, name);
+      b.create<StrictConnectOp>(loc, wire.getResult(), invalid.getResult());
+    }
+  };
+  if (exportLeaf == 1) reserveExportLeaf(child, "simulationTrigger_simulationTrigger_creditEvent", false);
   auto credit = b.create<NodeOp>(loc, arg(child, 1), b.getStringAttr("creditEvent"));
   auto debit = b.create<NodeOp>(loc, arg(child, 2),
       b.getStringAttr(collidingMasks ? "simulationTrigger_creditEvent" : "debitEvent"));
@@ -1172,6 +1183,8 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
   for (auto relay : relays) {
     b.setInsertionPointToEnd(relay.getBodyBlock());
+    if (exportLeaf >= 2 && relay == relays.front())
+      reserveExportLeaf(relay, "simulationTrigger_child_creditEvent", exportLeaf == 3);
     if (ancestorCollision && relay == relays.front())
       b.create<NodeOp>(loc, arg(relay, 2), b.getStringAttr(ancestorCollision == 1 ?
         "simulationTrigger_child_creditEvent" : "child_creditEvent_masked"));
@@ -1316,14 +1329,14 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   require(child.getPortName(originalPorts) == "simulationTrigger_" + creditExport +
               (collidingMasks ? "_0" : "") &&
           child.getPortName(originalPorts + exports - 1) ==
-              "simulationTrigger_" + finalExport &&
+              "simulationTrigger_" + finalExport + (exportLeaf == 1 ? "_0" : "") &&
           (!duplicateMasked || child.getPortName(originalPorts + 1) == "simulationTrigger_creditEvent_masked_0"), "source fanout export names");
   std::string prefix;
   for (auto [depth, relay] : llvm::enumerate(relays)) {
     prefix = std::string(depth ? "relay_" : "child_") + prefix;
     require(relay.getNumPorts() == originalPorts + exports + bool(ancestorCollision) + childSink &&
             relay.getPortName(originalPorts) == "simulationTrigger_" + prefix + creditExport +
-              (ancestorCollision == 1 && !depth ? "_0" : "") &&
+              ((ancestorCollision == 1 || exportLeaf >= 2) && !depth ? "_0" : "") &&
             relay.getPortName(originalPorts + exports - 1) == "simulationTrigger_" + prefix +
                 finalExport &&
             (!duplicateMasked || relay.getPortName(originalPorts + 1) == "simulationTrigger_" + prefix + "creditEvent_masked_0"),
@@ -1913,6 +1926,11 @@ int main(int argc, char **argv) {
     fanoutSources(context, 14, "", 1, false, false, true, 0, 3, true);
     for (unsigned mode : {12u, 13u, 14u})
       eventTargets(context, mode, argc > mode + 77 ? argv[mode + 77] : "");
+    // Existing aggregate leaves reserve descendant/relay export names after
+    // Scala normalization. Port renaming must preserve the event's SSA driver.
+    for (unsigned leaf : {1u, 2u, 3u})
+      fanoutSources(context, 14, argc > leaf + 91 ? argv[leaf + 91] : "",
+                    1, false, false, true, 0, 0, false, leaf);
     run(context, true, false, argc > 74 ? argv[74] : "", true);
     run(context, false, false, argc > 75 ? argv[75] : "", true);
     fanoutSources(context, 13, argc > 70 ? argv[70] : "", 0, true);
