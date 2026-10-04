@@ -269,6 +269,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   SmallVector<Source> events;
   circt::igraph::InstanceGraph graph(circuit);
   llvm::MapVector<Operation *, InstanceOp> parentInstances;
+  llvm::MapVector<Operation *, SmallVector<InstanceOp>> sourceFanoutInstances;
   llvm::MapVector<Operation *, SmallVector<InstanceOp>> sinkParentInstances;
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseMap<Operation *, unsigned> depths;
@@ -359,14 +360,41 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     auto local = resolveLocalField(circuit, target, error);
     auto event = local.field;
     if (!event) return failure();
-    SmallVector<InstanceOp> path;
+    SmallVector<SmallVector<InstanceOp>> paths;
     SmallVector<FModuleOp> pathModules;
-    if (failed(routeToTop(local.module, path, pathModules))) return failure();
+    // BridgeTopWiring exports each use of a pathless source separately. Start
+    // with sibling instances at top; descendant relay routes remain unique.
+    SmallVector<InstanceOp> directInstances;
+    if (local.module != top)
+      for (auto *use : graph.lookup(local.module)->uses())
+        directInstances.push_back(use->getInstance<InstanceOp>());
+    if (directInstances.size() > 1) {
+      for (auto instance : directInstances) {
+        if (!instance || instance->getParentOfType<FModuleOp>() != top ||
+            instance->getBlock() != top.getBodyBlock() ||
+            instance.getNumResults() != local.module.getNumPorts()) {
+          error = "trigger source fanout currently needs direct unconditional top instances";
+          return failure();
+        }
+        paths.push_back({instance});
+      }
+      sourceFanoutInstances[local.module] = directInstances;
+      pathModules.push_back(local.module);
+      depths[local.module] = std::max(depths.lookup(local.module), 1u);
+    } else {
+      SmallVector<InstanceOp> path;
+      if (failed(routeToTop(local.module, path, pathModules))) return failure();
+      paths.push_back(std::move(path));
+    }
     auto eventClock = resolveField(circuit, local.module, a.getMember<StringAttr>("clock"), error);
     if (!eventClock) return failure();
-    if (!boolean(event) || !(aliases.root(local.module, eventClock, path) == clockRoot)) {
+    if (!boolean(event)) {
       error = "trigger sources must be UInt<1> on the local base clock"; return failure();
     }
+    for (auto &path : paths)
+      if (!(aliases.root(local.module, eventClock, path) == clockRoot)) {
+        error = "trigger sources must be UInt<1> on the local base clock"; return failure();
+      }
     bool credit = a.getMember<BoolAttr>("sourceType").getValue();
     if (!(credit ? creditTargets : debitTargets).insert(event).second) {
       error = "trigger hardware currently needs distinct source targets per sourceType";
@@ -423,6 +451,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   }
   // All unsupported scope/type/clock cases have been rejected before mutation.
   llvm::DenseMap<unsigned, Value> routed;
+  llvm::DenseMap<unsigned, SmallVector<Value>> expandedSignals;
   llvm::DenseMap<unsigned, std::string> routedNames;
   SmallVector<Operation *> routingOrder;
   for (auto &[operation, indices] : childEvents) routingOrder.push_back(operation);
@@ -464,22 +493,32 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     child.insertPorts(added);
     for (unsigned i = 0; i < signals.size(); ++i)
       childBuilder.create<StrictConnectOp>(child.getBodyBlock()->getArgument(oldPorts + i), signals[i]);
-    auto instance = parentInstances.lookup(operation);
-    auto replacement = instance.cloneAndInsertPorts(added);
-    for (auto attr : instance->getAttrs())
-      if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
-    for (unsigned i = 0; i < oldPorts; ++i)
-      instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
-    for (unsigned i = 0; i < indices.size(); ++i) {
-      routed[indices[i]] = replacement.getResult(oldPorts + i);
-      routedNames[indices[i]] = (instance.getName() + "_" + signalNames[i]).str();
+    auto instances = sourceFanoutInstances.lookup(operation);
+    bool fanout = !instances.empty();
+    if (!fanout) instances.push_back(parentInstances.lookup(operation));
+    for (auto instance : instances) {
+      auto replacement = instance.cloneAndInsertPorts(added);
+      for (auto attr : instance->getAttrs())
+        if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
+      for (unsigned i = 0; i < oldPorts; ++i)
+        instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
+      for (unsigned i = 0; i < indices.size(); ++i) {
+        if (fanout) {
+          // Preserve multiplicity: simultaneous events in two instances count
+          // twice, and each instance applies its own local reset mask.
+          expandedSignals[indices[i]].push_back(replacement.getResult(oldPorts + i));
+        } else {
+          routed[indices[i]] = replacement.getResult(oldPorts + i);
+          routedNames[indices[i]] = (instance.getName() + "_" + signalNames[i]).str();
+        }
+      }
+      if (!fanout) parentInstances[operation] = replacement;
+      // Source exports may replace an ancestor also used by a sink route.
+      // Keep every sink handle live before erasing that original instance.
+      for (auto &sinkInstance : sinkParentInstances[operation])
+        if (sinkInstance == instance) sinkInstance = replacement;
+      instance.erase();
     }
-    parentInstances[operation] = replacement;
-    // Source exports may replace an ancestor also used by a sink route.
-    // Keep every sink handle live before erasing that original instance.
-    for (auto &sinkInstance : sinkParentInstances[operation])
-      if (sinkInstance == instance) sinkInstance = replacement;
-    instance.erase();
   }
   circt::Namespace names;
   for (auto name : top.getPortNamesAttr()) names.newName(cast<StringAttr>(name).getValue());
@@ -507,6 +546,11 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   };
   SmallVector<Value> creditSignals, debitSignals;
   for (auto [index, event] : llvm::enumerate(events)) {
+    if (auto expanded = expandedSignals.find(index); expanded != expandedSignals.end()) {
+      auto &signals = event.credit ? creditSignals : debitSignals;
+      signals.append(expanded->second.begin(), expanded->second.end());
+      continue;
+    }
     if (auto signal = routed.lookup(index)) {
       (event.credit ? creditSignals : debitSignals).push_back(signal);
       continue;
