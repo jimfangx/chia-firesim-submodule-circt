@@ -16,8 +16,8 @@ namespace goldengate {
 // or a descendant with one unconditional instance at every level to the top, with
 // field identity used for duplicate detection and flattened masked-event names.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
-// top or a descendant instantiated by unconditional siblings under one parent,
-// with one unconditional instance at every remaining level to top; all sink
+// top or a descendant with unconditional instances under distinct parents,
+// each with one unconditional instance at every remaining level to top; all sink
 // instance clock paths must resolve to the same top base-clock leaf;
 // each sink clock dominates its node declaration.
 // Consumes: TriggerSource/TriggerSink and their internal annotation classes.
@@ -25,7 +25,7 @@ namespace goldengate {
 // Descendant events are masked locally and exported through appended output
 // ports along the unique route, from the deepest module upward. Each parent
 // instance retains its original attributes and port connections. Sink enables
-// flow downward through one appended input per definition and every sibling
+// flow downward through one appended input per definition and every sink
 // instance; each instance retains independent sink synchronizer state in its
 // declaring module on its annotated clock, including node aliases.
 // Duplicate sink annotations select the last clock for that node; synchronizer

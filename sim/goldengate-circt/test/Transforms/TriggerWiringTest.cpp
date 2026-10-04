@@ -878,8 +878,9 @@ void sharedSinks(MLIRContext &context, unsigned mode, StringRef output) {
   }
 }
 
-// Pathless sink annotations fan out into sibling instances, with independent
-// state in each instance. A source-owning ancestor is replaced before sink IO.
+// Pathless sink annotations fan out into siblings or distinct parents, with
+// independent state per instance. Unequal route depths must put the relay
+// enable input before the leaf inputs; source exports replace that relay first.
 void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
   std::string leafPorts = "in %clock: !firrtl.clock, in %data: !firrtl.uint<1>, "
     "out %first: !firrtl.uint<1>, out %second: !firrtl.uint<1>, out %echo: !firrtl.uint<1>";
@@ -895,10 +896,11 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
   };
   auto left = instanceText("left", "Leaf", leafPorts, 5);
   auto right = instanceText("right", "Leaf", leafPorts, 5);
-  bool hasRelay = mode == 1 || mode == 3 || mode == 4;
+  bool split = mode == 3 || mode == 6 || mode == 7 || mode == 8;
+  bool hasRelay = mode == 1 || mode == 4 || split;
   auto relayText = hasRelay ? "firrtl.module @Relay(" + ports + ") { " +
     (mode == 1 || mode == 4 ? left + " " : "") + right + " } " : "";
-  auto topText = hasRelay ? (mode == 3 ? left + " " : "") +
+  auto topText = hasRelay ? (split ? left + " " : "") +
     instanceText("relay", "Relay", ports, 11) : left + " " + right;
   if (mode == 4) topText += " " + instanceText("otherRelay", "Relay", ports, 11);
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" attributes "
@@ -930,13 +932,14 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
       instance->setAttr("example.metadata", b.getStringAttr("preserve"));
       if (instance.getModuleName() == "Relay") {
         for (unsigned i = 0; i < 5; ++i)
-          b.create<StrictConnectOp>(loc, instance.getResult(i), arg(module, i));
+          b.create<StrictConnectOp>(loc, instance.getResult(i), arg(module, mode == 7 && i == 0 ? 4 : i));
         if (instance.getName() == "relay")
           for (unsigned i = 5; i < 11; ++i)
-            b.create<StrictConnectOp>(loc, arg(module, i), instance.getResult(i));
+            if (!split || i == 7 || i == 8 || i == 10)
+              b.create<StrictConnectOp>(loc, arg(module, i), instance.getResult(i));
       } else {
         bool isLeft = instance.getName() == "left";
-        b.create<StrictConnectOp>(loc, instance.getResult(0), arg(module, ((mode == 2 && !isLeft) || (mode == 5 && isLeft)) ? 4 : 0));
+        b.create<StrictConnectOp>(loc, instance.getResult(0), arg(module, ((mode == 2 && !isLeft) || ((mode == 5 || mode == 8) && isLeft)) ? 4 : 0));
         b.create<StrictConnectOp>(loc, instance.getResult(1), arg(module, isLeft ? 1 : 2));
         b.create<StrictConnectOp>(loc, arg(module, isLeft ? 5 : 7), instance.getResult(2));
         b.create<StrictConnectOp>(loc, arg(module, isLeft ? 6 : 8), instance.getResult(3));
@@ -944,7 +947,12 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
       }
     }
   }
-  auto sourceModule = mode == 1 ? relay : top;
+  if (split) {
+    b.setInsertionPointToEnd(relay.getBodyBlock());
+    auto zero = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 0));
+    for (unsigned i : {5, 6, 9}) b.create<StrictConnectOp>(loc, arg(relay, i), zero.getResult());
+  }
+  auto sourceModule = mode == 1 || mode == 6 ? relay : top;
   b.setInsertionPointToEnd(sourceModule.getBodyBlock());
   b.create<NodeOp>(loc, arg(sourceModule, 1), b.getStringAttr("creditEvent"));
   b.create<NodeOp>(loc, arg(sourceModule, 2), b.getStringAttr("debitEvent"));
@@ -966,7 +974,7 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode >= 2) {
+  if (mode == 2 || mode == 4 || mode == 5 || mode == 7 || mode == 8) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
             "unsupported sink fanout must fail atomically");
     return;
@@ -975,8 +983,9 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
   require(consumed == 2 && succeeded(verify(*root)), "invalid sink fanout IR");
   require(top.getNumPorts() == 11 && leaf.getNumPorts() == 6 && leaf.getPortName(5) == "trigger_sink",
           "sink fanout must append one module input, preserving top IO");
-  if (relay) require(relay.getNumPorts() == 14 && relay.getPortName(13) == "trigger_source",
-                     "source-owning relay lost exports or enable input");
+  unsigned relayEnable = sourceModule == relay ? 13 : 11;
+  if (relay) require(relay.getNumPorts() == relayEnable + 1 && relay.getPortName(relayEnable) == "trigger_source",
+                     "relay lost original ports, source exports or enable input");
   for (auto [node, name] : {std::pair{sinkA, StringRef("trigger_sync")},
                             std::pair{sinkB, StringRef("trigger_sync_0")}}) {
     auto reg = node.getInput().getDefiningOp<RegOp>();
@@ -993,12 +1002,12 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
       require(instance->getAttrOfType<StringAttr>("example.metadata").getValue() == "preserve",
               "sink fanout discarded instance metadata");
       if (instance.getModuleName() != "Leaf") continue;
-      ++leafInstances; require(instance.getNumResults() == 6, "each sibling needs appended enable port");
+      ++leafInstances; require(instance.getNumResults() == 6, "each sink instance needs appended enable port");
       unsigned drivers = 0, originalDrivers = 0;
       for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>()) {
         if (connect.getDest() == instance.getResult(5)) {
-          ++drivers; require(connect.getSrc() == (module == top ? enable : arg(module, 13)),
-                             "each sibling must receive the same trigger enable");
+          ++drivers; require(connect.getSrc() == (module == top ? enable : arg(module, relayEnable)),
+                             "each sink instance must receive the same trigger enable");
         }
         if (connect.getDest() == instance.getResult(0) || connect.getDest() == instance.getResult(1))
           ++originalDrivers;
@@ -1066,7 +1075,10 @@ int main(int argc, char **argv) {
     fanoutSinks(context, 0, argc > 27 ? argv[27] : "");
     fanoutSinks(context, 1, argc > 28 ? argv[28] : "");
     fanoutSinks(context, 2, "");
-    fanoutSinks(context, 3, "");
+    fanoutSinks(context, 3, argc > 29 ? argv[29] : "");
+    fanoutSinks(context, 6, argc > 30 ? argv[30] : "");
+    fanoutSinks(context, 7, "");
+    fanoutSinks(context, 8, "");
     fanoutSinks(context, 4, "");
     fanoutSinks(context, 5, "");
     llvm::outs() << "TriggerWiring local accounting and atomic preflight PASS\n";

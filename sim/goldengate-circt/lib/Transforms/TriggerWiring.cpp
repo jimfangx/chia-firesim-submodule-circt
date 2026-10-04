@@ -306,43 +306,45 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       depths[ancestor] = pathModules.size() - index;
     return success();
   };
-  // A pathless sink applies to every instance of its module. Support sibling
-  // fanout under one parent, whose remaining route to top is unique. Record
+  // A pathless sink applies to every instance of its module. Each direct
+  // parent must have a unique remaining route to top. Record
   // every path for clock preflight and every instance for later input rewiring.
   auto routeSinkToTop = [&](FModuleOp module,
                             SmallVector<SmallVector<InstanceOp>> &paths,
                             SmallVector<FModuleOp> &pathModules) -> LogicalResult {
     if (module == top) { paths.emplace_back(); return success(); }
     SmallVector<InstanceOp> instances;
-    FModuleOp parent;
+    llvm::DenseSet<Operation *> seenModules;
+    seenModules.insert(module);
+    pathModules.push_back(module);
+    unsigned maxDepth = 0;
     for (auto *use : graph.lookup(module)->uses()) {
       auto instance = use->getInstance<InstanceOp>();
-      auto candidate = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
-      if (!candidate || instance->getBlock() != candidate.getBodyBlock() ||
-          instance.getNumResults() != module.getNumPorts() ||
-          (parent && parent != candidate)) {
-        error = "trigger sink fanout needs unconditional siblings under one parent";
+      auto parent = instance ? instance->getParentOfType<FModuleOp>() : FModuleOp();
+      if (!parent || instance->getBlock() != parent.getBodyBlock() ||
+          instance.getNumResults() != module.getNumPorts()) {
+        error = "trigger sink fanout needs unconditional instances";
         return failure();
       }
-      parent = candidate;
+      SmallVector<InstanceOp> tail;
+      SmallVector<FModuleOp> ancestors;
+      if (failed(routeToTop(parent, tail, ancestors))) return failure();
       instances.push_back(instance);
-    }
-    if (!parent) {
-      error = "trigger sink needs an instance route to top"; return failure();
-    }
-    SmallVector<InstanceOp> tail;
-    SmallVector<FModuleOp> ancestors;
-    if (failed(routeToTop(parent, tail, ancestors))) return failure();
-    pathModules.push_back(module);
-    llvm::append_range(pathModules, ancestors);
-    depths[module] = pathModules.size();
-    sinkParentInstances[module] = instances;
-    for (auto ancestor : ancestors)
-      sinkParentInstances[ancestor] = {parentInstances.lookup(ancestor)};
-    for (auto instance : instances) {
       paths.push_back({instance});
       llvm::append_range(paths.back(), tail);
+      maxDepth = std::max(maxDepth, unsigned(paths.back().size()));
+      for (auto ancestor : ancestors) {
+        if (seenModules.insert(ancestor).second) pathModules.push_back(ancestor);
+        sinkParentInstances[ancestor] = {parentInstances.lookup(ancestor)};
+      }
     }
+    if (instances.empty()) {
+      error = "trigger sink needs an instance route to top"; return failure();
+    }
+    // A direct use may be nearer top than a relay use of the same definition.
+    // Use the longest route so all relay inputs exist before leaf rewiring.
+    depths[module] = maxDepth;
+    sinkParentInstances[module] = instances;
     return success();
   };
   for (auto a : sources) {
