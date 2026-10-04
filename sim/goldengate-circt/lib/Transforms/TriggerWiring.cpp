@@ -88,7 +88,7 @@ bool boolean(circt::FieldRef field) {
 using Route = std::vector<unsigned>;
 struct Source {
   circt::FieldRef event, reset;
-  bool credit;
+  bool credit, debit;
   std::string name;
   std::map<Route, circt::FieldRef> clocks;
 };
@@ -281,21 +281,24 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
   llvm::MapVector<Operation *, SmallVector<InstanceOp>> sinkParentInstances;
   llvm::MapVector<Operation *, SmallVector<unsigned>> childEvents;
   llvm::DenseMap<Operation *, unsigned> depths;
-  llvm::DenseSet<circt::FieldRef> creditTargets, debitTargets;
-  llvm::DenseMap<circt::FieldRef, StringAttr> creditUnmaskedClocks, debitUnmaskedClocks;
-  // BridgeTopWiring's target-to-clock map selects the last annotation. Select
-  // it before tracing any instance path: a discarded clock must neither create
-  // an accounting domain nor constrain the surviving export's clock aliases.
-  // Reset-masked annotations have distinct generated targets and keep their
-  // individual clocks. Same-kind unmasked annotations share one export.
-  for (auto a : sources) {
-    if (a.getDict().get("reset")) continue;
-    auto local = resolveLocalField(circuit, a.getMember<StringAttr>("target"), error);
-    if (!local.field) return failure();
-    auto &clocks = a.getMember<BoolAttr>("sourceType").getValue()
-        ? creditUnmaskedClocks : debitUnmaskedClocks;
-    clocks[local.field] = a.getMember<StringAttr>("clock");
-  }
+  llvm::DenseSet<circt::FieldRef> unmaskedTargets;
+  llvm::DenseMap<circt::FieldRef, StringAttr> unmaskedClocks;
+  llvm::DenseMap<circt::FieldRef, std::pair<bool, bool>> unmaskedKinds;
+  // Scala groups credits before debits within each module before constructing
+  // BridgeTopWiring's target-to-clock map. Its last annotation selects the
+  // clock of the one shared export, even when the target belongs to both kinds.
+  // Select it before path tracing: discarded clocks cannot constrain aliases.
+  // Reset-masked annotations get distinct targets and keep individual clocks.
+  for (bool credit : {true, false})
+    for (auto a : sources) {
+      if (a.getDict().get("reset") ||
+          a.getMember<BoolAttr>("sourceType").getValue() != credit) continue;
+      auto local = resolveLocalField(circuit, a.getMember<StringAttr>("target"), error);
+      if (!local.field) return failure();
+      unmaskedClocks[local.field] = a.getMember<StringAttr>("clock");
+      auto &kinds = unmaskedKinds[local.field];
+      (credit ? kinds.first : kinds.second) = true;
+    }
   // Stable preflight IDs survive instance replacement; a relay carries the
   // innermost-to-outermost route, without retaining erased operation handles.
   llvm::DenseMap<Operation *, unsigned> instanceIDs;
@@ -418,11 +421,15 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     } else if (a.getDict().get("reset")) {
       error = "trigger reset must be a reference when present"; return failure();
     }
-    auto &unmaskedClocks = credit ? creditUnmaskedClocks : debitUnmaskedClocks;
-    if (!reset && !(credit ? creditTargets : debitTargets).insert(event).second) {
+    bool debit = !credit;
+    if (!reset && !unmaskedTargets.insert(event).second) {
       // An unmasked target is exported once by TopWiring's distinct annotations.
-      // Its .exists membership test also counts that export only once.
+      // Each kind's .exists membership test counts that export only once.
       continue;
+    }
+    if (!reset) {
+      auto kinds = unmaskedKinds.lookup(event);
+      credit = kinds.first; debit = kinds.second;
     }
     // Every masked annotation receives its own node and absolute exports,
     // even when event, reset, and clock field identities are identical.
@@ -443,11 +450,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       }
       clocks.emplace(std::move(route), eventRoot);
       auto &counts = domainSources[eventRoot];
-      ++(credit ? counts.first : counts.second);
+      if (credit) ++counts.first;
+      if (debit) ++counts.second;
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
     for (auto module : pathModules) childEvents[module].push_back(events.size());
-    events.push_back({event, reset, credit, name, std::move(clocks)});
+    events.push_back({event, reset, credit, debit, name, std::move(clocks)});
   }
   // Scala's per-domain DensePrefixSum requires both event lists to be nonempty.
   // Reject an incomplete domain before materializing any hardware.
@@ -596,12 +604,12 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     if (auto exported = routed[top].find(index); exported != routed[top].end()) {
       for (auto &signal : exported->second) {
         auto &domain = domainSignals[event.clocks.at(signal.route)];
-        (event.credit ? domain.credits : domain.debits).push_back(signal.value);
+        if (event.credit) domain.credits.push_back(signal.value);
+        if (event.debit) domain.debits.push_back(signal.value);
       }
       continue;
     }
     auto &domain = domainSignals[event.clocks.at(Route{})];
-    auto &signals = event.credit ? domain.credits : domain.debits;
     Value signal = getValueByFieldID(ImplicitLocOpBuilder(loc, b),
                                     event.event.getValue(), event.event.getFieldID());
     if (event.reset) {
@@ -610,7 +618,8 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       Value active = b.create<NotPrimOp>(loc, reset);
       signal = named(b.create<AndPrimOp>(loc, active, signal), event.name + "_masked");
     }
-    signals.push_back(signal);
+    if (event.credit) domain.credits.push_back(signal);
+    if (event.debit) domain.debits.push_back(signal);
   }
   auto reduce = [&](ArrayRef<Value> signals, StringRef stem) -> Value {
     // Scala DensePrefixSum uses the previous layer for every addition at an
