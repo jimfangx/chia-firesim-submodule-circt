@@ -105,15 +105,17 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     return failure();
   }
   const std::string circuitName = circuit.getName().str();
-  // An engaged, empty plan removes an annotation on an empty aggregate;
-  // an absent plan leaves unrelated targets untouched.
-  // AutoCounter and trigger annotations use exact renames for event, clock
-  // and optional reset references in SFC. Keep separate leaf identities for
-  // event, clock and reset; only
-  // DontTouch targets may expand into more than one annotation.
-  const std::array<StringRef, 3> members{"target", "clock", "reset"};
-  using MemberPlan = std::optional<SmallVector<GroundTarget>>;
-  SmallVector<std::array<MemberPlan, 3>> replacements(raw.size());
+  // Only DontTouch targets may fan out. Trigger/AutoCounter scalar members
+  // and each TargetClockChannel endpoint follow SFC RTRenamer.exact. Keep
+  // endpoint indices so repeated references and clock schedule order survive.
+  // An empty DontTouch plan removes an empty aggregate annotation; no plan
+  // preserves a member whose identity does not need transferring.
+  struct TargetPlan {
+    StringRef member;
+    std::optional<unsigned> element;
+    SmallVector<GroundTarget> targets;
+  };
+  SmallVector<SmallVector<TargetPlan>> replacements(raw.size());
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
     const bool dontTouch = annotation.isClass(AnnotationClasses::DontTouch);
@@ -123,67 +125,86 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         annotation.isClass(AnnotationClasses::InternalTriggerSource);
     const bool triggerSink = annotation.isClass(AnnotationClasses::TriggerSink) ||
         annotation.isClass(AnnotationClasses::InternalTriggerSink);
-    const bool exact = autoCounter || triggerSource || triggerSink;
-    const StringRef kind = autoCounter ? "AutoCounter" : "Trigger";
+    auto info = annotation.getMember<DictionaryAttr>("channelInfo");
+    const bool clockChannel = annotation.isClass(AnnotationClasses::ChannelConnection) &&
+        info && Annotation(info).isClass(AnnotationClasses::TargetClockChannel);
+    const bool exact = autoCounter || triggerSource || triggerSink || clockChannel;
+    const StringRef kind = clockChannel ? "TargetClockChannel" :
+                           autoCounter ? "AutoCounter" : "Trigger";
     if (!dontTouch && !exact)
       continue;
-    unsigned memberCount = triggerSink ? 2 : exact ? members.size() : 1;
-    for (unsigned member = 0; member < memberCount; ++member) {
-      auto &replacement = replacements[index][member];
-      auto spelling = annotation.getMember<StringAttr>(members[member]);
-      // Missing optional metadata remains the responsibility of the consuming
-      // AutoCounter/trigger analysis; partial handoffs still lower their event.
-      if (!spelling && member != 0)
-        continue;
-      if (!spelling) {
-        error = "retained target annotation has no target";
-        return failure();
-      }
+    auto planTarget = [&](StringRef member, StringAttr spelling,
+                          std::optional<unsigned> element = std::nullopt) -> LogicalResult {
+      TargetPlan plan{member, element, {}};
       auto local = spelling.getValue().split('>').second;
       std::string resolutionError;
-      auto target = resolveAnnotationTarget(circuit, spelling.getValue(),
-                                            resolutionError);
+      auto target = resolveAnnotationTarget(circuit, spelling.getValue(), resolutionError);
       if (target && target->port) {
         auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
             target->module.getPortType(*target->port), *target->fieldID));
         if (exact && !type.isGround()) {
-          error = kind.str() + " " + members[member].str() +
-                  " must select a ground value: " +
-                  spelling.getValue().str();
+          error = kind.str() + " " + member.str() +
+                  " must select a ground value: " + spelling.getValue().str();
           return failure();
         }
-        replacement.emplace();
         collectGroundTargets(type, target->module, *target->port, nullptr,
-                             *target->fieldID, *replacement);
-        continue;
-      }
-      if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
-                                                     resolutionError)) {
+                             *target->fieldID, plan.targets);
+      } else if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
+                                                            resolutionError)) {
         if (exact && !internal->type.isGround()) {
-          error = kind.str() + " " + members[member].str() +
-                  " must select a ground value: " +
-                  spelling.getValue().str();
+          error = kind.str() + " " + member.str() +
+                  " must select a ground value: " + spelling.getValue().str();
           return failure();
         }
-        replacement.emplace();
         collectGroundTargets(internal->type, internal->module, std::nullopt,
-                             internal->declaration, internal->fieldID,
-                             *replacement);
-        continue;
+                             internal->declaration, internal->fieldID, plan.targets);
+      } else {
+        // Unused ground triggers are consumed without resolution by TriggerWiring.
+        // Preserve ground AutoCounter events and root memory DontTouches as before.
+        if (((autoCounter && member == "target") || triggerSource || triggerSink) &&
+            !local.contains('.') && !local.contains('['))
+          return success();
+        if (exact || !resolveInternalAnnotationTarget(circuit, spelling.getValue(),
+                                                     resolutionError)) {
+          error = "unresolved retained annotation " + member.str() + " " +
+                  spelling.getValue().str() + ": " + resolutionError;
+          return failure();
+        }
+        return success();
       }
-      // Defer unresolved ground trigger metadata to TriggerWiring, which skips
-      // reference resolution when no sources or sinks need hardware. Preserve
-      // ground AutoCounter events and root memory DontTouches as before.
-      if (((autoCounter && member == 0) || triggerSource || triggerSink) &&
-          !local.contains('.') && !local.contains('['))
-        continue;
-      if (exact ||
-          !resolveInternalAnnotationTarget(circuit, spelling.getValue(),
-                                           resolutionError)) {
-        error = "unresolved retained annotation " + members[member].str() + " " +
-                spelling.getValue().str() + ": " + resolutionError;
+      replacements[index].push_back(std::move(plan));
+      return success();
+    };
+    if (clockChannel) {
+      // Optional members are left absent; empty arrays remain empty. Rational
+      // clocks and perClockMFMR metadata contain no reference targets.
+      if (auto clock = annotation.getMember<StringAttr>("clock"))
+        if (failed(planTarget("clock", clock))) return failure();
+      for (StringRef member : {"sources", "sinks"}) {
+        auto endpoints = annotation.getMember<ArrayAttr>(member);
+        if (!endpoints) continue;
+        for (auto [element, endpoint] : llvm::enumerate(endpoints)) {
+          auto spelling = dyn_cast<StringAttr>(endpoint);
+          if (!spelling) {
+            error = "TargetClockChannel " + member.str() + " endpoint is not a reference target";
+            return failure();
+          }
+          if (failed(planTarget(member, spelling, element))) return failure();
+        }
+      }
+      continue;
+    }
+    const std::array<StringRef, 3> members{"target", "clock", "reset"};
+    unsigned memberCount = triggerSink ? 2 : exact ? members.size() : 1;
+    for (unsigned member = 0; member < memberCount; ++member) {
+      auto spelling = annotation.getMember<StringAttr>(members[member]);
+      // Missing optional metadata remains the consuming analysis's responsibility.
+      if (!spelling && member != 0) continue;
+      if (!spelling) {
+        error = "retained target annotation has no target";
         return failure();
       }
+      if (failed(planTarget(members[member], spelling))) return failure();
     }
   }
 
@@ -196,9 +217,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   llvm::DenseMap<Operation *, SmallVector<StringAttr>> temporarySymbols;
   for (auto &annotationPlan : replacements) {
     for (auto &replacement : annotationPlan) {
-      if (!replacement)
-        continue;
-      for (auto &target : *replacement) {
+      for (auto &target : replacement.targets) {
         auto symbols = target.port
             ? target.module.getPortSymbolAttr(*target.port)
             : cast<circt::hw::InnerSymbolOpInterface>(target.declaration)
@@ -310,25 +329,28 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   };
   for (auto [index, attr] : llvm::enumerate(raw)) {
     Annotation annotation(attr);
-    // Clock and reset have exactly one ground identity each. Rewrite them
-    // before copying the event annotation, preserving every other member.
-    for (unsigned member = 1; member < members.size(); ++member) {
-      if (auto &plan = replacements[index][member]) {
-        auto spelling = loweredSpelling(plan->front());
-        if (!spelling)
-          return failure();
-        annotation.setMember(members[member], spelling);
+    const TargetPlan *events = nullptr;
+    for (auto &plan : replacements[index]) {
+      if (plan.member == "target" && !plan.element) {
+        events = &plan;
+        continue;
       }
+      auto spelling = loweredSpelling(plan.targets.front());
+      if (!spelling) return failure();
+      if (plan.element) {
+        auto endpoints = annotation.getMember<ArrayAttr>(plan.member);
+        SmallVector<Attribute> updated(endpoints.begin(), endpoints.end());
+        updated[*plan.element] = spelling;
+        annotation.setMember(plan.member, ArrayAttr::get(module.getContext(), updated));
+      } else annotation.setMember(plan.member, spelling);
     }
-    auto &events = replacements[index][0];
     if (!events) {
       rewritten.push_back(annotation.getAttr());
       continue;
     }
-    for (auto &replacement : *events) {
+    for (auto &replacement : events->targets) {
       auto spelling = loweredSpelling(replacement);
-      if (!spelling)
-        return failure();
+      if (!spelling) return failure();
       Annotation leaf(annotation.getAttr());
       leaf.setMember("target", spelling);
       rewritten.push_back(leaf.getAttr());

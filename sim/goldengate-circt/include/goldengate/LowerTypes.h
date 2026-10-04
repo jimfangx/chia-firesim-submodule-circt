@@ -9,7 +9,8 @@ namespace goldengate {
 // Requires: imported FIRRTL with rawAnnotations and resolvable local selectors.
 // Consumes: DontTouch references to empty aggregates; temporary leaf identities.
 // Produces: ground DontTouch targets and exact AutoCounter/trigger event,
-// clock and optional reset references, for public and internal classes.
+// clock and optional reset references, for public and internal classes; exact
+// TargetClockChannel clock/source/sink references in their original list order.
 // Mutates: resolves CHIRRTL, infers widths/resets, lowers aggregates, uniquifies
 // declaration names, synchronizes instance ports, and transfers retained targets.
 // Requires analyses: FIRRTL subtype/field IDs and CIRCT inner symbol namespaces.

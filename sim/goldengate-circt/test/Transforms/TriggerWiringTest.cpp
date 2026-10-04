@@ -440,7 +440,7 @@ void aliases(MLIRContext &context, unsigned mode, StringRef output,
 // Raw aggregate clock targets correspond to Scala's renamed LowerTypes leaves.
 // Keep event/reset/sink-node targets ground and test every failure before IR
 // projection materialization, including a late aggregate sink declaration.
-void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
+void clockTargets(MLIRContext &context, unsigned mode, StringRef output, bool normalizeFirst = false) {
   const std::string type = "!firrtl.bundle<traces: vector<bundle<clock: clock>, 2>, flag: uint<1>>";
   std::string body;
   if (mode == 2) {
@@ -464,7 +464,14 @@ void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
   SmallVector<Attribute> annotations;
   annotations.push_back(b.getDictionaryAttr({
     b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
-    b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel))})),
+    b.getNamedAttr("globalName", b.getStringAttr("clock")),
+    b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel)),
+      b.getNamedAttr("clockInfo", b.getArrayAttr({b.getDictionaryAttr({
+        b.getNamedAttr("name", b.getStringAttr("base")),
+        b.getNamedAttr("multiplier", b.getI64IntegerAttr(1)),
+        b.getNamedAttr("divisor", b.getI64IntegerAttr(1))})})),
+      b.getNamedAttr("perClockMFMR", b.getArrayAttr({b.getI64IntegerAttr(1)}))})),
     b.getNamedAttr("sinks", b.getArrayAttr({ref(base)}))}));
   for (bool credit : {true, false}) {
     NamedAttrList a;
@@ -482,6 +489,18 @@ void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
   annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(A::InternalTriggerSink)),
     b.getNamedAttr("target", ref("trigger")), b.getNamedAttr("clock", ref(sink))}));
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  if (normalizeFirst) {
+    std::string error;
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+    auto channel = cast<DictionaryAttr>(circuit->getAttrOfType<ArrayAttr>("rawAnnotations")[0]);
+    auto sinks = cast<ArrayAttr>(channel.get("sinks"));
+    require(sinks == b.getArrayAttr({ref(mode == 0 ? "clocks_traces_0_clock" : "base_traces_0_clock")}),
+            "production LowerTypes must transfer clock-channel sink identity");
+    if (!output.empty()) {
+      std::error_code ec; llvm::raw_fd_ostream out((output + ".normalized.mlir").str(), ec);
+      require(!ec, "cannot write normalized clock candidate"); root->print(out); out << '\n';
+    }
+  }
   auto before = dump(root.get());
   unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
@@ -501,6 +520,13 @@ void clockTargets(MLIRContext &context, unsigned mode, StringRef output) {
   top.walk([&](RegOp reg) {
     ++registers;
     bool local = reg.getName() == "clocks_traces_0_clock_credits" || reg.getName() == "clocks_traces_0_clock_debits";
+    if (normalizeFirst) {
+      Value expected = local || mode == 0 ? top.getBodyBlock()->getArgument(0) :
+                       values.at(reg.getName() == "trigger_sync" ? "sink_traces_0_clock" : "base_traces_0_clock");
+      require(getFieldRefFromValue(reg.getClockVal()) == circt::FieldRef(expected, 0),
+              "normalized clock channel selected the wrong SSA clock: " + reg.getName().str());
+      return;
+    }
     Value expected = local || mode == 0 ? top.getBodyBlock()->getArgument(0) :
                      values.at(reg.getName() == "trigger_sync" ? "sink" : "base");
     require(getFieldRefFromValue(reg.getClockVal()) == circt::FieldRef(expected, 3),
@@ -1950,6 +1976,8 @@ int main(int argc, char **argv) {
     aliases(context, 0, "", 16);
     aliases(context, 2, "", 15);
     aliases(context, 0, argc > 9 ? argv[9] : "", 17);
+    for (unsigned mode : {0u, 1u, 2u})
+      clockTargets(context, mode, argc > 102 + mode ? argv[102 + mode] : "", true);
     clockTargets(context, 0, argc > 10 ? argv[10] : "");
     clockTargets(context, 1, argc > 11 ? argv[11] : "");
     clockTargets(context, 2, argc > 12 ? argv[12] : "");
