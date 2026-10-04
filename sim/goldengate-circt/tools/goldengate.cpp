@@ -28,6 +28,7 @@
 #include "goldengate/SimulatorRTL.h"
 #include "goldengate/AutoCounterAnalysis.h"
 #include "goldengate/AutoILAAnalysis.h"
+#include "goldengate/AutoILAWiring.h"
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/PrintStubs.h"
@@ -230,6 +231,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter";
   bool analyzeAutoILA =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-ila";
+  bool wireILAProbes =
+      argc == 7 && llvm::StringRef(argv[6]) == "--wire-ila-probes";
   bool gateAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--gate-autocounter-events";
   bool gateSelectedAutoCounter =
@@ -270,7 +273,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !analyzeAutoCounter && !analyzeAutoILA &&
+       !resolveDontTouch && !lowerTypes && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -289,7 +292,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--lower-types | --analyze-ila | --analyze-autocounter | --gate-autocounter-events | "
+                    "--lower-types | --analyze-ila | --wire-ila-probes | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -3394,12 +3397,37 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (analyzeAutoILA) {
+  if (analyzeAutoILA || wireILAProbes) {
     std::string error;
     if (failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
       return fail("retained annotation LowerTypes: " + error);
     if (failed(emitAutoILAAnalysis(circuit, outputDir, error)))
       return fail("AutoILA analysis: " + error);
+    if (wireILAProbes) {
+      llvm::SmallVector<goldengate::WiredILAProbe> routes;
+      if (failed(goldengate::wireAutoILAProbesToTop(circuit, routes, error)))
+        return fail("AutoILA top wiring: " + error);
+      if (failed(mlir::verify(*module))) return fail("AutoILA top wiring produced invalid FIRRTL IR");
+      llvm::json::Array summary;
+      for (auto &route : routes)
+        summary.push_back(llvm::json::Object{
+            {"index", route.source.index}, {"target", route.source.target},
+            {"width", route.source.width}, {"top_target", route.topTarget}});
+      llvm::SmallString<256> irPath(outputDir), routePath(outputDir), annoPath(outputDir);
+      llvm::sys::path::append(irPath, "post-autoila-top-wiring.mlir");
+      llvm::sys::path::append(routePath, "autoila-routes.json");
+      llvm::sys::path::append(annoPath, "post-autoila-top-wiring-all.json");
+      std::error_code ec;
+      llvm::raw_fd_ostream irOut(irPath, ec);
+      if (ec) return fail("cannot write AutoILA top wiring: " + ec.message());
+      module->print(irOut); irOut << '\n'; irOut.close();
+      llvm::raw_fd_ostream routeOut(routePath, ec);
+      if (ec) return fail("cannot write AutoILA routes: " + ec.message());
+      routeOut << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
+      if (failed(goldengate::emitAllAnnotations(circuit, annoPath, error)))
+        return fail("AutoILA top wiring annotations: " + error);
+      llvm::outs() << "Wired " << routes.size() << " CIRCT AutoILA probes to top outputs in " << irPath << '\n';
+    }
     return 0;
   }
 

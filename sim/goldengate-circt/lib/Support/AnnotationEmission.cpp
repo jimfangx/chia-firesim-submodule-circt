@@ -5,6 +5,7 @@
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
+#include <cmath>
 #include <map>
 #include <optional>
 
@@ -54,6 +55,16 @@ std::optional<llvm::json::Value> toJSON(Attribute attr,
     return llvm::json::Value(value.getValue().str());
   if (auto value = dyn_cast<BoolAttr>(attr))
     return llvm::json::Value(value.getValue());
+  if (auto value = dyn_cast<FloatAttr>(attr)) {
+    // SFC DedupedResult annotations use fractional indices. Preserve their
+    // retained JSON payload when emitting a normalized comparison boundary.
+    double number = value.getValueAsDouble();
+    if (!std::isfinite(number)) {
+      error = "annotation float is not a finite JSON number";
+      return std::nullopt;
+    }
+    return llvm::json::Value(number);
+  }
   if (auto value = dyn_cast<IntegerAttr>(attr)) {
     if (value.getValue().getBitWidth() > 64) {
       error = "annotation integer exceeds JSON's 64-bit range";

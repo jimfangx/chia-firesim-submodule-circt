@@ -41,6 +41,7 @@ add_executable(goldengate-circt
   lib/Transforms/AutoCounterPrintfValues.cpp
   lib/Transforms/PrintStubs.cpp
   lib/Transforms/PrintWiring.cpp
+  lib/Transforms/AutoILAWiring.cpp
   lib/Transforms/GlobalResetWiring.cpp
   lib/Analysis/PrintClockSources.cpp
   lib/Transforms/CoerceAsyncToSyncReset.cpp
@@ -316,6 +317,16 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-autoila-analysis-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-autoila-analysis COMMAND goldengate-autoila-analysis-test)
+  add_executable(goldengate-autoila-wiring-test
+    test/Transforms/AutoILAWiringTest.cpp lib/Transforms/AutoILAWiring.cpp
+    lib/Analysis/AutoILAAnalysis.cpp lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-autoila-wiring-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autoila-wiring-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autoila-wiring-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autoila-wiring-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autoila-wiring COMMAND goldengate-autoila-wiring-test)
   add_executable(goldengate-fame-clock-gate-test
     test/Transforms/FAMEClockGateTest.cpp lib/Transforms/FAMEInputChannel.cpp)
   target_compile_features(goldengate-fame-clock-gate-test PRIVATE cxx_std_17)
