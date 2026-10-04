@@ -323,6 +323,40 @@ void run(MLIRContext &context) {
   before = dump(*internal);
   require(succeeded(goldengate::lowerTypesWithRetainedTargets(*internal, ic, error)) &&
               dump(*internal) == before, "internal lowering is not idempotent");
+  // Global signals use SingleTargetAnnotation fanout, unlike exact channel members.
+  // Preserve distinct payloads on overlapping selectors and internal namespaces.
+  for (StringRef klass : {goldengate::AnnotationClasses::HostClock,
+                         goldengate::AnnotationClasses::HostReset}) {
+    auto candidate = parseSourceString<ModuleOp>(internalFixture, &context);
+    auto owner = *candidate->getOps<CircuitOp>().begin();
+    SmallVector<Attribute> input, expected;
+    for (auto attr : internalAnnotations) {
+      Annotation changed(attr); changed.setMember("class", b.getStringAttr(klass));
+      input.push_back(changed.getAttr());
+    }
+    for (auto attr : ia) {
+      Annotation changed(attr); changed.setMember("class", b.getStringAttr(klass));
+      expected.push_back(changed.getAttr());
+    }
+    owner->setAttr("rawAnnotations", b.getArrayAttr(input));
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*candidate, owner, error)) &&
+            succeeded(verify(*candidate)) && owner->getAttr("rawAnnotations") == b.getArrayAttr(expected),
+            "host global internal fanout/identity/payload changed: " + error);
+    InnerSymbolTable::walkSymbols(*owner.getOps<FModuleOp>().begin(), [&](StringAttr, InnerSymTarget) {
+      require(false, "temporary host global identity leaked");
+    });
+    before = dump(*candidate);
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*candidate, owner, error)) &&
+            dump(*candidate) == before, "host global lowering is not idempotent");
+    for (StringRef bad : {"~Top|Top>absent", "~Top|Top>state.absent", "~Top|Top>agg.v[1]"}) {
+      auto invalid = parseSourceString<ModuleOp>(internalFixture, &context);
+      auto invalidOwner = *invalid->getOps<CircuitOp>().begin();
+      invalidOwner->setAttr("rawAnnotations", b.getArrayAttr({input.front(), annotation(bad, "bad", klass)}));
+      before = dump(*invalid);
+      require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, invalidOwner, error)) &&
+              dump(*invalid) == before, "invalid host global target mutated IR");
+    }
+  }
   for (auto bad : {annotation("~Top|Top>agg.v[1]", "bad"),
                    annotation("~Top|Top>state.absent", "bad"),
                    annotation("~Top|Top>alias.a", "bad-event",
@@ -789,6 +823,43 @@ void channelTargets(MLIRContext &context, unsigned mode, unsigned kind, StringRe
     root->print(file);
   }
 }
+void hostTargets(MLIRContext &context, unsigned mode, StringRef output) {
+  std::string text = R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %io: !firrtl.bundle<clocks: vector<clock, 2>, resets: vector<uint<1>, 2>>,
+                        in %empty: !firrtl.bundle<>) {
+  )mlir";
+  text += mode == 2 ? R"mlir(
+        %base = firrtl.wire : !firrtl.bundle<clocks: vector<clock, 2>, resets: vector<uint<1>, 2>>
+        firrtl.strictconnect %base, %io : !firrtl.bundle<clocks: vector<clock, 2>, resets: vector<uint<1>, 2>>
+  )mlir" : R"mlir(
+        %base = firrtl.node %io : !firrtl.bundle<clocks: vector<clock, 2>, resets: vector<uint<1>, 2>>
+  )mlir";
+  text += "} } }";
+  auto root = parseSourceString<ModuleOp>(text, &context);
+  require(bool(root), "host global oracle fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context);
+  std::string name = mode == 0 ? "io" : "base";
+  auto annotation = [&](StringRef klass, StringRef target) {
+    return b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(klass)),
+        b.getNamedAttr("target", b.getStringAttr("~Top|Top>" + target.str()))});
+  };
+  using A = goldengate::AnnotationClasses;
+  circuit->setAttr("rawAnnotations", b.getArrayAttr({
+      annotation(A::HostClock, name + ".clocks"), annotation(A::HostReset, name + ".resets"),
+      annotation(A::HostClock, name + ".clocks[1]"), annotation(A::HostReset, "empty")}));
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)) && circuit->getAttr("rawAnnotations") == b.getArrayAttr({
+      annotation(A::HostClock, name + "_clocks_0"), annotation(A::HostClock, name + "_clocks_1"),
+      annotation(A::HostReset, name + "_resets_0"), annotation(A::HostReset, name + "_resets_1")}),
+      "host global fanout/empty target/duplicate coalescing changed");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file(output, ec);
+    require(!ec, "cannot write host global oracle: " + ec.message()); root->print(file);
+  }
+}
 } // namespace
 int main(int argc, char **argv) {
   MLIRContext context;
@@ -797,6 +868,7 @@ int main(int argc, char **argv) {
     run(context);
     for (unsigned mode = 0; mode < 3; ++mode) {
       StringRef name = mode == 0 ? "port-fields" : mode == 1 ? "node-fields" : "wire-fields";
+      hostTargets(context, mode, argc > 1 ? std::string(argv[1]) + "/host-" + name.str() + "-candidate.mlir" : "");
       for (unsigned kind = 0; kind < 4; ++kind) {
         std::string prefix = kind == 1 ? "reverse-" : kind == 2 ? "forward-" : kind == 3 ? "model-" : "";
         channelTargets(context, mode, kind, argc > 1 ? std::string(argv[1]) + "/" + prefix + name.str() + "-candidate.mlir" : "");
