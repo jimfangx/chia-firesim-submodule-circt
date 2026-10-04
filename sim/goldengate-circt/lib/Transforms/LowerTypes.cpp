@@ -106,7 +106,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   }
   const std::string circuitName = circuit.getName().str();
   // Only DontTouch targets may fan out. Trigger/AutoCounter scalar members
-  // and each TargetClockChannel endpoint follow SFC RTRenamer.exact. Keep
+  // and each clock/pipe channel endpoint follow SFC RTRenamer.exact. Keep
   // endpoint indices so repeated references and clock schedule order survive.
   // An empty DontTouch plan removes an empty aggregate annotation; no plan
   // preserves a member whose identity does not need transferring.
@@ -128,8 +128,12 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     auto info = annotation.getMember<DictionaryAttr>("channelInfo");
     const bool clockChannel = annotation.isClass(AnnotationClasses::ChannelConnection) &&
         info && Annotation(info).isClass(AnnotationClasses::TargetClockChannel);
-    const bool exact = autoCounter || triggerSource || triggerSink || clockChannel;
+    const bool pipeChannel = annotation.isClass(AnnotationClasses::ChannelConnection) &&
+        info && Annotation(info).isClass(AnnotationClasses::PipeChannel);
+    const bool channelConnection = clockChannel || pipeChannel;
+    const bool exact = autoCounter || triggerSource || triggerSink || channelConnection;
     const StringRef kind = clockChannel ? "TargetClockChannel" :
+                           pipeChannel ? "PipeChannel" :
                            autoCounter ? "AutoCounter" : "Trigger";
     if (!dontTouch && !exact)
       continue;
@@ -175,9 +179,9 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
       replacements[index].push_back(std::move(plan));
       return success();
     };
-    if (clockChannel) {
+    if (channelConnection) {
       // Optional members are left absent; empty arrays remain empty. Rational
-      // clocks and perClockMFMR metadata contain no reference targets.
+      // clocks, perClockMFMR and pipe latency contain no reference targets.
       if (auto clock = annotation.getMember<StringAttr>("clock"))
         if (failed(planTarget("clock", clock))) return failure();
       for (StringRef member : {"sources", "sinks"}) {
@@ -186,7 +190,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         for (auto [element, endpoint] : llvm::enumerate(endpoints)) {
           auto spelling = dyn_cast<StringAttr>(endpoint);
           if (!spelling) {
-            error = "TargetClockChannel " + member.str() + " endpoint is not a reference target";
+            error = kind.str() + " " + member.str() + " endpoint is not a reference target";
             return failure();
           }
           if (failed(planTarget(member, spelling, element))) return failure();

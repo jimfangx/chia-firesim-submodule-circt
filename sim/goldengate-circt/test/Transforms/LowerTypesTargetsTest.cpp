@@ -11,6 +11,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
+#include <system_error>
 #include <stdexcept>
 
 using namespace mlir;
@@ -514,9 +515,9 @@ void run(MLIRContext &context) {
               dump(*invalid) == before, "aggregate trigger selector did not reject atomically");
     }
   }
-  // TargetClockChannel uses exact per-endpoint renames, including repetitions,
-  // optional clock and both directions. Colliding flat declarations must not
-  // displace the selected aggregate leaf or alter rational-clock payloads.
+  // Clock and pipe connections use exact per-endpoint renames, including
+  // repetitions, optional clock and both directions. Data selectors must
+  // follow leaf identity even when their flattened names collide.
   auto clockInfo = b.getDictionaryAttr({
       b.getNamedAttr("class", b.getStringAttr(A::TargetClockChannel)),
       b.getNamedAttr("clockInfo", b.getArrayAttr({b.getDictionaryAttr({
@@ -524,72 +525,79 @@ void run(MLIRContext &context) {
           b.getNamedAttr("multiplier", b.getI64IntegerAttr(1)),
           b.getNamedAttr("divisor", b.getI64IntegerAttr(1))})})),
       b.getNamedAttr("perClockMFMR", b.getArrayAttr({b.getI64IntegerAttr(3)}))});
-  auto channel = b.getDictionaryAttr({
-      b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
-      b.getNamedAttr("globalName", b.getStringAttr("clock")),
-      b.getNamedAttr("channelInfo", clockInfo),
-      b.getNamedAttr("clock", Annotation(counters[1]).getMember<StringAttr>("clock")),
-      b.getNamedAttr("sources", b.getArrayAttr({
-          Annotation(counters[0]).getMember<StringAttr>("clock"),
-          Annotation(counters[1]).getMember<StringAttr>("clock"),
-          Annotation(counters[0]).getMember<StringAttr>("clock")})),
-      b.getNamedAttr("sinks", b.getArrayAttr({
-          Annotation(counters[1]).getMember<StringAttr>("clock"),
-          Annotation(counters[0]).getMember<StringAttr>("clock")}))});
-  auto clockCandidate = parseSourceString<ModuleOp>(counterFixture, &context);
-  auto clockCircuit = *clockCandidate->getOps<CircuitOp>().begin();
-  auto selected = goldengate::resolveAnnotationTarget(clockCircuit, "~Top|Top>io.domain[0].clock", error);
-  selected->module.setPortSymbolsAttr(*selected->port,
-      InnerSymAttr::get(&context, {property("clock_endpoint", *selected->fieldID, "public")}));
-  NamedAttrList emptyChannel(channel); emptyChannel.erase("clock");
-  emptyChannel.erase("sources"); emptyChannel.set("sinks", b.getArrayAttr({}));
-  clockCircuit->setAttr("rawAnnotations", b.getArrayAttr({channel, emptyChannel.getDictionary(&context)}));
-  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*clockCandidate, clockCircuit, error)), error);
-  NamedAttrList expectedChannel(channel);
-  auto portClock = Annotation(counterRaw[0]).getMember<StringAttr>("clock");
-  auto internalClock = Annotation(counterRaw[1]).getMember<StringAttr>("clock");
-  expectedChannel.set("clock", internalClock);
-  expectedChannel.set("sources", b.getArrayAttr({portClock, internalClock, portClock}));
-  expectedChannel.set("sinks", b.getArrayAttr({internalClock, portClock}));
-  require(clockCircuit->getAttr("rawAnnotations") == b.getArrayAttr({
-      expectedChannel.getDictionary(&context), emptyChannel.getDictionary(&context)}) &&
-      succeeded(verify(*clockCandidate)), "clock channel identity/order/payload/options changed");
-  auto clockModule = *clockCircuit.getOps<FModuleOp>().begin(); unsigned clockSymbols = 0;
-  InnerSymbolTable::walkSymbols(clockModule, [&](StringAttr name, InnerSymTarget target) {
-    require(name.getValue() == "clock_endpoint" && target.isPort() &&
-            clockModule.getPortName(target.getPort()) == portClock.getValue().split('>').second,
-            "clock channel did not preserve native leaf symbol");
-    ++clockSymbols;
-  });
-  require(clockSymbols == 1, "temporary clock channel identities leaked");
-  before = dump(*clockCandidate);
-  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*clockCandidate, clockCircuit, error)) &&
-          dump(*clockCandidate) == before, "clock channel normalization is not idempotent");
-  for (StringRef member : {"clock", "sources", "sinks"})
-    for (StringRef spelling : {"~Top|Top>io.domain", "~Top|Top>state.domain[0]", "~Top|Top>absent"}) {
+  for (int latency : {-1, 0, 3}) {
+    bool pipe = latency >= 0;
+    auto info = pipe ? b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(A::PipeChannel)),
+        b.getNamedAttr("latency", b.getI32IntegerAttr(latency))}) : clockInfo;
+    StringRef endpointMember = pipe ? "target" : "clock";
+    auto channel = b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(A::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr("clock")),
+        b.getNamedAttr("channelInfo", info),
+        b.getNamedAttr("clock", Annotation(counters[1]).getMember<StringAttr>("clock")),
+        b.getNamedAttr("sources", b.getArrayAttr({
+            Annotation(counters[0]).getMember<StringAttr>(endpointMember),
+            Annotation(counters[1]).getMember<StringAttr>(endpointMember),
+            Annotation(counters[0]).getMember<StringAttr>(endpointMember)})),
+        b.getNamedAttr("sinks", b.getArrayAttr({
+            Annotation(counters[1]).getMember<StringAttr>(endpointMember),
+            Annotation(counters[0]).getMember<StringAttr>(endpointMember)}))});
+    auto channelCandidate = parseSourceString<ModuleOp>(counterFixture, &context);
+    auto channelCircuit = *channelCandidate->getOps<CircuitOp>().begin();
+    auto selected = goldengate::resolveAnnotationTarget(channelCircuit, pipe ? "~Top|Top>io.event" : "~Top|Top>io.domain[0].clock", error);
+    selected->module.setPortSymbolsAttr(*selected->port,
+        InnerSymAttr::get(&context, {property("channel_endpoint", *selected->fieldID, "public")}));
+    NamedAttrList emptyChannel(channel); emptyChannel.erase("clock");
+    emptyChannel.erase("sources"); emptyChannel.set("sinks", b.getArrayAttr({}));
+    channelCircuit->setAttr("rawAnnotations", b.getArrayAttr({channel, emptyChannel.getDictionary(&context)}));
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*channelCandidate, channelCircuit, error)), error);
+    NamedAttrList expectedChannel(channel);
+    auto portEndpoint = Annotation(counterRaw[0]).getMember<StringAttr>(endpointMember);
+    auto internalEndpoint = Annotation(counterRaw[1]).getMember<StringAttr>(endpointMember);
+    expectedChannel.set("clock", Annotation(counterRaw[1]).getMember<StringAttr>("clock"));
+    expectedChannel.set("sources", b.getArrayAttr({portEndpoint, internalEndpoint, portEndpoint}));
+    expectedChannel.set("sinks", b.getArrayAttr({internalEndpoint, portEndpoint}));
+    require(channelCircuit->getAttr("rawAnnotations") == b.getArrayAttr({
+        expectedChannel.getDictionary(&context), emptyChannel.getDictionary(&context)}) &&
+        succeeded(verify(*channelCandidate)), "channel identity/order/payload/options changed: " + info.getAs<StringAttr>("class").getValue().str());
+    auto channelModule = *channelCircuit.getOps<FModuleOp>().begin(); unsigned channelSymbols = 0;
+    InnerSymbolTable::walkSymbols(channelModule, [&](StringAttr name, InnerSymTarget target) {
+      require(name.getValue() == "channel_endpoint" && target.isPort() &&
+              channelModule.getPortName(target.getPort()) == portEndpoint.getValue().split('>').second,
+              "channel did not preserve native leaf symbol");
+      ++channelSymbols;
+    });
+    require(channelSymbols == 1, "temporary channel identities leaked");
+    before = dump(*channelCandidate);
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*channelCandidate, channelCircuit, error)) &&
+            dump(*channelCandidate) == before, "channel normalization is not idempotent");
+    for (StringRef member : {"clock", "sources", "sinks"})
+      for (StringRef spelling : {"~Top|Top>io.domain", "~Top|Top>state.domain[0]", "~Top|Top>absent"}) {
+        NamedAttrList bad(channel);
+        bad.set(member, member == "clock" ? Attribute(b.getStringAttr(spelling)) :
+                Attribute(b.getArrayAttr({Annotation(counters[0]).getMember<StringAttr>(endpointMember),
+                                          b.getStringAttr(spelling)})));
+        auto invalid = parseSourceString<ModuleOp>(counterFixture, &context);
+        auto owner = *invalid->getOps<CircuitOp>().begin();
+        owner->setAttr("rawAnnotations", b.getArrayAttr({channel, bad.getDictionary(&context)}));
+        before = dump(*invalid);
+        require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
+                !error.empty() && dump(*invalid) == before,
+                "late channel endpoint must reject before identity materialization");
+      }
+    for (StringRef member : {"sources", "sinks"}) {
       NamedAttrList bad(channel);
-      bad.set(member, member == "clock" ? Attribute(b.getStringAttr(spelling)) :
-              Attribute(b.getArrayAttr({Annotation(counters[0]).getMember<StringAttr>("clock"),
-                                        b.getStringAttr(spelling)})));
+      bad.set(member, b.getArrayAttr({Annotation(counters[0]).getMember<StringAttr>(endpointMember),
+                                      b.getI64IntegerAttr(0)}));
       auto invalid = parseSourceString<ModuleOp>(counterFixture, &context);
       auto owner = *invalid->getOps<CircuitOp>().begin();
-      owner->setAttr("rawAnnotations", b.getArrayAttr({channel, bad.getDictionary(&context)}));
+      owner->setAttr("rawAnnotations", b.getArrayAttr({bad.getDictionary(&context)}));
       before = dump(*invalid);
       require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
-              !error.empty() && dump(*invalid) == before,
-              "late clock channel endpoint must reject before identity materialization");
+              error.find("endpoint is not a reference target") != std::string::npos &&
+              dump(*invalid) == before, "malformed channel endpoint did not reject atomically");
     }
-  for (StringRef member : {"sources", "sinks"}) {
-    NamedAttrList bad(channel);
-    bad.set(member, b.getArrayAttr({Annotation(counters[0]).getMember<StringAttr>("clock"),
-                                    b.getI64IntegerAttr(0)}));
-    auto invalid = parseSourceString<ModuleOp>(counterFixture, &context);
-    auto owner = *invalid->getOps<CircuitOp>().begin();
-    owner->setAttr("rawAnnotations", b.getArrayAttr({bad.getDictionary(&context)}));
-    before = dump(*invalid);
-    require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
-            error.find("endpoint is not a reference target") != std::string::npos &&
-            dump(*invalid) == before, "malformed clock channel endpoint did not reject atomically");
   }
   // Unused sources/sinks are consumed without resolving their ground metadata.
   auto unused = parseSourceString<ModuleOp>(counterFixture, &context);
@@ -603,11 +611,69 @@ void run(MLIRContext &context) {
   llvm::outs() << "DontTouch aggregates expand in declaration order; fields, flips and unrelated targets preserved; three invalid selectors reject atomically; namespace collisions follow leaf identities and preserve native InnerRefs without temporary symbol leakage; internal wire/node/register targets expand and follow declaration namespace renames; AutoCounter event/clock/reset references preserve port and internal leaf identities\n";
 
 }
+// Compare the native normalization boundary to Scala LowForm using the same
+// data selectors on aggregate ports, nodes and wires. Emit only when requested.
+void pipeTargets(MLIRContext &context, unsigned mode, StringRef output) {
+  std::string text = R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %io: !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>,
+                        in %scalar: !firrtl.uint<8>) {
+  )mlir";
+  text += mode == 2 ? R"mlir(
+        %base = firrtl.wire : !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>
+        firrtl.strictconnect %base, %io : !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>
+  )mlir" : R"mlir(
+        %base = firrtl.node %io : !firrtl.bundle<clock: clock, rows: vector<bundle<data: uint<8>, flag: uint<1>>, 2>>
+  )mlir";
+  text += "} } }";
+  auto root = parseSourceString<ModuleOp>(text, &context);
+  require(bool(root), "pipe normalization oracle fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context);
+  std::string name = mode == 0 ? "io" : "base";
+  auto target = [&](StringRef field) { return b.getStringAttr("~Top|Top>" + name + field.str()); };
+  auto channel = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+      b.getNamedAttr("globalName", b.getStringAttr("data")),
+      b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+          b.getNamedAttr("latency", b.getI32IntegerAttr(mode))})),
+      b.getNamedAttr("clock", target(".clock")),
+      b.getNamedAttr("sources", b.getArrayAttr({target(".rows[1].data"),
+          b.getStringAttr("~Top|Top>scalar"), target(".rows[0].data"), target(".rows[1].data")})),
+      b.getNamedAttr("sinks", b.getArrayAttr({target(".rows[0].flag"), target(".rows[1].data")}))});
+  NamedAttrList empty(channel); empty.erase("clock"); empty.erase("sources");
+  empty.set("globalName", b.getStringAttr("empty")); empty.set("sinks", b.getArrayAttr({}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr({channel, empty.getDictionary(&context)}));
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "pipe normalization oracle produced invalid IR");
+  NamedAttrList expected(channel);
+  expected.set("clock", target("_clock"));
+  expected.set("sources", b.getArrayAttr({target("_rows_1_data"), b.getStringAttr("~Top|Top>scalar"),
+                                        target("_rows_0_data"), target("_rows_1_data")}));
+  expected.set("sinks", b.getArrayAttr({target("_rows_0_flag"), target("_rows_1_data")}));
+  require(circuit->getAttr("rawAnnotations") == b.getArrayAttr({
+      expected.getDictionary(&context), empty.getDictionary(&context)}),
+      "pipe oracle endpoints/latency/options changed");
+  if (!output.empty()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream file(output, ec);
+    require(!ec, "cannot write pipe normalization fixture: " + ec.message());
+    root->print(file);
+  }
+}
 } // namespace
-int main() {
+int main(int argc, char **argv) {
   MLIRContext context;
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { run(context); }
+  try {
+    run(context);
+    for (unsigned mode = 0; mode < 3; ++mode) {
+      StringRef name = mode == 0 ? "port-fields" : mode == 1 ? "node-fields" : "wire-fields";
+      pipeTargets(context, mode, argc > 1 ? std::string(argv[1]) + "/" + name.str() + "-candidate.mlir" : "");
+    }
+  }
   catch (const std::exception &error) { llvm::errs() << error.what() << '\n'; return 1; }
   return 0;
 }
