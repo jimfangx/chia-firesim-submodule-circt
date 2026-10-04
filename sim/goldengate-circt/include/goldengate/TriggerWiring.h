@@ -31,6 +31,9 @@ namespace goldengate {
 // export per target/absolute instance,
 // counted once in each sourceType containing that target. Its last clock is
 // selected after grouping credits before debits, before instance-path analysis.
+// Distinct sources must have distinct flattened absolute instance/source
+// identities. Ambiguous ancestor or underscore-separated paths fail before
+// mutation, matching Scala TopWiring's nonunique port rejection.
 // All source annotations are consumed.
 // Requires: retained raw annotations; ground local UInt<1> node sinks in the
 // top or a descendant with unconditional instances, including repeated ancestor

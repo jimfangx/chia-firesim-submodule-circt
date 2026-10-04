@@ -1099,7 +1099,8 @@ void fanoutSinks(MLIRContext &context, unsigned mode, StringRef output) {
 // Each pathless source contributes once per complete instance path. Keep masking
 // in the child definition so repeated ancestors have independent reset inputs.
 void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsigned relayDepth = 0,
-                   bool sharedTarget = false, bool mixedMasks = false, bool collidingMasks = false) {
+                   bool sharedTarget = false, bool mixedMasks = false, bool collidingMasks = false,
+                   unsigned ancestorCollision = 0) {
   bool lastSourceClock = mode >= 13;
   bool childSink = mode >= 14 || mode == 1 || mode == 5 || mode == 6 || mode == 7 || mode == 10 || mode == 12;
   bool duplicateMasked = mode == 11 || mode == 12;
@@ -1147,6 +1148,9 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   }
   for (auto relay : relays) {
     b.setInsertionPointToEnd(relay.getBodyBlock());
+    if (ancestorCollision && relay == relays.front())
+      b.create<NodeOp>(loc, arg(relay, 2), b.getStringAttr(ancestorCollision == 1 ?
+        "simulationTrigger_child_creditEvent" : "child_creditEvent_masked"));
     auto instance = *relay.getBodyBlock()->getOps<InstanceOp>().begin();
     instance->setAttr("example.metadata", b.getStringAttr("preserve"));
     for (unsigned i = 0; i < 4; ++i)
@@ -1229,6 +1233,16 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
         b.getNamedAttr("reset", ref("Child", isCredit ? "reset" : "credit")),
         b.getNamedAttr("sourceType", b.getBoolAttr(isCredit))}));
   }
+  if (ancestorCollision) {
+    NamedAttrList attrs;
+    attrs.set("class", b.getStringAttr(A::InternalTriggerSource));
+    attrs.set("target", ref("Relay", ancestorCollision == 1 ?
+      "simulationTrigger_child_creditEvent" : "child_creditEvent_masked"));
+    attrs.set("clock", ref("Relay", "clock"));
+    attrs.set("sourceType", b.getBoolAttr(false));
+    if (ancestorCollision == 1) attrs.set("reset", ref("Relay", "reset"));
+    annotations.push_back(attrs.getDictionary(&context));
+  }
   SmallVector<StringRef> sinkModules{"Top"};
   if (childSink) sinkModules.push_back("Child");
   for (StringRef module : sinkModules)
@@ -1240,12 +1254,15 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   annotations.push_back(channel); circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   auto before = dump(root.get()); unsigned consumed = 99; std::string error;
   auto result = goldengate::wireTriggers(circuit, consumed, error);
-  if (mode == 8 || mode == 16) {
+  if (mode == 8 || mode == 16 || ancestorCollision == 2) {
     require(failed(result) && consumed == 0 && before == dump(root.get()) && !error.empty(),
-            "source fanout missing clock path must fail atomically"); return;
+            "source fanout unsupported path must fail atomically: " + error);
+    if (ancestorCollision == 2) require(error.find("ambiguous flattened trigger source") != std::string::npos,
+      "flattened ancestor/descendant source collision needs a specific diagnostic");
+    return;
   }
   require(succeeded(result), error);
-  require(consumed == (collidingMasks ? 2 : duplicateMasked ? 3 : mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
+  require(consumed == (collidingMasks ? 2 + bool(ancestorCollision) : duplicateMasked ? 3 : mode >= 9 ? 4 : 2) && succeeded(verify(*root)), "invalid source fanout IR");
   require(top.getNumPorts() == 11 + 2 * childSink && child.getNumPorts() == originalPorts + exports + childSink,
           "source fanout must preserve top IO and share child export definitions");
   require(child.getPortName(originalPorts) == "simulationTrigger_" + creditExport +
@@ -1256,12 +1273,42 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   std::string prefix;
   for (auto [depth, relay] : llvm::enumerate(relays)) {
     prefix = std::string(depth ? "relay_" : "child_") + prefix;
-    require(relay.getNumPorts() == originalPorts + exports + childSink &&
-            relay.getPortName(originalPorts) == "simulationTrigger_" + prefix + creditExport &&
+    require(relay.getNumPorts() == originalPorts + exports + bool(ancestorCollision) + childSink &&
+            relay.getPortName(originalPorts) == "simulationTrigger_" + prefix + creditExport +
+              (ancestorCollision == 1 && !depth ? "_0" : "") &&
             relay.getPortName(originalPorts + exports - 1) == "simulationTrigger_" + prefix +
                 finalExport &&
             (!duplicateMasked || relay.getPortName(originalPorts + 1) == "simulationTrigger_" + prefix + "creditEvent_masked_0"),
             "ancestor must relay each event through one export per definition");
+  }
+  if (ancestorCollision == 1) {
+    unsigned ancestorMasks = 0;
+    auto relay = relays.front();
+    relay.walk([&](NodeOp node) {
+      if (node.getName() != "simulationTrigger_child_creditEvent_masked") return;
+      auto gate = node.getInput().getDefiningOp<AndPrimOp>();
+      auto negate = gate ? gate.getLhs().getDefiningOp<NotPrimOp>() : NotPrimOp();
+      auto event = gate ? gate.getRhs().getDefiningOp<NodeOp>() : NodeOp();
+      require(negate && event && negate.getInput() == arg(relay, 3) &&
+              event.getName() == "simulationTrigger_child_creditEvent" &&
+              event.getInput() == arg(relay, 2), "ancestor mask lost its local event/reset driver");
+      ++ancestorMasks;
+    });
+    require(ancestorMasks == 1 && relay.getPortName(originalPorts + exports) ==
+            "simulationTrigger_simulationTrigger_child_creditEvent_masked",
+            "ancestor source must retain its distinct mask/export identity");
+    unsigned exportDrivers = 0;
+    for (auto connect : relay.getBodyBlock()->getOps<StrictConnectOp>()) {
+      if (connect.getDest() == arg(relay, originalPorts)) {
+        auto result = dyn_cast<OpResult>(connect.getSrc());
+        auto instance = result ? dyn_cast<InstanceOp>(result.getOwner()) : InstanceOp();
+        require(instance && instance.getName() == "child" &&
+                instance.getPortName(result.getResultNumber()) == "simulationTrigger_creditEvent_masked_0",
+                "renamed descendant relay export must retain its child's masked source");
+        ++exportDrivers;
+      }
+    }
+    require(exportDrivers == 1, "descendant relay export needs one driver");
   }
   unsigned instances = 0, masks = 0, registers = 0;
   child.walk([&](NodeOp n) {
@@ -1301,13 +1348,15 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
   for (auto module : circuit.getOps<FModuleOp>()) {
     for (auto instance : module.getBodyBlock()->getOps<InstanceOp>()) {
       ++instances;
-      require(instance.getNumResults() == child.getNumPorts() &&
+      require(instance.getNumResults() == child.getNumPorts() +
+                  (ancestorCollision && instance.getModuleName() != "Child") &&
               instance->getAttrOfType<StringAttr>("example.metadata") == "preserve", "source fanout instance replacement");
       unsigned originalDrivers = 0, sinkDrivers = 0;
       for (auto connect : module.getBodyBlock()->getOps<StrictConnectOp>()) {
         for (unsigned i = 0; i < 4; ++i) originalDrivers += connect.getDest() == instance.getResult(i);
         if (lastSourceClock) originalDrivers += connect.getDest() == instance.getResult(originalPorts - 1);
-        if (childSink) sinkDrivers += connect.getDest() == instance.getResult(originalPorts + exports);
+        if (childSink) sinkDrivers += connect.getDest() == instance.getResult(originalPorts + exports +
+            (ancestorCollision && instance.getModuleName() != "Child"));
       }
       unsigned expectedDrivers = 4 + lastSourceClock;
       if (mode == 15 && module == top && instance.getName() == "second") --expectedDrivers;
@@ -1365,7 +1414,7 @@ void fanoutSources(MLIRContext &context, unsigned mode, StringRef output, unsign
         for (bool credit : {true, false}) {
           std::string name = std::string(secondary ? "otherClock_" : "clock_") +
                              (credit ? "credits_next" : "debits_next");
-          if (node.getName() != name) continue;
+          if (node.getName() != name || (ancestorCollision && !credit)) continue;
           auto add = node.getInput().getDefiningOp<AddPrimOp>();
           StringRef instanceName = secondary == alternateSelected ? "first" : "second";
           for (auto instance : top.getBodyBlock()->getOps<InstanceOp>())
@@ -1791,6 +1840,12 @@ int main(int argc, char **argv) {
     fanoutSources(context, 14, argc > 81 ? argv[81] : "", 0, false, false, true);
     fanoutSources(context, 14, argc > 82 ? argv[82] : "", 1, false, false, true);
     fanoutSources(context, 14, argc > 83 ? argv[83] : "", 2, false, false, true);
+    // Ancestor masks may occupy descendant export names. A local source
+    // matching a flattened descendant identity is rejected by Scala TopWiring.
+    fanoutSources(context, 14, argc > 84 ? argv[84] : "", 1, false, false, true, 1);
+    fanoutSources(context, 14, argc > 85 ? argv[85] : "", 2, false, false, true, 1);
+    fanoutSources(context, 14, "", 1, false, false, true, 2);
+    fanoutSources(context, 14, "", 2, false, false, true, 2);
     run(context, true, false, argc > 74 ? argv[74] : "", true);
     run(context, false, false, argc > 75 ? argv[75] : "", true);
     fanoutSources(context, 13, argc > 70 ? argv[70] : "", 0, true);

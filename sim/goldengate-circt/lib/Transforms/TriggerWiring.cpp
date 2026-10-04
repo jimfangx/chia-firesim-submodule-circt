@@ -90,6 +90,7 @@ using Route = std::vector<unsigned>;
 struct Source {
   circt::FieldRef event, reset;
   bool credit, debit;
+  // Final local source identity, including any preflight-allocated mask name.
   std::string name;
   std::map<Route, circt::FieldRef> clocks;
 };
@@ -406,6 +407,11 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
     };
     return visit(module);
   };
+  // Predict gateEventsWithReset identities without creating projections or
+  // nodes. TopWiring keys ports by flattened instance path, so distinct
+  // sources with the same flattened identity are rejected by the Scala oracle.
+  std::map<Operation *, circt::Namespace> sourceNames;
+  llvm::StringMap<bool> flattenedSources;
   for (auto a : sources) {
     auto target = a.getMember<StringAttr>("target");
     auto local = resolveLocalField(circuit, target, error);
@@ -461,6 +467,27 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       if (debit) ++counts.second;
     }
     auto name = getFieldName(event, /*nameSafe=*/true).first;
+    if (reset) {
+      auto [entry, inserted] = sourceNames.try_emplace(local.module);
+      auto &ns = entry->second;
+      if (inserted) {
+        for (auto portName : local.module.getPortNamesAttr())
+          ns.newName(cast<StringAttr>(portName).getValue());
+        local.module.walk([&](Operation *op) {
+          if (auto opName = op->getAttrOfType<StringAttr>("name")) ns.newName(opName.getValue());
+        });
+      }
+      name = ns.newName(name + "_masked");
+    }
+    for (auto &path : paths) {
+      std::string flattened = "simulationTrigger_";
+      for (auto instance : llvm::reverse(path)) flattened += instance.getName().str() + "_";
+      flattened += name;
+      if (!flattenedSources.try_emplace(flattened, true).second) {
+        error = "ambiguous flattened trigger source: " + flattened;
+        return failure();
+      }
+    }
     for (auto module : pathModules) childEvents[module].push_back(events.size());
     events.push_back({event, reset, credit, debit, name, std::move(clocks)});
   }
@@ -549,7 +576,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
         if (event.reset) {
           Value reset = getValueByFieldID(childBuilder, event.reset.getValue(), event.reset.getFieldID());
           Value active = childBuilder.create<NotPrimOp>(reset);
-          signalName = childNames.newName(event.name + "_masked");
+          signalName = childNames.newName(event.name);
           signal = childBuilder.create<NodeOp>(childBuilder.create<AndPrimOp>(active, signal),
                                               childBuilder.getStringAttr(signalName)).getResult();
         }
@@ -631,7 +658,7 @@ LogicalResult goldengate::wireTriggers(CircuitOp circuit, unsigned &consumed,
       Value reset = getValueByFieldID(ImplicitLocOpBuilder(loc, b),
                                      event.reset.getValue(), event.reset.getFieldID());
       Value active = b.create<NotPrimOp>(loc, reset);
-      signal = named(b.create<AndPrimOp>(loc, active, signal), event.name + "_masked");
+      signal = named(b.create<AndPrimOp>(loc, active, signal), event.name);
     }
     if (event.credit) domain.credits.push_back(signal);
     if (event.debit) domain.debits.push_back(signal);
