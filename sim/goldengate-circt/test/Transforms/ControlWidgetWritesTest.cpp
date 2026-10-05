@@ -6,9 +6,12 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
+#include <algorithm>
 #include <functional>
 #include <map>
+#include <set>
 #include <stdexcept>
+#include <vector>
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
@@ -18,7 +21,20 @@ constexpr const char *oldTop="GGControlWriteDispatchWrapper",*newTop="GGControlW
 const std::pair<unsigned,const char*> slaves[]{{2,"tracerv_ctrl"},{4,"loadmem_ctrl"},
   {5,"peekPokeBridge_ctrl"},{6,"uartBridge_ctrl"},{7,"clockBridge_ctrl"},
   {9,"resetBridge_ctrl"},{10,"cpuStream_ctrl"}};
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0) {
+std::vector<std::string> allocation(unsigned layout) {
+  std::vector<std::string> names{"BlockDevBridgeModule_0","FASEDMemoryTimingModel_0",
+    "TracerVBridgeModule_0","TSIBridgeModule_0","LoadMemWidget_0","PeekPokeBridgeModule_0",
+    "UARTBridgeModule_0","ClockBridgeModule_0","SimulationMaster_0",
+    "ResetPulseBridgeModule_0","CPUManagedStreamEngine_0"};
+  if(layout==1)names.insert(names.begin()+5,{"PrintBridgeModule_0","PrintBridgeModule_1"});
+  if(layout==2)std::reverse(names.begin(),names.end());
+  return names;
+}
+unsigned allocatedSlave(unsigned baseline,unsigned layout) {
+  auto names=allocation(layout), original=allocation(0);
+  return std::find(names.begin(),names.end(),original[baseline])-names.begin();
+}
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned layout=0) {
   std::string address="bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>";
   std::string data="bundle<data: uint<32>, last: uint<1>, id: uint<12>, strb: uint<4>, user: uint<1>>";
   auto token=[](std::string bits){return "bundle<ready flip: uint<1>, valid: uint<1>, bits: "+bits+">";};
@@ -26,6 +42,10 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0) {
   std::string text="module { firrtl.circuit \""+std::string(oldTop)+"\" { firrtl.module @"+oldTop+"(in %other: !firrtl.uint<8>";
   for(auto [slave,port]:slaves) {
     text+=", "+std::string(bad==1&&slave==7?"out":"in")+" %"+port+": "+control;
+  }
+  if(layout==1)for(auto port:{"print0_ctrl","print1_ctrl"})text+=", in %"+std::string(port)+": "+control;
+  auto names=allocation(layout);
+  for(unsigned slave=0;slave<names.size();++slave) {
     const std::pair<const char*,unsigned> fields[]{{"aw_ready",1},{"w_ready",1},{"aw_valid",1},{"aw_bits_addr",25},{"aw_bits_len",8},{"aw_bits_id",12},{"w_valid",1},{"w_bits_data",32},{"w_bits_last",1}};
     for(auto [field,width]:fields) {
       if(bad==2&&slave==10&&std::string(field)=="w_ready")continue;
@@ -40,11 +60,21 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0) {
   auto root=parseSourceString<ModuleOp>(text,&ctx);require(bool(root),"fixture parse failed");
   auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
   auto decoder=*std::next(c.getOps<FModuleOp>().begin());
-  const char *names[]{"BlockDevBridgeModule_0","FASEDMemoryTimingModel_0","TracerVBridgeModule_0","TSIBridgeModule_0","LoadMemWidget_0","PeekPokeBridgeModule_0","UARTBridgeModule_0","ClockBridgeModule_0","SimulationMaster_0","ResetPulseBridgeModule_0","CPUManagedStreamEngine_0"};
   SmallVector<Attribute> rows;
-  for(unsigned i=0;i<(bad==6?10:11);++i)rows.push_back(b.getDictionaryAttr({
-    b.getNamedAttr("name",b.getStringAttr(bad==7&&i==7?"WrongWidget":names[i])),
-    b.getNamedAttr("slave",b.getI32IntegerAttr(bad==8&&i==7?6:i))}));
+  for(unsigned i=0;i<(bad==6?10:names.size());++i) {
+    auto name=names[i];
+    if(bad==7&&i==7)name="WrongWidget";
+    if(bad==12&&i==3)name=names[0]; // Duplicate an unbound widget, too.
+    if(bad==13&&i==3)name="";
+    NamedAttrList row;
+    if(!(bad==16&&i==3))row.set("name",b.getStringAttr(name));
+    if(!(bad==17&&i==3))row.set("slave",bad==18&&i==3?
+      b.getIntegerAttr(b.getIntegerType(128),APInt(128,1).shl(100)):
+      b.getI32IntegerAttr(bad==14&&i==3?-1:bad==8&&i==7?6:i));
+    rows.push_back(bad==15&&i==3?Attribute(b.getStringAttr("bad")):row.getDictionary(&ctx));
+  }
+  if(bad==19)rows.clear();
+  if(bad==20)while(rows.size()<64)rows.push_back(rows[0]);
   decoder->setAttr("goldengate.controlRegions",b.getArrayAttr(rows));
   SmallVector<Attribute> annos;
   for(auto ref:{"other","clockBridge_ctrl","clockBridge_ctrl.aw.bits.addr","clockBridge_ctrl.w.valid",
@@ -52,6 +82,10 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0) {
                 "ctrl_write_dispatch_slave_7_aw_valid"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Target")),
       b.getNamedAttr("target",b.getStringAttr("~"+std::string(oldTop)+"|"+oldTop+">"+ref))}));
+  auto dispatchTarget=b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Target")),
+    b.getNamedAttr("target",b.getStringAttr("~"+std::string(oldTop)+"|"+oldTop+
+      ">ctrl_write_dispatch_slave_"+std::to_string(allocatedSlave(7,layout))+"_aw_valid"))});
+  annos.back()=dispatchTarget;
   if(bad!=9)c->setAttr("rawAnnotations",b.getArrayAttr(annos));
   if(bad==10) {
     b.setInsertionPointToEnd(c.getBodyBlock());auto top=*c.getOps<FModuleOp>().begin();
@@ -61,15 +95,19 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0) {
   if(bad==11)c.setNameAttr(b.getStringAttr("WrongTop"));
   return root;
 }
-void test(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void test(MLIRContext &ctx,unsigned layout) {
+  auto root=fixture(ctx,0,layout);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+  std::vector<std::string> originalTargets;
+  for(auto a:c->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    originalTargets.push_back(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue().str());
   require(succeeded(goldengate::bindControlWidgetWrites(c,error)),error);
   require(succeeded(verify(*root)),"widget write IR invalid");
   FModuleOp top;for(auto m:c.getOps<FModuleOp>())if(m.getName()==newTop)top=m;
   require(bool(top),"wrapper missing");
   // The AR/B/R fields keep their bidirectional contract. AW/W no longer
   // accept unrelated external transactions alongside the internal dispatcher.
-  for(auto [slave,port]:slaves) {
+  for(auto [baseline,port]:slaves) {
+    unsigned slave=allocatedSlave(baseline,layout);
     bool found=false;
     for(auto p:top.getPorts()) {
       require(!p.name.getValue().starts_with("ctrl_write_dispatch_slave_"+std::to_string(slave)+"_"),"consumed dispatch port exposed");
@@ -81,12 +119,37 @@ void test(MLIRContext &ctx) {
     }
     require(found,"remaining control port missing");
   }
-  require(top.getNumPorts()==19,"metadata is not shared across the seven widgets");
+  require(top.getNumPorts()==(layout==1?75:55),"shared metadata or unbound ports changed");
+  auto bindings=top->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
+  require(bindings&&bindings.size()==7,"binding catalog missing");
+  auto names=allocation(layout);
+  for(auto [i,entry]:llvm::enumerate(bindings)) {
+    auto row=cast<DictionaryAttr>(entry);
+    unsigned slave=allocatedSlave(slaves[i].first,layout);
+    require(row.getAs<StringAttr>("name").getValue()==names[slave]&&
+      row.getAs<StringAttr>("port").getValue()==slaves[i].second&&
+      row.getAs<IntegerAttr>("slave").getInt()==slave,"binding catalog lost allocated identity");
+  }
+  // Unimplemented widgets retain their full dispatch boundary. Adding Print
+  // allocations must not accidentally consume their requests or readiness.
+  for(unsigned slave=0;slave<names.size();++slave) {
+    bool bound=false;for(auto [baseline,port]:slaves)bound|=slave==allocatedSlave(baseline,layout);
+    if(bound)continue;
+    unsigned count=0;for(auto p:top.getPorts())
+      count+=p.name.getValue().starts_with("ctrl_write_dispatch_slave_"+std::to_string(slave)+"_");
+    require(count==9,"unbound dispatch lane lost");
+  }
+  if(layout==1)for(auto name:{"print0_ctrl","print1_ctrl"}) {
+    bool full=false;for(auto p:top.getPorts())if(p.name==name)
+      full=cast<BundleType>(p.type).getNumElements()==5;
+    require(full,"unbound Print control bundle changed");
+  }
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
   unsigned i=0;
   for(auto a:annos) {
     auto target=cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue();
-    auto suffix=target.drop_front(target.find('>'));
+    auto original=StringRef(originalTargets[i]);
+    auto suffix=original.drop_front(original.find('>'));
     auto module=(i==0||i==4||i==5||i==6)?newTop:oldTop;
     require(target=="~"+std::string(newTop)+"|"+module+suffix.str(),"annotation target lost during partial bundle transfer");++i;
   }
@@ -95,21 +158,54 @@ void test(MLIRContext &ctx) {
   std::map<std::string,unsigned> sinks;
   std::function<std::string(Value)> key=[&](Value v)->std::string {
     if(auto f=v.getDefiningOp<SubfieldOp>())return key(f.getInput())+"."+f.getFieldName().str();
-    return std::to_string(reinterpret_cast<uintptr_t>(v.getAsOpaquePointer()));
+    if(auto instance=v.getDefiningOp<InstanceOp>())
+      return "sim."+instance.getPortNameStr(cast<OpResult>(v).getResultNumber()).str();
+    if(auto argument=dyn_cast<BlockArgument>(v))
+      return "top."+top.getPorts()[argument.getArgNumber()].name.getValue().str();
+    throw std::runtime_error("unexpected binding value");
   };
-  for(auto x:top.getOps<StrictConnectOp>())require(++sinks[key(x.getDest())]==1,"multiple scalar drivers");
-  require(sinks.size()==140,"incomplete widget request/ready binding");
+  std::set<std::pair<std::string,std::string>> copiedConnections;
+  for(auto x:top.getOps<ConnectOp>())copiedConnections.emplace(key(x.getDest()),key(x.getSrc()));
+  for(auto p:top.getPorts())if(p.name.getValue().starts_with("ctrl_write_dispatch_slave_")) {
+    auto name=p.name.getValue().str();
+    auto dest=(p.direction==Direction::In?"sim.":"top.")+name;
+    auto source=(p.direction==Direction::In?"top.":"sim.")+name;
+    require(copiedConnections.count({dest,source}),"unbound dispatch connection changed");
+  }
+  std::map<std::string,std::string> actual,expected;
+  for(auto x:top.getOps<StrictConnectOp>()) {
+    require(++sinks[key(x.getDest())]==1,"multiple scalar drivers");
+    actual.emplace(key(x.getDest()),key(x.getSrc()));
+  }
+  for(auto [baseline,port]:slaves)for(auto channel:{"aw","w"}) {
+    std::string prefix="sim.ctrl_write_dispatch_slave_"+std::to_string(allocatedSlave(baseline,layout))+"_"+channel;
+    std::string widget="sim."+std::string(port)+"."+channel;
+    expected[prefix+"_ready"]=widget+".ready";
+    expected[widget+".valid"]=prefix+"_valid";
+    const char *address[]{"addr","len","size","burst","lock","cache","prot","qos","region","id","user"};
+    const char *data[]{"data","last","id","strb","user"};
+    for(auto field:std::string(channel)=="aw"?ArrayRef<const char*>(address):ArrayRef<const char*>(data)) {
+      bool dispatched=std::string(channel)=="aw"?
+        std::string(field)=="addr"||std::string(field)=="len"||std::string(field)=="id":
+        std::string(field)=="data"||std::string(field)=="last";
+      expected[widget+".bits."+field]=dispatched?prefix+"_bits_"+field:
+        "top.ctrl_write_dispatch_master_"+std::string(channel)+"_bits_"+field;
+    }
+  }
+  require(actual==expected&&actual.size()==140,"widget requests/readiness wired to incorrect allocation");
   auto good=dump(*root);require(failed(goldengate::bindControlWidgetWrites(c,error)),"repeat accepted");
   require(dump(*root)==good,"repeat rejection mutated IR");
-  for(unsigned bad=1;bad<=11;++bad) {
+  if(layout)return;
+  for(unsigned bad=1;bad<=20;++bad) {
     auto m=fixture(ctx,bad);auto circuit=*m->getOps<CircuitOp>().begin();auto before=dump(*m);
     require(failed(goldengate::bindControlWidgetWrites(circuit,error)),"malformed contract accepted");
     require(dump(*m)==before,"rejection mutated IR");
   }
-  llvm::outs()<<"Widget writes: seven bindings, partial bundle targets, shared metadata, and twelve atomic rejections passed\n";
 }
 }
 int main() {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try{test(ctx);return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}
+  try{for(unsigned layout=0;layout<3;++layout)test(ctx,layout);
+    llvm::outs()<<"Widget writes: 420 exact scalar bindings across baseline, two added Print banks, and reversed allocations; partial targets and 23 atomic rejections passed\n";
+    return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}
 }

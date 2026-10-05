@@ -11,15 +11,16 @@ using namespace mlir;
 using namespace circt::firrtl;
 
 namespace {
+struct WidgetPort { const char *widget; const char *port; };
+constexpr WidgetPort widgetPorts[]{
+  {"TracerVBridgeModule_0", "tracerv_ctrl"},
+  {"LoadMemWidget_0", "loadmem_ctrl"},
+  {"PeekPokeBridgeModule_0", "peekPokeBridge_ctrl"},
+  {"UARTBridgeModule_0", "uartBridge_ctrl"},
+  {"ClockBridgeModule_0", "clockBridge_ctrl"},
+  {"ResetPulseBridgeModule_0", "resetBridge_ctrl"},
+  {"CPUManagedStreamEngine_0", "cpuStream_ctrl"}};
 struct Binding { const char *widget; const char *port; unsigned slave; };
-constexpr Binding bindings[]{
-  {"TracerVBridgeModule_0", "tracerv_ctrl", 2},
-  {"LoadMemWidget_0", "loadmem_ctrl", 4},
-  {"PeekPokeBridgeModule_0", "peekPokeBridge_ctrl", 5},
-  {"UARTBridgeModule_0", "uartBridge_ctrl", 6},
-  {"ClockBridgeModule_0", "clockBridge_ctrl", 7},
-  {"ResetPulseBridgeModule_0", "resetBridge_ctrl", 9},
-  {"CPUManagedStreamEngine_0", "cpuStream_ctrl", 10}};
 struct Field { const char *name; unsigned width; };
 constexpr Field addressFields[]{
   {"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
@@ -45,8 +46,27 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto regions=decoder?decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions"):ArrayAttr();
-  if(!inner||!raw||!regions||regions.size()!=11)
-    return reject("widget writes require retained annotations and eleven decoded regions");
+  if(!inner||!raw||!regions||regions.empty()||regions.size()>63)
+    return reject("widget writes require retained annotations and 1..63 decoded regions");
+  // Widget.scala zips sortedWidgets with the interconnect slaves. Resolve
+  // identity through the decoder's allocation rather than assuming the
+  // baseline ordering: adding a register bank can shift existing slaves.
+  std::map<std::string,unsigned> allocated;
+  for(auto [i,row]:llvm::enumerate(regions)) {
+    auto region=dyn_cast<DictionaryAttr>(row);
+    auto name=region?region.getAs<StringAttr>("name"):StringAttr();
+    auto index=region?region.getAs<IntegerAttr>("slave"):IntegerAttr();
+    if(!name||name.getValue().empty()||!index||index.getValue().isNegative()||
+       index.getValue().getActiveBits()>32||index.getValue().getZExtValue()!=i||
+       !allocated.emplace(name.getValue().str(),i).second)
+      return reject("widget write allocation needs unique names and ordered slave indices");
+  }
+  SmallVector<Binding> bindings;
+  for(auto widget:widgetPorts) {
+    auto found=allocated.find(widget.widget);
+    if(found==allocated.end())return reject("widget write allocation is missing an implemented widget");
+    bindings.push_back({widget.widget,widget.port,found->second});
+  }
   bool instantiated=false;
   circuit.walk([&](InstanceOp i){instantiated|=i.getModuleName()==inner.getName();});
   if(instantiated)return reject("widget writes require an uninstantiated top");
@@ -77,11 +97,6 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
   std::set<std::string> consumed,controls;
   // Complete preflight before adding any operation or changing annotations.
   for(auto binding:bindings) {
-    auto region=dyn_cast<DictionaryAttr>(regions[binding.slave]);
-    auto name=region?region.getAs<StringAttr>("name"):StringAttr();
-    auto index=region?region.getAs<IntegerAttr>("slave"):IntegerAttr();
-    if(!name||name.getValue()!=binding.widget||!index||index.getInt()!=binding.slave)
-      return reject("widget write allocation differs from the decoded U250 catalog");
     auto found=old.find(binding.port);
     if(found==old.end()||inner.getPorts()[found->second].type!=controlType||
        inner.getPorts()[found->second].direction!=Direction::In)
