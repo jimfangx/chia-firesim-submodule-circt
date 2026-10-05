@@ -255,7 +255,11 @@ int main(int argc, char **argv) {
   bool wireAutoCounterStubs = analyzeAutoCounterPrintClocks ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
-  // boundary; PrintBridge host stream synthesis is a separate porting step.
+  // boundary; global PrintBridge host stream allocation remains pending.
+  bool materializePrintStreamConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-stream-constructors";
+  bool materializePrintStreams = materializePrintStreamConstructors ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-streams");
   bool materializePrintAXIConstructors =
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-axi-constructors";
   bool materializePrintAXI = materializePrintAXIConstructors ||
@@ -264,9 +268,9 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-config-constructors";
   bool materializePrintConfigs = materializePrintAXI || materializePrintConfigConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-configs");
-  bool materializePrintControlConstructors = materializePrintConfigConstructors ||
+  bool materializePrintControlConstructors = materializePrintStreamConstructors || materializePrintConfigConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-control-constructors";
-  bool materializePrintControls = materializePrintConfigs || materializePrintControlConstructors ||
+  bool materializePrintControls = materializePrintStreams || materializePrintConfigs || materializePrintControlConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-controls");
   bool materializePrintTokenConstructors = materializePrintControlConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-token-constructors";
@@ -424,6 +428,10 @@ int main(int argc, char **argv) {
     if (materializePrintControls &&
         failed(goldengate::materializePrintBridgeControls(circuit, payloads, stages, controls, error)))
       return fail("PrintBridge control materialization: " + error);
+    llvm::SmallVector<FModuleOp> streams;
+    if (materializePrintStreams && failed(goldengate::materializePrintBridgeStreams(
+          circuit, controls, streams, error)))
+      return fail("PrintBridge stream materialization: " + error);
     llvm::SmallVector<FModuleOp> configs;
     if (materializePrintConfigs &&
         failed(goldengate::materializePrintBridgeConfigs(circuit, controls, configs, error)))
@@ -435,7 +443,7 @@ int main(int argc, char **argv) {
     if (failed(mlir::verify(*module)))
       return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
-    llvm::sys::path::append(irPath, materializePrintAXI ? "post-print-axi.mlir" : materializePrintConfigs ? "post-print-configs.mlir" : materializePrintControls ? "post-print-controls.mlir" :
+    llvm::sys::path::append(irPath, materializePrintStreams ? "post-print-streams.mlir" : materializePrintAXI ? "post-print-axi.mlir" : materializePrintConfigs ? "post-print-configs.mlir" : materializePrintControls ? "post-print-controls.mlir" :
         materializePrintTokens ? "post-print-tokens.mlir" : "post-print-payloads.mlir");
     llvm::sys::path::append(firPath, "post-print-payloads.fir");
     llvm::sys::path::append(summaryPath, "print-payloads.json");
@@ -552,6 +560,39 @@ int main(int argc, char **argv) {
         if (ec) return fail("cannot write print control summary: " + ec.message());
         controlMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(controlSummary)));
         llvm::outs() << "Materialized " << controls.size() << " PrintBridge ROI/cycle control wrappers\n";
+        if (materializePrintStreams) {
+          llvm::SmallString<256> streamPath(outputDir), streamAnnosPath(outputDir), streamSummaryPath(outputDir);
+          llvm::sys::path::append(streamPath, "post-print-streams.fir");
+          llvm::sys::path::append(streamAnnosPath, "post-print-streams-all.json");
+          llvm::sys::path::append(streamSummaryPath, "print-streams.json");
+          if (failed(goldengate::emitAllAnnotations(circuit, streamAnnosPath, error)))
+            return fail("cannot export print stream annotations: " + error);
+          llvm::json::Array streamSummary;
+          if (!streams.empty()) payloadCircuit.setName(streams.front().getName());
+          for (auto wrapper : streams) {
+            auto layout = wrapper->getAttrOfType<DictionaryAttr>("goldengate.printStream");
+            auto adapterName = layout.getAs<StringAttr>("adapterModule").getValue();
+            for (auto m : circuit.getOps<FModuleOp>())
+              if (m.getName() == adapterName) payloadBuilder.insert(m->clone());
+            payloadBuilder.insert(wrapper->clone());
+            llvm::json::Object entry{{"module", wrapper.getName().str()}};
+            for (auto key : {"controlModule", "adapterModule", "bridgeTarget", "resetPortName"})
+              entry[key] = layout.getAs<StringAttr>(key).getValue().str();
+            for (auto key : {"tokenBits", "streamBits", "adapterDepth", "packingRatio"})
+              entry[key] = layout.getAs<IntegerAttr>(key).getInt();
+            for (auto key : {"lowSliceFirst", "narrowFlushInjection"})
+              entry[key] = layout.getAs<BoolAttr>(key).getValue();
+            streamSummary.push_back(std::move(entry));
+          }
+          llvm::raw_fd_ostream streamFir(streamPath, ec);
+          if (ec || failed(mlir::verify(*payloadIR)) ||
+              failed(exportFIRFile(*payloadIR, streamFir, std::nullopt, exportFIRVersion)))
+            return fail("cannot export print stream FIRRTL");
+          llvm::raw_fd_ostream streamMetadata(streamSummaryPath, ec);
+          if (ec) return fail("cannot write print stream summary: " + ec.message());
+          streamMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(streamSummary)));
+          llvm::outs() << "Materialized " << streams.size() << " PrintBridge 512-bit stream boundaries\n";
+        }
         if (materializePrintConfigs) {
           llvm::SmallString<256> configPath(outputDir), configAnnosPath(outputDir), configSummaryPath(outputDir);
           llvm::sys::path::append(configPath, "post-print-configs.fir");

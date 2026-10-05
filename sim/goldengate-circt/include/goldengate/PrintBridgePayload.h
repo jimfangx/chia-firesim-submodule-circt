@@ -51,4 +51,13 @@ mlir::LogicalResult materializePrintBridgeAXIControls(
     unsigned addressBits, unsigned idBits,
     llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
     std::string &error);
+// Connect accepted-cycle controls to the 512-bit CPU stream boundary. Port
+// PrintBridge's one-group MultiWidthFifo (not the separate CPU stream queue),
+// with low slices first and flush-valid injection only for narrow tokens.
+// Configuration/flush inputs remain explicit; annotations are retained.
+mlir::LogicalResult materializePrintBridgeStreams(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> controls,
+    llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
+    std::string &error);
 } // namespace goldengate
