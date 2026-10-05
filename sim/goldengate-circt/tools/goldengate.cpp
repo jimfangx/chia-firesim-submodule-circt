@@ -256,9 +256,13 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
   // boundary; PrintBridge host stream synthesis is a separate porting step.
-  bool materializePrintTokenConstructors =
+  bool materializePrintControlConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-control-constructors";
+  bool materializePrintControls = materializePrintControlConstructors ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-controls");
+  bool materializePrintTokenConstructors = materializePrintControlConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-token-constructors";
-  bool materializePrintTokens = materializePrintTokenConstructors ||
+  bool materializePrintTokens = materializePrintControls || materializePrintTokenConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-tokens");
   bool materializePrintPayloads = (materializePrintTokens && !materializePrintTokenConstructors) ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-payloads");
@@ -319,6 +323,7 @@ int main(int argc, char **argv) {
                     "--wire-print-reset | --update-print-bridge-clocks | "
                     "--materialize-print-payloads | --materialize-print-payload-constructors | "
                     "--materialize-print-tokens | --materialize-print-token-constructors | "
+                    "--materialize-print-controls | --materialize-print-control-constructors | "
                     "--wire-autocounter-print-stubs | "
                     "--analyze-autocounter-print-clocks | "
                     "--complete-autocounter-print-wiring | "
@@ -405,10 +410,15 @@ int main(int argc, char **argv) {
     if (materializePrintTokens &&
         failed(goldengate::materializePrintBridgeTokenStages(circuit, payloads, stages, error)))
       return fail("PrintBridge token stage materialization: " + error);
+    llvm::SmallVector<FModuleOp> controls;
+    if (materializePrintControls &&
+        failed(goldengate::materializePrintBridgeControls(circuit, payloads, stages, controls, error)))
+      return fail("PrintBridge control materialization: " + error);
     if (failed(mlir::verify(*module)))
       return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
-    llvm::sys::path::append(irPath, materializePrintTokens ? "post-print-tokens.mlir" : "post-print-payloads.mlir");
+    llvm::sys::path::append(irPath, materializePrintControls ? "post-print-controls.mlir" :
+        materializePrintTokens ? "post-print-tokens.mlir" : "post-print-payloads.mlir");
     llvm::sys::path::append(firPath, "post-print-payloads.fir");
     llvm::sys::path::append(summaryPath, "print-payloads.json");
     std::error_code ec;
@@ -473,8 +483,7 @@ int main(int argc, char **argv) {
       llvm::sys::path::append(stageAnnosPath, "post-print-tokens-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, stageAnnosPath, error)))
         return fail("cannot export print token stage annotations: " + error);
-      // The standalone stage boundary takes already packed valid/data. ROI
-      // registers and width adaptation will connect these modules in a later port.
+      // Keep the standalone stage artifact available for independent comparison.
       if (!stages.empty()) payloadCircuit.setName(stages.front().getName());
       for (auto stage : stages) payloadBuilder.insert(stage->clone());
       llvm::raw_fd_ostream stageFir(stagePath, ec);
@@ -497,6 +506,35 @@ int main(int argc, char **argv) {
       if (ec) return fail("cannot write print token stage summary: " + ec.message());
       stageMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(stageSummary)));
       llvm::outs() << "Materialized " << stages.size() << " PrintBridge accepted-cycle token stages\n";
+      if (materializePrintControls) {
+        llvm::SmallString<256> controlPath(outputDir), controlAnnosPath(outputDir), controlSummaryPath(outputDir);
+        llvm::sys::path::append(controlPath, "post-print-controls.fir");
+        llvm::sys::path::append(controlAnnosPath, "post-print-controls-all.json");
+        llvm::sys::path::append(controlSummaryPath, "print-controls.json");
+        if (failed(goldengate::emitAllAnnotations(circuit, controlAnnosPath, error)))
+          return fail("cannot export print control annotations: " + error);
+        if (!controls.empty()) payloadCircuit.setName(controls.front().getName());
+        for (auto control : controls) payloadBuilder.insert(control->clone());
+        llvm::raw_fd_ostream controlFir(controlPath, ec);
+        if (ec || failed(mlir::verify(*payloadIR)) ||
+            failed(exportFIRFile(*payloadIR, controlFir, std::nullopt, exportFIRVersion)))
+          return fail("cannot export print control FIRRTL");
+        llvm::json::Array controlSummary;
+        for (auto control : controls) {
+          auto layout = control->getAttrOfType<DictionaryAttr>("goldengate.printControl");
+          llvm::json::Object entry{{"module", control.getName().str()}};
+          for (auto key : {"payloadModule", "tokenStageModule", "bridgeTarget", "resetPortName"})
+            entry[key] = layout.getAs<StringAttr>(key).getValue().str();
+          for (auto key : {"tokenBits", "idleCycleBits", "cycleBits"})
+            entry[key] = layout.getAs<IntegerAttr>(key).getInt();
+          entry["roiInclusive"] = layout.getAs<BoolAttr>("roiInclusive").getValue();
+          controlSummary.push_back(std::move(entry));
+        }
+        llvm::raw_fd_ostream controlMetadata(controlSummaryPath, ec);
+        if (ec) return fail("cannot write print control summary: " + ec.message());
+        controlMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(controlSummary)));
+        llvm::outs() << "Materialized " << controls.size() << " PrintBridge ROI/cycle control wrappers\n";
+      }
     }
     return 0;
   };

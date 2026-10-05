@@ -24,4 +24,15 @@ mlir::LogicalResult materializePrintBridgeTokenStages(
     llvm::ArrayRef<circt::firrtl::FModuleOp> payloads,
     llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
     std::string &error);
+
+// Connect payload and token-stage instances with PrintBridge's accepted-cycle
+// counter and inclusive unsigned ROI. The four configuration words and the
+// already pulsified flush signal remain explicit inputs at this boundary.
+// Validate all pairs before modifying IR; retain constructor annotations.
+mlir::LogicalResult materializePrintBridgeControls(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> payloads,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> stages,
+    llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
+    std::string &error);
 } // namespace goldengate
