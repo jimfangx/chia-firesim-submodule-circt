@@ -21,6 +21,7 @@
 #include "goldengate/TSIHeader.h"
 #include "goldengate/BlockDevHeader.h"
 #include "goldengate/TracerVHeader.h"
+#include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/FASEDHeader.h"
 #include "goldengate/XDCEmission.h"
@@ -473,6 +474,15 @@ int main(int argc, char **argv) {
         return fail("PrintBridge post-FAME host binding: " + error);
       if (failed(mlir::verify(*module)))
         return fail("PrintBridge host binding produced invalid FIRRTL IR");
+      std::string printHeader;
+      if (failed(goldengate::preparePrintBridgeDecoderHeader(circuit, hosts, printHeader, error)))
+        return fail("PrintBridge decoder header: " + error);
+      llvm::SmallString<256> printHeaderPath(outputDir);
+      llvm::sys::path::append(printHeaderPath, "print-bridge-decoders.h");
+      std::error_code headerEC;
+      llvm::raw_fd_ostream decoderHeader(printHeaderPath, headerEC);
+      if (headerEC) return fail("cannot write Print decoder header: " + headerEC.message());
+      decoderHeader << printHeader; decoderHeader.close();
       llvm::SmallString<256> boundIR(outputDir), boundFIR(outputDir), boundAnnos(outputDir);
       llvm::sys::path::append(boundIR, "post-print-host-binding.mlir");
       llvm::sys::path::append(boundFIR, "post-print-host-binding.fir");

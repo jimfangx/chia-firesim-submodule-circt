@@ -17,6 +17,7 @@ add_executable(goldengate-circt
   lib/Support/TSIHeader.cpp
   lib/Support/BlockDevHeader.cpp
   lib/Support/TracerVHeader.cpp
+  lib/Support/PrintBridgeHeader.cpp
   lib/Support/CPUManagedStreamHeader.cpp
   lib/Support/FASEDHeader.cpp
   lib/Support/SimulatorRTL.cpp
@@ -284,6 +285,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-print-host COMMAND goldengate-print-host-test)
   add_executable(goldengate-print-binding-test
     test/Transforms/PrintBridgeBindingTest.cpp
+    lib/Support/PrintBridgeHeader.cpp
     lib/Transforms/PrintBridgePayload.cpp
     lib/Transforms/PrintBridgeTokenStage.cpp
     lib/Transforms/PrintBridgeControl.cpp

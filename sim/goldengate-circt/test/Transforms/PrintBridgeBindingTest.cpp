@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/PrintBridgePayload.h"
+#include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/CPUStreamCountBank.h"
 #include "circt/Dialect/HW/HWDialect.h"
@@ -46,11 +47,12 @@ struct Fixture {
   OwningOpRef<ModuleOp> root;
   CircuitOp circuit;
   SmallVector<FModuleOp> hosts;
-  Fixture(MLIRContext &ctx) {
+  Fixture(MLIRContext &ctx, bool multipleRecords = false, bool reverseRecords = false) {
+    unsigned fields = multipleRecords ? 5 : 3;
     std::string text = "module { firrtl.circuit \"Top\" { firrtl.module @Top(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>";
-    for (unsigned d = 0; d < 2; ++d) for (unsigned f = 0; f < 3; ++f)
+    for (unsigned d = 0; d < 2; ++d) for (unsigned f = 0; f < fields; ++f)
       text += ", out %source" + std::to_string(d) + "_" + std::to_string(f) +
-          ": !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: " + std::string(f == 2 ? "sint<5>" : "uint<1>") + ">";
+          ": !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: " + std::string(f == 2 ? "sint<5>" : f == 4 ? "uint<3>" : "uint<1>") + ">";
     text += ", out %tracerv_stream: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<512>>, out %tracerv_stream_count: !firrtl.uint<13>, out %other: !firrtl.uint<8>) {} } }";
     root = parseSourceString<ModuleOp>(text, &ctx); require(bool(root), "fixture parse");
     circuit = *root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
@@ -65,20 +67,33 @@ struct Fixture {
           b.getNamedAttr("ports", b.getArrayAttr({
               b.getDictionaryAttr({b.getNamedAttr("enable", b.getStringAttr("UInt<1>"))}),
               b.getDictionaryAttr({b.getNamedAttr("argument", b.getStringAttr("SInt<5>"))})}))});
+      SmallVector<Attribute> records{entry};
+      if (multipleRecords) {
+        records.push_back(b.getDictionaryAttr({b.getNamedAttr("name", b.getStringAttr(record + "extra")),
+            b.getNamedAttr("format", b.getStringAttr("quote=\" slash=\\n question=?" "?/\n%03x")),
+            b.getNamedAttr("ports", b.getArrayAttr({
+                b.getDictionaryAttr({b.getNamedAttr("enable", b.getStringAttr("UInt<1>"))}),
+                b.getDictionaryAttr({b.getNamedAttr("argument", b.getStringAttr("UInt<3>"))})}))}));
+        if (reverseRecords) std::reverse(records.begin(), records.end());
+      }
       auto key = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PrintBridgeParameters)),
-          b.getNamedAttr("resetPortName", b.getStringAttr(reset)), b.getNamedAttr("printPorts", b.getArrayAttr({entry}))});
+          b.getNamedAttr("resetPortName", b.getStringAttr(reset)), b.getNamedAttr("printPorts", b.getArrayAttr(records))});
       NamedAttrList mapping;
-      for (unsigned f = 0; f < 3; ++f) {
-        auto local = f == 0 ? reset : record + (f == 1 ? "_enable" : "_argument");
+      for (unsigned f = 0; f < fields; ++f) {
+        auto local = f == 0 ? reset : record + (f > 2 ? "extra" : "") + (f == 1 || f == 3 ? "_enable" : "_argument");
         mapping.set(local, b.getStringAttr("global" + std::to_string(d) + "_" + std::to_string(f)));
       }
       raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::BridgeIO)),
           b.getNamedAttr("target", b.getStringAttr("~Top|Top>synthesizedPrintf")),
           b.getNamedAttr("widgetClass", b.getStringAttr(goldengate::AnnotationClasses::PrintBridgeModule)),
+          b.getNamedAttr("clockInfo", b.getDictionaryAttr({
+              b.getNamedAttr("name", b.getStringAttr("clock\"\\?\n")),
+              b.getNamedAttr("multiplier", b.getI64IntegerAttr(d + 1)),
+              b.getNamedAttr("divisor", b.getI64IntegerAttr(3))})),
           b.getNamedAttr("widgetConstructorKey", key), b.getNamedAttr("channelMapping", mapping.getDictionary(&ctx))}));
     }
     // Reverse annotation order and use global names unrelated to source ports.
-    for (int d = 1; d >= 0; --d) for (int f = 2; f >= 0; --f) {
+    for (int d = 1; d >= 0; --d) for (int f = fields - 1; f >= 0; --f) {
       auto info = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
           b.getNamedAttr("latency", b.getI64IntegerAttr(0))});
       raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
@@ -129,6 +144,29 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   auto old = named(f.circuit, "Top"); std::string oldText = dump(old), error;
   require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
   auto wrapper = named(f.circuit, "GGPrintBridgeHostWrapper");
+  std::string header;
+  auto beforeHeader = dump(*f.root);
+  require(succeeded(goldengate::preparePrintBridgeDecoderHeader(f.circuit, f.hosts, header, error)), error);
+  require(dump(*f.root) == beforeHeader && header.find("{1U, \"signed=%d\\012\", std::vector<unsigned>{5U}}") != std::string::npos &&
+      header.find("1U, 254U, stream_index, 6144U") != std::string::npos &&
+      header.find("ClockInfo{\"clock\\\"\\\\\\077\\012\", " + std::to_string(reverse ? 2 : 1) + "U, 3U}") != std::string::npos,
+      "Print decoder layout, escaping or host order changed");
+  if (!output.empty()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream file((output.str() + ".h"), ec);
+    require(!ec, "cannot write Print decoder header fixture"); file << header;
+  }
+  // A corrupt offset must never change the caller's last successful header.
+  auto info = f.hosts[1]->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+  auto records = info.getAs<ArrayAttr>("records"); OpBuilder hb(&ctx);
+  NamedAttrList corruptRecord(cast<DictionaryAttr>(records[0]));
+  corruptRecord.set("offset", hb.getI64IntegerAttr(2)); NamedAttrList corruptInfo(info);
+  corruptInfo.set("records", hb.getArrayAttr({corruptRecord.getDictionary(&ctx)}));
+  f.hosts[1]->setAttr("goldengate.printHost", corruptInfo.getDictionary(&ctx));
+  auto lastHeader = header, corruptIR = dump(*f.root);
+  require(failed(goldengate::preparePrintBridgeDecoderHeader(f.circuit, f.hosts, header, error)) &&
+      header == lastHeader && dump(*f.root) == corruptIR, "Print decoder rejection not transactional");
+  f.hosts[1]->setAttr("goldengate.printHost", info);
   require(f.circuit.getName() == wrapper.getName() && wrapper.getNumPorts() == 11 && dump(old) == oldText && succeeded(verify(*f.root)), "invalid binding or changed original top");
   for (auto name : {"hostClock", "hostReset", "tracerv_stream", "tracerv_stream_count", "other"})
     require(wrapper.getPortType(port(wrapper, name)) == old.getPortType(port(old, name)), "lost nonprint port");
@@ -263,6 +301,36 @@ int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx);
+    for (bool reverse : {false, true}) {
+      Fixture f(ctx, true, reverse); std::string error, header;
+      require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
+      require(succeeded(goldengate::preparePrintBridgeDecoderHeader(f.circuit, f.hosts, header, error)), error);
+      require(header.find(std::string(reverse ? "{5U" : "{1U") + ", \"signed=%d") != std::string::npos &&
+          header.find(std::string(reverse ? "{1U" : "{7U") + ", \"quote=") != std::string::npos &&
+          header.find("2U, 65534U, stream_index, 6144U") != std::string::npos,
+          "decoder record permutation offsets or token geometry differ");
+      if (argc > 1) {
+        std::error_code ec;
+        llvm::raw_fd_ostream file(std::string(argv[1]) + (reverse ? ".reverse.h" : ".records.h"), ec);
+        require(!ec, "cannot write ordered decoder fixture"); file << header;
+      }
+      auto rejectWithoutMutation = [&](const std::string &why) {
+        auto before = dump(*f.root); std::string candidate = "preserve";
+        require(failed(goldengate::preparePrintBridgeDecoderHeader(f.circuit, f.hosts, candidate, error)) &&
+            !error.empty() && candidate == "preserve" && dump(*f.root) == before, why);
+      };
+      std::swap(f.hosts[0], f.hosts[1]); rejectWithoutMutation("accepted wrong host order");
+      std::swap(f.hosts[0], f.hosts[1]);
+      auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+      SmallVector<Attribute> bad(raw.begin(), raw.end());
+      NamedAttrList bridge(cast<DictionaryAttr>(bad[2]));
+      auto clock = bridge.get("clockInfo"); NamedAttrList badClock(cast<DictionaryAttr>(clock));
+      badClock.set("divisor", IntegerAttr::get(IntegerType::get(&ctx, 64), 0));
+      bridge.set("clockInfo", badClock.getDictionary(&ctx)); bad[2] = bridge.getDictionary(&ctx);
+      f.circuit->setAttr("rawAnnotations", ArrayAttr::get(&ctx, bad));
+      rejectWithoutMutation("accepted zero clock divisor"); f.circuit->setAttr("rawAnnotations", raw);
+    }
+    llvm::outs() << "PASS Print decoder signed/mixed records, both record orders and transactional rejection\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << "FAIL " << e.what() << "\n"; return 1; }
 }
