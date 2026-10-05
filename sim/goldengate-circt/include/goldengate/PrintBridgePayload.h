@@ -90,4 +90,14 @@ mlir::LogicalResult materializePrintBridgeHostQueues(
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
     std::string &error);
+// Bind queued hosts to the active post-FAME top's latency-zero output tokens,
+// using BridgeIO.channelMapping and resolved CIRCT port/field identities.
+// Preserve constructor/host order, platform host reset versus token reset,
+// and HostPortIO's per-channel DecoupledHelper predicates. Consume the token
+// ports; expose each host's local AXI control, buffered stream and live count.
+// Global control/stream allocation and Print driver collateral are later stages.
+// Validate/stage the complete batch before committing; empty batches are no-ops.
+mlir::LogicalResult bindPrintBridgeHosts(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
 } // namespace goldengate

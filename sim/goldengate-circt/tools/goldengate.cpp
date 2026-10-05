@@ -258,7 +258,9 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
   // boundary; global PrintBridge host stream allocation remains pending.
-  bool materializePrintHostConstructors =
+  bool bindPrintHostConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--bind-print-host-constructors";
+  bool materializePrintHostConstructors = bindPrintHostConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-host-constructors";
   bool materializePrintHosts = materializePrintHostConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-hosts");
@@ -342,6 +344,7 @@ int main(int argc, char **argv) {
                     "--materialize-print-payloads | --materialize-print-payload-constructors | "
                     "--materialize-print-tokens | --materialize-print-token-constructors | "
                     "--materialize-print-hosts | --materialize-print-host-constructors | "
+                    "--bind-print-host-constructors | "
                     "--materialize-print-streams | --materialize-print-stream-constructors | "
                     "--materialize-print-axi | --materialize-print-axi-constructors | "
                     "--materialize-print-configs | --materialize-print-config-constructors | "
@@ -452,6 +455,27 @@ int main(int argc, char **argv) {
     if (materializePrintHosts && failed(goldengate::materializePrintBridgeHosts(
           circuit, controls, 25, 12, hosts, error)))
       return fail("PrintBridge host materialization: " + error);
+    if (bindPrintHostConstructors) {
+      if (failed(goldengate::bindPrintBridgeHosts(circuit, hosts, error)))
+        return fail("PrintBridge post-FAME host binding: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("PrintBridge host binding produced invalid FIRRTL IR");
+      llvm::SmallString<256> boundIR(outputDir), boundFIR(outputDir), boundAnnos(outputDir);
+      llvm::sys::path::append(boundIR, "post-print-host-binding.mlir");
+      llvm::sys::path::append(boundFIR, "post-print-host-binding.fir");
+      llvm::sys::path::append(boundAnnos, "post-print-host-binding-all.json");
+      std::error_code ec;
+      llvm::raw_fd_ostream ir(boundIR, ec);
+      if (ec) return fail("cannot write PrintBridge binding MLIR: " + ec.message());
+      module->print(ir); ir << '\n'; ir.close();
+      llvm::raw_fd_ostream fir(boundFIR, ec);
+      if (ec || failed(exportFIRFile(*module, fir, std::nullopt, exportFIRVersion)))
+        return fail("cannot export PrintBridge binding FIRRTL");
+      if (failed(goldengate::emitAllAnnotations(circuit, boundAnnos, error)))
+        return fail("cannot export PrintBridge binding annotations: " + error);
+      llvm::outs() << "Bound " << hosts.size() << " queued PrintBridge hosts to post-FAME tokens in " << boundIR << '\n';
+      return 0;
+    }
     if (failed(mlir::verify(*module)))
       return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
