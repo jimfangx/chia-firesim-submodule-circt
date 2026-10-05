@@ -60,4 +60,25 @@ mlir::LogicalResult materializePrintBridgeStreams(
     llvm::ArrayRef<circt::firrtl::FModuleOp> controls,
     llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
     std::string &error);
+// Program the stream wrapper with the same six-word bank and Pulsify state.
+mlir::LogicalResult materializePrintBridgeStreamConfigs(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> streams,
+    llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
+    std::string &error);
+// Shared local transport helper for a freshly materialized stream bank.
+mlir::LogicalResult materializePrintBridgeStreamAXI(
+    circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp config,
+    unsigned addressBits, unsigned idBits,
+    llvm::StringRef wrapperName, llvm::StringRef adapterName,
+    circt::firrtl::FModuleOp &host, std::string &error);
+// Compose one control, stream adapter, register bank and local Nasti transport.
+// Stage the complete batch before committing IR. CPU stream queue/allocation
+// and driver collateral are separate; preserve source circuit/annotations.
+mlir::LogicalResult materializePrintBridgeHosts(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> controls,
+    unsigned addressBits, unsigned idBits,
+    llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
+    std::string &error);
 } // namespace goldengate

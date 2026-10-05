@@ -475,3 +475,12 @@ LogicalResult goldengate::materializePrintBridgeAXIControls(CircuitOp circuit,
   }
   return success();
 }
+
+// The composed print bank uses the same transport as the standalone ROI bank.
+LogicalResult goldengate::materializePrintBridgeStreamAXI(CircuitOp circuit,
+    FModuleOp config, unsigned addressBits, unsigned idBits,
+    StringRef wrapperName, StringRef adapterName, FModuleOp &host,
+    std::string &error) {
+  return mapBridgeControl(circuit, addressBits, idBits, 6, "", wrapperName,
+      adapterName, "mcr", "ctrl", error, {}, config, false, &host);
+}

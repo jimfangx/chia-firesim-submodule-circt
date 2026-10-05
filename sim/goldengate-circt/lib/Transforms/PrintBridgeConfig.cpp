@@ -9,9 +9,10 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
+namespace {
+LogicalResult materializeConfigs(CircuitOp circuit,
     llvm::ArrayRef<FModuleOp> controls, llvm::SmallVectorImpl<FModuleOp> &modules,
-    std::string &error) {
+    std::string &error, bool streamForm) {
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
   auto *ctx = circuit.getContext(); OpBuilder b(ctx);
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w); };
@@ -19,7 +20,7 @@ LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
   std::set<std::pair<std::string, std::string>> identities;
   for (auto &op : circuit.getBodyBlock()->getOperations()) {
     if (auto m = dyn_cast<FModuleLike>(&op)) names.insert(m.getModuleName());
-    if (auto prior = op.getAttrOfType<DictionaryAttr>("goldengate.printConfig")) {
+    if (auto prior = op.getAttrOfType<DictionaryAttr>(streamForm ? "goldengate.printStreamConfig" : "goldengate.printConfig")) {
       auto target = prior.getAs<StringAttr>("bridgeTarget");
       auto reset = prior.getAs<StringAttr>("resetPortName");
       if (target && reset) identities.emplace(target.getValue().str(), reset.getValue().str());
@@ -29,11 +30,16 @@ LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
       "flushNarrowPacket", "bufferReady", "startCycleL", "startCycleH", "endCycleL",
       "endCycleH", "hBits", "hReady", "fromHostValid", "tokenValid", "tokenData",
       "currentCycle", "enable"};
+  const char *streamNames[] = {"hostClock", "hostReset", "doneInit", "hValid",
+      "flushNarrowPacket", "startCycleL", "startCycleH", "endCycleL", "endCycleH",
+      "hBits", "hReady", "fromHostValid", "currentCycle", "enable", "streamReady",
+      "streamValid", "streamData"};
+  auto sourceMetadata = streamForm ? "goldengate.printStream" : "goldengate.printControl";
   // Validate the entire collection before creating any state or instances.
   for (auto control : controls) {
     if (!control || control->getParentOp() != circuit || control.getNumPorts() != 17)
       return reject("PrintBridge config requires materialized controls in this circuit");
-    auto layout = control->getAttrOfType<DictionaryAttr>("goldengate.printControl");
+    auto layout = control->getAttrOfType<DictionaryAttr>(sourceMetadata);
     auto target = layout ? layout.getAs<StringAttr>("bridgeTarget") : StringAttr();
     auto reset = layout ? layout.getAs<StringAttr>("resetPortName") : StringAttr();
     auto bits = layout ? layout.getAs<IntegerAttr>("tokenBits") : IntegerAttr();
@@ -44,12 +50,30 @@ LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
         (bits.getInt() & (bits.getInt()-1)) || !cycles || cycles.getInt() != 64 ||
         !inclusive || !inclusive.getValue())
       return reject("PrintBridge config has incompatible control metadata");
+    if (streamForm) {
+      auto streamBits = layout.getAs<IntegerAttr>("streamBits");
+      auto depth = layout.getAs<IntegerAttr>("adapterDepth");
+      auto packing = layout.getAs<IntegerAttr>("packingRatio");
+      auto lowFirst = layout.getAs<BoolAttr>("lowSliceFirst");
+      auto flush = layout.getAs<BoolAttr>("narrowFlushInjection");
+      auto source = layout.getAs<StringAttr>("controlModule");
+      auto adapter = layout.getAs<StringAttr>("adapterModule");
+      if (!streamBits || streamBits.getInt() != 512 || !depth ||
+          depth.getInt() != (bits.getInt() < 512 ? 1 : bits.getInt() / 512) ||
+          !packing || packing.getInt() != (bits.getInt() < 512 ? 512 / bits.getInt() : 1) ||
+          !lowFirst || !lowFirst.getValue() || !flush || flush.getValue() != (bits.getInt() < 512) ||
+          !source || source.getValue().empty() || !adapter || adapter.getValue().empty())
+        return reject("PrintBridge config has incompatible stream metadata");
+    }
     for (unsigned p = 0; p < 17; ++p) {
-      Type expected = p == 0 ? Type(ClockType::get(ctx)) : p == 10 ? control.getPortType(p) :
-          Type(uint(p >= 6 && p <= 9 ? 32 : p == 14 ? bits.getInt() : p == 15 ? 64 : 1));
-      if (control.getPortName(p) != portNames[p] || control.getPortType(p) != expected ||
-          control.getPortDirection(p) != (p < 11 ? Direction::In : Direction::Out) ||
-          (p == 10 && (!isa<BundleType>(expected) || !cast<FIRRTLBaseType>(expected).isPassive())))
+      unsigned hBitsPort = streamForm ? 9 : 10;
+      Type expected = p == 0 ? Type(ClockType::get(ctx)) : p == hBitsPort ? control.getPortType(p) :
+          Type(uint(streamForm ? (p >= 5 && p <= 8 ? 32 : p == 12 ? 64 : p == 16 ? 512 : 1) :
+              (p >= 6 && p <= 9 ? 32 : p == 14 ? bits.getInt() : p == 15 ? 64 : 1)));
+      Direction direction = (streamForm ? p < 10 || p == 14 : p < 11) ? Direction::In : Direction::Out;
+      if (control.getPortName(p) != (streamForm ? streamNames[p] : portNames[p]) || control.getPortType(p) != expected ||
+          control.getPortDirection(p) != direction ||
+          (p == hBitsPort && (!isa<BundleType>(expected) || !cast<FIRRTLBaseType>(expected).isPassive())))
         return reject("PrintBridge config control interface mismatch");
     }
     if (!identities.emplace(target.getValue().str(), reset.getValue().str()).second)
@@ -64,27 +88,29 @@ LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
       {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
   auto loc = circuit.getLoc();
   for (auto control : controls) {
-    std::string name = "GGPrintBridgeConfig";
+    llvm::StringRef base = streamForm ? "GGPrintBridgeStreamConfig" : "GGPrintBridgeConfig";
+    std::string name = base.str();
     for (unsigned suffix = 1; names.count(name); ++suffix)
-      name = "GGPrintBridgeConfig_" + std::to_string(suffix);
+      name = base.str() + "_" + std::to_string(suffix);
     names.insert(name);
     SmallVector<PortInfo> ports;
     SmallVector<unsigned> copied;
     for (auto [p, info] : llvm::enumerate(control.getPorts())) {
-      if (p == 2 || p == 4 || (p >= 6 && p <= 9)) continue;
+      unsigned roiStart = streamForm ? 5 : 6;
+      if (p == 2 || p == 4 || (p >= roiStart && p < roiStart + 4)) continue;
       ports.push_back(info); copied.push_back(p);
     }
     ports.push_back({b.getStringAttr("mcr"), mcrType, Direction::Out});
     b.setInsertionPointToEnd(circuit.getBodyBlock());
     auto m = b.create<FModuleOp>(loc, b.getStringAttr(name),
         ConventionAttr::get(ctx, Convention::Internal), ports);
-    auto layout = control->getAttrOfType<DictionaryAttr>("goldengate.printControl");
+    auto layout = control->getAttrOfType<DictionaryAttr>(sourceMetadata);
     unsigned tokenBits = layout.getAs<IntegerAttr>("tokenBits").getInt();
     // BridgeStreamConstants.streamWidthBits is 512. Equal/wide tokens still
     // have the unused, one-cycle flush register, exactly as PrintBridge.scala.
     unsigned pulseLength = tokenBits < 512 ? 512 / tokenBits : 1;
     NamedAttrList metadata(layout);
-    metadata.set("controlModule", b.getStringAttr(control.getName()));
+    metadata.set(streamForm ? "streamModule" : "controlModule", b.getStringAttr(control.getName()));
     metadata.set("flushPulseLength", b.getI64IntegerAttr(pulseLength));
     SmallVector<Attribute> registerMap;
     for (unsigned word = 0; word < 6; ++word) {
@@ -98,14 +124,14 @@ LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
       registerMap.push_back(entry.getDictionary(ctx));
     }
     metadata.set("registers", b.getArrayAttr(registerMap));
-    m->setAttr("goldengate.printConfig", metadata.getDictionary(ctx));
+    m->setAttr(streamForm ? "goldengate.printStreamConfig" : "goldengate.printConfig", metadata.getDictionary(ctx));
     b.setInsertionPointToStart(m.getBodyBlock());
     auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
     auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
     auto k = [&](unsigned w, uint64_t v) -> Value { return b.create<ConstantOp>(loc, uint(w), APInt(w, v)); };
     auto mux = [&](Value s, Value t, Value f) -> Value { return b.create<MuxPrimOp>(loc, s, t, f); };
     Value zero = k(1, 0), one = k(1, 1);
-    auto inner = b.create<InstanceOp>(loc, control, "control");
+    auto inner = b.create<InstanceOp>(loc, control, streamForm ? "stream" : "control");
     for (auto [outer, p] : llvm::enumerate(copied)) {
       Value arg = m.getArgument(outer), instance = inner.getResult(p);
       connect(control.getPortDirection(p) == Direction::In ? instance : arg,
@@ -139,9 +165,22 @@ LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
       if (word >= 4) read = b.create<PadPrimOp>(loc, read, 32);
       connect(field(rd, "bits"), read);
     }
-    for (unsigned word = 0; word < 4; ++word) connect(inner.getResult(6+word), regs[word]);
+    for (unsigned word = 0; word < 4; ++word) connect(inner.getResult((streamForm ? 5 : 6)+word), regs[word]);
     connect(inner.getResult(2), regs[4]); connect(inner.getResult(4), regs[5]);
     modules.push_back(m);
   }
   return success();
+}
+} // namespace
+
+LogicalResult goldengate::materializePrintBridgeConfigs(CircuitOp circuit,
+    llvm::ArrayRef<FModuleOp> controls, llvm::SmallVectorImpl<FModuleOp> &modules,
+    std::string &error) {
+  return materializeConfigs(circuit, controls, modules, error, false);
+}
+
+LogicalResult goldengate::materializePrintBridgeStreamConfigs(CircuitOp circuit,
+    llvm::ArrayRef<FModuleOp> streams, llvm::SmallVectorImpl<FModuleOp> &modules,
+    std::string &error) {
+  return materializeConfigs(circuit, streams, modules, error, true);
 }

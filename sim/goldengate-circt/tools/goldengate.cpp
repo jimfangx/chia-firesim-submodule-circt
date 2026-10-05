@@ -32,6 +32,8 @@
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/PrintStubs.h"
+#include "llvm/ADT/StringSet.h"
+#include <functional>
 #include "goldengate/PrintWiring.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/GlobalResetWiring.h"
@@ -256,6 +258,10 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
   // boundary; global PrintBridge host stream allocation remains pending.
+  bool materializePrintHostConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-host-constructors";
+  bool materializePrintHosts = materializePrintHostConstructors ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-hosts");
   bool materializePrintStreamConstructors =
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-stream-constructors";
   bool materializePrintStreams = materializePrintStreamConstructors ||
@@ -268,9 +274,9 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-config-constructors";
   bool materializePrintConfigs = materializePrintAXI || materializePrintConfigConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-configs");
-  bool materializePrintControlConstructors = materializePrintStreamConstructors || materializePrintConfigConstructors ||
+  bool materializePrintControlConstructors = materializePrintHostConstructors || materializePrintStreamConstructors || materializePrintConfigConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-control-constructors";
-  bool materializePrintControls = materializePrintStreams || materializePrintConfigs || materializePrintControlConstructors ||
+  bool materializePrintControls = materializePrintHosts || materializePrintStreams || materializePrintConfigs || materializePrintControlConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-controls");
   bool materializePrintTokenConstructors = materializePrintControlConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-token-constructors";
@@ -335,6 +341,8 @@ int main(int argc, char **argv) {
                     "--wire-print-reset | --update-print-bridge-clocks | "
                     "--materialize-print-payloads | --materialize-print-payload-constructors | "
                     "--materialize-print-tokens | --materialize-print-token-constructors | "
+                    "--materialize-print-hosts | --materialize-print-host-constructors | "
+                    "--materialize-print-streams | --materialize-print-stream-constructors | "
                     "--materialize-print-axi | --materialize-print-axi-constructors | "
                     "--materialize-print-configs | --materialize-print-config-constructors | "
                     "--materialize-print-controls | --materialize-print-control-constructors | "
@@ -440,10 +448,14 @@ int main(int argc, char **argv) {
     if (materializePrintAXI && failed(goldengate::materializePrintBridgeAXIControls(
           circuit, configs, 25, 12, axi, error)))
       return fail("PrintBridge AXI materialization: " + error);
+    llvm::SmallVector<FModuleOp> hosts;
+    if (materializePrintHosts && failed(goldengate::materializePrintBridgeHosts(
+          circuit, controls, 25, 12, hosts, error)))
+      return fail("PrintBridge host materialization: " + error);
     if (failed(mlir::verify(*module)))
       return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
-    llvm::sys::path::append(irPath, materializePrintStreams ? "post-print-streams.mlir" : materializePrintAXI ? "post-print-axi.mlir" : materializePrintConfigs ? "post-print-configs.mlir" : materializePrintControls ? "post-print-controls.mlir" :
+    llvm::sys::path::append(irPath, materializePrintHosts ? "post-print-hosts.mlir" : materializePrintStreams ? "post-print-streams.mlir" : materializePrintAXI ? "post-print-axi.mlir" : materializePrintConfigs ? "post-print-configs.mlir" : materializePrintControls ? "post-print-controls.mlir" :
         materializePrintTokens ? "post-print-tokens.mlir" : "post-print-payloads.mlir");
     llvm::sys::path::append(firPath, "post-print-payloads.fir");
     llvm::sys::path::append(summaryPath, "print-payloads.json");
@@ -560,6 +572,45 @@ int main(int argc, char **argv) {
         if (ec) return fail("cannot write print control summary: " + ec.message());
         controlMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(controlSummary)));
         llvm::outs() << "Materialized " << controls.size() << " PrintBridge ROI/cycle control wrappers\n";
+        if (materializePrintHosts) {
+          llvm::SmallString<256> hostPath(outputDir), hostAnnos(outputDir), hostSummaryPath(outputDir);
+          llvm::sys::path::append(hostPath, "post-print-hosts.fir");
+          llvm::sys::path::append(hostAnnos, "post-print-hosts-all.json");
+          llvm::sys::path::append(hostSummaryPath, "print-hosts.json");
+          if (failed(goldengate::emitAllAnnotations(circuit, hostAnnos, error)))
+            return fail("cannot export print host annotations: " + error);
+          llvm::json::Array hostSummary;
+          if (!hosts.empty()) payloadCircuit.setName(hosts.front().getName());
+          // Only the generated host closure belongs in this standalone artifact.
+          llvm::StringSet<> included;
+          for (auto m : payloadCircuit.getOps<FModuleLike>()) included.insert(m.getModuleName());
+          std::function<void(FModuleOp)> cloneClosure = [&](FModuleOp m) {
+            if (!included.insert(m.getName()).second) return;
+            m.walk([&](InstanceOp instance) {
+              for (auto dependency : circuit.getOps<FModuleOp>())
+                if (dependency.getName() == instance.getModuleName()) cloneClosure(dependency);
+            });
+            payloadBuilder.insert(m->clone());
+          };
+          for (auto host : hosts) {
+            cloneClosure(host);
+            auto layout = host->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+            llvm::json::Object entry{{"module", host.getName().str()}};
+            for (auto key : {"controlModule", "streamModule", "configModule", "mcrModule", "adapterModule", "bridgeTarget", "resetPortName"})
+              entry[key] = layout.getAs<StringAttr>(key).getValue().str();
+            for (auto key : {"tokenBits", "streamBits", "flushPulseLength", "addressBits", "idBits"})
+              entry[key] = layout.getAs<IntegerAttr>(key).getInt();
+            hostSummary.push_back(std::move(entry));
+          }
+          llvm::raw_fd_ostream hostFir(hostPath, ec);
+          if (ec || failed(mlir::verify(*payloadIR)) ||
+              failed(exportFIRFile(*payloadIR, hostFir, std::nullopt, exportFIRVersion)))
+            return fail("cannot export print host FIRRTL");
+          llvm::raw_fd_ostream hostMetadata(hostSummaryPath, ec);
+          if (ec) return fail("cannot write print host summary: " + ec.message());
+          hostMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(hostSummary)));
+          llvm::outs() << "Materialized " << hosts.size() << " PrintBridge local AXI/stream hosts\n";
+        }
         if (materializePrintStreams) {
           llvm::SmallString<256> streamPath(outputDir), streamAnnosPath(outputDir), streamSummaryPath(outputDir);
           llvm::sys::path::append(streamPath, "post-print-streams.fir");
