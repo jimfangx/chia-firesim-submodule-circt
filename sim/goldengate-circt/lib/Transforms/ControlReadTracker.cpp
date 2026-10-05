@@ -1,8 +1,13 @@
 // See LICENSE for license details.
-// Port junctions/ReorderQueue.scala's small-tag-space storage semantics.
+// Bind junctions/ReorderQueue.scala's 64-slot storage to AR acceptance and
+// final R-beat retirement. The decoder catalog determines route width and
+// normal/error dequeue count. Validate all bindings before mutating the IR.
+// Retain annotation classes/payloads; copied targets move to the wrapper and
+// consumed dispatch targets remain on the inner module.
 #include "goldengate/ControlReadTracker.h"
 #include "goldengate/ControlTransactionTracker.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 #include <map>
 #include <set>
@@ -16,16 +21,31 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGControlReadDispatchWrapper")
     return reject("control read tracker requires the AR dispatch wrapper");
-  FModuleOp inner;
+  FModuleOp inner, decoder;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == wrapperName || m.getModuleName() == helperName)
       return reject("control read tracker module already exists");
+    if (m.getModuleName() == "GGControlAddressDecode") decoder = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getModuleName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto bindings = inner ? inner->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings") : ArrayAttr();
-  if (!inner || !raw || !bindings || bindings.size() != 7)
-    return reject("control read tracker requires retained annotations and seven read bindings");
+  auto catalog = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
+  if (!inner || !raw || !bindings || !catalog || catalog.empty() || catalog.size() > 63)
+    return reject("control read tracker requires retained annotations, read bindings and one to 63 decoded regions");
+  const unsigned slaveCount = catalog.size();
+  const unsigned routeWidth = llvm::Log2_64_Ceil(slaveCount + 1);
+  SmallVector<StringAttr> regionNames;
+  std::set<std::string> uniqueNames;
+  for (auto [i, a] : llvm::enumerate(catalog)) {
+    auto d = dyn_cast<DictionaryAttr>(a);
+    auto name = d ? d.getAs<StringAttr>("name") : StringAttr();
+    auto slave = d ? d.getAs<IntegerAttr>("slave") : IntegerAttr();
+    if (!name || name.getValue().empty() || !slave || slave.getInt() != int64_t(i) ||
+        !uniqueNames.insert(name.getValue().str()).second)
+      return reject("control read tracker requires unique region names and ordered decoded-slave indices");
+    regionNames.push_back(name);
+  }
   bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("control read tracker requires an uninstantiated top");
@@ -55,7 +75,7 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
       {"ctrl_read_dispatch_tracker_ready", uint(1), Direction::In},
       {"ctrl_read_dispatch_track_valid", uint(1), Direction::Out},
       {"ctrl_read_dispatch_track_tag", uint(12), Direction::Out},
-      {"ctrl_read_dispatch_track_target", uint(4), Direction::Out},
+      {"ctrl_read_dispatch_track_target", uint(routeWidth), Direction::Out},
       {"ctrl_error_r_ready", uint(1), Direction::In},
       {"ctrl_error_r_valid", uint(1), Direction::Out},
       {"ctrl_error_r_bits_last", uint(1), Direction::Out},
@@ -64,20 +84,18 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
     auto it = old.find(r.name);
     if (it == old.end() || inner.getPorts()[it->second].type != r.type ||
         inner.getPorts()[it->second].direction != r.direction)
-      return reject("control read tracker requires exact U250 clock, dispatch and error boundaries");
+      return reject("control read tracker requires exact clock, dispatch and error boundaries");
   }
   std::set<std::string> widgetPorts;
-  const std::map<unsigned, llvm::StringRef> expected{{2, "tracerv_ctrl"}, {4, "loadmem_ctrl"},
-      {5, "peekPokeBridge_ctrl"}, {6, "uartBridge_ctrl"}, {7, "clockBridge_ctrl"},
-      {9, "resetBridge_ctrl"}, {10, "cpuStream_ctrl"}};
   for (auto a : bindings) {
     auto d = dyn_cast<DictionaryAttr>(a);
     auto port = d ? d.getAs<StringAttr>("port") : StringAttr();
     auto slave = d ? d.getAs<IntegerAttr>("slave") : IntegerAttr();
-    if (!port || !slave || !expected.count(slave.getInt()) ||
-        expected.at(slave.getInt()) != port.getValue() || widgets.count(slave.getInt()) ||
+    auto name = d ? d.getAs<StringAttr>("name") : StringAttr();
+    if (!port || !slave || !name || slave.getInt() < 0 || slave.getInt() >= slaveCount ||
+        regionNames[slave.getInt()] != name || widgets.count(slave.getInt()) ||
         !widgetPorts.insert(port.getValue().str()).second)
-      return reject("control read tracker requires the seven mapped U250 widget indices");
+      return reject("control read tracker read bindings must identify unique decoded slaves and matching region names");
     auto it = old.find(port.getValue().str());
     if (it == old.end() || inner.getPorts()[it->second].type != controlType ||
         inner.getPorts()[it->second].direction != Direction::In)
@@ -86,7 +104,7 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
   }
   const std::set<std::string> consumed{"ctrl_read_dispatch_tracker_ready",
       "ctrl_read_dispatch_track_valid", "ctrl_read_dispatch_track_tag", "ctrl_read_dispatch_track_target"};
-  auto hp = controlTransactionTrackerPorts(ctx);
+  auto hp = controlTransactionTrackerPorts(ctx, slaveCount);
   for (auto [i, p] : llvm::enumerate(hp)) hpIndex[p.name.getValue().str()] = i;
   SmallVector<PortInfo> ports;
   for (auto p : inner.getPorts()) if (!consumed.count(p.name.getValue().str())) {
@@ -94,12 +112,12 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
   }
   for (unsigned i = 6; i < hp.size(); ++i) {
     unsigned slave = (i - 6) / 4;
-    if (hp[i].direction == Direction::Out || (slave != 11 && !widgets.count(slave))) {
+    if (hp[i].direction == Direction::Out || (slave != slaveCount && !widgets.count(slave))) {
       auto p = hp[i]; exposed[p.name.getValue().str()] = ports.size();
       p.name = b.getStringAttr("ctrl_read_tracker_" + p.name.getValue().str()); ports.push_back(p);
     }
   }
-  auto helper = createControlTransactionTracker(circuit, helperName, "ar_queue");
+  auto helper = createControlTransactionTracker(circuit, helperName, "ar_queue", slaveCount);
   auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
   auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
   auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
@@ -131,8 +149,8 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
     connect(track("deq_" + std::to_string(i) + "_valid"), fireLast);
     connect(track("deq_" + std::to_string(i) + "_tag"), field(bits, "id"));
   }
-  connect(track("deq_11_valid"), both(both(topArg("ctrl_error_r_ready"), result("ctrl_error_r_valid")), result("ctrl_error_r_bits_last")));
-  connect(track("deq_11_tag"), result("ctrl_error_r_bits_id"));
+  connect(track("deq_" + std::to_string(slaveCount) + "_valid"), both(both(topArg("ctrl_error_r_ready"), result("ctrl_error_r_valid")), result("ctrl_error_r_bits_last")));
+  connect(track("deq_" + std::to_string(slaveCount) + "_tag"), result("ctrl_error_r_bits_id"));
   std::string op = "~" + circuit.getName().str(), np = "~" + wrapperName.str(), mp = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
     if (auto s = dyn_cast<StringAttr>(a)) {
