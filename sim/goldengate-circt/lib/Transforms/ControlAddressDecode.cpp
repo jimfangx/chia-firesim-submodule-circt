@@ -14,7 +14,7 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::deriveControlMMIOWidget(CircuitOp circuit,
     StringRef widgetName, StringRef mcrModule, ArrayRef<StringRef> registerModules,
-    ControlMMIOWidget &widget, std::string &error) {
+    ControlMMIOWidget &widget, std::string &error, Direction mcrDirection) {
   auto reject = [&](StringRef why) {
     error = "control widget '" + widgetName.str() + "': " + why.str();
     return failure();
@@ -67,7 +67,7 @@ LogicalResult goldengate::deriveControlMMIOWidget(CircuitOp circuit,
       {b.getStringAttr("wstrb"), true, uint(4)}});
   unsigned matched = 0;
   for (auto port : adapter.getPorts()) if (port.name == "mcr") {
-    if (port.direction != Direction::In || port.type != expected)
+    if (port.direction != mcrDirection || port.type != expected)
       return reject("MCRFile lanes differ from the register registry");
     ++matched;
   }

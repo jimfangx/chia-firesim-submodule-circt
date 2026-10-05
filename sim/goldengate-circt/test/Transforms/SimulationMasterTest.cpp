@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/SimulationMaster.h"
+#include "goldengate/ControlAddressDecode.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -90,6 +91,85 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
   }
   return root;
 }
+void phases(MLIRContext &ctx) {
+  std::string error;
+  auto early = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGControlErrorWrapper" {
+    firrtl.module @GGControlErrorWrapper(in %hostClock: !firrtl.clock,
+      in %hostReset: !firrtl.uint<1>, out %other: !firrtl.uint<8>) {}
+  } })", &ctx);
+  require(bool(early), "early fixture parse failed");
+  auto c = *early->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+  c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("test.Target")),
+      b.getNamedAttr("target", b.getStringAttr("~GGControlErrorWrapper|GGControlErrorWrapper>other"))})}));
+  auto top = named(c, "GGControlErrorWrapper"); auto topBefore = dump(top);
+  auto annotations = c->getAttr("rawAnnotations"); FModuleOp bank;
+  require(succeeded(goldengate::materializeSimulationMasterBank(c, bank, error)), error);
+  require(c.getName() == "GGControlErrorWrapper" && dump(top) == topBefore &&
+      c->getAttr("rawAnnotations") == annotations && succeeded(verify(*early)),
+      "early materialization changed top identity, ports or annotations");
+  unsigned uses = 0; c.walk([&](InstanceOp i) { uses += i.getModuleName() == bank.getName(); });
+  require(uses == 0, "materialization prematurely attached the bank");
+  goldengate::ControlMMIOWidget master{"sentinel", 99};
+  require(succeeded(goldengate::deriveControlMMIOWidget(c, "SimulationMaster_0", bank.getName(),
+      {bank.getName()}, master, error, Direction::Out)) && master.registerCount == 3, error);
+  const goldengate::ControlMMIOWidget widgets[]{master, {"stream", 1}};
+  SmallVector<goldengate::ControlMMIORegion> regions;
+  require(succeeded(goldengate::allocateControlMMIORegions(25, widgets, regions, error)) &&
+      regions.size() == 2 && regions[0].name == master.name && regions[0].size == 16 &&
+      regions[0].start == 0 && regions[1].start == 16, "standalone bank allocation differs");
+  auto before = dump(*early); FModuleOp unchanged = top;
+  require(failed(goldengate::materializeSimulationMasterBank(c, unchanged, error)) &&
+      unchanged == top && dump(*early) == before, "duplicate materialization changed result or IR");
+  require(failed(goldengate::attachSimulationMasterBank(c, bank, error)) && dump(*early) == before,
+      "premature attachment changed IR");
+  goldengate::ControlMMIOWidget sentinel{"sentinel", 99, 8};
+  require(failed(goldengate::deriveControlMMIOWidget(c, master.name, bank.getName(),
+      {bank.getName()}, sentinel, error)) && sentinel.registerCount == 99 &&
+      sentinel.customSize == 8 && dump(*early) == before, "wrong MCR direction accepted or mutated output");
+
+  // Separating construction from attachment must reproduce the combined API's
+  // exact hardware and target transfer, including bank instance clock/reset.
+  auto split = fixture(ctx), combined = fixture(ctx);
+  auto splitCircuit = *split->getOps<CircuitOp>().begin();
+  require(succeeded(goldengate::materializeSimulationMasterBank(splitCircuit, bank, error)) &&
+      succeeded(goldengate::attachSimulationMasterBank(splitCircuit, bank, error)), error);
+  require(succeeded(goldengate::addSimulationMasterBank(*combined->getOps<CircuitOp>().begin(), error)), error);
+  require(dump(*split) == dump(*combined) && succeeded(verify(*split)),
+      "split bank construction changed hardware or annotations");
+
+  for (unsigned bad = 0; bad < 10; ++bad) {
+    auto root = fixture(ctx), foreign = fixture(ctx);
+    auto circuit = *root->getOps<CircuitOp>().begin(); FModuleOp candidate;
+    require(succeeded(goldengate::materializeSimulationMasterBank(circuit, candidate, error)), error);
+    if (bad == 0) candidate = {};
+    if (bad == 1) require(succeeded(goldengate::materializeSimulationMasterBank(
+        *foreign->getOps<CircuitOp>().begin(), candidate, error)), error);
+    if (bad == 2) candidate = named(circuit, "GGControlWriteTrackerWrapper");
+    if (bad >= 3 && bad <= 8) {
+      auto ports = candidate.getPorts(); SmallVector<PortInfo> malformed(ports);
+      if (bad == 3) malformed[0].type = UIntType::get(&ctx, 1);
+      if (bad == 4) malformed[0].direction = Direction::Out;
+      if (bad == 5) malformed[1].type = UIntType::get(&ctx, 2);
+      if (bad == 6) malformed[1].direction = Direction::Out;
+      if (bad == 7) malformed[2].type = UIntType::get(&ctx, 32);
+      if (bad == 8) malformed[2].direction = Direction::In;
+      candidate.erase(); b.setInsertionPointToEnd(circuit.getBodyBlock());
+      candidate = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("GGSimulationMasterBank"),
+          ConventionAttr::get(&ctx, Convention::Internal), malformed);
+    }
+    if (bad == 9) {
+      b.setInsertionPointToEnd(circuit.getBodyBlock());
+      auto user = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("User"),
+          ConventionAttr::get(&ctx, Convention::Internal), ArrayRef<PortInfo>{});
+      b.setInsertionPointToStart(user.getBodyBlock()); b.create<InstanceOp>(circuit.getLoc(), candidate, "used");
+    }
+    auto before = dump(*root);
+    require(failed(goldengate::attachSimulationMasterBank(circuit, candidate, error)) &&
+        !error.empty() && dump(*root) == before, "invalid standalone bank accepted or mutated IR");
+  }
+  llvm::outs() << "SimulationMaster phases: early bank allocation, unchanged top/annotations, split/combined equivalence and 13 atomic rejections passed\n";
+}
 void test(MLIRContext &ctx) {
   auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addSimulationMasterBank(c, error)), error);
@@ -147,5 +227,5 @@ void test(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { test(ctx); return 0; } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  try { phases(ctx); test(ctx); return 0; } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

@@ -2495,9 +2495,28 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlErrorAnnotations, error)))
         return fail("control error slave annotations: " + error);
       llvm::outs() << "Mapped CIRCT control decode-error endpoint in " << controlErrorPath << '\n';
+      // Construct Master before allocation without changing the active top.
+      // Its actual register bank, rather than a duplicated word count, defines
+      // the descriptor; attachment to dispatch remains at its existing boundary.
+      FModuleOp simulationMasterBank;
+      if (failed(goldengate::materializeSimulationMasterBank(circuit, simulationMasterBank, error)))
+        return fail("SimulationMaster materialization: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("SimulationMaster materialization produced invalid FIRRTL IR");
+      llvm::SmallString<256> masterBankPath(outputDir), masterBankAnnotations(outputDir);
+      llvm::sys::path::append(masterBankPath, "post-fame-simulation-master-bank.mlir");
+      llvm::sys::path::append(masterBankAnnotations, "post-fame-simulation-master-bank-all.json");
+      std::error_code masterBankWriteError;
+      llvm::raw_fd_ostream masterBankOut(masterBankPath, masterBankWriteError);
+      if (masterBankWriteError)
+        return fail("cannot write SimulationMaster materialization: " + masterBankWriteError.message());
+      module->print(masterBankOut); masterBankOut << '\n'; masterBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, masterBankAnnotations, error)))
+        return fail("SimulationMaster materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT SimulationMaster bank before control allocation in " << masterBankPath << '\n';
       // HasWidgets registration order remains independent of IR module order.
       // Derive each available bank's size from its register registry and check
-      // it against the implemented MCRFile. The four banks assembled after
+      // it against the implemented MCR port. The three banks assembled after
       // global dispatch still use explicit declarations until that boundary
       // can be moved ahead of allocation.
       SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
@@ -2509,7 +2528,12 @@ int main(int argc, char **argv) {
         controlWidgets.push_back(widget);
         return success();
       };
-      controlWidgets.push_back({"SimulationMaster_0", 3});
+      goldengate::ControlMMIOWidget masterWidget;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "SimulationMaster_0",
+              simulationMasterBank.getName(), {simulationMasterBank.getName()},
+              masterWidget, error, Direction::Out)))
+        return fail("SimulationMaster register registry: " + error);
+      controlWidgets.push_back(masterWidget);
       if (failed(appendBank("PeekPokeBridgeModule_0", "GGPeekPokeMCRFile",
                            {"GGPeekPokeMMIOBank"})) ||
           failed(appendBank("ResetPulseBridgeModule_0", "GGResetPulseBridgeMCRFile",
@@ -2667,7 +2691,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, writeTrackerAnnotations, error)))
         return fail("control write tracker annotations: " + error);
       llvm::outs() << "Tracked CIRCT control AW transactions and accepted B responses in " << writeTrackerPath << '\n';
-      if (failed(goldengate::addSimulationMasterBank(circuit, error)))
+      if (failed(goldengate::attachSimulationMasterBank(circuit, simulationMasterBank, error)))
         return fail("SimulationMaster bank: " + error);
       if (failed(mlir::verify(*module)))
         return fail("SimulationMaster bank produced invalid FIRRTL IR");
@@ -2684,6 +2708,12 @@ int main(int argc, char **argv) {
       llvm::outs() << "Mapped CIRCT SimulationMaster initialization and presence registers in " << masterPath << '\n';
       if (failed(goldengate::mapSimulationMasterControl(circuit, 25, 12, error)))
         return fail("SimulationMaster MCRFile: " + error);
+      goldengate::ControlMMIOWidget mappedMaster;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "SimulationMaster_0",
+              "GGSimulationMasterMCRFile", {simulationMasterBank.getName()}, mappedMaster, error)))
+        return fail("SimulationMaster adapter register registry: " + error);
+      if (mappedMaster.registerCount != masterWidget.registerCount)
+        return fail("SimulationMaster adapter word count differs from its allocated register bank");
       if (failed(mlir::verify(*module)))
         return fail("SimulationMaster MCRFile produced invalid FIRRTL IR");
       llvm::SmallString<256> masterControlPath(outputDir), masterControlAnnotations(outputDir);

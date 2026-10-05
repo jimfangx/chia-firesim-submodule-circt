@@ -25,10 +25,12 @@ struct ControlMMIOWidget {
 // annotations are consumed/produced, no IR or analyses are mutated. The result
 // borrows widgetName; leave it unchanged on failure. Registration order is
 // supplied by the caller, independently of module or metadata row order.
+// Default MCR direction is In (adapter). Specify Out to inspect a standalone
+// register bank before its adapter is assembled; the exact type still applies.
 mlir::LogicalResult deriveControlMMIOWidget(circt::firrtl::CircuitOp circuit,
     llvm::StringRef widgetName, llvm::StringRef mcrModule,
     llvm::ArrayRef<llvm::StringRef> registerModules, ControlMMIOWidget &widget,
-    std::string &error);
+    std::string &error, circt::firrtl::Direction mcrDirection = circt::firrtl::Direction::In);
 // Widget.memRegionSize / HasWidgets.addrMap: round the 32-bit control bank's
 // byte size up to a power of two (or use customSize), stable-sort by decreasing
 // size, then assign contiguous regions from zero. Input order is widget

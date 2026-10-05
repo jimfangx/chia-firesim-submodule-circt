@@ -1,10 +1,14 @@
 // See LICENSE for license details.
 // Port Master.scala and Widget.gen{RO,WO}Reg through typed FIRRTL operations.
-// Input invariants: uninstantiated post-control-tracker top, host clock/reset,
-// and retained annotations. The decoded MCR bank is the adapter boundary.
+// Materialization requires a free bank symbol; it leaves the circuit identity,
+// top ports and annotations unchanged so allocation can inspect the actual IR.
+// Attachment requires that standalone bank, an uninstantiated post-control-
+// tracker top, host clock/reset, and retained annotations. The decoded MCR bank
+// is the adapter boundary. All validation precedes mutation in either phase.
 // Annotations consumed/produced: none; retained top-port targets transfer.
 // Analyses required/preserved: none.
-// IR mutations: create the bank and a wrapper; copy ports and transfer targets.
+// IR mutations: materialize the bank; later attach it once through a wrapper,
+// copy ports and transfer targets. The combined API retains atomic preflight.
 // Output invariants: five registers, synchronous reset for four; all three
 // slots are ReadWrite, as Widget.attach defaults, regardless of genRO/WO name.
 #include "goldengate/SimulationMaster.h"
@@ -13,25 +17,31 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addSimulationMasterBank(CircuitOp circuit,
-                                                std::string &error) {
-  constexpr llvm::StringLiteral bankName = "GGSimulationMasterBank";
-  constexpr llvm::StringLiteral wrapperName = "GGSimulationMasterWrapper";
+namespace {
+constexpr llvm::StringLiteral bankName = "GGSimulationMasterBank";
+constexpr llvm::StringLiteral wrapperName = "GGSimulationMasterWrapper";
+BundleType masterMCRType(MLIRContext *ctx) {
+  OpBuilder b(ctx);
+  auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, uint(1)},
+      {b.getStringAttr("valid"), false, uint(1)}, {b.getStringAttr("bits"), false, uint(32)}});
+  auto words = FVectorType::get(token, 3);
+  return BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+}
+LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
+    std::optional<unsigned> &clock, std::optional<unsigned> &reset, std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGControlWriteTrackerWrapper")
     return reject("SimulationMaster bank requires the control write tracker wrapper");
-  FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
+    if (m.getName() == wrapperName)
       return reject("SimulationMaster module already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!inner || !raw) return reject("SimulationMaster bank needs a top and retained annotations");
-  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
-  auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
-  auto bit = uint(1);
-  std::optional<unsigned> clock, reset;
+  auto bit = UIntType::get(circuit.getContext(), 1, false);
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
     if (p.name == "simulationMaster_mcr") return reject("SimulationMaster MCR port already exists");
     if (p.name == "hostClock" && isa<ClockType>(p.type) && p.direction == Direction::In) clock = i;
@@ -43,11 +53,21 @@ LogicalResult goldengate::addSimulationMasterBank(CircuitOp circuit,
   circuit.walk([&](InstanceOp i) { instantiated |= i.getModuleName() == inner.getName(); });
   if (instantiated) return reject("SimulationMaster bank requires an uninstantiated top");
 
-  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
-      {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, uint(32)}});
-  auto words = FVectorType::get(token, 3);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::materializeSimulationMasterBank(CircuitOp circuit,
+    FModuleOp &result, std::string &error) {
+  for (auto module : circuit.getOps<FModuleLike>())
+    if (module.getName() == bankName) {
+      error = "SimulationMaster bank module already exists";
+      return failure();
+    }
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
+  auto bit = uint(1);
+  auto mcr = masterMCRType(ctx);
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
       {b.getStringAttr("reset"), bit, Direction::In},
@@ -97,6 +117,33 @@ LogicalResult goldengate::addSimulationMasterBank(CircuitOp circuit,
   }
   // wstrb is intentionally ignored: these Scala bindReg paths write full words.
 
+  result = bank;
+  return success();
+}
+
+LogicalResult goldengate::attachSimulationMasterBank(CircuitOp circuit,
+    FModuleOp bank, std::string &error) {
+  FModuleOp inner;
+  std::optional<unsigned> clock, reset;
+  if (failed(attachmentTop(circuit, inner, clock, reset, error))) return failure();
+  auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
+  if (!bank || bank->getParentOp() != circuit.getOperation() || bank.getName() != bankName)
+    return reject("SimulationMaster attachment requires its materialized bank in this circuit");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto mcr = masterMCRType(ctx);
+  auto bankPorts = bank.getPorts();
+  if (bankPorts.size() != 3 || bankPorts[0].name != "clock" ||
+      bankPorts[0].type != ClockType::get(ctx) || bankPorts[0].direction != Direction::In ||
+      bankPorts[1].name != "reset" || bankPorts[1].type != UIntType::get(ctx, 1, false) ||
+      bankPorts[1].direction != Direction::In || bankPorts[2].name != "mcr" ||
+      bankPorts[2].type != mcr || bankPorts[2].direction != Direction::Out)
+    return reject("SimulationMaster attachment requires exact clock/reset and three-word MCR ports");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+  if (used) return reject("SimulationMaster attachment requires an uninstantiated bank");
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
+
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
     copied.push_back(i); ports.push_back(p);
@@ -136,4 +183,15 @@ LogicalResult goldengate::addSimulationMasterBank(CircuitOp circuit,
   };
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+LogicalResult goldengate::addSimulationMasterBank(CircuitOp circuit,
+                                                std::string &error) {
+  FModuleOp inner, bank;
+  std::optional<unsigned> clock, reset;
+  // Preserve the combined API's atomic failure contract: validate the top
+  // before materialization, whose only additional precondition is a free name.
+  if (failed(attachmentTop(circuit, inner, clock, reset, error)) ||
+      failed(materializeSimulationMasterBank(circuit, bank, error))) return failure();
+  return attachSimulationMasterBank(circuit, bank, error);
 }
