@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // CIRCT implementation of junctions/ReorderQueue.scala's small-tag storage.
-// Required input invariants: U250 twelve-port, twelve-bit tag tracker; dequeue
+// Required input invariants: one to 63 decoded slaves, twelve-bit tags; dequeue
 // valid means accepted B or accepted final R, as wired by the owning wrapper.
 // Annotations consumed/produced: none. Analyses required: none.
 // IR mutations: create a tracker module with storage and NastiRouter retirement
@@ -9,10 +9,13 @@
 // disabled during reset; assertions do not change storage or handshake behavior.
 #include "goldengate/ControlTransactionTracker.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <map>
 using namespace mlir;
 using namespace circt::firrtl;
-llvm::SmallVector<PortInfo> goldengate::controlTransactionTrackerPorts(MLIRContext *ctx) {
+llvm::SmallVector<PortInfo> goldengate::controlTransactionTrackerPorts(MLIRContext *ctx, unsigned slaveCount) {
+  if (!slaveCount || slaveCount > 63) return {};
+  const unsigned routeWidth = llvm::Log2_64_Ceil(slaveCount + 1);
   OpBuilder b(ctx); std::map<std::string, unsigned> hpIndex;
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   SmallVector<PortInfo> hp;
@@ -21,26 +24,29 @@ llvm::SmallVector<PortInfo> goldengate::controlTransactionTrackerPorts(MLIRConte
   };
   port("clock", ClockType::get(ctx), Direction::In); port("reset", uint(1), Direction::In);
   port("enq_valid", uint(1), Direction::In); port("enq_bits_tag", uint(12), Direction::In);
-  port("enq_bits_data", uint(4), Direction::In); port("enq_ready", uint(1), Direction::Out);
-  for (unsigned i = 0; i < 12; ++i) {
+  port("enq_bits_data", uint(routeWidth), Direction::In); port("enq_ready", uint(1), Direction::Out);
+  for (unsigned i = 0; i < slaveCount + 1; ++i) {
     std::string p = "deq_" + std::to_string(i) + "_";
     port(p + "valid", uint(1), Direction::In); port(p + "tag", uint(12), Direction::In);
-    port(p + "data", uint(4), Direction::Out); port(p + "matches", uint(1), Direction::Out);
+    port(p + "data", uint(routeWidth), Direction::Out); port(p + "matches", uint(1), Direction::Out);
   }
   return hp;
 }
 FModuleOp goldengate::createControlTransactionTracker(CircuitOp circuit, llvm::StringRef name,
-                                                     llvm::StringRef queueName) {
+                                                     llvm::StringRef queueName, unsigned slaveCount) {
+  if (!slaveCount || slaveCount > 63) return {};
+  const unsigned routeWidth = llvm::Log2_64_Ceil(slaveCount + 1);
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
-  auto hp = controlTransactionTrackerPorts(ctx); std::map<std::string, unsigned> hpIndex;
+  auto hp = controlTransactionTrackerPorts(ctx, slaveCount); std::map<std::string, unsigned> hpIndex;
   for (auto [i, p] : llvm::enumerate(hp)) hpIndex[p.name.getValue().str()] = i;
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto helper = b.create<FModuleOp>(loc, b.getStringAttr(name),
       ConventionAttr::get(ctx, Convention::Internal), hp);
   helper->setAttr("goldengate.trackerSlots", b.getI32IntegerAttr(64));
   helper->setAttr("goldengate.trackerTagWidth", b.getI32IntegerAttr(12));
-  helper->setAttr("goldengate.trackerDequeuePorts", b.getI32IntegerAttr(12));
+  helper->setAttr("goldengate.trackerDequeuePorts", b.getI32IntegerAttr(slaveCount + 1));
+  helper->setAttr("goldengate.trackerRouteWidth", b.getI32IntegerAttr(routeWidth));
   b.setInsertionPointToStart(helper.getBodyBlock());
   auto arg = [&](llvm::StringRef n) { return helper.getBodyBlock()->getArgument(hpIndex.at(n.str())); };
   auto constant = [&](unsigned w, uint64_t n) -> Value { return b.create<ConstantOp>(loc, uint(w), APInt(w, n)); };
@@ -54,7 +60,7 @@ FModuleOp goldengate::createControlTransactionTracker(CircuitOp circuit, llvm::S
   SmallVector<Value> data, tags, free;
   for (unsigned i = 0; i < 64; ++i) {
     std::string n = std::to_string(i);
-    data.push_back(b.create<RegOp>(loc, uint(4), arg("clock"), "roq_data_" + n).getResult());
+    data.push_back(b.create<RegOp>(loc, uint(routeWidth), arg("clock"), "roq_data_" + n).getResult());
     tags.push_back(b.create<RegOp>(loc, uint(6), arg("clock"), "roq_tags_" + n).getResult());
     free.push_back(b.create<RegResetOp>(loc, uint(1), arg("clock"), arg("reset"), constant(1, 1), "roq_free_" + n).getResult());
   }
@@ -76,10 +82,10 @@ FModuleOp goldengate::createControlTransactionTracker(CircuitOp circuit, llvm::S
   connect(arg("enq_ready"), enqReady);
   SmallVector<Value> deqIndex;
   Value assertionEnable = invert(arg("reset"));
-  for (unsigned i = 0; i < 12; ++i) {
+  for (unsigned i = 0; i < slaveCount + 1; ++i) {
     std::string p = "deq_" + std::to_string(i) + "_";
     Value index = low(arg(p + "tag")); deqIndex.push_back(index);
-    connect(arg(p + "data"), select(index, data, 4));
+    connect(arg(p + "data"), select(index, data, routeWidth));
     Value matches = both(invert(select(index, free, 1)),
         b.create<EQPrimOp>(loc, select(index, tags, 6), high(arg(p + "tag"))));
     connect(arg(p + "matches"), matches);
@@ -93,7 +99,7 @@ FModuleOp goldengate::createControlTransactionTracker(CircuitOp circuit, llvm::S
   for (unsigned i = 0; i < 64; ++i) {
     Value put = both(push, b.create<EQPrimOp>(loc, enqIndex, constant(6, i)));
     Value retire = constant(1, 0);
-    for (unsigned j = 0; j < 12; ++j)
+    for (unsigned j = 0; j < slaveCount + 1; ++j)
       retire = either(retire, both(arg("deq_" + std::to_string(j) + "_valid"),
           b.create<EQPrimOp>(loc, deqIndex[j], constant(6, i))));
     connect(data[i], mux(put, arg("enq_bits_data"), data[i]));
