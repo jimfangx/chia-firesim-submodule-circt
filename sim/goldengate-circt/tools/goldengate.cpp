@@ -33,6 +33,7 @@
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/PrintStubs.h"
 #include "goldengate/PrintWiring.h"
+#include "goldengate/PrintBridgePayload.h"
 #include "goldengate/GlobalResetWiring.h"
 #include "goldengate/HostClockWiring.h"
 #include "goldengate/BridgeAnalysis.h"
@@ -255,8 +256,12 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
   // boundary; PrintBridge host stream synthesis is a separate porting step.
-  bool updatePrintBridgeClocks =
-      argc == 7 && llvm::StringRef(argv[6]) == "--update-print-bridge-clocks";
+  bool materializePrintPayloads =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-payloads";
+  bool materializePrintConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-payload-constructors";
+  bool updatePrintBridgeClocks = materializePrintPayloads ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--update-print-bridge-clocks");
   bool wirePrintReset = updatePrintBridgeClocks ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-print-reset");
   bool completePrintSynthesis = wirePrintReset ||
@@ -285,7 +290,7 @@ int main(int argc, char **argv) {
        !promoteGroundBridges && !promoteAggregateBridges &&
        !resolveDontTouch && !lowerTypes && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
-       !synthesizePrintStubs && !disableAutoCounter && !compileBaseline) ||
+       !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
       llvm::StringRef(argv[4]) != "--output-dir") {
     llvm::errs() << "usage: goldengate-circt input.fir --annotation-file "
@@ -308,6 +313,7 @@ int main(int argc, char **argv) {
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
                     "--wire-print-stubs | --complete-print-synthesis | "
                     "--wire-print-reset | --update-print-bridge-clocks | "
+                    "--materialize-print-payloads | --materialize-print-payload-constructors | "
                     "--wire-autocounter-print-stubs | "
                     "--analyze-autocounter-print-clocks | "
                     "--complete-autocounter-print-wiring | "
@@ -384,6 +390,76 @@ int main(int argc, char **argv) {
   if (!circuit)
     return fail("input did not produce a firrtl.circuit");
   const std::string originalTargetName = circuit.getName().str();
+
+  auto emitPrintPayloadBoundary = [&]() -> int {
+    std::string error;
+    llvm::SmallVector<FModuleOp> payloads;
+    if (failed(goldengate::materializePrintBridgePayloads(circuit, payloads, error)))
+      return fail("PrintBridge payload materialization: " + error);
+    if (failed(mlir::verify(*module)))
+      return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
+    llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
+    llvm::sys::path::append(irPath, "post-print-payloads.mlir");
+    llvm::sys::path::append(firPath, "post-print-payloads.fir");
+    llvm::sys::path::append(summaryPath, "print-payloads.json");
+    std::error_code ec;
+    llvm::raw_fd_ostream ir(irPath, ec);
+    if (ec) return fail("cannot write print payload IR: " + ec.message());
+    module->print(ir); ir << '\n';
+    llvm::raw_fd_ostream fir(firPath, ec);
+    if (ec) return fail("cannot write print payload FIRRTL: " + ec.message());
+    // Export just the combinational boundary. The target may contain CIRCT
+    // operations (e.g. multibit_mux) that the FIRRTL text exporter cannot
+    // represent; the complete candidate remains in the MLIR artifact above.
+    mlir::OwningOpRef<mlir::ModuleOp> payloadIR = mlir::ModuleOp::create(circuit.getLoc());
+    mlir::OpBuilder payloadBuilder(&context);
+    payloadBuilder.setInsertionPointToStart(payloadIR->getBody());
+    auto payloadCircuit = payloadBuilder.create<CircuitOp>(circuit.getLoc(),
+        payloadBuilder.getStringAttr(payloads.empty()
+            ? "GGPrintBridgePayloads" : payloads.front().getName()));
+    payloadBuilder.setInsertionPointToStart(payloadCircuit.getBodyBlock());
+    if (payloads.empty())
+      payloadBuilder.create<FModuleOp>(circuit.getLoc(),
+          payloadBuilder.getStringAttr("GGPrintBridgePayloads"),
+          ConventionAttr::get(&context, Convention::Internal), llvm::ArrayRef<PortInfo>{});
+    for (auto payload : payloads) payloadBuilder.insert(payload->clone());
+    if (failed(mlir::verify(*payloadIR)) ||
+        failed(exportFIRFile(*payloadIR, fir, std::nullopt, exportFIRVersion)))
+      return fail("cannot export print payload FIRRTL");
+    llvm::json::Array summary;
+    for (auto payload : payloads) {
+      auto layout = payload->getAttrOfType<DictionaryAttr>("goldengate.printPayload");
+      llvm::json::Object object{{"module", payload.getName().str()}};
+      for (auto field : layout) {
+        auto name = field.getName().getValue();
+        if (auto value = dyn_cast<StringAttr>(field.getValue()))
+          object[name] = value.getValue().str();
+        else if (auto value = dyn_cast<IntegerAttr>(field.getValue()))
+          object[name] = value.getInt();
+      }
+      llvm::json::Array records;
+      for (auto attr : layout.getAs<ArrayAttr>("records")) {
+        auto record = cast<DictionaryAttr>(attr);
+        llvm::json::Array widths;
+        for (auto width : record.getAs<ArrayAttr>("argumentWidths"))
+          widths.push_back(cast<IntegerAttr>(width).getInt());
+        records.push_back(llvm::json::Object{
+            {"name", record.getAs<StringAttr>("name").getValue().str()},
+            {"format", record.getAs<StringAttr>("format").getValue().str()},
+            {"offset", record.getAs<IntegerAttr>("offset").getInt()},
+            {"width", record.getAs<IntegerAttr>("width").getInt()},
+            {"argumentWidths", std::move(widths)}});
+      }
+      object["records"] = std::move(records);
+      summary.push_back(std::move(object));
+    }
+    llvm::raw_fd_ostream metadata(summaryPath, ec);
+    if (ec) return fail("cannot write print payload summary: " + ec.message());
+    metadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
+    llvm::outs() << "Materialized " << payloads.size() << " PrintBridge combinational payload modules\n";
+    return 0;
+  };
+  if (materializePrintConstructors) return emitPrintPayloadBoundary();
 
   if (disableAutoCounter || compileBaseline) {
     std::string error;
@@ -3450,7 +3526,7 @@ int main(int argc, char **argv) {
         }
       }
     }
-    return 0;
+    return materializePrintPayloads ? emitPrintPayloadBoundary() : 0;
   };
   if (synthesizePrintStubs) {
     std::string error;
