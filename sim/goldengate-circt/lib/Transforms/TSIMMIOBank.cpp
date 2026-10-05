@@ -3,38 +3,56 @@
 // All nine words are attached ReadWrite. Status samples each host cycle, with
 // writes overriding samples. Pulses clear next cycle unless written again.
 // Only pulse registers have host reset; target reset belongs to the queues.
+// Materialization requires a free bank symbol and preserves circuit identity,
+// top ports and retained annotations. Attachment requires the uninstantiated
+// bank with exact six ports and the uninstantiated TSI word-queue top with host
+// clock/reset, queue and scheduler ports. All preflight precedes IR mutation.
+// No annotation classes consumed/produced; copied top-port targets transfer.
+// No analyses required/preserved. Create FIRRTL bank operations, then attach
+// exactly once through a wrapper. Combined API retains atomic failure behavior.
 #include "goldengate/TSIMMIOBank.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addTSIMMIOBank(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral bankName = "GGTSIMMIOBank";
-  constexpr llvm::StringLiteral wrapperName = "GGTSIMMIOWrapper";
-  constexpr llvm::StringLiteral controlName = "tsiBridge_mcr";
+namespace {
+constexpr llvm::StringLiteral bankName = "GGTSIMMIOBank";
+constexpr llvm::StringLiteral wrapperName = "GGTSIMMIOWrapper";
+constexpr llvm::StringLiteral controlName = "tsiBridge_mcr";
+SmallVector<PortInfo> tsiBankPorts(MLIRContext *ctx) {
+  OpBuilder b(ctx);
+  auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
+  auto bit = uint(1);
+  auto wordToken = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
+      {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, uint(32)}});
+  auto control = BundleType::get(ctx, {{b.getStringAttr("step_size"), true, uint(32)},
+      {b.getStringAttr("start"), true, bit}, {b.getStringAttr("done"), false, bit}});
+  auto words = FVectorType::get(wordToken, 9);
+  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  return {{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+      {b.getStringAttr("reset"), bit, Direction::In},
+      {b.getStringAttr("inBuf"), wordToken, Direction::Out},
+      {b.getStringAttr("outBuf"), wordToken, Direction::In},
+      {b.getStringAttr("control"), control, Direction::In},
+      {b.getStringAttr("mcr"), mcr, Direction::Out}};
+}
+LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
+    std::optional<unsigned> &clock, std::optional<unsigned> &reset,
+    std::optional<unsigned> &input, std::optional<unsigned> &output,
+    std::optional<unsigned> &scheduler, std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGTSIWordQueuesWrapper")
     return reject("TSI MMIO requires the active TSI word queue wrapper");
-  FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
-      return reject("TSI MMIO module or wrapper already exists");
+    if (m.getName() == wrapperName) return reject("TSI MMIO wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
   }
-  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!inner || !raw) return reject("TSI MMIO needs a top and retained annotations");
-  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
-  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
-  auto bit = uint(1);
-  auto token = [&](FIRRTLBaseType payload) {
-    return BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
-        {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
-  };
-  auto wordToken = token(uint(32));
-  auto control = BundleType::get(ctx, {{b.getStringAttr("step_size"), true, uint(32)},
-      {b.getStringAttr("start"), true, bit}, {b.getStringAttr("done"), false, bit}});
-  std::optional<unsigned> clock, reset, input, output, scheduler;
+  if (!inner || !circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    return reject("TSI MMIO needs a top and retained annotations");
+  auto ports = tsiBankPorts(circuit.getContext());
+  auto bit = ports[1].type, wordToken = ports[2].type, control = ports[4].type;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
     if (p.name == controlName) return reject("TSI decoded MCR port already exists");
     if (p.name == "hostClock" && isa<ClockType>(p.type) && p.direction == Direction::In) clock = i;
@@ -49,17 +67,22 @@ LogicalResult goldengate::addTSIMMIOBank(CircuitOp circuit, std::string &error) 
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("TSI MMIO needs an uninstantiated top");
 
-  // Validate the complete boundary before introducing hardware.
-  auto words = FVectorType::get(token(uint(32)), 9);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::materializeTSIMMIOBank(CircuitOp circuit,
+    FModuleOp &result, std::string &error) {
+  for (auto module : circuit.getOps<FModuleLike>())
+    if (module.getName() == bankName) {
+      error = "TSI MMIO bank module already exists";
+      return failure();
+    }
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1);
+  auto bankPorts = tsiBankPorts(ctx);
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-      {b.getStringAttr("reset"), bit, Direction::In},
-      {b.getStringAttr("inBuf"), wordToken, Direction::Out},
-      {b.getStringAttr("outBuf"), wordToken, Direction::In},
-      {b.getStringAttr("control"), control, Direction::In},
-      {b.getStringAttr("mcr"), mcr, Direction::Out}};
   auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName),
       ConventionAttr::get(ctx, Convention::Internal), bankPorts);
   const llvm::StringRef names[]{"in_bits", "in_valid", "in_ready", "out_bits", "out_valid", "out_ready",
@@ -98,6 +121,34 @@ LogicalResult goldengate::addTSIMMIOBank(CircuitOp circuit, std::string &error) 
   connect(field(arg(2), "bits"), values[0]); connect(field(arg(2), "valid"), values[1]);
   connect(field(arg(3), "ready"), values[5]);
   connect(field(arg(4), "step_size"), values[6]); connect(field(arg(4), "start"), values[8]);
+
+  result = bank;
+  return success();
+}
+
+LogicalResult goldengate::attachTSIMMIOBank(CircuitOp circuit,
+    FModuleOp bank, std::string &error) {
+  FModuleOp inner;
+  std::optional<unsigned> clock, reset, input, output, scheduler;
+  if (failed(attachmentTop(circuit, inner, clock, reset, input, output, scheduler, error)))
+    return failure();
+  auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
+  if (!bank || bank->getParentOp() != circuit.getOperation() || bank.getName() != bankName)
+    return reject("TSI MMIO attachment requires its materialized bank in this circuit");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto expected = tsiBankPorts(ctx);
+  auto actual = bank.getPorts();
+  if (actual.size() != expected.size()) return reject("TSI MMIO bank needs exactly six ports");
+  for (auto [i, port] : llvm::enumerate(actual))
+    if (port.name != expected[i].name || port.type != expected[i].type ||
+        port.direction != expected[i].direction)
+      return reject("TSI MMIO bank ports differ from the queue/scheduler/nine-word MCR boundary");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+  if (used) return reject("TSI MMIO attachment requires an uninstantiated bank");
+  auto mcr = expected[5].type;
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (i != *input && i != *output && i != *scheduler) {
@@ -142,4 +193,13 @@ LogicalResult goldengate::addTSIMMIOBank(CircuitOp circuit, std::string &error) 
   };
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+LogicalResult goldengate::addTSIMMIOBank(CircuitOp circuit, std::string &error) {
+  FModuleOp inner, bank;
+  std::optional<unsigned> clock, reset, input, output, scheduler;
+  // Preflight the top before constructing a bank to preserve atomic rejection.
+  if (failed(attachmentTop(circuit, inner, clock, reset, input, output, scheduler, error)) ||
+      failed(materializeTSIMMIOBank(circuit, bank, error))) return failure();
+  return attachTSIMMIOBank(circuit, bank, error);
 }

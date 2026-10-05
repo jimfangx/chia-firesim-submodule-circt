@@ -2514,9 +2514,27 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, masterBankAnnotations, error)))
         return fail("SimulationMaster materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT SimulationMaster bank before control allocation in " << masterBankPath << '\n';
+      // Materialize TSI independently of its late queue/scheduler attachment.
+      // Allocation reads the actual nine-word bank and its register registry.
+      FModuleOp tsiMMIOBank;
+      if (failed(goldengate::materializeTSIMMIOBank(circuit, tsiMMIOBank, error)))
+        return fail("TSI MMIO materialization: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("TSI MMIO materialization produced invalid FIRRTL IR");
+      llvm::SmallString<256> tsiBankPath(outputDir), tsiBankAnnotations(outputDir);
+      llvm::sys::path::append(tsiBankPath, "post-fame-tsi-mmio-bank.mlir");
+      llvm::sys::path::append(tsiBankAnnotations, "post-fame-tsi-mmio-bank-all.json");
+      std::error_code tsiBankWriteError;
+      llvm::raw_fd_ostream tsiBankOut(tsiBankPath, tsiBankWriteError);
+      if (tsiBankWriteError)
+        return fail("cannot write TSI MMIO materialization: " + tsiBankWriteError.message());
+      module->print(tsiBankOut); tsiBankOut << '\n'; tsiBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, tsiBankAnnotations, error)))
+        return fail("TSI MMIO materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT TSI MMIO bank before control allocation in " << tsiBankPath << '\n';
       // HasWidgets registration order remains independent of IR module order.
       // Derive each available bank's size from its register registry and check
-      // it against the implemented MCR port. The three banks assembled after
+      // it against the implemented MCR port. The two banks assembled after
       // global dispatch still use explicit declarations until that boundary
       // can be moved ahead of allocation.
       SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
@@ -2545,7 +2563,11 @@ int main(int argc, char **argv) {
       controlWidgets.push_back({"FASEDMemoryTimingModel_0", 21});
       if (failed(appendBank("TracerVBridgeModule_0", "GGTracerVMCRFile", {"GGTracerVTriggerConfig"})))
         return fail("control bank registry: " + error);
-      controlWidgets.push_back({"TSIBridgeModule_0", 9});
+      goldengate::ControlMMIOWidget tsiWidget;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "TSIBridgeModule_0",
+              tsiMMIOBank.getName(), {tsiMMIOBank.getName()}, tsiWidget, error, Direction::Out)))
+        return fail("TSI MMIO register registry: " + error);
+      controlWidgets.push_back(tsiWidget);
       if (failed(appendBank("ClockBridgeModule_0", "GGClockBridgeMCRFile", {"GGSingleClockBridge"})) ||
           failed(appendBank("LoadMemWidget_0", "GGLoadMemMCRFile",
                            {"GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataWrapper",
@@ -2766,7 +2788,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tsiQueuesAnnotations, error)))
         return fail("TSI word queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TSI words in two 16-entry queues in " << tsiQueuesPath << '\n';
-      if (failed(goldengate::addTSIMMIOBank(circuit, error)))
+      if (failed(goldengate::attachTSIMMIOBank(circuit, tsiMMIOBank, error)))
         return fail("TSI MMIO bank: " + error);
       if (failed(mlir::verify(*module))) return fail("TSI MMIO bank produced invalid FIRRTL IR");
       llvm::SmallString<256> tsiMMIOPath(outputDir), tsiMMIOAnnotations(outputDir);
@@ -2781,6 +2803,12 @@ int main(int argc, char **argv) {
       llvm::outs() << "Mapped CIRCT TSI queue and scheduler MMIO registers in " << tsiMMIOPath << '\n';
       if (failed(goldengate::mapTSIBridgeControl(circuit, 25, 12, error)))
         return fail("TSI MCRFile control: " + error);
+      goldengate::ControlMMIOWidget mappedTSI;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "TSIBridgeModule_0",
+              "GGTSIMCRFile", {tsiMMIOBank.getName()}, mappedTSI, error)))
+        return fail("TSI adapter register registry: " + error);
+      if (mappedTSI.registerCount != tsiWidget.registerCount)
+        return fail("TSI adapter word count differs from its allocated register bank");
       if (failed(mlir::verify(*module))) return fail("TSI MCRFile control produced invalid FIRRTL IR");
       llvm::SmallString<256> tsiControlPath(outputDir), tsiControlAnnotations(outputDir);
       llvm::sys::path::append(tsiControlPath, "post-fame-tsi-control.mlir");

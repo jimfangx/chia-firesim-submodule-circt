@@ -1068,7 +1068,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-blockdev-token COMMAND goldengate-blockdev-token-test)
   add_executable(goldengate-tsi-mmio-test
-    test/Transforms/TSIMMIOBankTest.cpp lib/Transforms/TSIMMIOBank.cpp)
+    test/Transforms/TSIMMIOBankTest.cpp lib/Transforms/TSIMMIOBank.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-tsi-mmio-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-tsi-mmio-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-tsi-mmio-test PRIVATE
