@@ -596,10 +596,12 @@ int main(int argc, char **argv) {
             cloneClosure(host);
             auto layout = host->getAttrOfType<DictionaryAttr>("goldengate.printHost");
             llvm::json::Object entry{{"module", host.getName().str()}};
-            for (auto key : {"controlModule", "streamModule", "configModule", "mcrModule", "adapterModule", "bridgeTarget", "resetPortName"})
+            for (auto key : {"controlModule", "streamModule", "configModule", "mcrModule", "adapterModule", "hostModule", "queueModule", "bridgeTarget", "resetPortName"})
               entry[key] = layout.getAs<StringAttr>(key).getValue().str();
-            for (auto key : {"tokenBits", "streamBits", "flushPulseLength", "addressBits", "idBits"})
+            for (auto key : {"tokenBits", "streamBits", "flushPulseLength", "addressBits", "idBits", "queueDepth", "widthBytes", "countBits"})
               entry[key] = layout.getAs<IntegerAttr>(key).getInt();
+            for (auto key : {"synchronousRead", "flow", "pipe"})
+              entry[key] = layout.getAs<BoolAttr>(key).getValue();
             hostSummary.push_back(std::move(entry));
           }
           llvm::raw_fd_ostream hostFir(hostPath, ec);
@@ -609,7 +611,7 @@ int main(int argc, char **argv) {
           llvm::raw_fd_ostream hostMetadata(hostSummaryPath, ec);
           if (ec) return fail("cannot write print host summary: " + ec.message());
           hostMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(hostSummary)));
-          llvm::outs() << "Materialized " << hosts.size() << " PrintBridge local AXI/stream hosts\n";
+          llvm::outs() << "Materialized " << hosts.size() << " PrintBridge local AXI/queued stream hosts\n";
         }
         if (materializePrintStreams) {
           llvm::SmallString<256> streamPath(outputDir), streamAnnosPath(outputDir), streamSummaryPath(outputDir);

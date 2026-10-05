@@ -72,13 +72,22 @@ mlir::LogicalResult materializePrintBridgeStreamAXI(
     unsigned addressBits, unsigned idBits,
     llvm::StringRef wrapperName, llvm::StringRef adapterName,
     circt::firrtl::FModuleOp &host, std::string &error);
-// Compose one control, stream adapter, register bank and local Nasti transport.
-// Stage the complete batch before committing IR. CPU stream queue/allocation
-// and driver collateral are separate; preserve source circuit/annotations.
+// Compose one control, width adapter, register bank, local Nasti transport and
+// outgoing CPU queue. Stage the complete batch before committing IR. Global
+// stream allocation and driver collateral remain separate; retain annotations.
 mlir::LogicalResult materializePrintBridgeHosts(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> controls,
     unsigned addressBits, unsigned idBits,
+    llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
+    std::string &error);
+// Buffer each local PrintBridge host using the shared CPUManagedStreamEngine
+// 6144x512 synchronous queue. Retain circuit/annotation identities and all host
+// ports; append streamCount UInt<13>. Stream index/address allocation is pending.
+// Reject invalid or repeated identities atomically across the complete batch.
+mlir::LogicalResult materializePrintBridgeHostQueues(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
     std::string &error);
 } // namespace goldengate

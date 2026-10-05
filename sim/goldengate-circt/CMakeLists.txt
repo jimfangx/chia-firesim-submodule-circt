@@ -141,6 +141,7 @@ add_executable(goldengate-circt
   lib/Transforms/PeekPokeMMIOBank.cpp
   lib/Transforms/TracerVTokenEngine.cpp
   lib/Transforms/TracerVTriggerConfig.cpp
+  lib/Transforms/CPUStreamQueue.cpp
   lib/Transforms/TracerVStreamQueue.cpp
   lib/Transforms/CPUStreamRead.cpp
   lib/Transforms/CPUStreamCountBank.cpp
@@ -270,6 +271,7 @@ if(BUILD_TESTING)
     lib/Transforms/PrintBridgeStream.cpp
     lib/Transforms/PrintBridgeConfig.cpp
     lib/Transforms/PrintBridgeHost.cpp
+    lib/Transforms/CPUStreamQueue.cpp
     lib/Transforms/ClockBridgeControl.cpp)
   target_compile_features(goldengate-print-host-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-host-test PRIVATE -fno-rtti)
@@ -525,6 +527,7 @@ if(BUILD_TESTING)
     test/Support/CPUManagedStreamHeaderTest.cpp
     lib/Support/CPUManagedStreamHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
     lib/Support/AnnotationEmission.cpp
+    lib/Transforms/CPUStreamQueue.cpp
     lib/Transforms/TracerVStreamQueue.cpp lib/Transforms/CPUStreamRead.cpp
     lib/Transforms/CPUStreamCountBank.cpp lib/Transforms/EmptyCPUStreamWrite.cpp)
   target_compile_features(goldengate-cpu-managed-stream-header-test PRIVATE cxx_std_17)
@@ -543,6 +546,7 @@ if(BUILD_TESTING)
     lib/Support/SimulationMasterHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
     lib/Support/AnnotationEmission.cpp lib/Support/TargetUtils.cpp
     lib/Transforms/TracerVTokenEngine.cpp lib/Transforms/TracerVTriggerConfig.cpp
+    lib/Transforms/CPUStreamQueue.cpp
     lib/Transforms/TracerVStreamQueue.cpp lib/Transforms/CPUStreamRead.cpp)
   target_compile_features(goldengate-tracerv-header-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-tracerv-header-test PRIVATE -fno-rtti)
@@ -1437,6 +1441,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-tracerv-token COMMAND goldengate-tracerv-token-test)
   add_executable(goldengate-tracerv-stream-queue-test
     test/Transforms/TracerVStreamQueueTest.cpp
+    lib/Transforms/CPUStreamQueue.cpp
     lib/Transforms/TracerVStreamQueue.cpp)
   target_compile_features(goldengate-tracerv-stream-queue-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-tracerv-stream-queue-test PRIVATE -fno-rtti)

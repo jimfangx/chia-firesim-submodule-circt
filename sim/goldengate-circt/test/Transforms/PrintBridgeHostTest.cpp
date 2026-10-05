@@ -52,6 +52,8 @@ struct Fixture {
         firrtl.module @GGPrintBridgeStreamConfig() {}
         firrtl.module @GGPrintBridgeMCRFile() {}
         firrtl.module @GGPrintBridgeHostMCRFile() {}
+        firrtl.module @GGPrintBridgeHostQueued() {}
+        firrtl.module @GGPrintBridgeCPUQueue6144() {}
       }
     })mlir", &context);
     require(bool(root), "host fixture parse failed");
@@ -108,8 +110,67 @@ void checkHosts(MLIRContext &context, unsigned bits) {
       "currentCycle", "enable", "streamReady", "streamValid", "streamData", "ctrl"};
   const char *registerNames[] = {"startCycleL", "startCycleH", "endCycleL", "endCycleH", "doneInit", "flushNarrowPacket"};
   for (unsigned n = 0; n < hosts.size(); ++n) {
-    auto host = hosts[n]; auto info = host->getAttrOfType<DictionaryAttr>("goldengate.printHost");
-    require(info && host.isPublic() && host.getNumPorts() == 12, "host metadata/interface missing");
+    auto buffered = hosts[n]; auto info = buffered->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+    require(info && buffered.isPublic() && buffered.getNumPorts() == 13, "buffered host metadata/interface missing");
+    auto host = named(f.circuit, info.getAs<StringAttr>("hostModule").getValue());
+    auto queue = named(f.circuit, info.getAs<StringAttr>("queueModule").getValue());
+    require(host.isPublic() && host.getNumPorts() == 12 && host != buffered,
+        "queue lost original unbuffered host");
+    require(buffered.getName() != "GGPrintBridgeHostQueued" && queue.getName() != "GGPrintBridgeCPUQueue6144",
+        "buffered host/queue failed reserved-name collision");
+    for (auto item : host->getAttrOfType<DictionaryAttr>("goldengate.printHost"))
+      require(info.get(item.getName()) == item.getValue(), "queue changed original host metadata");
+    require(info.getAs<IntegerAttr>("queueDepth").getInt() == 6144 &&
+        info.getAs<IntegerAttr>("widthBytes").getInt() == 64 &&
+        info.getAs<IntegerAttr>("countBits").getInt() == 13 &&
+        info.getAs<BoolAttr>("synchronousRead").getValue() &&
+        !info.getAs<BoolAttr>("flow").getValue() && !info.getAs<BoolAttr>("pipe").getValue() &&
+        !info.get("streamIndex") && !info.get("streamName"), "queue allocated global stream or wrong policy");
+    require(queue->getAttrOfType<DictionaryAttr>("goldengate.printCPUQueue") == info,
+        "queue RAM intent lost buffered host identity/collateral");
+    require(buffered.getPortName(12) == "streamCount" &&
+        buffered.getPortType(12) == UIntType::get(&context, 13) &&
+        buffered.getPortDirection(12) == Direction::Out, "queue count boundary mismatch");
+    for (unsigned p = 0; p < 12; ++p)
+      require(buffered.getPortName(p) == host.getPortName(p) &&
+          buffered.getPortType(p) == host.getPortType(p) &&
+          buffered.getPortDirection(p) == host.getPortDirection(p), "queue changed copied host interface");
+    auto original = instanceOf(buffered, host), fifo = instanceOf(buffered, queue);
+    auto bufferedDrivers = drivers(buffered);
+    for (unsigned p = 0; p < 12; ++p) {
+      if (p >= 8 && p <= 10) continue;
+      Value outer = buffered.getArgument(p), inner = original.getResult(p);
+      require(bufferedDrivers.lookup(host.getPortDirection(p) == Direction::In ? inner : outer) ==
+          (host.getPortDirection(p) == Direction::In ? outer : inner), "buffered copied host connection");
+    }
+    auto field = [&](Value value, StringRef name) -> Value {
+      for (auto f : buffered.getOps<SubfieldOp>())
+        if (f.getInput() == value && f.getFieldName() == name) return f.getResult();
+      throw std::runtime_error("missing queue stream field " + name.str());
+    };
+    require(bufferedDrivers.lookup(fifo.getResult(0)) == buffered.getArgument(0) &&
+        bufferedDrivers.lookup(fifo.getResult(1)) == buffered.getArgument(1) &&
+        bufferedDrivers.lookup(original.getResult(8)) == field(fifo.getResult(2), "ready") &&
+        bufferedDrivers.lookup(field(fifo.getResult(2), "valid")) == original.getResult(9) &&
+        bufferedDrivers.lookup(field(fifo.getResult(2), "bits")) == original.getResult(10) &&
+        bufferedDrivers.lookup(field(fifo.getResult(3), "ready")) == buffered.getArgument(8) &&
+        bufferedDrivers.lookup(buffered.getArgument(9)) == field(fifo.getResult(3), "valid") &&
+        bufferedDrivers.lookup(buffered.getArgument(10)) == field(fifo.getResult(3), "bits") &&
+        bufferedDrivers.lookup(buffered.getArgument(12)) == fifo.getResult(4), "queue clock/reset/stream/count wiring");
+    require(std::distance(queue.getOps<MemOp>().begin(), queue.getOps<MemOp>().end()) == 1,
+        "queue needs exactly one RAM");
+    auto ram = *queue.getOps<MemOp>().begin();
+    require(ram.getDepth() == 6144 && ram.getDataType() == UIntType::get(&context, 512) &&
+        ram.getReadLatency() == 0 && ram.getWriteLatency() == 1 && ram.getRuw() == RUWAttr::Undefined &&
+        ram.getNumResults() == 2 && ram.getPortKind(size_t(0)) == MemOp::PortKind::Read &&
+        ram.getPortKind(size_t(1)) == MemOp::PortKind::Write &&
+        ram->getAttrOfType<StringAttr>("goldengate.ramStyle").getValue() == "ULTRA", "buffer RAM geometry/intent");
+    require(std::distance(queue.getOps<RegResetOp>().begin(), queue.getOps<RegResetOp>().end()) == 3 &&
+        std::distance(queue.getOps<RegOp>().begin(), queue.getOps<RegOp>().end()) == 1,
+        "queue reset/lookahead policy");
+    auto readAddress = *queue.getOps<RegOp>().begin();
+    require(readAddress.getName() == "ram_read_addr" && readAddress.getResult().getType() == UIntType::get(&context, 13),
+        "queue needs unreset synchronous-lookahead address");
     for (auto field : f.controls[n]->getAttrOfType<DictionaryAttr>("goldengate.printControl"))
       require(info.get(field.getName()) == field.getValue(), "host changed constructor/control identity");
     require(info.getAs<StringAttr>("controlModule").getValue() == f.controls[n].getName() &&
@@ -154,11 +215,12 @@ void checkHosts(MLIRContext &context, unsigned bits) {
     require(sd.lookup(ci.getResult(5)) == ai.getResult(6) && sd.lookup(ai.getResult(2)) == ci.getResult(13) &&
         sd.lookup(ai.getResult(3)) == ci.getResult(14), "stream feedback/token wiring");
     std::map<std::string, unsigned> reachable; std::set<std::string> path;
-    countInstances(f.circuit, host, reachable, path);
+    countInstances(f.circuit, buffered, reachable, path);
     require(reachable[f.controls[n].getName().str()] == 1 && reachable[f.stages[n].getName().str()] == 1 &&
         reachable[f.payloads[n].getName().str()] == 1 && reachable[bank.getName().str()] == 1 &&
         reachable[stream.getName().str()] == 1 && reachable[adapter.getName().str()] == 1 &&
-        reachable[transport.getName().str()] == 1 && reachable.size() == 7, "composed host duplicates stateful control/payload/stage");
+        reachable[transport.getName().str()] == 1 && reachable[host.getName().str()] == 1 &&
+        reachable[queue.getName().str()] == 1 && reachable.size() == 9, "composed host duplicates stateful control/payload/stage");
     require(!reachable.count(f.controls[1-n].getName().str()), "host crossed reset/domain identity");
     unsigned counters = 0;
     for (auto [moduleName, count] : reachable) for (auto r : named(f.circuit, moduleName).getOps<RegResetOp>())
@@ -228,6 +290,83 @@ void checkRejections(MLIRContext &context) {
       hosts.empty() && dump(*empty.root) == before, "empty host transaction not a no-op");
 }
 
+SmallVector<FModuleOp> freshUnbufferedHosts(MLIRContext &context, Fixture &f) {
+  SmallVector<FModuleOp> streams, banks, hosts; std::string error; OpBuilder b(&context);
+  require(succeeded(goldengate::materializePrintBridgeStreams(f.circuit, f.controls, streams, error)), error);
+  require(succeeded(goldengate::materializePrintBridgeStreamConfigs(f.circuit, streams, banks, error)), error);
+  for (auto [n, bank] : llvm::enumerate(banks)) {
+    auto hostName = "RawPrintHost" + std::to_string(n);
+    auto mcrName = "RawPrintMCR" + std::to_string(n);
+    FModuleOp host;
+    require(succeeded(goldengate::materializePrintBridgeStreamAXI(
+        f.circuit, bank, 25, 12, hostName, mcrName, host, error)), error);
+    NamedAttrList metadata(bank->getAttrOfType<DictionaryAttr>("goldengate.printStreamConfig"));
+    metadata.set("configModule", b.getStringAttr(bank.getName()));
+    metadata.set("mcrModule", b.getStringAttr(mcrName));
+    metadata.set("addressBits", b.getI64IntegerAttr(25)); metadata.set("idBits", b.getI64IntegerAttr(12));
+    host->setAttr("goldengate.printHost", metadata.getDictionary(&context));
+    hosts.push_back(host);
+  }
+  return hosts;
+}
+
+void checkQueueRejections(MLIRContext &context) {
+  for (unsigned bad = 0; bad < 24; ++bad) {
+    Fixture f(context), foreign(context, 8, 1); OpBuilder b(&context);
+    auto hosts = freshUnbufferedHosts(context, f), foreignHosts = freshUnbufferedHosts(context, foreign);
+    auto h = hosts[1];
+    auto metadata = [&](StringRef key, Attribute value) {
+      NamedAttrList fields(h->getAttrOfType<DictionaryAttr>("goldengate.printHost"));
+      if (value) fields.set(key, value); else fields.erase(key);
+      h->setAttr("goldengate.printHost", fields.getDictionary(&context));
+    };
+    if (bad == 0) hosts[1] = {};
+    if (bad == 1) hosts[1] = foreignHosts[0];
+    if (bad == 2) h->removeAttr("goldengate.printHost");
+    if (bad == 3) metadata("bridgeTarget", {});
+    if (bad == 4) metadata("bridgeTarget", b.getI64IntegerAttr(1));
+    if (bad == 5) metadata("resetPortName", b.getStringAttr(""));
+    if (bad == 6) metadata("tokenBits", b.getI64IntegerAttr(12));
+    if (bad == 7) metadata("streamBits", b.getI64IntegerAttr(256));
+    if (bad == 8) metadata("addressBits", b.getI64IntegerAttr(4));
+    if (bad == 9) metadata("idBits", b.getI64IntegerAttr(0));
+    if (bad == 10) hosts[1] = hosts[0];
+    if (bad == 11) metadata("resetPortName", b.getStringAttr("reset0"));
+    if (bad == 12 || bad == 13) {
+      SmallVector<Attribute> names(h.getPortNames().begin(), h.getPortNames().end());
+      names[bad == 12 ? 10 : 7] = b.getStringAttr(bad == 12 ? "wrongStream" : "streamCount");
+      h.setPortNames(names);
+    }
+    if (bad >= 14 && bad <= 18) {
+      unsigned p = bad == 14 ? 10 : bad == 15 ? 3 : bad == 16 ? 0 : bad == 17 ? 6 : 11;
+      SmallVector<Attribute> types(h.getPortTypes().begin(), h.getPortTypes().end());
+      types[p] = TypeAttr::get(UIntType::get(&context, 1)); h.setPortTypes(types);
+    }
+    if (bad == 19) f.circuit->removeAttr("rawAnnotations");
+    if (bad == 20) f.circuit->setAttr("rawAnnotations", b.getStringAttr("malformed"));
+    if (bad == 21) metadata("queueModule", b.getStringAttr("priorQueue"));
+    if (bad == 22) {
+      SmallVector<FModuleOp> queued; std::string error;
+      require(succeeded(goldengate::materializePrintBridgeHostQueues(f.circuit, hosts, queued, error)), error);
+      hosts = queued;
+    }
+    if (bad == 23) {
+      SmallVector<FModuleOp> queued; std::string error;
+      require(succeeded(goldengate::materializePrintBridgeHostQueues(f.circuit, {hosts[1]}, queued, error)), error);
+    }
+    auto before = dump(*f.root), other = dump(*foreign.root);
+    SmallVector<FModuleOp> queued{*f.circuit.getOps<FModuleOp>().begin()}; std::string error;
+    require(failed(goldengate::materializePrintBridgeHostQueues(f.circuit, hosts, queued, error)),
+        "accepted invalid later queue host " + std::to_string(bad));
+    require(!error.empty() && queued.size() == 1 && dump(*f.root) == before && dump(*foreign.root) == other,
+        "queue rejection changed live circuit/output or foreign domain " + std::to_string(bad));
+  }
+  Fixture empty(context, 8, 0); auto before = dump(*empty.root);
+  SmallVector<FModuleOp> queued; std::string error;
+  require(succeeded(goldengate::materializePrintBridgeHostQueues(empty.circuit, {}, queued, error)) &&
+      queued.empty() && dump(*empty.root) == before, "empty queue batch not a no-op");
+}
+
 void checkStreamBankRejections(MLIRContext &context) {
   for (unsigned bad = 0; bad < 8; ++bad) {
     Fixture f(context); OpBuilder b(&context); SmallVector<FModuleOp> streams;
@@ -257,8 +396,8 @@ int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     for (unsigned bits : {8, 512, 1024}) checkHosts(context, bits);
-    checkRejections(context); checkStreamBankRejections(context);
-    llvm::outs() << "PASS PrintBridge host composition, shared flush/state, and atomic staging\n"; return 0;
+    checkRejections(context); checkQueueRejections(context); checkStreamBankRejections(context);
+    llvm::outs() << "PASS PrintBridge buffered host composition, shared flush/state/RAM, and atomic staging\n"; return 0;
   } catch (const std::exception &error) {
     llvm::errs() << "FAIL: " << error.what() << "\n"; return 1;
   }
