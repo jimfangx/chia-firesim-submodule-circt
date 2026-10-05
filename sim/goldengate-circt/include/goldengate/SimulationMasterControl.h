@@ -4,20 +4,20 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
+// Bind each widget's AW/W/AR requests and B/R responses to the slave selected
+// by its unique name in the ordered 1..63-region decoder catalog. Validate
+// all row identities and nonoverlapping 25-bit bounds before IR mutation.
+// AXI widths remain those of the supported U250 control interface. Copied
+// targets transfer to the wrapper; internalized targets retain inner identity.
 mlir::LogicalResult bindSimulationMasterControl(circt::firrtl::CircuitOp circuit,
                                               std::string &error);
-// Bind TSI AW/W/AR requests and B/R responses to the recorded control slave 3.
 mlir::LogicalResult bindTSIBridgeControl(circt::firrtl::CircuitOp circuit,
                                        std::string &error);
-// Bind BlockDev AW/W/AR requests and B/R responses to control slave 0,
-// allocated at [0x0, 0x80) in the recorded U250 widget catalog.
 mlir::LogicalResult bindBlockDevBridgeControl(circt::firrtl::CircuitOp circuit,
                                             std::string &error);
-// Bind FASED AW/W/AR requests and B/R responses to control slave 1,
-// allocated at [0x80, 0x100) in the recorded U250 widget catalog.
 mlir::LogicalResult bindFASEDBridgeControl(circt::firrtl::CircuitOp circuit,
                                          std::string &error);
-// Assemble the host control master after all eleven widgets are bound.
+// Assemble the host control master after the widget controls are bound.
 mlir::LogicalResult bindControlMaster(circt::firrtl::CircuitOp circuit,
                                     std::string &error);
 }

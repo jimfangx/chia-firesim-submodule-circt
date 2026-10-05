@@ -1,13 +1,16 @@
 // See LICENSE for license details.
-// Input: uninstantiated widget MCRFile wrapper and the recorded U250 catalog.
-// Widget.scala attaches SimulationMaster/TSI/BlockDev/FASED at indices 8/3/0/1.
+// Requires: uninstantiated widget MCRFile wrapper, exact U250 Nasti ports,
+// retained annotations and an ordered, unique 1..63-region decoder catalog.
+// Widget.scala zips sortedWidgets with the interconnect slaves. Resolve the
+// widget by catalog name: adding a larger bank can move its slot and address.
 // Consume AW/W/AR dispatch and B/R arbiter boundaries using FIRRTL operations.
 // The existing arbiters already retire tracker entries on accepted responses;
 // their ready signals, not response valid alone, return to the MCRFile.
 // Retained annotations: copied ports transfer; consumed targets stay in inner.
 // Output: internally connected widget slave; other unported slaves stay explicit.
-// All catalog, identity, type and direction checks precede mutation. No analyses
-// or annotation classes are consumed; retained targets follow wrapper identity.
+// All catalog, identity, type and direction checks precede mutation. Analyses
+// required: none. Produces: resolved slave attribute; no annotation classes
+// are consumed or produced. Retained targets follow wrapper identity.
 // These bindings add no state and preserve host clock/reset and tracker wiring.
 #include "goldengate/SimulationMasterControl.h"
 #include "mlir/IR/Builders.h"
@@ -20,13 +23,10 @@ using namespace circt::firrtl;
 namespace {
 struct WidgetBinding {
   llvm::StringRef inputName, wrapperName, controlPort, catalogName, slaveAttr;
-  unsigned slaveIndex;
-  uint64_t start, size;
 };
 LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
                                 std::string &error) {
   auto wrapperName = spec.wrapperName;
-  const std::string index = std::to_string(spec.slaveIndex);
   auto reject = [&](llvm::StringRef s) { error = spec.catalogName.str()+": "+s.str(); return failure(); };
   if (circuit.getName() != spec.inputName)
     return reject("widget binding requires its MCRFile wrapper");
@@ -38,16 +38,46 @@ LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
-  if (!inner || !raw || !regions || regions.size() != 11)
-    return reject("widget binding needs retained annotations and eleven regions");
-  auto row = dyn_cast<DictionaryAttr>(regions[spec.slaveIndex]);
-  auto name = row ? row.getAs<StringAttr>("name") : StringAttr();
-  auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr();
-  auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr();
-  auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr();
-  if (!name || name != spec.catalogName || !slave || slave.getInt() != spec.slaveIndex ||
-      !start || start.getInt() != spec.start || !size || size.getInt() != spec.size)
-    return reject("widget allocation differs from the recorded U250 catalog");
+  if (!inner || !raw || !regions || regions.empty() || regions.size() > 63)
+    return reject("widget binding needs retained annotations and one to 63 regions");
+  // Validate the whole decoder contract before selecting a slave or mutating
+  // IR. Bounds match addControlAddressDecode's half-open 25-bit byte ranges;
+  // this binding does not independently reallocate or resize register banks.
+  constexpr uint64_t addressLimit = uint64_t(1) << 25;
+  std::set<std::string> names;
+  SmallVector<std::pair<uint64_t, uint64_t>> ranges;
+  unsigned slaveIndex = regions.size();
+  auto bounded = [](IntegerAttr attr, uint64_t limit) {
+    return attr && !attr.getValue().isNegative() &&
+           attr.getValue().getActiveBits() <= 64 &&
+           attr.getValue().getZExtValue() < limit;
+  };
+  for (auto [i, attr] : llvm::enumerate(regions)) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr();
+    auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr();
+    auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr();
+    auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr();
+    if (!name || name.getValue().empty() ||
+        !names.insert(name.getValue().str()).second ||
+        !bounded(slave, regions.size()) || slave.getValue().getZExtValue() != i)
+      return reject("widget binding requires unique names and ordered slave indices");
+    if (!bounded(start, addressLimit) || !bounded(size, addressLimit + 1))
+      return reject("widget binding region bounds are invalid");
+    uint64_t begin = start.getValue().getZExtValue();
+    uint64_t length = size.getValue().getZExtValue();
+    if (!length || length > addressLimit - begin)
+      return reject("widget binding region exceeds the control address space");
+    uint64_t end = begin + length;
+    for (auto [priorBegin, priorEnd] : ranges)
+      if (begin < priorEnd && priorBegin < end)
+        return reject("widget binding regions overlap");
+    ranges.emplace_back(begin, end);
+    if (name.getValue() == spec.catalogName) slaveIndex = i;
+  }
+  if (slaveIndex == regions.size())
+    return reject("widget is missing from the control decoder catalog");
+  const std::string index = std::to_string(slaveIndex);
   bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("widget binding requires an uninstantiated top");
@@ -110,7 +140,7 @@ LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
   }
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper = b.create<FModuleOp>(loc,b.getStringAttr(wrapperName),inner.getConventionAttr(),ports);
-  wrapper->setAttr(spec.slaveAttr,b.getI32IntegerAttr(spec.slaveIndex));
+  wrapper->setAttr(spec.slaveAttr,b.getI32IntegerAttr(slaveIndex));
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc,inner,"sim");
   auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc,v,n); };
@@ -165,49 +195,46 @@ LogicalResult goldengate::bindSimulationMasterControl(CircuitOp circuit,
   return bindWidgetControl(circuit,
       {"GGSimulationMasterControlWrapper", "GGSimulationMasterBoundWrapper",
        "simulationMaster_ctrl", "SimulationMaster_0",
-       "goldengate.simulationMasterSlave", 8, 0x220, 0x10}, error);
+       "goldengate.simulationMasterSlave"}, error);
 }
 
 LogicalResult goldengate::bindTSIBridgeControl(CircuitOp circuit,
                                               std::string &error) {
   return bindWidgetControl(circuit,
       {"GGTSIBridgeControlWrapper", "GGTSIBridgeBoundWrapper",
-       "tsiBridge_ctrl", "TSIBridgeModule_0", "goldengate.tsiSlave",
-       3, 0x140, 0x40}, error);
+       "tsiBridge_ctrl", "TSIBridgeModule_0", "goldengate.tsiSlave"}, error);
 }
 
 // Requires: uninstantiated GGBlockDevBridgeControlWrapper, exact Nasti and
-// dispatcher/arbiter ports, and the eleven-region U250 control catalog.
-// Consumes: BlockDev control and slave-0 dispatch/response boundary ports;
+// dispatcher/arbiter ports, and the validated control decoder catalog.
+// Consumes: BlockDev control and its catalog-selected slave boundary ports;
 // no annotation classes are consumed or produced. Copied targets transfer,
 // while targets of internalized ports retain the inner module identity.
 // Mutates: adds a stateless FIRRTL wrapper connecting all five AXI channels.
 // Analyses required: none. Preserves: inner state, clocks, channels, constructor
 // metadata and existing tracker retirement through arbiter ready signals.
-// Output: internally bound slave 0 at [0, 128); other boundaries remain explicit.
+// Output: internally bound catalog-selected slave; other boundaries stay explicit.
 LogicalResult goldengate::bindBlockDevBridgeControl(CircuitOp circuit,
                                                   std::string &error) {
   return bindWidgetControl(circuit,
       {"GGBlockDevBridgeControlWrapper", "GGBlockDevBridgeBoundWrapper",
-       "blockdevBridge_ctrl", "BlockDevBridgeModule_0", "goldengate.blockdevSlave",
-       0, 0x0, 0x80}, error);
+       "blockdevBridge_ctrl", "BlockDevBridgeModule_0", "goldengate.blockdevSlave"}, error);
 }
 
 // Requires: uninstantiated GGFASEDBridgeControlWrapper, exact Nasti and
-// dispatcher/arbiter ports, and the eleven-region U250 control catalog.
-// Consumes: FASED control and slave-1 dispatch/response boundary ports.
+// dispatcher/arbiter ports, and the validated control decoder catalog.
+// Consumes: FASED control and its catalog-selected slave boundary ports.
 // No annotation classes are consumed or produced. Copied targets transfer;
 // targets of internalized ports retain their inner module identity.
 // Mutates: adds a stateless FIRRTL wrapper connecting all five AXI channels.
 // Analyses required: none. Preserves: inner timing state, host clocks/reset,
 // channels, constructor metadata and tracker retirement on accepted responses.
-// Output: internally bound slave 1 at [128, 256); other boundaries stay explicit.
+// Output: internally bound catalog-selected slave; other boundaries stay explicit.
 LogicalResult goldengate::bindFASEDBridgeControl(CircuitOp circuit,
                                                std::string &error) {
   return bindWidgetControl(circuit,
       {"GGFASEDBridgeControlWrapper", "GGFASEDBridgeBoundWrapper",
-       "fasedBridge_ctrl", "FASEDMemoryTimingModel_0", "goldengate.fasedSlave",
-       1, 0x80, 0x80}, error);
+       "fasedBridge_ctrl", "FASEDMemoryTimingModel_0", "goldengate.fasedSlave"}, error);
 }
 
 // Requires: uninstantiated GGFASEDBridgeBoundWrapper and exact U250 master

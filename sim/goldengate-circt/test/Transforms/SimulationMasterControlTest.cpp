@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <functional>
 #include <map>
+#include <set>
 #include <stdexcept>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -23,12 +24,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef n) {
 struct BindingSpec {
   std::string stem, widget, input, catalogName, slaveAttr;
   unsigned slave, words;
-  uint64_t start, size;
   LogicalResult (*mapControl)(CircuitOp, unsigned, unsigned, std::string &);
   LogicalResult (*bindControl)(CircuitOp, std::string &);
 };
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
-                            unsigned bad = 0) {
+                            unsigned bad = 0, unsigned count = 11) {
   const auto &stem = spec.stem;
   const auto &widget = spec.widget;
   const std::string slot = std::to_string(spec.slave);
@@ -77,13 +77,37 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
   c->setAttr("rawAnnotations",b.getArrayAttr({})); std::string error;
   require(succeeded(spec.mapControl(c,25,12,error)),error);
   SmallVector<Attribute> rows;
-  for (unsigned i = 0; i < 11; ++i) rows.push_back(b.getDictionaryAttr({
-    b.getNamedAttr("name",b.getStringAttr(i == spec.slave ? spec.catalogName : "Other")),
-    b.getNamedAttr("slave",b.getI32IntegerAttr(i)),b.getNamedAttr("start",b.getI64IntegerAttr(spec.start+(bad == 4 ? 0x10 : 0))),
-    b.getNamedAttr("size",b.getI64IntegerAttr(spec.size))}));
+  // Moving a widget and changing its base/region size must still select the
+  // matching decoder slot. Distinct rows also exercise whole-catalog checks.
+  // Large catalogs end exactly at 2^25, a legal half-open decoder endpoint.
+  const uint64_t base = count >= 31 ? (uint64_t(1)<<25)-count*0x80 : 0x1000;
+  for (unsigned i = 0; i < (bad == 32 ? 64 : count); ++i) rows.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("name",b.getStringAttr(i == spec.slave ? spec.catalogName : "Other_"+std::to_string(i))),
+    b.getNamedAttr("slave",b.getI32IntegerAttr(i)),
+    b.getNamedAttr("start",b.getI64IntegerAttr(base+i*0x80)),
+    b.getNamedAttr("size",b.getI64IntegerAttr(0x80))}));
   auto decoder = named(c,"GGControlAddressDecode");
-  if (bad == 12) rows.pop_back();
+  if (bad == 12) rows.clear();
   if (bad == 14) rows[spec.slave] = b.getStringAttr("malformed row");
+  if (bad == 4 || (bad >= 24 && bad <= 36 && bad != 32)) {
+    unsigned other = (spec.slave+1)%count;
+    unsigned selected = bad == 24 || bad == 25 || bad == 26 || bad == 28 || bad == 31 ? other : spec.slave;
+    NamedAttrList row(cast<DictionaryAttr>(rows[selected]));
+    if (bad == 4) row.set("start",b.getI64IntegerAttr((1<<25)-0x40));
+    if (bad == 24) row.set("name",b.getStringAttr(spec.catalogName));
+    if (bad == 25) row.set("slave",b.getI32IntegerAttr(spec.slave));
+    if (bad == 26) row.set("start",b.getI64IntegerAttr(0x1000+spec.slave*0x80));
+    if (bad == 27) row.set("name",b.getStringAttr("MissingWidget"));
+    if (bad == 28) row.set("name",b.getStringAttr(""));
+    if (bad == 29) row.set("start",b.getI64IntegerAttr(-1));
+    if (bad == 30) row.set("size",b.getI64IntegerAttr(0));
+    if (bad == 31) row.erase("size");
+    if (bad == 33) row.set("start",b.getIntegerAttr(b.getIntegerType(128),APInt(128,1).shl(100)));
+    if (bad == 34) row.set("start",b.getI64IntegerAttr(1<<25));
+    if (bad == 35) row.set("slave",b.getI64IntegerAttr(-1));
+    if (bad == 36) row.set("size",b.getI64IntegerAttr((1<<25)+1));
+    rows[selected] = row.getDictionary(&ctx);
+  }
   if (bad >= 15 && bad <= 21) {
     NamedAttrList row(cast<DictionaryAttr>(rows[spec.slave]));
     if (bad == 15) row.erase("name");
@@ -93,7 +117,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
     if (bad == 18) row.erase("slave");
     if (bad == 19) row.erase("start");
     if (bad == 20) row.erase("size");
-    if (bad == 21) row.set("size",b.getI64IntegerAttr(1));
+    if (bad == 21) row.set("size",b.getI64IntegerAttr(-1));
     rows[spec.slave] = row.getDictionary(&ctx);
   }
   decoder->setAttr("goldengate.controlRegions",bad == 13 ? Attribute(b.getStringAttr("malformed catalog")) : Attribute(b.getArrayAttr(rows)));
@@ -110,19 +134,22 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
   if (bad == 10) { b.setInsertionPointToEnd(c.getBodyBlock()); b.create<FModuleOp>(c.getLoc(),b.getStringAttr(stem+"BoundWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{}); }
   return root;
 }
-void test(MLIRContext &ctx, const BindingSpec &spec) {
+void test(MLIRContext &ctx, const BindingSpec &spec, unsigned count = 11,
+          bool rejections = true) {
   const auto &stem = spec.stem;
   const std::string slot = std::to_string(spec.slave);
   const auto &widget = spec.widget;
   auto bind = spec.bindControl;
-  auto root = fixture(ctx,spec); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  auto before = named(c,stem+"ControlWrapper"); auto count = before.getNumPorts();
+  auto root = fixture(ctx,spec,0,count); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto catalog = named(c,"GGControlAddressDecode")->getAttr("goldengate.controlRegions");
+  auto before = named(c,stem+"ControlWrapper"); auto portCount = before.getNumPorts();
   require(succeeded(bind(c,error)),error);
   require(succeeded(verify(*root)),"bound IR invalid");
   auto top = named(c,stem+"BoundWrapper");
-  require(top.getNumPorts()+23 == count,"not all slave boundaries consumed");
+  require(top.getNumPorts()+23 == portCount,"not all slave boundaries consumed");
   require(top->getAttrOfType<IntegerAttr>(spec.slaveAttr).getInt()==spec.slave,"wrong slave identity");
   require(c.getName()==stem+"BoundWrapper","top identity not updated");
+  require(named(c,"GGControlAddressDecode")->getAttr("goldengate.controlRegions")==catalog,"decoder catalog mutated");
   InstanceOp sim = *top.getOps<InstanceOp>().begin();
   require(sim.getModuleName()==before.getName() && sim.getName()=="sim","inner instance identity lost");
   std::function<std::string(Value)> key = [&](Value v) -> std::string {
@@ -187,30 +214,44 @@ void test(MLIRContext &ctx, const BindingSpec &spec) {
   }
   auto good = dump(*root);
   require(failed(bind(c,error)) && good == dump(*root),"repeat mutated IR");
-  for (unsigned bad = 1; bad <= 23; ++bad) {
+  for (unsigned bad = 1; rejections && bad <= 36; ++bad) {
     auto root = fixture(ctx,spec,bad); auto c = *root->getOps<CircuitOp>().begin(); auto s = dump(*root);
     require(failed(bind(c,error)),"invalid contract accepted: "+std::to_string(bad));
     require(s == dump(*root),"rejection mutated IR");
   }
-  llvm::outs()<<widget<<" control: slave "<<slot<<", all 32 scalar and aggregate AR bindings, copied metadata, target transfer, 24 atomic rejections passed\n";
+  llvm::outs()<<widget<<" control: "<<count<<" regions, slave "<<slot
+    <<", all 32 scalar and aggregate AR bindings, copied metadata, target transfer"
+    <<(rejections ? ", 37 atomic rejections" : "")<<" passed\n";
 }
 }
 int main() {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
   const BindingSpec specs[]{
     {"GGSimulationMaster", "simulationMaster", "GGSimulationMasterWrapper",
-     "SimulationMaster_0", "goldengate.simulationMasterSlave", 8, 3, 0x220, 0x10,
+     "SimulationMaster_0", "goldengate.simulationMasterSlave", 8, 3,
      goldengate::mapSimulationMasterControl, goldengate::bindSimulationMasterControl},
     {"GGTSIBridge", "tsiBridge", "GGTSIMMIOWrapper",
-     "TSIBridgeModule_0", "goldengate.tsiSlave", 3, 9, 0x140, 0x40,
+     "TSIBridgeModule_0", "goldengate.tsiSlave", 3, 9,
      goldengate::mapTSIBridgeControl, goldengate::bindTSIBridgeControl},
     {"GGBlockDevBridge", "blockdevBridge", "GGBlockDevMMIOWrapper",
-     "BlockDevBridgeModule_0", "goldengate.blockdevSlave", 0, 26, 0, 0x80,
+     "BlockDevBridgeModule_0", "goldengate.blockdevSlave", 0, 26,
      goldengate::mapBlockDevBridgeControl, goldengate::bindBlockDevBridgeControl},
     {"GGFASEDBridge", "fasedBridge", "GGFASEDMMIOWrapper",
-     "FASEDMemoryTimingModel_0", "goldengate.fasedSlave", 1, 21, 0x80, 0x80,
+     "FASEDMemoryTimingModel_0", "goldengate.fasedSlave", 1, 21,
      goldengate::mapFASEDBridgeControl, goldengate::bindFASEDBridgeControl}
   };
-  try { for (const auto &spec : specs) test(ctx,spec); return 0; }
+  try {
+    unsigned cases = 0;
+    for (const auto &spec : specs) {
+      test(ctx,spec); ++cases;
+      for (unsigned count : {1u,2u,3u,11u,13u,31u,63u})
+        for (unsigned slot : std::set<unsigned>{0,count/2,count-1}) {
+          auto shifted = spec; shifted.slave = slot;
+          test(ctx,shifted,count,false); ++cases;
+        }
+    }
+    llvm::outs()<<cases<<" widget catalog bindings and 148 atomic rejections passed\n";
+    return 0;
+  }
   catch (const std::exception &e) { llvm::errs()<<e.what()<<'\n'; return 1; }
 }
