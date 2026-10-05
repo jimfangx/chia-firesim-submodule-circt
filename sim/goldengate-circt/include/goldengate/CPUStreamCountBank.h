@@ -6,8 +6,9 @@
 #include <string>
 namespace goldengate {
 // Ordered queue occupancy outputs of the active simulator top. Stream ordering
-// is supplied by the stream allocator: sink streams precede source streams in
-// CPUManagedStreamEngine's MCRFile. Counts remain live during read backpressure.
+// is supplied by the stream allocator: CPUManagedStreamEngine elaborates source
+// counts before sink counts (its constructor serializes sink descriptors first).
+// Counts remain live during read backpressure.
 struct CPUStreamCountPort {
   std::string streamName;
   std::string portName;
