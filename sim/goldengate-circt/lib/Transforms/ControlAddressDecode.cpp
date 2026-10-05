@@ -5,10 +5,76 @@
 #include "goldengate/ControlAddressDecode.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
+#include "llvm/ADT/StringSet.h"
+#include <set>
 #include <algorithm>
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
+
+LogicalResult goldengate::deriveControlMMIOWidget(CircuitOp circuit,
+    StringRef widgetName, StringRef mcrModule, ArrayRef<StringRef> registerModules,
+    ControlMMIOWidget &widget, std::string &error) {
+  auto reject = [&](StringRef why) {
+    error = "control widget '" + widgetName.str() + "': " + why.str();
+    return failure();
+  };
+  if (widgetName.empty() || mcrModule.empty() || registerModules.empty())
+    return reject("requires widget, MCRFile and register module identities");
+  auto find = [&](StringRef name) -> FModuleOp {
+    for (auto module : circuit.getOps<FModuleOp>())
+      if (module.getName() == name) return module;
+    return {};
+  };
+  llvm::StringSet<> modules, names;
+  std::set<uint64_t> offsets;
+  for (auto name : registerModules) {
+    if (name.empty() || !modules.insert(name).second)
+      return reject("register module identities must be nonempty and unique");
+    auto module = find(name);
+    auto rows = module ? module->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters") : ArrayAttr();
+    if (!rows || rows.empty()) return reject("register module or nonempty registry is missing");
+    for (auto attr : rows) {
+      auto row = dyn_cast<DictionaryAttr>(attr);
+      auto label = row ? row.getAs<StringAttr>("name") : StringAttr();
+      auto offset = row ? row.getAs<IntegerAttr>("offset") : IntegerAttr();
+      auto read = row ? row.getAs<BoolAttr>("readable") : BoolAttr();
+      auto write = row ? row.getAs<BoolAttr>("writeable") : BoolAttr();
+      if (!label || label.getValue().empty() || !names.insert(label.getValue()).second ||
+          !offset || offset.getValue().getBitWidth() > 64 || offset.getValue().isNegative() ||
+          offset.getValue().getZExtValue() % 4 || !read || !write ||
+          (!read.getValue() && !write.getValue()))
+        return reject("registry needs unique names, aligned nonnegative offsets and permissions");
+      if (!offsets.insert(offset.getValue().getZExtValue()).second)
+        return reject("register offsets overlap");
+    }
+  }
+  uint64_t count = offsets.size();
+  if (*offsets.begin() != 0 || *offsets.rbegin() / 4 != count - 1)
+    return reject("register registry has missing words");
+  // Validate the implemented MCR bank, not just the collateral registry. This
+  // catches a stale schema before it can change global region/slave allocation.
+  auto adapter = find(mcrModule);
+  if (!adapter) return reject("MCRFile module is missing");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx);
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, uint(1)},
+      {b.getStringAttr("valid"), false, uint(1)},
+      {b.getStringAttr("bits"), false, uint(32)}});
+  auto lanes = FVectorType::get(token, count);
+  auto expected = BundleType::get(ctx, {{b.getStringAttr("read"), false, lanes},
+      {b.getStringAttr("write"), true, lanes},
+      {b.getStringAttr("wstrb"), true, uint(4)}});
+  unsigned matched = 0;
+  for (auto port : adapter.getPorts()) if (port.name == "mcr") {
+    if (port.direction != Direction::In || port.type != expected)
+      return reject("MCRFile lanes differ from the register registry");
+    ++matched;
+  }
+  if (matched != 1) return reject("requires exactly one MCRFile bank port");
+  widget = {widgetName, count};
+  return success();
+}
 
 LogicalResult goldengate::allocateControlMMIORegions(unsigned addressBits,
     ArrayRef<ControlMMIOWidget> widgets,

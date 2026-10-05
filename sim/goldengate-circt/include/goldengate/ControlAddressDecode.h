@@ -18,6 +18,17 @@ struct ControlMMIOWidget {
   uint64_t registerCount;
   std::optional<uint64_t> customSize = std::nullopt;
 };
+// Read an already materialized widget's register registry from the named
+// FIRRTL modules (possibly sparse fragments, as for LoadMem). Requires unique
+// names, contiguous four-byte offsets and permissions, and an MCRFile whose
+// read/write vectors have exactly the registry's UInt32 token count. No
+// annotations are consumed/produced, no IR or analyses are mutated. The result
+// borrows widgetName; leave it unchanged on failure. Registration order is
+// supplied by the caller, independently of module or metadata row order.
+mlir::LogicalResult deriveControlMMIOWidget(circt::firrtl::CircuitOp circuit,
+    llvm::StringRef widgetName, llvm::StringRef mcrModule,
+    llvm::ArrayRef<llvm::StringRef> registerModules, ControlMMIOWidget &widget,
+    std::string &error);
 // Widget.memRegionSize / HasWidgets.addrMap: round the 32-bit control bank's
 // byte size up to a power of two (or use customSize), stable-sort by decreasing
 // size, then assign contiguous regions from zero. Input order is widget

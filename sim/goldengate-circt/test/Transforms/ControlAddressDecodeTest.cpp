@@ -208,6 +208,91 @@ void allocation(MLIRContext &context) {
         result[0].start == 123 && result[0].size == 456, "failed allocation changed output");
   }
 }
+// Build a live CIRCT registry split across two sparse fragments. Deliberately
+// reverse row and module order: allocation must follow widget registration,
+// while register identity comes from offsets rather than visitation order.
+void registry(MLIRContext &context) {
+  const unsigned counts[]{1, 2, 3, 7, 8, 9, 15, 16, 17, 31, 32, 33, 63};
+  auto setup = [&](CircuitOp c, unsigned count, unsigned fault) {
+    OpBuilder b(&context); b.setInsertionPointToEnd(c.getBodyBlock());
+    auto uint = [&](unsigned width) { return UIntType::get(&context, width); };
+    auto token = BundleType::get(&context, {{b.getStringAttr("ready"), true, uint(1)},
+        {b.getStringAttr("valid"), false, uint(1)},
+        {b.getStringAttr("bits"), false, uint(fault == 13 ? 64 : 32)}});
+    auto lanes = FVectorType::get(token, count + (fault == 14));
+    auto mcr = BundleType::get(&context, {{b.getStringAttr("read"), false, lanes},
+        {b.getStringAttr("write"), fault != 15, lanes},
+        {b.getStringAttr("wstrb"), true, uint(fault == 16 ? 8 : 4)}});
+    SmallVector<PortInfo> ports{{b.getStringAttr(fault == 17 ? "wrong" : "mcr"), mcr,
+        fault == 18 ? Direction::Out : Direction::In}};
+    if (fault != 19) b.create<FModuleOp>(c.getLoc(), b.getStringAttr("Adapter"),
+        ConventionAttr::get(&context, Convention::Internal), ports);
+    for (unsigned fragment = 0; fragment < (count == 1 ? 1u : 2u); ++fragment) {
+      auto bank = b.create<FModuleOp>(c.getLoc(), b.getStringAttr(fragment ? "Odd" : "Even"),
+          ConventionAttr::get(&context, Convention::Internal), ArrayRef<PortInfo>{});
+      SmallVector<Attribute> rows;
+      for (unsigned j = count; j-- > 0;) if (j % 2 == fragment) {
+        unsigned offset = 4 * j;
+        if (j == 0 && fault == 0) offset = 1;
+        if (j == 0 && fault == 1) offset = 4;
+        if (j == count - 1 && fault == 2) offset += 4;
+        auto row = b.getDictionaryAttr({
+            b.getNamedAttr("name", b.getStringAttr(j == 0 && fault == 3 ? "word1" :
+                j == 0 && fault == 4 ? "" : "word" + std::to_string(j))),
+            b.getNamedAttr("offset", b.getI64IntegerAttr(j == 0 && fault == 5 ? -4 : int64_t(offset))),
+            b.getNamedAttr("readable", b.getBoolAttr(fault != 6)),
+            b.getNamedAttr("writeable", b.getBoolAttr(false))});
+        NamedAttrList attrs(row);
+        if (j == 0 && fault == 7) attrs.erase("name");
+        if (j == 0 && fault == 8) attrs.erase("offset");
+        if (j == 0 && fault == 9) attrs.erase("readable");
+        if (j == 0 && fault == 10) attrs.erase("writeable");
+        rows.push_back(j == 0 && fault == 11 ? Attribute(b.getStringAttr("bad")) :
+            Attribute(attrs.getDictionary(&context)));
+      }
+      if (!(fault == 12 && fragment == 0))
+        bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+    }
+  };
+  auto printed = [](ModuleOp root) {
+    std::string text; llvm::raw_string_ostream out(text); root.print(out); return text;
+  };
+  for (auto count : counts) {
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin();
+    setup(c, count, 99);
+    auto before = printed(*root);
+    SmallVector<llvm::StringRef> modules = count == 1 ? SmallVector<llvm::StringRef>{"Even"} :
+        SmallVector<llvm::StringRef>{"Odd", "Even"};
+    goldengate::ControlMMIOWidget widget{"sentinel", 999, 8}; std::string error;
+    require(succeeded(goldengate::deriveControlMMIOWidget(c, "stream", "Adapter", modules, widget, error)), error);
+    require(widget.name == "stream" && widget.registerCount == count && !widget.customSize,
+        "live registry count or identity differs");
+    require(printed(*root) == before, "registry query mutated IR");
+    // A growing stream bank moves ahead of its peer when rounded size grows.
+    // At equal sizes it stays first, preserving registration order.
+    const goldengate::ControlMMIOWidget widgets[]{widget, {"peer", 3}};
+    SmallVector<goldengate::ControlMMIORegion> regions;
+    require(succeeded(goldengate::allocateControlMMIORegions(12, widgets, regions, error)), error);
+    auto index = count <= 2 ? 1u : 0u;
+    uint64_t bytes = 4; while (bytes < 4 * count) bytes *= 2;
+    require(regions[index].name == "stream" && regions[index].size == bytes &&
+        regions[index].start == (index ? 16 : 0), "derived growth/tie allocation differs");
+  }
+  for (unsigned fault = 0; fault < 25; ++fault) {
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); setup(c, 9, fault);
+    SmallVector<llvm::StringRef> modules{"Odd", "Even"};
+    if (fault == 20) modules.push_back("Even");
+    if (fault == 21) modules[0] = "Missing";
+    if (fault == 22) modules[0] = "";
+    if (fault == 23) modules.clear();
+    auto before = printed(*root); std::string error;
+    goldengate::ControlMMIOWidget widget{"sentinel", 999, 8};
+    require(failed(goldengate::deriveControlMMIOWidget(c, fault == 24 ? "" : "stream",
+        "Adapter", modules, widget, error)) && !error.empty(), "bad live registry accepted");
+    require(widget.name == "sentinel" && widget.registerCount == 999 && widget.customSize == 8 &&
+        printed(*root) == before, "failed registry query changed output or IR");
+  }
+}
 void mapping(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addControlAddressDecode(c, 25, regions, error)), error);
@@ -270,14 +355,14 @@ void rejection(MLIRContext &context) {
 }
 int main() {
   try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    allocation(context);
+    allocation(context); registry(context);
     // Nonzero base, holes, unsorted slave indices, and the full address-space
     // endpoint exercise the generic API independently of the U250 catalog.
     const goldengate::ControlMMIORegion sparse[]{{"high", 100, 10}, {"low", 4, 4}};
     const goldengate::ControlMMIORegion full[]{{"all", 0, uint64_t(1) << 63}};
     checkMap(context, 8, sparse); checkMap(context, 63, full);
     mapping(context); rejection(context);
-    llvm::outs() << "Control decoder: " << samples << " address pairs; baseline/Print/custom allocations, catalog, wiring, targets, 12 allocation and 15 IR atomic rejections passed\n";
+    llvm::outs() << "Control decoder: " << samples << " address pairs; baseline/Print/custom allocations, catalog, wiring, targets, 13 live registry/growth cases, 25 registry, 12 allocation and 15 IR atomic rejections passed\n";
   } catch (const std::exception &error) { llvm::errs() << error.what() << '\n'; return 1; }
   return 0;
 }

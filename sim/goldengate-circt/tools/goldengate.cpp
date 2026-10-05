@@ -2495,16 +2495,40 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlErrorAnnotations, error)))
         return fail("control error slave annotations: " + error);
       llvm::outs() << "Mapped CIRCT control decode-error endpoint in " << controlErrorPath << '\n';
-      // The supported Rocket/U250 widget bank sizes. HasWidgets assigns bases
-      // and slave indices; equal-size bridge peers retain registration order.
-      // These counts match the decoded banks supplied to map*Control.
-      const goldengate::ControlMMIOWidget controlWidgets[]{
-          {"SimulationMaster_0", 3}, {"PeekPokeBridgeModule_0", 7},
-          {"ResetPulseBridgeModule_0", 2}, {"BlockDevBridgeModule_0", 26},
-          {"UARTBridgeModule_0", 6}, {"FASEDMemoryTimingModel_0", 21},
-          {"TracerVBridgeModule_0", 15}, {"TSIBridgeModule_0", 9},
-          {"ClockBridgeModule_0", 6}, {"LoadMemWidget_0", 9},
-          {"CPUManagedStreamEngine_0", 1}};
+      // HasWidgets registration order remains independent of IR module order.
+      // Derive each available bank's size from its register registry and check
+      // it against the implemented MCRFile. The four banks assembled after
+      // global dispatch still use explicit declarations until that boundary
+      // can be moved ahead of allocation.
+      SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
+      auto appendBank = [&](StringRef name, StringRef mcr,
+                            ArrayRef<StringRef> registers) {
+        goldengate::ControlMMIOWidget widget;
+        if (failed(goldengate::deriveControlMMIOWidget(
+                circuit, name, mcr, registers, widget, error))) return failure();
+        controlWidgets.push_back(widget);
+        return success();
+      };
+      controlWidgets.push_back({"SimulationMaster_0", 3});
+      if (failed(appendBank("PeekPokeBridgeModule_0", "GGPeekPokeMCRFile",
+                           {"GGPeekPokeMMIOBank"})) ||
+          failed(appendBank("ResetPulseBridgeModule_0", "GGResetPulseBridgeMCRFile",
+                           {"GGResetPulseBridge"})))
+        return fail("control bank registry: " + error);
+      controlWidgets.push_back({"BlockDevBridgeModule_0", 26});
+      if (failed(appendBank("UARTBridgeModule_0", "GGUARTMCRFile", {"GGUARTMMIOBank"})))
+        return fail("control bank registry: " + error);
+      controlWidgets.push_back({"FASEDMemoryTimingModel_0", 21});
+      if (failed(appendBank("TracerVBridgeModule_0", "GGTracerVMCRFile", {"GGTracerVTriggerConfig"})))
+        return fail("control bank registry: " + error);
+      controlWidgets.push_back({"TSIBridgeModule_0", 9});
+      if (failed(appendBank("ClockBridgeModule_0", "GGClockBridgeMCRFile", {"GGSingleClockBridge"})) ||
+          failed(appendBank("LoadMemWidget_0", "GGLoadMemMCRFile",
+                           {"GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataWrapper",
+                            "GGLoadMemReadRequestWrapper", "GGLoadMemReadDataWrapper"})) ||
+          failed(appendBank("CPUManagedStreamEngine_0", "GGCPUStreamMCRFile",
+                           {"GGCPUStreamCountBank"})))
+        return fail("control bank registry: " + error);
       SmallVector<goldengate::ControlMMIORegion> controlRegions;
       if (failed(goldengate::allocateControlMMIORegions(25, controlWidgets, controlRegions, error)))
         return fail("control address allocation: " + error);
