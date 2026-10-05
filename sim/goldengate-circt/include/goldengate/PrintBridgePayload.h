@@ -42,4 +42,13 @@ mlir::LogicalResult materializePrintBridgeConfigs(
     llvm::ArrayRef<circt::firrtl::FModuleOp> controls,
     llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
     std::string &error);
+// Local Nasti slave backed by the shared Lib.scala MCRFile transport. Batch
+// preflight preserves target circuit and annotations; no global address/stream
+// allocation occurs at this boundary.
+mlir::LogicalResult materializePrintBridgeAXIControls(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> configs,
+    unsigned addressBits, unsigned idBits,
+    llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
+    std::string &error);
 } // namespace goldengate

@@ -9,6 +9,9 @@
 // and metadata are deliberately ignored as in the executable Scala oracle.
 // Output: local Nasti slave; global widget allocation/crossbar remain pending.
 #include "goldengate/ClockBridgeControl.h"
+#include "goldengate/PrintBridgePayload.h"
+#include "llvm/ADT/StringSet.h"
+#include <set>
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
@@ -25,18 +28,21 @@ LogicalResult mapBridgeControl(CircuitOp circuit, unsigned addressBits,
     unsigned idBits, unsigned bankWords, llvm::StringRef expectedTop,
     llvm::StringRef wrapperName, llvm::StringRef adapterName,
     llvm::StringRef bankPortName, llvm::StringRef controlPortName,
-    std::string &error, ArrayRef<DecodedBankGroup> groups = {}) {
+    std::string &error, ArrayRef<DecodedBankGroup> groups = {},
+    FModuleOp helper = {}, bool validateOnly = false, FModuleOp *result = nullptr) {
   unsigned indexBits = llvm::Log2_64_Ceil(bankWords);
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (addressBits < indexBits + 2 || idBits == 0)
     return reject("MCRFile control needs enough address bits for word selection and a nonzero ID width");
-  if (circuit.getName() != expectedTop)
+  if (!helper && circuit.getName() != expectedTop)
     return reject("MCRFile control needs the active decoded bridge wrapper");
-  FModuleOp inner;
+  FModuleOp inner = helper;
+  if (helper && helper->getParentOp() != circuit)
+    return reject("MCRFile helper must belong to this circuit");
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getName() == wrapperName || m.getName() == adapterName)
       return reject("MCRFile control module already exists");
-    if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
+    if (!helper && m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!inner || !raw) return reject("MCRFile control requires a top and retained annotations");
@@ -110,6 +116,8 @@ LogicalResult mapBridgeControl(CircuitOp circuit, unsigned addressBits,
   };
   check(raw);
   if (referenced) return reject("Bridge decoded MCR target cannot transfer to a Nasti field");
+
+  if (validateOnly) return success();
 
   // Nasti.scala field widths and flips, including unused request metadata.
   auto address = bundle({{b.getStringAttr("addr"), false, uint(addressBits)},
@@ -245,6 +253,9 @@ LogicalResult mapBridgeControl(CircuitOp circuit, unsigned addressBits,
     }
     connect(field(bank,"wstrb"),field(crFile.getResult(3),"wstrb"));
   }
+  if (result) *result = wrapper;
+  // Standalone helpers retain the target circuit and all annotation identities.
+  if (helper) return success();
   std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
@@ -380,4 +391,87 @@ LogicalResult goldengate::mapFASEDBridgeControl(CircuitOp circuit,
   return mapBridgeControl(circuit, addressBits, idBits, 21,
       "GGFASEDMMIOWrapper", "GGFASEDBridgeControlWrapper",
       "GGFASEDMCRFile", "fasedBridge_mcr", "fasedBridge_ctrl", error);
+}
+
+// Requires: freshly materialized PrintBridge configuration banks and retained
+// constructors. Consume decoded MCR interfaces on new wrappers only. Preserve
+// the target circuit, bank modules, annotations and target/reset identities.
+// Generate the shared Lib.scala MCRFile operations, not a second AXI engine.
+// Global widget allocation, stream adaptation and FAME binding remain pending.
+LogicalResult goldengate::materializePrintBridgeAXIControls(CircuitOp circuit,
+    ArrayRef<FModuleOp> configs, unsigned addressBits, unsigned idBits,
+    llvm::SmallVectorImpl<FModuleOp> &modules, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  llvm::StringSet<> names;
+  std::set<std::pair<std::string, std::string>> identities;
+  for (auto &op : circuit.getBodyBlock()->getOperations()) {
+    if (auto m = dyn_cast<FModuleLike>(&op)) names.insert(m.getModuleName());
+    if (auto prior = op.getAttrOfType<DictionaryAttr>("goldengate.printAXI")) {
+      auto target = prior.getAs<StringAttr>("bridgeTarget");
+      auto reset = prior.getAs<StringAttr>("resetPortName");
+      if (target && reset) identities.emplace(target.getValue().str(), reset.getValue().str());
+    }
+  }
+  auto unique = [&](StringRef base) {
+    std::string name = base.str();
+    for (unsigned suffix = 1; names.count(name); ++suffix)
+      name = base.str() + "_" + std::to_string(suffix);
+    names.insert(name); return name;
+  };
+  SmallVector<std::pair<std::string, std::string>> allocated;
+  // Preflight every bank before creating either an adapter or a wrapper.
+  if (addressBits < 5 || !idBits)
+    return reject("PrintBridge MCRFile needs at least five address bits and nonzero IDs");
+  for (auto config : configs) {
+    if (!config || config->getParentOp() != circuit || config.getNumPorts() != 12)
+      return reject("PrintBridge AXI requires configuration banks in this circuit");
+    auto layout = config->getAttrOfType<DictionaryAttr>("goldengate.printConfig");
+    auto target = layout ? layout.getAs<StringAttr>("bridgeTarget") : StringAttr();
+    auto reset = layout ? layout.getAs<StringAttr>("resetPortName") : StringAttr();
+    auto bits = layout ? layout.getAs<IntegerAttr>("tokenBits") : IntegerAttr();
+    auto cycles = layout ? layout.getAs<IntegerAttr>("cycleBits") : IntegerAttr();
+    auto inclusive = layout ? layout.getAs<BoolAttr>("roiInclusive") : BoolAttr();
+    auto pulse = layout ? layout.getAs<IntegerAttr>("flushPulseLength") : IntegerAttr();
+    if (!target || !reset || target.getValue().empty() || reset.getValue().empty() ||
+        !bits || bits.getInt() < 8 || bits.getInt() > (1LL << 30) ||
+        (bits.getInt() & (bits.getInt()-1)) || !cycles || cycles.getInt() != 64 ||
+        !inclusive || !inclusive.getValue() || !pulse ||
+        pulse.getInt() != (bits.getInt() < 512 ? 512 / bits.getInt() : 1))
+      return reject("PrintBridge AXI has incompatible config metadata");
+    if (!identities.emplace(target.getValue().str(), reset.getValue().str()).second)
+      return reject("PrintBridge AXI target/reset identity already materialized or duplicated");
+    const char *ports[] = {"hostClock", "hostReset", "hValid", "bufferReady", "hBits",
+        "hReady", "fromHostValid", "tokenValid", "tokenData", "currentCycle", "enable", "mcr"};
+    for (unsigned p = 0; p < 11; ++p) {
+      Type expected = p == 0 ? Type(ClockType::get(circuit.getContext())) :
+          p == 4 ? config.getPortType(p) : Type(UIntType::get(circuit.getContext(),
+              p == 8 ? bits.getInt() : p == 9 ? 64 : 1));
+      if (config.getPortName(p) != ports[p] || config.getPortType(p) != expected ||
+          config.getPortDirection(p) != (p < 5 ? Direction::In : Direction::Out) ||
+          (p == 4 && (!isa<BundleType>(expected) || !cast<FIRRTLBaseType>(expected).isPassive())))
+        return reject("PrintBridge AXI config interface mismatch");
+    }
+
+    auto wrapper = unique("GGPrintBridgeAXI"), adapter = unique("GGPrintBridgeMCRFile");
+    if (failed(mapBridgeControl(circuit, addressBits, idBits, 6, "", wrapper,
+          adapter, "mcr", "ctrl", error, {}, config, true))) return failure();
+    allocated.emplace_back(wrapper, adapter);
+  }
+  OpBuilder b(circuit.getContext());
+  for (unsigned i = 0; i < configs.size(); ++i) {
+    auto config = configs[i];
+    FModuleOp wrapper;
+    auto &names = allocated[i];
+    if (failed(mapBridgeControl(circuit, addressBits, idBits, 6, "", names.first,
+          names.second, "mcr", "ctrl", error, {}, config, false, &wrapper)))
+      return failure(); // All rejection conditions were checked above.
+    NamedAttrList metadata(config->getAttrOfType<DictionaryAttr>("goldengate.printConfig"));
+    metadata.set("configModule", b.getStringAttr(config.getName()));
+    metadata.set("mcrModule", b.getStringAttr(names.second));
+    metadata.set("addressBits", b.getI64IntegerAttr(addressBits));
+    metadata.set("idBits", b.getI64IntegerAttr(idBits));
+    wrapper->setAttr("goldengate.printAXI", metadata.getDictionary(circuit.getContext()));
+    modules.push_back(wrapper);
+  }
+  return success();
 }

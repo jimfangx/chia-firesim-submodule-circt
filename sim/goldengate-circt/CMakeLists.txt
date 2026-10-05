@@ -249,6 +249,19 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-print-config-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-print-config COMMAND goldengate-print-config-test)
+  add_executable(goldengate-print-axi-test
+    test/Transforms/PrintBridgeAXITest.cpp
+    lib/Transforms/PrintBridgePayload.cpp lib/Transforms/PrintBridgeTokenStage.cpp
+    lib/Transforms/PrintBridgeControl.cpp lib/Transforms/PrintBridgeConfig.cpp
+    lib/Transforms/ClockBridgeControl.cpp)
+  target_compile_features(goldengate-print-axi-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-print-axi-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-print-axi-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-print-axi-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-print-axi COMMAND goldengate-print-axi-test)
+
   add_executable(goldengate-print-stubs-test
     test/Transforms/PrintStubsTest.cpp lib/Transforms/PrintStubs.cpp
     lib/Support/TargetUtils.cpp)

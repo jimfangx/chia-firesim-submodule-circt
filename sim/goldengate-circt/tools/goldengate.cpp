@@ -256,9 +256,13 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
   // boundary; PrintBridge host stream synthesis is a separate porting step.
-  bool materializePrintConfigConstructors =
+  bool materializePrintAXIConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-axi-constructors";
+  bool materializePrintAXI = materializePrintAXIConstructors ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-axi");
+  bool materializePrintConfigConstructors = materializePrintAXIConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-config-constructors";
-  bool materializePrintConfigs = materializePrintConfigConstructors ||
+  bool materializePrintConfigs = materializePrintAXI || materializePrintConfigConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-configs");
   bool materializePrintControlConstructors = materializePrintConfigConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-control-constructors";
@@ -327,6 +331,7 @@ int main(int argc, char **argv) {
                     "--wire-print-reset | --update-print-bridge-clocks | "
                     "--materialize-print-payloads | --materialize-print-payload-constructors | "
                     "--materialize-print-tokens | --materialize-print-token-constructors | "
+                    "--materialize-print-axi | --materialize-print-axi-constructors | "
                     "--materialize-print-configs | --materialize-print-config-constructors | "
                     "--materialize-print-controls | --materialize-print-control-constructors | "
                     "--wire-autocounter-print-stubs | "
@@ -423,10 +428,14 @@ int main(int argc, char **argv) {
     if (materializePrintConfigs &&
         failed(goldengate::materializePrintBridgeConfigs(circuit, controls, configs, error)))
       return fail("PrintBridge config materialization: " + error);
+    llvm::SmallVector<FModuleOp> axi;
+    if (materializePrintAXI && failed(goldengate::materializePrintBridgeAXIControls(
+          circuit, configs, 25, 12, axi, error)))
+      return fail("PrintBridge AXI materialization: " + error);
     if (failed(mlir::verify(*module)))
       return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
-    llvm::sys::path::append(irPath, materializePrintConfigs ? "post-print-configs.mlir" : materializePrintControls ? "post-print-controls.mlir" :
+    llvm::sys::path::append(irPath, materializePrintAXI ? "post-print-axi.mlir" : materializePrintConfigs ? "post-print-configs.mlir" : materializePrintControls ? "post-print-controls.mlir" :
         materializePrintTokens ? "post-print-tokens.mlir" : "post-print-payloads.mlir");
     llvm::sys::path::append(firPath, "post-print-payloads.fir");
     llvm::sys::path::append(summaryPath, "print-payloads.json");
@@ -580,6 +589,38 @@ int main(int argc, char **argv) {
           if (ec) return fail("cannot write print config summary: " + ec.message());
           configMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(configSummary)));
           llvm::outs() << "Materialized " << configs.size() << " PrintBridge configuration banks\n";
+          if (materializePrintAXI) {
+            llvm::SmallString<256> axiPath(outputDir), axiAnnosPath(outputDir), axiSummaryPath(outputDir);
+            llvm::sys::path::append(axiPath, "post-print-axi.fir");
+            llvm::sys::path::append(axiAnnosPath, "post-print-axi-all.json");
+            llvm::sys::path::append(axiSummaryPath, "print-axi.json");
+            if (failed(goldengate::emitAllAnnotations(circuit, axiAnnosPath, error)))
+              return fail("cannot export print AXI annotations: " + error);
+            llvm::json::Array axiSummary;
+            if (!axi.empty()) payloadCircuit.setName(axi.front().getName());
+            for (auto wrapper : axi) {
+              auto layout = wrapper->getAttrOfType<DictionaryAttr>("goldengate.printAXI");
+              auto adapterName = layout.getAs<StringAttr>("mcrModule").getValue();
+              for (auto m : circuit.getOps<FModuleOp>())
+                if (m.getName() == adapterName) payloadBuilder.insert(m->clone());
+              payloadBuilder.insert(wrapper->clone());
+              llvm::json::Object entry{{"module", wrapper.getName().str()}};
+              for (auto key : {"configModule", "mcrModule", "bridgeTarget", "resetPortName"})
+                entry[key] = layout.getAs<StringAttr>(key).getValue().str();
+              for (auto key : {"tokenBits", "flushPulseLength", "addressBits", "idBits"})
+                entry[key] = layout.getAs<IntegerAttr>(key).getInt();
+              axiSummary.push_back(std::move(entry));
+            }
+            llvm::raw_fd_ostream axiFir(axiPath, ec);
+            if (ec || failed(mlir::verify(*payloadIR)) ||
+                failed(exportFIRFile(*payloadIR, axiFir, std::nullopt, exportFIRVersion)))
+              return fail("cannot export print AXI FIRRTL");
+            llvm::raw_fd_ostream axiMetadata(axiSummaryPath, ec);
+            if (ec) return fail("cannot write print AXI summary: " + ec.message());
+            axiMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(axiSummary)));
+            llvm::outs() << "Materialized " << axi.size() << " PrintBridge local AXI slaves\n";
+          }
+
         }
       }
     }
