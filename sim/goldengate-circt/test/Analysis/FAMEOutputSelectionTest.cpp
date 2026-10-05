@@ -2,6 +2,9 @@
 #include "goldengate/FAMEPortAnalysis.h"
 #include "goldengate/FAMEOutputChannel.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/InferModelPorts.h"
+#include "goldengate/LowerTypes.h"
+#include "goldengate/WrapTop.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -9,6 +12,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
+#include <tuple>
 
 using namespace mlir;
 using namespace circt::firrtl;
@@ -43,7 +47,8 @@ void run(MLIRContext &context, unsigned rejection) {
           in %inputValid: !firrtl.uint<1>) {}
       firrtl.module private @Other(in %data: !firrtl.uint<8>,
                                   out %printf: !firrtl.uint<8>) {}
-      firrtl.extmodule private @BlackBox(out value: !firrtl.uint<8>)
+      firrtl.extmodule private @BlackBox(in input: !firrtl.uint<1>,
+                                       out out: !firrtl.uint<8>)
     }
   })mlir", &context);
   require(bool(root), "output selection fixture parse failed");
@@ -71,10 +76,13 @@ void run(MLIRContext &context, unsigned rejection) {
                            other.getBodyBlock()->getArgument(0));
   b.setInsertionPointToEnd(model.getBodyBlock());
   auto arg = [&](unsigned i) { return model.getBodyBlock()->getArgument(i); };
-  if (rejection == 7) {
+  if (rejection == 7 || rejection == 9) {
     auto external = *circuit.getOps<FExtModuleOp>().begin();
+    if (rejection == 9)
+      external->setAttr("defname", b.getStringAttr("plusarg_reader"));
     auto blackbox = b.create<InstanceOp>(model.getLoc(), external, "blackbox");
-    b.create<StrictConnectOp>(model.getLoc(), arg(4), blackbox.getResult(0));
+    b.create<StrictConnectOp>(model.getLoc(), blackbox.getResult(0), arg(3));
+    b.create<StrictConnectOp>(model.getLoc(), arg(4), blackbox.getResult(1));
   } else if (rejection != 6) {
     auto print = b.create<MuxPrimOp>(model.getLoc(), arg(3), arg(1), arg(1));
     b.create<StrictConnectOp>(model.getLoc(), arg(4), print.getResult());
@@ -244,14 +252,82 @@ void run(MLIRContext &context, unsigned rejection) {
               model.getPortName(4) == "printfA",
           "selected Print rewrite lost payload or changed another channel");
 }
+// PrintSynthesis introduces aggregates after the initial target lowering.
+// Reproduce that boundary: WrapTop creates scalar external leaves, while the
+// model still has an aggregate port. The second lowering must expose every
+// leaf to InferModelPorts and preserve its original combinational dependency.
+void newlySynthesizedPrintBundle(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "PrintTarget" {
+      firrtl.module @PrintTarget(in %clock: !firrtl.clock,
+          in %data: !firrtl.sint<5>,
+          out %record: !firrtl.bundle<enable: uint<1>, arg: sint<5>>) {
+        %configuration = firrtl.instance reader @PlusArg(out out: !firrtl.uint<1>)
+        %enable = firrtl.subfield %record[enable] : !firrtl.bundle<enable: uint<1>, arg: sint<5>>
+        %arg = firrtl.subfield %record[arg] : !firrtl.bundle<enable: uint<1>, arg: sint<5>>
+        firrtl.strictconnect %enable, %configuration : !firrtl.uint<1>
+        firrtl.strictconnect %arg, %data : !firrtl.sint<5>
+      }
+      firrtl.extmodule private @PlusArg(out out: !firrtl.uint<1>)
+    }
+  })mlir", &context);
+  require(bool(root), "new Print bundle parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context);
+  auto reader = *circuit.getOps<FExtModuleOp>().begin();
+  reader->setAttr("defname", b.getStringAttr("plusarg_reader"));
+  SmallVector<Attribute> annotations;
+  for (auto [name, endpoint, input] : {
+           std::tuple<StringRef, StringRef, bool>{"input_data", "data", true},
+           {"print_enable", "record.enable", false},
+           {"print_argument", "record.arg", false}}) {
+    auto target = b.getArrayAttr({b.getStringAttr(
+        ("~PrintTarget|PrintTarget>" + endpoint).str())});
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr(name)),
+        b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+            b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::PipeChannel)),
+            b.getNamedAttr("latency", b.getI64IntegerAttr(0))})),
+        b.getNamedAttr(input ? "sinks" : "sources", target)}));
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  std::string error;
+  if (failed(goldengate::wrapTop(circuit, error)))
+    throw std::runtime_error("Print WrapTop: " + error);
+  if (failed(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)))
+    throw std::runtime_error("Print LowerTypes: " + error);
+  // FAMEDefaults selects the model after WrapTop changes the circuit identity.
+  annotations.assign(circuit->getAttrOfType<ArrayAttr>("rawAnnotations").begin(),
+                     circuit->getAttrOfType<ArrayAttr>("rawAnnotations").end());
+  annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::FAMETransform)),
+      b.getNamedAttr("target", b.getStringAttr("~FAMETop|PrintTarget"))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  if (failed(goldengate::inferModelPorts(circuit, error)))
+    throw std::runtime_error("Print InferModelPorts: " + error);
+  auto selected = goldengate::analyzeFAMEOutputSelection(circuit, model, error);
+  require(bool(selected) && selected->size() == 2,
+          "new Print bundle fields were omitted from FAME output selection: " + error);
+  require((*selected)[0].globalName == "print_enable" &&
+              (*selected)[0].dependency.inputChannels.empty(),
+          "configuration-only Print enable dependency changed");
+  require((*selected)[1].globalName == "print_argument" &&
+              (*selected)[1].dependency.inputChannels ==
+                  std::vector<std::string>{"data"},
+          "signed Print argument lost its data-channel dependency");
+  require(succeeded(verify(*root)), "new Print bundle lowering produced invalid IR");
+}
 } // namespace
 int main() {
   try {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    for (unsigned rejection = 0; rejection <= 8; ++rejection) run(context, rejection);
+    for (unsigned rejection = 0; rejection <= 9; ++rejection) run(context, rejection);
+    newlySynthesizedPrintBundle(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
-                    "dependencies and model isolation passed; 8 unsafe selections "
+                    "dependencies and model isolation passed; 9 unsafe selections "
                     "rejected without mutation\n";
     return 0;
   } catch (const std::exception &e) {

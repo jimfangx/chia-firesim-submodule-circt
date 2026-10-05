@@ -8,7 +8,8 @@
 namespace goldengate {
 // A partial version of CheckCombLoops' port connectivity. An unresolved
 // output must never be treated as having no input dependencies: black boxes
-// and unsupported operations require further analysis.
+// and unsupported operations require further analysis. The known output-only
+// Rocket plusarg_reader is a configuration source with no target input paths.
 struct LocalChannelDependency {
   std::string outputChannel;
   std::vector<std::string> inputChannels;

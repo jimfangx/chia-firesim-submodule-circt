@@ -1661,13 +1661,15 @@ if(BUILD_TESTING)
     lib/Analysis/ChannelAnalysis.cpp lib/Analysis/ModelAnalysis.cpp
     lib/Analysis/HierarchyAnalysis.cpp lib/Analysis/CombDependencyAnalysis.cpp
     lib/Transforms/FAMEOutputChannel.cpp
+    lib/Transforms/WrapTop.cpp lib/Transforms/LowerTypes.cpp
+    lib/Transforms/InferModelPorts.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-fame-output-selection-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fame-output-selection-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fame-output-selection-test PRIVATE
     include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
   target_link_libraries(goldengate-fame-output-selection-test PRIVATE
-    CIRCTFIRRTL CIRCTHW CIRCTSupport
+    CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
     MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-output-selection COMMAND goldengate-fame-output-selection-test)
 endif()

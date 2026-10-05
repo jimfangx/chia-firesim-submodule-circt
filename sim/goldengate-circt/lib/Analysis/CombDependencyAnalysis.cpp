@@ -127,6 +127,18 @@ private:
           for (auto [inputPort, inputFieldID] : childTrace.inputPorts)
             merge(traceValue(current, instance.getResult(inputPort), active,
                              inputFieldID));
+        } else if (auto external = dyn_cast<FExtModuleOp>(child->second.getOperation());
+                   external && external.getDefname() == "plusarg_reader" &&
+                   external.getNumPorts() == 1 &&
+                   external.getPortName(0) == "out" &&
+                   external.getPortDirection(0) == Direction::Out &&
+                   isa<UIntType>(external.getPortType(0)) &&
+                   cast<UIntType>(external.getPortType(0)).getWidth() > 0) {
+          // Rocket's plusarg_reader has no target inputs: its output is a
+          // configuration value initialized by $value$plusargs (DEFAULT in
+          // synthesis). The immutable SFC RTL confirms that contract. Scala
+          // CheckCombLoops therefore finds no input paths through this source.
+          // Keep other blackboxes unresolved, including readers with inputs.
         } else {
           result.blockers.insert(current.getName().str() + ":external " +
                                  instance.getModuleName().str());

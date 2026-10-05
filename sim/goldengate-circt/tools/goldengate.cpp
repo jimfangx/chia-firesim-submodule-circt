@@ -256,8 +256,9 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter-print-clocks");
   bool wireAutoCounterStubs = analyzeAutoCounterPrintClocks ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
-  // Enabled ordinary prints currently terminate at the pre-FAME debug
-  // boundary; global PrintBridge host stream allocation remains pending.
+  // Standalone debug boundaries can also consume recorded post-FAME inputs.
+  // The baseline pipeline can now carry enabled prints through FAME and stop
+  // after binding their local hosts, before global platform allocation.
   bool bindPrintHostConstructors =
       argc == 7 && llvm::StringRef(argv[6]) == "--bind-print-host-constructors";
   bool materializePrintHostConstructors = bindPrintHostConstructors ||
@@ -357,6 +358,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
+                    "[--stop-after-print-host-binding] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -364,6 +366,7 @@ int main(int argc, char **argv) {
   llvm::StringRef firPath(argv[1]), annoPath(argv[3]), outputDir(argv[5]);
   llvm::StringRef outputBase = "FireSim-generated";
   bool enableAutoILA = false;
+  bool stopAfterPrintHostBinding = false;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
     bool baseSeen = false, depthSeen = false, triggersSeen = false;
@@ -372,6 +375,16 @@ int main(int argc, char **argv) {
       if (option == "--enable-autoila") {
         if (enableAutoILA) return fail("duplicate --enable-autoila");
         enableAutoILA = true;
+        continue;
+      }
+      if (option == "--stop-after-print-host-binding") {
+        if (stopAfterPrintHostBinding)
+          return fail("duplicate --stop-after-print-host-binding");
+        stopAfterPrintHostBinding = true;
+        // Reuse the same constructor and queued-host implementation as the
+        // standalone post-FAME binding boundary, without returning at import.
+        materializePrintTokens = materializePrintControls =
+            materializePrintHosts = bindPrintHostConstructors = true;
         continue;
       }
       if (i + 1 == argc) return fail("missing value for compiler option: " + option.str());
@@ -468,11 +481,22 @@ int main(int argc, char **argv) {
       llvm::raw_fd_ostream ir(boundIR, ec);
       if (ec) return fail("cannot write PrintBridge binding MLIR: " + ec.message());
       module->print(ir); ir << '\n'; ir.close();
-      llvm::raw_fd_ostream fir(boundFIR, ec);
-      if (ec || failed(exportFIRFile(*module, fir, std::nullopt, exportFIRVersion)))
-        return fail("cannot export PrintBridge binding FIRRTL");
+      // A complete lowered target contains multibit_mux operations that the
+      // FIR text exporter cannot represent. Keep that boundary in MLIR for
+      // CIRCT's backend; compact binding fixtures can also export FIR text.
+      if (!stopAfterPrintHostBinding) {
+        llvm::raw_fd_ostream fir(boundFIR, ec);
+        if (ec || failed(exportFIRFile(*module, fir, std::nullopt, exportFIRVersion)))
+          return fail("cannot export PrintBridge binding FIRRTL");
+      }
       if (failed(goldengate::emitAllAnnotations(circuit, boundAnnos, error)))
         return fail("cannot export PrintBridge binding annotations: " + error);
+      if (stopAfterPrintHostBinding) {
+        llvm::SmallString<256> boundRTL(outputDir);
+        llvm::sys::path::append(boundRTL, "post-print-host-binding.sv");
+        if (failed(goldengate::emitSimulatorRTL(*module, firPath, boundRTL, error)))
+          return fail("PrintBridge binding RTL: " + error);
+      }
       llvm::outs() << "Bound " << hosts.size() << " queued PrintBridge hosts to post-FAME tokens in " << boundIR << '\n';
       return 0;
     }
@@ -829,11 +853,29 @@ int main(int argc, char **argv) {
     if (compileBaseline) {
       // The default FireSim configuration has SynthPrints=false. Scala still
       // consumes its selections before TriggerWiring, preserving printf RTL.
-      // Enabled print bridge construction is exposed by the incremental modes.
+      // Enabled prints follow the Scala pass order through target FAME. The
+      // explicit stop leaves local host interfaces for later platform mapping.
       unsigned removedPrintSelections = 0;
-      if (failed(goldengate::dropDisabledPrintAnnotations(
-              circuit, removedPrintSelections, error)))
+      if (stopAfterPrintHostBinding) {
+        mlir::PassManager lowForm(module->getContext());
+        lowForm.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+        if (failed(lowForm.run(*module)))
+          return fail("enabled PrintSynthesis ExpandWhens failed");
+        llvm::SmallVector<goldengate::PrintStub> stubs;
+        llvm::SmallVector<goldengate::WiredPrint> routes;
+        if (failed(goldengate::synthesizePrintStubs(circuit, stubs, error)) ||
+            failed(goldengate::wirePrintStubsToTop(circuit, stubs, routes, error)) ||
+            failed(goldengate::completePrintClockWiring(circuit, stubs, routes, error)) ||
+            failed(goldengate::completePrintSynthesis(circuit, stubs, error)))
+          return fail("enabled PrintSynthesis: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("enabled PrintSynthesis produced invalid FIRRTL IR");
+        llvm::outs() << "Synthesized " << routes.size()
+                     << " printf instances for CIRCT FAME host binding\n";
+      } else if (failed(goldengate::dropDisabledPrintAnnotations(
+                     circuit, removedPrintSelections, error))) {
         return fail("disabled PrintSynthesis: " + error);
+      }
       llvm::SmallString<256> debugIRPath(outputDir), debugAnnotationPath(outputDir);
       llvm::sys::path::append(debugIRPath, "post-debug-synthesis.mlir");
       llvm::sys::path::append(debugAnnotationPath, "post-debug-synthesis-all.json");
@@ -845,9 +887,10 @@ int main(int argc, char **argv) {
       debugIROut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, debugAnnotationPath, error)))
         return fail("cannot export debug synthesis annotations: " + error);
-      llvm::outs() << "Consumed " << removedPrintSelections
-                   << " disabled SynthPrintf selections in "
-                   << debugAnnotationPath << '\n';
+      if (!stopAfterPrintHostBinding)
+        llvm::outs() << "Consumed " << removedPrintSelections
+                     << " disabled SynthPrintf selections in "
+                     << debugAnnotationPath << '\n';
 
       unsigned consumedTriggerSources = 0;
       if (mlir::failed(goldengate::wireTriggers(
@@ -898,6 +941,11 @@ int main(int argc, char **argv) {
                      << resetIRPath << '\n';
       }
 
+      // New Print bridges were absent from the initial aggregate clock map.
+      // Refresh their metadata after reset wiring, as in MidasTransforms.
+      if (stopAfterPrintHostBinding &&
+          failed(goldengate::analyzeChannelClocksAndUpdateBridges(circuit, error)))
+        return fail("enabled Print bridge clock analysis: " + error);
       if (mlir::failed(goldengate::wrapTop(circuit, error)))
         return fail("WrapTop: " + error);
       if (enableAutoILA && failed(goldengate::prepareAutoILAAnnotations(
@@ -951,6 +999,14 @@ int main(int argc, char **argv) {
         return fail("cannot export extracted-model annotations: " + error);
       llvm::outs() << "Promoted " << promotedModels << " CIRCT models in "
                    << modelIRPath << '\n';
+
+      // PrintSynthesis creates new aggregate ports after the first lowering.
+      // Scala lowers again after ExtractModel. Match that boundary so every
+      // printf leaf has a direct model/top connection for InferModelPorts;
+      // otherwise only the scalar reset gets FAME controls.
+      if (stopAfterPrintHostBinding &&
+          failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
+        return fail("post-ExtractModel Print LowerTypes: " + error);
 
       unsigned promotedConnections = 0;
       if (mlir::failed(goldengate::promotePassthroughConnections(
@@ -1850,6 +1906,12 @@ int main(int argc, char **argv) {
       llvm::outs() << "Added CIRCT FAME output controls for "
                    << outputChannel->name << " in " << outputControlIRPath << '\n';
       }
+      // All output payload, valid, fired and finishing rewrites are complete.
+      // Print hosts consume these scalar latency-zero tokens directly, using
+      // the retained constructors and channel mappings. Stop before global
+      // simulator wrappers, MMIO allocation, streams and driver collateral.
+      if (stopAfterPrintHostBinding) return emitPrintPayloadBoundary();
+
       // Create scalar boundary queues from the post-FAME channel annotations.
       // Equal (payload width, latency) pairs share a module definition.
       if (failed(goldengate::addFAMEBoundaryPipeChannels(circuit, error)))
