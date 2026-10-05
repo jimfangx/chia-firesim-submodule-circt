@@ -5,9 +5,52 @@
 #include "goldengate/ControlAddressDecode.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
+
+LogicalResult goldengate::allocateControlMMIORegions(unsigned addressBits,
+    ArrayRef<ControlMMIOWidget> widgets,
+    SmallVectorImpl<ControlMMIORegion> &regions, std::string &error) {
+  auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
+  if (!addressBits || addressBits > 63 || widgets.empty() || widgets.size() > 63)
+    return reject("control allocation needs 1..63 address bits and 1..63 widgets");
+  uint64_t limit = uint64_t(1) << addressBits;
+  SmallVector<ControlMMIORegion> allocated;
+  for (auto [i, widget] : llvm::enumerate(widgets)) {
+    if (widget.name.empty()) return reject("control widget name must be nonempty");
+    for (auto prior : widgets.take_front(i))
+      if (prior.name == widget.name) return reject("control widget names must be unique");
+    uint64_t size;
+    if (widget.customSize) {
+      // Scala customSize replaces the register-derived size; WidgetRegion
+      // requires the supplied size to be a power of two.
+      size = *widget.customSize;
+      if (!llvm::isPowerOf2_64(size))
+        return reject("control custom region size must be a positive power of two");
+    } else {
+      // Check before multiplying or rounding. The largest supported address
+      // space is 2^63 bytes, whose last endpoint still fits uint64_t.
+      if (!widget.registerCount || widget.registerCount > limit / 4)
+        return reject("control register bank exceeds the address space or is empty");
+      size = uint64_t(1) << llvm::Log2_64_Ceil(widget.registerCount * 4);
+    }
+    if (size > limit) return reject("control widget region exceeds the address space");
+    allocated.push_back({widget.name, 0, size});
+  }
+  std::stable_sort(allocated.begin(), allocated.end(),
+      [](const auto &a, const auto &b) { return a.size > b.size; });
+  uint64_t start = 0;
+  for (auto &region : allocated) {
+    if (region.size > limit - start)
+      return reject("control widgets collectively exceed the address space");
+    region.start = start;
+    start += region.size;
+  }
+  regions.assign(allocated.begin(), allocated.end());
+  return success();
+}
 
 LogicalResult goldengate::addControlAddressDecode(CircuitOp circuit,
     unsigned addressBits, ArrayRef<ControlMMIORegion> regions, std::string &error) {

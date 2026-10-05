@@ -2495,15 +2495,19 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlErrorAnnotations, error)))
         return fail("control error slave annotations: " + error);
       llvm::outs() << "Mapped CIRCT control decode-error endpoint in " << controlErrorPath << '\n';
-      // FireSimRocketConfig/U250 HasWidgets sorted allocation. Keep the full
-      // catalog, including widgets whose CIRCT implementations are pending.
-      const goldengate::ControlMMIORegion controlRegions[]{
-          {"BlockDevBridgeModule_0", 0x000, 0x80}, {"FASEDMemoryTimingModel_0", 0x080, 0x80},
-          {"TracerVBridgeModule_0", 0x100, 0x40}, {"TSIBridgeModule_0", 0x140, 0x40},
-          {"LoadMemWidget_0", 0x180, 0x40}, {"PeekPokeBridgeModule_0", 0x1c0, 0x20},
-          {"UARTBridgeModule_0", 0x1e0, 0x20}, {"ClockBridgeModule_0", 0x200, 0x20},
-          {"SimulationMaster_0", 0x220, 0x10}, {"ResetPulseBridgeModule_0", 0x230, 0x08},
-          {"CPUManagedStreamEngine_0", 0x238, 0x04}};
+      // The supported Rocket/U250 widget bank sizes. HasWidgets assigns bases
+      // and slave indices; equal-size bridge peers retain registration order.
+      // These counts match the decoded banks supplied to map*Control.
+      const goldengate::ControlMMIOWidget controlWidgets[]{
+          {"SimulationMaster_0", 3}, {"PeekPokeBridgeModule_0", 7},
+          {"ResetPulseBridgeModule_0", 2}, {"BlockDevBridgeModule_0", 26},
+          {"UARTBridgeModule_0", 6}, {"FASEDMemoryTimingModel_0", 21},
+          {"TracerVBridgeModule_0", 15}, {"TSIBridgeModule_0", 9},
+          {"ClockBridgeModule_0", 6}, {"LoadMemWidget_0", 9},
+          {"CPUManagedStreamEngine_0", 1}};
+      SmallVector<goldengate::ControlMMIORegion> controlRegions;
+      if (failed(goldengate::allocateControlMMIORegions(25, controlWidgets, controlRegions, error)))
+        return fail("control address allocation: " + error);
       if (failed(goldengate::addControlAddressDecode(circuit, 25, controlRegions, error)))
         return fail("control address decoder: " + error);
       if (failed(mlir::verify(*module)))

@@ -136,6 +136,78 @@ void checkMap(MLIRContext &context, unsigned width,
   std::mt19937_64 random(176);
   for (unsigned i = 0; i < 20000; ++i) sample(random() & mask, random() & mask);
 }
+void allocation(MLIRContext &context) {
+  // FPGATop registration order: master, BridgeIO annotations, LoadMem, stream.
+  const goldengate::ControlMMIOWidget widgets[]{
+      {"SimulationMaster_0", 3}, {"PeekPokeBridgeModule_0", 7},
+      {"ResetPulseBridgeModule_0", 2}, {"BlockDevBridgeModule_0", 26},
+      {"UARTBridgeModule_0", 6}, {"FASEDMemoryTimingModel_0", 21},
+      {"TracerVBridgeModule_0", 15}, {"TSIBridgeModule_0", 9},
+      {"ClockBridgeModule_0", 6}, {"LoadMemWidget_0", 9},
+      {"CPUManagedStreamEngine_0", 1}};
+  SmallVector<goldengate::ControlMMIORegion> allocated;
+  std::string error;
+  require(succeeded(goldengate::allocateControlMMIORegions(25, widgets, allocated, error)), error);
+  require(allocated.size() == std::size(regions), "baseline allocation count");
+  for (auto [i, expected] : llvm::enumerate(regions))
+    require(allocated[i].name == expected.name && allocated[i].start == expected.start &&
+        allocated[i].size == expected.size, "HasWidgets allocation differs from immutable U250 map");
+  checkMap(context, 25, allocated);
+
+  // Two synthesized Print widgets register after existing BridgeIO peers and
+  // before LoadMem/stream. Six MMIO words round to 32 bytes, with stable ties.
+  SmallVector<goldengate::ControlMMIOWidget> enabled(std::begin(widgets), std::end(widgets));
+  enabled.insert(enabled.begin() + 9, {{"PrintBridgeModule_0", 6}, {"PrintBridgeModule_1", 6}});
+  require(succeeded(goldengate::allocateControlMMIORegions(25, enabled, allocated, error)), error);
+  require(allocated.size() == 13 && allocated[8].name == "PrintBridgeModule_0" &&
+      allocated[8].start == 0x220 && allocated[8].size == 0x20 &&
+      allocated[9].name == "PrintBridgeModule_1" && allocated[9].start == 0x240 &&
+      allocated[10].name == "SimulationMaster_0" && allocated[10].start == 0x260 &&
+      allocated[11].start == 0x270 && allocated[12].start == 0x278,
+      "Print allocation did not shift smaller widgets in stable order");
+  checkMap(context, 25, allocated);
+
+  // Custom regions replace bank-derived size, including an empty custom bank.
+  // Equal-size ties must follow input order, even when names sort differently.
+  const goldengate::ControlMMIOWidget custom[]{
+      {"z", 0, 8}, {"a", 1, 8}, {"large", 1, 32}, {"rounded", 3}};
+  require(succeeded(goldengate::allocateControlMMIORegions(6, custom, allocated, error)), error);
+  require(allocated[0].name == "large" && allocated[0].start == 0 &&
+      allocated[1].name == "rounded" && allocated[1].start == 32 &&
+      allocated[2].name == "z" && allocated[2].start == 48 &&
+      allocated[3].name == "a" && allocated[3].start == 56, "custom/tie allocation differs");
+  checkMap(context, 6, allocated);
+  const goldengate::ControlMMIOWidget full[]{{"full", uint64_t(1) << 61}};
+  require(succeeded(goldengate::allocateControlMMIORegions(63, full, allocated, error)) &&
+      allocated[0].size == uint64_t(1) << 63, "full address space allocation failed");
+  checkMap(context, 63, allocated);
+
+  for (unsigned bad = 0; bad < 12; ++bad) {
+    SmallVector<goldengate::ControlMMIOWidget> invalid{{"widget", 1}};
+    unsigned width = 25;
+    if (bad == 0) width = 0;
+    if (bad == 1) width = 64;
+    if (bad == 2) invalid.clear();
+    if (bad == 3) invalid[0].name = "";
+    if (bad == 4) invalid.push_back(invalid[0]);
+    if (bad == 5) invalid[0].registerCount = 0;
+    if (bad == 6) invalid[0].registerCount = UINT64_MAX;
+    if (bad == 7) invalid[0].customSize = 0;
+    if (bad == 8) invalid[0].customSize = 12;
+    if (bad == 9) invalid[0].customSize = uint64_t(1) << 26;
+    if (bad == 10) {
+      width = 4; invalid = {{"first", 3}, {"second", 1}};
+    }
+    if (bad == 11) {
+      width = 63; invalid[0].registerCount = (uint64_t(1) << 61) + 1;
+    }
+    SmallVector<goldengate::ControlMMIORegion> result{{"sentinel", 123, 456}};
+    require(failed(goldengate::allocateControlMMIORegions(width, invalid, result, error)),
+        "invalid allocation accepted");
+    require(result.size() == 1 && result[0].name == "sentinel" &&
+        result[0].start == 123 && result[0].size == 456, "failed allocation changed output");
+  }
+}
 void mapping(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addControlAddressDecode(c, 25, regions, error)), error);
@@ -198,14 +270,14 @@ void rejection(MLIRContext &context) {
 }
 int main() {
   try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    checkMap(context, 25, regions);
+    allocation(context);
     // Nonzero base, holes, unsorted slave indices, and the full address-space
     // endpoint exercise the generic API independently of the U250 catalog.
     const goldengate::ControlMMIORegion sparse[]{{"high", 100, 10}, {"low", 4, 4}};
     const goldengate::ControlMMIORegion full[]{{"all", 0, uint64_t(1) << 63}};
     checkMap(context, 8, sparse); checkMap(context, 63, full);
     mapping(context); rejection(context);
-    llvm::outs() << "Control decoder: " << samples << " address pairs; catalog, wiring, targets and 15 atomic rejections passed\n";
+    llvm::outs() << "Control decoder: " << samples << " address pairs; baseline/Print/custom allocations, catalog, wiring, targets, 12 allocation and 15 IR atomic rejections passed\n";
   } catch (const std::exception &error) { llvm::errs() << error.what() << '\n'; return 1; }
   return 0;
 }
