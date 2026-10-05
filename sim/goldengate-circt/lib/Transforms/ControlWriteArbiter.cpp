@@ -2,6 +2,7 @@
 // Port NastiRouter's RRArbiter B response selection and acceptance.
 #include "goldengate/ControlWriteArbiter.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 #include <map>
 #include <set>
@@ -15,16 +16,31 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGControlReadArbiterWrapper")
     return reject("control write arbiter requires the R arbiter wrapper");
-  FModuleOp inner;
+  FModuleOp inner, decoder;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == wrapperName || m.getModuleName() == helperName)
       return reject("control write arbiter module already exists");
+    if (m.getModuleName() == "GGControlAddressDecode") decoder = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getModuleName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto bindings = inner ? inner->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings") : ArrayAttr();
-  if (!inner || !raw || !bindings || bindings.size() != 7)
-    return reject("control write arbiter requires retained annotations and seven read bindings");
+  auto catalog = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
+  if (!inner || !raw || !bindings || !catalog || catalog.empty() || catalog.size() > 63)
+    return reject("control write arbiter requires retained annotations, read bindings and one to 63 decoded regions");
+  const unsigned slaveCount = catalog.size(), sourceCount = slaveCount + 1;
+  const unsigned indexWidth = llvm::Log2_64_Ceil(sourceCount);
+  SmallVector<StringAttr> regionNames;
+  std::set<std::string> uniqueNames;
+  for (auto [i, a] : llvm::enumerate(catalog)) {
+    auto d = dyn_cast<DictionaryAttr>(a);
+    auto name = d ? d.getAs<StringAttr>("name") : StringAttr();
+    auto slave = d ? d.getAs<IntegerAttr>("slave") : IntegerAttr();
+    if (!name || name.getValue().empty() || !slave || slave.getInt() != int64_t(i) ||
+        !uniqueNames.insert(name.getValue().str()).second)
+      return reject("control write arbiter requires unique region names and ordered decoded-slave indices");
+    regionNames.push_back(name);
+  }
   bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("control write arbiter requires an uninstantiated top");
@@ -57,20 +73,18 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
     auto it = old.find(r.name);
     if (it == old.end() || inner.getPorts()[it->second].type != r.type ||
         inner.getPorts()[it->second].direction != r.direction)
-      return reject("control write arbiter requires exact U250 clock, dispatch and error boundaries");
+      return reject("control write arbiter requires exact clock and error response boundaries");
   }
   std::set<std::string> widgetPorts;
-  const std::map<unsigned, llvm::StringRef> expected{{2, "tracerv_ctrl"}, {4, "loadmem_ctrl"},
-      {5, "peekPokeBridge_ctrl"}, {6, "uartBridge_ctrl"}, {7, "clockBridge_ctrl"},
-      {9, "resetBridge_ctrl"}, {10, "cpuStream_ctrl"}};
   for (auto a : bindings) {
     auto d = dyn_cast<DictionaryAttr>(a);
     auto port = d ? d.getAs<StringAttr>("port") : StringAttr();
     auto slave = d ? d.getAs<IntegerAttr>("slave") : IntegerAttr();
-    if (!port || !slave || !expected.count(slave.getInt()) ||
-        expected.at(slave.getInt()) != port.getValue() || widgets.count(slave.getInt()) ||
+    auto name = d ? d.getAs<StringAttr>("name") : StringAttr();
+    if (!port || !slave || !name || slave.getInt() < 0 || slave.getInt() >= slaveCount ||
+        regionNames[slave.getInt()] != name || widgets.count(slave.getInt()) ||
         !widgetPorts.insert(port.getValue().str()).second)
-      return reject("control write arbiter requires the seven mapped U250 widget indices");
+      return reject("control write arbiter read bindings must identify unique decoded slaves and matching region names");
     auto it = old.find(port.getValue().str());
     if (it == old.end() || inner.getPorts()[it->second].type != controlType ||
         inner.getPorts()[it->second].direction != Direction::In)
@@ -86,28 +100,29 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
     hpIndex[n] = hp.size(); hp.push_back({b.getStringAttr(n), t, d});
   };
   port("clock", ClockType::get(ctx), Direction::In);
-  for (unsigned i = 0; i < 12; ++i) {
+  for (unsigned i = 0; i < sourceCount; ++i) {
     std::string p = "in_" + std::to_string(i) + "_";
     port(p + "ready", uint(1), Direction::Out); port(p + "valid", uint(1), Direction::In);
     for (auto l : leaves) port(p + "bits_" + l.name, uint(l.width), Direction::In);
   }
   port("out_ready", uint(1), Direction::In); port("out_valid", uint(1), Direction::Out);
   for (auto l : leaves) port(std::string("out_bits_") + l.name, uint(l.width), Direction::Out);
-  port("chosen", uint(4), Direction::Out);
+  port("chosen", uint(indexWidth), Direction::Out);
   SmallVector<PortInfo> ports;
   for (auto p : inner.getPorts()) if (!consumed.count(p.name.getValue().str())) {
     copied[p.name.getValue().str()] = ports.size(); ports.push_back(p);
   }
   for (unsigned i = 1; i < hp.size(); ++i) {
     auto n = hp[i].name.getValue(); bool outside = n.starts_with("out_") || n == "chosen";
-    for (unsigned slave : {0u, 1u, 3u, 8u}) outside |= n.starts_with("in_" + std::to_string(slave) + "_");
+    for (unsigned slave = 0; slave < slaveCount; ++slave)
+      if (!widgets.count(slave)) outside |= n.starts_with("in_" + std::to_string(slave) + "_");
     if (outside) {
       auto p = hp[i]; exposed[n.str()] = ports.size();
       p.name = b.getStringAttr("ctrl_write_arb_" + n.str()); ports.push_back(p);
     }
   }
   std::map<std::string, unsigned> retirement;
-  for (unsigned i = 0; i < 12; ++i) for (auto suffix : {"valid", "tag"}) {
+  for (unsigned i = 0; i < sourceCount; ++i) for (auto suffix : {"valid", "tag"}) {
     std::string n = "ctrl_write_tracker_deq_" + std::to_string(i) + "_" + suffix;
     if (old.count(n)) return reject("control write arbiter retirement boundary already exists");
     retirement[n] = ports.size();
@@ -116,7 +131,7 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto helper = b.create<FModuleOp>(loc, b.getStringAttr(helperName),
       ConventionAttr::get(ctx, Convention::Internal), hp);
-  helper->setAttr("goldengate.writeArbiterSources", b.getI32IntegerAttr(12));
+  helper->setAttr("goldengate.writeArbiterSources", b.getI32IntegerAttr(sourceCount));
   b.setInsertionPointToStart(helper.getBodyBlock());
   auto arg = [&](llvm::StringRef n) { return helper.getBodyBlock()->getArgument(hpIndex.at(n.str())); };
   auto constant = [&](unsigned w, uint64_t n) -> Value { return b.create<ConstantOp>(loc, uint(w), APInt(w, n)); };
@@ -125,35 +140,35 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
   auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
   auto invert = [&](Value v) -> Value { return b.create<NotPrimOp>(loc, v); };
   auto mux = [&](Value s, Value y, Value n) -> Value { return b.create<MuxPrimOp>(loc, s, y, n); };
-  auto eq = [&](Value a, unsigned i) -> Value { return b.create<EQPrimOp>(loc, a, constant(4, i)); };
+  auto eq = [&](Value a, unsigned i) -> Value { return b.create<EQPrimOp>(loc, a, constant(indexWidth, i)); };
   // Chisel RRArbiter deliberately leaves this register uninitialized. Do not
-  // reset it: all sixteen initial four-bit values have defined two-state behavior.
-  Value lastGrant = b.create<RegOp>(loc, uint(4), arg("clock"), "lastGrant").getResult();
+  // reset it: every representable initial value has defined two-state behavior.
+  Value lastGrant = b.create<RegOp>(loc, uint(indexWidth), arg("clock"), "lastGrant").getResult();
   SmallVector<Value> masks, maskedPrefix{constant(1, 0)}, validPrefix{constant(1, 0)};
-  for (unsigned i = 0; i < 12; ++i) {
+  for (unsigned i = 0; i < sourceCount; ++i) {
     Value valid = arg("in_" + std::to_string(i) + "_valid");
-    Value mask = b.create<GTPrimOp>(loc, constant(4, i), lastGrant);
+    Value mask = b.create<GTPrimOp>(loc, constant(indexWidth, i), lastGrant);
     masks.push_back(mask);
     Value request = both(valid, mask);
     maskedPrefix.push_back(b.create<OrPrimOp>(loc, maskedPrefix.back(), request));
     validPrefix.push_back(b.create<OrPrimOp>(loc, validPrefix.back(), valid));
   }
   // First valid index above lastGrant, otherwise first valid index overall.
-  // Chisel defaults chosen to index 11 when no inputs are valid.
-  Value chosen = constant(4, 11);
-  for (int i = 10; i >= 0; --i)
-    chosen = mux(arg("in_" + std::to_string(i) + "_valid"), constant(4, i), chosen);
-  for (int i = 11; i >= 1; --i)
-    chosen = mux(both(arg("in_" + std::to_string(i) + "_valid"), masks[i]), constant(4, i), chosen);
+  // Chisel defaults chosen to the final (error) source when no inputs are valid.
+  Value chosen = constant(indexWidth, slaveCount);
+  for (int i = int(sourceCount) - 2; i >= 0; --i)
+    chosen = mux(arg("in_" + std::to_string(i) + "_valid"), constant(indexWidth, i), chosen);
+  for (int i = int(sourceCount) - 1; i >= 1; --i)
+    chosen = mux(both(arg("in_" + std::to_string(i) + "_valid"), masks[i]), constant(indexWidth, i), chosen);
   auto select = [&](std::string suffix) -> Value {
     Value v = arg("in_0_" + suffix);
-    for (unsigned i = 1; i < 12; ++i) v = mux(eq(chosen, i), arg("in_" + std::to_string(i) + "_" + suffix), v);
+    for (unsigned i = 1; i < sourceCount; ++i) v = mux(eq(chosen, i), arg("in_" + std::to_string(i) + "_" + suffix), v);
     return v;
   };
   Value valid = select("valid"), fire = both(arg("out_ready"), valid);
   connect(arg("chosen"), chosen); connect(arg("out_valid"), valid);
   for (auto l : leaves) connect(arg(std::string("out_bits_") + l.name), select(std::string("bits_") + l.name));
-  for (unsigned i = 0; i < 12; ++i) {
+  for (unsigned i = 0; i < sourceCount; ++i) {
     // Grants are prefix permissions, not a one-hot chosen decoder. Invalid
     // sources can be ready alongside the sole valid accepted source.
     Value masked = both(invert(maskedPrefix[i]), masks[i]);
@@ -190,9 +205,10 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
     connect(field(r, "ready"), ap(p + "ready")); connect(ap(p + "valid"), field(r, "valid"));
     for (auto l : leaves) connect(ap(p + "bits_" + l.name), field(bits, l.name));
   }
-  connect(result("ctrl_error_b_ready"), ap("in_11_ready")); connect(ap("in_11_valid"), result("ctrl_error_b_valid"));
-  for (auto l : leaves) connect(ap(std::string("in_11_bits_") + l.name), result(std::string("ctrl_error_b_bits_") + l.name));
-  for (unsigned i = 0; i < 12; ++i) {
+  const std::string errorPrefix = "in_" + std::to_string(slaveCount) + "_";
+  connect(result("ctrl_error_b_ready"), ap(errorPrefix + "ready")); connect(ap(errorPrefix + "valid"), result("ctrl_error_b_valid"));
+  for (auto l : leaves) connect(ap(errorPrefix + "bits_" + l.name), result(std::string("ctrl_error_b_bits_") + l.name));
+  for (unsigned i = 0; i < sourceCount; ++i) {
     std::string p = "in_" + std::to_string(i) + "_", q = "ctrl_write_tracker_deq_" + std::to_string(i) + "_";
     connect(wrapper.getBodyBlock()->getArgument(retirement.at(q + "valid")), both(ap(p + "ready"), ap(p + "valid")));
     connect(wrapper.getBodyBlock()->getArgument(retirement.at(q + "tag")), ap(p + "bits_id"));
