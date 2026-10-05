@@ -256,9 +256,13 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
   // boundary; PrintBridge host stream synthesis is a separate porting step.
-  bool materializePrintPayloads =
-      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-payloads";
-  bool materializePrintConstructors =
+  bool materializePrintTokenConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-token-constructors";
+  bool materializePrintTokens = materializePrintTokenConstructors ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-tokens");
+  bool materializePrintPayloads = (materializePrintTokens && !materializePrintTokenConstructors) ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-payloads");
+  bool materializePrintConstructors = materializePrintTokenConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-payload-constructors";
   bool updatePrintBridgeClocks = materializePrintPayloads ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--update-print-bridge-clocks");
@@ -314,6 +318,7 @@ int main(int argc, char **argv) {
                     "--wire-print-stubs | --complete-print-synthesis | "
                     "--wire-print-reset | --update-print-bridge-clocks | "
                     "--materialize-print-payloads | --materialize-print-payload-constructors | "
+                    "--materialize-print-tokens | --materialize-print-token-constructors | "
                     "--wire-autocounter-print-stubs | "
                     "--analyze-autocounter-print-clocks | "
                     "--complete-autocounter-print-wiring | "
@@ -396,10 +401,14 @@ int main(int argc, char **argv) {
     llvm::SmallVector<FModuleOp> payloads;
     if (failed(goldengate::materializePrintBridgePayloads(circuit, payloads, error)))
       return fail("PrintBridge payload materialization: " + error);
+    llvm::SmallVector<FModuleOp> stages;
+    if (materializePrintTokens &&
+        failed(goldengate::materializePrintBridgeTokenStages(circuit, payloads, stages, error)))
+      return fail("PrintBridge token stage materialization: " + error);
     if (failed(mlir::verify(*module)))
       return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
-    llvm::sys::path::append(irPath, "post-print-payloads.mlir");
+    llvm::sys::path::append(irPath, materializePrintTokens ? "post-print-tokens.mlir" : "post-print-payloads.mlir");
     llvm::sys::path::append(firPath, "post-print-payloads.fir");
     llvm::sys::path::append(summaryPath, "print-payloads.json");
     std::error_code ec;
@@ -457,6 +466,38 @@ int main(int argc, char **argv) {
     if (ec) return fail("cannot write print payload summary: " + ec.message());
     metadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
     llvm::outs() << "Materialized " << payloads.size() << " PrintBridge combinational payload modules\n";
+    if (materializePrintTokens) {
+      llvm::SmallString<256> stagePath(outputDir), stageSummaryPath(outputDir), stageAnnosPath(outputDir);
+      llvm::sys::path::append(stagePath, "post-print-tokens.fir");
+      llvm::sys::path::append(stageSummaryPath, "print-token-stages.json");
+      llvm::sys::path::append(stageAnnosPath, "post-print-tokens-all.json");
+      if (failed(goldengate::emitAllAnnotations(circuit, stageAnnosPath, error)))
+        return fail("cannot export print token stage annotations: " + error);
+      // The standalone stage boundary takes already packed valid/data. ROI
+      // registers and width adaptation will connect these modules in a later port.
+      if (!stages.empty()) payloadCircuit.setName(stages.front().getName());
+      for (auto stage : stages) payloadBuilder.insert(stage->clone());
+      llvm::raw_fd_ostream stageFir(stagePath, ec);
+      if (ec || failed(mlir::verify(*payloadIR)) ||
+          failed(exportFIRFile(*payloadIR, stageFir, std::nullopt, exportFIRVersion)))
+        return fail("cannot export print token stage FIRRTL");
+      llvm::json::Array stageSummary;
+      for (auto stage : stages) {
+        auto layout = stage->getAttrOfType<DictionaryAttr>("goldengate.printTokenStage");
+        stageSummary.push_back(llvm::json::Object{
+            {"module", stage.getName().str()},
+            {"payloadModule", layout.getAs<StringAttr>("payloadModule").getValue().str()},
+            {"bridgeTarget", layout.getAs<StringAttr>("bridgeTarget").getValue().str()},
+            {"resetPortName", layout.getAs<StringAttr>("resetPortName").getValue().str()},
+            {"tokenBits", layout.getAs<IntegerAttr>("tokenBits").getInt()},
+            {"idleCycleBits", layout.getAs<IntegerAttr>("idleCycleBits").getInt()},
+            {"queueDepth", 1}, {"pipe", true}, {"flow", false}});
+      }
+      llvm::raw_fd_ostream stageMetadata(stageSummaryPath, ec);
+      if (ec) return fail("cannot write print token stage summary: " + ec.message());
+      stageMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(stageSummary)));
+      llvm::outs() << "Materialized " << stages.size() << " PrintBridge accepted-cycle token stages\n";
+    }
     return 0;
   };
   if (materializePrintConstructors) return emitPrintPayloadBoundary();
