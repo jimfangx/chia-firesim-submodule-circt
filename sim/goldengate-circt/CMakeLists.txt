@@ -44,6 +44,7 @@ add_executable(goldengate-circt
   lib/Transforms/PrintBridgePayload.cpp
   lib/Transforms/PrintBridgeTokenStage.cpp
   lib/Transforms/PrintBridgeControl.cpp
+  lib/Transforms/PrintBridgeConfig.cpp
   lib/Transforms/AutoILAWiring.cpp
   lib/Transforms/GlobalResetWiring.cpp
   lib/Analysis/PrintClockSources.cpp
@@ -237,6 +238,17 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-print-control-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-print-control COMMAND goldengate-print-control-test)
+  add_executable(goldengate-print-config-test
+    test/Transforms/PrintBridgeConfigTest.cpp
+    lib/Transforms/PrintBridgePayload.cpp lib/Transforms/PrintBridgeTokenStage.cpp
+    lib/Transforms/PrintBridgeControl.cpp lib/Transforms/PrintBridgeConfig.cpp)
+  target_compile_features(goldengate-print-config-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-print-config-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-print-config-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-print-config-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-print-config COMMAND goldengate-print-config-test)
   add_executable(goldengate-print-stubs-test
     test/Transforms/PrintStubsTest.cpp lib/Transforms/PrintStubs.cpp
     lib/Support/TargetUtils.cpp)

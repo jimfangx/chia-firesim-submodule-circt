@@ -35,4 +35,11 @@ mlir::LogicalResult materializePrintBridgeControls(
     llvm::ArrayRef<circt::firrtl::FModuleOp> stages,
     llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
     std::string &error);
+// Six readable/writable MCR words and Pulsify state feed the ROI wrapper.
+// This decoded register boundary does not yet allocate an AXI/stream region.
+mlir::LogicalResult materializePrintBridgeConfigs(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> controls,
+    llvm::SmallVectorImpl<circt::firrtl::FModuleOp> &modules,
+    std::string &error);
 } // namespace goldengate

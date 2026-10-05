@@ -256,9 +256,13 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--wire-autocounter-print-stubs");
   // Enabled ordinary prints currently terminate at the pre-FAME debug
   // boundary; PrintBridge host stream synthesis is a separate porting step.
-  bool materializePrintControlConstructors =
+  bool materializePrintConfigConstructors =
+      argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-config-constructors";
+  bool materializePrintConfigs = materializePrintConfigConstructors ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-configs");
+  bool materializePrintControlConstructors = materializePrintConfigConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-control-constructors";
-  bool materializePrintControls = materializePrintControlConstructors ||
+  bool materializePrintControls = materializePrintConfigs || materializePrintControlConstructors ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-controls");
   bool materializePrintTokenConstructors = materializePrintControlConstructors ||
       argc == 7 && llvm::StringRef(argv[6]) == "--materialize-print-token-constructors";
@@ -323,6 +327,7 @@ int main(int argc, char **argv) {
                     "--wire-print-reset | --update-print-bridge-clocks | "
                     "--materialize-print-payloads | --materialize-print-payload-constructors | "
                     "--materialize-print-tokens | --materialize-print-token-constructors | "
+                    "--materialize-print-configs | --materialize-print-config-constructors | "
                     "--materialize-print-controls | --materialize-print-control-constructors | "
                     "--wire-autocounter-print-stubs | "
                     "--analyze-autocounter-print-clocks | "
@@ -414,10 +419,14 @@ int main(int argc, char **argv) {
     if (materializePrintControls &&
         failed(goldengate::materializePrintBridgeControls(circuit, payloads, stages, controls, error)))
       return fail("PrintBridge control materialization: " + error);
+    llvm::SmallVector<FModuleOp> configs;
+    if (materializePrintConfigs &&
+        failed(goldengate::materializePrintBridgeConfigs(circuit, controls, configs, error)))
+      return fail("PrintBridge config materialization: " + error);
     if (failed(mlir::verify(*module)))
       return fail("PrintBridge payload materialization produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), firPath(outputDir), summaryPath(outputDir);
-    llvm::sys::path::append(irPath, materializePrintControls ? "post-print-controls.mlir" :
+    llvm::sys::path::append(irPath, materializePrintConfigs ? "post-print-configs.mlir" : materializePrintControls ? "post-print-controls.mlir" :
         materializePrintTokens ? "post-print-tokens.mlir" : "post-print-payloads.mlir");
     llvm::sys::path::append(firPath, "post-print-payloads.fir");
     llvm::sys::path::append(summaryPath, "print-payloads.json");
@@ -534,6 +543,44 @@ int main(int argc, char **argv) {
         if (ec) return fail("cannot write print control summary: " + ec.message());
         controlMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(controlSummary)));
         llvm::outs() << "Materialized " << controls.size() << " PrintBridge ROI/cycle control wrappers\n";
+        if (materializePrintConfigs) {
+          llvm::SmallString<256> configPath(outputDir), configAnnosPath(outputDir), configSummaryPath(outputDir);
+          llvm::sys::path::append(configPath, "post-print-configs.fir");
+          llvm::sys::path::append(configAnnosPath, "post-print-configs-all.json");
+          llvm::sys::path::append(configSummaryPath, "print-configs.json");
+          if (failed(goldengate::emitAllAnnotations(circuit, configAnnosPath, error)))
+            return fail("cannot export print config annotations: " + error);
+          if (!configs.empty()) payloadCircuit.setName(configs.front().getName());
+          for (auto config : configs) payloadBuilder.insert(config->clone());
+          llvm::raw_fd_ostream configFir(configPath, ec);
+          if (ec || failed(mlir::verify(*payloadIR)) ||
+              failed(exportFIRFile(*payloadIR, configFir, std::nullopt, exportFIRVersion)))
+            return fail("cannot export print config FIRRTL");
+          llvm::json::Array configSummary;
+          for (auto config : configs) {
+            auto layout = config->getAttrOfType<DictionaryAttr>("goldengate.printConfig");
+            llvm::json::Object entry{{"module", config.getName().str()}};
+            for (auto key : {"controlModule", "bridgeTarget", "resetPortName"})
+              entry[key] = layout.getAs<StringAttr>(key).getValue().str();
+            for (auto key : {"tokenBits", "flushPulseLength"})
+              entry[key] = layout.getAs<IntegerAttr>(key).getInt();
+            llvm::json::Array registers;
+            for (auto attr : layout.getAs<ArrayAttr>("registers")) {
+              auto reg = cast<DictionaryAttr>(attr); llvm::json::Object object;
+              for (auto key : {"name", "permissions", "reset"})
+                object[key] = reg.getAs<StringAttr>(key).getValue().str();
+              for (auto key : {"word", "byteOffset", "bits"})
+                object[key] = reg.getAs<IntegerAttr>(key).getInt();
+              registers.push_back(std::move(object));
+            }
+            entry["registers"] = std::move(registers);
+            configSummary.push_back(std::move(entry));
+          }
+          llvm::raw_fd_ostream configMetadata(configSummaryPath, ec);
+          if (ec) return fail("cannot write print config summary: " + ec.message());
+          configMetadata << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(configSummary)));
+          llvm::outs() << "Materialized " << configs.size() << " PrintBridge configuration banks\n";
+        }
       }
     }
     return 0;
