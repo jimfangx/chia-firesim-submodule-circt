@@ -29,7 +29,8 @@ mlir::LogicalResult mapPeekPokeBridgeControl(circt::firrtl::CircuitOp circuit,
 mlir::LogicalResult mapTracerVBridgeControl(circt::firrtl::CircuitOp circuit,
                                            unsigned addressBits, unsigned idBits,
                                            std::string &error);
-// CPUManagedStreamEngine has one read-only count word; all addresses alias it.
+// Map the ordered CPU stream occupancy bank using its actual MCR vector size.
+// A single-word bank retains the Scala behavior where all addresses alias it.
 mlir::LogicalResult mapCPUStreamControl(circt::firrtl::CircuitOp circuit,
                                        unsigned addressBits, unsigned idBits,
                                        std::string &error);

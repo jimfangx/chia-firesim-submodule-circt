@@ -320,7 +320,23 @@ LogicalResult goldengate::mapTracerVBridgeControl(CircuitOp circuit,
 
 LogicalResult goldengate::mapCPUStreamControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
-  return mapBridgeControl(circuit, addressBits, idBits, 1,
+  // The stream allocator supplies an ordered occupancy bank. Infer its word
+  // count from the actual FIRRTL interface; mapBridgeControl validates the
+  // complete read/write token types before constructing the AXI MCRFile.
+  unsigned bankWords = 0;
+  for (auto top : circuit.getOps<FModuleOp>())
+    if (top.getName() == circuit.getName())
+      for (auto port : top.getPorts()) if (port.name == "cpuStream_mcr") {
+        auto bundle = dyn_cast<BundleType>(port.type);
+        auto read = bundle ? bundle.getElement("read") : std::nullopt;
+        auto words = read ? dyn_cast<FVectorType>(read->type) : FVectorType();
+        if (words) bankWords = words.getNumElements();
+      }
+  if (!bankWords) {
+    error = "CPU stream control requires a nonempty occupancy bank";
+    return failure();
+  }
+  return mapBridgeControl(circuit, addressBits, idBits, bankWords,
       "GGCPUStreamCountWrapper", "GGCPUStreamControlWrapper",
       "GGCPUStreamMCRFile", "cpuStream_mcr", "cpuStream_ctrl", error);
 }

@@ -1611,4 +1611,15 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-control-write-dispatch-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-control-write-dispatch COMMAND goldengate-control-write-dispatch-test)
+  add_executable(goldengate-cpu-stream-count-bank-test
+    test/Transforms/CPUStreamCountBankTest.cpp
+    lib/Transforms/CPUStreamCountBank.cpp
+    lib/Transforms/ClockBridgeControl.cpp)
+  target_compile_features(goldengate-cpu-stream-count-bank-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-cpu-stream-count-bank-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-cpu-stream-count-bank-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-cpu-stream-count-bank-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-cpu-stream-count-bank COMMAND goldengate-cpu-stream-count-bank-test)
 endif()
