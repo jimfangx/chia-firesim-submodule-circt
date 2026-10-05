@@ -1063,146 +1063,57 @@ int main(int argc, char **argv) {
       llvm::outs() << "Inferred CIRCT model ports in "
                    << inferredPortsIRPath << '\n';
 
-      // Trace selected outputs while their payload ports still have
-      // their original FIRRTL identities. Include the input bindings so a
-      // missing dependency cannot be mistaken for an independent output.
-      std::map<std::string, goldengate::LocalChannelDependency> outputDependencies;
-      {
-        auto dependencyHierarchy = goldengate::analyzeTopHierarchy(circuit, error);
-        if (!dependencyHierarchy)
-          return fail("FAME output dependency hierarchy: " + error);
-        auto dependencyAnnotations =
-            circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
-        llvm::SmallVector<goldengate::ModelPortGroup> dependencyGroups;
-        for (auto attr : dependencyAnnotations) {
-          Annotation annotation(attr);
-          if (!annotation.isClass(goldengate::AnnotationClasses::ChannelPorts))
-            continue;
-          auto group = goldengate::analyzeModelPortGroup(circuit, annotation,
-                                                        error);
-          if (!group)
-            return fail("FAME dependency model ports: " + error);
-          dependencyGroups.push_back(std::move(*group));
-        }
-        llvm::SmallVector<goldengate::ModelChannelBinding> dependencyBindings;
-        FModuleOp dependencyModel;
-        for (auto attr : dependencyAnnotations) {
-          Annotation annotation(attr);
-          if (!annotation.isClass(goldengate::AnnotationClasses::ChannelConnection))
-            continue;
-          auto name = annotation.getMember<mlir::StringAttr>("globalName");
-          if (!name || (name.getValue() != "peekPokeBridge_reset" &&
-                        name.getValue() != "resetBridge_reset" &&
-                        name.getValue() != "ep_bdev_info_max_req_len" &&
-                        name.getValue() != "ep_bdev_info_nsectors" &&
-                        name.getValue() != "ep_bdev_data_rev" &&
-                        name.getValue() != "ep_bdev_req_rev" &&
-                        name.getValue() != "ep_bdev_resp_fwd" &&
-                        name.getValue() != "ep_bdev_data_fwd" &&
-                        name.getValue() != "ep_bdev_req_fwd" &&
-                        name.getValue() != "ep_bdev_resp_rev" &&
-                        name.getValue() != "ep_reset" &&
-                        name.getValue() != "ep_1_reset" &&
-                        name.getValue() != "ep_1_uart_rxd" &&
-                        name.getValue() != "ep_1_uart_txd" &&
-                        name.getValue() != "ep_2_reset" &&
-                        name.getValue() != "ep_3_reset" &&
-                        name.getValue() != "ep_3_tsi_in_fwd" &&
-                        name.getValue() != "ep_3_tsi_out_rev" &&
-                        name.getValue() != "ep_3_tsi_in_rev" &&
-                        name.getValue() != "ep_3_tsi_out_fwd" &&
-                        name.getValue() != "ep_2_axi4_ar_fwd" &&
-                        name.getValue() != "ep_2_axi4_w_fwd" &&
-                        name.getValue() != "ep_2_axi4_aw_fwd" &&
-                        name.getValue() != "ep_2_axi4_r_rev" &&
-                        name.getValue() != "ep_2_axi4_b_rev" &&
-                        name.getValue() != "tracerv_tiletrace_reset" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_valid" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_iaddr" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_insn" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_priv" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_exception" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_interrupt" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_cause" &&
-                        name.getValue() !=
-                            "tracerv_tiletrace_trace_retiredinsns_0_tval" &&
-                        name.getValue() != "tracerv_tiletrace_trace_time"))
-            continue;
-          auto channel = goldengate::analyzeChannelConnection(
-              circuit, annotation, error);
-          if (!channel)
-            return fail("FAME dependency channel: " + error);
-          auto bindings = goldengate::bindChannelToModels(
-              *channel, *dependencyHierarchy, dependencyGroups, error);
-          if (!bindings || bindings->size() != 1)
-            return fail("FAME dependency model binding: " + error);
-          if (name.getValue() == "ep_bdev_data_fwd") {
-            auto boundModule = bindings->front().portGroup->module;
-            dependencyModel = dyn_cast<FModuleOp>(boundModule.getOperation());
-          }
-          dependencyBindings.push_back(std::move(bindings->front()));
-        }
-        if (!dependencyModel || dependencyBindings.size() != 35)
-          return fail("FAME output dependency channels are incomplete");
-        auto dependencies = goldengate::analyzeLocalChannelDependencies(
-            dependencyModel, dependencyBindings);
-        for (auto &dependency : dependencies)
-          if (dependency.outputChannel == "ep_bdev_data_fwd" ||
-              dependency.outputChannel == "ep_bdev_req_fwd" ||
-              dependency.outputChannel == "ep_bdev_resp_ready" ||
-              dependency.outputChannel == "ep_reset" ||
-              dependency.outputChannel == "ep_1_reset" ||
-              dependency.outputChannel == "ep_1_uart_txd" ||
-              dependency.outputChannel == "ep_2_reset" ||
-              dependency.outputChannel == "ep_3_reset" ||
-              dependency.outputChannel == "ep_3_tsi_in_ready" ||
-              dependency.outputChannel == "ep_3_tsi_out_fwd" ||
-              dependency.outputChannel == "ep_2_axi4_ar_fwd" ||
-              dependency.outputChannel == "ep_2_axi4_w_fwd" ||
-              dependency.outputChannel == "ep_2_axi4_aw_fwd" ||
-              dependency.outputChannel == "ep_2_axi4_r_ready" ||
-              dependency.outputChannel == "ep_2_axi4_b_ready" ||
-              dependency.outputChannel == "tracerv_tiletrace_reset" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_valid" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_iaddr" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_insn" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_priv" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_exception" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_interrupt" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_cause" ||
-              dependency.outputChannel ==
-                  "tracerv_tiletrace_trace_retiredinsns_0_tval" ||
-              dependency.outputChannel == "tracerv_tiletrace_trace_time")
-            outputDependencies.emplace(dependency.outputChannel,
-                                       std::move(dependency));
-        if (outputDependencies.size() != 25)
-          return fail("FAME output dependencies were not found");
-        for (const auto &[name, dependency] : outputDependencies)
-          if (!dependency.unresolvedPorts.empty() ||
-              !dependency.unresolvedCauses.empty()) {
-            std::string detail = "FAME output " + name +
-                                 " has unresolved combinational dependencies:";
-            for (const auto &port : dependency.unresolvedPorts)
-              detail += " port=" + port;
-            for (const auto &cause : dependency.unresolvedCauses)
-              detail += " cause=" + cause;
-            return fail(detail);
-          }
+      // Snapshot annotation-selected outputs and all data input dependencies
+      // before channelization changes port identities. This baseline path
+      // currently supports one model/clock hub.
+      llvm::SmallVector<goldengate::FAMEOutputSelection> selectedOutputs;
+      FModuleOp selectedOutputModel;
+      for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {
+        Annotation annotation(attr);
+        if (!annotation.isClass(goldengate::AnnotationClasses::FAMETransform))
+          continue;
+        auto target = annotation.getMember<mlir::StringAttr>("target");
+        if (!target)
+          return fail("FAME output selection needs a model target");
+        auto resolved = goldengate::resolveAnnotationTarget(
+            circuit, target.getValue(), error);
+        auto model = resolved && !resolved->port
+                         ? dyn_cast<FModuleOp>(resolved->module.getOperation())
+                         : FModuleOp{};
+        if (!model)
+          return fail("FAME output selection has an invalid model target: " + error);
+        if (selectedOutputModel && selectedOutputModel != model)
+          return fail("baseline FAME output selection needs one model");
+        selectedOutputModel = model;
       }
+      if (!selectedOutputModel)
+        return fail("FAME output selection has no transformed model");
+      auto outputSelection = goldengate::analyzeFAMEOutputSelection(
+          circuit, selectedOutputModel, error);
+      if (!outputSelection)
+        return fail("FAME output selection: " + error);
+      selectedOutputs = std::move(*outputSelection);
+      llvm::json::Array outputInventory;
+      for (const auto &output : selectedOutputs) {
+        llvm::json::Array dependencies;
+        for (const auto &input : output.dependency.inputChannels)
+          dependencies.push_back(input);
+        outputInventory.push_back(llvm::json::Object{
+            {"globalName", output.globalName}, {"localName", output.localName},
+            {"fieldCount", output.fieldCount},
+            {"inputChannels", std::move(dependencies)}});
+      }
+      llvm::SmallString<256> outputSelectionPath(outputDir);
+      llvm::sys::path::append(outputSelectionPath, "fame-output-selection.json");
+      std::error_code selectionWriteError;
+      llvm::raw_fd_ostream selectionOut(outputSelectionPath, selectionWriteError);
+      if (selectionWriteError)
+        return fail("cannot write FAME output selection: " +
+                    selectionWriteError.message());
+      selectionOut << llvm::formatv("{0:2}\n", llvm::json::Value(
+          llvm::json::Object{{"model", selectedOutputModel.getName().str()},
+                             {"outputs", std::move(outputInventory)}}));
+      selectionOut.close();
 
       auto currentAnnotations =
           circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
@@ -1288,6 +1199,8 @@ int main(int argc, char **argv) {
           *clockChannel, *clockHierarchy, clockGroups, error);
       if (!clockBindings || clockBindings->size() != 1)
         return fail("FAME clock model binding: " + error);
+      if (clockGroup->module.getOperation() != selectedOutputModel.getOperation())
+        return fail("baseline FAME output model differs from clock hub");
       llvm::SmallVector<FModuleLike> clockModels;
       clockModels.push_back(clockGroup->module);
       llvm::SmallVector<goldengate::GGChannelConnection, 0> clockChannels;
@@ -1731,38 +1644,15 @@ int main(int argc, char **argv) {
       llvm::outs() << "Wired partial CIRCT FAME cycle completion in "
                    << finishingIRPath << '\n';
 
-      // The block-device forward halves have three and five payload fields.
-      // The response ready, TSI ready, and model reset halves have one scalar
-      // field each.
-      // Resolve hierarchy after each port mutation.
+      // Resolve hierarchy after each mutation; selections contain no stale
+      // model port indices or pointers. Artifact ordinals carry no semantics.
       llvm::SmallVector<std::string> convertedOutputs;
-      for (const auto &[outputName, outputOrdinal, expectedFields] :
-           {std::tuple<llvm::StringRef, llvm::StringRef, unsigned>{
-                "ep_bdev_data_fwd", "first", 3},
-            {"ep_bdev_req_fwd", "second", 5},
-            {"ep_bdev_resp_rev", "third", 1},
-            {"ep_reset", "fourth", 1},
-            {"ep_1_reset", "fifth", 1},
-            {"ep_1_uart_txd", "sixth", 1},
-            {"ep_2_reset", "seventh", 1},
-            {"ep_3_reset", "eighth", 1},
-            {"ep_3_tsi_in_rev", "ninth", 1},
-            {"ep_3_tsi_out_fwd", "tenth", 2},
-            {"ep_2_axi4_ar_fwd", "eleventh", 12},
-            {"ep_2_axi4_w_fwd", "twelfth", 6},
-            {"ep_2_axi4_aw_fwd", "thirteenth", 12},
-            {"ep_2_axi4_r_rev", "fourteenth", 1},
-            {"ep_2_axi4_b_rev", "fifteenth", 1},
-            {"tracerv_tiletrace_reset", "sixteenth", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_valid", "seventeenth", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_iaddr", "eighteenth", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_insn", "nineteenth", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_priv", "twentieth", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_exception", "twenty-first", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_interrupt", "twenty-second", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_cause", "twenty-third", 1},
-            {"tracerv_tiletrace_trace_retiredinsns_0_tval", "twenty-fourth", 1},
-            {"tracerv_tiletrace_trace_time", "twenty-fifth", 1}}) {
+      unsigned outputIndex = 0;
+      for (const auto &selectedOutput : selectedOutputs) {
+      const auto &outputName = selectedOutput.globalName;
+      const auto expectedFields = selectedOutput.fieldCount;
+      const auto expectedKind = selectedOutput.kind;
+      const auto outputOrdinal = std::to_string(++outputIndex);
       auto outputHierarchy = goldengate::analyzeTopHierarchy(circuit, error);
       if (!outputHierarchy)
         return fail("FAME output hierarchy: " + error);
@@ -1778,61 +1668,34 @@ int main(int argc, char **argv) {
             outputChannel = goldengate::analyzeChannelConnection(
                 circuit, annotation, error);
             if (!outputChannel)
-              return fail("FAME forward channel: " + error);
+              return fail("FAME output channel: " + error);
           }
         } else if (annotation.isClass(goldengate::AnnotationClasses::ChannelPorts)) {
           auto group = goldengate::analyzeModelPortGroup(circuit, annotation,
                                                         error);
           if (!group)
-            return fail("FAME forward model ports: " + error);
+            return fail("FAME output model ports: " + error);
           outputGroups.push_back(std::move(*group));
         }
       }
-      auto expectedKind = outputName == "ep_bdev_resp_rev" ||
-                                  outputName == "ep_3_tsi_in_rev" ||
-                                  outputName == "ep_2_axi4_r_rev" ||
-                                  outputName == "ep_2_axi4_b_rev"
-                              ? goldengate::ChannelKind::DecoupledReverse
-                              : outputName == "ep_reset" || outputName == "ep_1_reset" ||
-                                        outputName == "ep_1_uart_txd" ||
-                                        outputName == "ep_2_reset" ||
-                                        outputName == "ep_3_reset" ||
-                                        outputName == "tracerv_tiletrace_reset" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_valid" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_iaddr" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_insn" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_priv" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_exception" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_interrupt" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_cause" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_retiredinsns_0_tval" ||
-                                        outputName ==
-                                            "tracerv_tiletrace_trace_time"
-                                    ? goldengate::ChannelKind::Pipe
-                                    : goldengate::ChannelKind::DecoupledForward;
       if (!outputChannel || outputChannel->kind != expectedKind ||
           outputChannel->sources.size() != expectedFields)
-        return fail("FAME block-device output payload count or kind differs from the oracle");
+        return fail("FAME output payload count or kind changed");
       auto outputBindings = goldengate::bindChannelToModels(
           *outputChannel, *outputHierarchy, outputGroups, error);
       if (!outputBindings || outputBindings->size() != 1)
-        return fail("FAME forward model binding: " + error);
+        return fail("FAME output model binding: " + error);
       auto outputGroup = *outputBindings->front().portGroup;
+      if (outputGroup.module.getOperation() != selectedOutputModel.getOperation() ||
+          outputGroup.name != selectedOutput.localName)
+        return fail("FAME output model binding changed: " + outputName);
       llvm::SmallVector<goldengate::GGChannelConnection, 0> oneOutput{
           *outputChannel};
       llvm::SmallVector<FModuleLike> outputModels{outputGroup.module};
       auto outputPlan = goldengate::analyzeFAMEPorts(
           *outputHierarchy, *outputBindings, oneOutput, outputModels, error);
       if (!outputPlan || outputPlan->sources.size() != 1)
-        return fail("FAME forward port plan: " + error);
+        return fail("FAME output port plan: " + error);
       const auto &outputPort = outputPlan->sources.front();
       struct OutputRename {
         std::string oldTop, newTop, oldModel, newModel;
@@ -1852,11 +1715,11 @@ int main(int argc, char **argv) {
           if (connection.instance == outputBindings->front().instance &&
               connection.instancePort == modelPort) {
             if (topPort)
-              return fail("FAME forward output has multiple top connections");
+              return fail("FAME output has multiple top connections");
             topPort = connection.topPort;
           }
         if (!topPort)
-          return fail("FAME forward output has no top connection");
+          return fail("FAME output has no top connection");
         auto oldTop = outputHierarchy->top.getPortName(*topPort);
         auto oldModel = outputGroup.module.getPortName(modelPort);
         auto topField = outputBindings->front().instancePorts.size() == 1
@@ -1875,7 +1738,7 @@ int main(int argc, char **argv) {
       }
       if (failed(goldengate::rewriteFAMEOutputChannel(
               *outputHierarchy, outputPort, error)))
-        return fail("FAME forward output channel: " + error);
+        return fail("FAME output channel: " + error);
       llvm::SmallVector<mlir::Attribute> rewrittenOutputAnnotations;
       unsigned outputTopRenames = 0, outputModelRenames = 0;
       unsigned outputValidRenames = 0, outputReadyRenames = 0;
@@ -1914,7 +1777,7 @@ int main(int argc, char **argv) {
           outputModelRenames != expectedFields ||
           outputValidRenames != (expectedKind == goldengate::ChannelKind::DecoupledForward) ||
           outputReadyRenames != (expectedKind == goldengate::ChannelKind::DecoupledReverse))
-        return fail("FAME forward output annotation targets were not unique");
+        return fail("FAME output annotation targets were not unique");
       circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(
           &context, rewrittenOutputAnnotations));
       for (const auto &rename : outputRenames)
@@ -1924,7 +1787,7 @@ int main(int argc, char **argv) {
                 circuit, rename.oldModel, rename.newModel, error))))
           return fail("FAME output debug target transfer: " + error);
       if (failed(mlir::verify(*module)))
-        return fail("FAME forward output produced invalid FIRRTL IR");
+        return fail("FAME output produced invalid FIRRTL IR");
       llvm::SmallString<256> outputIRPath(outputDir), outputAnnotationPath(outputDir);
       llvm::sys::path::append(outputIRPath,
                               "post-fame-" + outputOrdinal + "-output-channel.mlir");
@@ -1933,14 +1796,14 @@ int main(int argc, char **argv) {
       std::error_code outputWriteError;
       llvm::raw_fd_ostream outputOut(outputIRPath, outputWriteError);
       if (outputWriteError)
-        return fail("cannot write FAME forward output MLIR: " +
+        return fail("cannot write FAME output MLIR: " +
                     outputWriteError.message());
       module->print(outputOut);
       outputOut << '\n';
       outputOut.close();
       if (failed(goldengate::emitFAMEAnnotations(
               circuit, outputAnnotationPath, error)))
-        return fail("cannot export FAME forward output annotations: " + error);
+        return fail("cannot export FAME output annotations: " + error);
       llvm::outs() << "Channelized CIRCT FAME output " << outputChannel->name
                    << " in " << outputIRPath << '\n';
 
@@ -1958,7 +1821,7 @@ int main(int argc, char **argv) {
               clockModel, thisOutputFired, error)))
         return fail("FAME output fired register: " + error);
       llvm::SmallVector<goldengate::LocalChannelDependency> thisOutputDeps{
-          outputDependencies.at(outputGroup.name)};
+          selectedOutput.dependency};
       if (failed(goldengate::rewriteFAMEOutputValids(
               clockModel, thisOutputDeps, error)))
         return fail("FAME output valid: " + error);

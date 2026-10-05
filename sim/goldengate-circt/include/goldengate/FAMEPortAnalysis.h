@@ -2,6 +2,7 @@
 #pragma once
 
 #include "goldengate/ModelAnalysis.h"
+#include "goldengate/CombDependencyAnalysis.h"
 #include <optional>
 #include <string>
 
@@ -19,6 +20,21 @@ struct FAMEPortPlan {
   llvm::SmallVector<FAMETopChannelPort> sources;
   llvm::SmallVector<unsigned> staleTopPorts;
 };
+
+// Capture names and dependencies before any port rewrite invalidates indices.
+// Selection follows connection annotation order; payload order stays in the
+// connection's source list, independently of the model's physical port order.
+struct FAMEOutputSelection {
+  std::string globalName;
+  std::string localName;
+  ChannelKind kind;
+  unsigned fieldCount;
+  LocalChannelDependency dependency;
+};
+
+std::optional<llvm::SmallVector<FAMEOutputSelection>>
+analyzeFAMEOutputSelection(circt::firrtl::CircuitOp circuit,
+                           circt::firrtl::FModuleOp model, std::string &error);
 
 std::optional<FAMEPortPlan>
 analyzeFAMEPorts(const TopHierarchy &hierarchy,

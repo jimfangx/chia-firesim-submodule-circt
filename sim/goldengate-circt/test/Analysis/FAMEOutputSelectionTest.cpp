@@ -1,0 +1,261 @@
+// See LICENSE for license details.
+#include "goldengate/FAMEPortAnalysis.h"
+#include "goldengate/FAMEOutputChannel.h"
+#include "goldengate/AnnotationClasses.h"
+#include "circt/Dialect/HW/HWDialect.h"
+#include "mlir/IR/Builders.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
+#include "mlir/Parser/Parser.h"
+#include "llvm/Support/raw_ostream.h"
+#include <stdexcept>
+
+using namespace mlir;
+using namespace circt::firrtl;
+using goldengate::AnnotationClasses;
+namespace {
+void require(bool ok, const std::string &message) {
+  if (!ok) throw std::runtime_error(message);
+}
+std::string dump(Operation *op) {
+  std::string text;
+  llvm::raw_string_ostream out(text);
+  op->print(out);
+  return text;
+}
+// A pair of data directions and two unrelated printf channels. Connection
+// order, local channel names, and physical port order deliberately differ.
+void run(MLIRContext &context, unsigned rejection) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(in %hostClock: !firrtl.clock,
+          in %data: !firrtl.uint<8>, in %ready: !firrtl.uint<1>,
+          in %trigger: !firrtl.uint<1>, out %printfA: !firrtl.uint<8>,
+          out %forwardData: !firrtl.uint<8>, out %forwardValid: !firrtl.uint<1>,
+          out %reverseReady: !firrtl.uint<1>, out %printfB: !firrtl.uint<8>,
+          in %inputValid: !firrtl.uint<1>, in %otherData: !firrtl.uint<8>,
+          out %otherPrintf: !firrtl.uint<8>) {}
+      firrtl.module private @Model(in %clock: !firrtl.clock,
+          in %data: !firrtl.uint<8>, in %ready: !firrtl.uint<1>,
+          in %trigger: !firrtl.uint<1>, out %printfA: !firrtl.uint<8>,
+          out %forwardData: !firrtl.uint<8>, out %forwardValid: !firrtl.uint<1>,
+          out %reverseReady: !firrtl.uint<1>, out %printfB: !firrtl.uint<8>,
+          in %inputValid: !firrtl.uint<1>) {}
+      firrtl.module private @Other(in %data: !firrtl.uint<8>,
+                                  out %printf: !firrtl.uint<8>) {}
+      firrtl.extmodule private @BlackBox(out value: !firrtl.uint<8>)
+    }
+  })mlir", &context);
+  require(bool(root), "output selection fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto modules = circuit.getOps<FModuleOp>();
+  auto it = modules.begin();
+  auto top = *it++;
+  auto model = *it++;
+  auto other = *it;
+  OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
+  auto instance = b.create<InstanceOp>(top.getLoc(), model, "model");
+  for (unsigned i = 0; i < model.getNumPorts(); ++i) {
+    auto t = top.getBodyBlock()->getArgument(i);
+    auto m = instance.getResult(i);
+    bool input = model.getPortDirection(i) == Direction::In;
+    b.create<StrictConnectOp>(top.getLoc(), input ? m : t, input ? t : m);
+  }
+  auto otherInstance = b.create<InstanceOp>(top.getLoc(), other, "other");
+  b.create<StrictConnectOp>(top.getLoc(), otherInstance.getResult(0),
+                           top.getBodyBlock()->getArgument(10));
+  b.create<StrictConnectOp>(top.getLoc(), top.getBodyBlock()->getArgument(11),
+                           otherInstance.getResult(1));
+  b.setInsertionPointToEnd(other.getBodyBlock());
+  b.create<StrictConnectOp>(other.getLoc(), other.getBodyBlock()->getArgument(1),
+                           other.getBodyBlock()->getArgument(0));
+  b.setInsertionPointToEnd(model.getBodyBlock());
+  auto arg = [&](unsigned i) { return model.getBodyBlock()->getArgument(i); };
+  if (rejection == 7) {
+    auto external = *circuit.getOps<FExtModuleOp>().begin();
+    auto blackbox = b.create<InstanceOp>(model.getLoc(), external, "blackbox");
+    b.create<StrictConnectOp>(model.getLoc(), arg(4), blackbox.getResult(0));
+  } else if (rejection != 6) {
+    auto print = b.create<MuxPrimOp>(model.getLoc(), arg(3), arg(1), arg(1));
+    b.create<StrictConnectOp>(model.getLoc(), arg(4), print.getResult());
+  }
+  auto forward = b.create<MuxPrimOp>(model.getLoc(), arg(2), arg(1), arg(1));
+  b.create<StrictConnectOp>(model.getLoc(), arg(5), forward.getResult());
+  b.create<StrictConnectOp>(model.getLoc(), arg(6), arg(3));
+  b.create<StrictConnectOp>(model.getLoc(), arg(7), arg(2));
+  b.create<StrictConnectOp>(model.getLoc(), arg(8), arg(1));
+
+  auto strings = [&](ArrayRef<StringRef> ports, StringRef module) {
+    SmallVector<Attribute> targets;
+    for (auto port : ports)
+      targets.push_back(b.getStringAttr(("~Top|" + module + ">" + port).str()));
+    return b.getArrayAttr(targets);
+  };
+  SmallVector<Attribute> annotations;
+  auto group = [&](StringRef name, ArrayRef<StringRef> ports,
+                   StringRef module = "Model") {
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::ChannelPorts)),
+        b.getNamedAttr("localName", b.getStringAttr(name)),
+        b.getNamedAttr("ports", strings(ports, module))}));
+  };
+  group("print_local_a", {"printfA"});
+  group(rejection == 4 ? "print_local_a" : "print_local_b", {"printfB"});
+  group("tx_local", {"forwardData", "forwardValid"});
+  group("tx_ready_local", {"ready"});
+  group("rx_local", {"data", "inputValid"});
+  group("rx_ready_local", {"reverseReady"});
+  group("trigger_local", {"trigger"});
+  group("other_input", {"data"}, "Other");
+  group("other_print", {"printf"}, "Other");
+  if (rejection == 3) group("ambiguous_print", {"printfB"});
+  if (rejection == 5) annotations.erase(annotations.begin());
+  auto channel = [&](StringRef name, StringRef kind,
+                     ArrayRef<StringRef> sources, ArrayRef<StringRef> sinks,
+                     StringRef valid = "", StringRef ready = "") {
+    SmallVector<NamedAttribute> info{
+        b.getNamedAttr("class", b.getStringAttr(kind))};
+    if (kind == AnnotationClasses::PipeChannel)
+      info.push_back(b.getNamedAttr("latency", b.getI64IntegerAttr(0)));
+    if (!valid.empty()) {
+      bool source = !sources.empty();
+      info.push_back(b.getNamedAttr(source ? "validSource" : "validSink",
+                                   b.getStringAttr(("~Top|Top>" + valid).str())));
+      info.push_back(b.getNamedAttr(source ? "readySink" : "readySource",
+                                   b.getStringAttr(("~Top|Top>" + ready).str())));
+    }
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr(name)),
+        b.getNamedAttr("channelInfo", b.getDictionaryAttr(info)),
+        b.getNamedAttr("sources", strings(sources, "Top")),
+        b.getNamedAttr("sinks", strings(sinks, "Top"))}));
+  };
+  channel("arbitrary_print_second", AnnotationClasses::PipeChannel,
+          rejection == 2 ? ArrayRef<StringRef>{"printfB", "printfB"}
+                         : ArrayRef<StringRef>{"printfB"}, {});
+  channel("tx_global", AnnotationClasses::DecoupledForwardChannel,
+          {"forwardValid", "forwardData"}, {}, "forwardValid", "ready");
+  channel("other_print_global", AnnotationClasses::PipeChannel, {"otherPrintf"}, {});
+  channel("rx_ready_global", AnnotationClasses::DecoupledReverseChannel,
+          {"reverseReady"}, {});
+  channel(rejection == 1 ? "arbitrary_print_second" : "arbitrary_print_first",
+          AnnotationClasses::PipeChannel, {"printfA"}, {});
+  channel("tx_ready_global", AnnotationClasses::DecoupledReverseChannel, {}, {"ready"});
+  channel("rx_global", AnnotationClasses::DecoupledForwardChannel, {},
+          {"inputValid", "data"}, "inputValid", "reverseReady");
+  channel("trigger_global", AnnotationClasses::PipeChannel, {}, {"trigger"});
+  channel("other_input_global", AnnotationClasses::PipeChannel, {}, {"otherData"});
+  if (rejection == 8)
+    channel("second_claim_on_print_b", AnnotationClasses::PipeChannel,
+            {"printfB"}, {});
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  require(succeeded(verify(*root)), "output selection fixture invalid");
+  auto before = dump(*root);
+  std::string error;
+  auto selected = goldengate::analyzeFAMEOutputSelection(circuit, model, error);
+  require(dump(*root) == before, "output selection mutated IR/annotations");
+  if (rejection) {
+    require(!selected && !error.empty(), "unsafe output selection accepted: " +
+                                          std::to_string(rejection));
+    if (rejection == 8)
+      require(error == "two FAME channels claim model port: printfB",
+              "shared output port did not fail at the channel ownership check");
+    return;
+  }
+  require(selected && selected->size() == 4, "expected four selected outputs: " + error);
+  const char *global[] = {"arbitrary_print_second", "tx_global", "rx_ready_global",
+                          "arbitrary_print_first"};
+  const char *local[] = {"print_local_b", "tx_local", "rx_ready_local", "print_local_a"};
+  const goldengate::ChannelKind kinds[] = {goldengate::ChannelKind::Pipe,
+      goldengate::ChannelKind::DecoupledForward, goldengate::ChannelKind::DecoupledReverse,
+      goldengate::ChannelKind::Pipe};
+  const std::vector<std::string> dependencies[] = {{"rx_local"},
+      {"tx_ready_local", "rx_local", "trigger_local"}, {"tx_ready_local"},
+      {"trigger_local", "rx_local"}};
+  for (unsigned i = 0; i < 4; ++i) {
+    const auto &output = (*selected)[i];
+    require(output.globalName == global[i] && output.localName == local[i] &&
+                output.kind == kinds[i] && output.fieldCount == (i == 1 ? 2u : 1u),
+            "output order/name/kind/field count differs from annotations");
+    require(output.dependency.outputChannel == local[i] &&
+                output.dependency.inputChannels == dependencies[i] &&
+                output.dependency.unresolvedPorts.empty() &&
+                output.dependency.unresolvedCauses.empty(),
+            "output lost data/ready/trigger dependencies");
+  }
+  error.clear();
+  auto otherSelection = goldengate::analyzeFAMEOutputSelection(circuit, other, error);
+  require(otherSelection && otherSelection->size() == 1 &&
+              otherSelection->front().globalName == "other_print_global" &&
+              otherSelection->front().dependency.inputChannels ==
+                  std::vector<std::string>{"other_input"},
+          "selection leaked channels across models: " + error);
+
+  auto hierarchy = goldengate::analyzeTopHierarchy(circuit, error);
+  SmallVector<goldengate::ModelPortGroup> groups;
+  SmallVector<goldengate::GGChannelConnection, 0> channels;
+  for (auto attr : annotations) {
+    Annotation annotation(attr);
+    if (annotation.isClass(AnnotationClasses::ChannelPorts)) {
+      auto value = goldengate::analyzeModelPortGroup(circuit, annotation, error);
+      require(bool(value), error);
+      groups.push_back(std::move(*value));
+    } else {
+      auto value = goldengate::analyzeChannelConnection(circuit, annotation, error);
+      require(bool(value), error);
+      channels.push_back(std::move(*value));
+    }
+  }
+  require(goldengate::validateDecoupledChannelPairs(channels, error), error);
+  SmallVector<goldengate::ModelChannelBinding> bindings;
+  for (const auto &connection : channels) {
+    auto value = goldengate::bindChannelToModels(connection, *hierarchy, groups, error);
+    require(bool(value), error);
+    bindings.append(value->begin(), value->end());
+  }
+  auto plan = goldengate::analyzeFAMEPorts(*hierarchy, bindings, channels, {model}, error);
+  require(plan && plan->sources.size() == 4, "selected ports cannot be planned: " + error);
+  auto payload = cast<BundleType>(plan->sources[1].type.getElementType(2));
+  require(payload.getElements()[0].name.getValue() == "forwardValid" &&
+              payload.getElements()[1].name.getValue() == "forwardData",
+          "source annotation payload order replaced by physical port order");
+  // Exercise the selected arbitrary Print channel through the actual FAME IR
+  // rewrite: its data driver must move under token.bits, with a typed host
+  // handshake on both the wrapper and model source ports.
+  require(succeeded(goldengate::rewriteFAMEOutputChannel(
+              *hierarchy, plan->sources.front(), error)), error);
+  require(succeeded(verify(*root)), "selected Print output rewrite invalid");
+  require(top.getPortName(8) == "model_print_local_b_source" &&
+              model.getPortName(8) == "print_local_b_source" &&
+              top.getPorts()[8].type == plan->sources.front().type &&
+              model.getPorts()[8].type == plan->sources.front().type,
+          "selected Print output did not become a matching token interface");
+  bool payloadDriven = false;
+  for (auto connect : model.getOps<StrictConnectOp>())
+    if (auto field = connect.getDest().getDefiningOp<SubfieldOp>())
+      if (field.getInput() == model.getBodyBlock()->getArgument(8) &&
+          field.getFieldName() == "bits") {
+        require(connect.getSrc() == model.getBodyBlock()->getArgument(1),
+                "selected Print payload data driver changed");
+        payloadDriven = true;
+      }
+  require(payloadDriven && other.getPortName(1) == "printf" &&
+              model.getPortName(4) == "printfA",
+          "selected Print rewrite lost payload or changed another channel");
+}
+} // namespace
+int main() {
+  try {
+    MLIRContext context;
+    context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    for (unsigned rejection = 0; rejection <= 8; ++rejection) run(context, rejection);
+    llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
+                    "dependencies and model isolation passed; 8 unsafe selections "
+                    "rejected without mutation\n";
+    return 0;
+  } catch (const std::exception &e) {
+    llvm::errs() << e.what() << '\n';
+    return 1;
+  }
+}
