@@ -4,6 +4,7 @@
 // together, even under independent slave and response-tracker backpressure.
 #include "goldengate/ControlReadDispatch.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 #include <map>
 #include <set>
@@ -23,8 +24,21 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto regions=decoder?decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions"):ArrayAttr();
   auto bindings=inner?inner->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings"):ArrayAttr();
-  if(!inner||!raw||!regions||regions.size()!=11||!bindings||bindings.size()!=7)
-    return reject("control read dispatch needs retained annotations, regions and seven write bindings");
+  if(!inner||!raw||!regions||regions.empty()||regions.size()>63||!bindings)
+    return reject("control read dispatch needs retained annotations, write bindings and one to 63 decoded regions");
+  const unsigned slaveCount=regions.size();
+  const unsigned targetWidth=llvm::Log2_64_Ceil(slaveCount+1);
+  SmallVector<StringAttr> regionNames;
+  std::set<std::string> uniqueNames;
+  for(auto [i,a]:llvm::enumerate(regions)) {
+    auto d=dyn_cast<DictionaryAttr>(a);
+    auto name=d?d.getAs<StringAttr>("name"):StringAttr();
+    auto slave=d?d.getAs<IntegerAttr>("slave"):IntegerAttr();
+    if(!name||name.getValue().empty()||!slave||slave.getInt()!=int64_t(i)||
+       !uniqueNames.insert(name.getValue().str()).second)
+      return reject("control read dispatch requires unique region names and ordered decoded-slave indices");
+    regionNames.push_back(name);
+  }
   bool used=false;circuit.walk([&](InstanceOp i){used|=i.getModuleName()==inner.getName();});
   if(used)return reject("control read dispatch requires an uninstantiated top");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
@@ -53,26 +67,24 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
     old.emplace(p.name.getValue().str(),i);
   }
   struct Required {const char *name;unsigned width;Direction dir;};
-  const Required required[]{{"ctrl_decode_ar_route",11,Direction::Out},
-    {"ctrl_decode_ar_target",4,Direction::Out},{"ctrl_decode_ar_addr",25,Direction::In},
+  const Required required[]{{"ctrl_decode_ar_route",slaveCount,Direction::Out},
+    {"ctrl_decode_ar_target",targetWidth,Direction::Out},{"ctrl_decode_ar_addr",25,Direction::In},
     {"ctrl_error_ar_ready",1,Direction::Out},{"ctrl_error_ar_valid",1,Direction::In},
     {"ctrl_error_ar_bits_addr",25,Direction::In},{"ctrl_error_ar_bits_len",8,Direction::In},
     {"ctrl_error_ar_bits_id",12,Direction::In}};
   for(auto r:required) {
     auto it=old.find(r.name);
     if(it==old.end()||inner.getPorts()[it->second].type!=uint(r.width)||inner.getPorts()[it->second].direction!=r.dir)
-      return reject("control read dispatch requires exact U250 decoder/error boundaries");
+      return reject("control read dispatch requires catalog-sized U250 decoder/error boundaries");
   }
   for(auto a:bindings) {
     auto d=dyn_cast<DictionaryAttr>(a);auto name=d?d.getAs<StringAttr>("name"):StringAttr();
     auto port=d?d.getAs<StringAttr>("port"):StringAttr();auto slave=d?d.getAs<IntegerAttr>("slave"):IntegerAttr();
-    if(!name||!port||!slave||slave.getInt()<0||slave.getInt()>=11||
+    if(!name||!port||port.getValue().empty()||!slave||slave.getInt()<0||slave.getInt()>=slaveCount||
        !allocated.insert(slave.getInt()).second||widgets.count(port.getValue().str()))
       return reject("control read dispatch has invalid or duplicate widget bindings");
-    auto row=dyn_cast<DictionaryAttr>(regions[slave.getInt()]);
-    auto rn=row?row.getAs<StringAttr>("name"):StringAttr();auto ri=row?row.getAs<IntegerAttr>("slave"):IntegerAttr();
     auto it=old.find(port.getValue().str());
-    if(!rn||rn!=name||!ri||ri.getInt()!=slave.getInt()||it==old.end()||
+    if(regionNames[slave.getInt()]!=name||it==old.end()||
        inner.getPorts()[it->second].type!=controlType||inner.getPorts()[it->second].direction!=Direction::In)
       return reject("control read dispatch widget catalog or control bundle differs");
     widgets[port.getValue().str()]=slave.getInt();
@@ -81,21 +93,22 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
     "ctrl_error_ar_bits_addr","ctrl_error_ar_bits_len","ctrl_error_ar_bits_id"};
   SmallVector<PortInfo> hp;
   auto port=[&](std::string n,Type t,Direction d){hi[n]=hp.size();hp.push_back({b.getStringAttr(n),t,d});};
-  port("route",uint(11),Direction::In);port("target",uint(4),Direction::In);
+  port("route",uint(slaveCount),Direction::In);port("target",uint(targetWidth),Direction::In);
   port("tracker_ready",uint(1),Direction::In);port("master_ar",arType,Direction::In);
-  for(unsigned i=0;i<12;++i)port(i==11?"err_slave_ar":"slave_"+std::to_string(i)+"_ar",arType,Direction::Out);
-  port("track_valid",uint(1),Direction::Out);port("track_tag",uint(12),Direction::Out);port("track_target",uint(4),Direction::Out);
+  for(unsigned i=0;i<=slaveCount;++i)port(i==slaveCount?"err_slave_ar":"slave_"+std::to_string(i)+"_ar",arType,Direction::Out);
+  port("track_valid",uint(1),Direction::Out);port("track_tag",uint(12),Direction::Out);port("track_target",uint(targetWidth),Direction::Out);
   SmallVector<PortInfo> ports;
   for(auto p:inner.getPorts())if(!consumed.count(p.name.getValue().str())) {
     std::string n=p.name.getValue().str();copied[n]=ports.size();if(widgets.count(n))p.type=remainingType;ports.push_back(p);
   }
   for(auto p:hp) {
     auto n=p.name.getValue().str();bool expose=n=="master_ar"||n=="tracker_ready"||n.rfind("track_",0)==0;
-    for(unsigned i=0;i<11;++i)if(!allocated.count(i)&&n=="slave_"+std::to_string(i)+"_ar")expose=true;
+    for(unsigned i=0;i<slaveCount;++i)if(!allocated.count(i)&&n=="slave_"+std::to_string(i)+"_ar")expose=true;
     if(expose){exposed[n]=ports.size();p.name=b.getStringAttr("ctrl_read_dispatch_"+n);ports.push_back(p);}
   }
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto helper=b.create<FModuleOp>(loc,b.getStringAttr(helperName),ConventionAttr::get(ctx,Convention::Internal),hp);
+  helper->setAttr("goldengate.controlRegions",regions);
   b.setInsertionPointToStart(helper.getBodyBlock());
   auto arg=[&](llvm::StringRef n){return helper.getBodyBlock()->getArgument(hi.at(n.str()));};
   auto field=[&](Value v,llvm::StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};
@@ -103,9 +116,9 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
   Value master=arg("master_ar"),valid=field(master,"valid"),bits=field(master,"bits"),route=arg("route");
   Value dispatched=b.create<AndPrimOp>(loc,valid,arg("tracker_ready"));
   Value ready=b.create<ConstantOp>(loc,uint(1),APInt(1,0));
-  for(unsigned i=0;i<12;++i) {
-    Value slave=arg(i==11?"err_slave_ar":"slave_"+std::to_string(i)+"_ar");
-    Value selected=i==11?Value(b.create<EQPrimOp>(loc,route,b.create<ConstantOp>(loc,uint(11),APInt(11,0)))):
+  for(unsigned i=0;i<=slaveCount;++i) {
+    Value slave=arg(i==slaveCount?"err_slave_ar":"slave_"+std::to_string(i)+"_ar");
+    Value selected=i==slaveCount?Value(b.create<EQPrimOp>(loc,route,b.create<ConstantOp>(loc,uint(slaveCount),APInt(slaveCount,0)))):
       Value(b.create<BitsPrimOp>(loc,route,i,i));
     ready=b.create<MuxPrimOp>(loc,selected,field(slave,"ready"),ready);
     connect(field(slave,"valid"),b.create<AndPrimOp>(loc,dispatched,selected));
