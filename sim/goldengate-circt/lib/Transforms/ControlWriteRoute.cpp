@@ -1,10 +1,11 @@
 // See LICENSE for license details.
 // Port NastiRouter's write route queue and request coordination through FIRRTL
 // memory, registers and ready/valid expressions. The decoded AW route is copied
-// into a depth-eleven circular queue; W.last advances the route only when W is
-// accepted. Tracker and selected-slave readiness remain explicit boundaries.
+// into a circular queue with one entry per decoded slave. Accepted W.last
+// advances the route. Tracker and selected-slave readiness remain boundaries.
 #include "goldengate/ControlWriteRoute.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -24,12 +25,14 @@ LogicalResult goldengate::addControlWriteRoute(CircuitOp circuit, std::string &e
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto catalog = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
-  if (!inner || !raw || !catalog || catalog.size() != 11)
-    return reject("control write route needs a top, retained annotations and eleven decoded regions");
+  if (!inner || !raw || !catalog || catalog.empty() || catalog.size() > 63)
+    return reject("control write route needs a top, retained annotations and one to 63 decoded regions");
+  const unsigned slaveCount = catalog.size();
+  const unsigned pointerWidth = std::max(1u, llvm::Log2_64_Ceil(slaveCount));
   auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(context, w, false); };
   const llvm::StringRef names[]{"hostClock", "hostReset", "ctrl_decode_aw_route"};
-  const Type types[]{ClockType::get(context), uint(1), uint(11)};
+  const Type types[]{ClockType::get(context), uint(1), uint(slaveCount)};
   unsigned indices[3];
   for (unsigned j = 0; j < 3; ++j) {
     std::optional<unsigned> found;
@@ -47,17 +50,17 @@ LogicalResult goldengate::addControlWriteRoute(CircuitOp circuit, std::string &e
 
   SmallVector<PortInfo> helperPorts{{b.getStringAttr("clock"), ClockType::get(context), Direction::In},
       {b.getStringAttr("reset"), uint(1), Direction::In},
-      {b.getStringAttr("aw_route"), uint(11), Direction::In}};
+      {b.getStringAttr("aw_route"), uint(slaveCount), Direction::In}};
   for (auto n : {"aw_valid", "aw_tracker_ready", "aw_slave_ready", "w_valid", "w_last", "w_slave_ready"})
     helperPorts.push_back({b.getStringAttr(n), uint(1), Direction::In});
   for (auto n : {"aw_ready", "aw_slave_valid", "aw_track_valid", "w_ready", "w_slave_valid"})
     helperPorts.push_back({b.getStringAttr(n), uint(1), Direction::Out});
-  helperPorts.push_back({b.getStringAttr("w_route"), uint(11), Direction::Out});
+  helperPorts.push_back({b.getStringAttr("w_route"), uint(slaveCount), Direction::Out});
   helperPorts.push_back({b.getStringAttr("w_error"), uint(1), Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto helper = b.create<FModuleOp>(loc, b.getStringAttr(helperName),
       ConventionAttr::get(context, Convention::Internal), helperPorts);
-  helper->setAttr("goldengate.queueDepth", b.getI32IntegerAttr(11));
+  helper->setAttr("goldengate.queueDepth", b.getI32IntegerAttr(slaveCount));
   helper->setAttr("goldengate.queueFlow", b.getBoolAttr(false));
   helper->setAttr("goldengate.queuePipe", b.getBoolAttr(false));
   b.setInsertionPointToStart(helper.getBodyBlock());
@@ -71,7 +74,10 @@ LogicalResult goldengate::addControlWriteRoute(CircuitOp circuit, std::string &e
   auto reg = [&](unsigned w, llvm::StringRef n) -> Value {
     return b.create<RegResetOp>(loc, uint(w), arg(0), arg(1), constant(w, 0), n).getResult();
   };
-  Value enq = reg(4, "enq_ptr_value"), deq = reg(4, "deq_ptr_value"), full = reg(1, "maybe_full");
+  // Chisel Counter(1) has no pointer state; its RAM addresses are constant zero.
+  Value enq = slaveCount == 1 ? constant(1, 0) : reg(pointerWidth, "enq_ptr_value");
+  Value deq = slaveCount == 1 ? enq : reg(pointerWidth, "deq_ptr_value");
+  Value full = reg(1, "maybe_full");
   Value equal = b.create<EQPrimOp>(loc, enq, deq);
   Value ready = invert(both(equal, full)), valid = invert(both(equal, invert(full)));
   Value enqueueValid = both(both(arg(3), arg(4)), arg(5));
@@ -82,20 +88,23 @@ LogicalResult goldengate::addControlWriteRoute(CircuitOp circuit, std::string &e
   connect(arg(11), both(both(arg(3), ready), arg(5)));
   connect(arg(12), both(valid, arg(8))); connect(arg(13), both(arg(6), valid));
   auto advance = [&](Value ptr) -> Value {
-    Value increment = b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, ptr, constant(4, 1)), 3, 0);
-    return mux(b.create<EQPrimOp>(loc, ptr, constant(4, 10)), constant(4, 0), increment);
+    Value increment = b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, ptr, constant(pointerWidth, 1)), pointerWidth - 1, 0);
+    return mux(b.create<EQPrimOp>(loc, ptr, constant(pointerWidth, slaveCount - 1)), constant(pointerWidth, 0), increment);
   };
-  connect(enq, mux(push, advance(enq), enq)); connect(deq, mux(pop, advance(deq), deq));
+  if (slaveCount > 1) {
+    connect(enq, mux(push, advance(enq), enq));
+    connect(deq, mux(pop, advance(deq), deq));
+  }
   connect(full, mux(b.create<XorPrimOp>(loc, push, pop), push, full));
-  SmallVector<Type> memoryTypes{MemOp::getTypeForPort(11, uint(11), MemOp::PortKind::Read),
-      MemOp::getTypeForPort(11, uint(11), MemOp::PortKind::Write)};
+  SmallVector<Type> memoryTypes{MemOp::getTypeForPort(slaveCount, uint(slaveCount), MemOp::PortKind::Read),
+      MemOp::getTypeForPort(slaveCount, uint(slaveCount), MemOp::PortKind::Write)};
   SmallVector<Attribute> memoryPorts{b.getStringAttr("read"), b.getStringAttr("write")};
-  auto ram = b.create<MemOp>(loc, memoryTypes, 0, 1, 11, RUWAttr::Undefined, memoryPorts, "ram");
+  auto ram = b.create<MemOp>(loc, memoryTypes, 0, 1, slaveCount, RUWAttr::Undefined, memoryPorts, "ram");
   Value rd = ram.getResult(0), wr = ram.getResult(1);
   connect(field(rd, "clk"), arg(0)); connect(field(rd, "en"), constant(1, 1)); connect(field(rd, "addr"), deq);
   connect(field(wr, "clk"), arg(0)); connect(field(wr, "en"), push); connect(field(wr, "addr"), enq);
   connect(field(wr, "data"), arg(2)); connect(field(wr, "mask"), constant(1, 1));
-  connect(arg(14), field(rd, "data")); connect(arg(15), b.create<EQPrimOp>(loc, field(rd, "data"), constant(11, 0)));
+  connect(arg(14), field(rd, "data")); connect(arg(15), b.create<EQPrimOp>(loc, field(rd, "data"), constant(slaveCount, 0)));
 
   SmallVector<PortInfo> ports(inner.getPorts()); unsigned first = ports.size();
   for (auto port : ArrayRef<PortInfo>(helperPorts).drop_front(3)) {

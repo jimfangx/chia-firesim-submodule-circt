@@ -4,13 +4,20 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
-// NastiRouter's U250 AW route queue and AW/W DecoupledHelper gates. One route
-// per accepted AW, popped only on accepted W.last. Eleven entries, no flow/pipe;
-// reset flushes occupancy but accepted writes still update unreset RAM.
-// Input: uninstantiated GGControlDecodeWrapper, retained annotations, host
-// clock/reset and decoded eleven-bit AW route. Copied targets transfer. The
-// ctrl_write_route_* boundary exposes selected-slave and response-tracker
-// readiness; their implementation and request payload wiring follow later.
+// NastiRouter's AW route queue and AW/W DecoupledHelper gates. One route
+// per accepted AW, popped only on accepted W.last. One entry per decoded slave
+// (1..63), no flow/pipe; reset flushes occupancy while accepted writes still
+// update unreset RAM.
+// Requires: uninstantiated GGControlDecodeWrapper, host clock/reset, retained
+// rawAnnotations and GGControlAddressDecode's 1..63-entry controlRegions.
+// Decoded AW route width must equal the region count.
+// Consumes: no annotations. Produces: queue depth/flow/pipe attributes.
+// Mutates: adds helper and wrapper modules; transfers copied top-port targets
+// and circuit prefixes while retaining internal target identities.
+// Analyses required/preserved: none; callers must rebuild hierarchy analyses.
+// Output: GGControlWriteRouteWrapper with ctrl_write_route_* handshake and
+// route boundaries. Selected-slave/tracker readiness and payload wiring are
+// bound by later passes.
 mlir::LogicalResult addControlWriteRoute(circt::firrtl::CircuitOp circuit,
                                        std::string &error);
 }
