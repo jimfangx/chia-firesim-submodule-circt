@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // Oracle: TimingModel.scala:151-167 and FASEDMemoryTimingModel MCR words 14-17.
-// Required input invariants: recorded ten-flight 35/64/4-bit FASED profile,
+// Materialization requires a free bank symbol and preserves top/annotations.
+// Attachment requires the recorded ten-flight 35/64/4-bit FASED profile,
 // uninstantiated response-error top, unique sim chain to response releaser,
 // exact model reset/fire and timing request interfaces.
 // Annotations consumed: none.
@@ -19,17 +20,42 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addFASEDStatistics(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral bankName = "GGFASEDStatistics";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDStatisticsWrapper";
-  constexpr llvm::StringLiteral controlName = "fased_statistics_mcr";
+namespace {
+constexpr llvm::StringLiteral bankName = "GGFASEDStatistics";
+constexpr llvm::StringLiteral wrapperName = "GGFASEDStatisticsWrapper";
+constexpr llvm::StringLiteral controlName = "fased_statistics_mcr";
+SmallVector<PortInfo> statisticsPorts(MLIRContext *ctx) {
+  OpBuilder b(ctx);
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1);
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
+      {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, uint(32)}});
+  auto words = FVectorType::get(token, 4);
+  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  SmallVector<PortInfo> ports{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In}};
+  for (auto name : {"hostReset", "modelReset", "targetFire", "awFire", "arFire", "wFire", "rFire"})
+    ports.push_back({b.getStringAttr(name), bit, Direction::In});
+  ports.push_back({b.getStringAttr("mcr"), mcr, Direction::Out});
+  return ports;
+}
+struct StatisticsAttachment {
+  FModuleOp inner;
+  unsigned indices[5];
+  SmallVector<FModuleOp> modules;
+  SmallVector<InstanceOp> chain;
+  InstanceOp releaser;
+  unsigned rIndex;
+};
+LogicalResult attachmentBoundary(CircuitOp circuit, StatisticsAttachment &boundary,
+    std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGFASEDResponseErrorsWrapper")
     return reject("FASED statistics require the active response-error wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
-      return reject("FASED statistics module or wrapper already exists");
+    if (m.getName() == wrapperName)
+      return reject("FASED statistics wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
   }
@@ -40,13 +66,9 @@ LogicalResult goldengate::addFASEDStatistics(CircuitOp circuit, std::string &err
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
   if (!flight || flight.getInt() != 10)
     return reject("FASED statistics currently require the recorded ten-flight constructor");
-  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx);
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);
-  auto token = [&](FIRRTLBaseType payload) {
-    return BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
-        {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
-  };
   auto payload = [&](std::initializer_list<std::pair<llvm::StringRef, unsigned>> fields) {
     SmallVector<BundleType::BundleElement> elements;
     for (auto [name, width] : fields) elements.push_back({b.getStringAttr(name), false, uint(width)});
@@ -105,44 +127,31 @@ LogicalResult goldengate::addFASEDStatistics(CircuitOp circuit, std::string &err
         releaser.getPortDirection(i)==Direction::Out) rIndex=i;
   if (!rIndex) return reject("FASED statistics need the exact releaser target R response");
 
-  // All validation precedes mutations. The appended observation is consumed
-  // internally by this wrapper, so the original top interface is preserved.
-  auto originalPorts=inner.getPorts();
-  for (unsigned j=modules.size(); j-- > 0;) {
-    SmallVector<std::pair<unsigned,PortInfo>> added{{modules[j].getNumPorts(),
-        PortInfo(b.getStringAttr(observationName),bit,Direction::Out)}};
-    modules[j].insertPorts(added);
-    if (j) {
-      auto replacement=chain[j-1].cloneAndInsertPorts(added);
-      for (auto attr : chain[j-1]->getAttrs())
-        if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(),attr.getValue());
-      for (unsigned i=0; i<chain[j-1].getNumResults(); ++i)
-        chain[j-1].getResult(i).replaceAllUsesWith(replacement.getResult(i));
-      chain[j-1].erase(); chain[j-1]=replacement;
-    }
-  }
-  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc,dest,src); };
-  auto field = [&](Value v, llvm::StringRef n)->Value { return b.create<SubfieldOp>(loc,v,n); };
-  auto both = [&](Value a, Value z)->Value { return b.create<AndPrimOp>(loc,a,z); };
-  for (unsigned j=0; j+1<modules.size(); ++j) {
-    b.setInsertionPointToEnd(modules[j].getBodyBlock());
-    connect(modules[j].getArguments().back(),chain[j].getResults().back());
-  }
-  b.setInsertionPointToEnd(modules.back().getBodyBlock());
-  Value r=releaser.getResult(*rIndex);
-  connect(modules.back().getArguments().back(),both(field(r,"ready"),field(r,"valid")));
+  boundary.inner = inner;
+  std::copy(std::begin(indices), std::end(indices), std::begin(boundary.indices));
+  boundary.modules = std::move(modules); boundary.chain = std::move(chain);
+  boundary.releaser = releaser; boundary.rIndex = *rIndex;
+  return success();
+}
+} // namespace
 
-  // Preflight is complete. Local lanes 0-3 map to global words 14-17.
-  auto words = FVectorType::get(token(uint(32)), 4);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+LogicalResult goldengate::materializeFASEDStatistics(CircuitOp circuit,
+    FModuleOp &result, std::string &error) {
+  for (auto module : circuit.getOps<FModuleLike>())
+    if (module.getName() == bankName) {
+      error = "FASED statistics module already exists";
+      return failure();
+    }
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1);
+  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
+  auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
+  auto both = [&](Value a, Value z) -> Value { return b.create<AndPrimOp>(loc, a, z); };
+  // Local lanes 0-3 retain global words 14-17 (56-68 bytes).
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"),ClockType::get(ctx),Direction::In}};
-  for (auto name : {"hostReset","modelReset","targetFire","awFire","arFire","wFire","rFire"})
-    bankPorts.push_back({b.getStringAttr(name),bit,Direction::In});
-  bankPorts.push_back({b.getStringAttr("mcr"),mcr,Direction::Out});
   auto bank=b.create<FModuleOp>(loc,b.getStringAttr(bankName),
-      ConventionAttr::get(ctx,Convention::Internal),bankPorts);
+      ConventionAttr::get(ctx,Convention::Internal),statisticsPorts(ctx));
   const llvm::StringRef names[]{"totalWriteBeats","totalReadBeats","totalWrites","totalReads"};
   SmallVector<Attribute> registers;
   for (unsigned i=0;i<4;++i) registers.push_back(b.getDictionaryAttr({
@@ -173,6 +182,61 @@ LogicalResult goldengate::addFASEDStatistics(CircuitOp circuit, std::string &err
     b.create<AssertOp>(loc,arg(0),permitted,enabled,
         "Register "+names[i].str()+" is read only",ValueRange{},"");
   }
+
+  result = bank;
+  return success();
+}
+
+LogicalResult goldengate::attachFASEDStatistics(CircuitOp circuit,
+    FModuleOp bank, std::string &error) {
+  StatisticsAttachment boundary;
+  if (failed(attachmentBoundary(circuit, boundary, error))) return failure();
+  auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
+  if (!bank || bank->getParentOp() != circuit.getOperation() || bank.getName() != bankName)
+    return reject("FASED statistics attachment requires its materialized bank in this circuit");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto expected = statisticsPorts(ctx); auto actual = bank.getPorts();
+  if (actual.size() != expected.size()) return reject("FASED statistics bank needs exactly nine ports");
+  for (auto [i, port] : llvm::enumerate(actual))
+    if (port.name != expected[i].name || port.type != expected[i].type ||
+        port.direction != expected[i].direction)
+      return reject("FASED statistics bank ports differ from the clock/reset/event/four-word MCR boundary");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+  if (used) return reject("FASED statistics attachment requires an uninstantiated bank");
+  auto inner = boundary.inner; auto &indices = boundary.indices;
+  auto &modules = boundary.modules; auto &chain = boundary.chain;
+  auto releaser = boundary.releaser; auto rIndex = boundary.rIndex;
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto bit = UIntType::get(ctx, 1, false); auto mcr = expected[8].type;
+  constexpr llvm::StringLiteral observationName = "fased_accepted_r_fire";
+  // All validation precedes mutations. The appended observation is consumed
+  // internally by this wrapper, so the original top interface is preserved.
+  auto originalPorts=inner.getPorts();
+  for (unsigned j=modules.size(); j-- > 0;) {
+    SmallVector<std::pair<unsigned,PortInfo>> added{{modules[j].getNumPorts(),
+        PortInfo(b.getStringAttr(observationName),bit,Direction::Out)}};
+    modules[j].insertPorts(added);
+    if (j) {
+      auto replacement=chain[j-1].cloneAndInsertPorts(added);
+      for (auto attr : chain[j-1]->getAttrs())
+        if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(),attr.getValue());
+      for (unsigned i=0; i<chain[j-1].getNumResults(); ++i)
+        chain[j-1].getResult(i).replaceAllUsesWith(replacement.getResult(i));
+      chain[j-1].erase(); chain[j-1]=replacement;
+    }
+  }
+  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc,dest,src); };
+  auto field = [&](Value v, llvm::StringRef n)->Value { return b.create<SubfieldOp>(loc,v,n); };
+  auto both = [&](Value a, Value z)->Value { return b.create<AndPrimOp>(loc,a,z); };
+  for (unsigned j=0; j+1<modules.size(); ++j) {
+    b.setInsertionPointToEnd(modules[j].getBodyBlock());
+    connect(modules[j].getArguments().back(),chain[j].getResults().back());
+  }
+  b.setInsertionPointToEnd(modules.back().getBodyBlock());
+  Value r=releaser.getResult(rIndex);
+  connect(modules.back().getArguments().back(),both(field(r,"ready"),field(r,"valid")));
+
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, port] : llvm::enumerate(originalPorts)) {
@@ -221,4 +285,13 @@ LogicalResult goldengate::addFASEDStatistics(CircuitOp circuit, std::string &err
   };
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+LogicalResult goldengate::addFASEDStatistics(CircuitOp circuit, std::string &error) {
+  // Preflight the full hierarchy before creating a bank so rejection is atomic.
+  StatisticsAttachment boundary;
+  if (failed(attachmentBoundary(circuit, boundary, error))) return failure();
+  FModuleOp bank;
+  if (failed(materializeFASEDStatistics(circuit, bank, error))) return failure();
+  return attachFASEDStatistics(circuit, bank, error);
 }

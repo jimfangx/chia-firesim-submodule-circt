@@ -2628,6 +2628,24 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsBankAnnotations, error)))
         return fail("FASED response-error materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT FASED response-error bank before control allocation in " << fasedResponseErrorsBankPath << '\n';
+      // This sparse fragment retains global words 14-17; combine its registry
+      // with the other FASED banks after the final fragment is materialized.
+      FModuleOp fasedStatisticsBank;
+      if (failed(goldengate::materializeFASEDStatistics(circuit, fasedStatisticsBank, error)))
+        return fail("FASED statistics materialization: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("FASED statistics materialization produced invalid FIRRTL IR");
+      llvm::SmallString<256> fasedStatisticsBankPath(outputDir), fasedStatisticsBankAnnotations(outputDir);
+      llvm::sys::path::append(fasedStatisticsBankPath, "post-fame-fased-statistics-bank.mlir");
+      llvm::sys::path::append(fasedStatisticsBankAnnotations, "post-fame-fased-statistics-bank-all.json");
+      std::error_code fasedStatisticsBankWriteError;
+      llvm::raw_fd_ostream fasedStatisticsBankOut(fasedStatisticsBankPath, fasedStatisticsBankWriteError);
+      if (fasedStatisticsBankWriteError)
+        return fail("cannot write FASED statistics materialization: " + fasedStatisticsBankWriteError.message());
+      module->print(fasedStatisticsBankOut); fasedStatisticsBankOut << '\n'; fasedStatisticsBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsBankAnnotations, error)))
+        return fail("FASED statistics materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT FASED statistics bank before control allocation in " << fasedStatisticsBankPath << '\n';
       // HasWidgets registration order remains independent of IR module order.
       // Derive each available bank's size from its register registry and check
       // it against the implemented MCR port. FASED, still assembled after
@@ -3408,7 +3426,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsAnnotations, error)))
         return fail("FASED response error registers annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock response error registers and response handshake binding in " << fasedResponseErrorsPath << '\n';
-      if (failed(goldengate::addFASEDStatistics(circuit, error)))
+      if (failed(goldengate::attachFASEDStatistics(circuit, fasedStatisticsBank, error)))
         return fail("FASED transaction and beat counters: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED transaction and beat counters produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedStatisticsPath(outputDir), fasedStatisticsAnnotations(outputDir);
