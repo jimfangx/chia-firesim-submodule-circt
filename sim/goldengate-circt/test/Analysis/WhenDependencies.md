@@ -87,3 +87,39 @@ connectivity to form output-channel dependencies. Asynchronous readwrite ports
 need a separate write-mode investigation and now produce an explicit blocker;
 new read-under-write retains its existing blocker. Both rejection paths are
 tested, so unsupported memory behavior cannot appear dependency-free.
+
+The October 6 iteration 3 comparison covers variable-address register-file
+reads and their explicit write bypass. The unchanged statements from the same
+immutable compiler artifact's lines 145182–145198 and 146396–146408 are placed
+in `RFReadProbe`. Its inputs expose `id_raddr1`, `id_raddr2`, `rf_wen`,
+`rf_waddr`, and `rf_wdata`; its outputs expose both the initial memory reads
+and the bypassed values. This is an extracted internal boundary, not a
+replacement for compiling or simulating the whole Rocket module.
+
+The immutable U250 `design/FireSim-generated.sv` lines 124018–124030 fix both
+read enables to one, invert each corresponding read address, and read stored
+RF state. Lines 123611–123618 apply the write-address comparison and write-enable
+bypass. The imported and normalized candidate matches these dependency sets:
+
+```
+raw0  <- {id_raddr1}
+raw1  <- {id_raddr2}
+read0 <- {id_raddr1, rf_wen, rf_waddr, rf_wdata}
+read1 <- {id_raddr2, rf_wen, rf_waddr, rf_wdata}
+```
+
+The comparison also repeats the earlier queue assertions. The mutable FIRRTL
+extraction, imported MLIR, normalized MLIR, and comparison logs are in
+`iteration3-field-dependencies/` under the same generated-source directory.
+Run the boundary assertion with `goldengate-comb-dependency-test` using
+`candidate/post-lower-types.mlir` and optionally `normalized-rf.mlir` there.
+
+A related C++ regression packages two independently addressed reads and an
+unrelated input into aggregate wires, aliases one wire with a node, and selects
+fields from an aggregate mux. Before the fix it fails with
+`unresolved output alias: Model:undriven wire`: tracing the immediate subfield
+discarded the selected field ID before reaching its driver. Node and mux
+tracing now forwards the canonical field ID. The chosen read follows only
+the selector and its two address inputs, in Scala operand order. Selecting
+the other field follows only the selector and the unrelated input, which
+also checks that memoization keeps the two field identities separate.

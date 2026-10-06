@@ -195,9 +195,21 @@ private:
           result.blockers.insert(current.getName().str() +
                                  ":undriven memory field");
         }
-      } else if (auto field = value.getDefiningOp<SubfieldOp>()) {
-        // Other subfields retain their ordinary FIRRTL SSA dependency.
-        merge(traceValue(current, field.getInput(), active));
+      } else if (auto node = dyn_cast<NodeOp>(op)) {
+        // Nodes preserve their input's aggregate layout. Forward the selected
+        // field, rather than tracing the entire aggregate and losing the
+        // individual field drivers (or adding unrelated input channels).
+        merge(traceValue(current, node.getInput(), active,
+                         fieldRef.getFieldID()));
+      } else if (auto mux = dyn_cast<MuxPrimOp>(op)) {
+        // A selected mux result depends on its condition and the matching
+        // field of each arm. Static selections have already been folded into
+        // fieldRef, so traversing the immediate SubfieldOp would discard them.
+        merge(traceValue(current, mux.getSel(), active));
+        merge(traceValue(current, mux.getHigh(), active,
+                         fieldRef.getFieldID()));
+        merge(traceValue(current, mux.getLow(), active,
+                         fieldRef.getFieldID()));
       } else if (auto port = dyn_cast<circt::chirrtl::MemoryPortOp>(op)) {
         // A CHIRRTL memory port's data is stored state, while an asynchronous
         // read still follows its access index. Infer ports are read-only when
@@ -232,9 +244,8 @@ private:
       } else if (isa<WireOp>(op)) {
         result.blockers.insert(current.getName().str() + ":undriven wire");
       } else {
-        // Nodes, muxes, casts, and primitive expressions depend on every
-        // operand, including a mux condition. An aggregate expression without
-        // an explicit field connect remains conservative here.
+        // Casts and primitive expressions depend on every operand. Aggregate
+        // expressions without an explicit field connect remain conservative.
         for (Value operand : op->getOperands())
           merge(traceValue(current, operand, active));
       }

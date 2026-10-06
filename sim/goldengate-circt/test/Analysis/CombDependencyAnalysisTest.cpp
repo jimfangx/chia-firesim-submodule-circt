@@ -168,6 +168,68 @@ void selectedMemoryData(MLIRContext &context) {
   }), "new read-under-write was silently treated as stored-state-only data");
 }
 
+void selectedAggregateAliases(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %clock: !firrtl.clock,
+          in %address0: !firrtl.uint<5>, in %address1: !firrtl.uint<5>,
+          in %select: !firrtl.uint<1>, in %unrelated: !firrtl.uint<64>,
+          out %alias: !firrtl.uint<64>, out %chosen: !firrtl.uint<64>,
+          out %other: !firrtl.uint<64>) {
+        %read0 = firrtl.mem Undefined {depth = 31 : i64, name = "rf0",
+          portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32}
+          : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %addr0 = firrtl.subfield %read0[addr] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %en0 = firrtl.subfield %read0[en] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %clk0 = firrtl.subfield %read0[clk] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %data0 = firrtl.subfield %read0[data] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %read1 = firrtl.mem Undefined {depth = 31 : i64, name = "rf1",
+          portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32}
+          : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %addr1 = firrtl.subfield %read1[addr] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %en1 = firrtl.subfield %read1[en] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %clk1 = firrtl.subfield %read1[clk] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %data1 = firrtl.subfield %read1[data] : !firrtl.bundle<addr: uint<5>, en: uint<1>, clk: clock, data flip: uint<64>>
+        %one = firrtl.constant 1 : !firrtl.uint<1>
+        firrtl.strictconnect %addr0, %address0 : !firrtl.uint<5>
+        firrtl.strictconnect %addr1, %address1 : !firrtl.uint<5>
+        firrtl.strictconnect %en0, %one : !firrtl.uint<1>
+        firrtl.strictconnect %en1, %one : !firrtl.uint<1>
+        firrtl.strictconnect %clk0, %clock : !firrtl.clock
+        firrtl.strictconnect %clk1, %clock : !firrtl.clock
+        %left = firrtl.wire : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        %right = firrtl.wire : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        %lread = firrtl.subfield %left[read] : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        %lother = firrtl.subfield %left[other] : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        %rread = firrtl.subfield %right[read] : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        %rother = firrtl.subfield %right[other] : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        firrtl.strictconnect %lread, %data0 : !firrtl.uint<64>
+        firrtl.strictconnect %rread, %data1 : !firrtl.uint<64>
+        firrtl.strictconnect %lother, %unrelated : !firrtl.uint<64>
+        firrtl.strictconnect %rother, %unrelated : !firrtl.uint<64>
+        %copy = firrtl.node %left : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        %copy_read = firrtl.subfield %copy[read] : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        firrtl.strictconnect %alias, %copy_read : !firrtl.uint<64>
+        %mux = firrtl.mux(%select, %copy, %right) : (!firrtl.uint<1>, !firrtl.bundle<read: uint<64>, other: uint<64>>, !firrtl.bundle<read: uint<64>, other: uint<64>>) -> !firrtl.bundle<read: uint<64>, other: uint<64>>
+        %mux_read = firrtl.subfield %mux[read] : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        firrtl.strictconnect %chosen, %mux_read : !firrtl.uint<64>
+        %mux_other = firrtl.subfield %mux[other] : !firrtl.bundle<read: uint<64>, other: uint<64>>
+        firrtl.strictconnect %other, %mux_other : !firrtl.uint<64>
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "aggregate alias fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  expect(model, "alias", {"address0"});
+  expect(model, "chosen", {"select", "address0", "address1"});
+  expect(model, "other", {"select", "unrelated"});
+  auto dependencies = analyze(model);
+  require(dependencies[1].inputChannels ==
+              std::vector<std::string>({"select", "address0", "address1"}),
+          "selected mux lost Scala operand traversal order");
+}
+
 void asynchronousReadWrite(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Model" {
@@ -214,6 +276,7 @@ int main(int argc, char **argv) {
     conditionalDrivers(context);
     repeatedDrivers(context);
     selectedMemoryData(context);
+    selectedAggregateAliases(context);
     asynchronousReadWrite(context);
     require(argc <= 3, "expected optional input MLIR and normalized output MLIR");
     if (argc >= 2) {
@@ -224,23 +287,49 @@ int main(int argc, char **argv) {
       std::string error;
       require(succeeded(goldengate::normalizeFAMEInput(*root, circuit, error)), error);
       require(succeeded(verify(*root)), "golden normalization invalid");
-      FModuleOp model;
+      FModuleOp rfProbe;
       for (auto candidate : circuit.getOps<FModuleOp>())
-        if (candidate.getName() == "Queue1_AXI4BundleW") model = candidate;
-      require(bool(model), "missing golden module");
-      expect(model, "io_deq_valid", {"io_enq_valid"});
-      expect(model, "io_enq_ready", {});
-      expect(model, "io_count", {});
-      for (StringRef field : {"data", "strb", "last"}) {
-        expect(model, "io_deq_bits_" + field.str(),
-               {"io_enq_bits_" + field.str()});
+        if (candidate.getName() == "RFReadProbe") rfProbe = candidate;
+      if (rfProbe) {
+        auto memories = rfProbe.getOps<MemOp>();
+        require(std::distance(memories.begin(), memories.end()) == 1,
+                "RF extraction changed memory count");
+        auto memory = *memories.begin();
+        require(memory.getDepth() == 31 && memory.getReadLatency() == 0 &&
+                    memory.getWriteLatency() == 1 && memory.getNumResults() == 3,
+                "RF extraction changed memory depth, latency or port count");
+        expect(rfProbe, "raw0", {"id_raddr1"});
+        expect(rfProbe, "raw1", {"id_raddr2"});
+        expect(rfProbe, "read0", {"id_raddr1", "rf_wen", "rf_waddr", "rf_wdata"});
+        expect(rfProbe, "read1", {"id_raddr2", "rf_wen", "rf_waddr", "rf_wdata"});
+        llvm::outs() << "Rocket RF read boundary: raw0 <- {id_raddr1}; "
+                        "raw1 <- {id_raddr2}; bypassed reads add "
+                        "{rf_wen, rf_waddr, rf_wdata}; matched SFC RTL\n";
+      } else {
+        FModuleOp model;
+        for (auto candidate : circuit.getOps<FModuleOp>())
+          if (candidate.getName() == "Queue1_AXI4BundleW") model = candidate;
+        require(bool(model), "missing golden module");
+        expect(model, "io_deq_valid", {"io_enq_valid"});
+        expect(model, "io_enq_ready", {});
+        expect(model, "io_count", {});
+        for (StringRef field : {"data", "strb", "last"}) {
+          expect(model, "io_deq_bits_" + field.str(),
+                 {"io_enq_bits_" + field.str()});
+        }
+        // Also exercise recursive instance tracing through the probe wrapper.
+        auto probe = *circuit.getOps<FModuleOp>().begin();
+        expect(probe, "io_deq_valid", {"io_enq_valid"});
+        for (StringRef field : {"data", "strb", "last"})
+          expect(probe, "io_deq_bits_" + field.str(),
+                 {"io_enq_bits_" + field.str()});
+        llvm::outs() << "Rocket Queue1_AXI4BundleW: io_deq_valid <- {io_enq_valid}; "
+                        "io_enq_ready <- {} matched SFC RTL; "
+                        "io_count <- {} matched SFC FIRRTL register boundary\n"
+                        "Payload data/strb/last each depends only on matching "
+                        "enqueue field, including through the probe instance; "
+                        "matched SFC RTL\n";
       }
-      // Also exercise recursive instance tracing through the probe wrapper.
-      auto probe = *circuit.getOps<FModuleOp>().begin();
-      expect(probe, "io_deq_valid", {"io_enq_valid"});
-      for (StringRef field : {"data", "strb", "last"})
-        expect(probe, "io_deq_bits_" + field.str(),
-               {"io_enq_bits_" + field.str()});
       if (argc == 3) {
         std::error_code ec;
         llvm::raw_fd_ostream out(argv[2], ec);
@@ -248,16 +337,11 @@ int main(int argc, char **argv) {
         root->print(out);
         out << '\n';
       }
-      llvm::outs() << "Rocket Queue1_AXI4BundleW: io_deq_valid <- {io_enq_valid}; "
-                      "io_enq_ready <- {} matched SFC RTL; "
-                      "io_count <- {} matched SFC FIRRTL register boundary\n"
-                      "Payload data/strb/last each depends only on matching "
-                      "enqueue field, including through the probe instance; "
-                      "matched SFC RTL\n";
     }
     llvm::outs() << "Nested when conditions, last-connect override and register "
                     "boundaries passed; static memory selections and aliases "
                     "follow async address/enable and stop at sync state; "
+                    "selected node/mux fields preserve dependencies and order; "
                     "unsupported memory modes rejected\n";
     return 0;
   } catch (const std::exception &e) {
