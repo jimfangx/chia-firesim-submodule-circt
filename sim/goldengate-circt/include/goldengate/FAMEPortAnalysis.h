@@ -21,6 +21,24 @@ struct FAMEPortPlan {
   llvm::SmallVector<unsigned> staleTopPorts;
 };
 
+// Capture the hub's domain identities before channelization deletes the scalar
+// ports. Order is FAMEChannelPorts/TargetClockChannel annotation order, never
+// physical module port order. An empty payloadField denotes scalar bits.
+struct FAMEHubClockDomain {
+  unsigned modelPort;
+  unsigned topPort;
+  std::string modelClockName;
+  std::string topClockName;
+  std::string payloadField;
+  RationalClockInfo clockInfo;
+};
+
+std::optional<llvm::SmallVector<FAMEHubClockDomain>>
+analyzeFAMEHubClockDomains(const GGChannelConnection &channel,
+                           const TopHierarchy &hierarchy,
+                           const ModelChannelBinding &binding,
+                           std::string &error);
+
 // Capture names and dependencies before any port rewrite invalidates indices.
 // Selection follows connection annotation order; payload order stays in the
 // connection's source list, independently of the model's physical port order.

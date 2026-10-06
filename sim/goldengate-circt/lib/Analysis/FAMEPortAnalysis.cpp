@@ -5,6 +5,103 @@
 
 using namespace circt::firrtl;
 
+std::optional<llvm::SmallVector<goldengate::FAMEHubClockDomain>>
+goldengate::analyzeFAMEHubClockDomains(
+    const GGChannelConnection &channel, const TopHierarchy &hierarchy,
+    const ModelChannelBinding &binding, std::string &error) {
+  auto reject = [&](llvm::StringRef reason)
+      -> std::optional<llvm::SmallVector<FAMEHubClockDomain>> {
+    error = "FAME hub clock domains: " + reason.str();
+    return std::nullopt;
+  };
+  if (!binding.portGroup || !binding.instance || !hierarchy.top)
+    return reject("missing model binding or top hierarchy");
+  const auto &group = *binding.portGroup;
+  auto model = group.module;
+  auto top = hierarchy.top;
+  auto instance = binding.instance;
+  if (!model || !mlir::isa<FModuleOp>(model.getOperation()) ||
+      instance->getParentOfType<FModuleOp>() != top ||
+      instance.getModuleName() != model.getModuleName() ||
+      binding.globalName != channel.name || group.name.empty() ||
+      channel.name.empty() || channel.kind != ChannelKind::TargetClock ||
+      group.direction != Direction::In || group.clockPort || channel.clock ||
+      !channel.sources.empty())
+    return reject("expected an unclocked input clock channel on the bound hub");
+  if (group.ports.empty() || group.ports.size() != channel.sinks.size() ||
+      group.ports.size() != channel.targetClocks.size() ||
+      group.ports.size() != binding.instancePorts.size())
+    return reject("clock ports, sinks, binding and metadata counts differ");
+
+  // bindChannelToModels uses a sorted set to find the local group. Recover the
+  // ordered association from actual top/instance connections, as SFC's
+  // portsByInputChannel does, and verify the local annotation agrees.
+  llvm::SmallVector<FAMEHubClockDomain> domains;
+  std::set<unsigned> modelPorts, topPorts;
+  std::set<std::string> fields;
+  auto payloadField = [](llvm::StringRef name, llvm::StringRef channelName) {
+    while (!name.empty() && !channelName.empty() &&
+           name.front() == channelName.front()) {
+      name = name.drop_front();
+      channelName = channelName.drop_front();
+    }
+    return name.str();
+  };
+  for (unsigned i = 0; i < group.ports.size(); ++i) {
+    unsigned modelPort = group.ports[i];
+    const auto &sink = channel.sinks[i];
+    if (modelPort >= model.getNumPorts() ||
+        !modelPorts.insert(modelPort).second ||
+        !llvm::is_contained(binding.instancePorts, modelPort) ||
+        model.getPortDirection(modelPort) != Direction::In ||
+        !mlir::isa<ClockType>(model.getPorts()[modelPort].type))
+      return reject("model clock port is repeated, unbound or not an input Clock");
+    if (sink.module != top || !sink.port ||
+        *sink.port >= top.getNumPorts() ||
+        (sink.fieldID && *sink.fieldID != 0) ||
+        !topPorts.insert(*sink.port).second ||
+        top.getPortDirection(*sink.port) != Direction::In ||
+        !mlir::isa<ClockType>(top.getPorts()[*sink.port].type))
+      return reject("clock sink is repeated or not a top input Clock");
+    unsigned matches = 0;
+    for (const auto &connection : hierarchy.connections) {
+      if (connection.instance != binding.instance)
+        continue;
+      if (connection.instancePort == modelPort) {
+        if (connection.topPort != *sink.port)
+          return reject("model clock annotation order disagrees with sinks");
+        ++matches;
+      } else if (connection.topPort == *sink.port) {
+        return reject("clock sink connects to a different model clock");
+      }
+    }
+    if (matches != 1)
+      return reject("clock domain needs one direct top-to-model connection");
+    const auto &info = channel.targetClocks[i];
+    if (info.name.empty() || !info.multiplier || !info.divisor || !info.mfmr)
+      return reject("clock metadata has an empty name or zero ratio/MFMR");
+    auto modelName = model.getPortName(modelPort).str();
+    auto topName = top.getPortName(*sink.port).str();
+    std::string field;
+    if (group.ports.size() > 1) {
+      field = payloadField(modelName, group.name);
+      if (field.empty() || !fields.insert(field).second ||
+          field != payloadField(topName, channel.name))
+        return reject("model and top clock payload fields disagree");
+    }
+    auto resolvedInfo = info;
+    // Scala's clockMFMRMap is clockInfo.zip(clockMFMRs).toMap: repeated
+    // RationalClock records select the last MFMR for that exact clock key.
+    for (const auto &other : channel.targetClocks)
+      if (other.name == info.name && other.multiplier == info.multiplier &&
+          other.divisor == info.divisor)
+        resolvedInfo.mfmr = other.mfmr;
+    domains.push_back({modelPort, *sink.port, std::move(modelName),
+                       std::move(topName), std::move(field), resolvedInfo});
+  }
+  return domains;
+}
+
 // SFC's getHostDecoupledChannelType preserves the original endpoint type for a
 // single leaf, or groups multiple leaves under their names after removing the
 // common prefix with the global channel name. Construct the corresponding

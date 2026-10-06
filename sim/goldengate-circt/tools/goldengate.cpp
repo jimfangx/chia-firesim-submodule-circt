@@ -1249,9 +1249,10 @@ int main(int argc, char **argv) {
                                                               error);
           if (!candidate)
             return fail("FAME clock model ports: " + error);
-          if (candidate->ports.size() == 1 &&
-              isa<ClockType>(candidate->module.getPorts()[candidate->ports[0]].type) &&
-              !candidate->clockPort) {
+          if (!candidate->clockPort &&
+              llvm::all_of(candidate->ports, [&](unsigned port) {
+                return isa<ClockType>(candidate->module.getPorts()[port].type);
+              })) {
             if (clockGroup)
               return fail("multiple target clock model groups");
             clockGroup = std::move(*candidate);
@@ -1268,6 +1269,15 @@ int main(int argc, char **argv) {
         return fail("FAME clock model binding: " + error);
       if (clockGroup->module.getOperation() != selectedOutputModel.getOperation())
         return fail("baseline FAME output model differs from clock hub");
+      auto clockDomains = goldengate::analyzeFAMEHubClockDomains(
+          *clockChannel, *clockHierarchy, clockBindings->front(), error);
+      if (!clockDomains)
+        return fail(error);
+      // Downstream data-channel control still uses one domain. Validate the
+      // complete ordered plan before any clock-channel mutation.
+      if (clockDomains->size() != 1)
+        return fail("baseline FAME data-channel control currently requires one hub clock domain");
+      const auto &clockDomain = clockDomains->front();
       llvm::SmallVector<FModuleLike> clockModels;
       clockModels.push_back(clockGroup->module);
       llvm::SmallVector<goldengate::GGChannelConnection, 0> clockChannels;
@@ -1276,9 +1286,8 @@ int main(int argc, char **argv) {
           *clockHierarchy, *clockBindings, clockChannels, clockModels, error);
       if (!clockPlan || clockPlan->sinks.size() != 1)
         return fail("FAME clock port plan: " + error);
-      auto oldTopClock = clockChannel->sinks.front().module.getPortName(
-          *clockChannel->sinks.front().port).str();
-      auto oldModelClock = clockGroup->module.getPortName(clockGroup->ports[0]).str();
+      auto oldTopClock = clockDomain.topClockName;
+      auto oldModelClock = clockDomain.modelClockName;
       auto newTopClock = clockPlan->sinks.front().portName;
       auto newModelClock = clockGroup->name + "_sink";
       if (failed(goldengate::rewriteFAMEInputChannel(
@@ -1394,11 +1403,9 @@ int main(int argc, char **argv) {
               circuit, clockModel, oldModelClock, error,
               clockBits.getResult())))
         return fail("FAME target clock gate: " + error);
-      if (clockChannel->targetClocks.size() != 1)
-        return fail("FAME hub clock XDC currently requires one analyzed clock");
       if (failed(goldengate::addFAMEClockConstraint(
               circuit, clockModel, oldModelClock,
-              clockChannel->targetClocks.front(), error)))
+              clockDomain.clockInfo, error)))
         return fail("FAME hub clock XDC: " + error);
       if (failed(mlir::verify(*module)))
         return fail("FAME target clock gate produced invalid FIRRTL IR");

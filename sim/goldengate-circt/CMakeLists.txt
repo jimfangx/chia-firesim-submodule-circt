@@ -482,6 +482,21 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-fame-clock-gate-identity-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-clock-gate-identity COMMAND goldengate-fame-clock-gate-identity-test)
+  add_executable(goldengate-fame-hub-clock-domains-test
+    test/Transforms/FAMEHubClockDomainsTest.cpp
+    lib/Analysis/FAMEPortAnalysis.cpp lib/Analysis/ModelAnalysis.cpp
+    lib/Analysis/HierarchyAnalysis.cpp lib/Analysis/ChannelAnalysis.cpp
+    lib/Support/TargetUtils.cpp lib/Support/XDCEmission.cpp
+    lib/Transforms/FAMEInputChannel.cpp)
+  target_compile_features(goldengate-fame-hub-clock-domains-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-hub-clock-domains-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-hub-clock-domains-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-hub-clock-domains-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-hub-clock-domains COMMAND goldengate-fame-hub-clock-domains-test)
+  add_test(NAME goldengate-fame-hub-clock-domains-reversed
+    COMMAND goldengate-fame-hub-clock-domains-test --reversed)
   add_test(NAME goldengate-fame-clock-gate-collision COMMAND goldengate-circt
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEClockGateCollision.fir
     --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.anno.json

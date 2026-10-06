@@ -8,8 +8,8 @@ import firesim.lib.bridgeutils.RationalClock
 object FAMEHubClockOracle extends App {
   val input = """circuit Top :
   module Model :
-    input bridge_clocks_0 : Clock
     input bridge_clocks_1 : Clock
+    input bridge_clocks_0 : Clock
     output out0 : UInt<1>
     output out1 : UInt<1>
     output targetClock0 : Clock
@@ -42,7 +42,8 @@ object FAMEHubClockOracle extends App {
   val low = new LowFirrtlCompiler().compile(CircuitState(Parser.parse(input), ChirrtlForm), Nil)
   val top = ModuleTarget("Top", "Top")
   val model = ModuleTarget("Top", "Model")
-  val clockNames = Seq("bridge_clocks_0", "bridge_clocks_1")
+  val clockNames = if (args.length > 1) Seq("bridge_clocks_1", "bridge_clocks_0")
+                   else Seq("bridge_clocks_0", "bridge_clocks_1")
   val annos = Seq(
     FAMEHostClock(top.ref("hostClock")), FAMEHostReset(top.ref("hostReset")),
     FAMETransformAnnotation(model),
@@ -70,8 +71,20 @@ object FAMEHubClockOracle extends App {
   val connects = body.collect { case c: Connect => c.loc.serialize -> c.expr }.toMap
   val payload = transformed.ports.find(_.name == "bridge_clocks_sink").get.tpe
     .asInstanceOf[BundleType].fields.find(_.name == "bits").get.tpe.asInstanceOf[BundleType]
-  require(payload.fields.map(_.name) == Seq("_0", "_1") &&
+  require(payload.fields.map(_.name) == clockNames.map(_.stripPrefix("bridge_clocks")) &&
     payload.fields.forall(_.tpe == ClockType))
+  // Inspect emitted gate constraints to observe the actual positional metadata
+  // association, independently of the input annotation construction.
+  for (name <- clockNames) {
+    val constraint = result.annotations.collectFirst {
+      case a: midas.InternalXDCAnnotation if a.argumentList.head.ref == name + "_buffer" => a
+    }.get
+    val lines = constraint.formatString.split("\n")
+    val clockName = lines(0).split(" ")(2)
+    val mfmr = lines(1).split(" ")(1)
+    val divisor = if (clockName == "domain0") 2 else 3
+    println(s"DOMAIN $name ${name.stripPrefix("bridge_clocks")} $clockName 1 $divisor $mfmr")
+  }
   for (i <- 0 until 2) {
     val register = body.collectFirst { case r: DefRegister if r.name == s"state$i" => r }.get
     require(register.clock.serialize == s"bridge_clocks_${i}_buffer.O")

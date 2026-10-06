@@ -54,11 +54,43 @@ preserved compiler, and is not an immutable Rocket fixture.
 The compiler and relevant native test binaries build successfully; 19 focused
 CTest checks pass, followed by three mixed-clock checks in `tests-mixed.log`.
 
+## Ordered domain analysis
+
+`analyzeFAMEHubClockDomains` captures each model clock, connected top clock,
+payload field and rational clock/MFMR record before scalar port erasure. It
+follows the annotation sequence used by Scala `portsByInputChannel` and
+`clockMetadata`, rather than the sorted set in `ModelChannelBinding`. It
+rejects inconsistent local/global order, repeated ports, non-Clock ports,
+missing connections and invalid metadata without changing IR. Repeated exact
+RationalClock keys retain Scala's last-MFMR map semantics.
+
+The baseline compiler now uses these records for clock identity and constraint
+selection. `FAMEHubClockDomainsTest.cpp` also constructs both native enable/
+gate pairs after erasing the scalar ports, with reversed physical declarations
+and both annotation orders. Its four `DOMAIN` rows match the actual Scala
+oracle's emitted gate-constraint associations exactly; 13 malformed cases are
+rejected in each order. The native gate constraints and target state clocks
+remain attached to the correct domains.
+
+The actual Rocket `circt-ingestion/post-fame-host-control.mlir` yields one
+scalar domain, `clockBridge_clocks_0`, with ratio 1/1 and MFMR 1. Its metadata
+matches the immutable ClockBridgeChannel in:
+
+```text
+sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json
+```
+
+Iteration 13 evidence is in `iteration13-clock-domains/`: Scala and native
+normal/reversed domain observations, `rocket-domains.log`,
+`rocket-gate-boundary.log`, successful build logs and `tests-final.log` (24
+focused checks). The gate comparison again matches the immutable U250 RTL
+contract and all three generated-clock XDC commands listed above. These local
+tests do not start the harness-owned manager verification gates.
+
 ## Remaining work
 
-The baseline driver still selects one hub clock. Next, construct clock-domain
-records from the ordered model clock port group and clock metadata, and use
-them to select each raw payload leaf and its enable/gate identity. Annotation
-renames and input/output FSM clock enables must use those records before the
-full hub path can support multiple clocks. Manager gates remain harness-owned;
+The baseline driver still requires one hub clock because downstream data
+channels use one enable. Next, use the ordered records for all clock annotation
+renames and input/output FSM clock-enable selection before enabling multiple
+clocks in the full hub path. Manager gates remain harness-owned;
 FAME-5 and the SFC UART-bearing differential remain incomplete.
