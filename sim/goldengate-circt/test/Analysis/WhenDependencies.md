@@ -326,3 +326,70 @@ gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireS
 This comparison establishes constructor field connectivity. Comparing grouped
 channel unions and emitted output-valid predicates against executable Scala
 FAME remains the next consumer step; full Rocket gates remain harness-owned.
+
+The October 6 iteration 8 comparison extends that same immutable UserYanker
+boundary to aggregate `MultibitMuxOp`. The native candidate replaces the
+dynamic vector read with mux arms in CIRCT's descending element order. It
+retains the original field sources, named vector boundary, and selected nested
+field identity. This is an equivalent CIRCT representation of the extraction,
+not an operation appearing in the SFC fixture itself. Generic operand tracing
+previously included sibling fields: the new regression failed with
+`wrong dependencies for size` before the core fix.
+
+The tracer now projects the selected field into each reachable mux arm.
+Literal indices select one arm; narrow indices exclude unreachable high arms
+using the original operand count. The local regression also checks explicit
+rejection of out-of-range literals; this diagnostic is not an SFC parity claim.
+The immutable `.sfc.fir` lines 26572–26588 and 26604–26605 remain unchanged in
+the extraction. The immutable U250 `design/FireSim-generated.sv` lines
+57878–57925 and 58321–58322 confirm independent source/size lookup muxes and
+zero tails. Both candidate ordered input lists match executable SFC
+`LowFirrtlCompiler`/`CheckCombLoops`: `index, source9, ..., source0` and
+`index, size9, ..., size0`. Sets also match after `normalizeFAMEInput`.
+
+The consumer comparison groups index, all source fields, and all size fields
+into three input channels. It analyzes a source-only output and a combined
+size/source output as separate model configurations, then passes those actual
+dependency results to `rewriteFAMEOutputValids`. All 32 valid/fired input
+combinations for each emitted predicate match the preserved executable Scala
+`FAME1OutputChannel.setValid` rule. Source-only validity is independent of the
+size token; combined validity requires both. These are extracted-boundary
+channel assignments, not the full Rocket annotation graph or timestep test.
+
+Mutable comparison artifacts are under `iteration8-multibit-dependencies/` in
+the U250 generated-source tree: `sfc-comparison.log`, `circt-comparison.log`,
+`comparison.log`, `multibit-useryanker.mlir`, its `.valid.mlir` control candidate,
+and `normalized-useryanker.mlir`. Reproduce the native comparison with:
+
+```sh
+cd /scratch/jfx/fsim-circt/sims/firesim
+source ./sourceme-manager.sh --skip-ssh-setup
+gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config
+"$gg_generated/goldengate-circt-build/goldengate-comb-dependency-test" \
+  "$gg_generated/iteration5-aggregate-dependencies/candidate/input.mlir" \
+  "$gg_generated/iteration8-multibit-dependencies/normalized-useryanker.mlir" \
+  "$gg_generated/iteration8-multibit-dependencies/constructed-useryanker.mlir" \
+  "$gg_generated/iteration8-multibit-dependencies/multibit-useryanker.mlir"
+```
+
+The tracked `UserYankerFAMEOracle.scala` compiles with the cached Scala compiler,
+the existing midas dependency classpath, and `sim/midas/target/scala-2.13/classes`.
+Run it with `iteration5-aggregate-dependencies/UserYankerProbe.fir` to obtain the
+SFC ordered lists and two valid truth tables, continuing in the sourced shell:
+
+```sh
+gg_classpath=$(cat sim/midas/target/streams/compile/dependencyClasspath/_global/streams/export)
+gg_classpath="sim/midas/target/scala-2.13/classes:$gg_classpath"
+gg_compiler=/home/firesim/.cache/coursier/v1/https/repo1.maven.org/maven2/org/scala-lang/scala-compiler/2.13.10/scala-compiler-2.13.10.jar
+mkdir -p "$gg_generated/iteration8-multibit-dependencies/classes"
+java -cp "$gg_classpath:$gg_compiler" scala.tools.nsc.Main \
+  -classpath "$gg_classpath" -d "$gg_generated/iteration8-multibit-dependencies/classes" \
+  sim/goldengate-circt/test/Analysis/UserYankerFAMEOracle.scala
+java -cp "$gg_generated/iteration8-multibit-dependencies/classes:$gg_classpath" Oracle \
+  "$gg_generated/iteration5-aggregate-dependencies/UserYankerProbe.fir"
+```
+
+Full Rocket gates remain owned by the harness. The next consumer gap is
+fired-register identity when target
+declarations collide with generated names; Scala uses its namespace allocator
+while native control consumers still rely on fixed suffixes.

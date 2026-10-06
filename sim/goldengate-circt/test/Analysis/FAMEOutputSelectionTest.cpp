@@ -91,13 +91,18 @@ void run(MLIRContext &context, unsigned rejection) {
   b.create<StrictConnectOp>(model.getLoc(), arg(5), forward.getResult());
   b.create<StrictConnectOp>(model.getLoc(), arg(6), arg(3));
   b.create<StrictConnectOp>(model.getLoc(), arg(7), arg(2));
-  // Native bundle construction must not make printfB depend on the unused
-  // trigger field. This catches a spurious input valid in the FAME rule.
+  // Native bundle construction and aggregate multibit selection must not make
+  // printfB depend on the unused trigger field. The index shares rx_local with
+  // data, so the selected channel must be deduplicated in the valid rule.
   auto recordType = BundleType::get(&context, {
       {b.getStringAttr("data"), false, UIntType::get(&context, 8)},
       {b.getStringAttr("unused"), false, UIntType::get(&context, 1)}});
   Value record = b.create<BundleCreateOp>(model.getLoc(), recordType,
                                         ValueRange{arg(1), arg(3)});
+  Value alternative = b.create<BundleCreateOp>(model.getLoc(), recordType,
+                                              ValueRange{arg(1), arg(3)});
+  record = b.create<MultibitMuxOp>(model.getLoc(), arg(9),
+                                   ValueRange{alternative, record});
   Value printData = b.create<SubfieldOp>(model.getLoc(), record, "data");
   b.create<StrictConnectOp>(model.getLoc(), arg(8), printData);
 

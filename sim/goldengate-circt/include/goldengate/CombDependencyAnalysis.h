@@ -26,6 +26,8 @@ namespace goldengate {
 // aggregate/leaf drivers remain blocked until last-connect normalization.
 // Bundle/vector constructors project a selected leaf onto its matching
 // operand, retaining relative nested field identity and excluding siblings.
+// Multibit muxes preserve that field in each reachable arm, including literal
+// and narrow indices, with CIRCT's descending arm order.
 // Inputs retain CheckCombLoops' breadth-first discovery order over named
 // electrical fields. Inline primitive expressions do not add graph depth;
 // instance output edges use the child's already simplified port ordering.

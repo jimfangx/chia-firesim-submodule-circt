@@ -316,6 +316,35 @@ private:
         mergeSource(mux.getSel());
         mergeSource(mux.getHigh(), fieldRef.getFieldID());
         mergeSource(mux.getLow(), fieldRef.getFieldID());
+      } else if (auto mux = dyn_cast<MultibitMuxOp>(op)) {
+        // LowerTypes can represent a dynamic read as a multibit mux. Its
+        // arms may still be aggregates: select the matching field in each
+        // reachable arm, rather than adding sibling channel dependencies.
+        auto arms = mux.getInputs();
+        uint64_t count = arms.size();
+        auto traceArm = [&](uint64_t index) {
+          // CIRCT stores arms highest index first. Keep the original arm
+          // count when mapping an index after bounding the reachable range.
+          mergeSource(arms[arms.size() - 1 - index], fieldRef.getFieldID());
+        };
+        if (auto constant = mux.getIndex().getDefiningOp<ConstantOp>()) {
+          auto index = constant.getValue().getLimitedValue(count);
+          if (index < count)
+            traceArm(index);
+          else
+            result.blockers.insert(current.getName().str() +
+                                   ":out-of-range multibit mux selection");
+        } else if (!count) {
+          result.blockers.insert(current.getName().str() +
+                                 ":zero-input multibit mux selection");
+        } else {
+          mergeSource(mux.getIndex());
+          auto width = mux.getIndex().getType().base().getWidthOrSentinel();
+          if (width >= 0 && width < 64)
+            count = std::min<uint64_t>(count, uint64_t{1} << width);
+          for (auto index = count; index > 0; --index)
+            traceArm(index - 1);
+        }
       } else if (auto access = dyn_cast<SubaccessOp>(op)) {
         // Dynamic reads select the same relative field from every reachable
         // vector element. Tracing the whole vector loses its leaf drivers and

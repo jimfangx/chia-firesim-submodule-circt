@@ -2,6 +2,7 @@
 #include "goldengate/CombDependencyAnalysis.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/LowerTypes.h"
+#include "goldengate/FAMEOutputValid.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -9,6 +10,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
+#include <functional>
 #include <stdexcept>
 
 using namespace mlir;
@@ -113,6 +115,116 @@ void expectUserYanker(FModuleOp model) {
     expect(model, field, inputs);
   }
 }
+// Consume the actual field dependencies as channels, then evaluate the emitted
+// FIRRTL valid predicates. Source-only and combined size/source payloads must
+// wait for precisely their required tokens, independently of fired state.
+void checkEchoValids(FModuleOp model, StringRef outputPath = {}) {
+  SmallVector<goldengate::ModelPortGroup> inputs;
+  for (StringRef field : {"index", "source", "size"}) {
+    goldengate::ModelPortGroup group{field.str() + "Input", model,
+                                    Direction::In, std::nullopt, {}};
+    for (auto [i, port] : llvm::enumerate(model.getPorts()))
+      if (port.direction == Direction::In && port.name.getValue().starts_with(field))
+        group.ports.push_back(i);
+    require(!group.ports.empty(), "missing echo input group");
+    inputs.push_back(std::move(group));
+  }
+  SmallVector<goldengate::LocalChannelDependency> dependencies;
+  for (StringRef name : {"source", "pair"}) {
+    goldengate::ModelPortGroup output{name.str(), model, Direction::Out,
+                                      std::nullopt, {}};
+    for (auto [i, port] : llvm::enumerate(model.getPorts()))
+      if (port.direction == Direction::Out &&
+          (port.name.getValue() == "source" ||
+           (name == "pair" && port.name.getValue() == "size")))
+        output.ports.push_back(i);
+    SmallVector<goldengate::ModelChannelBinding> bindings;
+    for (auto &input : inputs)
+      bindings.push_back({input.name, &input, {}, input.ports});
+    bindings.push_back({output.name, &output, {}, output.ports});
+    auto rows = goldengate::analyzeLocalChannelDependencies(model, bindings);
+    require(rows.size() == 1 && rows.front().unresolvedCauses.empty() &&
+                rows.front().unresolvedPorts.empty(), "unresolved grouped echo output");
+    dependencies.push_back(rows.front());
+  }
+  auto controls = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Controls" {
+      firrtl.module @Controls(in %hostClock: !firrtl.clock,
+          in %hostReset: !firrtl.uint<1>,
+          in %indexInput_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<1>>,
+          in %sourceInput_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<8>>,
+          in %sizeInput_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<8>>,
+          out %source_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<8>>,
+          out %pair_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<8>>) {
+        %zero = firrtl.constant 0 : !firrtl.uint<1>
+        %source_fired_0 = firrtl.regreset %hostClock, %hostReset, %zero : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>
+        %pair_fired_0 = firrtl.regreset %hostClock, %hostReset, %zero : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>, !firrtl.uint<1>
+        firrtl.strictconnect %source_fired_0, %source_fired_0 : !firrtl.uint<1>
+        firrtl.strictconnect %pair_fired_0, %pair_fired_0 : !firrtl.uint<1>
+      }
+    }
+  })mlir", model.getContext());
+  require(bool(controls), "echo controls parse failed");
+  auto controlCircuit = *controls->getOps<CircuitOp>().begin();
+  auto control = *controlCircuit.getOps<FModuleOp>().begin();
+  std::string error;
+  require(succeeded(goldengate::rewriteFAMEOutputValids(control, dependencies, error)), error);
+  require(succeeded(verify(*controls)), "echo valid controls invalid");
+  for (StringRef name : {"source", "pair"}) {
+    Value predicate;
+    control.walk([&](StrictConnectOp connect) {
+      auto field = connect.getDest().getDefiningOp<SubfieldOp>();
+      if (field && field.getFieldName() == "valid")
+        if (auto port = dyn_cast<BlockArgument>(field.getInput());
+            port && control.getPortName(port.getArgNumber()) == (name + "_source").str())
+          predicate = connect.getSrc();
+    });
+    require(bool(predicate), "missing echo valid predicate");
+    std::string table;
+    for (unsigned flags = 0; flags < 32; ++flags) {
+      std::function<bool(Value)> eval = [&](Value value) -> bool {
+        if (auto op = value.getDefiningOp<SubfieldOp>()) {
+          auto port = cast<BlockArgument>(op.getInput());
+          return (flags >> (port.getArgNumber() - 2)) & 1;
+        }
+        if (auto op = value.getDefiningOp<RegResetOp>())
+          return (flags >> (op.getName() == "source_fired_0" ? 3 : 4)) & 1;
+        if (auto op = value.getDefiningOp<NotPrimOp>()) return !eval(op.getInput());
+        if (auto op = value.getDefiningOp<AndPrimOp>())
+          return eval(op.getLhs()) && eval(op.getRhs());
+        throw std::runtime_error("unsupported echo valid expression");
+      };
+      bool expected = (flags & 3) == 3 && !(flags & (name == "source" ? 8 : 16)) &&
+                      (name == "source" || (flags & 4));
+      require(eval(predicate) == expected, "echo output waited for wrong channel tokens");
+      table.push_back(eval(predicate) ? '1' : '0');
+    }
+    if (!outputPath.empty()) llvm::outs() << "valid " << name << " <- " << table << '\n';
+  }
+  if (!outputPath.empty()) {
+    std::error_code ec;
+    llvm::raw_fd_ostream out(outputPath, ec);
+    require(!ec, "cannot write echo valid candidate: " + ec.message());
+    controls->print(out);
+    out << '\n';
+  }
+}
+// CIRCT's multibit mux stores its arms in descending element order. Keep the
+// same named vector boundary while replacing the dynamic read representation.
+void useMultibitMuxes(FModuleOp model) {
+  SmallVector<SubaccessOp> accesses;
+  model.walk([&](SubaccessOp op) { accesses.push_back(op); });
+  for (auto access : accesses) {
+    OpBuilder b(access);
+    auto type = access.getInput().getType().base();
+    SmallVector<Value> arms;
+    for (unsigned i = type.getNumElements(); i > 0; --i)
+      arms.push_back(b.create<SubindexOp>(access.getLoc(), access.getInput(), i - 1));
+    Value mux = b.create<MultibitMuxOp>(access.getLoc(), access.getIndex(), arms);
+    access.getResult().replaceAllUsesWith(mux);
+    access.erase();
+  }
+}
 // Native aggregate construction must preserve the selected leaf just like
 // the equivalent FIRRTL aggregate connects. Include nested vector/bundle
 // selection, a dynamic read, and a grouped output whose dependency is a union.
@@ -146,6 +258,11 @@ void constructedAggregates(MLIRContext &context) {
   expectOrder(model, "size", {"index", "size1", "size0"});
   expectOrder(model, "source", {"index", "source1", "source0"});
   expect(model, "fixed", {"source1"});
+  useMultibitMuxes(model);
+  require(succeeded(verify(*root)), "constructed multibit mux fixture invalid");
+  expectOrder(model, "size", {"index", "size1", "size0"});
+  expectOrder(model, "source", {"index", "source1", "source0"});
+  checkEchoValids(model);
   goldengate::ModelPortGroup input{"request", model, Direction::In,
                                     std::nullopt, {0, 2, 4}};
   goldengate::ModelPortGroup output{"response", model, Direction::Out,
@@ -558,6 +675,14 @@ void boundedDynamicVector(MLIRContext &context) {
   require(llvm::any_of(dependencies.back().unresolvedCauses, [](auto &cause) {
     return StringRef(cause).ends_with(":out-of-range vector selection");
   }), "out-of-range vector selection appeared dependency-free");
+  useMultibitMuxes(model);
+  require(succeeded(verify(*root)), "bounded multibit mux fixture invalid");
+  expectOrder(model, "narrow", {"index", "b", "a"});
+  expect(model, "fixed", {"b"});
+  dependencies = analyze(model);
+  require(llvm::any_of(dependencies.back().unresolvedCauses, [](auto &cause) {
+    return StringRef(cause).ends_with(":out-of-range multibit mux selection");
+  }), "out-of-range multibit mux selection appeared dependency-free");
 }
 
 void asynchronousReadWrite(MLIRContext &context) {
@@ -614,7 +739,7 @@ int main(int argc, char **argv) {
     foreignConnections(context);
     boundedDynamicVector(context);
     asynchronousReadWrite(context);
-    require(argc <= 4, "expected input MLIR, normalized output, optional constructed output");
+    require(argc <= 5, "expected input MLIR, normalized output, optional constructed and mux outputs");
     if (argc >= 2) {
       // Optional immutable Rocket extraction, normalized by the real tool.
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
@@ -629,7 +754,7 @@ int main(int argc, char **argv) {
         else if (candidate.getName() == "UserYankerProbe")
           userYankerProbe = candidate;
       if (userYankerProbe) expectUserYanker(userYankerProbe);
-      if (argc == 4) {
+      if (argc >= 4) {
         require(bool(userYankerProbe), "constructor comparison needs UserYanker extraction");
         constructUserYankerVector(userYankerProbe);
         require(succeeded(verify(*root)), "constructed UserYanker candidate invalid");
@@ -646,6 +771,22 @@ int main(int argc, char **argv) {
         out << '\n';
         llvm::outs() << "Native bundle/vector constructors match the extracted "
                         "UserYanker source/size dependency sets\n";
+      }
+      if (argc == 5) {
+        useMultibitMuxes(userYankerProbe);
+        require(succeeded(verify(*root)), "multibit UserYanker candidate invalid");
+        expectUserYanker(userYankerProbe);
+        for (const auto &row : analyze(userYankerProbe)) {
+          llvm::outs() << "multibit " << row.outputChannel << " <- ";
+          llvm::interleaveComma(row.inputChannels, llvm::outs());
+          llvm::outs() << '\n';
+        }
+        std::error_code ec;
+        llvm::raw_fd_ostream out(argv[4], ec);
+        require(!ec, "cannot write multibit candidate: " + ec.message());
+        root->print(out);
+        out << '\n';
+        checkEchoValids(userYankerProbe, std::string(argv[4]) + ".valid.mlir");
       }
       if (opcodeProbe) {
         unsigned dynamicReads = 0;

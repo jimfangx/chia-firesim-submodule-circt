@@ -173,6 +173,7 @@ if(BUILD_TESTING)
   add_executable(goldengate-comb-dependency-test
     test/Analysis/CombDependencyAnalysisTest.cpp
     lib/Analysis/CombDependencyAnalysis.cpp lib/Transforms/LowerTypes.cpp
+    lib/Transforms/FAMEOutputValid.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-comb-dependency-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-comb-dependency-test PRIVATE -fno-rtti)
