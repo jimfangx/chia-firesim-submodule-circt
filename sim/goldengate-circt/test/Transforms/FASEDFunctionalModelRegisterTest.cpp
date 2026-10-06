@@ -82,6 +82,80 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         b.getNamedAttr("target", b.getStringAttr("~GGFASEDLatencyRegistersWrapper|GGFASEDLatencyRegistersWrapper>" + std::string(name)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
+std::string dump(Operation *op) {
+  std::string text; llvm::raw_string_ostream out(text); op->print(out); return text;
+}
+void phases(MLIRContext &context) {
+  auto early = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGControlErrorWrapper" {
+    firrtl.module @GGControlErrorWrapper(in %hostClock: !firrtl.clock,
+      in %hostReset: !firrtl.uint<1>, out %other: !firrtl.uint<8>) {}
+  } })", &context);
+  require(bool(early), "early fixture parse failed");
+  auto c = *early->getOps<CircuitOp>().begin(); OpBuilder b(&context);
+  c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("test.Target")),
+      b.getNamedAttr("target", b.getStringAttr("~GGControlErrorWrapper|GGControlErrorWrapper>other"))})}));
+  auto top = named(c, "GGControlErrorWrapper"); auto topBefore = dump(top);
+  auto annotations = c->getAttr("rawAnnotations"); FModuleOp bank; std::string error;
+  require(succeeded(goldengate::materializeFASEDFunctionalModelRegister(c, bank, error)), error);
+  require(c.getName() == "GGControlErrorWrapper" && dump(top) == topBefore &&
+      c->getAttr("rawAnnotations") == annotations && succeeded(verify(*early)),
+      "early materialization changed top identity, ports or annotations");
+  unsigned uses = 0; c.walk([&](InstanceOp i) { uses += i.getModuleName() == bank.getName(); });
+  require(uses == 0, "materialization prematurely attached the bank");
+  auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  require(regs && regs.size() == 1 &&
+      cast<DictionaryAttr>(regs[0]).getAs<StringAttr>("name") == "relaxFunctionalModel" &&
+      cast<DictionaryAttr>(regs[0]).getAs<IntegerAttr>("offset").getInt() == 72,
+      "early bank changed global word 18 or register identity");
+  auto before = dump(*early); FModuleOp unchanged = top;
+  require(failed(goldengate::materializeFASEDFunctionalModelRegister(c, unchanged, error)) &&
+      unchanged == top && dump(*early) == before, "duplicate materialization changed result or IR");
+  require(failed(goldengate::attachFASEDFunctionalModelRegister(c, bank, error)) && dump(*early) == before,
+      "premature attachment changed IR");
+  // The split API must preserve all hardware equations and target transfers.
+  auto split = fixture(context), combined = fixture(context);
+  auto splitCircuit = *split->getOps<CircuitOp>().begin();
+  require(succeeded(goldengate::materializeFASEDFunctionalModelRegister(splitCircuit, bank, error)) &&
+      succeeded(goldengate::attachFASEDFunctionalModelRegister(splitCircuit, bank, error)), error);
+  require(succeeded(goldengate::addFASEDFunctionalModelRegister(*combined->getOps<CircuitOp>().begin(), error)), error);
+  require(dump(*split) == dump(*combined) && succeeded(verify(*split)),
+      "split bank construction changed hardware or annotations");
+
+  // Null/foreign/wrong banks, each port's name/type/direction, arity and uses.
+  for (unsigned bad = 0; bad < 17; ++bad) {
+    auto root = fixture(context), foreign = fixture(context);
+    auto circuit = *root->getOps<CircuitOp>().begin(); FModuleOp candidate;
+    require(succeeded(goldengate::materializeFASEDFunctionalModelRegister(circuit, candidate, error)), error);
+    if (bad == 0) candidate = {};
+    if (bad == 1) require(succeeded(goldengate::materializeFASEDFunctionalModelRegister(
+        *foreign->getOps<CircuitOp>().begin(), candidate, error)), error);
+    if (bad == 2) candidate = named(circuit, "GGFASEDLatencyRegistersWrapper");
+    if (bad >= 3 && bad <= 15) {
+      SmallVector<PortInfo> malformed(candidate.getPorts());
+      if (bad == 15) malformed.pop_back();
+      else {
+        unsigned port = (bad - 3) / 3, mutation = (bad - 3) % 3;
+        if (mutation == 0) malformed[port].name = b.getStringAttr("wrong");
+        if (mutation == 1) malformed[port].type = UIntType::get(&context, 2);
+        if (mutation == 2) malformed[port].direction = malformed[port].direction == Direction::In ? Direction::Out : Direction::In;
+      }
+      candidate.erase(); b.setInsertionPointToEnd(circuit.getBodyBlock());
+      candidate = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("GGFASEDFunctionalModelRegister"),
+          ConventionAttr::get(&context, Convention::Internal), malformed);
+    }
+    if (bad == 16) {
+      b.setInsertionPointToEnd(circuit.getBodyBlock());
+      auto user = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("User"),
+          ConventionAttr::get(&context, Convention::Internal), ArrayRef<PortInfo>{});
+      b.setInsertionPointToStart(user.getBodyBlock()); b.create<InstanceOp>(circuit.getLoc(), candidate, "used");
+    }
+    auto before = dump(*root);
+    require(failed(goldengate::attachFASEDFunctionalModelRegister(circuit, candidate, error)) &&
+        !error.empty() && dump(*root) == before, "invalid standalone bank accepted or mutated IR");
+  }
+  llvm::outs() << "FASED functional-model MMIO phases: early global word 18, unchanged top/annotations, split/combined equivalence and 19 atomic rejections passed\n";
+}
 void behavior(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDFunctionalModelRegister(c, error)), error);
@@ -179,7 +253,7 @@ void rejections(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(context); mapping(context); rejections(context);
+    phases(context); behavior(context); mapping(context); rejections(context);
     llvm::outs() << "FASED functional model register: 32768 cycles, host/ingress bindings, targets and 14 atomic rejections passed\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }

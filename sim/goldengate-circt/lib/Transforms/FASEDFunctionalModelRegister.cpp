@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // Oracle: FuncModelProgrammableRegs, Widget.genAndAttachReg, MCRIO.bindReg.
-// Requires: uninstantiated latency-register wrapper, exact host clock/reset,
+// Materialization requires a free bank symbol and preserves top/annotations.
+// Attachment requires an uninstantiated latency-register wrapper, host clock/reset,
 // one-bit ingress relaxed input and retained ten-flight bridge constructor.
 // Consumes/produces annotations: none; preserves and explicitly retargets all.
 // IR mutations: a host-clocked 32-bit reset register, decoded MCR word 18
@@ -15,17 +16,32 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addFASEDFunctionalModelRegister(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral bankName = "GGFASEDFunctionalModelRegister";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDFunctionalModelRegisterWrapper";
-  constexpr llvm::StringLiteral controlName = "fased_functional_model_mcr";
+namespace {
+constexpr llvm::StringLiteral bankName = "GGFASEDFunctionalModelRegister";
+constexpr llvm::StringLiteral wrapperName = "GGFASEDFunctionalModelRegisterWrapper";
+constexpr llvm::StringLiteral controlName = "fased_functional_model_mcr";
+SmallVector<PortInfo> functionalModelPorts(MLIRContext *ctx) {
+  OpBuilder b(ctx);
+  auto u = [&](unsigned w) { return UIntType::get(ctx, w, false); };
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, u(1)},
+      {b.getStringAttr("valid"), false, u(1)}, {b.getStringAttr("bits"), false, u(32)}});
+  auto words = FVectorType::get(token, 1);
+  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, u(4)}});
+  return {{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+      {b.getStringAttr("reset"), u(1), Direction::In},
+      {b.getStringAttr("relaxed"), u(1), Direction::Out},
+      {b.getStringAttr("mcr"), mcr, Direction::Out}};
+}
+LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
+    unsigned (&indices)[3], std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGFASEDLatencyRegistersWrapper")
     return reject("FASED functional model register requires the active latency register wrapper");
-  FModuleOp inner, engine;
+  FModuleOp engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
-      return reject("FASED functional model register module or wrapper already exists");
+    if (m.getName() == wrapperName)
+      return reject("FASED functional model register wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
   }
@@ -36,13 +52,9 @@ LogicalResult goldengate::addFASEDFunctionalModelRegister(CircuitOp circuit, std
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
   if (!flight || flight.getInt() != 10)
     return reject("FASED functional model register currently requires the recorded ten-flight constructor");
-  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto *ctx = circuit.getContext();
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);
-  auto token = [&](FIRRTLBaseType payload) {
-    return BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
-        {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
-  };
   std::optional<unsigned> clock, reset, relaxed;
   for (auto [i, port] : llvm::enumerate(inner.getPorts())) {
     if (port.name == controlName) return reject("FASED functional model MCR port already exists");
@@ -56,15 +68,23 @@ LogicalResult goldengate::addFASEDFunctionalModelRegister(CircuitOp circuit, std
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("FASED functional model register needs an uninstantiated top");
 
-  // Preflight is complete. Local lane zero maps to global word 18 (72 bytes).
-  auto words = FVectorType::get(token(uint(32)), 1);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  indices[0] = *clock; indices[1] = *reset; indices[2] = *relaxed;
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::materializeFASEDFunctionalModelRegister(CircuitOp circuit,
+    FModuleOp &result, std::string &error) {
+  for (auto module : circuit.getOps<FModuleLike>())
+    if (module.getName() == bankName) {
+      error = "FASED functional model register module already exists";
+      return failure();
+    }
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1); auto bankPorts = functionalModelPorts(ctx);
+  // Local lane zero retains global word 18 (72 bytes).
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-      {b.getStringAttr("reset"), bit, Direction::In},
-      {b.getStringAttr("relaxed"), bit, Direction::Out},
-      {b.getStringAttr("mcr"), mcr, Direction::Out}};
   auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName),
       ConventionAttr::get(ctx, Convention::Internal), bankPorts);
   bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr({b.getDictionaryAttr({
@@ -89,6 +109,32 @@ LogicalResult goldengate::addFASEDFunctionalModelRegister(CircuitOp circuit, std
   connect(field(read, "bits"), reg);
   connect(field(read, "valid"), one); connect(field(write, "ready"), one);
   connect(arg(2), b.create<BitsPrimOp>(loc, reg, 0, 0));
+
+  result = bank;
+  return success();
+}
+
+LogicalResult goldengate::attachFASEDFunctionalModelRegister(CircuitOp circuit,
+    FModuleOp bank, std::string &error) {
+  FModuleOp inner; unsigned indices[3];
+  if (failed(attachmentTop(circuit, inner, indices, error))) return failure();
+  auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
+  if (!bank || bank->getParentOp() != circuit.getOperation() || bank.getName() != bankName)
+    return reject("FASED functional-model attachment requires its materialized bank in this circuit");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto expected = functionalModelPorts(ctx); auto actual = bank.getPorts();
+  if (actual.size() != expected.size()) return reject("FASED functional-model bank needs exactly four ports");
+  for (auto [i, port] : llvm::enumerate(actual))
+    if (port.name != expected[i].name || port.type != expected[i].type ||
+        port.direction != expected[i].direction)
+      return reject("FASED functional-model bank ports differ from the clock/reset/one-bit relaxation/one-word MCR boundary");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+  if (used) return reject("FASED functional-model attachment requires an uninstantiated bank");
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto mcr = expected[3].type;
+  std::optional<unsigned> clock = indices[0], reset = indices[1], relaxed = indices[2];
+  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, port] : llvm::enumerate(inner.getPorts())) if (i != *relaxed) {
@@ -131,4 +177,11 @@ LogicalResult goldengate::addFASEDFunctionalModelRegister(CircuitOp circuit, std
   };
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+LogicalResult goldengate::addFASEDFunctionalModelRegister(CircuitOp circuit, std::string &error) {
+  FModuleOp inner, bank; unsigned indices[3];
+  if (failed(attachmentTop(circuit, inner, indices, error)) ||
+      failed(materializeFASEDFunctionalModelRegister(circuit, bank, error))) return failure();
+  return attachFASEDFunctionalModelRegister(circuit, bank, error);
 }
