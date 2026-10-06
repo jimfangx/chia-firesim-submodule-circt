@@ -1011,7 +1011,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-blockdev-write-latency COMMAND goldengate-blockdev-write-latency-test)
   add_executable(goldengate-blockdev-mmio-bank-test
     test/Transforms/BlockDevMMIOBankTest.cpp
-    lib/Transforms/BlockDevMMIOBank.cpp)
+    lib/Transforms/BlockDevMMIOBank.cpp lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-blockdev-mmio-bank-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-blockdev-mmio-bank-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-blockdev-mmio-bank-test PRIVATE

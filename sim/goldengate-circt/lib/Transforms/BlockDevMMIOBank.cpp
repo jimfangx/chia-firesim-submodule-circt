@@ -1,6 +1,9 @@
 // See LICENSE for license details.
-// Requires: active uninstantiated GGBlockDevWriteAckQueueWrapper, retained
-// annotations and exact one-tracker queue, host, geometry and timing boundaries.
+// Materialization requires a free bank symbol; preserves circuit identity, top
+// ports and annotations. Attachment requires the active uninstantiated
+// GGBlockDevWriteAckQueueWrapper, retained annotations, exact one-tracker queue,
+// host, geometry and timing boundaries and the uninstantiated ten-port bank.
+// All attachment preflight precedes mutation; combined API rejects atomically.
 // Consumes: four functional queue ports and geometry; annotation classes unchanged.
 // Transfers: circuit/copied-port targets; consumed targets remain on inner sim.
 // Produces: 26-word MMIO name/offset/permission metadata and ordinary FIRRTL ops.
@@ -16,22 +19,12 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addBlockDevMMIOBank(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral bankName = "GGBlockDevMMIOBank";
-  constexpr llvm::StringLiteral wrapperName = "GGBlockDevMMIOWrapper";
-  constexpr llvm::StringLiteral controlName = "blockdevBridge_mcr";
-  auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGBlockDevWriteAckQueueWrapper")
-    return reject("BlockDev MMIO requires the active BlockDev write-ack queue wrapper");
-  FModuleOp inner;
-  for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
-      return reject("BlockDev MMIO module or wrapper already exists");
-    if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
-  }
-  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!inner || !raw) return reject("BlockDev MMIO needs a top and retained annotations");
-  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+namespace {
+constexpr llvm::StringLiteral bankName = "GGBlockDevMMIOBank";
+constexpr llvm::StringLiteral wrapperName = "GGBlockDevMMIOWrapper";
+constexpr llvm::StringLiteral controlName = "blockdevBridge_mcr";
+SmallVector<PortInfo> blockDevBankPorts(MLIRContext *ctx) {
+  OpBuilder b(ctx);
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);
   auto token = [&](FIRRTLBaseType payload) {
@@ -43,21 +36,48 @@ LogicalResult goldengate::addBlockDevMMIOBank(CircuitOp circuit, std::string &er
       {b.getStringAttr("write"), false, bit}});
   auto data = BundleType::get(ctx, {{b.getStringAttr("tag"), false, bit},
       {b.getStringAttr("data"), false, uint(64)}});
-  auto timing = BundleType::get(ctx, {{b.getStringAttr("returnWrite"), false, bit},
-      {b.getStringAttr("readRespBusy"), false, bit}, {b.getStringAttr("wAckStallN"), true, bit},
-      {b.getStringAttr("rRespStallN"), true, bit}, {b.getStringAttr("tCycle"), true, uint(24)}});
   auto status = BundleType::get(ctx, {{b.getStringAttr("wAckStallN"), false, bit},
       {b.getStringAttr("rRespStallN"), false, bit}});
   auto info = BundleType::get(ctx, {{b.getStringAttr("nsectors"), false, uint(32)},
       {b.getStringAttr("max_req_len"), false, uint(32)}});
   auto latency = BundleType::get(ctx, {{b.getStringAttr("read_latency"), false, uint(24)},
       {b.getStringAttr("write_latency"), false, uint(24)}});
+  auto words = FVectorType::get(token(uint(32)), 26);
+  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  return {{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+      {b.getStringAttr("reset"), bit, Direction::In},
+      {b.getStringAttr("reqBuf"), token(request), Direction::In},
+      {b.getStringAttr("dataBuf"), token(data), Direction::In},
+      {b.getStringAttr("rRespBuf"), token(data), Direction::Out},
+      {b.getStringAttr("wAckBuf"), token(bit), Direction::Out},
+      {b.getStringAttr("timing"), status, Direction::In},
+      {b.getStringAttr("info"), info, Direction::Out},
+      {b.getStringAttr("latency"), latency, Direction::Out},
+      {b.getStringAttr("mcr"), mcr, Direction::Out}};
+}
+LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
+    unsigned (&indices)[8], std::string &error) {
+  auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
+  if (circuit.getName() != "GGBlockDevWriteAckQueueWrapper")
+    return reject("BlockDev MMIO requires the active BlockDev write-ack queue wrapper");
+  for (auto m : circuit.getOps<FModuleLike>()) {
+    if (m.getName() == wrapperName) return reject("BlockDev MMIO wrapper already exists");
+    if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
+  }
+  if (!inner || !circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    return reject("BlockDev MMIO needs a top and retained annotations");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx);
+  auto ports = blockDevBankPorts(ctx); auto bit = cast<FIRRTLBaseType>(ports[1].type);
+  auto timing = BundleType::get(ctx, {{b.getStringAttr("returnWrite"), false, bit},
+      {b.getStringAttr("readRespBusy"), false, bit}, {b.getStringAttr("wAckStallN"), true, bit},
+      {b.getStringAttr("rRespStallN"), true, bit},
+      {b.getStringAttr("tCycle"), true, UIntType::get(ctx, 24, false)}});
   const llvm::StringRef required[]{"hostClock", "hostReset", "blockdev_req_deq", "blockdev_data_deq",
       "blockdev_rresp_enq", "blockdev_wack_enq", "blockdev_timing", "blockdev_info"};
-  const Type types[]{ClockType::get(ctx), bit, token(request), token(data), token(data), token(bit), timing, info};
+  const Type types[]{ports[0].type, bit, ports[2].type, ports[3].type, ports[4].type, ports[5].type, timing, ports[7].type};
   const Direction directions[]{Direction::In, Direction::In, Direction::Out, Direction::Out,
       Direction::In, Direction::In, Direction::In, Direction::In};
-  unsigned indices[8];
   for (auto p : inner.getPorts())
     if (p.name == controlName || p.name == "blockdev_latency")
       return reject("BlockDev decoded MCR or latency port already exists");
@@ -72,21 +92,21 @@ LogicalResult goldengate::addBlockDevMMIOBank(CircuitOp circuit, std::string &er
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("BlockDev MMIO needs an uninstantiated top");
 
-  // Validate the complete boundary before introducing hardware.
-  auto words = FVectorType::get(token(uint(32)), 26);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::materializeBlockDevMMIOBank(CircuitOp circuit,
+    FModuleOp &result, std::string &error) {
+  for (auto module : circuit.getOps<FModuleLike>())
+    if (module.getName() == bankName) {
+      error = "BlockDev MMIO bank module already exists";
+      return failure();
+    }
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1); auto bankPorts = blockDevBankPorts(ctx);
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-      {b.getStringAttr("reset"), bit, Direction::In},
-      {b.getStringAttr("reqBuf"), token(request), Direction::In},
-      {b.getStringAttr("dataBuf"), token(data), Direction::In},
-      {b.getStringAttr("rRespBuf"), token(data), Direction::Out},
-      {b.getStringAttr("wAckBuf"), token(bit), Direction::Out},
-      {b.getStringAttr("timing"), status, Direction::In},
-      {b.getStringAttr("info"), info, Direction::Out},
-      {b.getStringAttr("latency"), latency, Direction::Out},
-      {b.getStringAttr("mcr"), mcr, Direction::Out}};
   auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName),
       ConventionAttr::get(ctx, Convention::Internal), bankPorts);
   const llvm::StringRef names[]{"read_latency", "write_latency", "bdev_nsectors", "bdev_max_req_len",
@@ -157,6 +177,32 @@ LogicalResult goldengate::addBlockDevMMIOBank(CircuitOp circuit, std::string &er
   connect(field(arg(7), "nsectors"), values[2]); connect(field(arg(7), "max_req_len"), values[3]);
   connect(field(arg(8), "read_latency"), values[0]); connect(field(arg(8), "write_latency"), values[1]);
 
+  result = bank;
+  return success();
+}
+
+LogicalResult goldengate::attachBlockDevMMIOBank(CircuitOp circuit,
+    FModuleOp bank, std::string &error) {
+  FModuleOp inner; unsigned indices[8];
+  if (failed(attachmentTop(circuit, inner, indices, error))) return failure();
+  auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
+  if (!bank || bank->getParentOp() != circuit.getOperation() || bank.getName() != bankName)
+    return reject("BlockDev MMIO attachment requires its materialized bank in this circuit");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto expected = blockDevBankPorts(ctx); auto actual = bank.getPorts();
+  if (actual.size() != expected.size()) return reject("BlockDev MMIO bank needs exactly ten ports");
+  for (auto [i, port] : llvm::enumerate(actual))
+    if (port.name != expected[i].name || port.type != expected[i].type ||
+        port.direction != expected[i].direction)
+      return reject("BlockDev MMIO bank ports differ from the queue/status/geometry/latency/26-word MCR boundary");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+  if (used) return reject("BlockDev MMIO attachment requires an uninstantiated bank");
+  auto latency = expected[8].type, mcr = expected[9].type;
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
+  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
+
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   SmallVector<unsigned> consumed{indices[2], indices[3], indices[4], indices[5], indices[7]};
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (!llvm::is_contained(consumed, i)) {
@@ -205,4 +251,12 @@ LogicalResult goldengate::addBlockDevMMIOBank(CircuitOp circuit, std::string &er
   };
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+LogicalResult goldengate::addBlockDevMMIOBank(CircuitOp circuit, std::string &error) {
+  FModuleOp inner, bank; unsigned indices[8];
+  // Validate the top before constructing hardware for atomic combined rejection.
+  if (failed(attachmentTop(circuit, inner, indices, error)) ||
+      failed(materializeBlockDevMMIOBank(circuit, bank, error))) return failure();
+  return attachBlockDevMMIOBank(circuit, bank, error);
 }

@@ -2532,10 +2532,28 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tsiBankAnnotations, error)))
         return fail("TSI MMIO materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT TSI MMIO bank before control allocation in " << tsiBankPath << '\n';
+      // Materialize BlockDev independently of its late queue/geometry/latency attachment.
+      // Allocation reads the actual 26-word bank and its register registry.
+      FModuleOp blockDevMMIOBank;
+      if (failed(goldengate::materializeBlockDevMMIOBank(circuit, blockDevMMIOBank, error)))
+        return fail("BlockDev MMIO materialization: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("BlockDev MMIO materialization produced invalid FIRRTL IR");
+      llvm::SmallString<256> blockDevBankPath(outputDir), blockDevBankAnnotations(outputDir);
+      llvm::sys::path::append(blockDevBankPath, "post-fame-blockdev-mmio-bank.mlir");
+      llvm::sys::path::append(blockDevBankAnnotations, "post-fame-blockdev-mmio-bank-all.json");
+      std::error_code blockDevBankWriteError;
+      llvm::raw_fd_ostream blockDevBankOut(blockDevBankPath, blockDevBankWriteError);
+      if (blockDevBankWriteError)
+        return fail("cannot write BlockDev MMIO materialization: " + blockDevBankWriteError.message());
+      module->print(blockDevBankOut); blockDevBankOut << '\n'; blockDevBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, blockDevBankAnnotations, error)))
+        return fail("BlockDev MMIO materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT BlockDev MMIO bank before control allocation in " << blockDevBankPath << '\n';
       // HasWidgets registration order remains independent of IR module order.
       // Derive each available bank's size from its register registry and check
-      // it against the implemented MCR port. The two banks assembled after
-      // global dispatch still use explicit declarations until that boundary
+      // it against the implemented MCR port. FASED, still assembled after
+      // global dispatch, retains its explicit declaration until its boundary
       // can be moved ahead of allocation.
       SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
       auto appendBank = [&](StringRef name, StringRef mcr,
@@ -2557,7 +2575,12 @@ int main(int argc, char **argv) {
           failed(appendBank("ResetPulseBridgeModule_0", "GGResetPulseBridgeMCRFile",
                            {"GGResetPulseBridge"})))
         return fail("control bank registry: " + error);
-      controlWidgets.push_back({"BlockDevBridgeModule_0", 26});
+      goldengate::ControlMMIOWidget blockDevWidget;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "BlockDevBridgeModule_0",
+              blockDevMMIOBank.getName(), {blockDevMMIOBank.getName()}, blockDevWidget,
+              error, Direction::Out)))
+        return fail("BlockDev MMIO register registry: " + error);
+      controlWidgets.push_back(blockDevWidget);
       if (failed(appendBank("UARTBridgeModule_0", "GGUARTMCRFile", {"GGUARTMMIOBank"})))
         return fail("control bank registry: " + error);
       controlWidgets.push_back({"FASEDMemoryTimingModel_0", 21});
@@ -2898,7 +2921,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevWriteAckAnnotations, error)))
         return fail("BlockDev write-ack queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT BlockDev write acknowledgements in a 4-entry queue in " << blockDevWriteAckPath << '\n';
-      if (failed(goldengate::addBlockDevMMIOBank(circuit, error)))
+      if (failed(goldengate::attachBlockDevMMIOBank(circuit, blockDevMMIOBank, error)))
         return fail("BlockDev MMIO bank: " + error);
       if (failed(mlir::verify(*module))) return fail("BlockDev MMIO bank produced invalid FIRRTL IR");
       llvm::SmallString<256> blockDevMMIOPath(outputDir), blockDevMMIOAnnotations(outputDir);
@@ -2913,6 +2936,12 @@ int main(int argc, char **argv) {
       llvm::outs() << "Mapped CIRCT BlockDev 26-word MMIO bank in " << blockDevMMIOPath << '\n';
       if (failed(goldengate::mapBlockDevBridgeControl(circuit, 25, 12, error)))
         return fail("BlockDev control transport: " + error);
+      goldengate::ControlMMIOWidget mappedBlockDev;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "BlockDevBridgeModule_0",
+              "GGBlockDevMCRFile", {blockDevMMIOBank.getName()}, mappedBlockDev, error)))
+        return fail("BlockDev adapter register registry: " + error);
+      if (mappedBlockDev.registerCount != blockDevWidget.registerCount)
+        return fail("BlockDev adapter word count differs from its allocated register bank");
       if (failed(mlir::verify(*module))) return fail("BlockDev control transport produced invalid FIRRTL IR");
       llvm::SmallString<256> blockDevControlPath(outputDir), blockDevControlAnnotations(outputDir);
       llvm::sys::path::append(blockDevControlPath, "post-fame-blockdev-control.mlir");

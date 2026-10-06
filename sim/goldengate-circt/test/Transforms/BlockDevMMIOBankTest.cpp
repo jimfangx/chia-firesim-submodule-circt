@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/BlockDevMMIOBank.h"
+#include "goldengate/ControlAddressDecode.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -94,6 +95,88 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
         b.getNamedAttr("target", b.getStringAttr("~GGBlockDevWriteAckQueueWrapper|GGBlockDevWriteAckQueueWrapper>" + std::string(name)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
+}
+std::string dump(Operation *op) {
+  std::string text; llvm::raw_string_ostream out(text); op->print(out); return text;
+}
+void phases(MLIRContext &context) {
+  auto early = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGControlErrorWrapper" {
+    firrtl.module @GGControlErrorWrapper(in %hostClock: !firrtl.clock,
+      in %hostReset: !firrtl.uint<1>, out %other: !firrtl.uint<8>) {}
+  } })", &context);
+  require(bool(early), "early fixture parse failed");
+  auto c = *early->getOps<CircuitOp>().begin(); OpBuilder b(&context);
+  c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("test.Target")),
+      b.getNamedAttr("target", b.getStringAttr("~GGControlErrorWrapper|GGControlErrorWrapper>other"))})}));
+  auto top = named(c, "GGControlErrorWrapper"); auto topBefore = dump(top);
+  auto annotations = c->getAttr("rawAnnotations"); FModuleOp bank; std::string error;
+  require(succeeded(goldengate::materializeBlockDevMMIOBank(c, bank, error)), error);
+  require(c.getName() == "GGControlErrorWrapper" && dump(top) == topBefore &&
+      c->getAttr("rawAnnotations") == annotations && succeeded(verify(*early)),
+      "early materialization changed top identity, ports or annotations");
+  unsigned uses = 0; c.walk([&](InstanceOp i) { uses += i.getModuleName() == bank.getName(); });
+  require(uses == 0, "materialization prematurely attached the bank");
+  goldengate::ControlMMIOWidget blockDev{"sentinel", 99};
+  require(succeeded(goldengate::deriveControlMMIOWidget(c, "BlockDevBridgeModule_0", bank.getName(),
+      {bank.getName()}, blockDev, error, Direction::Out)) && blockDev.registerCount == 26, error);
+  const goldengate::ControlMMIOWidget widgets[]{blockDev, {"stream", 1}};
+  SmallVector<goldengate::ControlMMIORegion> regions;
+  require(succeeded(goldengate::allocateControlMMIORegions(25, widgets, regions, error)) &&
+      regions.size() == 2 && regions[0].name == blockDev.name && regions[0].size == 128 &&
+      regions[0].start == 0 && regions[1].start == 128, "standalone BlockDev bank allocation differs");
+  auto before = dump(*early); FModuleOp unchanged = top;
+  require(failed(goldengate::materializeBlockDevMMIOBank(c, unchanged, error)) &&
+      unchanged == top && dump(*early) == before, "duplicate materialization changed result or IR");
+  require(failed(goldengate::attachBlockDevMMIOBank(c, bank, error)) && dump(*early) == before,
+      "premature attachment changed IR");
+  goldengate::ControlMMIOWidget sentinel{"sentinel", 99, 8};
+  require(failed(goldengate::deriveControlMMIOWidget(c, blockDev.name, bank.getName(),
+      {bank.getName()}, sentinel, error)) && sentinel.registerCount == 99 &&
+      sentinel.customSize == 8 && dump(*early) == before, "wrong MCR direction accepted or mutated output");
+
+  // The split API must preserve all hardware equations and target transfers.
+  auto split = fixture(context), combined = fixture(context);
+  auto splitCircuit = *split->getOps<CircuitOp>().begin();
+  require(succeeded(goldengate::materializeBlockDevMMIOBank(splitCircuit, bank, error)) &&
+      succeeded(goldengate::attachBlockDevMMIOBank(splitCircuit, bank, error)), error);
+  require(succeeded(goldengate::addBlockDevMMIOBank(*combined->getOps<CircuitOp>().begin(), error)), error);
+  require(dump(*split) == dump(*combined) && succeeded(verify(*split)),
+      "split bank construction changed hardware or annotations");
+
+  // Null/foreign/wrong banks, each port's name/type/direction, arity and uses.
+  for (unsigned bad = 0; bad < 35; ++bad) {
+    auto root = fixture(context), foreign = fixture(context);
+    auto circuit = *root->getOps<CircuitOp>().begin(); FModuleOp candidate;
+    require(succeeded(goldengate::materializeBlockDevMMIOBank(circuit, candidate, error)), error);
+    if (bad == 0) candidate = {};
+    if (bad == 1) require(succeeded(goldengate::materializeBlockDevMMIOBank(
+        *foreign->getOps<CircuitOp>().begin(), candidate, error)), error);
+    if (bad == 2) candidate = named(circuit, "GGBlockDevWriteAckQueueWrapper");
+    if (bad >= 3 && bad <= 33) {
+      SmallVector<PortInfo> malformed(candidate.getPorts());
+      if (bad == 33) malformed.pop_back();
+      else {
+        unsigned port = (bad - 3) / 3, mutation = (bad - 3) % 3;
+        if (mutation == 0) malformed[port].name = b.getStringAttr("wrong");
+        if (mutation == 1) malformed[port].type = UIntType::get(&context, 2);
+        if (mutation == 2) malformed[port].direction = malformed[port].direction == Direction::In ? Direction::Out : Direction::In;
+      }
+      candidate.erase(); b.setInsertionPointToEnd(circuit.getBodyBlock());
+      candidate = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("GGBlockDevMMIOBank"),
+          ConventionAttr::get(&context, Convention::Internal), malformed);
+    }
+    if (bad == 34) {
+      b.setInsertionPointToEnd(circuit.getBodyBlock());
+      auto user = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("User"),
+          ConventionAttr::get(&context, Convention::Internal), ArrayRef<PortInfo>{});
+      b.setInsertionPointToStart(user.getBodyBlock()); b.create<InstanceOp>(circuit.getLoc(), candidate, "used");
+    }
+    auto before = dump(*root);
+    require(failed(goldengate::attachBlockDevMMIOBank(circuit, candidate, error)) &&
+        !error.empty() && dump(*root) == before, "invalid standalone bank accepted or mutated IR");
+  }
+  llvm::outs() << "BlockDev MMIO phases: early 26-word allocation, unchanged top/annotations, split/combined equivalence and 38 atomic rejections passed\n";
 }
 void behavior(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
@@ -223,7 +306,7 @@ void rejection(MLIRContext &context) {
 }
 }
 int main() {
-  try { MLIRContext context; context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>(); behavior(context); mapping(context); rejection(context);
+  try { MLIRContext context; context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>(); phases(context); behavior(context); mapping(context); rejection(context);
     llvm::outs()<<"BlockDev MMIO mapping, metadata, write-only assertions and 17 atomic rejections passed\n"; return 0;
   } catch(const std::exception &e) { llvm::errs()<<e.what()<<'\n'; return 1; }
 }
