@@ -230,6 +230,98 @@ void selectedAggregateAliases(MLIRContext &context) {
           "selected mux lost Scala operand traversal order");
 }
 
+void selectedDynamicVector(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %clock: !firrtl.clock,
+          in %index: !firrtl.uint<1>, in %a: !firrtl.uint<8>,
+          in %b: !firrtl.uint<8>, in %unrelated: !firrtl.uint<8>,
+          out %chosen: !firrtl.uint<8>, out %other: !firrtl.uint<8>,
+          out %state: !firrtl.uint<8>) {
+        %values = firrtl.wire : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %v0 = firrtl.subindex %values[0] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %v1 = firrtl.subindex %values[1] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %a_field = firrtl.subfield %v0[read] : !firrtl.bundle<read: uint<8>, other: uint<8>>
+        %b_field = firrtl.subfield %v1[read] : !firrtl.bundle<read: uint<8>, other: uint<8>>
+        %other0 = firrtl.subfield %v0[other] : !firrtl.bundle<read: uint<8>, other: uint<8>>
+        %other1 = firrtl.subfield %v1[other] : !firrtl.bundle<read: uint<8>, other: uint<8>>
+        firrtl.strictconnect %a_field, %a : !firrtl.uint<8>
+        firrtl.strictconnect %b_field, %b : !firrtl.uint<8>
+        firrtl.strictconnect %other0, %unrelated : !firrtl.uint<8>
+        firrtl.strictconnect %other1, %unrelated : !firrtl.uint<8>
+        %copy = firrtl.node %values : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %selected = firrtl.subaccess %copy[%index] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>, !firrtl.uint<1>
+        %read = firrtl.subfield %selected[read] : !firrtl.bundle<read: uint<8>, other: uint<8>>
+        %other_field = firrtl.subfield %selected[other] : !firrtl.bundle<read: uint<8>, other: uint<8>>
+        firrtl.strictconnect %chosen, %read : !firrtl.uint<8>
+        firrtl.strictconnect %other, %other_field : !firrtl.uint<8>
+        %q = firrtl.reg %clock : !firrtl.clock, !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        firrtl.strictconnect %q, %values : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %state_selected = firrtl.subaccess %q[%index] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>, !firrtl.uint<1>
+        %state_read = firrtl.subfield %state_selected[read] : !firrtl.bundle<read: uint<8>, other: uint<8>>
+        firrtl.strictconnect %state, %state_read : !firrtl.uint<8>
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "dynamic vector fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  expect(model, "chosen", {"index", "a", "b"});
+  expect(model, "other", {"index", "unrelated"});
+  expect(model, "state", {"index"});
+  require(analyze(model).front().inputChannels ==
+              std::vector<std::string>({"index", "b", "a"}),
+          "dynamic vector lost SFC last-connect traversal order");
+  OpBuilder builder(&context);
+  circuit->setAttr("rawAnnotations", builder.getArrayAttr({}));
+  std::string error;
+  require(succeeded(goldengate::normalizeFAMEInput(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "dynamic vector normalization invalid");
+  model = *circuit.getOps<FModuleOp>().begin();
+  expect(model, "chosen", {"index", "a", "b"});
+  expect(model, "other", {"index", "unrelated"});
+  expect(model, "state", {"index"});
+  require(analyze(model).front().inputChannels ==
+              std::vector<std::string>({"index", "b", "a"}),
+          "dynamic vector dependencies differ after CIRCT normalization");
+}
+
+void boundedDynamicVector(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %index: !firrtl.uint<1>,
+          in %a: !firrtl.uint<8>, in %b: !firrtl.uint<8>,
+          in %unreachable: !firrtl.uint<8>, out %narrow: !firrtl.uint<8>,
+          out %fixed: !firrtl.uint<8>, out %invalid: !firrtl.uint<8>) {
+        %values = firrtl.wire : !firrtl.vector<uint<8>, 3>
+        %v0 = firrtl.subindex %values[0] : !firrtl.vector<uint<8>, 3>
+        %v1 = firrtl.subindex %values[1] : !firrtl.vector<uint<8>, 3>
+        %v2 = firrtl.subindex %values[2] : !firrtl.vector<uint<8>, 3>
+        firrtl.strictconnect %v0, %a : !firrtl.uint<8>
+        firrtl.strictconnect %v1, %b : !firrtl.uint<8>
+        firrtl.strictconnect %v2, %unreachable : !firrtl.uint<8>
+        %selected = firrtl.subaccess %values[%index] : !firrtl.vector<uint<8>, 3>, !firrtl.uint<1>
+        firrtl.strictconnect %narrow, %selected : !firrtl.uint<8>
+        %one = firrtl.constant 1 : !firrtl.uint<1>
+        %fixed_value = firrtl.subaccess %values[%one] : !firrtl.vector<uint<8>, 3>, !firrtl.uint<1>
+        firrtl.strictconnect %fixed, %fixed_value : !firrtl.uint<8>
+        %seven = firrtl.constant 7 : !firrtl.uint<3>
+        %invalid_value = firrtl.subaccess %values[%seven] : !firrtl.vector<uint<8>, 3>, !firrtl.uint<3>
+        firrtl.strictconnect %invalid, %invalid_value : !firrtl.uint<8>
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "bounded vector fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  expect(model, "narrow", {"index", "a", "b"});
+  expect(model, "fixed", {"b"});
+  auto dependencies = analyze(model);
+  require(llvm::any_of(dependencies.back().unresolvedCauses, [](auto &cause) {
+    return StringRef(cause).ends_with(":out-of-range vector selection");
+  }), "out-of-range vector selection appeared dependency-free");
+}
+
 void asynchronousReadWrite(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Model" {
@@ -277,6 +369,8 @@ int main(int argc, char **argv) {
     repeatedDrivers(context);
     selectedMemoryData(context);
     selectedAggregateAliases(context);
+    selectedDynamicVector(context);
+    boundedDynamicVector(context);
     asynchronousReadWrite(context);
     require(argc <= 3, "expected optional input MLIR and normalized output MLIR");
     if (argc >= 2) {
@@ -284,13 +378,29 @@ int main(int argc, char **argv) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(root), "golden module MLIR parse failed");
       auto circuit = *root->getOps<CircuitOp>().begin();
+      FModuleOp opcodeProbe;
+      for (auto candidate : circuit.getOps<FModuleOp>())
+        if (candidate.getName() == "OpcodeProbe") opcodeProbe = candidate;
+      if (opcodeProbe) {
+        unsigned dynamicReads = 0;
+        opcodeProbe.walk([&](SubaccessOp) { ++dynamicReads; });
+        require(dynamicReads == 1, "opcode import lost its dynamic lookup");
+        expect(opcodeProbe, "out", {"index"});
+      }
       std::string error;
       require(succeeded(goldengate::normalizeFAMEInput(*root, circuit, error)), error);
       require(succeeded(verify(*root)), "golden normalization invalid");
       FModuleOp rfProbe;
       for (auto candidate : circuit.getOps<FModuleOp>())
         if (candidate.getName() == "RFReadProbe") rfProbe = candidate;
-      if (rfProbe) {
+      if (opcodeProbe) {
+        expect(opcodeProbe, "out", {"index"});
+        bool hasAccess = false;
+        opcodeProbe.walk([&](SubaccessOp) { hasAccess = true; });
+        require(!hasAccess, "opcode normalization retained a dynamic access");
+        llvm::outs() << "TLError opcode lookup: out <- {index} before and after "
+                        "CIRCT FAME normalization; matched SFC RTL\n";
+      } else if (rfProbe) {
         auto memories = rfProbe.getOps<MemOp>();
         require(std::distance(memories.begin(), memories.end()) == 1,
                 "RF extraction changed memory count");
@@ -342,6 +452,7 @@ int main(int argc, char **argv) {
                     "boundaries passed; static memory selections and aliases "
                     "follow async address/enable and stop at sync state; "
                     "selected node/mux fields preserve dependencies and order; "
+                    "dynamic vector reads retain selected fields and index bounds; "
                     "unsupported memory modes rejected\n";
     return 0;
   } catch (const std::exception &e) {

@@ -2,6 +2,7 @@
 #include "goldengate/CombDependencyAnalysis.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include <algorithm>
@@ -210,6 +211,40 @@ private:
                          fieldRef.getFieldID()));
         merge(traceValue(current, mux.getLow(), active,
                          fieldRef.getFieldID()));
+      } else if (auto access = dyn_cast<SubaccessOp>(op)) {
+        // Dynamic reads select the same relative field from every reachable
+        // vector element. Tracing the whole vector loses its leaf drivers and
+        // can introduce unrelated bundle fields. Static selections following
+        // this access are already represented by fieldRef's relative field ID.
+        auto vector = access.getInput().getType().base();
+        auto count = vector.getNumElements();
+        auto traceElement = [&](unsigned index) {
+          merge(traceValue(current, access.getInput(), active,
+                           vector.getFieldID(index) + fieldRef.getFieldID()));
+        };
+        if (auto constant = access.getIndex().getDefiningOp<ConstantOp>()) {
+          auto index = constant.getValue().getLimitedValue(count);
+          if (index < count)
+            traceElement(index);
+          else
+            result.blockers.insert(current.getName().str() +
+                                   ":out-of-range vector selection");
+        } else if (!count) {
+          result.blockers.insert(current.getName().str() +
+                                 ":zero-length vector selection");
+        } else {
+          merge(traceValue(current, access.getIndex(), active));
+          // A narrow index cannot select higher elements. Avoid dependencies
+          // on unreachable fields even if they have no driver.
+          auto width = access.getIndex().getType().base().getWidthOrSentinel();
+          if (width >= 0 && width < 64)
+            count = std::min<uint64_t>(count, uint64_t{1} << width);
+          // SFC RemoveAccesses emits guarded connects in ascending index
+          // order. ExpandWhens gives the last connect priority, hence the
+          // resulting mux expression visits higher elements first.
+          for (auto index = count; index > 0; --index)
+            traceElement(index - 1);
+        }
       } else if (auto port = dyn_cast<circt::chirrtl::MemoryPortOp>(op)) {
         // A CHIRRTL memory port's data is stored state, while an asynchronous
         // read still follows its access index. Infer ports are read-only when

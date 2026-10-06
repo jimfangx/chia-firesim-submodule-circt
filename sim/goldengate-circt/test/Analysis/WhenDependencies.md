@@ -123,3 +123,48 @@ tracing now forwards the canonical field ID. The chosen read follows only
 the selector and its two address inputs, in Scala operand order. Selecting
 the other field follows only the selector and the unrelated input, which
 also checks that memoization keeps the two field identities separate.
+
+The October 6 iteration 4 comparison covers TLError's dynamic opcode lookup.
+The unchanged table and lookup statements from the immutable `.sfc.fir`
+lines 18828–18837 are placed in `OpcodeProbe`. Ground ports expose the original
+`a_q.io.deq.bits.opcode` index and `da.bits.opcode` result. The table has eight
+entries with values `0, 0, 1, 1, 1, 2, 4, 4`. The same immutable U250
+`design/FireSim-generated.sv` lines 51604–51609 and 51637 implement this table
+as constant-valued muxes controlled only by `a_q_io_deq_bits_opcode`.
+
+The candidate reports exactly `out <- {index}` both on imported FIRRTL MLIR
+containing `SubaccessOp` and after the real `normalizeFAMEInput` pipeline
+replaces it with `MultibitMuxOp`. This compares an extracted internal boundary,
+not the whole TLError module. The mutable extraction, annotation placeholder,
+imported and normalized MLIR, and comparison log are in
+`iteration4-dynamic-dependencies/` under the same U250 generated-source tree.
+Recheck it with:
+
+```sh
+cd /scratch/jfx/fsim-circt/sims/firesim
+source ./sourceme-manager.sh --skip-ssh-setup
+gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config
+"$gg_generated/goldengate-circt-build/goldengate-comb-dependency-test" \
+  "$gg_generated/iteration4-dynamic-dependencies/candidate/input.mlir" \
+  "$gg_generated/iteration4-dynamic-dependencies/normalized-opcode.mlir"
+```
+
+The related C++ regression selects a bundle field through a dynamic vector
+read and a node alias. Before the fix it fails with
+`unresolved output chosen: Model:undriven wire`. The tracer now visits the
+index and projects the selected relative field ID into each reachable vector
+element. It excludes unrelated bundle fields, keeps separate cached field
+identities, and stops at vector register state while retaining the read index.
+Those dependency sets and their direct operand order match before and after
+CIRCT normalization. Separate tests exclude elements unreachable by a narrow
+index, select only the literal-index element, and reject an out-of-range literal.
+
+SFC 1.6.0 `RemoveAccesses` emits guarded connections in ascending element order;
+`ExpandWhens` gives later connections priority. The resulting mux expression
+visits the selector and then higher elements first, also visible in the golden
+RTL. This validates local expression order, not general graph-order parity:
+SFC `CheckCombLoops` additionally simplifies connectivity using breadth-first
+reachability, which remains a separate ordering question for deeper graphs.
+Whole-aggregate connects with selected child fields still require normalization
+before this tracer can resolve their individual drivers; the next small boundary
+is AXI4UserYanker's selected `tl_state.source` and `tl_state.size` fields.

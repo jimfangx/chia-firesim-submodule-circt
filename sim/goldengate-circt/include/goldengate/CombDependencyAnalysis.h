@@ -18,6 +18,9 @@ namespace goldengate {
 // Memory read data is recognized by field identity, including static nested
 // selections. Async readers follow address/enable; sync reads break the path.
 // Async readwrite ports and new read-under-write remain explicit blockers.
+// Dynamic vector reads follow the index and the same selected field of each
+// reachable element. Literal indices follow only that element; out-of-range
+// literal and zero-length selections produce blockers until normalized.
 struct LocalChannelDependency {
   std::string outputChannel;
   std::vector<std::string> inputChannels;
