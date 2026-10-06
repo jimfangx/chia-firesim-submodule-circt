@@ -2550,7 +2550,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevBankAnnotations, error)))
         return fail("BlockDev MMIO materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT BlockDev MMIO bank before control allocation in " << blockDevBankPath << '\n';
-      // First FASED fragment: allocate its host register state independently
+      // FASED host register fragments: allocate their state independently
       // of the later timing-model wrappers. Remaining fragments still attach late.
       FModuleOp fasedLatencyBank;
       if (failed(goldengate::materializeFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
@@ -2573,6 +2573,25 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyBankAnnotations, error)))
         return fail("FASED latency materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT FASED latency bank before control allocation in " << fasedLatencyBankPath << '\n';
+      // Preserve global words 2/3 in this fragment's registry. It is not a
+      // standalone widget; validate its offsets against the complete FASED
+      // registry and typed adapter after all fragments have been assembled.
+      FModuleOp fasedRequestLimitsBank;
+      if (failed(goldengate::materializeFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
+        return fail("FASED request-limit materialization: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("FASED request-limit materialization produced invalid FIRRTL IR");
+      llvm::SmallString<256> fasedRequestLimitsBankPath(outputDir), fasedRequestLimitsBankAnnotations(outputDir);
+      llvm::sys::path::append(fasedRequestLimitsBankPath, "post-fame-fased-request-limits-bank.mlir");
+      llvm::sys::path::append(fasedRequestLimitsBankAnnotations, "post-fame-fased-request-limits-bank-all.json");
+      std::error_code fasedRequestLimitsBankWriteError;
+      llvm::raw_fd_ostream fasedRequestLimitsBankOut(fasedRequestLimitsBankPath, fasedRequestLimitsBankWriteError);
+      if (fasedRequestLimitsBankWriteError)
+        return fail("cannot write FASED request-limit materialization: " + fasedRequestLimitsBankWriteError.message());
+      module->print(fasedRequestLimitsBankOut); fasedRequestLimitsBankOut << '\n'; fasedRequestLimitsBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsBankAnnotations, error)))
+        return fail("FASED request-limit materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT FASED request-limit bank before control allocation in " << fasedRequestLimitsBankPath << '\n';
       // HasWidgets registration order remains independent of IR module order.
       // Derive each available bank's size from its register registry and check
       // it against the implemented MCR port. FASED, still assembled after
@@ -3301,7 +3320,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedReadAdmissionAnnotations, error)))
         return fail("FASED read admission annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED pending reads, final R retirement and AR admission in " << fasedReadAdmissionPath << '\n';
-      if (failed(goldengate::addFASEDRequestLimits(circuit, error)))
+      if (failed(goldengate::attachFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
         return fail("FASED request limits: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED request limits produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedRequestLimitsPath(outputDir), fasedRequestLimitsAnnotations(outputDir);

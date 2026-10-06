@@ -82,6 +82,80 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         b.getNamedAttr("target", b.getStringAttr("~GGFASEDReadAdmissionWrapper|GGFASEDReadAdmissionWrapper>" + std::string(name)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
+std::string dump(Operation *op) {
+  std::string text; llvm::raw_string_ostream out(text); op->print(out); return text;
+}
+void phases(MLIRContext &context) {
+  auto early = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGControlErrorWrapper" {
+    firrtl.module @GGControlErrorWrapper(in %hostClock: !firrtl.clock,
+      in %hostReset: !firrtl.uint<1>, out %other: !firrtl.uint<8>) {}
+  } })", &context);
+  require(bool(early), "early fixture parse failed");
+  auto c = *early->getOps<CircuitOp>().begin(); OpBuilder b(&context);
+  c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("test.Target")),
+      b.getNamedAttr("target", b.getStringAttr("~GGControlErrorWrapper|GGControlErrorWrapper>other"))})}));
+  auto top = named(c, "GGControlErrorWrapper"); auto topBefore = dump(top);
+  auto annotations = c->getAttr("rawAnnotations"); FModuleOp bank; std::string error;
+  require(succeeded(goldengate::materializeFASEDRequestLimits(c, bank, error)), error);
+  require(c.getName() == "GGControlErrorWrapper" && dump(top) == topBefore &&
+      c->getAttr("rawAnnotations") == annotations && succeeded(verify(*early)),
+      "early materialization changed top identity, ports or annotations");
+  unsigned uses = 0; c.walk([&](InstanceOp i) { uses += i.getModuleName() == bank.getName(); });
+  require(uses == 0, "materialization prematurely attached the bank");
+  auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  require(regs && regs.size() == 2, "early bank registry missing");
+  for (unsigned i = 0; i < 2; ++i)
+    require(cast<DictionaryAttr>(regs[i]).getAs<IntegerAttr>("offset").getInt() == 8 + 4 * i,
+        "early bank changed global words 2/3 to standalone offsets");
+  auto before = dump(*early); FModuleOp unchanged = top;
+  require(failed(goldengate::materializeFASEDRequestLimits(c, unchanged, error)) &&
+      unchanged == top && dump(*early) == before, "duplicate materialization changed result or IR");
+  require(failed(goldengate::attachFASEDRequestLimits(c, bank, error)) && dump(*early) == before,
+      "premature attachment changed IR");
+  // The split API must preserve all hardware equations and target transfers.
+  auto split = fixture(context), combined = fixture(context);
+  auto splitCircuit = *split->getOps<CircuitOp>().begin();
+  require(succeeded(goldengate::materializeFASEDRequestLimits(splitCircuit, bank, error)) &&
+      succeeded(goldengate::attachFASEDRequestLimits(splitCircuit, bank, error)), error);
+  require(succeeded(goldengate::addFASEDRequestLimits(*combined->getOps<CircuitOp>().begin(), error)), error);
+  require(dump(*split) == dump(*combined) && succeeded(verify(*split)),
+      "split bank construction changed hardware or annotations");
+
+  // Null/foreign/wrong banks, each port's name/type/direction, arity and uses.
+  for (unsigned bad = 0; bad < 17; ++bad) {
+    auto root = fixture(context), foreign = fixture(context);
+    auto circuit = *root->getOps<CircuitOp>().begin(); FModuleOp candidate;
+    require(succeeded(goldengate::materializeFASEDRequestLimits(circuit, candidate, error)), error);
+    if (bad == 0) candidate = {};
+    if (bad == 1) require(succeeded(goldengate::materializeFASEDRequestLimits(
+        *foreign->getOps<CircuitOp>().begin(), candidate, error)), error);
+    if (bad == 2) candidate = named(circuit, "GGFASEDReadAdmissionWrapper");
+    if (bad >= 3 && bad <= 15) {
+      SmallVector<PortInfo> malformed(candidate.getPorts());
+      if (bad == 15) malformed.pop_back();
+      else {
+        unsigned port = (bad - 3) / 3, mutation = (bad - 3) % 3;
+        if (mutation == 0) malformed[port].name = b.getStringAttr("wrong");
+        if (mutation == 1) malformed[port].type = UIntType::get(&context, 2);
+        if (mutation == 2) malformed[port].direction = malformed[port].direction == Direction::In ? Direction::Out : Direction::In;
+      }
+      candidate.erase(); b.setInsertionPointToEnd(circuit.getBodyBlock());
+      candidate = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("GGFASEDRequestLimits"),
+          ConventionAttr::get(&context, Convention::Internal), malformed);
+    }
+    if (bad == 16) {
+      b.setInsertionPointToEnd(circuit.getBodyBlock());
+      auto user = b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr("User"),
+          ConventionAttr::get(&context, Convention::Internal), ArrayRef<PortInfo>{});
+      b.setInsertionPointToStart(user.getBodyBlock()); b.create<InstanceOp>(circuit.getLoc(), candidate, "used");
+    }
+    auto before = dump(*root);
+    require(failed(goldengate::attachFASEDRequestLimits(circuit, candidate, error)) &&
+        !error.empty() && dump(*root) == before, "invalid standalone bank accepted or mutated IR");
+  }
+  llvm::outs() << "FASED request-limit MMIO phases: early global words 2/3, unchanged top/annotations, split/combined equivalence and 19 atomic rejections passed\n";
+}
 void behavior(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDRequestLimits(c, error)), error);
@@ -93,6 +167,8 @@ void behavior(MLIRContext &context) {
     unsigned mask = cycle < 128 ? (cycle >> 1) & 3 : random() & 3;
     unsigned strobe = cycle < 128 ? (cycle >> 3) & 15 : random() & 15;
     std::array<uint32_t, 2> data{uint32_t(random()), uint32_t(random())};
+    const uint32_t edges[]{0, 1, 10, 15, 16, 0x80000000U, UINT32_MAX, 65536};
+    if (cycle < 128) data = {edges[cycle % 8], edges[(cycle + 3) % 8]};
     sim.memo.clear(); sim.memo[sim.key(sim.arg(1))] = reset;
     sim.memo[sim.key(sim.arg(3)) + ".wstrb"] = strobe;
     for (unsigned i = 0; i < 2; ++i) {
@@ -175,7 +251,7 @@ void rejections(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(context); mapping(context); rejections(context);
+    phases(context); behavior(context); mapping(context); rejections(context);
     llvm::outs() << "FASED request limits: 32768 cycles, host/admission bindings, targets and 14 atomic rejections passed\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
