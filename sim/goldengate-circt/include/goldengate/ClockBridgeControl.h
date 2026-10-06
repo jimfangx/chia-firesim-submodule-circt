@@ -54,8 +54,9 @@ mlir::LogicalResult mapTSIBridgeControl(circt::firrtl::CircuitOp circuit,
 mlir::LogicalResult mapBlockDevBridgeControl(circt::firrtl::CircuitOp circuit,
                                            unsigned addressBits, unsigned idBits,
                                            std::string &error);
-// FASED's 21-word bank uses five-bit local decode; invalid reads alias word
-// zero, invalid writes never commit. Platform slave binding is separate.
+// FASED derives its lane count and local index width from the assembled MMIO
+// registry and validates the matching bank type before mutation. Invalid reads
+// alias word zero; invalid writes never commit. Platform binding is separate.
 mlir::LogicalResult mapFASEDBridgeControl(circt::firrtl::CircuitOp circuit,
                                         unsigned addressBits, unsigned idBits,
                                         std::string &error);

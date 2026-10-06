@@ -275,7 +275,8 @@ if(BUILD_TESTING)
     lib/Transforms/PrintBridgeConfig.cpp
     lib/Transforms/PrintBridgeHost.cpp
     lib/Transforms/CPUStreamQueue.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-print-host-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-host-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-host-test PRIVATE
@@ -297,7 +298,8 @@ if(BUILD_TESTING)
     lib/Transforms/CPUStreamRead.cpp
     lib/Transforms/CPUStreamCountBank.cpp
     lib/Transforms/ClockBridgeControl.cpp
-    lib/Support/TargetUtils.cpp)
+    lib/Support/TargetUtils.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-binding-test PRIVATE
@@ -309,7 +311,8 @@ if(BUILD_TESTING)
     test/Transforms/PrintBridgeAXITest.cpp
     lib/Transforms/PrintBridgePayload.cpp lib/Transforms/PrintBridgeTokenStage.cpp
     lib/Transforms/PrintBridgeControl.cpp lib/Transforms/PrintBridgeConfig.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-print-axi-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-axi-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-axi-test PRIVATE
@@ -1101,7 +1104,8 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-tsi-token COMMAND goldengate-tsi-token-test)
   add_executable(goldengate-simulation-master-control-test
     test/Transforms/SimulationMasterControlTest.cpp
-    lib/Transforms/SimulationMasterControl.cpp lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/SimulationMasterControl.cpp lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-simulation-master-control-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-simulation-master-control-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-simulation-master-control-test PRIVATE
@@ -1364,7 +1368,8 @@ if(BUILD_TESTING)
   add_executable(goldengate-clock-bridge-control-test
     test/Transforms/ClockBridgeControlTest.cpp
     lib/Transforms/ClockBridgeControl.cpp
-    lib/Transforms/CPUStreamCountBank.cpp)
+    lib/Transforms/CPUStreamCountBank.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-clock-bridge-control-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-clock-bridge-control-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-clock-bridge-control-test PRIVATE
@@ -1374,7 +1379,8 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-clock-bridge-control COMMAND goldengate-clock-bridge-control-test)
   add_executable(goldengate-blockdev-control-test
     test/Transforms/BlockDevControlTest.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-blockdev-control-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-blockdev-control-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-blockdev-control-test PRIVATE
@@ -1384,7 +1390,8 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-blockdev-control COMMAND goldengate-blockdev-control-test)
   add_executable(goldengate-fased-control-test
     test/Transforms/FASEDControlTest.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-fased-control-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-control-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-control-test PRIVATE
@@ -1427,7 +1434,8 @@ if(BUILD_TESTING)
   add_executable(goldengate-uart-mmio-test
     test/Transforms/UARTMMIOBankTest.cpp
     lib/Transforms/UARTMMIOBank.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-uart-mmio-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-uart-mmio-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-uart-mmio-test PRIVATE
@@ -1449,7 +1457,8 @@ if(BUILD_TESTING)
   add_executable(goldengate-peek-poke-mmio-test
     test/Transforms/PeekPokeMMIOBankTest.cpp
     lib/Transforms/PeekPokeMMIOBank.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-peek-poke-mmio-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-peek-poke-mmio-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-peek-poke-mmio-test PRIVATE
@@ -1644,7 +1653,8 @@ if(BUILD_TESTING)
   add_executable(goldengate-cpu-stream-count-bank-test
     test/Transforms/CPUStreamCountBankTest.cpp
     lib/Transforms/CPUStreamCountBank.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-cpu-stream-count-bank-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-cpu-stream-count-bank-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-cpu-stream-count-bank-test PRIVATE

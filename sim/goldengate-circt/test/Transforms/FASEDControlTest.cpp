@@ -8,6 +8,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
+#include <vector>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -19,8 +21,8 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("module missing");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
-  auto root=parseSourceString<ModuleOp>(R"(
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bankWords = 21) {
+  std::string text = R"(
     module { firrtl.circuit "GGFASEDMMIOWrapper" {
       firrtl.module @GGFASEDMMIOWrapper(
         in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
@@ -28,7 +30,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
         out %fasedBridge_mcr: !firrtl.bundle<
           read: vector<bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<32>>, 21>,
           write flip: vector<bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<32>>, 21>,
-          wstrb flip: uint<4>>) {} } })",&ctx);
+          wstrb flip: uint<4>>) {} } })";
+  for (size_t pos = 0; (pos = text.find(", 21>", pos)) != std::string::npos;) {
+    auto count = ", " + std::to_string(bankWords) + ">";
+    text.replace(pos, 5, count); pos += count.size();
+  }
+  auto root=parseSourceString<ModuleOp>(text,&ctx);
   require(bool(root),"fixture parse failed");
   auto c=*root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
   auto str=[&](llvm::StringRef s){return b.getStringAttr(s);};
@@ -40,6 +47,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
       str("~GGFASEDMMIOWrapper|GGFASEDMMIOWrapper"),str("~Other|Other>data")})),
     b.getNamedAttr("nested",b.getDictionaryAttr({b.getNamedAttr("target",
       str("~GGFASEDMMIOWrapper|GGFASEDMMIOWrapper>hostClock"))}))})}));
+  SmallVector<Attribute> rows;
+  // Offset order, rather than metadata row order, defines transport lanes.
+  for (unsigned i = bankWords; i > 0; --i) rows.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("name", str("register_" + std::to_string(i - 1))),
+    b.getNamedAttr("offset", b.getI64IntegerAttr(4 * (i - 1))),
+    b.getNamedAttr("readable", b.getBoolAttr(true)),
+    b.getNamedAttr("writeable", b.getBoolAttr(true))}));
+  named(c,"GGFASEDMMIOWrapper")->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
   return root;
 }
 struct Interpreter {
@@ -88,15 +103,15 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  constexpr unsigned bankWords = 21, indexBits = 5, indexMask = 31;
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin();
+void behavior(MLIRContext &ctx, unsigned bankWords) {
+  unsigned indexBits = llvm::Log2_64_Ceil(bankWords), indexMask = (1u << indexBits) - 1;
+  auto root = fixture(ctx,bankWords); auto c = *root->getOps<CircuitOp>().begin();
   std::string error;
   require(succeeded(goldengate::mapFASEDBridgeControl(c,25,12,error)),error);
   require(succeeded(verify(*root)),"FASED control invalid");
   auto adapter=named(c,"GGFASEDMCRFile");
   require(std::distance(adapter.getOps<RegResetOp>().begin(),adapter.getOps<RegResetOp>().end())==4,"transaction flag count");
-  require(std::distance(adapter.getOps<RegOp>().begin(),adapter.getOps<RegOp>().end())==5,"unreset payload capture count");
+  require(std::distance(adapter.getOps<RegOp>().begin(),adapter.getOps<RegOp>().end())==(indexBits ? 5 : 3),"unreset payload capture count");
   for (auto r : adapter.getOps<RegOp>())
     if (r.getName()=="wIndex" || r.getName()=="rIndex")
       require(cast<UIntType>(r.getResult().getType()).getWidth()==indexBits,"FASED index width");
@@ -123,7 +138,7 @@ void behavior(MLIRContext &ctx) {
   bool haveAW=false,haveW=false,haveAR=false,done=false;
   uint64_t writeWord=0,readWord=0,writeID=0,readID=0,writeData=0;
   std::mt19937_64 rng(201); unsigned readTransfers=0,writeTransfers=0,awFirst=0,wFirst=0;
-  bool seenRead[32]{}, seenWrite[32]{};
+  std::vector<bool> seenRead(indexMask + 1), seenWrite(indexMask + 1);
   for (unsigned cycle=0;cycle<24000;++cycle) {
     sim.memo.clear(); bool reset=cycle<2 || cycle%137==0;
     bool awValid=rng()%3==0,wValid=rng()%3==0,arValid=rng()%3==0;
@@ -138,7 +153,8 @@ void behavior(MLIRContext &ctx) {
     input(bits("aw","id"),awID);input(bits("ar","id"),arID);
     input(bits("aw","len"),0);input(bits("ar","len"),0);input(bits("w","data"),wData);
     input(bits("w","strb"),rng()&15); input(bits("w","last"),rng()&1);
-    bool readValid[21],writeReady[21];uint64_t readData[21];
+    std::vector<bool> readValid(bankWords),writeReady(bankWords);
+    std::vector<uint64_t> readData(bankWords);
     bool wr=haveAW && haveW && !done;
     for (unsigned i=0;i<bankWords;++i) {
       readValid[i]=rng()%4!=0;writeReady[i]=rng()%4!=0;readData[i]=rng()&0xffffffff;
@@ -175,7 +191,7 @@ void behavior(MLIRContext &ctx) {
   llvm::outs()<<bankWords<<"-word MCRFile coverage: reads="<<readTransfers<<", writes="<<writeTransfers
               <<", AW-first="<<awFirst<<", W-first="<<wFirst<<'\n';
   require(readTransfers>500 && writeTransfers>100 && awFirst>50 && wFirst>50,"insufficient transaction coverage");
-  for(unsigned i=0;i<32;++i) require(seenRead[i] && seenWrite[i],"local index coverage incomplete");
+  for(unsigned i=0;i<=indexMask;++i) require(seenRead[i] && seenWrite[i],"local index coverage incomplete");
   require(std::distance(adapter.getOps<AssertOp>().begin(),adapter.getOps<AssertOp>().end())==2,"AW/AR burst assertions missing");
   // Assertions must require an accepted address, and reset must mask them.
   for (auto a : adapter.getOps<AssertOp>()) {
@@ -240,8 +256,8 @@ void mapping(MLIRContext &ctx) {
   auto mapped=printed(*root);
   require(failed(goldengate::mapFASEDBridgeControl(c,25,12,error)),"repeated FASED control mapping accepted");
   require(mapped==printed(*root),"repeated FASED mapping mutated IR");
-  for(unsigned bad=0;bad<14;++bad) {
-    auto rejected=fixture(ctx); auto circuit=*rejected->getOps<CircuitOp>().begin();
+  for(unsigned bad=0;bad<27;++bad) {
+    auto rejected=fixture(ctx,bad==25?33:21); auto circuit=*rejected->getOps<CircuitOp>().begin();
     auto inner=named(circuit,"GGFASEDMMIOWrapper");
     if(bad==0)circuit->removeAttr("rawAnnotations");
     if(bad>=1 && bad<=3) {
@@ -263,16 +279,38 @@ void mapping(MLIRContext &ctx) {
             b.getStringAttr(bad==9?"~GGFASEDMMIOWrapper|GGFASEDMMIOWrapper>fasedBridge_mcr":
             "~GGFASEDMMIOWrapper|GGFASEDMMIOWrapper>fasedBridge_mcr.read[20].bits")}))}))})}));
     if(bad==13)circuit.setNameAttr(b.getStringAttr("WrongTop"));
+    if(bad==14)inner->removeAttr("goldengate.mmioRegisters");
+    if(bad>=15 && bad!=25) {
+      auto rows=llvm::to_vector(inner->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      if(bad==15)rows.clear();
+      if(bad==16)rows[0]=b.getStringAttr("not a row");
+      if((bad>=17 && bad<=23) || bad==26) {
+        NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+        if(bad==17)row.set("offset",b.getI64IntegerAttr(-4));
+        if(bad==18)row.set("offset",b.getI64IntegerAttr(81));
+        if(bad==19)row.set("offset",b.getI64IntegerAttr(84));
+        if(bad==20)row.set("name",b.getStringAttr("register_0"));
+        if(bad==21)row.erase("writeable");
+        if(bad==22)row.set("readable",b.getStringAttr("true"));
+        if(bad==23)row.set("offset",b.getI64IntegerAttr(0));
+        if(bad==26) { row.set("readable",b.getBoolAttr(false)); row.set("writeable",b.getBoolAttr(false)); }
+        rows[0]=row.getDictionary(&ctx);
+      }
+      // A valid dense 20-word registry must reject stale 21-word typed lanes.
+      if(bad==24)rows.erase(rows.begin());
+      inner->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+    }
     auto before=printed(*rejected);
-    require(failed(goldengate::mapFASEDBridgeControl(circuit,bad==11?6:25,bad==12?0:12,error)),"invalid FASED boundary accepted");
+    require(failed(goldengate::mapFASEDBridgeControl(circuit,bad==11?6:bad==25?7:25,bad==12?0:12,error)),"invalid FASED boundary accepted");
     require(before==printed(*rejected),"FASED boundary rejection mutated IR");
   }
-  llvm::outs()<<"FASED: aggregate control/bank bindings, six nested target transfers, 14 atomic boundary rejections and repeated-pass rejection passed\n";
+  llvm::outs()<<"FASED: aggregate control/bank bindings, six nested target transfers, 27 atomic boundary rejections and repeated-pass rejection passed\n";
 }
 }
 int main() {
   try { MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-    mapping(ctx); behavior(ctx);
+    mapping(ctx);
+    for (unsigned count : {1,21,32,33}) behavior(ctx,count);
   } catch(const std::exception &e) { llvm::errs()<<e.what()<<'\n'; return 1; }
   return 0;
 }

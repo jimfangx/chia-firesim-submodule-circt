@@ -9,12 +9,14 @@
 // and metadata are deliberately ignored as in the executable Scala oracle.
 // Output: local Nasti slave; global widget allocation/crossbar remain pending.
 #include "goldengate/ClockBridgeControl.h"
+#include "goldengate/ControlAddressDecode.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "llvm/ADT/StringSet.h"
 #include <set>
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
+#include <limits>
 using namespace mlir;
 using namespace circt::firrtl;
 
@@ -391,21 +393,34 @@ LogicalResult goldengate::mapBlockDevBridgeControl(CircuitOp circuit,
       "GGBlockDevMCRFile", "blockdevBridge_mcr", "blockdevBridge_ctrl", error);
 }
 
-// Requires: active uninstantiated GGFASEDMMIOWrapper, exact 21-word UInt32
-// MCR bundle, host clock/reset and retained annotations. No analyses required.
+// Requires: active uninstantiated GGFASEDMMIOWrapper, a validated register
+// registry and exactly matching UInt32 MCR lanes, host clock/reset and annotations.
 // Consumes: fasedBridge_mcr; unexpected decoded references reject atomically.
 // Produces: no annotation classes. Copied port targets transfer to the new top;
 // internal clock/model/channel and constructor identities remain on inner ops.
 // Mutates: adds ordinary FIRRTL MCRFile state and a Nasti-to-bank wrapper.
 // Preserves: FASED register permissions, timing state, histograms and MMIO order.
-// Output: independent AW/W capture, held B/R flags/IDs, live R data and five-bit
-// local decode. Indices 21..31 read lane zero and cannot commit writes. Host
+// Output: independent AW/W capture, held B/R flags/IDs, live R data and registry-
+// derived local decode. Out-of-range indices read lane zero and cannot write. Host
 // reset clears flags only; the legacy zero MCR strobe and burst checks remain.
 // Platform control slave binding and simulator emission are separate steps.
 LogicalResult goldengate::mapFASEDBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
-  return mapBridgeControl(circuit, addressBits, idBits, 21,
-      "GGFASEDMMIOWrapper", "GGFASEDBridgeControlWrapper",
+  ControlMMIOWidget registry;
+  const llvm::StringRef modules[]{"GGFASEDMMIOWrapper"};
+  if (failed(deriveControlMMIORegistry(circuit, "FASEDMemoryTimingModel_0",
+          modules, registry, error)))
+    return failure();
+  if (registry.registerCount > std::numeric_limits<unsigned>::max()) {
+    error = "FASED register count exceeds the supported MCR lane count";
+    return failure();
+  }
+  // Widget.genCRFile passes crRegistry.numRegs to Lib.scala MCRFile. Validate
+  // the assembled registry first, then let the shared transport check its
+  // exact typed bank before any operation or annotation is changed.
+  return mapBridgeControl(circuit, addressBits, idBits,
+      static_cast<unsigned>(registry.registerCount), "GGFASEDMMIOWrapper",
+      "GGFASEDBridgeControlWrapper",
       "GGFASEDMCRFile", "fasedBridge_mcr", "fasedBridge_ctrl", error);
 }
 

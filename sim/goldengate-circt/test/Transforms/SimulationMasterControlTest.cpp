@@ -75,6 +75,15 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
   auto root = parseSourceString<ModuleOp>(text+") {} firrtl.module @GGControlAddressDecode() {} } }",&ctx);
   require(bool(root),"fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
   c->setAttr("rawAnnotations",b.getArrayAttr({})); std::string error;
+  if (spec.mapControl == goldengate::mapFASEDBridgeControl) {
+    SmallVector<Attribute> registers;
+    for (unsigned i = 0; i < words; ++i) registers.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("name",b.getStringAttr("register_"+std::to_string(i))),
+      b.getNamedAttr("offset",b.getI64IntegerAttr(4*i)),
+      b.getNamedAttr("readable",b.getBoolAttr(true)),
+      b.getNamedAttr("writeable",b.getBoolAttr(true))}));
+    named(c,input)->setAttr("goldengate.mmioRegisters",b.getArrayAttr(registers));
+  }
   require(succeeded(spec.mapControl(c,25,12,error)),error);
   SmallVector<Attribute> rows;
   // Moving a widget and changing its base/region size must still select the
