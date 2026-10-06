@@ -57,6 +57,7 @@
 #include "goldengate/FAMEFinishing.h"
 #include "goldengate/FAMEHostControl.h"
 #include "goldengate/FAMEInputChannel.h"
+#include "goldengate/FAMEClockEnable.h"
 #include "goldengate/FAMEAnnotations.h"
 #include "goldengate/FAMEInputReady.h"
 #include "goldengate/FAMEPortAnalysis.h"
@@ -1875,13 +1876,10 @@ int main(int argc, char **argv) {
 
       llvm::SmallVector<goldengate::FAMEFiredChannel> thisOutputFired{
           {outputGroup.name, false, {}}};
-      mlir::Value outputClockEnable;
-      clockModel.walk([&](RegResetOp op) {
-        if (op.getName() == oldModelClock + "_enabled")
-          outputClockEnable = op.getResult();
-      });
+      mlir::Value outputClockEnable = goldengate::lookupFAMEClockEnable(
+          clockModel, oldModelClock, error);
       if (!outputClockEnable)
-        return fail("FAME output clock enable is missing");
+        return fail("FAME output clock enable: " + error);
       thisOutputFired.front().clockDomainEnable = outputClockEnable;
       if (failed(goldengate::ensureFAMEFiredRegisters(
               clockModel, thisOutputFired, error)))
@@ -4510,19 +4508,16 @@ int main(int argc, char **argv) {
             model.getLoc(), UIntType::get(&context, 1), llvm::APInt(1, 1));
       } else {
         std::string clockSinkName = (clockName + "_sink").str();
-        std::string clockEnableName = (clockName + "_enabled").str();
         mlir::Value clockPort;
         for (unsigned i = 0, n = model.getPorts().size(); i < n; ++i)
           if (model.getPortName(i) == clockSinkName &&
               model.getPortDirection(i) == Direction::In)
             clockPort = model.getBodyBlock()->getArgument(i);
-        model.walk([&](RegResetOp op) {
-          if (op.getName() == clockEnableName)
-            outputEnable = op.getResult();
-        });
+        outputEnable = goldengate::lookupFAMEClockEnable(
+            model, clockName, rewriteError);
         if (!clockPort || !outputEnable)
           return fail("FAME clock port or enable register missing in " +
-                      moduleName);
+                      moduleName + ": " + rewriteError);
         mlir::Value clockBits =
             builder.create<SubfieldOp>(model.getLoc(), clockPort, "bits");
         inputEnable =
@@ -4539,12 +4534,11 @@ int main(int argc, char **argv) {
         if (clock && !isInput) {
           enable = outputEnable;
           if (virtualClock)
-            model.walk([&](RegResetOp op) {
-              if (op.getName() == *clock + "_enabled")
-                enable = op.getResult();
-            });
+            enable = goldengate::lookupFAMEClockEnable(
+                model, *clock, rewriteError);
           if (!enable) {
-            rewriteError = "missing buffered channel clock enable for " + name;
+            rewriteError = "buffered channel clock enable for " + name +
+                           ": " + rewriteError;
             return false;
           }
         }
@@ -5662,13 +5656,12 @@ int main(int argc, char **argv) {
     if (!outputNames.empty()) {
       // The Scala FAME clock metadata uses the buffered clock enable for
       // outputs, while input channels use the incoming clock token.
-      RegResetOp outputClockEnableReg;
-      model.walk([&](RegResetOp reg) {
-        if (reg.getName() == clockModelPortName + "_enabled")
-          outputClockEnableReg = reg;
-      });
-      if (!outputClockEnableReg)
-        return fail("FAME output clock enable register is missing");
+      auto outputClockEnableValue = goldengate::lookupFAMEClockEnable(
+          model, clockModelPortName, rewriteError);
+      if (!outputClockEnableValue)
+        return fail("FAME output clock enable: " + rewriteError);
+      auto outputClockEnableReg =
+          outputClockEnableValue.getDefiningOp<RegResetOp>();
       // FAME1's output-channel clock flag is asUInt(buffered enable).  Keep
       // that operation explicit even when this single-clock enable is already
       // UInt<1>, so the generated fired-state rules retain SFC's clock cast.

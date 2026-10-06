@@ -29,8 +29,10 @@ mlir::LogicalResult addFAMEClockChannelToken(
 // The register is subsequently used by the abstract target clock gate. An
 // absent token selects SFC's VirtualClockChannel (constant one).
 // Requires hostClock: Clock, hostReset/targetCycleFinishing: UInt<1>, and a
-// unique <modelClockName>_enabled name. Consumes/produces no annotations;
-// creates a host-clocked, reset-to-zero register and its completion mux.
+// nonempty model clock identity without an existing generated enable.
+// Consumes/produces no annotations; creates a host-clocked, reset-to-zero
+// register and its completion mux. Uniques its name through all model ports
+// and declarations, preserving target state; attaches fameClockEnable identity.
 // Channel/hierarchy analyses are unchanged; callers must refresh state scans.
 mlir::LogicalResult addFAMEClockEnable(circt::firrtl::FModuleOp model,
                                        llvm::StringRef modelClockName,
@@ -43,6 +45,8 @@ mlir::LogicalResult addFAMEClockEnable(circt::firrtl::FModuleOp model,
 // Reuse the circuit's compatible AbstractClockGate external definition,
 // preserving its annotations and symbols. Reject incompatible definitions
 // before mutation; every model/domain gets its own instance and CE operands.
+// Resolve buffered enables by fameClockEnable identity (legacy names only in
+// untagged transformed boundaries); require model host clock/reset and reset0.
 mlir::LogicalResult addFAMEClockGate(circt::firrtl::CircuitOp circuit,
                                      circt::firrtl::FModuleOp model,
                                      llvm::StringRef modelClockName,

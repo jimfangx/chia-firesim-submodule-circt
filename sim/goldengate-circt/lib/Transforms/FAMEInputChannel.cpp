@@ -1,11 +1,14 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEInputChannel.h"
+#include "goldengate/FAMEClockEnable.h"
 #include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/HW/HWTypeInterfaces.h"
 #include "circt/Support/InstanceGraph.h"
+#include "circt/Support/Namespace.h"
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/APSInt.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/SymbolTable.h"
 #include <algorithm>
@@ -466,7 +469,14 @@ LogicalResult goldengate::addFAMEClockEnable(
     FModuleOp model, llvm::StringRef modelClockName, Value clockTokenBits,
     std::string &error) {
   Value hostClock, hostReset, finishing;
+  circt::Namespace names;
+  std::set<std::string> reserved;
+  auto reserve = [&](StringRef name) {
+    if (!name.empty() && reserved.insert(name.str()).second)
+      names.newName(name);
+  };
   for (unsigned i = 0, n = model.getNumPorts(); i < n; ++i) {
+    reserve(model.getPortName(i));
     if (model.getPortDirection(i) != Direction::In)
       continue;
     if (model.getPortName(i) == "hostClock")
@@ -474,11 +484,9 @@ LogicalResult goldengate::addFAMEClockEnable(
     if (model.getPortName(i) == "hostReset")
       hostReset = model.getBodyBlock()->getArgument(i);
   }
-  std::string enableName = (modelClockName + "_enabled").str();
-  bool nameTaken = false;
   model.walk([&](Operation *op) {
     if (auto name = op->getAttrOfType<StringAttr>("name")) {
-      nameTaken |= name.getValue() == enableName;
+      reserve(name.getValue());
       if (name.getValue() == "targetCycleFinishing")
         if (auto wire = dyn_cast<WireOp>(op))
           finishing = wire.getResult();
@@ -490,11 +498,20 @@ LogicalResult goldengate::addFAMEClockEnable(
   };
   if (!hostClock || !isa<ClockType>(hostClock.getType()) ||
       !isBit(hostReset) || !isBit(finishing) ||
-      (clockTokenBits && !isBit(clockTokenBits)) || nameTaken) {
+      (clockTokenBits && !isBit(clockTokenBits)) || modelClockName.empty()) {
     error = "target clock enable lacks a host clock, finishing signal, "
-            "one-bit token (when present), or unique name";
+            "one-bit token (when present), or clock identity";
     return failure();
   }
+  FAMEClockEnableIndex enables;
+  if (failed(enables.collect(model, error)))
+    return failure();
+  if (enables.lookup(modelClockName, false)) {
+    error = "target clock enable already exists for " + modelClockName.str();
+    return failure();
+  }
+  // SFC hostFlagReg allocates once through the complete model namespace.
+  std::string enableName = names.newName(modelClockName + "_enabled").str();
   auto *context = model.getContext();
   auto bitType = UIntType::get(context, 1, false);
   Location loc = model.getLoc();
@@ -504,8 +521,11 @@ LogicalResult goldengate::addFAMEClockEnable(
         loc, bitType, APInt(1, 1));
   Value resetZero = declarations.create<ConstantOp>(
       loc, bitType, APInt(1, 0));
-  Value enabled = declarations.create<RegResetOp>(
-      loc, bitType, hostClock, hostReset, resetZero, enableName).getResult();
+  auto enableReg = declarations.create<RegResetOp>(
+      loc, bitType, hostClock, hostReset, resetZero, enableName);
+  enableReg->setAttr(fameClockEnableAttr,
+                     declarations.getStringAttr(modelClockName));
+  Value enabled = enableReg.getResult();
   OpBuilder body(context);
   body.setInsertionPointToEnd(model.getBodyBlock());
   Value next = body.create<MuxPrimOp>(loc, finishing, clockTokenBits, enabled);
@@ -533,19 +553,19 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
     if (model.getPortName(i) == modelClockName)
       oldTargetClock = port;
   }
-  std::string enableName = (modelClockName + "_enabled").str();
   std::string bufferName = (modelClockName + "_buffer").str();
   bool bufferNameTaken = false;
   model.walk([&](Operation *op) {
     if (auto wire = dyn_cast<WireOp>(op);
         wire && wire.getName() == "targetCycleFinishing")
       finishing = wire.getResult();
-    if (auto reg = dyn_cast<RegResetOp>(op);
-        reg && reg.getName() == enableName)
-      enabled = reg.getResult();
     if (auto name = op->getAttrOfType<StringAttr>("name"))
       bufferNameTaken |= name.getValue() == bufferName;
   });
+  FAMEClockEnableIndex enables;
+  if (failed(enables.collect(model, error)))
+    return failure();
+  enabled = enables.lookup(modelClockName);
   auto isBit = [](Value value) {
     auto type = value ? dyn_cast<UIntType>(value.getType()) : UIntType();
     return type && type.getWidth() == 1;
@@ -559,6 +579,14 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
       !isBit(finishing) || !isBit(enabled) || bufferNameTaken) {
     error = "target clock gate lacks the original/host clock, control "
             "signals, or a unique instance name";
+    return failure();
+  }
+  auto enableReg = enabled.getDefiningOp<RegResetOp>();
+  auto resetValue = enableReg.getResetValue().getDefiningOp<ConstantOp>();
+  if (enableReg.getClockVal() != hostClock ||
+      enableReg.getResetSignal() != hostReset || !resetValue ||
+      !resetValue.getValue().isZero()) {
+    error = "target clock enable requires the model host clock and reset to zero";
     return failure();
   }
 

@@ -471,6 +471,15 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-fame-clock-gate-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-clock-gate COMMAND goldengate-fame-clock-gate-test)
+  add_test(NAME goldengate-fame-clock-enable-collision COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEClockEnableCollision.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/clock-enable-collision
+    --rewrite-fame-output-valid-from ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.json)
+  add_test(NAME goldengate-fame-clock-enable-collision-check COMMAND goldengate-fame-clock-gate-test
+    --collision-controls ${CMAKE_CURRENT_BINARY_DIR}/clock-enable-collision/output-valid.mlir)
+  set_tests_properties(goldengate-fame-clock-enable-collision PROPERTIES FIXTURES_SETUP fame-clock-enable-collision)
+  set_tests_properties(goldengate-fame-clock-enable-collision-check PROPERTIES FIXTURES_REQUIRED fame-clock-enable-collision)
   add_test(NAME goldengate-fame-multiple-virtual-clocks COMMAND goldengate-circt
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMultipleVirtualClocks.fir
     --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEMultipleVirtualClocks.anno.json
