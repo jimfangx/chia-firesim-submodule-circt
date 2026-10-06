@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // Oracle: FASEDMemoryTimingModel.scala:580-587 and MCRIO.bindReg.
-// Required input invariants: uninstantiated functional-model wrapper, exact
+// Materialization requires a free bank symbol and preserves top/annotations.
+// Attachment requires an uninstantiated functional-model wrapper, exact
 // host clock/reset and recorded 64/4-bit host response bundles, ten flights.
 // Annotations consumed: none.
 // Annotations produced: none; all retained targets explicitly retargeted.
@@ -18,17 +19,39 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addFASEDResponseErrors(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral bankName = "GGFASEDResponseErrors";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDResponseErrorsWrapper";
-  constexpr llvm::StringLiteral controlName = "fased_response_errors_mcr";
+namespace {
+constexpr llvm::StringLiteral bankName = "GGFASEDResponseErrors";
+constexpr llvm::StringLiteral wrapperName = "GGFASEDResponseErrorsWrapper";
+constexpr llvm::StringLiteral controlName = "fased_response_errors_mcr";
+SmallVector<PortInfo> responseErrorPorts(MLIRContext *ctx) {
+  OpBuilder b(ctx);
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1);
+  auto token = [&](FIRRTLBaseType payload) {
+    return BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
+        {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
+  };
+  auto words = FVectorType::get(token(uint(32)), 2);
+  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  SmallVector<PortInfo> ports{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+      {b.getStringAttr("reset"), bit, Direction::In}};
+  for (auto name : {"rValid", "rReady", "bValid", "bReady"})
+    ports.push_back({b.getStringAttr(name), bit, Direction::In});
+  for (auto name : {"rResp", "bResp"})
+    ports.push_back({b.getStringAttr(name), uint(2), Direction::In});
+  ports.push_back({b.getStringAttr("mcr"), mcr, Direction::Out});
+  return ports;
+}
+LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
+    unsigned (&indices)[4], std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGFASEDFunctionalModelRegisterWrapper")
     return reject("FASED response errors require the active functional-model register wrapper");
-  FModuleOp inner, engine;
+  FModuleOp engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
-      return reject("FASED response errors module or wrapper already exists");
+    if (m.getName() == wrapperName)
+      return reject("FASED response errors wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
   }
@@ -39,7 +62,7 @@ LogicalResult goldengate::addFASEDResponseErrors(CircuitOp circuit, std::string 
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
   if (!flight || flight.getInt() != 10)
     return reject("FASED response errors currently require the recorded ten-flight constructor");
-  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx);
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);
   auto token = [&](FIRRTLBaseType payload) {
@@ -67,18 +90,24 @@ LogicalResult goldengate::addFASEDResponseErrors(CircuitOp circuit, std::string 
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("FASED response errors need an uninstantiated top");
 
-  // Preflight is complete. Local lanes 0/1 map to global words 19/20.
-  auto words = FVectorType::get(token(uint(32)), 2);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  indices[0] = *clock; indices[1] = *reset;
+  indices[2] = *readResponse; indices[3] = *writeResponse;
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::materializeFASEDResponseErrors(CircuitOp circuit,
+    FModuleOp &result, std::string &error) {
+  for (auto module : circuit.getOps<FModuleLike>())
+    if (module.getName() == bankName) {
+      error = "FASED response errors module already exists";
+      return failure();
+    }
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1); auto bankPorts = responseErrorPorts(ctx);
+  // Local lanes 0/1 retain global words 19/20 (76/80 bytes).
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-      {b.getStringAttr("reset"), bit, Direction::In}};
-  for (auto name : {"rValid", "rReady", "bValid", "bReady"})
-    bankPorts.push_back({b.getStringAttr(name), bit, Direction::In});
-  for (auto name : {"rResp", "bResp"})
-    bankPorts.push_back({b.getStringAttr(name), uint(2), Direction::In});
-  bankPorts.push_back({b.getStringAttr("mcr"), mcr, Direction::Out});
   auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName),
       ConventionAttr::get(ctx, Convention::Internal), bankPorts);
   SmallVector<Attribute> registers;
@@ -114,6 +143,34 @@ LogicalResult goldengate::addFASEDResponseErrors(CircuitOp circuit, std::string 
     b.create<AssertOp>(loc, arg(0), permitted, enabled,
         std::string("Register ") + name + " is read only", ValueRange{}, "");
   }
+
+  result = bank;
+  return success();
+}
+
+LogicalResult goldengate::attachFASEDResponseErrors(CircuitOp circuit,
+    FModuleOp bank, std::string &error) {
+  FModuleOp inner; unsigned indices[4];
+  if (failed(attachmentTop(circuit, inner, indices, error))) return failure();
+  auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
+  if (!bank || bank->getParentOp() != circuit.getOperation() || bank.getName() != bankName)
+    return reject("FASED response-error attachment requires its materialized bank in this circuit");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto expected = responseErrorPorts(ctx); auto actual = bank.getPorts();
+  if (actual.size() != expected.size()) return reject("FASED response-error bank needs exactly nine ports");
+  for (auto [i, port] : llvm::enumerate(actual))
+    if (port.name != expected[i].name || port.type != expected[i].type ||
+        port.direction != expected[i].direction)
+      return reject("FASED response-error bank ports differ from the host clock/reset/response handshake/two-word MCR boundary");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+  if (used) return reject("FASED response-error attachment requires an uninstantiated bank");
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto mcr = expected[8].type;
+  std::optional<unsigned> clock = indices[0], reset = indices[1],
+      readResponse = indices[2], writeResponse = indices[3];
+  auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
+  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, port] : llvm::enumerate(inner.getPorts())) {
@@ -162,4 +219,13 @@ LogicalResult goldengate::addFASEDResponseErrors(CircuitOp circuit, std::string 
   };
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+LogicalResult goldengate::addFASEDResponseErrors(CircuitOp circuit, std::string &error) {
+  // Keep the combined API atomic for rejected attachment boundaries.
+  FModuleOp inner; unsigned indices[4];
+  if (failed(attachmentTop(circuit, inner, indices, error))) return failure();
+  FModuleOp bank;
+  if (failed(materializeFASEDResponseErrors(circuit, bank, error))) return failure();
+  return attachFASEDResponseErrors(circuit, bank, error);
 }

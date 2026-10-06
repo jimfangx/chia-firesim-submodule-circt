@@ -2610,6 +2610,24 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelBankAnnotations, error)))
         return fail("FASED functional-model materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT FASED functional-model bank before control allocation in " << fasedFunctionalModelBankPath << '\n';
+      // This sparse fragment retains global words 19/20; validate it with the
+      // complete FASED registry and typed adapter after fragment assembly.
+      FModuleOp fasedResponseErrorsBank;
+      if (failed(goldengate::materializeFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
+        return fail("FASED response-error materialization: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("FASED response-error materialization produced invalid FIRRTL IR");
+      llvm::SmallString<256> fasedResponseErrorsBankPath(outputDir), fasedResponseErrorsBankAnnotations(outputDir);
+      llvm::sys::path::append(fasedResponseErrorsBankPath, "post-fame-fased-response-errors-bank.mlir");
+      llvm::sys::path::append(fasedResponseErrorsBankAnnotations, "post-fame-fased-response-errors-bank-all.json");
+      std::error_code fasedResponseErrorsBankWriteError;
+      llvm::raw_fd_ostream fasedResponseErrorsBankOut(fasedResponseErrorsBankPath, fasedResponseErrorsBankWriteError);
+      if (fasedResponseErrorsBankWriteError)
+        return fail("cannot write FASED response-error materialization: " + fasedResponseErrorsBankWriteError.message());
+      module->print(fasedResponseErrorsBankOut); fasedResponseErrorsBankOut << '\n'; fasedResponseErrorsBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsBankAnnotations, error)))
+        return fail("FASED response-error materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT FASED response-error bank before control allocation in " << fasedResponseErrorsBankPath << '\n';
       // HasWidgets registration order remains independent of IR module order.
       // Derive each available bank's size from its register registry and check
       // it against the implemented MCR port. FASED, still assembled after
@@ -3377,7 +3395,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelRegisterAnnotations, error)))
         return fail("FASED functional model register annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock functional model register and ingress binding in " << fasedFunctionalModelRegisterPath << '\n';
-      if (failed(goldengate::addFASEDResponseErrors(circuit, error)))
+      if (failed(goldengate::attachFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
         return fail("FASED response error registers: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED response error registers produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedResponseErrorsPath(outputDir), fasedResponseErrorsAnnotations(outputDir);
