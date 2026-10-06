@@ -153,39 +153,51 @@ private:
           result.blockers.insert(current.getName().str() + ":external " +
                                  instance.getModuleName().str());
         }
-      } else if (auto field = value.getDefiningOp<SubfieldOp>()) {
-        if (auto memory = field.getInput().getDefiningOp<MemOp>();
-            memory && field.isFieldFlipped() &&
-            (field.getFieldName() == "data" ||
-             field.getFieldName() == "rdata")) {
+      } else if (auto memory = dyn_cast<MemOp>(op)) {
+        // Recognize a read by its canonical memory port and field identity,
+        // including nested bundle/vector selections. The original SSA value
+        // may be a SubindexOp rather than the port's data SubfieldOp.
+        auto port = fieldRef.getValue();
+        auto type = cast<BundleType>(port.getType());
+        if (!fieldRef.getFieldID()) {
+          result.blockers.insert(current.getName().str() +
+                                 ":unselected memory port");
+        } else if (auto element = type.getElement(
+                       type.getIndexForFieldID(fieldRef.getFieldID()));
+                   element.isFlip && (element.name.getValue() == "data" ||
+                                      element.name.getValue() == "rdata")) {
           // Stored bits are state. A zero-latency read can still depend on
           // this cycle's read address and enable. New read-under-write also
           // needs write-port dependencies, which remain explicitly unresolved.
           if (memory.getReadLatency() == 0) {
+            // Scala's reader-port connectivity does not establish a contract
+            // for combinational readwrite ports. Their write mode must not be
+            // silently omitted from an apparently complete dependency set.
+            if (element.name.getValue() == "rdata")
+              result.blockers.insert(current.getName().str() +
+                                     ":asynchronous readwrite memory");
             if (memory.getRuw() == RUWAttr::New)
               result.blockers.insert(current.getName().str() +
                                      ":new read-under-write memory");
-            bool hasAddr = false, hasEnable = false;
-            for (Operation *user : field.getInput().getUsers()) {
-              auto portField = dyn_cast<SubfieldOp>(user);
-              if (!portField)
-                continue;
-              if (portField.getFieldName() == "addr") {
-                hasAddr = true;
-                merge(traceValue(current, portField.getResult(), active));
-              } else if (portField.getFieldName() == "en") {
-                hasEnable = true;
-                merge(traceValue(current, portField.getResult(), active));
-              }
+            // CheckCombLoops adds address and enable edges to an async read.
+            // Resolve them directly from field IDs, without depending on the
+            // presence or use-list order of SSA subfield operations.
+            for (StringRef control : {"addr", "en"}) {
+              if (auto index = type.getElementIndex(control))
+                merge(traceValue(current, port, active, type.getFieldID(*index)));
+              else
+                result.blockers.insert(current.getName().str() +
+                                       ":incomplete memory read port");
             }
-            if (!hasAddr || !hasEnable)
-              result.blockers.insert(current.getName().str() +
-                                     ":incomplete memory read port");
           }
         } else {
-          // Other subfields retain their ordinary FIRRTL SSA dependency.
-          merge(traceValue(current, field.getInput(), active));
+          // A memory input field must have a resolved driver, found above.
+          result.blockers.insert(current.getName().str() +
+                                 ":undriven memory field");
         }
+      } else if (auto field = value.getDefiningOp<SubfieldOp>()) {
+        // Other subfields retain their ordinary FIRRTL SSA dependency.
+        merge(traceValue(current, field.getInput(), active));
       } else if (auto port = dyn_cast<circt::chirrtl::MemoryPortOp>(op)) {
         // A CHIRRTL memory port's data is stored state, while an asynchronous
         // read still follows its access index. Infer ports are read-only when
@@ -214,7 +226,7 @@ private:
           result.blockers.insert(current.getName().str() +
                                  ":memory port without access");
         }
-      } else if (isa<MemOp, circt::chirrtl::CombMemOp,
+      } else if (isa<circt::chirrtl::CombMemOp,
                      circt::chirrtl::SeqMemOp>(op)) {
         result.blockers.insert(current.getName().str() + ":memory result");
       } else if (isa<WireOp>(op)) {

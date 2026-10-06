@@ -15,6 +15,9 @@ namespace goldengate {
 // output must never be treated as having no input dependencies: black boxes
 // and unsupported operations require further analysis. The known output-only
 // Rocket plusarg_reader is a configuration source with no target input paths.
+// Memory read data is recognized by field identity, including static nested
+// selections. Async readers follow address/enable; sync reads break the path.
+// Async readwrite ports and new read-under-write remain explicit blockers.
 struct LocalChannelDependency {
   std::string outputChannel;
   std::vector<std::string> inputChannels;

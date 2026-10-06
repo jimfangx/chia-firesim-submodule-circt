@@ -35,7 +35,8 @@ void expect(FModuleOp model, StringRef output, std::set<std::string> inputs) {
   });
   require(row != dependencies.end(), "missing output " + output.str());
   require(row->unresolvedPorts.empty() && row->unresolvedCauses.empty(),
-          "unresolved output " + output.str());
+          "unresolved output " + output.str() + ": " +
+              (row->unresolvedCauses.empty() ? "" : row->unresolvedCauses.front()));
   require(std::set<std::string>(row->inputChannels.begin(),
                                row->inputChannels.end()) == inputs,
           "wrong dependencies for " + output.str());
@@ -112,6 +113,99 @@ void repeatedDrivers(MLIRContext &context) {
   require(succeeded(goldengate::normalizeFAMEInput(*root, circuit, error)), error);
   expect(model, "out", {"b"});
 }
+
+void selectedMemoryData(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %clock: !firrtl.clock,
+          in %address: !firrtl.uint<1>, in %enable: !firrtl.uint<1>,
+          out %async: !firrtl.uint<8>, out %sync: !firrtl.uint<8>,
+          out %alias: !firrtl.uint<8>) {
+        %read = firrtl.mem Undefined {depth = 2 : i64, name = "async_ram",
+          portNames = ["r"], readLatency = 0 : i32, writeLatency = 1 : i32}
+          : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock,
+                           data flip: vector<uint<8>, 2>>
+        %addr = firrtl.subfield %read[addr] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        %en = firrtl.subfield %read[en] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        %clk = firrtl.subfield %read[clk] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        firrtl.strictconnect %addr, %address : !firrtl.uint<1>
+        firrtl.strictconnect %en, %enable : !firrtl.uint<1>
+        firrtl.strictconnect %clk, %clock : !firrtl.clock
+        %data = firrtl.subfield %read[data] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        %element = firrtl.subindex %data[1] : !firrtl.vector<uint<8>, 2>
+        firrtl.strictconnect %async, %element : !firrtl.uint<8>
+        %data_alias = firrtl.node %data : !firrtl.vector<uint<8>, 2>
+        %alias_element = firrtl.subindex %data_alias[0] : !firrtl.vector<uint<8>, 2>
+        firrtl.strictconnect %alias, %alias_element : !firrtl.uint<8>
+        %sync_read = firrtl.mem Undefined {depth = 2 : i64, name = "sync_ram",
+          portNames = ["r"], readLatency = 1 : i32, writeLatency = 1 : i32}
+          : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock,
+                           data flip: vector<uint<8>, 2>>
+        %sync_addr = firrtl.subfield %sync_read[addr] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        %sync_en = firrtl.subfield %sync_read[en] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        %sync_clk = firrtl.subfield %sync_read[clk] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        firrtl.strictconnect %sync_addr, %address : !firrtl.uint<1>
+        firrtl.strictconnect %sync_en, %enable : !firrtl.uint<1>
+        firrtl.strictconnect %sync_clk, %clock : !firrtl.clock
+        %sync_data = firrtl.subfield %sync_read[data] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, data flip: vector<uint<8>, 2>>
+        %sync_element = firrtl.subindex %sync_data[0] : !firrtl.vector<uint<8>, 2>
+        firrtl.strictconnect %sync, %sync_element : !firrtl.uint<8>
+      }
+    }
+  })mlir", &context);
+  require(bool(root), "memory fixture parse failed");
+  require(succeeded(verify(*root)), "memory fixture is invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  expect(model, "async", {"address", "enable"});
+  expect(model, "alias", {"address", "enable"});
+  expect(model, "sync", {});
+  auto memory = *model.getOps<MemOp>().begin();
+  memory.setRuw(RUWAttr::New);
+  auto dependencies = analyze(model);
+  require(llvm::any_of(dependencies.front().unresolvedCauses, [](auto &cause) {
+    return StringRef(cause).ends_with(":new read-under-write memory");
+  }), "new read-under-write was silently treated as stored-state-only data");
+}
+
+void asynchronousReadWrite(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %clock: !firrtl.clock,
+          in %address: !firrtl.uint<1>, in %enable: !firrtl.uint<1>,
+          in %mode: !firrtl.uint<1>, in %write: !firrtl.uint<8>,
+          out %out: !firrtl.uint<8>) {
+        %rw = firrtl.mem Undefined {depth = 2 : i64, name = "ram",
+          portNames = ["rw"], readLatency = 0 : i32, writeLatency = 1 : i32}
+          : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock,
+              rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %addr = firrtl.subfield %rw[addr] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %en = firrtl.subfield %rw[en] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %clk = firrtl.subfield %rw[clk] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %data = firrtl.subfield %rw[rdata] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %wmode = firrtl.subfield %rw[wmode] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %wdata = firrtl.subfield %rw[wdata] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %wmask = firrtl.subfield %rw[wmask] : !firrtl.bundle<addr: uint<1>, en: uint<1>, clk: clock, rdata flip: uint<8>, wmode: uint<1>, wdata: uint<8>, wmask: uint<1>>
+        %one = firrtl.constant 1 : !firrtl.uint<1>
+        firrtl.strictconnect %addr, %address : !firrtl.uint<1>
+        firrtl.strictconnect %en, %enable : !firrtl.uint<1>
+        firrtl.strictconnect %clk, %clock : !firrtl.clock
+        firrtl.strictconnect %wmode, %mode : !firrtl.uint<1>
+        firrtl.strictconnect %wdata, %write : !firrtl.uint<8>
+        firrtl.strictconnect %wmask, %one : !firrtl.uint<1>
+        firrtl.strictconnect %out, %data : !firrtl.uint<8>
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "readwrite fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  auto dependencies = analyze(model);
+  require(dependencies.size() == 1 &&
+      llvm::any_of(dependencies.front().unresolvedCauses, [](auto &cause) {
+        return StringRef(cause).ends_with(":asynchronous readwrite memory");
+      }), "asynchronous readwrite omitted write mode without a blocker");
+}
 } // namespace
 int main(int argc, char **argv) {
   try {
@@ -119,6 +213,8 @@ int main(int argc, char **argv) {
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     conditionalDrivers(context);
     repeatedDrivers(context);
+    selectedMemoryData(context);
+    asynchronousReadWrite(context);
     require(argc <= 3, "expected optional input MLIR and normalized output MLIR");
     if (argc >= 2) {
       // Optional immutable Rocket extraction, normalized by the real tool.
@@ -135,9 +231,16 @@ int main(int argc, char **argv) {
       expect(model, "io_deq_valid", {"io_enq_valid"});
       expect(model, "io_enq_ready", {});
       expect(model, "io_count", {});
+      for (StringRef field : {"data", "strb", "last"}) {
+        expect(model, "io_deq_bits_" + field.str(),
+               {"io_enq_bits_" + field.str()});
+      }
       // Also exercise recursive instance tracing through the probe wrapper.
       auto probe = *circuit.getOps<FModuleOp>().begin();
       expect(probe, "io_deq_valid", {"io_enq_valid"});
+      for (StringRef field : {"data", "strb", "last"})
+        expect(probe, "io_deq_bits_" + field.str(),
+               {"io_enq_bits_" + field.str()});
       if (argc == 3) {
         std::error_code ec;
         llvm::raw_fd_ostream out(argv[2], ec);
@@ -147,10 +250,15 @@ int main(int argc, char **argv) {
       }
       llvm::outs() << "Rocket Queue1_AXI4BundleW: io_deq_valid <- {io_enq_valid}; "
                       "io_enq_ready <- {} matched SFC RTL; "
-                      "io_count <- {} matched SFC FIRRTL register boundary\n";
+                      "io_count <- {} matched SFC FIRRTL register boundary\n"
+                      "Payload data/strb/last each depends only on matching "
+                      "enqueue field, including through the probe instance; "
+                      "matched SFC RTL\n";
     }
     llvm::outs() << "Nested when conditions, last-connect override and register "
-                    "boundaries passed\n";
+                    "boundaries passed; static memory selections and aliases "
+                    "follow async address/enable and stop at sync state; "
+                    "unsupported memory modes rejected\n";
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

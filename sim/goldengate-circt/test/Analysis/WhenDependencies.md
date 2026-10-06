@@ -52,3 +52,38 @@ gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireS
 
 This comparison establishes the queue's combinational dependency boundary.
 Full transformed-Rocket compilation and behavioral gates remain harness-owned.
+
+The October 6 iteration 2 comparison extends this same immutable queue to the
+payload fields. FIRRTL lines 27347–27354 contain the constant-address read and
+empty-queue bypass; U250 RTL lines 58698–58700 fix the read enable to one and
+address to zero. RTL lines 58707–58709 select each enqueue field or its stored
+RAM value. The candidate must report exactly:
+
+```
+io_deq_bits_data <- {io_enq_bits_data}
+io_deq_bits_strb <- {io_enq_bits_strb}
+io_deq_bits_last <- {io_enq_bits_last}
+```
+
+All three paths are checked both in the queue and through the probe instance.
+There are no dependencies on the clock, write controls, or other payload fields.
+The mutable artifacts are in `iteration2-memory-dependencies/` beside the
+earlier extraction. `comparison.log` records the C++ analysis assertions;
+`normalized-queue.mlir` contains the corresponding normalized candidate IR.
+
+The related vector-selection regression exposed a gap in the reusable analysis:
+selected vector memory data was rejected as `memory result` because the
+immediate SSA operation was a `SubindexOp`. Memory reads now use the canonical
+memory-port `FieldRef`, decode the selected top-level port field, and follow
+address and enable by field ID. The C++ test checks static selections and node
+aliases from a vector memory with ground model ports; asynchronous reads depend
+on address/enable, while synchronous reads depend on neither. The failing
+pre-fix test reported `unresolved output async: Model:memory result`.
+
+The FireSim dependency is `firrtl_2.13:1.6.0`. Its
+`firrtl/transforms/CheckCombLoops.scala` lines 144–150 add address and enable
+edges for zero-latency reader ports. `FAMETransform.scala` consumes that
+connectivity to form output-channel dependencies. Asynchronous readwrite ports
+need a separate write-mode investigation and now produce an explicit blocker;
+new read-under-write retains its existing blocker. Both rejection paths are
+tested, so unsupported memory behavior cannot appear dependency-free.
