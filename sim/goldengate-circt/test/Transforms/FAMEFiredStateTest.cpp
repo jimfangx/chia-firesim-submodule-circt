@@ -1,5 +1,8 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEFiredState.h"
+#include "goldengate/FAMEFiredRegister.h"
+#include "goldengate/FAMEInputReady.h"
+#include "goldengate/FAMEOutputValid.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "goldengate/FAMEFinishing.h"
 #include "mlir/IR/Builders.h"
@@ -198,6 +201,139 @@ void rejections(MLIRContext &context) {
   }
   llvm::outs()
       << "Passed seven atomic reset/host-control/virtual-enable rejections\n";
+}
+
+void collidingIdentities(MLIRContext &context) {
+  auto root = fixture(context);
+  auto m = model(*root);
+  auto cs = channels(m);
+  OpBuilder b(&m.getBodyBlock()->front());
+  auto bit = UIntType::get(&context, 1);
+  Value one = b.create<ConstantOp>(m.getLoc(), bit, APInt(1, 1));
+  auto target = b.create<RegResetOp>(m.getLoc(), bit,
+      m.getBodyBlock()->getArgument(0), m.getBodyBlock()->getArgument(1),
+      one, "input_fired_0");
+  // This register even has the expected host controls/reset, but is target
+  // state. Nodes and wires must also participate in the namespace.
+  b.create<NodeOp>(m.getLoc(), one, "output_fired");
+  b.create<WireOp>(m.getLoc(), bit, "output_fired_0");
+  b.create<WireOp>(m.getLoc(), bit, "virtualInput_fired_0");
+  b.setInsertionPointToEnd(m.getBodyBlock());
+  b.create<StrictConnectOp>(m.getLoc(), target.getResult(), one);
+  std::string error;
+  require(succeeded(goldengate::ensureFAMEFiredRegisters(m, cs, error)),
+          error.c_str());
+  goldengate::FAMEFiredRegisterIndex index;
+  require(succeeded(index.collect(m, error)), error.c_str());
+  for (const auto &[channel, expected] :
+       std::map<std::string, std::string>{{"input", "input_fired_1"},
+          {"output", "output_fired_1_0"},
+          {"virtualInput", "virtualInput_fired_1"},
+          {"virtualOutput", "virtualOutput_fired_0"}}) {
+    auto reg = index.lookup(channel).getDefiningOp<RegResetOp>();
+    require(reg && reg.getName() == expected, "SFC namespace allocation differs");
+    llvm::outs() << "IDENTITY " << channel << " " << reg.getName() << "\n";
+  }
+  // Identity persists through textual IR boundaries and subsequent renaming.
+  index.lookup("output").getDefiningOp<RegResetOp>().setName("renamed_host_state");
+  root = parseSourceString<ModuleOp>(dump(*root), &context);
+  require(bool(root), "identity serialization failed");
+  m = model(*root);
+  cs = channels(m);
+  auto before = dump(*root);
+  require(succeeded(goldengate::ensureFAMEFiredRegisters(m, cs, error)) &&
+              before == dump(*root), "renamed host state was recreated");
+  goldengate::FAMEFiredRegisterIndex renamed;
+  require(succeeded(renamed.collect(m, error)), error.c_str());
+  SmallVector<goldengate::LocalChannelDependency> deps{
+      {"output", {"input"}, {}, {}},
+      {"virtualOutput", {"virtualInput"}, {}, {}}};
+  require(succeeded(goldengate::rewriteFAMEOutputValids(m, deps, error)), error.c_str());
+  require(succeeded(goldengate::rewriteFAMEFinishing(
+              m, {"input", "virtualInput"}, {"output", "virtualOutput"}, "", error)),
+          error.c_str());
+  require(succeeded(goldengate::rewriteFAMEInputReadies(
+              m, {"input", "virtualInput"}, error)), error.c_str());
+  require(succeeded(goldengate::rewriteFAMEFiredStates(m, cs, error)), error.c_str());
+  auto drive = [&](Value dest) -> Value {
+    for (auto c : m.getOps<StrictConnectOp>())
+      if (c.getDest() == dest)
+        return c.getSrc();
+    return {};
+  };
+  Value finishing;
+  for (auto w : m.getOps<WireOp>())
+    if (w.getName() == "targetCycleFinishing")
+      finishing = w.getResult();
+  // Exhaust all two-input/two-output token and fired-state combinations.
+  for (unsigned flags = 0; flags < 256; ++flags) {
+    unsigned iv = flags & 1, vv = (flags >> 1) & 1,
+             ready = (flags >> 2) & 1, vr = (flags >> 3) & 1,
+             inFired = (flags >> 4) & 1, viFired = (flags >> 5) & 1,
+             outFired = (flags >> 6) & 1, voFired = (flags >> 7) & 1;
+    unsigned ov = iv & !outFired, vov = vv & !voFired;
+    unsigned done = iv & vv & (outFired | ready) & (voFired | vr);
+    llvm::DenseMap<Value, unsigned> values{
+        {renamed.lookup("input"), inFired},
+        {renamed.lookup("virtualInput"), viFired},
+        {renamed.lookup("output"), outFired},
+        {renamed.lookup("virtualOutput"), voFired},
+        {m.getBodyBlock()->getArgument(2), 1}};
+    for (auto f : m.getOps<SubfieldOp>()) {
+      auto arg = dyn_cast<BlockArgument>(f.getInput());
+      require(bool(arg), "unexpected control subfield");
+      unsigned p = arg.getArgNumber();
+      if (f.getFieldName() == "valid")
+        values[f.getResult()] = p == 4 ? iv : p == 6 ? vv : p == 5 ? ov : vov;
+      if (f.getFieldName() == "ready")
+        values[f.getResult()] = p == 5 ? ready : p == 7 ? vr
+                                   : p == 4 ? done & !inFired : done & !viFired;
+    }
+    require(eval(drive(finishing), values) == done, "identity finishing differs");
+    for (auto c : m.getOps<StrictConnectOp>()) {
+      auto f = c.getDest().getDefiningOp<SubfieldOp>();
+      if (!f)
+        continue;
+      unsigned p = cast<BlockArgument>(f.getInput()).getArgNumber();
+      unsigned expected = p == 4 ? done & !inFired : p == 6 ? done & !viFired
+                            : p == 5 ? ov : vov;
+      require(eval(c.getSrc(), values) == expected, "identity handshake differs");
+      values[c.getDest()] = expected;
+      // All equivalent subfield SSA values denote the same port field.
+      for (auto other : m.getOps<SubfieldOp>())
+        if (other.getInput() == f.getInput() &&
+            other.getFieldIndex() == f.getFieldIndex())
+          values[other.getResult()] = expected;
+    }
+    for (const auto &ch : cs) {
+      Value fired = renamed.lookup(ch.name);
+      unsigned old = values.lookup(fired);
+      unsigned firing = ch.name == "input" ? iv & done & !inFired
+                       : ch.name == "virtualInput" ? vv & done & !viFired
+                       : ch.name == "output" ? ready & ov : vr & vov;
+      require(eval(drive(fired), values) == (done ? 0 : old | firing),
+              "identity next state differs");
+    }
+  }
+  for (auto reg : m.getOps<RegResetOp>())
+    if (reg.getName() == "input_fired_0")
+      require(drive(reg.getResult()) == reg.getResetValue() &&
+                  !reg->hasAttr(goldengate::fameFiredChannelAttr),
+              "target register was consumed as fired state");
+  require(succeeded(verify(*root)), "collision controls failed verification");
+  // A forged duplicate must reject every consumer before any IR mutation.
+  for (auto reg : m.getOps<RegResetOp>())
+    if (reg.getName() == "input_fired_0")
+      reg->setAttr(goldengate::fameFiredChannelAttr, b.getStringAttr("input"));
+  before = dump(*root);
+  require(failed(goldengate::ensureFAMEFiredRegisters(m, cs, error)) &&
+          failed(goldengate::rewriteFAMEOutputValids(m, deps, error)) &&
+          failed(goldengate::rewriteFAMEInputReadies(m, {"input"}, error)) &&
+          failed(goldengate::rewriteFAMEFiredStates(m, cs, error)) &&
+          failed(goldengate::rewriteFAMEFinishing(m, {"input", "virtualInput"},
+                    {"output", "virtualOutput"}, "", error)) &&
+          before == dump(*root), "duplicate identity was not rejected atomically");
+  llvm::outs() << "Passed 256 collision/rename control combinations and atomic duplicate rejections\n";
 }
 // FAMETransform topRules: VirtualClockChannel.isValid = 1 and
 // VirtualClockChannel.setReady = EmptyStmt. Exercise the same data predicate
@@ -783,11 +919,35 @@ void boundary(MLIRContext &context, const char *path) {
       cs.push_back({name.drop_back(7).str(), false, outputEnable});
   }
   require(cs.size() == 42, "unexpected Rocket data channel count");
-  auto before = dump(m);
   std::string error;
-  require(succeeded(goldengate::ensureFAMEFiredRegisters(m, cs, error)),
-          error.c_str());
-  require(before == dump(m), "oracle boundary register declaration changed");
+  // Recreate the native host declarations at the saved model boundary. Keep
+  // old values alive until their uses can be transferred, reserving different
+  // names so that creation sees the same target namespace as before FAME.
+  SmallVector<std::pair<std::string, RegResetOp>> oldRegisters;
+  for (const auto &ch : cs)
+    for (auto reg : m.getOps<RegResetOp>())
+      if (reg.getName() == ch.name + "_fired_0") {
+        oldRegisters.push_back({ch.name, reg});
+        reg.setName((reg.getName() + "_oracle").str());
+        reg->removeAttr(goldengate::fameFiredChannelAttr);
+      }
+  require(oldRegisters.size() == 42, "missing saved Rocket fired declarations");
+  require(succeeded(goldengate::ensureFAMEFiredRegisters(m, cs, error)), error.c_str());
+  goldengate::FAMEFiredRegisterIndex recreated;
+  require(succeeded(recreated.collect(m, error)), error.c_str());
+  for (auto &[name, reg] : oldRegisters) {
+    SmallVector<Operation *> connects;
+    for (auto *user : reg.getResult().getUsers())
+      if ((isa<ConnectOp, StrictConnectOp>(user)) && user->getOperand(0) == reg.getResult())
+        connects.push_back(user);
+    for (auto *connect : connects)
+      connect->erase();
+    reg.getResult().replaceAllUsesWith(recreated.lookup(name));
+    reg->erase();
+  }
+  auto before = dump(m);
+  require(succeeded(goldengate::ensureFAMEFiredRegisters(m, cs, error)) &&
+              before == dump(m), "Rocket recreation is not idempotent");
   require(succeeded(goldengate::rewriteFAMEFiredStates(m, cs, error)),
           error.c_str());
   SmallVector<std::string> inputs, outputs;
@@ -877,6 +1037,7 @@ int main(int argc, char **argv) {
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     behavior(context);
     rejections(context);
+    collidingIdentities(context);
     finishingBehavior(context);
     noDataFinishingRejections(context);
     if (argc == 3 && std::string(argv[1]) == "--virtual-controls")

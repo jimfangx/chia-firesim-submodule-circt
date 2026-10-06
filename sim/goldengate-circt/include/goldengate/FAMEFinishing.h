@@ -15,6 +15,8 @@ namespace goldengate {
 // valid is constant one and no clock-ready connect or port is created.
 // Requires decoupled data ports with one-bit fired registers and resolved
 // module-body connect semantics. All data ports must be listed exactly once.
+// Fired state resolves through goldengate.fameFiredChannel; untagged legacy
+// models retain name-based compatibility. Duplicate identities reject atomically.
 // Annotations consumed/produced: none. Analyses required/preserved: none.
 // Output: finishing is driven by all data conditions AND clock valid.
 mlir::LogicalResult rewriteFAMEFinishing(

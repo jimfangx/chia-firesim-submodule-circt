@@ -7,6 +7,8 @@
 namespace goldengate {
 // Required input invariants: model ports already use FAME decoupled bundles;
 // each output has one valid connect and a host-clocked fired register.
+// Resolve native fired state by goldengate.fameFiredChannel, with name-based
+// compatibility for wholly untagged legacy models. Reject duplicate identities.
 // Annotations consumed/produced: none.
 // IR mutations: replace output-valid connect sources with FIRRTL expressions.
 // Analysis required: local combinational input-channel dependencies.

@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEInputReady.h"
+#include "goldengate/FAMEFiredRegister.h"
 #include "mlir/IR/Builders.h"
 #include <map>
 #include <set>
@@ -33,14 +34,9 @@ LogicalResult goldengate::rewriteFAMEInputReadies(
     return failure();
   }
 
-  std::map<std::string, Value> firedRegisters;
-  module.walk([&](RegOp op) {
-    firedRegisters[op.getName().str()] = op.getResult();
-  });
-  module.walk([&](RegResetOp op) {
-    firedRegisters[op.getName().str()] = op.getResult();
-  });
-
+  FAMEFiredRegisterIndex firedRegisters;
+  if (failed(firedRegisters.collect(module, error)))
+    return failure();
   std::map<std::string, unsigned> ports;
   for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
     ports.emplace(module.getPortName(i).str(), i);
@@ -67,10 +63,8 @@ LogicalResult goldengate::rewriteFAMEInputReadies(
       error = "invalid FAME sink ready field for " + name;
       return failure();
     }
-    auto fired = firedRegisters.find(name + "_fired_0");
-    if (fired == firedRegisters.end())
-      fired = firedRegisters.find(name + "_fired");
-    if (fired == firedRegisters.end() || !isBit(fired->second)) {
+    Value fired = firedRegisters.lookup(name);
+    if (!fired || !isBit(fired)) {
       error = "missing one-bit fired register for " + name;
       return failure();
     }
@@ -94,7 +88,7 @@ LogicalResult goldengate::rewriteFAMEInputReadies(
       error = "sink ready has multiple connects for " + name;
       return failure();
     }
-    rules.push_back({readyConnect, sink, fired->second});
+    rules.push_back({readyConnect, sink, fired});
   }
 
   // Validate the complete channel set before changing the module.

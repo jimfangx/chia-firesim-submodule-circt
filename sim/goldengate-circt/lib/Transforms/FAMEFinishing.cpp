@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEFinishing.h"
+#include "goldengate/FAMEFiredRegister.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseSet.h"
@@ -82,10 +83,9 @@ LogicalResult goldengate::rewriteFAMEFinishing(
     return failure();
   }
 
-  std::map<std::string, Value> firedRegisters;
-  module.walk([&](RegResetOp op) {
-    firedRegisters.emplace(op.getName().str(), op.getResult());
-  });
+  FAMEFiredRegisterIndex firedRegisters;
+  if (failed(firedRegisters.collect(module, error)))
+    return failure();
   // Scala selects a clock channel whose payload ports all have ClockType;
   // counting it again as a data input would make its valid gate appear twice.
   std::set<std::string> seen;
@@ -109,13 +109,9 @@ LogicalResult goldengate::rewriteFAMEFinishing(
         error = "Clock-typed sink requires an explicit target clock channel: " + name;
         return false;
       }
-      Value fired;
-      auto found = firedRegisters.find(name + "_fired_0");
-      if (found == firedRegisters.end())
-        found = firedRegisters.find(name + "_fired");
-      if (found != firedRegisters.end())
-        fired = found->second;
-      if (!fired || !isBit(fired.getType())) {
+      Value fired = firedRegisters.lookup(name);
+      if (!fired || !isBit(fired.getType()) ||
+          !fired.getDefiningOp<RegResetOp>()) {
         error = "missing one-bit fired register for " + name;
         return false;
       }

@@ -521,7 +521,8 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-fame-virtual-clock-port COMMAND goldengate-fame-virtual-clock-port-test)
   add_executable(goldengate-fame-fired-state-test
     test/Transforms/FAMEFiredStateTest.cpp lib/Transforms/FAMEFiredState.cpp
-    lib/Transforms/FAMEFinishing.cpp)
+    lib/Transforms/FAMEFinishing.cpp lib/Transforms/FAMEInputReady.cpp
+    lib/Transforms/FAMEOutputValid.cpp)
   target_compile_features(goldengate-fame-fired-state-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fame-fired-state-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fame-fired-state-test PRIVATE

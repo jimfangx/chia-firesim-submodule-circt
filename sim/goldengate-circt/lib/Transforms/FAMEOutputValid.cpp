@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEOutputValid.h"
+#include "goldengate/FAMEFiredRegister.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "mlir/IR/Builders.h"
 #include <map>
@@ -42,14 +43,9 @@ LogicalResult goldengate::rewriteFAMEOutputValids(
                         UIntType::get(port.getContext(), 1, false);
   };
 
-  std::map<std::string, Value> firedRegisters;
-  module.walk([&](RegOp op) {
-    firedRegisters[op.getName().str()] = op.getResult();
-  });
-  module.walk([&](RegResetOp op) {
-    firedRegisters[op.getName().str()] = op.getResult();
-  });
-
+  FAMEFiredRegisterIndex firedRegisters;
+  if (failed(firedRegisters.collect(module, error)))
+    return failure();
   std::set<std::string> seenOutputs;
   SmallVector<ValidRule> rules;
   for (const auto &dependency : dependencies) {
@@ -68,10 +64,8 @@ LogicalResult goldengate::rewriteFAMEOutputValids(
       error = "missing FAME source valid port for " + dependency.outputChannel;
       return failure();
     }
-    auto fired = firedRegisters.find(dependency.outputChannel + "_fired_0");
-    if (fired == firedRegisters.end())
-      fired = firedRegisters.find(dependency.outputChannel + "_fired");
-    if (fired == firedRegisters.end() || !isBit(fired->second)) {
+    Value fired = firedRegisters.lookup(dependency.outputChannel);
+    if (!fired || !isBit(fired)) {
       error = "missing one-bit fired register for " + dependency.outputChannel;
       return failure();
     }
@@ -99,7 +93,7 @@ LogicalResult goldengate::rewriteFAMEOutputValids(
       return failure();
     }
 
-    ValidRule rule{validConnect, output, fired->second, {}};
+    ValidRule rule{validConnect, output, fired, {}};
     for (const auto &name : dependency.inputChannels) {
       Value input = lookupPort(name + "_sink", Direction::In);
       if (!input || !hasValid(input)) {

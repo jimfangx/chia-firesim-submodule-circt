@@ -1,8 +1,9 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEFiredState.h"
+#include "goldengate/FAMEFiredRegister.h"
+#include "circt/Support/Namespace.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/APSInt.h"
-#include <map>
 #include <set>
 
 using namespace circt::firrtl;
@@ -26,10 +27,15 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
     FModuleOp module, llvm::ArrayRef<FAMEFiredChannel> channels,
     std::string &error) {
   Value hostClock, hostReset;
-  std::set<std::string> names;
+  circt::Namespace names;
+  std::set<std::string> reserved;
+  auto reserve = [&](StringRef name) {
+    if (!name.empty() && reserved.insert(name.str()).second)
+      names.newName(name);
+  };
   for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i) {
     auto name = module.getPortName(i);
-    names.insert(name.str());
+    reserve(name);
     if (module.getPortDirection(i) != Direction::In)
       continue;
     if (name == "hostClock")
@@ -44,16 +50,15 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
   }
 
   WireOp finishing;
-  std::map<std::string, RegResetOp> registers;
   module.walk([&](WireOp op) {
-    names.insert(op.getName().str());
     if (op.getName() == "targetCycleFinishing")
       finishing = op;
   });
-  module.walk([&](RegOp op) { names.insert(op.getName().str()); });
-  module.walk([&](RegResetOp op) {
-    names.insert(op.getName().str());
-    registers[op.getName().str()] = op;
+  // Include every named declaration, including nodes, memories and instances.
+  module.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name");
+        name && !name.getValue().empty())
+      reserve(name.getValue());
   });
   if (!finishing || !isBit(finishing.getResult())) {
     error = "missing one-bit targetCycleFinishing wire";
@@ -61,7 +66,14 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
   }
 
   std::set<std::string> seenChannels;
-  SmallVector<std::pair<std::string, bool>> toCreate;
+  FAMEFiredRegisterIndex registers;
+  if (failed(registers.collect(module, error)))
+    return failure();
+  struct Declaration {
+    std::string name, channel;
+    bool resetFired;
+  };
+  SmallVector<Declaration> toCreate;
   for (const auto &channel : channels) {
     if (!seenChannels.insert(channel.name).second) {
       error = "duplicate data channel " + channel.name;
@@ -80,28 +92,25 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
       return failure();
     }
 
-    auto fired = registers.find(channel.name + "_fired_0");
-    if (fired == registers.end())
-      fired = registers.find(channel.name + "_fired");
-    if (fired != registers.end()) {
-      auto resetValue = fired->second.getResetValue().getDefiningOp<ConstantOp>();
+    // Only explicitly identified host state may be reused. A target register
+    // with the historical fired name is still target state.
+    if (Value fired = registers.lookup(channel.name, false)) {
+      auto reg = fired.getDefiningOp<RegResetOp>();
+      auto resetValue = reg.getResetValue().getDefiningOp<ConstantOp>();
       unsigned expectedReset = channel.isInput && channel.hasClockDomain;
-      if (!isBit(fired->second.getResult()) ||
-          fired->second.getClockVal() != hostClock ||
-          fired->second.getResetSignal() != hostReset || !resetValue ||
+      if (!isBit(fired) ||
+          reg.getClockVal() != hostClock ||
+          reg.getResetSignal() != hostReset || !resetValue ||
           resetValue.getValue().getZExtValue() != expectedReset) {
         error = "invalid fired register clock or reset for " + channel.name;
         return failure();
       }
       continue;
     }
-    std::string newName = channel.name + "_fired_0";
-    if (names.count(newName) || names.count(channel.name + "_fired")) {
-      error = "fired register name is already in use for " + channel.name;
-      return failure();
-    }
-    names.insert(newName);
-    toCreate.push_back({std::move(newName),
+    // SFC genMetadata reserves a suggestion, then hostFlagReg uniques it again.
+    std::string suggestion = names.newName(channel.name + "_fired").str();
+    std::string newName = names.newName(suggestion).str();
+    toCreate.push_back({std::move(newName), channel.name,
                         channel.isInput && channel.hasClockDomain});
   }
 
@@ -110,13 +119,14 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
   OpBuilder connects(module.getContext());
   connects.setInsertionPointToEnd(module.getBodyBlock());
   auto bitType = UIntType::get(module.getContext(), 1, false);
-  for (const auto &[name, resetFired] : toCreate) {
+  for (const auto &[name, channel, resetFired] : toCreate) {
     Location loc = finishing.getLoc();
     Value resetValue = declarations.create<ConstantOp>(
         loc, bitType, APInt(1, resetFired ? 1 : 0)).getResult();
-    Value fired = declarations.create<RegResetOp>(
-        loc, bitType, hostClock, hostReset, resetValue, name).getResult();
-    connects.create<StrictConnectOp>(loc, fired, fired);
+    auto fired = declarations.create<RegResetOp>(
+        loc, bitType, hostClock, hostReset, resetValue, name);
+    fired->setAttr(fameFiredChannelAttr, declarations.getStringAttr(channel));
+    connects.create<StrictConnectOp>(loc, fired.getResult(), fired.getResult());
   }
   return success();
 }
@@ -134,10 +144,9 @@ LogicalResult goldengate::rewriteFAMEFiredStates(
     return failure();
   }
 
-  std::map<std::string, Value> firedRegisters;
-  module.walk([&](RegResetOp op) {
-    firedRegisters[op.getName().str()] = op.getResult();
-  });
+  FAMEFiredRegisterIndex firedRegisters;
+  if (failed(firedRegisters.collect(module, error)))
+    return failure();
   std::map<std::string, unsigned> ports;
   for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
     ports.emplace(module.getPortName(i).str(), i);
@@ -196,14 +205,12 @@ LogicalResult goldengate::rewriteFAMEFiredStates(
       error = "invalid FAME ready/valid fields for " + channel.name;
       return failure();
     }
-    auto fired = firedRegisters.find(channel.name + "_fired_0");
-    if (fired == firedRegisters.end())
-      fired = firedRegisters.find(channel.name + "_fired");
-    if (fired == firedRegisters.end() || !isBit(fired->second)) {
+    Value fired = firedRegisters.lookup(channel.name);
+    if (!fired || !isBit(fired) || !fired.getDefiningOp<RegResetOp>()) {
       error = "missing one-bit resettable fired register for " + channel.name;
       return failure();
     }
-    auto registerOp = fired->second.getDefiningOp<RegResetOp>();
+    auto registerOp = fired.getDefiningOp<RegResetOp>();
     if (registerOp.getClockVal() != hostClock ||
         registerOp.getResetSignal() != hostReset) {
       error = "fired register must use host clock and reset for " +
@@ -220,7 +227,7 @@ LogicalResult goldengate::rewriteFAMEFiredStates(
     Operation *firedConnect = nullptr;
     unsigned firedConnectCount = 0;
     auto inspectConnect = [&](Operation *op, Value destination) {
-      if (destination != fired->second)
+      if (destination != fired)
         return;
       ++firedConnectCount;
       if (firedConnectCount == 1)
@@ -236,7 +243,7 @@ LogicalResult goldengate::rewriteFAMEFiredStates(
       error = "fired register needs exactly one connect for " + channel.name;
       return failure();
     }
-    rules.push_back({firedConnect, fired->second, bundlePort,
+    rules.push_back({firedConnect, fired, bundlePort,
                      channel.clockDomainEnable});
   }
 

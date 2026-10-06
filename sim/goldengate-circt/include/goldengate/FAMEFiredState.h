@@ -18,8 +18,9 @@ struct FAMEFiredChannel {
 
 // Add missing fired registers to a decoupled model. Clocked input channels
 // reset fired, whereas outputs and virtual-clock channels reset unfired.
-// Existing registers must obey the same host clock/reset and initial-value
-// contract. A self-connect is added
+// Reuse only registers identified by goldengate.fameFiredChannel, checking the
+// same host clock/reset and initial-value contract. Allocate collision-free
+// names for new state and attach that identity. A self-connect is added
 // for each new register; rewriteFAMEFiredStates replaces its source.
 mlir::LogicalResult ensureFAMEFiredRegisters(
     circt::firrtl::FModuleOp module,
@@ -28,7 +29,8 @@ mlir::LogicalResult ensureFAMEFiredRegisters(
 // Required input invariants: the model has decoupled channel ports, a
 // targetCycleFinishing wire, and one host-clocked, one-bit fired register per
 // channel. The caller supplies each channel's resolved clock-domain enable.
-// Annotations consumed/produced: none.
+// Annotations consumed/produced: none. Generated registers carry the internal
+// goldengate.fameFiredChannel identity; legacy untagged boundaries are readable.
 // IR mutations: replace fired-register next-state connects with the FAME-1
 // token state transition after checking the SFC reset value. Virtual-clock
 // channels require a constant-one enable. Validate all channels before mutation.
