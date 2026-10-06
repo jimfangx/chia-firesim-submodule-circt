@@ -49,8 +49,9 @@ mlir::LogicalResult mapSimulationMasterControl(circt::firrtl::CircuitOp circuit,
 mlir::LogicalResult mapTSIBridgeControl(circt::firrtl::CircuitOp circuit,
                                       unsigned addressBits, unsigned idBits,
                                       std::string &error);
-// BlockDev's 26-word bank uses addr[6:2]. Indices 26..31 read word zero
-// without a lane read handshake and cannot commit writes (SFC MCRFile_3).
+// BlockDev derives transport size from its MMIO registry and validates bank
+// and wrapper lane types before mutation. Invalid reads alias word zero without
+// a lane handshake; invalid writes never commit, matching SFC MCRFile_3.
 mlir::LogicalResult mapBlockDevBridgeControl(circt::firrtl::CircuitOp circuit,
                                            unsigned addressBits, unsigned idBits,
                                            std::string &error);

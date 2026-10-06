@@ -377,18 +377,32 @@ LogicalResult goldengate::mapTSIBridgeControl(CircuitOp circuit,
       "GGTSIMCRFile", "tsiBridge_mcr", "tsiBridge_ctrl", error);
 }
 
-// Requires: uninstantiated GGBlockDevMMIOWrapper, 26 decoded UInt32 lanes,
-// host clock/reset and retained annotations. No additional analyses required.
+// Requires: uninstantiated GGBlockDevMMIOWrapper, a validated MMIO registry
+// with matching bank/wrapper UInt32 lanes, host clock/reset and annotations.
 // Consumes: blockdevBridge_mcr; references to its fields are rejected atomically.
 // Produces: no annotation classes; copied port targets transfer to the wrapper.
 // Mutates: adds FIRRTL MCRFile hardware and replaces the decoded bank with Nasti.
 // Preserves: inner modules, bank state and channel/clock/constructor metadata.
 // Output: independent AW/W capture, held response flags/IDs, live selected R
-// data and five-bit decode. Indices 26..31 read lane zero but cannot write.
+// data and registry-derived local decode. Invalid indices read lane zero
+// without a lane read handshake and cannot commit writes.
 // Platform slave binding and BlockDev timing remain separate transformations.
 LogicalResult goldengate::mapBlockDevBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
-  return mapBridgeControl(circuit, addressBits, idBits, 26,
+  ControlMMIOWidget registry;
+  const llvm::StringRef modules[]{"GGBlockDevMMIOBank"};
+  if (failed(deriveControlMMIOWidget(circuit, "BlockDevBridgeModule_0",
+          modules[0], modules, registry, error, Direction::Out)))
+    return failure();
+  if (registry.registerCount > std::numeric_limits<unsigned>::max()) {
+    error = "BlockDev register count exceeds the supported MCR lane count";
+    return failure();
+  }
+  // Widget.genCRFile sizes MCRFile from crRegistry.numRegs. Check the bank's
+  // registry and typed lanes first; the shared transport also checks the
+  // wrapper's bank type before any operation or annotation is changed.
+  return mapBridgeControl(circuit, addressBits, idBits,
+      static_cast<unsigned>(registry.registerCount),
       "GGBlockDevMMIOWrapper", "GGBlockDevBridgeControlWrapper",
       "GGBlockDevMCRFile", "blockdevBridge_mcr", "blockdevBridge_ctrl", error);
 }
