@@ -24,6 +24,9 @@ namespace goldengate {
 // Aggregate connects are indexed by leaf identity, reversing flipped fields.
 // Selected reads follow only the corresponding source field; overlapping
 // aggregate/leaf drivers remain blocked until last-connect normalization.
+// Inputs retain CheckCombLoops' breadth-first discovery order over named
+// electrical fields. Inline primitive expressions do not add graph depth;
+// instance output edges use the child's already simplified port ordering.
 struct LocalChannelDependency {
   std::string outputChannel;
   std::vector<std::string> inputChannels;

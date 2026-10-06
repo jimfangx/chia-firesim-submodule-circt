@@ -41,6 +41,70 @@ void expect(FModuleOp model, StringRef output, std::set<std::string> inputs) {
                                row->inputChannels.end()) == inputs,
           "wrong dependencies for " + output.str());
 }
+void expectOrder(FModuleOp model, StringRef output,
+                 std::vector<std::string> inputs) {
+  expect(model, output, {inputs.begin(), inputs.end()});
+  auto dependencies = analyze(model);
+  auto row = llvm::find_if(dependencies, [&](auto &d) {
+    return d.outputChannel == output;
+  });
+  require(row->inputChannels == inputs,
+          "wrong ordered dependencies for " + output.str());
+}
+void expectArbiter(FModuleOp model) {
+  expectOrder(model, "io_in_0_ready", {"io_out_ready"});
+  expectOrder(model, "io_in_1_ready", {"io_out_ready", "io_in_0_valid"});
+  expectOrder(model, "io_in_2_ready",
+              {"io_out_ready", "io_in_0_valid", "io_in_1_valid"});
+  expectOrder(model, "io_in_3_ready",
+              {"io_out_ready", "io_in_2_valid", "io_in_0_valid", "io_in_1_valid"});
+  expectOrder(model, "io_out_valid",
+              {"io_in_3_valid", "io_in_2_valid", "io_in_0_valid", "io_in_1_valid"});
+  for (auto &row : analyze(model)) {
+    if (!StringRef(row.outputChannel).ends_with("ready") &&
+        row.outputChannel != "io_out_valid")
+      continue;
+    llvm::outs() << model.getName() << ": " << row.outputChannel << " <- ";
+    llvm::interleaveComma(row.inputChannels, llvm::outs());
+    llvm::outs() << '\n';
+  }
+}
+// Unequal named-signal depths distinguish electrical BFS from both DFS and
+// breadth-first traversal of every primitive SSA operation. Also check a
+// duplicate input first encountered on a deeper path and hierarchical edges.
+void orderedSignals(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Child(in %deep: !firrtl.uint<1>,
+          in %direct: !firrtl.uint<1>, out %out: !firrtl.uint<1>) {
+        %alias = firrtl.node %deep : !firrtl.uint<1>
+        %sum = firrtl.and %alias, %direct : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
+        firrtl.strictconnect %out, %sum : !firrtl.uint<1>
+      }
+      firrtl.module @Model(in %deep: !firrtl.uint<1>,
+          in %direct: !firrtl.uint<1>, out %local: !firrtl.uint<1>,
+          out %duplicate: !firrtl.uint<1>, out %child: !firrtl.uint<1>) {
+        %alias = firrtl.node %deep : !firrtl.uint<1>
+        %one = firrtl.constant 1 : !firrtl.uint<1>
+        %inline = firrtl.and %direct, %one : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
+        %sum = firrtl.and %alias, %inline : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
+        firrtl.strictconnect %local, %sum : !firrtl.uint<1>
+        %again = firrtl.or %sum, %deep : (!firrtl.uint<1>, !firrtl.uint<1>) -> !firrtl.uint<1>
+        firrtl.strictconnect %duplicate, %again : !firrtl.uint<1>
+        %i_deep, %i_direct, %i_out = firrtl.instance i @Child(in deep: !firrtl.uint<1>, in direct: !firrtl.uint<1>, out out: !firrtl.uint<1>)
+        firrtl.strictconnect %i_deep, %deep : !firrtl.uint<1>
+        firrtl.strictconnect %i_direct, %direct : !firrtl.uint<1>
+        firrtl.strictconnect %child, %i_out : !firrtl.uint<1>
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "ordered signals fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *std::next(circuit.getOps<FModuleOp>().begin());
+  expectOrder(model, "local", {"direct", "deep"});
+  expectOrder(model, "duplicate", {"direct", "deep"});
+  expectOrder(model, "child", {"direct", "deep"});
+}
 void expectUserYanker(FModuleOp model) {
   for (StringRef field : {"source", "size"}) {
     std::set<std::string> inputs{"index"};
@@ -234,8 +298,8 @@ void selectedAggregateAliases(MLIRContext &context) {
   expect(model, "other", {"select", "unrelated"});
   auto dependencies = analyze(model);
   require(dependencies[1].inputChannels ==
-              std::vector<std::string>({"select", "address0", "address1"}),
-          "selected mux lost Scala operand traversal order");
+              std::vector<std::string>({"select", "address1", "address0"}),
+          "selected mux lost named-signal breadth-first order");
 }
 
 void selectedDynamicVector(MLIRContext &context) {
@@ -452,6 +516,7 @@ int main(int argc, char **argv) {
   try {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    orderedSignals(context);
     conditionalDrivers(context);
     repeatedDrivers(context);
     selectedMemoryData(context);
@@ -469,8 +534,10 @@ int main(int argc, char **argv) {
       auto circuit = *root->getOps<CircuitOp>().begin();
       FModuleOp opcodeProbe;
       FModuleOp userYankerProbe;
+      FModuleOp arbiter;
       for (auto candidate : circuit.getOps<FModuleOp>())
-        if (candidate.getName() == "OpcodeProbe") opcodeProbe = candidate;
+        if (candidate.getName() == "Arbiter4_DCacheDataReq") arbiter = candidate;
+        else if (candidate.getName() == "OpcodeProbe") opcodeProbe = candidate;
         else if (candidate.getName() == "UserYankerProbe")
           userYankerProbe = candidate;
       if (userYankerProbe) expectUserYanker(userYankerProbe);
@@ -486,7 +553,9 @@ int main(int argc, char **argv) {
       FModuleOp rfProbe;
       for (auto candidate : circuit.getOps<FModuleOp>())
         if (candidate.getName() == "RFReadProbe") rfProbe = candidate;
-      if (userYankerProbe) {
+      if (arbiter) {
+        expectArbiter(arbiter);
+      } else if (userYankerProbe) {
         expectUserYanker(userYankerProbe);
         llvm::outs() << "AXI4UserYanker lookup: source <- {index, source0..9}; "
                         "size <- {index, size0..9} before and after CIRCT "

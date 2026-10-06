@@ -120,7 +120,8 @@ fields from an aggregate mux. Before the fix it fails with
 `unresolved output alias: Model:undriven wire`: tracing the immediate subfield
 discarded the selected field ID before reaching its driver. Node and mux
 tracing now forwards the canonical field ID. The chosen read follows only
-the selector and its two address inputs, in Scala operand order. Selecting
+the selector and its two address inputs. Iteration 6 below corrects their
+order to Scala's named-signal breadth-first discovery order. Selecting
 the other field follows only the selector and the unrelated input, which
 also checks that memoization keeps the two field identities separate.
 
@@ -221,6 +222,64 @@ gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireS
 ```
 
 This establishes the internal lookup's field dependency boundary, not whole
-UserYanker behavior or complete FAME port parity. General SFC breadth-first
-dependency ordering remains the next small connectivity investigation; manager
+UserYanker behavior or complete FAME port parity. Manager
 compilation, Verilator metasimulation, and U250 gates remain harness-owned.
+
+
+The October 6 iteration 6 comparison copies `Arbiter4_DCacheDataReq` unchanged
+from the primary immutable `.sfc.fir` artifact's lines 83484–83516. A probe
+wrapper supplies a concrete UInt1 reset and connects its whole interface.
+The full extracted module, including its named grant nodes and conditional
+payload assignments, is ingested by the CIRCT tool and normalized by
+`normalizeFAMEInput` in the comparison test.
+
+The executable SFC 1.6.0 oracle compiles the same extraction with
+`LowFirrtlCompiler`, then runs `CheckCombLoops.analyze` on the arbiter. Its
+ordered ready/valid dependencies match the normalized CIRCT candidate exactly:
+
+```
+io_in_0_ready <- io_out_ready
+io_in_1_ready <- io_out_ready, io_in_0_valid
+io_in_2_ready <- io_out_ready, io_in_0_valid, io_in_1_valid
+io_in_3_ready <- io_out_ready, io_in_2_valid, io_in_0_valid, io_in_1_valid
+io_out_valid  <- io_in_3_valid, io_in_2_valid, io_in_0_valid, io_in_1_valid
+```
+
+The previous CIRCT tracer discovers inputs depth first, so it visits
+`io_in_0_valid` before `io_out_ready` for `io_in_1_ready`. A separate local
+binary using the unchanged pre-fix analysis fails that extracted boundary's
+ordered assertion. SFC `CheckCombLoops.scala` lines 122–125 flatten inline
+expressions into edges to reference vertices; named nodes and wires add graph
+vertices at lines 138–143. `DiGraph.scala` lines 162–175, 196–198, and 371–374
+preserve breadth-first discovery order when simplifying the graph to ports.
+`FAMETransform.scala` lines 311–319 retain that order in channel dependencies.
+
+The CIRCT tracer now records ordered `FieldRef` edges while tracing semantics,
+then searches named electrical fields breadth first. Inline primitives and
+selections are collapsed before enqueuing the next named fields; counting all
+SSA operations as vertices would incorrectly add graph depth. Child instance
+outputs use their child's simplified port order. Existing state boundaries,
+selected-field behavior, and explicit blockers remain covered by the tests.
+A local regression distinguishes named-signal breadth-first order from both
+DFS and SSA breadth-first order, and checks repeated input paths and hierarchy.
+The aggregate-memory regression now expects the shallower right-hand address
+before the left address reached through a node alias.
+
+Mutable artifacts are under `iteration6-ordered-dependencies/` in the U250
+generated-source tree: `ArbiterProbe.fir`, `Oracle.scala`, `sfc-ordered.log`,
+`candidate/input.mlir`, `normalized-arbiter.mlir`, `circt-ordered.log`,
+`comparison.log`, and `before-comparison.log`. Recheck the boundary with:
+
+```sh
+cd /scratch/jfx/fsim-circt/sims/firesim
+source ./sourceme-manager.sh --skip-ssh-setup
+gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config
+"$gg_generated/goldengate-circt-build/goldengate-comb-dependency-test" \
+  "$gg_generated/iteration6-ordered-dependencies/candidate/input.mlir" \
+  "$gg_generated/iteration6-ordered-dependencies/normalized-arbiter.mlir"
+```
+
+The matching boundary covers the arbiter's ordered ready/valid connectivity.
+It does not establish full FAME channel grouping or emitted output-valid logic
+parity. Those are the next small consumer comparisons; full transformed-Rocket
+verification remains harness-owned.

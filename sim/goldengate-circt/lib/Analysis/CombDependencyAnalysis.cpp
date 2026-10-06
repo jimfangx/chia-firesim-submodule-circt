@@ -18,7 +18,7 @@ using PortField = std::pair<unsigned, unsigned>;
 using ModulePortField = std::tuple<Operation *, unsigned, unsigned>;
 
 struct Trace {
-  // Keep the FIRRTL operand traversal order for Scala's ordered ccDeps.
+  // Input order follows CheckCombLoops' simplified named-signal graph.
   std::vector<PortField> inputPorts;
   std::set<std::string> blockers;
 };
@@ -52,9 +52,64 @@ private:
     DenseSet<circt::FieldRef> active;
     Trace result = traceValue(current, current.getBodyBlock()->getArgument(port),
                               active, fieldID);
+    orderInputs(current, current.getBodyBlock()->getArgument(port), fieldID, result);
     activePorts.erase(key);
     portCache.emplace(key, result);
     return result;
+  }
+
+  // CheckCombLoops creates vertices for declared electrical signals, while
+  // primitive expressions contribute ordered edges directly to their named
+  // references. Counting every SSA operation as a vertex would give casts and
+  // inline muxes extra depth, changing Scala's breadth-first port order.
+  static bool isNamedSignal(circt::FieldRef field) {
+    auto value = field.getValue();
+    if (isa<BlockArgument>(value))
+      return true;
+    auto *op = value.getDefiningOp();
+    return op && isa<NodeOp, WireOp, RegOp, RegResetOp, InstanceOp, MemOp,
+                     circt::chirrtl::MemoryPortOp>(op);
+  }
+
+  void orderInputs(FModuleOp current, Value value, unsigned fieldID,
+                   Trace &result) {
+    auto &graph = edges[current.getOperation()];
+    auto root = getFieldRefFromValue(value).getSubField(fieldID);
+    SmallVector<circt::FieldRef> queue{root};
+    DenseSet<circt::FieldRef> visited;
+    visited.insert(root);
+    std::vector<PortField> ordered;
+    for (size_t next = 0; next < queue.size(); ++next) {
+      // Expand each inline expression depth first, as getExprDeps does,
+      // before enqueuing its named references at the next graph depth.
+      DenseSet<circt::FieldRef> expressions;
+      auto enqueue = [&](auto &&self, circt::FieldRef field) -> void {
+        if (isNamedSignal(field)) {
+          if (!visited.insert(field).second)
+            return;
+          queue.push_back(field);
+          if (auto arg = dyn_cast<BlockArgument>(field.getValue());
+              arg && arg.getOwner() == current.getBodyBlock()) {
+            PortField input{arg.getArgNumber(), field.getFieldID()};
+            if (llvm::is_contained(result.inputPorts, input))
+              ordered.push_back(input);
+          }
+          return;
+        }
+        if (!expressions.insert(field).second)
+          return;
+        for (auto source : graph.lookup(field))
+          self(self, source);
+      };
+      // Enqueuing can grow queue; copy the current field before doing so.
+      auto field = queue[next];
+      for (auto source : graph.lookup(field))
+        enqueue(enqueue, source);
+    }
+    if (ordered.size() != result.inputPorts.size())
+      result.blockers.insert(current.getName().str() +
+                             ":incomplete dependency graph");
+    result.inputPorts = std::move(ordered);
   }
 
   void indexDrivers(FModuleOp current) {
@@ -127,6 +182,13 @@ private:
           result.inputPorts.push_back(input);
       result.blockers.insert(other.blockers.begin(), other.blockers.end());
     };
+    auto mergeSource = [&](Value source, unsigned sourceFieldID = 0) {
+      auto ref = getFieldRefFromValue(source).getSubField(sourceFieldID);
+      auto &sources = edges[current.getOperation()][fieldRef];
+      if (!llvm::is_contained(sources, ref))
+        sources.push_back(ref);
+      merge(traceValue(current, source, active, sourceFieldID));
+    };
     indexDrivers(current);
     auto &moduleDrivers = drivers[current.getOperation()];
     auto driver = moduleDrivers.find(fieldRef);
@@ -136,8 +198,7 @@ private:
             ":unresolved last-connect semantics; run FIRRTL ExpandWhens");
       else {
         auto source = driver->second.front();
-        merge(traceValue(current, source.getValue(), active,
-                         source.getFieldID()));
+        mergeSource(source.getValue(), source.getFieldID());
       }
     } else if (auto arg = dyn_cast<BlockArgument>(fieldRef.getValue())) {
       unsigned port = arg.getArgNumber();
@@ -162,8 +223,7 @@ private:
           result.blockers.insert(childTrace.blockers.begin(),
                                  childTrace.blockers.end());
           for (auto [inputPort, inputFieldID] : childTrace.inputPorts)
-            merge(traceValue(current, instance.getResult(inputPort), active,
-                             inputFieldID));
+            mergeSource(instance.getResult(inputPort), inputFieldID);
         } else if (auto external = dyn_cast<FExtModuleOp>(child->second.getOperation());
                    external && external.getDefname() == "plusarg_reader" &&
                    external.getNumPorts() == 1 &&
@@ -211,7 +271,7 @@ private:
             // presence or use-list order of SSA subfield operations.
             for (StringRef control : {"addr", "en"}) {
               if (auto index = type.getElementIndex(control))
-                merge(traceValue(current, port, active, type.getFieldID(*index)));
+                mergeSource(port, type.getFieldID(*index));
               else
                 result.blockers.insert(current.getName().str() +
                                        ":incomplete memory read port");
@@ -226,17 +286,14 @@ private:
         // Nodes preserve their input's aggregate layout. Forward the selected
         // field, rather than tracing the entire aggregate and losing the
         // individual field drivers (or adding unrelated input channels).
-        merge(traceValue(current, node.getInput(), active,
-                         fieldRef.getFieldID()));
+        mergeSource(node.getInput(), fieldRef.getFieldID());
       } else if (auto mux = dyn_cast<MuxPrimOp>(op)) {
         // A selected mux result depends on its condition and the matching
         // field of each arm. Static selections have already been folded into
         // fieldRef, so traversing the immediate SubfieldOp would discard them.
-        merge(traceValue(current, mux.getSel(), active));
-        merge(traceValue(current, mux.getHigh(), active,
-                         fieldRef.getFieldID()));
-        merge(traceValue(current, mux.getLow(), active,
-                         fieldRef.getFieldID()));
+        mergeSource(mux.getSel());
+        mergeSource(mux.getHigh(), fieldRef.getFieldID());
+        mergeSource(mux.getLow(), fieldRef.getFieldID());
       } else if (auto access = dyn_cast<SubaccessOp>(op)) {
         // Dynamic reads select the same relative field from every reachable
         // vector element. Tracing the whole vector loses its leaf drivers and
@@ -245,8 +302,8 @@ private:
         auto vector = access.getInput().getType().base();
         auto count = vector.getNumElements();
         auto traceElement = [&](unsigned index) {
-          merge(traceValue(current, access.getInput(), active,
-                           vector.getFieldID(index) + fieldRef.getFieldID()));
+          mergeSource(access.getInput(),
+                      vector.getFieldID(index) + fieldRef.getFieldID());
         };
         if (auto constant = access.getIndex().getDefiningOp<ConstantOp>()) {
           auto index = constant.getValue().getLimitedValue(count);
@@ -259,7 +316,7 @@ private:
           result.blockers.insert(current.getName().str() +
                                  ":zero-length vector selection");
         } else {
-          merge(traceValue(current, access.getIndex(), active));
+          mergeSource(access.getIndex());
           // A narrow index cannot select higher elements. Avoid dependencies
           // on unreachable fields even if they have no driver.
           auto width = access.getIndex().getType().base().getWidthOrSentinel();
@@ -290,7 +347,7 @@ private:
                                  ":written memory port");
         } else if (auto access = port.getAccess()) {
           if (isa<circt::chirrtl::CombMemOp>(port.getMemory().getDefiningOp()))
-            merge(traceValue(current, access.getIndex(), active));
+            mergeSource(access.getIndex());
           else if (!isa<circt::chirrtl::SeqMemOp>(
                        port.getMemory().getDefiningOp()))
             result.blockers.insert(current.getName().str() +
@@ -308,7 +365,7 @@ private:
         // Casts and primitive expressions depend on every operand. Aggregate
         // expressions without an explicit field connect remain conservative.
         for (Value operand : op->getOperands())
-          merge(traceValue(current, operand, active));
+          mergeSource(operand);
       }
     }
     active.erase(fieldRef);
@@ -324,6 +381,10 @@ private:
   // Module maps must retain stable references as tracing enters a child.
   std::map<Operation *,
            DenseMap<circt::FieldRef, SmallVector<circt::FieldRef>>> drivers;
+  // Ordered electrical edges, including temporary inline-expression edges
+  // which orderInputs collapses when constructing the named-signal BFS.
+  std::map<Operation *,
+           DenseMap<circt::FieldRef, SmallVector<circt::FieldRef>>> edges;
   std::map<Operation *, DenseMap<circt::FieldRef, Trace>> valueCache;
   std::map<ModulePortField, Trace> portCache;
   std::set<ModulePortField> activePorts;
