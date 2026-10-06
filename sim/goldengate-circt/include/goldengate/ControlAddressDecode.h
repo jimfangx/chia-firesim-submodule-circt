@@ -18,6 +18,14 @@ struct ControlMMIOWidget {
   uint64_t registerCount;
   std::optional<uint64_t> customSize = std::nullopt;
 };
+// Derive allocation from materialized register fragments before the combined
+// adapter exists. Require unique names, contiguous aligned offsets and valid
+// permissions; leave IR and result unchanged on failure. The result borrows
+// widgetName. Later call deriveControlMMIOWidget to validate the typed adapter
+// against the same registry before binding it to global dispatch.
+mlir::LogicalResult deriveControlMMIORegistry(circt::firrtl::CircuitOp circuit,
+    llvm::StringRef widgetName, llvm::ArrayRef<llvm::StringRef> registerModules,
+    ControlMMIOWidget &widget, std::string &error);
 // Read an already materialized widget's register registry from the named
 // FIRRTL modules (possibly sparse fragments, as for LoadMem). Requires unique
 // names, contiguous four-byte offsets and permissions, and an MCRFile whose

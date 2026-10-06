@@ -2646,11 +2646,25 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsBankAnnotations, error)))
         return fail("FASED statistics materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT FASED statistics bank before control allocation in " << fasedStatisticsBankPath << '\n';
-      // HasWidgets registration order remains independent of IR module order.
-      // Derive each available bank's size from its register registry and check
-      // it against the implemented MCR port. FASED, still assembled after
-      // global dispatch, retains its explicit declaration until its boundary
-      // can be moved ahead of allocation.
+      FModuleOp fasedHistogramsBank;
+      if (failed(goldengate::materializeFASEDHistograms(circuit, fasedHistogramsBank, error)))
+        return fail("FASED histogram materialization: " + error);
+      if (failed(mlir::verify(*module))) return fail("FASED histogram materialization produced invalid FIRRTL IR");
+      llvm::SmallString<256> fasedHistogramsBankPath(outputDir), fasedHistogramsBankAnnotations(outputDir);
+      llvm::sys::path::append(fasedHistogramsBankPath, "post-fame-fased-histograms-bank.mlir");
+      llvm::sys::path::append(fasedHistogramsBankAnnotations, "post-fame-fased-histograms-bank-all.json");
+      std::error_code fasedHistogramsBankError;
+      llvm::raw_fd_ostream fasedHistogramsBankOut(fasedHistogramsBankPath, fasedHistogramsBankError);
+      if (fasedHistogramsBankError) return fail("cannot write FASED histogram bank: " + fasedHistogramsBankError.message());
+      module->print(fasedHistogramsBankOut); fasedHistogramsBankOut << '\n'; fasedHistogramsBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsBankAnnotations, error)))
+        return fail("FASED histogram materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT FASED histogram bank before control allocation in " << fasedHistogramsBankPath << '\n';
+      // HasWidgets registration order is independent of IR module order. All
+      // FASED fragments now exist, so derive its size from their complete
+      // registry. Validate the assembled typed MCR port again before binding.
+      const llvm::StringRef fasedRegisterModules[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
+          "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"};
       SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
       auto appendBank = [&](StringRef name, StringRef mcr,
                             ArrayRef<StringRef> registers) {
@@ -2679,7 +2693,11 @@ int main(int argc, char **argv) {
       controlWidgets.push_back(blockDevWidget);
       if (failed(appendBank("UARTBridgeModule_0", "GGUARTMCRFile", {"GGUARTMMIOBank"})))
         return fail("control bank registry: " + error);
-      controlWidgets.push_back({"FASEDMemoryTimingModel_0", 21});
+      goldengate::ControlMMIOWidget fasedWidget;
+      if (failed(goldengate::deriveControlMMIORegistry(circuit, "FASEDMemoryTimingModel_0",
+              fasedRegisterModules, fasedWidget, error)))
+        return fail("FASED fragment register registry: " + error);
+      controlWidgets.push_back(fasedWidget);
       if (failed(appendBank("TracerVBridgeModule_0", "GGTracerVMCRFile", {"GGTracerVTriggerConfig"})))
         return fail("control bank registry: " + error);
       goldengate::ControlMMIOWidget tsiWidget;
@@ -3439,7 +3457,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsAnnotations, error)))
         return fail("FASED transaction and beat counters annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED target-clock transaction and beat counters and read-only MMIO in " << fasedStatisticsPath << '\n';
-      if (failed(goldengate::addFASEDHistograms(circuit, error)))
+      if (failed(goldengate::attachFASEDHistograms(circuit, fasedHistogramsBank, error)))
         return fail("FASED outstanding occupancy histograms: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED outstanding occupancy histograms produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedHistogramsPath(outputDir), fasedHistogramsAnnotations(outputDir);
@@ -3454,8 +3472,6 @@ int main(int argc, char **argv) {
       llvm::outs() << "Mapped CIRCT FASED target-clock occupancy histograms and read-only MMIO in " << fasedHistogramsPath << '\n';
       if (failed(goldengate::addFASEDMMIOBank(circuit, error)))
         return fail("FASED MMIO bank: " + error);
-      const llvm::StringRef fasedRegisterModules[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
-          "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"};
       if (failed(mlir::verify(*module))) return fail("FASED MMIO bank produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedMMIOPath(outputDir), fasedMMIOAnnotations(outputDir);
       llvm::sys::path::append(fasedMMIOPath, "post-fame-fased-mmio.mlir");

@@ -268,6 +268,18 @@ void registry(MLIRContext &context) {
     require(widget.name == "stream" && widget.registerCount == count && !widget.customSize,
         "live registry count or identity differs");
     require(printed(*root) == before, "registry query mutated IR");
+    // Allocation can query the complete fragments before the adapter exists.
+    // Removing the adapter must not change identity/count/IR; typed validation
+    // remains mandatory when the adapter is subsequently assembled.
+    named(c, "Adapter").erase();
+    auto withoutAdapter = printed(*root);
+    goldengate::ControlMMIOWidget early{"sentinel", 999, 8};
+    require(succeeded(goldengate::deriveControlMMIORegistry(c, "stream", modules, early, error)) &&
+        early.name == widget.name && early.registerCount == widget.registerCount && !early.customSize &&
+        printed(*root) == withoutAdapter, "early fragment allocation differs or mutated IR");
+    require(failed(goldengate::deriveControlMMIOWidget(c, "stream", "Adapter", modules, early, error)) &&
+        early.name == widget.name && early.registerCount == count && !early.customSize &&
+        printed(*root) == withoutAdapter, "missing late adapter accepted or changed result");
     // A growing stream bank moves ahead of its peer when rounded size grows.
     // At equal sizes it stays first, preserving registration order.
     const goldengate::ControlMMIOWidget widgets[]{widget, {"peer", 3}};
@@ -291,6 +303,17 @@ void registry(MLIRContext &context) {
         "Adapter", modules, widget, error)) && !error.empty(), "bad live registry accepted");
     require(widget.name == "sentinel" && widget.registerCount == 999 && widget.customSize == 8 &&
         printed(*root) == before, "failed registry query changed output or IR");
+    // Adapter faults do not affect the fragment registry; every fragment fault
+    // must still fail atomically before address allocation.
+    bool fragmentFault = fault < 13 || fault >= 20;
+    bool ok = succeeded(goldengate::deriveControlMMIORegistry(c,
+        fault == 24 ? "" : "stream", modules, widget, error));
+    require(ok == !fragmentFault, "early fragment validation differs");
+    require(printed(*root) == before, "early registry query mutated IR");
+    if (fragmentFault) require(widget.name == "sentinel" && widget.registerCount == 999 &&
+        widget.customSize == 8 && !error.empty(), "failed early query changed result");
+    else require(widget.name == "stream" && widget.registerCount == 9 && !widget.customSize,
+        "adapter-independent registry count differs");
   }
 }
 void mapping(MLIRContext &context) {

@@ -12,15 +12,15 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::deriveControlMMIOWidget(CircuitOp circuit,
-    StringRef widgetName, StringRef mcrModule, ArrayRef<StringRef> registerModules,
-    ControlMMIOWidget &widget, std::string &error, Direction mcrDirection) {
+LogicalResult goldengate::deriveControlMMIORegistry(CircuitOp circuit,
+    StringRef widgetName, ArrayRef<StringRef> registerModules,
+    ControlMMIOWidget &widget, std::string &error) {
   auto reject = [&](StringRef why) {
     error = "control widget '" + widgetName.str() + "': " + why.str();
     return failure();
   };
-  if (widgetName.empty() || mcrModule.empty() || registerModules.empty())
-    return reject("requires widget, MCRFile and register module identities");
+  if (widgetName.empty() || registerModules.empty())
+    return reject("requires widget and register module identities");
   auto find = [&](StringRef name) -> FModuleOp {
     for (auto module : circuit.getOps<FModuleOp>())
       if (module.getName() == name) return module;
@@ -52,6 +52,24 @@ LogicalResult goldengate::deriveControlMMIOWidget(CircuitOp circuit,
   uint64_t count = offsets.size();
   if (*offsets.begin() != 0 || *offsets.rbegin() / 4 != count - 1)
     return reject("register registry has missing words");
+  widget = {widgetName, count};
+  return success();
+}
+
+LogicalResult goldengate::deriveControlMMIOWidget(CircuitOp circuit,
+    StringRef widgetName, StringRef mcrModule, ArrayRef<StringRef> registerModules,
+    ControlMMIOWidget &widget, std::string &error, Direction mcrDirection) {
+  ControlMMIOWidget registry;
+  if (failed(deriveControlMMIORegistry(circuit, widgetName, registerModules, registry, error)))
+    return failure();
+  auto reject = [&](StringRef why) {
+    error = "control widget '" + widgetName.str() + "': " + why.str(); return failure();
+  };
+  auto find = [&](StringRef name) -> FModuleOp {
+    for (auto module : circuit.getOps<FModuleOp>()) if (module.getName()==name) return module;
+    return {};
+  };
+  uint64_t count=registry.registerCount;
   // Validate the implemented MCR bank, not just the collateral registry. This
   // catches a stale schema before it can change global region/slave allocation.
   auto adapter = find(mcrModule);
