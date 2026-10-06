@@ -4,6 +4,7 @@
 #include "goldengate/FAMEClockGate.h"
 #include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Dialect/HW/HWTypeInterfaces.h"
 #include "circt/Support/InstanceGraph.h"
 #include "circt/Support/Namespace.h"
@@ -598,20 +599,34 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
   // The enable register keeps the raw token; all other clock reads are gated.
   SmallVector<SubfieldOp> clockReads;
   if (channelized) {
-    auto rawBits = rawClockTokenBits.getDefiningOp<SubfieldOp>();
-    auto input = rawBits ? dyn_cast<BlockArgument>(rawBits.getInput())
-                         : BlockArgument();
-    if (!rawBits || rawBits.getFieldName() != "bits" || !input ||
+    // SFC replacePortRef selects bits for a scalar clock channel, or
+    // bits.<clock suffix> for a channel containing several clock ports.
+    // Resolve the leaf identity rather than the immediate selector parent:
+    // the rewrite and token construction can create separate bits trees.
+    Value root = rawClockTokenBits;
+    SubfieldOp outermost;
+    bool passivePath = true;
+    while (auto field = root.getDefiningOp<SubfieldOp>()) {
+      auto bundle = cast<BundleType>(field.getInput().getType());
+      passivePath &= !bundle.getElements()[field.getFieldIndex()].isFlip;
+      outermost = field;
+      root = field.getInput();
+    }
+    auto input = dyn_cast<BlockArgument>(root);
+    if (!outermost || outermost.getFieldName() != "bits" ||
+        !passivePath || !input ||
         input.getOwner() != model.getBodyBlock() ||
         model.getPortDirection(input.getArgNumber()) != Direction::In) {
-      error = "target clock token is not a model input bits field";
+      error = "target clock token is not a passive model input bits leaf";
       return failure();
     }
-    for (OpOperand &use : rawBits.getInput().getUses()) {
-      auto field = dyn_cast<SubfieldOp>(use.getOwner());
-      if (field && field != rawBits && field.getFieldName() == "bits")
+    auto clockRef = getFieldRefFromValue(rawClockTokenBits);
+    model.walk([&](SubfieldOp field) {
+      if (field.getResult() != rawClockTokenBits &&
+          isa<ClockType>(field.getType()) &&
+          getFieldRefFromValue(field.getResult()) == clockRef)
         clockReads.push_back(field);
-    }
+    });
     if (clockReads.empty()) {
       error = "channelized target clock has no model uses to gate";
       return failure();

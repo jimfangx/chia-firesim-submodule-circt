@@ -42,6 +42,9 @@ mlir::LogicalResult addFAMEClockEnable(circt::firrtl::FModuleOp model,
 // Instantiate the SFC abstract clock gate and replace model uses of the target
 // clock with its gated host clock output. When the clock is already a channel,
 // preserve the raw token bits used by the clock-enable register.
+// Accept a passive Clock leaf within the model input's bits payload. Match
+// replacement reads by CIRCT root/field identity across separate selector
+// trees; sibling clock leaves keep their independent tokens and target uses.
 // Reuse the circuit's compatible AbstractClockGate external definition,
 // preserving its annotations and symbols. Reject incompatible definitions
 // before mutation; every model/domain gets its own instance and CE operands.

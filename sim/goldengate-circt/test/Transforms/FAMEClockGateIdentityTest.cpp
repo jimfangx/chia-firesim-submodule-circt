@@ -12,6 +12,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
@@ -40,6 +41,10 @@ unsigned eval(Value value, const llvm::DenseMap<Value, unsigned> &values) {
     return eval(op.getLhs(), values) & eval(op.getRhs(), values);
   if (auto op = value.getDefiningOp<NotPrimOp>())
     return !eval(op.getInput(), values);
+  if (auto op = value.getDefiningOp<AsUIntPrimOp>())
+    return eval(op.getInput(), values);
+  if (auto op = value.getDefiningOp<MuxPrimOp>())
+    return eval(eval(op.getSel(), values) ? op.getHigh() : op.getLow(), values);
   throw std::runtime_error("unsupported CE expression");
 }
 void paths(CircuitOp circuit, StringRef prefix) {
@@ -232,6 +237,152 @@ void rejectedIdentities(MLIRContext &ctx) {
   }
   llvm::outs() << "Rejected eight invalid/missing identities and two invalid tokens without mutation\n";
 }
+void bundledDomains(MLIRContext &ctx, bool observations) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module { firrtl.circuit "Hub" {
+    firrtl.module @Hub(in %hostClock: !firrtl.clock,
+        in %hostReset: !firrtl.uint<1>,
+        in %bridge_clocks_sink: !firrtl.bundle<ready flip: uint<1>,
+            valid: uint<1>, bits: bundle<_0: clock, _1: clock>>) {
+      %done = firrtl.wire : !firrtl.uint<1>
+      %shared = firrtl.subfield %bridge_clocks_sink[bits] :
+          !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<_0: clock, _1: clock>>
+      %first = firrtl.subfield %shared[_0] : !firrtl.bundle<_0: clock, _1: clock>
+      %second = firrtl.subfield %shared[_1] : !firrtl.bundle<_0: clock, _1: clock>
+      %separate = firrtl.subfield %bridge_clocks_sink[bits] :
+          !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<_0: clock, _1: clock>>
+      %firstAgain = firrtl.subfield %separate[_0] : !firrtl.bundle<_0: clock, _1: clock>
+      %secondAgain = firrtl.subfield %separate[_1] : !firrtl.bundle<_0: clock, _1: clock>
+      %state0 = firrtl.reg %first : !firrtl.clock, !firrtl.uint<8>
+      %state1 = firrtl.reg %second : !firrtl.clock, !firrtl.uint<8>
+      %state0Again = firrtl.reg %firstAgain : !firrtl.clock, !firrtl.uint<8>
+      %state1Again = firrtl.reg %secondAgain : !firrtl.clock, !firrtl.uint<8>
+    }
+  } })mlir", &ctx);
+  require(bool(root), "bundled clock fixture parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  auto done = *model.getOps<WireOp>().begin();
+  done.setName("targetCycleFinishing");
+  auto shared = *model.getOps<SubfieldOp>().begin();
+  OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(model.getBodyBlock());
+  Value tokens[2];
+  const char *clocks[] = {"bridge_clocks_0", "bridge_clocks_1"};
+  for (unsigned i = 0; i < 2; ++i) {
+    // Token 0 shares the target selector's bits parent; token 1 uses a third
+    // selector tree. Canonical field identity must cover both shapes.
+    Value bits = i == 0 ? shared.getResult() :
+        b.create<SubfieldOp>(model.getLoc(), model.getArgument(2), "bits").getResult();
+    tokens[i] = b.create<SubfieldOp>(model.getLoc(), bits, i == 0 ? "_0" : "_1");
+    Value flag = b.create<AsUIntPrimOp>(model.getLoc(), tokens[i]);
+    std::string error;
+    require(succeeded(goldengate::addFAMEClockEnable(model, clocks[i], flag, error)), error);
+    require(succeeded(goldengate::addFAMEClockGate(circuit, model, clocks[i], error, tokens[i])), error);
+    // Constructing the first domain must preserve every second-domain clock.
+    if (i == 0)
+      for (auto state : model.getOps<RegOp>())
+        if (state.getName().starts_with("state1"))
+          require(state.getClockVal().getDefiningOp<SubfieldOp>().getFieldName() == "_1",
+                  "first gate changed a sibling clock leaf");
+  }
+  std::string error;
+  goldengate::FAMEClockGateIndex gates;
+  require(succeeded(gates.collect(model, error)), error);
+  for (auto state : model.getOps<RegOp>()) {
+    unsigned i = state.getName().starts_with("state0") ? 0 : 1;
+    require(state.getClockVal() == gates.lookup(clocks[i], false).getResult(2),
+            "bundled target state uses wrong domain gate");
+  }
+  for (unsigned mask = 0; mask < 64; ++mask) {
+    unsigned token0 = mask & 1, token1 = (mask >> 1) & 1;
+    unsigned en0 = (mask >> 2) & 1, en1 = (mask >> 3) & 1;
+    unsigned finishing = (mask >> 4) & 1, reset = (mask >> 5) & 1;
+    Value enables[] = {
+        goldengate::lookupFAMEClockEnable(model, clocks[0], error),
+        goldengate::lookupFAMEClockEnable(model, clocks[1], error)};
+    llvm::DenseMap<Value, unsigned> values{{tokens[0], token0}, {tokens[1], token1},
+        {enables[0], en0}, {enables[1], en1}, {done.getResult(), finishing}, {model.getArgument(1), reset}};
+    for (unsigned i = 0; i < 2; ++i) {
+      unsigned enabled = i == 0 ? en0 : en1, token = i == 0 ? token0 : token1;
+      auto reg = enables[i].getDefiningOp<RegResetOp>();
+      require(reg.getClockVal() == model.getArgument(0) &&
+                  reg.getResetSignal() == model.getArgument(1) &&
+                  reg.getResetValue().getDefiningOp<ConstantOp>().getValue().isZero(),
+              "bundled enable host clock/reset differs from SFC");
+      require(eval(driver(model, enables[i]), values) == (finishing ? token : enabled),
+              "bundled enable mux consumed wrong clock token");
+      require(eval(driver(model, gates.lookup(clocks[i]).getResult(1)), values) ==
+                  (enabled & finishing & !reset), "bundled gate CE differs from SFC");
+    }
+    if (observations)
+      llvm::outs() << "HUB " << mask << ' '
+                   << eval(driver(model, enables[0]), values) << ' '
+                   << eval(driver(model, enables[1]), values) << ' '
+                   << eval(driver(model, gates.lookup(clocks[0]).getResult(1)), values) << ' '
+                   << eval(driver(model, gates.lookup(clocks[1]).getResult(1)), values) << '\n';
+  }
+  paths(circuit, "shell/hub");
+  for (unsigned i = 0; i < 2; ++i)
+    require(succeeded(goldengate::addFAMEClockConstraint(circuit, model, clocks[i],
+                {i == 0 ? "domain0" : "domain1", 1, i + 2, i + 2}, error)), error);
+  // Operation identities and separate incoming tokens survive serialization.
+  root = parseSourceString<ModuleOp>(dump(*root), &ctx);
+  require(bool(root) && succeeded(verify(*root)), "bundled gates failed verification/serialization");
+  circuit = *root->getOps<CircuitOp>().begin();
+  require(succeeded(goldengate::specializeXilinxClockGates(circuit, error)), error);
+  auto output = xdc(circuit);
+  for (unsigned i = 0; i < 2; ++i) {
+    std::string name = i == 0 ? "domain0" : "domain1";
+    require(output.find("shell/hub/" + std::string(clocks[i]) + "_buffer/O") != std::string::npos &&
+                output.find("set_multicycle_path " + std::to_string(i + 2) +
+                    " -setup -from [get_clocks " + name + "]") != std::string::npos &&
+                output.find("set_multicycle_path " + std::to_string(i + 1) +
+                    " -hold  -from [get_clocks " + name + "]") != std::string::npos,
+            "bundled XDC uses wrong domain pin/MFMR");
+  }
+  require(clockLines(output).size() == 6, "bundled XDC lost a clock constraint");
+  llvm::outs() << "Matched 64 two-domain assignments (128 enable muxes and 128 CEs), four target clock uses and six XDC commands\n";
+}
+void rejectedBundledTokens(MLIRContext &ctx) {
+  for (unsigned mode = 0; mode < 5; ++mode) {
+    std::string direction = mode == 0 ? "out" : "in";
+    std::string field = mode == 1 ? "aux" : "bits";
+    std::string flipped = mode == 2 ? " flip" : "";
+    auto root = parseSourceString<ModuleOp>(
+        "module { firrtl.circuit \"Hub\" { firrtl.module @Hub("
+        "in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, " +
+        direction + " %sink: !firrtl.bundle<" + field +
+        ": bundle<_0" + flipped + ": clock, _1: clock>>) {"
+        "%done = firrtl.wire : !firrtl.uint<1> }"
+        "firrtl.module @Other(in %sink: !firrtl.bundle<bits: bundle<_0: clock, _1: clock>>) {} } }", &ctx);
+    require(bool(root), "invalid bundled token fixture parse");
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    auto model = *circuit.getOps<FModuleOp>().begin();
+    (*model.getOps<WireOp>().begin()).setName("targetCycleFinishing");
+    std::string error;
+    require(succeeded(goldengate::addFAMEClockEnable(model, "bridge_clocks_0", {}, error)), error);
+    OpBuilder b(&ctx);
+    b.setInsertionPointToEnd(model.getBodyBlock());
+    Value rawRoot = model.getArgument(2);
+    if (mode == 3) {
+      auto other = *std::next(circuit.getOps<FModuleOp>().begin());
+      b.setInsertionPointToEnd(other.getBodyBlock());
+      rawRoot = other.getArgument(0);
+    }
+    auto loc = model.getLoc();
+    Value bits = b.create<SubfieldOp>(loc, rawRoot, field);
+    Value raw = b.create<SubfieldOp>(loc, bits, "_0");
+    // Mode 4 has a genuine model clock read, but only for the sibling leaf.
+    // The first clock cannot claim that use as its own replacement read.
+    Value read = b.create<SubfieldOp>(loc, bits, mode == 4 ? "_1" : "_0");
+    b.create<RegOp>(loc, UIntType::get(&ctx, 8), read, "state");
+    auto before = dump(*root);
+    require(failed(goldengate::addFAMEClockGate(circuit, model,
+                "bridge_clocks_0", error, raw)) && dump(*root) == before,
+            "invalid bundled token mutated gate construction");
+  }
+  llvm::outs() << "Rejected output, non-bits, flipped, foreign-model and sibling-only bundled tokens without mutation\n";
+}
 void golden(MLIRContext &ctx, StringRef goldenXDC, StringRef goldenRTL) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module { firrtl.circuit "FireSim" {
     firrtl.module @FireSim(in %hostClock: !firrtl.clock,
@@ -368,10 +519,15 @@ int main(int argc, char **argv) {
     ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     collisions(ctx);
     rejectedIdentities(ctx);
-    if (argc == 3 && StringRef(argv[1]) == "--cli") cliBoundary(ctx, argv[2]);
-    else {
-      if (argc >= 3) golden(ctx, argv[1], argv[2]);
-      if (argc == 4) rocketBoundary(ctx, argv[3], argv[1]);
+    bool observations = argc == 2 && StringRef(argv[1]) == "--hub-observations";
+    bundledDomains(ctx, observations);
+    rejectedBundledTokens(ctx);
+    if (!observations) {
+      if (argc == 3 && StringRef(argv[1]) == "--cli") cliBoundary(ctx, argv[2]);
+      else {
+        if (argc >= 3) golden(ctx, argv[1], argv[2]);
+        if (argc == 4) rocketBoundary(ctx, argv[3], argv[1]);
+      }
     }
     return 0;
   } catch (const std::exception &e) {
