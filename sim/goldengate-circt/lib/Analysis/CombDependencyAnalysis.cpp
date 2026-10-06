@@ -37,6 +37,10 @@ public:
 
 private:
   Trace tracePort(FModuleOp current, unsigned port, unsigned fieldID) {
+    indexDrivers(current);
+    if (conditionalModules.contains(current.getOperation()))
+      return {{}, {current.getName().str() +
+                   ":unresolved when semantics; run FIRRTL ExpandWhens"}};
     ModulePortField key{current.getOperation(), port, fieldID};
     if (auto cached = portCache.find(key); cached != portCache.end())
       return cached->second;
@@ -53,6 +57,9 @@ private:
   void indexDrivers(FModuleOp current) {
     if (!indexed.insert(current.getOperation()).second)
       return;
+    current.walk([&](WhenOp) {
+      conditionalModules.insert(current.getOperation());
+    });
     current.walk([&](StrictConnectOp op) {
       drivers[current.getOperation()][getFieldRefFromValue(op.getDest())]
           .push_back(op.getSrc());
@@ -100,8 +107,11 @@ private:
     auto &moduleDrivers = drivers[current.getOperation()];
     auto driver = moduleDrivers.find(fieldRef);
     if (driver != moduleDrivers.end()) {
-      for (Value source : driver->second)
-        merge(traceValue(current, source, active));
+      if (driver->second.size() != 1)
+        result.blockers.insert(current.getName().str() +
+            ":unresolved last-connect semantics; run FIRRTL ExpandWhens");
+      else
+        merge(traceValue(current, driver->second.front(), active));
     } else if (auto arg = dyn_cast<BlockArgument>(fieldRef.getValue())) {
       unsigned port = arg.getArgNumber();
       if (arg.getOwner() == current.getBodyBlock() &&
@@ -225,6 +235,7 @@ private:
   FModuleOp module;
   std::map<std::string, FModuleLike> modules;
   DenseSet<Operation *> indexed;
+  DenseSet<Operation *> conditionalModules;
   // Module maps must retain stable references as tracing enters a child.
   std::map<Operation *, DenseMap<circt::FieldRef, SmallVector<Value>>> drivers;
   std::map<Operation *, DenseMap<circt::FieldRef, Trace>> valueCache;

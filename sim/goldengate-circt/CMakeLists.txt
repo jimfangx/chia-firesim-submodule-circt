@@ -170,6 +170,18 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-comb-dependency-test
+    test/Analysis/CombDependencyAnalysisTest.cpp
+    lib/Analysis/CombDependencyAnalysis.cpp lib/Transforms/LowerTypes.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-comb-dependency-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-comb-dependency-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-comb-dependency-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-comb-dependency-test PRIVATE
+    CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
+    MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-comb-dependency COMMAND goldengate-comb-dependency-test)
   add_executable(goldengate-trigger-wiring-test
     test/Transforms/TriggerWiringTest.cpp lib/Transforms/TriggerWiring.cpp
     lib/Transforms/LowerTypes.cpp lib/Support/TargetUtils.cpp)

@@ -829,9 +829,9 @@ int main(int argc, char **argv) {
       llvm::outs() << "Resolved CIRCT bridge clocks in "
                    << clockAnnotationPath << '\n';
     }
-    if (mlir::failed(goldengate::lowerTypesWithRetainedTargets(
+    if (mlir::failed(goldengate::normalizeFAMEInput(
             *module, circuit, error)))
-      return fail("retained annotation LowerTypes: " + error);
+      return fail("FAME input normalization: " + error);
     if (compileBaseline) {
       // SFC normalizes target resets before FAME introduces gated clocks.
       goldengate::coerceAsyncToSyncReset(circuit);

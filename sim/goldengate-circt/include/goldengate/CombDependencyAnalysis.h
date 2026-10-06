@@ -6,6 +6,11 @@
 #include <vector>
 
 namespace goldengate {
+// Requires: ground model ports and resolved FIRRTL when/last-connect semantics.
+// No annotations consumed/produced, IR mutation or analyses invalidated.
+// Reads FIRRTL field identities and hierarchy; rebuild after structural rewrites.
+// Unnormalized conditional modules or multiply driven combinational fields
+// produce explicit blockers, never an apparently complete dependency set.
 // A partial version of CheckCombLoops' port connectivity. An unresolved
 // output must never be treated as having no input dependencies: black boxes
 // and unsupported operations require further analysis. The known output-only

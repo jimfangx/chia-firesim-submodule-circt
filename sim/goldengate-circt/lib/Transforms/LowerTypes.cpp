@@ -474,3 +474,20 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                                                      rewritten));
   return success();
 }
+
+LogicalResult goldengate::normalizeFAMEInput(
+    ModuleOp module, CircuitOp circuit, std::string &error) {
+  if (failed(lowerTypesWithRetainedTargets(module, circuit, error)))
+    return failure();
+  // SFC's LowForm boundary resolves conditional and last-connect semantics
+  // before FAME computes channel connectivity. A connect inside a when is
+  // controlled by the predicate as well as its source. Let CIRCT build those
+  // muxes after ground lowering, including priority between repeated connects.
+  PassManager passes(module.getContext());
+  passes.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+  if (failed(passes.run(module))) {
+    error = "CIRCT FAME input ExpandWhens failed";
+    return failure();
+  }
+  return success();
+}

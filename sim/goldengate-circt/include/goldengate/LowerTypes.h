@@ -38,4 +38,14 @@ enum class RetainedTargetScope { All, FpgaDebugOnly };
 mlir::LogicalResult lowerTypesWithRetainedTargets(
     mlir::ModuleOp module, circt::firrtl::CircuitOp circuit,
     std::string &error, RetainedTargetScope scope = RetainedTargetScope::All);
+// Requires: fully initialized imported target FIRRTL and retained annotations.
+// Runs the ground-target transfer above followed by CIRCT ExpandWhens, matching
+// the Scala LowForm input to FAME. Conditional/last-connect drivers become
+// explicit muxes before FAME hierarchy and data dependencies are analyzed.
+// Consumes/produces annotations as above; ExpandWhens adds no GG annotations.
+// Mutates: FIRRTL types, conditional regions and connections. Preserves named
+// target identities/metadata; structural analyses must be rebuilt. No GG
+// analyses required. Output: ground ports, no whens, one final driver per field.
+mlir::LogicalResult normalizeFAMEInput(
+    mlir::ModuleOp module, circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
