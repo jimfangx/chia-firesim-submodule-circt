@@ -47,6 +47,8 @@ mlir::LogicalResult addFAMEClockEnable(circt::firrtl::FModuleOp model,
 // before mutation; every model/domain gets its own instance and CE operands.
 // Resolve buffered enables by fameClockEnable identity (legacy names only in
 // untagged transformed boundaries); require model host clock/reset and reset0.
+// Allocate the instance through the complete namespace and preserve its
+// original clock with fameClockGate identity for later XDC attachment.
 mlir::LogicalResult addFAMEClockGate(circt::firrtl::CircuitOp circuit,
                                      circt::firrtl::FModuleOp model,
                                      llvm::StringRef modelClockName,

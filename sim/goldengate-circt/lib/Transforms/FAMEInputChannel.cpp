@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEInputChannel.h"
 #include "goldengate/FAMEClockEnable.h"
+#include "goldengate/FAMEClockGate.h"
 #include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "circt/Dialect/HW/HWTypeInterfaces.h"
@@ -553,15 +554,26 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
     if (model.getPortName(i) == modelClockName)
       oldTargetClock = port;
   }
-  std::string bufferName = (modelClockName + "_buffer").str();
-  bool bufferNameTaken = false;
+  circt::Namespace names;
+  std::set<std::string> reserved;
+  for (auto port : model.getPorts())
+    reserved.insert(port.getName().str());
   model.walk([&](Operation *op) {
     if (auto wire = dyn_cast<WireOp>(op);
         wire && wire.getName() == "targetCycleFinishing")
       finishing = wire.getResult();
     if (auto name = op->getAttrOfType<StringAttr>("name"))
-      bufferNameTaken |= name.getValue() == bufferName;
+      reserved.insert(name.getValue().str());
   });
+  for (const auto &name : reserved)
+    names.newName(name);
+  FAMEClockGateIndex gates;
+  if (failed(gates.collect(model, error)))
+    return failure();
+  if (gates.lookup(modelClockName, false)) {
+    error = "target clock gate already exists for " + modelClockName.str();
+    return failure();
+  }
   FAMEClockEnableIndex enables;
   if (failed(enables.collect(model, error)))
     return failure();
@@ -576,10 +588,34 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
       (oldTargetClock && !isa<ClockType>(oldTargetClock.getType())) ||
       (channelized && !isa<ClockType>(rawClockTokenBits.getType())) ||
       !isBit(hostReset) ||
-      !isBit(finishing) || !isBit(enabled) || bufferNameTaken) {
+      !isBit(finishing) || !isBit(enabled) || modelClockName.empty()) {
     error = "target clock gate lacks the original/host clock, control "
-            "signals, or a unique instance name";
+            "signals, or clock identity";
     return failure();
+  }
+
+  // Validate channelized uses before creating the definition or instance.
+  // The enable register keeps the raw token; all other clock reads are gated.
+  SmallVector<SubfieldOp> clockReads;
+  if (channelized) {
+    auto rawBits = rawClockTokenBits.getDefiningOp<SubfieldOp>();
+    auto input = rawBits ? dyn_cast<BlockArgument>(rawBits.getInput())
+                         : BlockArgument();
+    if (!rawBits || rawBits.getFieldName() != "bits" || !input ||
+        input.getOwner() != model.getBodyBlock() ||
+        model.getPortDirection(input.getArgNumber()) != Direction::In) {
+      error = "target clock token is not a model input bits field";
+      return failure();
+    }
+    for (OpOperand &use : rawBits.getInput().getUses()) {
+      auto field = dyn_cast<SubfieldOp>(use.getOwner());
+      if (field && field != rawBits && field.getFieldName() == "bits")
+        clockReads.push_back(field);
+    }
+    if (clockReads.empty()) {
+      error = "channelized target clock has no model uses to gate";
+      return failure();
+    }
   }
   auto enableReg = enabled.getDefiningOp<RegResetOp>();
   auto resetValue = enableReg.getResetValue().getDefiningOp<ConstantOp>();
@@ -629,7 +665,11 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
   }
 
   OpBuilder declarations(&model.getBodyBlock()->front());
+  // SFC allocates the buffer once in the complete model namespace.
+  std::string bufferName = names.newName(modelClockName + "_buffer").str();
   auto buffer = declarations.create<InstanceOp>(loc, gate, bufferName);
+  buffer->setAttr(fameClockGateAttr,
+                  StringAttr::get(context, modelClockName));
   OpBuilder body(context);
   body.setInsertionPointToEnd(model.getBodyBlock());
   Value notReset = body.create<NotPrimOp>(loc, hostReset);
@@ -642,27 +682,8 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
   if (oldTargetClock) {
     oldTargetClock.replaceAllUsesWith(buffer.getResult(2));
   } else {
-    // Channelization has already replaced the scalar target clock with
-    // subfields of the token bundle. Keep the incoming token used for the
-    // enable register; gate all other reads of that clock.
-    auto rawBits = rawClockTokenBits.getDefiningOp<SubfieldOp>();
-    if (!rawBits || rawBits.getFieldName() != "bits" ||
-        !isa<BlockArgument>(rawBits.getInput())) {
-      error = "target clock token is not a model input bits field";
-      return failure();
-    }
-    bool replaced = false;
-    for (OpOperand &use : llvm::make_early_inc_range(rawBits.getInput().getUses())) {
-      auto field = dyn_cast<SubfieldOp>(use.getOwner());
-      if (!field || field == rawBits || field.getFieldName() != "bits")
-        continue;
+    for (auto field : clockReads)
       field.getResult().replaceAllUsesWith(buffer.getResult(2));
-      replaced = true;
-    }
-    if (!replaced) {
-      error = "channelized target clock has no model uses to gate";
-      return failure();
-    }
   }
   return success();
 }

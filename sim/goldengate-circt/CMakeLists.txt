@@ -471,6 +471,26 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-fame-clock-gate-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-clock-gate COMMAND goldengate-fame-clock-gate-test)
+  add_executable(goldengate-fame-clock-gate-identity-test
+    test/Transforms/FAMEClockGateIdentityTest.cpp
+    lib/Transforms/FAMEInputChannel.cpp lib/Support/XDCEmission.cpp
+    lib/Transforms/XilinxHostSpecialization.cpp)
+  target_compile_features(goldengate-fame-clock-gate-identity-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-clock-gate-identity-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-clock-gate-identity-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-clock-gate-identity-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-clock-gate-identity COMMAND goldengate-fame-clock-gate-identity-test)
+  add_test(NAME goldengate-fame-clock-gate-collision COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEClockGateCollision.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/clock-gate-collision
+    --rewrite-fame-output-valid-from ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.json)
+  add_test(NAME goldengate-fame-clock-gate-collision-check COMMAND goldengate-fame-clock-gate-identity-test
+    --cli ${CMAKE_CURRENT_BINARY_DIR}/clock-gate-collision/output-valid.mlir)
+  set_tests_properties(goldengate-fame-clock-gate-collision PROPERTIES FIXTURES_SETUP fame-clock-gate-collision)
+  set_tests_properties(goldengate-fame-clock-gate-collision-check PROPERTIES FIXTURES_REQUIRED fame-clock-gate-collision)
   add_test(NAME goldengate-fame-clock-enable-collision COMMAND goldengate-circt
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEClockEnableCollision.fir
     --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.anno.json

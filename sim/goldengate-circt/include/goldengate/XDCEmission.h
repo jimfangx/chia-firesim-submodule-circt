@@ -3,7 +3,9 @@
 #include "goldengate/ChannelAnalysis.h"
 #include <string>
 namespace goldengate {
-// FAMETransform's hub clock constraint, attached to a verified gate instance.
+// FAMETransform's hub clock constraint, attached to the actual gate instance
+// resolved by original clock identity. Legacy names are accepted only in
+// entirely untagged boundaries; final XDC follows the instance's current name.
 mlir::LogicalResult addFAMEClockConstraint(circt::firrtl::CircuitOp circuit,
                                    circt::firrtl::FModuleOp model,
                                    llvm::StringRef modelClockName,

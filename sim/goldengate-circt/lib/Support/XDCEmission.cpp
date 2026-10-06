@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // Oracles: FAMETransform clockMetadata, WriteXDCFile, XDCAnnotationConstants.
 #include "goldengate/XDCEmission.h"
+#include "goldengate/FAMEClockGate.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Support/InstanceGraph.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
@@ -116,10 +117,9 @@ LogicalResult goldengate::addFAMEClockConstraint(CircuitOp circuit,FModuleOp mod
   if(!raw||!model||model->getParentOp()!=circuit.getOperation()||clock.name.empty()||
      !clock.mfmr||clock.mfmr>uint64_t(std::numeric_limits<int64_t>::max()))
     return reject("FAME clock XDC requires retained annotations and analyzed clock metadata");
-  std::string gateName=(modelClockName+"_buffer").str(); InstanceOp gate;
-  for(auto i:model.getOps<InstanceOp>()) if(i.getName()==gateName) {
-    if(gate) return reject("FAME clock XDC gate is ambiguous");gate=i;
-  }
+  FAMEClockGateIndex gates;
+  if (failed(gates.collect(model, error))) return failure();
+  auto gate = gates.lookup(modelClockName);
   if(!gate||gate.getModuleName()!="AbstractClockGate"||gate.getNumResults()!=3||
      gate.getPortNameStr(2)!="O"||!isa<ClockType>(gate.getResult(2).getType()))
     return reject("FAME clock XDC requires the actual abstract gate output");
