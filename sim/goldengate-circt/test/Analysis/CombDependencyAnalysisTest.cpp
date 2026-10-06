@@ -41,6 +41,14 @@ void expect(FModuleOp model, StringRef output, std::set<std::string> inputs) {
                                row->inputChannels.end()) == inputs,
           "wrong dependencies for " + output.str());
 }
+void expectUserYanker(FModuleOp model) {
+  for (StringRef field : {"source", "size"}) {
+    std::set<std::string> inputs{"index"};
+    for (unsigned i = 0; i < 10; ++i)
+      inputs.insert(field.str() + std::to_string(i));
+    expect(model, field, inputs);
+  }
+}
 void conditionalDrivers(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Model" {
@@ -238,9 +246,9 @@ void selectedDynamicVector(MLIRContext &context) {
           in %b: !firrtl.uint<8>, in %unrelated: !firrtl.uint<8>,
           out %chosen: !firrtl.uint<8>, out %other: !firrtl.uint<8>,
           out %state: !firrtl.uint<8>) {
-        %values = firrtl.wire : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
-        %v0 = firrtl.subindex %values[0] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
-        %v1 = firrtl.subindex %values[1] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %source_values = firrtl.wire : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %v0 = firrtl.subindex %source_values[0] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        %v1 = firrtl.subindex %source_values[1] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
         %a_field = firrtl.subfield %v0[read] : !firrtl.bundle<read: uint<8>, other: uint<8>>
         %b_field = firrtl.subfield %v1[read] : !firrtl.bundle<read: uint<8>, other: uint<8>>
         %other0 = firrtl.subfield %v0[other] : !firrtl.bundle<read: uint<8>, other: uint<8>>
@@ -249,6 +257,8 @@ void selectedDynamicVector(MLIRContext &context) {
         firrtl.strictconnect %b_field, %b : !firrtl.uint<8>
         firrtl.strictconnect %other0, %unrelated : !firrtl.uint<8>
         firrtl.strictconnect %other1, %unrelated : !firrtl.uint<8>
+        %values = firrtl.wire : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
+        firrtl.strictconnect %values, %source_values : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
         %copy = firrtl.node %values : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>
         %selected = firrtl.subaccess %copy[%index] : !firrtl.vector<bundle<read: uint<8>, other: uint<8>>, 2>, !firrtl.uint<1>
         %read = firrtl.subfield %selected[read] : !firrtl.bundle<read: uint<8>, other: uint<8>>
@@ -284,6 +294,83 @@ void selectedDynamicVector(MLIRContext &context) {
   require(analyze(model).front().inputChannels ==
               std::vector<std::string>({"index", "b", "a"}),
           "dynamic vector dependencies differ after CIRCT normalization");
+}
+
+void aggregateConnections(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %index: !firrtl.uint<1>,
+          in %a: !firrtl.uint<4>, in %b: !firrtl.uint<4>,
+          in %reverse: !firrtl.uint<1>, in %override: !firrtl.uint<8>,
+          out %chosen: !firrtl.uint<8>, out %returned: !firrtl.uint<1>) {
+        %lhs = firrtl.wire : !firrtl.bundle<forward: bundle<bits: vector<uint<8>, 2>>, reverse flip: uint<1>>
+        %rhs = firrtl.wire : !firrtl.bundle<forward: bundle<bits: vector<uint<4>, 2>>, reverse flip: uint<1>>
+        %lhs_forward = firrtl.subfield %lhs[forward] : !firrtl.bundle<forward: bundle<bits: vector<uint<8>, 2>>, reverse flip: uint<1>>
+        %lhs_bits = firrtl.subfield %lhs_forward[bits] : !firrtl.bundle<bits: vector<uint<8>, 2>>
+        %lhs0 = firrtl.subindex %lhs_bits[0] : !firrtl.vector<uint<8>, 2>
+        %lhs_reverse = firrtl.subfield %lhs[reverse] : !firrtl.bundle<forward: bundle<bits: vector<uint<8>, 2>>, reverse flip: uint<1>>
+        %rhs_forward = firrtl.subfield %rhs[forward] : !firrtl.bundle<forward: bundle<bits: vector<uint<4>, 2>>, reverse flip: uint<1>>
+        %rhs_bits = firrtl.subfield %rhs_forward[bits] : !firrtl.bundle<bits: vector<uint<4>, 2>>
+        %rhs0 = firrtl.subindex %rhs_bits[0] : !firrtl.vector<uint<4>, 2>
+        %rhs1 = firrtl.subindex %rhs_bits[1] : !firrtl.vector<uint<4>, 2>
+        %rhs_reverse = firrtl.subfield %rhs[reverse] : !firrtl.bundle<forward: bundle<bits: vector<uint<4>, 2>>, reverse flip: uint<1>>
+        firrtl.strictconnect %rhs0, %a : !firrtl.uint<4>
+        firrtl.strictconnect %rhs1, %b : !firrtl.uint<4>
+        firrtl.strictconnect %lhs_reverse, %reverse : !firrtl.uint<1>
+        firrtl.connect %lhs, %rhs : !firrtl.bundle<forward: bundle<bits: vector<uint<8>, 2>>, reverse flip: uint<1>>, !firrtl.bundle<forward: bundle<bits: vector<uint<4>, 2>>, reverse flip: uint<1>>
+        %selected = firrtl.subaccess %lhs_bits[%index] : !firrtl.vector<uint<8>, 2>, !firrtl.uint<1>
+        firrtl.strictconnect %chosen, %selected : !firrtl.uint<8>
+        firrtl.strictconnect %returned, %rhs_reverse : !firrtl.uint<1>
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "aggregate connect fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  expect(model, "chosen", {"index", "a", "b"});
+  expect(model, "returned", {"reverse"});
+  // An individual-field override overlaps the whole-bundle driver. Do not
+  // manufacture a complete dependency set until ExpandWhens resolves priority.
+  OpBuilder builder(model.getBodyBlock(), model.getBodyBlock()->end());
+  Value lhs0;
+  // Locate the UInt8 field selected from the destination bundle.
+  for (auto op : model.getOps<SubindexOp>())
+    if (op.getType() == UIntType::get(&context, 8)) {
+      lhs0 = op.getResult();
+      break;
+    }
+  require(bool(lhs0), "missing aggregate override field");
+  builder.create<StrictConnectOp>(model.getLoc(), lhs0,
+                                  model.getBodyBlock()->getArgument(4));
+  auto dependencies = analyze(model);
+  require(llvm::any_of(dependencies.front().unresolvedCauses, [](auto &cause) {
+    return StringRef(cause).ends_with(
+        ":unresolved last-connect semantics; run FIRRTL ExpandWhens");
+  }), "aggregate/leaf overlap silently resolved priority");
+  expect(model, "returned", {"reverse"});
+  circuit->setAttr("rawAnnotations", builder.getArrayAttr({}));
+  std::string error;
+  require(succeeded(goldengate::normalizeFAMEInput(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "aggregate normalization invalid");
+  expect(model, "chosen", {"index", "b", "override"});
+  expect(model, "returned", {"reverse"});
+}
+
+void foreignConnections(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %a: i8, out %out: i8) {
+        firrtl.strictconnect %out, %a : i8
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "foreign connect fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto dependencies = analyze(*circuit.getOps<FModuleOp>().begin());
+  require(dependencies.size() == 1 &&
+      llvm::any_of(dependencies.front().unresolvedCauses, [](auto &cause) {
+        return StringRef(cause).ends_with(":unsupported foreign connect");
+      }), "foreign connect appeared fully analyzed");
 }
 
 void boundedDynamicVector(MLIRContext &context) {
@@ -370,6 +457,8 @@ int main(int argc, char **argv) {
     selectedMemoryData(context);
     selectedAggregateAliases(context);
     selectedDynamicVector(context);
+    aggregateConnections(context);
+    foreignConnections(context);
     boundedDynamicVector(context);
     asynchronousReadWrite(context);
     require(argc <= 3, "expected optional input MLIR and normalized output MLIR");
@@ -379,8 +468,12 @@ int main(int argc, char **argv) {
       require(bool(root), "golden module MLIR parse failed");
       auto circuit = *root->getOps<CircuitOp>().begin();
       FModuleOp opcodeProbe;
+      FModuleOp userYankerProbe;
       for (auto candidate : circuit.getOps<FModuleOp>())
         if (candidate.getName() == "OpcodeProbe") opcodeProbe = candidate;
+        else if (candidate.getName() == "UserYankerProbe")
+          userYankerProbe = candidate;
+      if (userYankerProbe) expectUserYanker(userYankerProbe);
       if (opcodeProbe) {
         unsigned dynamicReads = 0;
         opcodeProbe.walk([&](SubaccessOp) { ++dynamicReads; });
@@ -393,7 +486,12 @@ int main(int argc, char **argv) {
       FModuleOp rfProbe;
       for (auto candidate : circuit.getOps<FModuleOp>())
         if (candidate.getName() == "RFReadProbe") rfProbe = candidate;
-      if (opcodeProbe) {
+      if (userYankerProbe) {
+        expectUserYanker(userYankerProbe);
+        llvm::outs() << "AXI4UserYanker lookup: source <- {index, source0..9}; "
+                        "size <- {index, size0..9} before and after CIRCT "
+                        "FAME normalization; matched SFC RTL field isolation\n";
+      } else if (opcodeProbe) {
         expect(opcodeProbe, "out", {"index"});
         bool hasAccess = false;
         opcodeProbe.walk([&](SubaccessOp) { hasAccess = true; });

@@ -39,6 +39,8 @@ public:
 private:
   Trace tracePort(FModuleOp current, unsigned port, unsigned fieldID) {
     indexDrivers(current);
+    if (foreignConnectModules.contains(current.getOperation()))
+      return {{}, {current.getName().str() + ":unsupported foreign connect"}};
     if (conditionalModules.contains(current.getOperation()))
       return {{}, {current.getName().str() +
                    ":unresolved when semantics; run FIRRTL ExpandWhens"}};
@@ -61,13 +63,34 @@ private:
     current.walk([&](WhenOp) {
       conditionalModules.insert(current.getOperation());
     });
+    auto indexConnect = [&](Value dest, Value src) {
+      auto type = dyn_cast<FIRRTLType>(dest.getType());
+      if (!type) {
+        foreignConnectModules.insert(current.getOperation());
+        return;
+      }
+      auto destRef = getFieldRefFromValue(dest);
+      auto srcRef = getFieldRefFromValue(src);
+      // Legal FIRRTL connects have matching aggregate layouts, even when
+      // their ground widths differ. Project both ends to the same leaf ID.
+      // This also detects overlapping whole-bundle and individual-field
+      // assignments as multiple drivers, rather than silently preferring one.
+      walkGroundTypes(type,
+                      [&](uint64_t fieldID, FIRRTLBaseType, bool flipped) {
+        auto sink = destRef.getSubField(fieldID);
+        auto source = srcRef.getSubField(fieldID);
+        // ExpandConnects reverses the leaf assignment under a flipped field.
+        // StrictConnect is passive; ordinary Connect can contain flips.
+        if (flipped)
+          std::swap(sink, source);
+        drivers[current.getOperation()][sink].push_back(source);
+      });
+    };
     current.walk([&](StrictConnectOp op) {
-      drivers[current.getOperation()][getFieldRefFromValue(op.getDest())]
-          .push_back(op.getSrc());
+      indexConnect(op.getDest(), op.getSrc());
     });
     current.walk([&](ConnectOp op) {
-      drivers[current.getOperation()][getFieldRefFromValue(op.getDest())]
-          .push_back(op.getSrc());
+      indexConnect(op.getDest(), op.getSrc());
     });
   }
 
@@ -111,8 +134,11 @@ private:
       if (driver->second.size() != 1)
         result.blockers.insert(current.getName().str() +
             ":unresolved last-connect semantics; run FIRRTL ExpandWhens");
-      else
-        merge(traceValue(current, driver->second.front(), active));
+      else {
+        auto source = driver->second.front();
+        merge(traceValue(current, source.getValue(), active,
+                         source.getFieldID()));
+      }
     } else if (auto arg = dyn_cast<BlockArgument>(fieldRef.getValue())) {
       unsigned port = arg.getArgNumber();
       if (arg.getOwner() == current.getBodyBlock() &&
@@ -294,8 +320,10 @@ private:
   std::map<std::string, FModuleLike> modules;
   DenseSet<Operation *> indexed;
   DenseSet<Operation *> conditionalModules;
+  DenseSet<Operation *> foreignConnectModules;
   // Module maps must retain stable references as tracing enters a child.
-  std::map<Operation *, DenseMap<circt::FieldRef, SmallVector<Value>>> drivers;
+  std::map<Operation *,
+           DenseMap<circt::FieldRef, SmallVector<circt::FieldRef>>> drivers;
   std::map<Operation *, DenseMap<circt::FieldRef, Trace>> valueCache;
   std::map<ModulePortField, Trace> portCache;
   std::set<ModulePortField> activePorts;

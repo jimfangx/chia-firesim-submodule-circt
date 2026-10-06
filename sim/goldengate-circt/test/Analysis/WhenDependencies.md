@@ -165,6 +165,62 @@ visits the selector and then higher elements first, also visible in the golden
 RTL. This validates local expression order, not general graph-order parity:
 SFC `CheckCombLoops` additionally simplifies connectivity using breadth-first
 reachability, which remains a separate ordering question for deeper graphs.
-Whole-aggregate connects with selected child fields still require normalization
-before this tracer can resolve their individual drivers; the next small boundary
-is AXI4UserYanker's selected `tl_state.source` and `tl_state.size` fields.
+At that checkpoint, whole-aggregate connects still required normalization to
+resolve selected child-field drivers. The following comparison covers that gap.
+
+The October 6 iteration 5 comparison extracts AXI4UserYanker's response echo
+lookup. The same immutable compiler `.sfc.fir` lines 26572–26588 define
+`_r_bits_WIRE` and drive each vector element with a whole-bundle connection.
+Lines 26604–26605 dynamically select `tl_state.source` and `tl_state.size`.
+`UserYankerProbe` retains those statements verbatim and exposes the ten queue
+outputs for each field as ground inputs. It also retains the original invalid
+assignments for entries 10–15 from lines 26779–26845. Those entries become zero
+in the immutable U250 `design/FireSim-generated.sv` lines 57896–57901,
+57920–57925, and 58321–58322; they are not additional boundary inputs.
+
+RTL lines 57878–57925 construct separate source and size mux chains controlled
+by `auto_out_r_bits_id`. Lines 58321–58322 assign their results to the response
+echo fields. The imported and normalized candidate matches exactly:
+
+```
+source <- {index, source0, source1, ..., source9}
+size   <- {index, size0, size1, ..., size9}
+```
+
+Neither output depends on the other field's queue inputs. The unchanged
+extraction initially failed with
+`unresolved output source: UserYankerProbe:undriven wire`. Driver indexing now
+uses CIRCT `walkGroundTypes` to project each aggregate connection into leaf
+`FieldRef` pairs, preserving the source field ID when tracing a selected sink.
+Legal connect layouts have matching relative field IDs even when ground widths
+differ. Flipped leaves reverse the pair, following SFC 1.6.0 `ExpandConnects`;
+strict connects are passive. Overlapping aggregate/leaf assignments retain
+the unresolved last-connect blocker until `normalizeFAMEInput` resolves them.
+
+The C++ regression checks nested bundle/vector connections, passive strict
+vector connections, mixed-direction ordinary bundle connections with differing
+widths, isolated selected fields, and a leaf override before/after normalization.
+Foreign connections receive an explicit unsupported-module blocker rather than
+an invalid FIRRTL type cast. Three focused CTest cases passed:
+`goldengate-comb-dependency`, `goldengate-lower-types-targets`, and
+`goldengate-fame-output-selection`. Queue, RF, and opcode boundary comparisons
+also passed again with the modified tracer.
+
+Mutable artifacts are under the same generated-source tree's
+`iteration5-aggregate-dependencies/`: `UserYankerProbe.fir`, `annotations.json`,
+`candidate/input.mlir`, `normalized-user-yanker.mlir`, `before-test.log`,
+`comparison.log`, and `tests.log`. Recheck the boundary with:
+
+```sh
+cd /scratch/jfx/fsim-circt/sims/firesim
+source ./sourceme-manager.sh --skip-ssh-setup
+gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config
+"$gg_generated/goldengate-circt-build/goldengate-comb-dependency-test" \
+  "$gg_generated/iteration5-aggregate-dependencies/candidate/input.mlir" \
+  "$gg_generated/iteration5-aggregate-dependencies/normalized-user-yanker.mlir"
+```
+
+This establishes the internal lookup's field dependency boundary, not whole
+UserYanker behavior or complete FAME port parity. General SFC breadth-first
+dependency ordering remains the next small connectivity investigation; manager
+compilation, Verilator metasimulation, and U250 gates remain harness-owned.

@@ -21,6 +21,9 @@ namespace goldengate {
 // Dynamic vector reads follow the index and the same selected field of each
 // reachable element. Literal indices follow only that element; out-of-range
 // literal and zero-length selections produce blockers until normalized.
+// Aggregate connects are indexed by leaf identity, reversing flipped fields.
+// Selected reads follow only the corresponding source field; overlapping
+// aggregate/leaf drivers remain blocked until last-connect normalization.
 struct LocalChannelDependency {
   std::string outputChannel;
   std::vector<std::string> inputChannels;
