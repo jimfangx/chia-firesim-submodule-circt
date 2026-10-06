@@ -2550,6 +2550,29 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevBankAnnotations, error)))
         return fail("BlockDev MMIO materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT BlockDev MMIO bank before control allocation in " << blockDevBankPath << '\n';
+      // First FASED fragment: allocate its host register state independently
+      // of the later timing-model wrappers. Remaining fragments still attach late.
+      FModuleOp fasedLatencyBank;
+      if (failed(goldengate::materializeFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
+        return fail("FASED latency materialization: " + error);
+      if (failed(mlir::verify(*module)))
+        return fail("FASED latency materialization produced invalid FIRRTL IR");
+      goldengate::ControlMMIOWidget fasedLatencyWidget;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "FASED latency fragment",
+              fasedLatencyBank.getName(), {fasedLatencyBank.getName()}, fasedLatencyWidget,
+              error, Direction::Out)))
+        return fail("FASED latency register registry: " + error);
+      llvm::SmallString<256> fasedLatencyBankPath(outputDir), fasedLatencyBankAnnotations(outputDir);
+      llvm::sys::path::append(fasedLatencyBankPath, "post-fame-fased-latency-bank.mlir");
+      llvm::sys::path::append(fasedLatencyBankAnnotations, "post-fame-fased-latency-bank-all.json");
+      std::error_code fasedLatencyBankWriteError;
+      llvm::raw_fd_ostream fasedLatencyBankOut(fasedLatencyBankPath, fasedLatencyBankWriteError);
+      if (fasedLatencyBankWriteError)
+        return fail("cannot write FASED latency materialization: " + fasedLatencyBankWriteError.message());
+      module->print(fasedLatencyBankOut); fasedLatencyBankOut << '\n'; fasedLatencyBankOut.close();
+      if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyBankAnnotations, error)))
+        return fail("FASED latency materialization annotations: " + error);
+      llvm::outs() << "Materialized CIRCT FASED latency bank before control allocation in " << fasedLatencyBankPath << '\n';
       // HasWidgets registration order remains independent of IR module order.
       // Derive each available bank's size from its register registry and check
       // it against the implemented MCR port. FASED, still assembled after
@@ -3291,7 +3314,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsAnnotations, error)))
         return fail("FASED request limits annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock request-limit registers and admission binding in " << fasedRequestLimitsPath << '\n';
-      if (failed(goldengate::addFASEDLatencyRegisters(circuit, error)))
+      if (failed(goldengate::attachFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
         return fail("FASED latency registers: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED latency registers produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedLatencyRegistersPath(outputDir), fasedLatencyRegistersAnnotations(outputDir);
@@ -3358,6 +3381,8 @@ int main(int argc, char **argv) {
       llvm::outs() << "Mapped CIRCT FASED target-clock occupancy histograms and read-only MMIO in " << fasedHistogramsPath << '\n';
       if (failed(goldengate::addFASEDMMIOBank(circuit, error)))
         return fail("FASED MMIO bank: " + error);
+      const llvm::StringRef fasedRegisterModules[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
+          "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"};
       if (failed(mlir::verify(*module))) return fail("FASED MMIO bank produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedMMIOPath(outputDir), fasedMMIOAnnotations(outputDir);
       llvm::sys::path::append(fasedMMIOPath, "post-fame-fased-mmio.mlir");
@@ -3371,6 +3396,16 @@ int main(int argc, char **argv) {
       llvm::outs() << "Assembled CIRCT FASED 21-word MMIO bank in " << fasedMMIOPath << '\n';
       if (failed(goldengate::mapFASEDBridgeControl(circuit, 25, 12, error)))
         return fail("FASED MCRFile control: " + error);
+      goldengate::ControlMMIOWidget mappedFASED;
+      if (failed(goldengate::deriveControlMMIOWidget(circuit, "FASEDMemoryTimingModel_0",
+              "GGFASEDMCRFile", fasedRegisterModules, mappedFASED, error)))
+        return fail("FASED adapter register registry: " + error);
+      auto allocatedFASED = llvm::find_if(controlWidgets, [](const auto &widget) {
+        return widget.name == "FASEDMemoryTimingModel_0";
+      });
+      if (allocatedFASED == controlWidgets.end() ||
+          mappedFASED.registerCount != allocatedFASED->registerCount)
+        return fail("FASED adapter and fragment registry word count differs from the allocated widget");
       if (failed(mlir::verify(*module))) return fail("FASED MCRFile control produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedControlPath(outputDir), fasedControlAnnotations(outputDir);
       llvm::sys::path::append(fasedControlPath, "post-fame-fased-control.mlir");

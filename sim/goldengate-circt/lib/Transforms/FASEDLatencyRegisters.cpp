@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // Oracle: LatencyPipeMMRegIO, Widget.attachIO/genAndAttachReg, MCRIO.bindReg.
-// Requires: uninstantiated GGFASEDRequestLimitsWrapper, host clock/reset,
+// Materialization requires a free bank symbol and preserves top identity/annotations.
+// Attachment requires an uninstantiated GGFASEDRequestLimitsWrapper, host clock/reset,
 // 32-bit latency inputs and the retained recorded ten-flight bridge profile.
 // Consumes/produces annotations: none; preserves and explicitly retargets all.
 // IR mutations: two host-clocked reset registers, a decoded MCR fragment for
@@ -15,17 +16,34 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addFASEDLatencyRegisters(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral bankName = "GGFASEDLatencyRegisters";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDLatencyRegistersWrapper";
-  constexpr llvm::StringLiteral controlName = "fased_latency_mcr";
+namespace {
+constexpr llvm::StringLiteral bankName = "GGFASEDLatencyRegisters";
+constexpr llvm::StringLiteral wrapperName = "GGFASEDLatencyRegistersWrapper";
+constexpr llvm::StringLiteral controlName = "fased_latency_mcr";
+SmallVector<PortInfo> latencyPorts(MLIRContext *ctx) {
+  OpBuilder b(ctx);
+  auto u = [&](unsigned w) { return UIntType::get(ctx, w, false); };
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, u(1)},
+      {b.getStringAttr("valid"), false, u(1)}, {b.getStringAttr("bits"), false, u(32)}});
+  auto words = FVectorType::get(token, 2);
+  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, u(4)}});
+  auto latencies = BundleType::get(ctx, {{b.getStringAttr("write"), false, u(32)},
+      {b.getStringAttr("read"), false, u(32)}});
+  return {{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+      {b.getStringAttr("reset"), u(1), Direction::In},
+      {b.getStringAttr("latencies"), latencies, Direction::Out},
+      {b.getStringAttr("mcr"), mcr, Direction::Out}};
+}
+LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
+    unsigned (&indices)[4], std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != "GGFASEDRequestLimitsWrapper")
     return reject("FASED latency registers require the active request limit wrapper");
-  FModuleOp inner, engine;
+  FModuleOp engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
-      return reject("FASED latency register module or wrapper already exists");
+    if (m.getName() == wrapperName)
+      return reject("FASED latency register wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
   }
@@ -36,15 +54,9 @@ LogicalResult goldengate::addFASEDLatencyRegisters(CircuitOp circuit, std::strin
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
   if (!flight || flight.getInt() != 10)
     return reject("FASED latency registers currently require the recorded ten-flight constructor");
-  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto *ctx = circuit.getContext();
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);
-  auto token = [&](FIRRTLBaseType payload) {
-    return BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
-        {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
-  };
-  auto latencies = BundleType::get(ctx, {{b.getStringAttr("write"), false, uint(32)},
-      {b.getStringAttr("read"), false, uint(32)}});
   std::optional<unsigned> clock, reset, writeLatency, readLatency;
   for (auto [i, port] : llvm::enumerate(inner.getPorts())) {
     if (port.name == controlName) return reject("FASED latency register MCR port already exists");
@@ -59,15 +71,23 @@ LogicalResult goldengate::addFASEDLatencyRegisters(CircuitOp circuit, std::strin
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("FASED latency registers need an uninstantiated top");
 
-  // Preflight is complete. Local lanes 0/1 map to global words 0/1 (0/4 bytes).
-  auto words = FVectorType::get(token(uint(32)), 2);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  indices[0] = *clock; indices[1] = *reset;
+  indices[2] = *writeLatency; indices[3] = *readLatency;
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::materializeFASEDLatencyRegisters(CircuitOp circuit,
+    FModuleOp &result, std::string &error) {
+  for (auto module : circuit.getOps<FModuleLike>())
+    if (module.getName() == bankName) {
+      error = "FASED latency register module already exists";
+      return failure();
+    }
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1); auto bankPorts = latencyPorts(ctx);
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-      {b.getStringAttr("reset"), bit, Direction::In},
-      {b.getStringAttr("latencies"), latencies, Direction::Out},
-      {b.getStringAttr("mcr"), mcr, Direction::Out}};
   auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName),
       ConventionAttr::get(ctx, Convention::Internal), bankPorts);
   const llvm::StringRef names[]{"writeLatency", "readLatency"};
@@ -95,6 +115,34 @@ LogicalResult goldengate::addFASEDLatencyRegisters(CircuitOp circuit, std::strin
     connect(field(read, "valid"), one); connect(field(write, "ready"), one);
     connect(field(arg(2), i == 0 ? "write" : "read"), reg);
   }
+
+  result = bank;
+  return success();
+}
+
+LogicalResult goldengate::attachFASEDLatencyRegisters(CircuitOp circuit,
+    FModuleOp bank, std::string &error) {
+  FModuleOp inner; unsigned indices[4];
+  if (failed(attachmentTop(circuit, inner, indices, error))) return failure();
+  auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
+  if (!bank || bank->getParentOp() != circuit.getOperation() || bank.getName() != bankName)
+    return reject("FASED latency attachment requires its materialized bank in this circuit");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto expected = latencyPorts(ctx); auto actual = bank.getPorts();
+  if (actual.size() != expected.size()) return reject("FASED latency bank needs exactly four ports");
+  for (auto [i, port] : llvm::enumerate(actual))
+    if (port.name != expected[i].name || port.type != expected[i].type ||
+        port.direction != expected[i].direction)
+      return reject("FASED latency bank ports differ from the clock/reset/full-width latency/two-word MCR boundary");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+  if (used) return reject("FASED latency attachment requires an uninstantiated bank");
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto mcr = expected[3].type;
+  std::optional<unsigned> clock = indices[0], reset = indices[1],
+      writeLatency = indices[2], readLatency = indices[3];
+  auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
+  auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, port] : llvm::enumerate(inner.getPorts())) if (i != *writeLatency && i != *readLatency) {
@@ -138,4 +186,11 @@ LogicalResult goldengate::addFASEDLatencyRegisters(CircuitOp circuit, std::strin
   };
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+LogicalResult goldengate::addFASEDLatencyRegisters(CircuitOp circuit, std::string &error) {
+  FModuleOp inner, bank; unsigned indices[4];
+  if (failed(attachmentTop(circuit, inner, indices, error)) ||
+      failed(materializeFASEDLatencyRegisters(circuit, bank, error))) return failure();
+  return attachFASEDLatencyRegisters(circuit, bank, error);
 }

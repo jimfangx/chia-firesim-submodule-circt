@@ -772,7 +772,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-functional-model-register COMMAND goldengate-fased-functional-model-register-test)
   add_executable(goldengate-fased-latency-registers-test
-    test/Transforms/FASEDLatencyRegistersTest.cpp lib/Transforms/FASEDLatencyRegisters.cpp)
+    test/Transforms/FASEDLatencyRegistersTest.cpp lib/Transforms/FASEDLatencyRegisters.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-fased-latency-registers-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-latency-registers-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-latency-registers-test PRIVATE
