@@ -113,6 +113,93 @@ void expectUserYanker(FModuleOp model) {
     expect(model, field, inputs);
   }
 }
+// Native aggregate construction must preserve the selected leaf just like
+// the equivalent FIRRTL aggregate connects. Include nested vector/bundle
+// selection, a dynamic read, and a grouped output whose dependency is a union.
+void constructedAggregates(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %index: !firrtl.uint<1>,
+          in %size0: !firrtl.uint<4>, in %source0: !firrtl.uint<4>,
+          in %size1: !firrtl.uint<4>, in %source1: !firrtl.uint<4>,
+          out %size: !firrtl.uint<4>, out %source: !firrtl.uint<4>,
+          out %fixed: !firrtl.uint<4>) {
+        %entry0 = firrtl.bundlecreate %size0, %source0 : (!firrtl.uint<4>, !firrtl.uint<4>) -> !firrtl.bundle<size: uint<4>, source: uint<4>>
+        %entry1 = firrtl.bundlecreate %size1, %source1 : (!firrtl.uint<4>, !firrtl.uint<4>) -> !firrtl.bundle<size: uint<4>, source: uint<4>>
+        %vector = firrtl.vectorcreate %entry0, %entry1 : (!firrtl.bundle<size: uint<4>, source: uint<4>>, !firrtl.bundle<size: uint<4>, source: uint<4>>) -> !firrtl.vector<bundle<size: uint<4>, source: uint<4>>, 2>
+        %wrapped = firrtl.bundlecreate %vector : (!firrtl.vector<bundle<size: uint<4>, source: uint<4>>, 2>) -> !firrtl.bundle<entries: vector<bundle<size: uint<4>, source: uint<4>>, 2>>
+        %entries = firrtl.subfield %wrapped[entries] : !firrtl.bundle<entries: vector<bundle<size: uint<4>, source: uint<4>>, 2>>
+        %chosen = firrtl.subaccess %entries[%index] : !firrtl.vector<bundle<size: uint<4>, source: uint<4>>, 2>, !firrtl.uint<1>
+        %size_value = firrtl.subfield %chosen[size] : !firrtl.bundle<size: uint<4>, source: uint<4>>
+        %source_value = firrtl.subfield %chosen[source] : !firrtl.bundle<size: uint<4>, source: uint<4>>
+        firrtl.strictconnect %size, %size_value : !firrtl.uint<4>
+        firrtl.strictconnect %source, %source_value : !firrtl.uint<4>
+        %second = firrtl.subindex %entries[1] : !firrtl.vector<bundle<size: uint<4>, source: uint<4>>, 2>
+        %fixed_value = firrtl.subfield %second[source] : !firrtl.bundle<size: uint<4>, source: uint<4>>
+        firrtl.strictconnect %fixed, %fixed_value : !firrtl.uint<4>
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "constructed aggregate fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  expectOrder(model, "size", {"index", "size1", "size0"});
+  expectOrder(model, "source", {"index", "source1", "source0"});
+  expect(model, "fixed", {"source1"});
+  goldengate::ModelPortGroup input{"request", model, Direction::In,
+                                    std::nullopt, {0, 2, 4}};
+  goldengate::ModelPortGroup output{"response", model, Direction::Out,
+                                     std::nullopt, {6, 7}};
+  auto grouped = goldengate::analyzeLocalChannelDependencies(
+      model, {{"request", &input, {}, input.ports},
+              {"response", &output, {}, output.ports}});
+  require(grouped.size() == 1 && grouped.front().inputChannels ==
+              std::vector<std::string>{"request"} &&
+              grouped.front().unresolvedCauses.empty(),
+          "constructed aggregate lost or repeated a grouped input dependency");
+}
+// Re-express the extracted SFC UserYanker vector's whole-element connects as
+// native constructors. Preserve the source leaves and named vector boundary;
+// this changes the CIRCT representation, not the selected echo function.
+void constructUserYankerVector(FModuleOp model) {
+  WireOp wire;
+  for (auto candidate : model.getOps<WireOp>())
+    if (candidate.getName() == "_r_bits_WIRE") wire = candidate;
+  require(bool(wire), "missing extracted UserYanker vector");
+  auto type = cast<FVectorType>(wire.getResult().getType());
+  SmallVector<Value> elements(type.getNumElements());
+  SmallVector<Operation *> connects;
+  model.walk([&](StrictConnectOp connect) {
+    auto selection = connect.getDest().getDefiningOp<SubindexOp>();
+    if (selection && selection.getInput() == wire.getResult()) {
+      require(!elements[selection.getIndex()], "duplicate extracted vector element");
+      elements[selection.getIndex()] = connect.getSrc();
+      connects.push_back(connect);
+    }
+  });
+  require(connects.size() == elements.size(), "incomplete extracted vector connects");
+  // All original element sources precede the vector declaration. Rebuild
+  // there so the constructor node dominates every original vector selection.
+  OpBuilder b(wire.getOperation());
+  auto rebuild = [&](auto &&self, Value value) -> Value {
+    if (auto bundle = dyn_cast<BundleType>(value.getType())) {
+      SmallVector<Value> fields;
+      for (auto element : bundle.getElements()) {
+        Value field = b.create<SubfieldOp>(model.getLoc(), value,
+                                           element.name.getValue());
+        fields.push_back(self(self, field));
+      }
+      return b.create<BundleCreateOp>(model.getLoc(), bundle, fields).getResult();
+    }
+    return value;
+  };
+  for (auto &element : elements) element = rebuild(rebuild, element);
+  Value value = b.create<VectorCreateOp>(model.getLoc(), type, elements);
+  value = b.create<NodeOp>(model.getLoc(), value, wire.getName()).getResult();
+  for (auto *connect : connects) connect->erase();
+  wire.getResult().replaceAllUsesWith(value);
+  wire.erase();
+}
 void conditionalDrivers(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Model" {
@@ -517,6 +604,7 @@ int main(int argc, char **argv) {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     orderedSignals(context);
+    constructedAggregates(context);
     conditionalDrivers(context);
     repeatedDrivers(context);
     selectedMemoryData(context);
@@ -526,7 +614,7 @@ int main(int argc, char **argv) {
     foreignConnections(context);
     boundedDynamicVector(context);
     asynchronousReadWrite(context);
-    require(argc <= 3, "expected optional input MLIR and normalized output MLIR");
+    require(argc <= 4, "expected input MLIR, normalized output, optional constructed output");
     if (argc >= 2) {
       // Optional immutable Rocket extraction, normalized by the real tool.
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
@@ -541,6 +629,24 @@ int main(int argc, char **argv) {
         else if (candidate.getName() == "UserYankerProbe")
           userYankerProbe = candidate;
       if (userYankerProbe) expectUserYanker(userYankerProbe);
+      if (argc == 4) {
+        require(bool(userYankerProbe), "constructor comparison needs UserYanker extraction");
+        constructUserYankerVector(userYankerProbe);
+        require(succeeded(verify(*root)), "constructed UserYanker candidate invalid");
+        expectUserYanker(userYankerProbe);
+        for (const auto &row : analyze(userYankerProbe)) {
+          llvm::outs() << "constructed " << row.outputChannel << " <- ";
+          llvm::interleaveComma(row.inputChannels, llvm::outs());
+          llvm::outs() << '\n';
+        }
+        std::error_code ec;
+        llvm::raw_fd_ostream out(argv[3], ec);
+        require(!ec, "cannot write constructed candidate: " + ec.message());
+        root->print(out);
+        out << '\n';
+        llvm::outs() << "Native bundle/vector constructors match the extracted "
+                        "UserYanker source/size dependency sets\n";
+      }
       if (opcodeProbe) {
         unsigned dynamicReads = 0;
         opcodeProbe.walk([&](SubaccessOp) { ++dynamicReads; });
@@ -607,7 +713,7 @@ int main(int argc, char **argv) {
                         "enqueue field, including through the probe instance; "
                         "matched SFC RTL\n";
       }
-      if (argc == 3) {
+      if (argc >= 3) {
         std::error_code ec;
         llvm::raw_fd_ostream out(argv[2], ec);
         require(!ec, "cannot write normalized golden MLIR: " + ec.message());

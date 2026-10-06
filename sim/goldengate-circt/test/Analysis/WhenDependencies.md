@@ -283,3 +283,46 @@ The matching boundary covers the arbiter's ordered ready/valid connectivity.
 It does not establish full FAME channel grouping or emitted output-valid logic
 parity. Those are the next small consumer comparisons; full transformed-Rocket
 verification remains harness-owned.
+
+The October 6 iteration 7 comparison covers equivalent native aggregate
+construction at the same UserYanker boundary. The immutable primary fixture
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` lines 26572–26588 construct
+the 16-entry echo vector; lines 26604–26605 select source and size independently.
+All 19 statements remain unchanged in the iteration 5 FIRRTL extraction.
+The immutable U250 `design/FireSim-generated.sv` lines 57878–57925 implement
+separate source and size mux chains, confirming field isolation.
+
+The test re-expresses the imported vector's element assignments using native
+`BundleCreateOp` and `VectorCreateOp`, preserving source leaves and its named
+electrical boundary. These operations are a CIRCT representation of the
+fixture's semantics; they are not present in the SFC source. Previously,
+generic operand traversal added unrelated sibling fields: the new nested
+constructor regression failed with `wrong dependencies for size`. The tracer
+now projects each selected field onto its matching constructor operand and
+keeps the relative field ID through nested aggregates.
+
+Executable SFC 1.6 `LowFirrtlCompiler` and `CheckCombLoops` on the extraction
+report `size <- index, size9, ..., size0` and
+`source <- index, source9, ..., source0`. The constructed CIRCT candidate
+matches both ordered lists exactly, with 11 dependencies each. Dependency sets
+also match after the real `normalizeFAMEInput` pipeline. Local regressions cover
+nested bundle/vector fields, static and dynamic selections, channel grouping,
+and annotation-based output selection that excludes an unused trigger field.
+
+Mutable Scala oracle, constructed and normalized MLIR, and comparison logs
+are under `iteration7-constructed-dependencies/` in the U250 generated-source
+tree. Recheck with:
+
+```sh
+cd /scratch/jfx/fsim-circt/sims/firesim
+source ./sourceme-manager.sh --skip-ssh-setup
+gg_generated=sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config
+"$gg_generated/goldengate-circt-build/goldengate-comb-dependency-test" \
+  "$gg_generated/iteration5-aggregate-dependencies/candidate/input.mlir" \
+  "$gg_generated/iteration7-constructed-dependencies/normalized-useryanker.mlir" \
+  "$gg_generated/iteration7-constructed-dependencies/constructed-useryanker.mlir"
+```
+
+This comparison establishes constructor field connectivity. Comparing grouped
+channel unions and emitted output-valid predicates against executable Scala
+FAME remains the next consumer step; full Rocket gates remain harness-owned.

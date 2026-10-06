@@ -24,6 +24,8 @@ namespace goldengate {
 // Aggregate connects are indexed by leaf identity, reversing flipped fields.
 // Selected reads follow only the corresponding source field; overlapping
 // aggregate/leaf drivers remain blocked until last-connect normalization.
+// Bundle/vector constructors project a selected leaf onto its matching
+// operand, retaining relative nested field identity and excluding siblings.
 // Inputs retain CheckCombLoops' breadth-first discovery order over named
 // electrical fields. Inline primitive expressions do not add graph depth;
 // instance output edges use the child's already simplified port ordering.

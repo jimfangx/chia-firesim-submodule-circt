@@ -287,6 +287,28 @@ private:
         // field, rather than tracing the entire aggregate and losing the
         // individual field drivers (or adding unrelated input channels).
         mergeSource(node.getInput(), fieldRef.getFieldID());
+      } else if (auto bundle = dyn_cast<BundleCreateOp>(op)) {
+        // Constructed aggregates are electrical values, just like an
+        // aggregate wire with one connect per field. Project a selected leaf
+        // onto its operand and preserve the relative nested field identity.
+        // Following every operand would add unrelated channel dependencies.
+        auto type = cast<BundleType>(bundle.getResult().getType().base());
+        if (auto fieldID = fieldRef.getFieldID()) {
+          auto index = type.getIndexForFieldID(fieldID);
+          mergeSource(bundle.getFields()[index], fieldID - type.getFieldID(index));
+        } else {
+          for (Value field : bundle.getFields())
+            mergeSource(field);
+        }
+      } else if (auto vector = dyn_cast<VectorCreateOp>(op)) {
+        auto type = cast<FVectorType>(vector.getResult().getType().base());
+        if (auto fieldID = fieldRef.getFieldID()) {
+          auto index = type.getIndexForFieldID(fieldID);
+          mergeSource(vector.getFields()[index], fieldID - type.getFieldID(index));
+        } else {
+          for (Value field : vector.getFields())
+            mergeSource(field);
+        }
       } else if (auto mux = dyn_cast<MuxPrimOp>(op)) {
         // A selected mux result depends on its condition and the matching
         // field of each arm. Static selections have already been folded into

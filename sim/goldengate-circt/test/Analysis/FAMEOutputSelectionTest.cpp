@@ -91,7 +91,15 @@ void run(MLIRContext &context, unsigned rejection) {
   b.create<StrictConnectOp>(model.getLoc(), arg(5), forward.getResult());
   b.create<StrictConnectOp>(model.getLoc(), arg(6), arg(3));
   b.create<StrictConnectOp>(model.getLoc(), arg(7), arg(2));
-  b.create<StrictConnectOp>(model.getLoc(), arg(8), arg(1));
+  // Native bundle construction must not make printfB depend on the unused
+  // trigger field. This catches a spurious input valid in the FAME rule.
+  auto recordType = BundleType::get(&context, {
+      {b.getStringAttr("data"), false, UIntType::get(&context, 8)},
+      {b.getStringAttr("unused"), false, UIntType::get(&context, 1)}});
+  Value record = b.create<BundleCreateOp>(model.getLoc(), recordType,
+                                        ValueRange{arg(1), arg(3)});
+  Value printData = b.create<SubfieldOp>(model.getLoc(), record, "data");
+  b.create<StrictConnectOp>(model.getLoc(), arg(8), printData);
 
   auto strings = [&](ArrayRef<StringRef> ports, StringRef module) {
     SmallVector<Attribute> targets;
@@ -244,7 +252,7 @@ void run(MLIRContext &context, unsigned rejection) {
     if (auto field = connect.getDest().getDefiningOp<SubfieldOp>())
       if (field.getInput() == model.getBodyBlock()->getArgument(8) &&
           field.getFieldName() == "bits") {
-        require(connect.getSrc() == model.getBodyBlock()->getArgument(1),
+        require(connect.getSrc() == printData,
                 "selected Print payload data driver changed");
         payloadDriven = true;
       }
