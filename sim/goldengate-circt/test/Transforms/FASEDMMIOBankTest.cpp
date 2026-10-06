@@ -24,7 +24,11 @@ const llvm::StringRef names[]{"writeLatency","readLatency","writeMaxReqs","readM
     "readOutstandingHistogram_4","totalWriteBeats","totalReadBeats","totalWrites","totalReads",
     "relaxFunctionalModel","rrespError","brespError"};
 FModuleOp named(CircuitOp c,llvm::StringRef name){for(auto m:c.getOps<FModuleOp>())if(m.getName()==name)return m;throw std::runtime_error("missing module");}
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
+unsigned globalWord(unsigned j,unsigned k,unsigned order) {
+  unsigned local=order==1?lengths[j]-1-k:order==2?(3*k+1)%lengths[j]:k;
+  return starts[j]+local;
+}
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned order=0) {
   auto root=parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGFASEDHistogramsWrapper" {
     firrtl.module @GGFASEDTokenEngine() {} firrtl.module @GGFASEDHistogramsWrapper() {} } })",&ctx);
   require(bool(root),"fixture parse failed");auto c=*root->getOps<CircuitOp>().begin();
@@ -42,7 +46,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
     auto bank=b.create<FModuleOp>(loc,b.getStringAttr(modules[j]),ConventionAttr::get(&ctx,Convention::Internal),
         ArrayRef<PortInfo>{{b.getStringAttr("mcr"),mcr(lengths[j]),Direction::Out}});
     SmallVector<Attribute> rows;for(unsigned k=0;k<lengths[j];++k) {
-      unsigned word=starts[j]+k;
+      unsigned word=globalWord(j,k,order);
       rows.push_back(b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(names[word])),
           b.getNamedAttr("offset",b.getI32IntegerAttr(4*word)),b.getNamedAttr("readable",b.getBoolAttr(true)),
           b.getNamedAttr("writeable",b.getBoolAttr(word<4 || word==18))}));
@@ -64,7 +68,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
     add(source,next+"|GGFASEDHistogramsWrapper>"+fragments[j].str());
     add(source+".wstrb",destination+".wstrb");
     for(unsigned k=0;k<lengths[j];++k)for(auto g:{"read","write"})
-      add(source+"."+g+"["+std::to_string(k)+"].bits",destination+"."+g+"["+std::to_string(starts[j]+k)+"].bits");
+      add(source+"."+g+"["+std::to_string(k)+"].bits",destination+"."+g+"["+std::to_string(globalWord(j,k,order))+"].bits");
   }
   add(old+"|GGFASEDLatencyRegisters>mcr.read[1].bits",next+"|GGFASEDLatencyRegisters>mcr.read[1].bits");
   c->setAttr("rawAnnotations",b.getArrayAttr(annos));return root;
@@ -76,8 +80,8 @@ std::string valueName(Value v,FModuleOp top) {
   auto inst=v.getDefiningOp<InstanceOp>();require(bool(inst),"unexpected wiring value");
   return inst.getName().str()+"."+cast<StringAttr>(inst.getPortNames()[cast<OpResult>(v).getResultNumber()]).getValue().str();
 }
-void mapping(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void mapping(MLIRContext &ctx,unsigned order) {
+  auto root=fixture(ctx,order);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDMMIOBank(c,error)),error);
   require(succeeded(verify(*root)),"assembled bank failed verifier");
   auto top=named(c,"GGFASEDMMIOWrapper");require(top.getNumPorts()==4,"fragments were not consumed");
@@ -94,8 +98,8 @@ void mapping(MLIRContext &ctx) {
   for(unsigned j=0;j<6;++j) {
     std::string frag="sim."+fragments[j].str();expected[frag+".wstrb"]="fasedBridge_mcr.wstrb";
     for(unsigned k=0;k<lengths[j];++k) {
-      expected["fasedBridge_mcr.read["+std::to_string(starts[j]+k)+"]"]=frag+".read["+std::to_string(k)+"]";
-      expected[frag+".write["+std::to_string(k)+"]"]="fasedBridge_mcr.write["+std::to_string(starts[j]+k)+"]";
+      expected["fasedBridge_mcr.read["+std::to_string(globalWord(j,k,order))+"]"]=frag+".read["+std::to_string(k)+"]";
+      expected[frag+".write["+std::to_string(k)+"]"]="fasedBridge_mcr.write["+std::to_string(globalWord(j,k,order))+"]";
     }
   }require(actual==expected,"lane or strobe routing differs");
   auto rows=top->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");require(rows.size()==21,"wrong register map length");
@@ -106,7 +110,7 @@ void mapping(MLIRContext &ctx) {
   for(auto a:annos){auto row=cast<DictionaryAttr>(a);require(row.getAs<StringAttr>("target")==row.getAs<StringAttr>("expected"),"lane annotation target transfer failed");}
 }
 void rejection(MLIRContext &ctx) {
-  for(unsigned mode=0;mode<67;++mode) {
+  for(unsigned mode=0;mode<93;++mode) {
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
     auto top=named(c,"GGFASEDHistogramsWrapper"),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");if(mode==1)c->removeAttr("rawAnnotations");
@@ -135,12 +139,33 @@ void rejection(MLIRContext &ctx) {
         ConventionAttr::get(&ctx,Convention::Internal),ArrayRef<PortInfo>{});}
     if(mode==65){b.setInsertionPointToEnd(engine.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"usedTop");}
     if(mode==66){auto ports=llvm::to_vector(top.getPortNames());ports[2]=b.getStringAttr("fasedBridge_mcr");top.setPortNames(ports);}
+    if(mode>=67 && mode<85) {
+      unsigned group=(mode-67)/6,j=(mode-67)%6;auto bank=named(c,modules[j]);
+      if(group==0)bank.setPortNames(ArrayRef<Attribute>{b.getStringAttr("wrong")});
+      if(group==1)bank.setPortDirections(SmallVector<bool>{false});
+      if(group==2){auto type=UIntType::get(&ctx,32,false);bank.getArgument(0).setType(type);
+        bank.setPortTypes(ArrayRef<Attribute>{TypeAttr::get(type)});}
+    }
+    if(mode>=85) {
+      auto bank=named(c,modules[0]);auto rows=llvm::to_vector(bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+      if(mode==85)row.set("offset",b.getI32IntegerAttr(-4));
+      if(mode==86)row.set("offset",b.getI32IntegerAttr(1));
+      if(mode==87)row.set("offset",b.getI32IntegerAttr(84));
+      if(mode==88)row.set("offset",b.getIntegerAttr(b.getIntegerType(128),0));
+      if(mode==89)row.set("name",b.getStringAttr(names[1]));
+      if(mode==90)row.erase("writeable");
+      if(mode==91)row.set("readable",b.getStringAttr("true"));
+      rows[0]=mode==92?Attribute(b.getStringAttr("invalid row")):Attribute(row.getDictionary(&ctx));
+      bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+    }
     std::string before,after;llvm::raw_string_ostream original(before);root->print(original);original.flush();std::string error;
     require(failed(goldengate::addFASEDMMIOBank(c,error)) && !error.empty(),"invalid fragment accepted");
     llvm::raw_string_ostream updated(after);root->print(updated);updated.flush();require(before==after,"rejected bank mutated IR");
   }
 }
 }
-int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();mapping(ctx);rejection(ctx);
-  llvm::outs()<<"FASED MMIO bank: 21 lanes, six strobe routes, 59 annotation targets and 67 atomic rejections passed\n";return 0;
+int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  for(unsigned order=0;order<3;++order)mapping(ctx,order);rejection(ctx);
+  llvm::outs()<<"FASED MMIO bank: three lane orders, 21 lanes, six strobe routes, 59 annotation targets and 93 atomic rejections passed\n";return 0;
 }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}}
