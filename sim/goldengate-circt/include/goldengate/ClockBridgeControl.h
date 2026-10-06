@@ -44,8 +44,9 @@ mlir::LogicalResult mapLoadMemControl(circt::firrtl::CircuitOp circuit,
 mlir::LogicalResult mapSimulationMasterControl(circt::firrtl::CircuitOp circuit,
                                              unsigned addressBits, unsigned idBits,
                                              std::string &error);
-// TSI's nine ReadWrite words use addr[5:2]. Indices 9..15 alias read word
-// zero and cannot commit writes, matching the recorded SFC MCRFile_7.
+// TSI derives transport size from its MMIO registry and validates bank/wrapper
+// lanes before mutation. The recorded nine-word bank retains addr[5:2], with
+// indices 9..15 reading lane zero without a handshake and never committing writes.
 mlir::LogicalResult mapTSIBridgeControl(circt::firrtl::CircuitOp circuit,
                                       unsigned addressBits, unsigned idBits,
                                       std::string &error);

@@ -76,7 +76,8 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
   require(bool(root),"fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
   c->setAttr("rawAnnotations",b.getArrayAttr({})); std::string error;
   if (spec.mapControl == goldengate::mapFASEDBridgeControl ||
-      spec.mapControl == goldengate::mapBlockDevBridgeControl) {
+      spec.mapControl == goldengate::mapBlockDevBridgeControl ||
+      spec.mapControl == goldengate::mapTSIBridgeControl) {
     SmallVector<Attribute> registers;
     for (unsigned i = 0; i < words; ++i) registers.push_back(b.getDictionaryAttr({
       b.getNamedAttr("name",b.getStringAttr("register_"+std::to_string(i))),
@@ -84,10 +85,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
       b.getNamedAttr("readable",b.getBoolAttr(true)),
       b.getNamedAttr("writeable",b.getBoolAttr(true))}));
     auto owner = named(c,input);
-    if (spec.mapControl == goldengate::mapBlockDevBridgeControl) {
+    if (spec.mapControl == goldengate::mapBlockDevBridgeControl ||
+        spec.mapControl == goldengate::mapTSIBridgeControl) {
       b.setInsertionPointToEnd(c.getBodyBlock());
       const PortInfo ports[]{{b.getStringAttr("mcr"),owner.getPortType(3),Direction::Out}};
-      owner = b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGBlockDevMMIOBank"),
+      owner = b.create<FModuleOp>(c.getLoc(),b.getStringAttr(spec.mapControl == goldengate::mapTSIBridgeControl ?
+          "GGTSIMMIOBank" : "GGBlockDevMMIOBank"),
           owner.getConventionAttr(),ports);
     }
     owner->setAttr("goldengate.mmioRegisters",b.getArrayAttr(registers));

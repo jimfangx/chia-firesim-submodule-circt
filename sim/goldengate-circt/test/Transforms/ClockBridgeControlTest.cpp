@@ -9,6 +9,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
+#include <vector>
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -21,10 +23,10 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   throw std::runtime_error("module missing");
 }
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0,
-                               unsigned bridge = 0) {
+                               unsigned bridge = 0, unsigned tsiWords = 9) {
   std::string top = bridge == 7 ? "GGTSIMMIOWrapper" : bridge == 6 ? "GGSimulationMasterWrapper" : bridge == 5 ? "GGLoadMemReadDataWrapper" : bridge == 4 ? "GGCPUStreamCountWrapper" : bridge == 1 ? "GGResetPulseBridgeWrapper" : bridge == 2 ? "GGPeekPokeMMIOWrapper" : bridge == 3 ? "GGTracerVTriggerWrapper" : "GGClockBridgeWrapper";
   std::string bank = bridge == 7 ? "tsiBridge_mcr" : bridge == 6 ? "simulationMaster_mcr" : bridge == 5 ? "loadmemWrite_mcr" : bridge == 4 ? "cpuStream_mcr" : bridge == 1 ? "resetBridge_mcr" : bridge == 2 ? "peekPokeBridge_mcr" : bridge == 3 ? "tracerv_mcr" : "clockBridge_mcr";
-  unsigned words = bridge == 7 ? 9 : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
+  unsigned words = bridge == 7 ? tsiWords : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
   std::string token="bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<32>>";
   std::string header="module { firrtl.circuit \""+top+"\" { firrtl.module @"+top+"(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %data: !firrtl.uint<8>";
   if (bridge == 5) {
@@ -41,7 +43,23 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0,
   auto root=parseSourceString<ModuleOp>(header+") {} } }",&ctx);
   require(bool(root),"parse failed"); auto c=*root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
   auto a=b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test")),b.getNamedAttr("target",b.getStringAttr("~"+top+"|"+top+">"+(bad == 2 ? bank+".read[0].bits" : "data")))});
-  c->setAttr("rawAnnotations",b.getArrayAttr({a})); return root;
+  c->setAttr("rawAnnotations",b.getArrayAttr({a}));
+  if (bridge == 7) {
+    auto inner = named(c,top);
+    b.setInsertionPointToEnd(c.getBodyBlock());
+    const PortInfo ports[]{{b.getStringAttr("mcr"),inner.getPortType(3),Direction::Out}};
+    auto owner = b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGTSIMMIOBank"),
+        inner.getConventionAttr(),ports);
+    SmallVector<Attribute> rows;
+    // Decode follows byte offsets, independently of metadata row order.
+    for (unsigned i = words; i > 0; --i) rows.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("name",b.getStringAttr("register_"+std::to_string(i-1))),
+      b.getNamedAttr("offset",b.getI64IntegerAttr(4*(i-1))),
+      b.getNamedAttr("readable",b.getBoolAttr(true)),
+      b.getNamedAttr("writeable",b.getBoolAttr(true))}));
+    owner->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+  }
+  return root;
 }
 LogicalResult mapControl(CircuitOp c, unsigned bridge, unsigned addressBits,
                          unsigned idBits, std::string &error) {
@@ -101,11 +119,12 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx, unsigned bridge) {
-  unsigned bankWords = bridge == 7 ? 9 : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6, indexBits = bridge == 7 ? 4 : bridge == 6 ? 2 : bridge == 5 ? 4 : bridge == 4 ? 0 : bridge == 1 ? 1 : bridge == 3 ? 4 : 3;
+void behavior(MLIRContext &ctx, unsigned bridge, unsigned tsiWords = 9) {
+  unsigned bankWords = bridge == 7 ? tsiWords : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
+  unsigned indexBits = llvm::Log2_64_Ceil(bankWords);
   unsigned indexMask = (1U << indexBits) - 1;
   std::string prefix = bridge == 7 ? "GGTSI" : bridge == 6 ? "GGSimulationMaster" : bridge == 5 ? "GGLoadMem" : bridge == 4 ? "GGCPUStream" : bridge == 1 ? "GGResetPulseBridge" : bridge == 2 ? "GGPeekPoke" : bridge == 3 ? "GGTracerV" : "GGClockBridge";
-  auto root=fixture(ctx,0,bridge); auto c=*root->getOps<CircuitOp>().begin(); std::string error;
+  auto root=fixture(ctx,0,bridge,tsiWords); auto c=*root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(mapControl(c,bridge,25,12,error)),error);
   require(succeeded(verify(*root)),"IR verification failed");
   auto adapter=named(c,prefix+"MCRFile"), wrapper=named(c,prefix+(bridge == 2 || bridge == 3 || bridge == 7 ? "BridgeControlWrapper" : "ControlWrapper"));
@@ -113,7 +132,7 @@ void behavior(MLIRContext &ctx, unsigned bridge) {
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(cast<DictionaryAttr>(annos[0]).getAs<StringAttr>("target").getValue()=="~"+wrapper.getName().str()+"|"+wrapper.getName().str()+">data","copied target was not transferred");
   require(std::distance(adapter.getOps<RegResetOp>().begin(),adapter.getOps<RegResetOp>().end())==4,"transaction flag count");
-  require(std::distance(adapter.getOps<RegOp>().begin(),adapter.getOps<RegOp>().end())==(bridge == 4 ? 3 : 5),"unreset capture count");
+  require(std::distance(adapter.getOps<RegOp>().begin(),adapter.getOps<RegOp>().end())==(indexBits ? 5 : 3),"unreset capture count");
   for (auto r : adapter.getOps<RegOp>())
     if (r.getName() == "wIndex" || r.getName() == "rIndex")
       require(cast<UIntType>(r.getResult().getType()).getWidth() == indexBits,
@@ -141,6 +160,7 @@ void behavior(MLIRContext &ctx, unsigned bridge) {
   bool haveAW=false,haveW=false,haveAR=false,done=false;
   uint64_t writeWord=0,readWord=0,writeID=0,readID=0,writeData=0;
   std::mt19937_64 rng(148); unsigned readTransfers=0,writeTransfers=0,awFirst=0,wFirst=0;
+  std::vector<bool> seenRead(indexMask+1),seenWrite(indexMask+1);
   for (unsigned cycle=0;cycle<15000;++cycle) {
     sim.memo.clear(); bool reset=cycle<2 || cycle%137==0;
     bool awValid=rng()%3==0,wValid=rng()%3==0,arValid=rng()%3==0;
@@ -155,7 +175,8 @@ void behavior(MLIRContext &ctx, unsigned bridge) {
     input(bits("aw","id"),awID);input(bits("ar","id"),arID);
     input(bits("aw","len"),0);input(bits("ar","len"),0);input(bits("w","data"),wData);
     input(bits("w","strb"),rng()&15); input(bits("w","last"),rng()&1);
-    bool readValid[15],writeReady[15];uint64_t readData[15];
+    std::vector<bool> readValid(bankWords),writeReady(bankWords);
+    std::vector<uint64_t> readData(bankWords);
     bool wr=haveAW && haveW && !done;
     for (unsigned i=0;i<bankWords;++i) {
       readValid[i]=rng()%4!=0;writeReady[i]=rng()%4!=0;readData[i]=rng()&0xffffffff;
@@ -177,9 +198,9 @@ void behavior(MLIRContext &ctx, unsigned bridge) {
     bool takeR=rv&&rReady,takeB=bv&&bReady;
     awFirst+=takeAW&&!haveW&&!takeW;wFirst+=takeW&&!haveAW&&!takeAW;
     readTransfers+=takeR;writeTransfers+=takeB;
-    if(takeAW){writeWord=(awAddr>>2)&indexMask;writeID=awID;}
+    if(takeAW){writeWord=(awAddr>>2)&indexMask;writeID=awID;seenWrite[writeWord]=true;}
     if(takeW)writeData=wData;
-    if(takeAR){readWord=(arAddr>>2)&indexMask;readID=arID;}
+    if(takeAR){readWord=(arAddr>>2)&indexMask;readID=arID;seenRead[readWord]=true;}
     if(takeAW)haveAW=true;if(takeW)haveW=true;if(takeAR)haveAR=true;
     if(takeR)haveAR=false;
     if(takeB){haveAW=false;haveW=false;done=false;}
@@ -192,14 +213,16 @@ void behavior(MLIRContext &ctx, unsigned bridge) {
   llvm::outs()<<bankWords<<"-word MCRFile coverage: reads="<<readTransfers<<", writes="<<writeTransfers
               <<", AW-first="<<awFirst<<", W-first="<<wFirst<<'\n';
   require(readTransfers>500 && writeTransfers>100 && awFirst>50 && wFirst>50,"insufficient transaction coverage");
+  for(unsigned i=0;i<=indexMask;++i) require(seenRead[i] && seenWrite[i],"local index coverage incomplete");
+  require(std::distance(adapter.getOps<AssertOp>().begin(),adapter.getOps<AssertOp>().end())==2,"AW/AR burst assertions missing");
   // Assertions must require an accepted address, and reset must mask them.
   for (auto a : adapter.getOps<AssertOp>()) {
-    for (bool reset : {false,true}) for(bool accept : {false,true}) {
+    for (bool reset : {false,true}) for(bool accept : {false,true}) for(bool held : {false,true}) {
       sim.memo.clear(); input(sim.arg(1),reset);
       input(nasti("aw","valid"),accept);input(nasti("ar","valid"),accept);
       input(bits("aw","len"),7);input(bits("ar","len"),7);
-      for(auto r:adapter.getOps<RegResetOp>())sim.state[r.getResult()]=0;
-      require(sim.eval(a.getEnable())==(!reset&&accept),"burst assertion gating mismatch");
+      for(auto r:adapter.getOps<RegResetOp>())sim.state[r.getResult()]=held;
+      require(sim.eval(a.getEnable())==(!reset&&accept&&!held),"burst assertion gating mismatch");
       require(sim.eval(a.getPredicate())==0,"burst assertion predicate mismatch");
     }
   }
@@ -352,8 +375,8 @@ void tsiMapping(MLIRContext &ctx) {
   auto mapped=printed(*root);
   require(failed(goldengate::mapTSIBridgeControl(c,25,12,error)),"repeated TSI control mapping accepted");
   require(mapped==printed(*root),"repeated TSI mapping mutated IR");
-  for(unsigned bad=0;bad<11;++bad) {
-    auto rejected=fixture(ctx,0,7); auto circuit=*rejected->getOps<CircuitOp>().begin();
+  for(unsigned bad=0;bad<30;++bad) {
+    auto rejected=fixture(ctx,0,7,bad==25?17:9); auto circuit=*rejected->getOps<CircuitOp>().begin();
     auto inner=named(circuit,"GGTSIMMIOWrapper");
     if(bad==0)circuit->removeAttr("rawAnnotations");
     if(bad>=1 && bad<=3) {
@@ -374,11 +397,37 @@ void tsiMapping(MLIRContext &ctx) {
         b.getNamedAttr("nested",b.getDictionaryAttr({b.getNamedAttr("targets",b.getArrayAttr({
             b.getStringAttr(bad==9?"~GGTSIMMIOWrapper|GGTSIMMIOWrapper>tsiBridge_mcr":
             "~GGTSIMMIOWrapper|GGTSIMMIOWrapper>tsiBridge_mcr.read[8].bits")}))}))})}));
+    if(bad==13)circuit.setNameAttr(b.getStringAttr("WrongTop"));
+    auto bank=named(circuit,"GGTSIMMIOBank");
+    if(bad==14)bank->removeAttr("goldengate.mmioRegisters");
+    if(bad>=15 && bad<=26 && bad!=25) {
+      auto rows=llvm::to_vector(bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      if(bad==15)rows.clear();
+      if(bad==16)rows[0]=b.getStringAttr("not a row");
+      if((bad>=17 && bad<=23) || bad==26) {
+        NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+        if(bad==17)row.set("offset",b.getI64IntegerAttr(-4));
+        if(bad==18)row.set("offset",b.getI64IntegerAttr(33));
+        if(bad==19)row.set("offset",b.getI64IntegerAttr(36));
+        if(bad==20)row.set("name",b.getStringAttr("register_0"));
+        if(bad==21)row.erase("writeable");
+        if(bad==22)row.set("readable",b.getStringAttr("true"));
+        if(bad==23)row.set("offset",b.getI64IntegerAttr(0));
+        if(bad==26) { row.set("readable",b.getBoolAttr(false)); row.set("writeable",b.getBoolAttr(false)); }
+        rows[0]=row.getDictionary(&ctx);
+      }
+      // A valid dense eight-word registry must reject stale nine-word bank lanes.
+      if(bad==24)rows.erase(rows.begin());
+      bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+    }
+    if(bad==27)bank.erase();
+    if(bad==28)bank.setPortTypes({TypeAttr::get(UIntType::get(&ctx,2,false))});
+    if(bad==29)bank.setPortNames({b.getStringAttr("missing")});
     auto before=printed(*rejected);
-    require(failed(goldengate::mapTSIBridgeControl(circuit,25,12,error)),"invalid TSI boundary accepted");
+    require(failed(goldengate::mapTSIBridgeControl(circuit,bad==11?5:bad==25?6:25,bad==12?0:12,error)),"invalid TSI boundary accepted");
     require(before==printed(*rejected),"TSI boundary rejection mutated IR");
   }
-  llvm::outs()<<"TSI: aggregate control/bank bindings, six nested target transfers, 11 atomic boundary rejections and repeated-pass rejection passed\n";
+  llvm::outs()<<"TSI: aggregate control/bank bindings, six nested target transfers, 30 atomic boundary rejections and repeated-pass rejection passed\n";
 }
 void rejection(MLIRContext &ctx, unsigned bridge) {
   for(unsigned bad=0;bad<5;++bad){
@@ -394,6 +443,7 @@ void rejection(MLIRContext &ctx, unsigned bridge) {
 }
 }
 int main(){
-  try {MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();countBank(ctx);loadMemMapping(ctx);tsiMapping(ctx);for(unsigned bridge : {0U,1U,2U,3U,4U,5U,6U,7U}) {behavior(ctx,bridge);rejection(ctx,bridge);}}
+  try {MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();countBank(ctx);loadMemMapping(ctx);tsiMapping(ctx);for(unsigned bridge : {0U,1U,2U,3U,4U,5U,6U,7U}) {behavior(ctx,bridge);rejection(ctx,bridge);}
+    for(unsigned count : {1U,16U,17U}) behavior(ctx,7,count);}
   catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}return 0;
 }

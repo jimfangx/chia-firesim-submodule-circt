@@ -362,17 +362,29 @@ LogicalResult goldengate::mapSimulationMasterControl(CircuitOp circuit,
       "GGSimulationMasterMCRFile", "simulationMaster_mcr", "simulationMaster_ctrl", error);
 }
 
-// Requires: uninstantiated GGTSIMMIOWrapper, nine decoded UInt32 lanes,
-// host clock/reset, and retained annotations. No additional analyses required.
+// Requires: uninstantiated GGTSIMMIOWrapper, a validated MMIO registry
+// with matching bank/wrapper UInt32 lanes, host clock/reset and annotations.
 // Consumes: decoded tsiBridge_mcr port, with references rejected before mutation.
 // Produces: no annotation classes; copied targets transfer, inner targets stay.
 // Mutates: adds a FIRRTL MCRFile and wrapper, replacing decoded lanes with Nasti.
 // Preserves: inner modules, TSI register state, channel/clock/constructor metadata.
-// Output: independent AW/W capture, held B/R responses and four-bit local decode.
+// Output: independent AW/W capture, held B/R responses and registry-derived
+// local decode. Invalid reads alias lane zero without a lane read handshake;
+// invalid writes cannot commit.
 // The platform control slave binding remains a separate transformation.
 LogicalResult goldengate::mapTSIBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
-  return mapBridgeControl(circuit, addressBits, idBits, 9,
+  ControlMMIOWidget registry;
+  const llvm::StringRef modules[]{"GGTSIMMIOBank"};
+  if (failed(deriveControlMMIOWidget(circuit, "TSIBridgeModule_0",
+          modules[0], modules, registry, error, Direction::Out)))
+    return failure();
+  if (registry.registerCount > std::numeric_limits<unsigned>::max()) {
+    error = "TSI register count exceeds the supported MCR lane count";
+    return failure();
+  }
+  return mapBridgeControl(circuit, addressBits, idBits,
+      static_cast<unsigned>(registry.registerCount),
       "GGTSIMMIOWrapper", "GGTSIBridgeControlWrapper",
       "GGTSIMCRFile", "tsiBridge_mcr", "tsiBridge_ctrl", error);
 }
