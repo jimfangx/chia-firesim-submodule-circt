@@ -266,8 +266,56 @@ not whole-design equivalence. Completed large MLIR files are compressed,
 retaining the two compared boundaries. Iteration 31 manager gates await the
 harness; no manager action was started by the implementation agent.
 
-Distinct physical aliases of multiport groups and shared groups mixing channel
-kinds remain unsupported. The next smallest step is multiport alias collapse,
-including ordered leaf identity and per-branch payload field renaming.
-Mixed fanout also still needs bridge bindings to resolve each external queue
-output independently from the retained upstream producer identity.
+## Iteration 32: ordered multiport producer aliases
+
+The multiport output rewrite now collapses distinct wrapper ports for each
+producer leaf into one shared decoupled bundle. Retained source annotations
+identify every alias. Their complete ordered SSA connections must match the
+payload's field order, and each branch's global prefix removal must produce
+the corresponding model leaf. Model bindings contain sorted physical indices;
+these indices do not define payload order. The same preflight supplies payload
+fields to the full compiler and standalone output target renames.
+
+Each model leaf driver moves once. Every validated wrapper alias and direct
+connect is removed; unrelated ports survive. Wrapper DontTouch metadata and
+payload symbols transfer to field IDs. Seven new rejection cases cover missing
+source coverage, reordered or partial branches, inconsistent field names,
+extra model/top uses, and conflicting payload symbols. Rejections leave IR
+unchanged. The positive fixture deliberately reverses payload versus physical
+port order. All six focused CTests pass, including both clock-hub and queued
+clock-hub orders.
+
+The preserved Scala `InferModelPorts` and `FAMETransform.hostDecouplingRenames`
+produce the `distinct-multiport-aliases` fixture under
+`iteration32-multiport-aliases/scala/`. Its four wrapper outputs share one
+ordered `data/valid` producer. SFC chooses the representative branch name for
+an aggregate local group (here `right_`); both branches converge on
+`model_right__source.bits.data/valid`. The native compiler ingests those exact
+FIRRTL and annotation files. Its two output annotation classes, clocks,
+latencies, four source targets, and two model leaf targets match
+`post-host-renames.sfc.json`. Selecting either global branch produces the same
+one physical token port and connect with the original leaf drivers.
+`alias-comparison.json` records this output-only comparison. Raw input and
+model DontTouch targets remain outside the standalone rewrite comparison;
+this probe does not claim a normalized full Scala FAME RTL result.
+
+The fresh Rocket candidate's `post-infer-model-ports.mlir` matches the immutable
+U250 `design/FireSim-generated.sv` on 17 input and 25 output clock assignments,
+including phase/reset behavior. `post-fame-first-pipe-wrapper.mlir` matches
+four eight-port queue interfaces and 22 singleton valid/ready connections in
+that same artifact. The recorded compiler annotation fixtures have no fanout
+annotation and do not exercise multiport alias collapse. Their UInt0 queue
+payloads differ from current UInt3/UInt64 payloads; these matches are scoped
+boundary evidence, not whole-design equivalence. The production Scala alias
+fixture supplies the missing differential case.
+
+The prior iteration's harness passed CIRCT replacertl and the Verilator smoke,
+portable suite (90,141 checks, `0x78194504c338c229`) and Rocket suite (90,805
+checks, `0x5f3744639d41ea35`). The UART-bearing SFC workload baseline remains
+pending. This iteration's manager gates remain owned by the harness.
+
+Shared groups mixing channel kinds remain unsupported. The next small porting
+step is to establish the SFC mixed-kind producer boundary and preserve each
+branch's independent queue/handshake semantics. Mixed fanout also needs bridge
+bindings to resolve each external queue output independently from the retained
+upstream producer identity.

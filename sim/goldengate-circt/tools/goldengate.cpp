@@ -1727,16 +1727,18 @@ int main(int argc, char **argv) {
           }
         if (topPorts.empty())
           return fail("FAME output has no top connection");
-        if (topPorts.size() > 1 && expectedFields != 1)
-          return fail("FAME multiport output aliases are not yet supported");
         // Top targets rename per alias; the common model target renames once.
         bool firstAlias = true;
         for (unsigned topPort : topPorts) {
           auto oldTop = outputHierarchy->top.getPortName(topPort);
           auto oldModel = outputGroup.module.getPortName(modelPort);
-          auto topField = outputBindings->front().instancePorts.size() == 1
-                              ? std::string()
-                              : ("." + removeCommonPrefix(oldTop, outputChannel->name).str());
+          std::string topField;
+          if (expectedFields > 1) {
+            auto field = goldengate::getFAMEOutputAliasField(
+                *outputHierarchy, outputPort, modelPort, topPort, error);
+            if (!field) return fail("FAME output alias: " + error);
+            topField = "." + *field;
+          }
           auto modelField = outputBindings->front().instancePorts.size() == 1
                                 ? std::string()
                                 : ("." + removeCommonPrefix(oldModel, outputGroup.name).str());
@@ -5008,16 +5010,16 @@ int main(int argc, char **argv) {
         }
       if (topPorts.empty())
         return fail("FAME output channel has no top port");
-      if (topPorts.size() > 1 && binding.instancePorts.size() != 1)
-        return fail("FAME multiport output aliases are not yet supported");
       bool firstAlias = true;
       for (unsigned topPort : topPorts) {
         auto oldTopName = hierarchy->top.getPortName(topPort);
         auto oldModelName = model.getPortName(modelPort);
         std::string topSuffix, modelSuffix;
         if (binding.instancePorts.size() > 1) {
-          topSuffix = ("." + removeCommonPrefix(oldTopName,
-                                                  binding.globalName)).str();
+          auto field = goldengate::getFAMEOutputAliasField(
+              *hierarchy, *selected, modelPort, topPort, fameError);
+          if (!field) return fail("FAME output alias: " + fameError);
+          topSuffix = "." + *field;
           modelSuffix = ("." + removeCommonPrefix(
                                    oldModelName, binding.portGroup->name)).str();
         }

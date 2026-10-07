@@ -98,6 +98,76 @@ object FAMESharedProducerOracle extends App {
     require(aliasAnalysis.staleTopPorts.contains(rt(port)))
   }
   println("PRODUCER printfB physical aliases 2 one token target")
+  // Aggregate producer names are the representative global channel name in
+  // SFC's ModulePortDeduper, not the common prefix of the model's leaf ports.
+  // Keep model leaves independent of either branch prefix so both possible
+  // representatives have the same host bundle field names.
+  val multiAliasInput = """circuit Top :
+  module Model :
+    input clock0 : Clock
+    input inData : UInt<8>
+    output data : UInt<8>
+    output valid : UInt<1>
+    output alias0 : Clock
+    data <= inData
+    valid <= UInt<1>(1)
+    alias0 <= clock0
+  module Top :
+    input hostClock : Clock
+    input hostReset : UInt<1>
+    input clock0 : Clock
+    input inData : UInt<8>
+    output left_data : UInt<8>
+    output left_valid : UInt<1>
+    output right_data : UInt<8>
+    output right_valid : UInt<1>
+    output alias0 : Clock
+    inst model of Model
+    model.clock0 <= clock0
+    model.inData <= inData
+    left_data <= model.data
+    left_valid <= model.valid
+    right_data <= model.data
+    right_valid <= model.valid
+    alias0 <= model.alias0
+"""
+  val multiAliasLow = new LowFirrtlCompiler().compile(
+    CircuitState(Parser.parse(multiAliasInput), ChirrtlForm), Nil)
+  def multiAliasState(rightPorts: Seq[String]) = multiAliasLow.copy(annotations = Seq(
+    FAMEHostClock(rt("hostClock")), FAMEHostReset(rt("hostReset")),
+    FAMETransformAnnotation(ModuleTarget("Top", "Model")),
+    FAMEChannelConnectionAnnotation("input", PipeChannel(0), Some(rt("alias0")),
+      None, Some(Seq(rt("inData")))),
+    source("left_", Seq("left_data", "left_valid")),
+    source("right_", rightPorts, latency = 1)))
+  val multiAliasInferred = new InferModelPorts().execute(
+    multiAliasState(Seq("right_data", "right_valid")))
+  val multiAliasAnalysis = new FAMEChannelAnalysis(multiAliasInferred)
+  val multiOutputs = multiAliasAnalysis.modelOutputChannelPortMap(ModuleTarget("Top", "Model"))
+  require(multiOutputs.size == 1 &&
+    multiOutputs.values.head._2.map(_.name) == Seq("data", "valid"))
+  val multiProducer = multiOutputs.keys.head
+  require(Set("left_", "right_").contains(multiProducer))
+  val multiAliasRenames = transform.hostDecouplingRenames(multiAliasAnalysis)
+  for (branch <- Seq("left_", "right_")) {
+    require(multiAliasAnalysis.chNameToModelSourcePortName(branch) == s"${multiProducer}_source")
+    require(transform.topSourcePortName(branch, multiAliasAnalysis) == s"model_${multiProducer}_source")
+    for (leaf <- Seq("data", "valid")) {
+      require(RTRenamer.exact(multiAliasRenames)(rt(s"$branch$leaf")) ==
+        rt(s"model_${multiProducer}_source").field("bits").field(leaf))
+      require(multiAliasAnalysis.staleTopPorts.contains(rt(s"$branch$leaf")))
+      require(RTRenamer.exact(multiAliasRenames)(ModuleTarget("Top", "Model").ref(leaf)) ==
+        ModuleTarget("Top", "Model").ref(s"${multiProducer}_source").field("bits").field(leaf))
+    }
+  }
+  var reversedAliasesRejected = false
+  try new InferModelPorts().execute(multiAliasState(Seq("right_valid", "right_data")))
+  catch {
+    case e: RuntimeException if e.getMessage.contains("partially overlapping") =>
+      reversedAliasesRejected = true
+  }
+  require(reversedAliasesRejected, "Scala accepted a reordered aggregate alias branch")
+  println(s"PRODUCER $multiProducer physical aliases 4 fields data valid one token target")
   def writeBoundary(directory: java.io.File, boundary: CircuitState, renames: RenameMap): Unit = {
     directory.mkdirs()
     val fir = new java.io.PrintWriter(new java.io.File(directory, "post-infer-model-ports.sfc.fir"))
@@ -111,6 +181,8 @@ object FAMESharedProducerOracle extends App {
   if (args.nonEmpty) {
     writeBoundary(new java.io.File(args(0)), inferred, renames)
     writeBoundary(new java.io.File(args(0), "distinct-top-aliases"), aliasInferred, aliasRenames)
+    writeBoundary(new java.io.File(args(0), "distinct-multiport-aliases"),
+      multiAliasInferred, multiAliasRenames)
   }
-  println("PASS production shared scalar/aggregate producer; common bits rename; three incompatible groups rejected")
+  println("PASS production shared scalar/aggregate producer; common bits rename; four incompatible groups rejected")
 }

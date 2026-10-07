@@ -410,6 +410,113 @@ void newlySynthesizedPrintBundle(MLIRContext &context) {
           "signed Print argument lost its data-channel dependency");
   require(succeeded(verify(*root)), "new Print bundle lowering produced invalid IR");
 }
+// Distinct wrapper names share an ordered two-leaf producer. Branch prefixes
+// differ, while model order and physical wrapper order deliberately disagree.
+void multiportAliases(MLIRContext &context, unsigned rejection) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(out %left_data: !firrtl.uint<8>,
+          out %left_valid: !firrtl.uint<1>, out %right_data: !firrtl.uint<8>,
+          out %right_valid: !firrtl.uint<1>, in %hostClock: !firrtl.clock) {}
+      firrtl.module private @Model(out %tx_data: !firrtl.uint<8>,
+          out %tx_valid: !firrtl.uint<1>) {}
+    }
+  })mlir", &context);
+  require(bool(root), "multiport alias fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto it = circuit.getOps<FModuleOp>().begin();
+  auto top = *it++, model = *it;
+  OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
+  auto instance = b.create<InstanceOp>(top.getLoc(), model, "model");
+  for (unsigned port = 0; port < 4; ++port)
+    b.create<StrictConnectOp>(top.getLoc(), top.getBodyBlock()->getArgument(port),
+                              instance.getResult(port % 2));
+  top.setPortSymbolsAttr(3, circt::hw::InnerSymAttr::get(b.getStringAttr("valid_identity")));
+  if (rejection == 5)
+    top.setPortSymbolsAttr(1, circt::hw::InnerSymAttr::get(b.getStringAttr("conflicting_valid")));
+  auto protection = b.getArrayAttr({b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::DontTouch))})});
+  top.setPortAnnotationsAttr(b.getArrayAttr(
+      {b.getArrayAttr({}), b.getArrayAttr({}), protection, b.getArrayAttr({}),
+       b.getArrayAttr({})}));
+  if (rejection == 3)
+    b.create<NodeOp>(top.getLoc(), instance.getResult(0), "extra_producer_use");
+  if (rejection == 4)
+    b.create<NodeOp>(top.getLoc(), top.getBodyBlock()->getArgument(2), "extra_alias_use");
+  b.setInsertionPointToEnd(model.getBodyBlock());
+  auto data = b.create<ConstantOp>(model.getLoc(), UIntType::get(&context, 8), APInt(8, 93));
+  auto valid = b.create<ConstantOp>(model.getLoc(), UIntType::get(&context, 1), APInt(1, 1));
+  b.create<StrictConnectOp>(model.getLoc(), model.getBodyBlock()->getArgument(0), data);
+  b.create<StrictConnectOp>(model.getLoc(), model.getBodyBlock()->getArgument(1), valid);
+  auto targets = [&](ArrayRef<StringRef> names, StringRef module) {
+    SmallVector<Attribute> values;
+    for (auto name : names)
+      values.push_back(b.getStringAttr(("~Top|" + module + ">" + name).str()));
+    return b.getArrayAttr(values);
+  };
+  auto group = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::ChannelPorts)),
+      b.getNamedAttr("localName", b.getStringAttr("tx_")),
+      b.getNamedAttr("ports", targets({"tx_valid", "tx_data"}, "Model"))});
+  auto branch = [&](StringRef name, ArrayRef<StringRef> ports) {
+    return b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr(name)),
+        b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+            b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::PipeChannel)),
+            b.getNamedAttr("latency", b.getI64IntegerAttr(0))})),
+        b.getNamedAttr("sources", targets(ports, "Top"))});
+  };
+  auto first = branch("left_", {"left_valid", "left_data"});
+  SmallVector<Attribute> raw{group, first};
+  if (rejection != 1)
+    raw.push_back(branch(rejection == 6 ? "wrong_" : "right_",
+        rejection == 2 ? ArrayRef<StringRef>{"right_data", "right_valid"}
+        : rejection == 7 ? ArrayRef<StringRef>{"right_valid"}
+                         : ArrayRef<StringRef>{"right_valid", "right_data"}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(raw));
+  require(succeeded(verify(*root)), "multiport alias input invalid");
+  std::string error;
+  auto hierarchy = goldengate::analyzeTopHierarchy(circuit, error);
+  auto portGroup = goldengate::analyzeModelPortGroup(circuit, Annotation(group), error);
+  auto connection = goldengate::analyzeChannelConnection(circuit, Annotation(first), error);
+  require(hierarchy && portGroup && connection, error);
+  SmallVector<goldengate::ModelPortGroup> groups{*portGroup};
+  auto bindings = goldengate::bindChannelToModels(*connection, *hierarchy, groups, error);
+  require(bool(bindings), error);
+  auto plan = goldengate::analyzeFAMEPorts(*hierarchy, *bindings, {*connection}, {model}, error);
+  require(plan && plan->sources.size() == 1, error);
+  auto before = dump(*root);
+  auto result = goldengate::rewriteFAMEOutputChannel(*hierarchy, plan->sources.front(), error);
+  if (rejection) {
+    require(failed(result) && !error.empty(), "unsafe multiport alias accepted");
+    require(before == dump(*root), "unsafe multiport alias rejection mutated IR");
+    return;
+  }
+  require(succeeded(result), error);
+  require(succeeded(verify(*root)), "multiport alias rewrite invalid");
+  require(top.getNumPorts() == 2 && model.getNumPorts() == 1 &&
+              top.getPortName(0) == "model_tx__source" &&
+              model.getPortName(0) == "tx__source",
+          "multiport aliases retained stale ports or duplicated the producer");
+  auto token = cast<BundleType>(top.getPorts()[0].type);
+  auto payload = cast<BundleType>(token.getElementType(2));
+  require(payload.getElements()[0].name.getValue() == "valid" &&
+              payload.getElements()[1].name.getValue() == "data",
+          "multiport alias collapse reordered payload leaves");
+  require(llvm::range_size(top.getPorts()[0].sym) == 1 &&
+              (*top.getPorts()[0].sym.begin()).getFieldID() ==
+                  token.getFieldID(2) + payload.getFieldID(0) &&
+              !cast<ArrayAttr>(top.getPortAnnotationsAttr()[0]).empty(),
+          "multiport alias collapse lost payload identities/protection");
+  for (auto connect : model.getOps<StrictConnectOp>()) {
+    auto leaf = connect.getDest().getDefiningOp<SubfieldOp>();
+    require(leaf && ((leaf.getFieldName() == "data" && connect.getSrc() == data.getResult()) ||
+                    (leaf.getFieldName() == "valid" && connect.getSrc() == valid.getResult())),
+            "multiport alias collapse changed a model leaf driver");
+  }
+  llvm::outs() << "PRODUCER tx_ physical aliases 4 ordered leaves 2 one token port\n";
+}
 } // namespace
 int main(int argc, char **argv) {
   try {
@@ -443,6 +550,8 @@ int main(int argc, char **argv) {
     }
     require(argc == 1, "usage: test [--data-selection boundary.mlir model]");
     for (unsigned rejection = 0; rejection <= 20; ++rejection) run(context, rejection);
+    for (unsigned rejection = 0; rejection <= 7; ++rejection)
+      multiportAliases(context, rejection);
     newlySynthesizedPrintBundle(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
                     "dependencies, scalar/multiport shared producers, all data inputs and model isolation passed; 13 unsafe selections "

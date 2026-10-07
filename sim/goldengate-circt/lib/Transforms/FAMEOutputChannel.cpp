@@ -55,11 +55,10 @@ LogicalResult rewriteMultiportOutputChannel(
 
   struct Leaf {
     unsigned modelPort;
-    unsigned topPort;
     std::string field;
-    Operation *connection;
   };
   llvm::SmallVector<Leaf> leaves;
+  llvm::SmallVector<std::pair<unsigned, Operation *>> aliasesToErase;
   llvm::SmallVector<Annotation> wrapperAnnotations;
   llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
   std::set<unsigned> topPorts;
@@ -75,52 +74,63 @@ LogicalResult rewriteMultiportOutputChannel(
       error = "FAME output bundle field does not match a model port";
       return failure();
     }
-    std::optional<unsigned> topPort;
+    std::set<unsigned> aliases;
     for (const auto &connection : hierarchy.connections)
       if (connection.instance == instance &&
-          connection.instancePort == modelPort) {
-        if (topPort) {
-          error = "FAME output bundle field has multiple top connections";
-          return failure();
-        }
-        topPort = connection.topPort;
-      }
-    if (!topPort || !topPorts.insert(*topPort).second ||
-        top.getPortDirection(*topPort) != Direction::Out ||
-        top.getPorts()[*topPort].type != model.getPorts()[modelPort].type ||
-        removeCommonPrefix(top.getPortName(*topPort), binding.globalName) !=
-            field) {
+          connection.instancePort == modelPort)
+        aliases.insert(connection.topPort);
+    if (aliases.empty()) {
       error = "FAME output bundle field has no matching top port";
       return failure();
     }
-    if (failed(goldengate::collectFAMEWrapperPayloadMetadata(
-            top, *topPort, channel.type, field, wrapperAnnotations,
-            wrapperSymbols, error)) ||
-        failed(goldengate::collectFAMEPayloadSymbols(
+    if (failed(goldengate::collectFAMEPayloadSymbols(
             model, modelPort, channel.type, field, modelSymbols, error)))
       return failure();
-    Value oldTop = top.getBodyBlock()->getArgument(*topPort);
+    llvm::SmallVector<Operation *> connections;
     Value oldInstance = instance.getResult(modelPort);
-    Operation *oldConnection = nullptr;
-    for (OpOperand &use : oldTop.getUses()) {
-      Operation *connect = use.getOwner();
-      auto strict = dyn_cast<StrictConnectOp>(connect);
-      auto ordinary = dyn_cast<ConnectOp>(connect);
-      if ((!strict && !ordinary) ||
-          (strict && (strict.getDest() != oldTop ||
-                      strict.getSrc() != oldInstance)) ||
-          (ordinary && (ordinary.getDest() != oldTop ||
-                        ordinary.getSrc() != oldInstance)) || oldConnection) {
-        error = "FAME output bundle field has nontrivial top wiring";
+    for (unsigned topPort : aliases) {
+      auto aliasField = goldengate::getFAMEOutputAliasField(
+          hierarchy, channel, modelPort, topPort, error);
+      if (!aliasField || *aliasField != field ||
+          !topPorts.insert(topPort).second ||
+          top.getPortDirection(topPort) != Direction::Out ||
+          top.getPorts()[topPort].type != model.getPorts()[modelPort].type) {
+        if (error.empty()) error = "FAME output bundle alias has incompatible payload";
         return failure();
       }
-      oldConnection = connect;
+      if (failed(goldengate::collectFAMEWrapperPayloadMetadata(
+              top, topPort, channel.type, field, wrapperAnnotations,
+              wrapperSymbols, error)))
+        return failure();
+      Value oldTop = top.getBodyBlock()->getArgument(topPort);
+      Operation *oldConnection = nullptr;
+      for (OpOperand &use : oldTop.getUses()) {
+        Operation *connect = use.getOwner();
+        auto strict = dyn_cast<StrictConnectOp>(connect);
+        auto ordinary = dyn_cast<ConnectOp>(connect);
+        if ((!strict && !ordinary) ||
+            (strict && (strict.getDest() != oldTop ||
+                        strict.getSrc() != oldInstance)) ||
+            (ordinary && (ordinary.getDest() != oldTop ||
+                          ordinary.getSrc() != oldInstance)) || oldConnection) {
+          error = "FAME output bundle field has nontrivial top wiring";
+          return failure();
+        }
+        oldConnection = connect;
+      }
+      if (!oldConnection) {
+        error = "FAME output bundle alias has no direct connection";
+        return failure();
+      }
+      connections.push_back(oldConnection);
+      aliasesToErase.push_back({topPort, oldConnection});
     }
-    if (!oldConnection || !oldInstance.hasOneUse()) {
-      error = "FAME output bundle field is not exclusively connected to its top port";
-      return failure();
-    }
-    leaves.push_back({modelPort, *topPort, field.str(), oldConnection});
+    for (OpOperand &use : oldInstance.getUses())
+      if (!llvm::is_contained(connections, use.getOwner())) {
+        error = "FAME output bundle field has a use outside its top aliases";
+        return failure();
+      }
+    leaves.push_back({modelPort, field.str()});
   }
 
   std::string modelName = binding.portGroup->name + "_source";
@@ -172,11 +182,11 @@ LogicalResult rewriteMultiportOutputChannel(
 
   top.insertPorts({{topInsert, topInfo}});
   Value newTop = top.getBodyBlock()->getArgument(topInsert);
-  for (auto &leaf : leaves)
-    leaf.connection->erase();
+  for (auto &alias : aliasesToErase)
+    alias.second->erase();
   llvm::BitVector eraseTop(top.getNumPorts());
-  for (const auto &leaf : leaves)
-    eraseTop.set(leaf.topPort + 1);
+  for (unsigned port : topPorts)
+    eraseTop.set(port + 1);
   top.erasePorts(eraseTop);
 
   InstanceOp expanded = instance.cloneAndInsertPorts({{modelInsert, modelInfo}});
@@ -207,6 +217,93 @@ LogicalResult rewriteMultiportOutputChannel(
   return success();
 }
 } // namespace
+
+// Match wrapper aliases through retained source annotations and the actual
+// instance connections. The ordered producer identity must match in every
+// branch, and SFC's branch-specific prefix removal must yield the same leaf.
+std::optional<std::string> goldengate::getFAMEOutputAliasField(
+    const TopHierarchy &hierarchy, const FAMETopChannelPort &channel,
+    unsigned modelPort, unsigned topPort, std::string &error) {
+  const auto &binding = *channel.binding;
+  auto top = hierarchy.top;
+  auto model = binding.portGroup->module;
+  auto circuit = top->getParentOfType<CircuitOp>();
+  auto target = [&](unsigned port) {
+    return "~" + circuit.getName().str() + "|" + top.getName().str() +
+           ">" + top.getPortName(port).str();
+  };
+  std::string expected = removeCommonPrefix(
+      model.getPortName(modelPort),
+      binding.portGroup->name).str();
+  auto type = channel.type;
+  auto bits = type.getElementIndex("bits");
+  auto payload = bits ? dyn_cast<BundleType>(type.getElementType(*bits))
+                      : BundleType();
+  if (!payload || payload.getElements().size() != binding.instancePorts.size()) {
+    error = "FAME output alias has no ordered bundle payload";
+    return std::nullopt;
+  }
+  // ModelChannelBinding stores sorted physical indices. Payload fields retain
+  // source annotation order, which is the producer order used by SFC dedup.
+  llvm::SmallVector<unsigned> orderedPorts;
+  for (const auto &leaf : payload.getElements()) {
+    auto port = llvm::find_if(binding.instancePorts, [&](unsigned index) {
+      return removeCommonPrefix(model.getPortName(index), binding.portGroup->name) ==
+             leaf.name.getValue();
+    });
+    if (port == binding.instancePorts.end()) {
+      error = "FAME output alias payload leaf has no model port";
+      return std::nullopt;
+    }
+    orderedPorts.push_back(*port);
+  }
+  bool covered = false;
+  if (auto annotations = circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    for (auto attr : annotations) {
+      Annotation annotation(attr);
+      if (!annotation.isClass(AnnotationClasses::ChannelConnection)) continue;
+      auto sources = annotation.getMember<ArrayAttr>("sources");
+      if (!sources || !llvm::any_of(sources, [&](Attribute source) {
+            auto value = dyn_cast<StringAttr>(source);
+            return value && value.getValue() == target(topPort);
+          })) continue;
+      auto name = annotation.getMember<StringAttr>("globalName");
+      if (!name || sources.size() != binding.instancePorts.size()) {
+        error = "FAME output alias is not a complete ordered channel source";
+        return std::nullopt;
+      }
+      for (unsigned i = 0; i < sources.size(); ++i) {
+        auto source = dyn_cast<StringAttr>(sources[i]);
+        bool matched = false;
+        for (const auto &connection : hierarchy.connections) {
+          if (!source || connection.instance != binding.instance ||
+              connection.instancePort != orderedPorts[i] ||
+              source.getValue() != target(connection.topPort)) continue;
+          auto field = removeCommonPrefix(top.getPortName(connection.topPort),
+                                          name.getValue());
+          auto modelField = removeCommonPrefix(
+              model.getPortName(orderedPorts[i]),
+              binding.portGroup->name);
+          matched |= !field.empty() && field == modelField;
+        }
+        if (!matched) {
+          error = "FAME output alias branch differs in producer order or payload fields";
+          return std::nullopt;
+        }
+      }
+      covered = true;
+    }
+  unsigned aliases = 0;
+  for (const auto &connection : hierarchy.connections)
+    aliases += connection.instance == binding.instance &&
+               connection.instancePort == modelPort;
+  if (!covered && (aliases > 1 ||
+      removeCommonPrefix(top.getPortName(topPort), binding.globalName) != expected)) {
+    error = "FAME output alias is not an annotated bundle channel source";
+    return std::nullopt;
+  }
+  return expected;
+}
 
 LogicalResult goldengate::rewriteFAMEOutputChannel(
     const TopHierarchy &hierarchy, const FAMETopChannelPort &channel,

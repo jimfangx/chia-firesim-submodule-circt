@@ -5,6 +5,13 @@
 #include <string>
 
 namespace goldengate {
+// Resolve a grouped output alias to its payload leaf using branch annotations
+// and ordered SSA producer connections. No IR mutation; shared aliases must
+// belong to complete, compatible source branches.
+std::optional<std::string> getFAMEOutputAliasField(
+    const TopHierarchy &hierarchy, const FAMETopChannelPort &channel,
+    unsigned modelPort, unsigned topPort, std::string &error);
+
 // Replace scalar or grouped model outputs and their top-level connections with the
 // decoupled source port used by FAME1OutputChannel.
 // Wrapper ground-port DontTouch annotations and wrapper/model inner symbols
