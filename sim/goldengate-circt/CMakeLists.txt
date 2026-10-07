@@ -1420,6 +1420,8 @@ if(BUILD_TESTING)
   add_executable(goldengate-clock-channel-test
     test/Transforms/FAMEClockChannelTest.cpp
     lib/Transforms/FAMEClockChannel.cpp
+    lib/Transforms/SingleClockBridge.cpp
+    lib/Transforms/RationalClockTokenGenerator.cpp
     lib/Transforms/FAMEPipeChannel.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-clock-channel-test PRIVATE cxx_std_17)
@@ -1427,7 +1429,7 @@ if(BUILD_TESTING)
   target_include_directories(goldengate-clock-channel-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
   target_link_libraries(goldengate-clock-channel-test PRIVATE
-    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-clock-channel COMMAND goldengate-clock-channel-test)
   add_executable(goldengate-rational-clock-token-test
     test/Transforms/RationalClockTokenGeneratorTest.cpp

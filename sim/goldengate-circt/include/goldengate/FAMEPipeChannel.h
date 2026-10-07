@@ -22,6 +22,14 @@ mlir::LogicalResult addFAMEPipeWrapper(circt::firrtl::CircuitOp circuit,
                                       std::string &error);
 // Select the wrapper as the FIRRTL circuit top and move retained annotation
 // targets from its formerly direct FAMETop ports to the wrapper ports.
+// ChannelConnection.clock retains its inner module identity (only its circuit
+// name changes): a target Clock leaf is not a wrapper Boolean clock token.
+// Requires an inactive GGFAMEPipeWrapper and retained rawAnnotations. Consumes
+// no annotations; produces retargeted annotations and selects the circuit top.
+// Mutates circuit identity and annotation targets, preserving module IR and
+// target-domain identities. No analysis is required; cached circuit/target
+// analyses must be rebuilt after activation. Boundary endpoints name wrapper
+// ports while associated clocks continue to name inner target ports.
 mlir::LogicalResult activateFAMEPipeWrapper(
     circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

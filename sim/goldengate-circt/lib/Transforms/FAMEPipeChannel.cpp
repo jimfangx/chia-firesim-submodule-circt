@@ -351,7 +351,8 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
   std::string newCircuit = "~" + wrapperName.str();
   std::string oldModule = "|" + oldName;
   std::string newModule = "|" + wrapperName.str();
-  std::function<Attribute(Attribute)> retarget = [&](Attribute attr) -> Attribute {
+  std::function<Attribute(Attribute, bool)> retarget =
+      [&](Attribute attr, bool targetDomain) -> Attribute {
     if (auto string = dyn_cast<StringAttr>(attr)) {
       llvm::StringRef value = string.getValue();
       if (value == oldCircuit)
@@ -361,27 +362,35 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
       std::string suffix = value.drop_front(oldName.size() + 1).str();
       if (suffix == oldModule)
         return StringAttr::get(context, newCircuit + newModule);
-      if (llvm::StringRef(suffix).starts_with(oldModule + ">"))
+      if (!targetDomain && llvm::StringRef(suffix).starts_with(oldModule + ">"))
         suffix.replace(0, oldModule.size() + 1, newModule + ">");
       return StringAttr::get(context, newCircuit + suffix);
     }
     if (auto array = dyn_cast<ArrayAttr>(attr)) {
       SmallVector<Attribute> values;
       for (Attribute value : array)
-        values.push_back(retarget(value));
+        values.push_back(retarget(value, targetDomain));
       return ArrayAttr::get(context, values);
     }
     if (auto dict = dyn_cast<DictionaryAttr>(attr)) {
       SmallVector<NamedAttribute> values;
+      Annotation annotation(dict);
       for (NamedAttribute value : dict)
-        values.emplace_back(value.getName(), retarget(value.getValue()));
+        // A channel's associated clock names the retained target domain.
+        // SimWrapper.genClockChannel changes the wrapper payload to Vec[Bool],
+        // while the target still owns its scalar Clock / ClockRecord leaves.
+        // Only boundary endpoints move to wrapper ports; moving a clock leaf
+        // there either loses its Clock type or leaves an invalid record path.
+        values.emplace_back(value.getName(), retarget(value.getValue(),
+            targetDomain || (annotation.isClass(AnnotationClasses::ChannelConnection) &&
+                             value.getName().getValue() == "clock")));
       return DictionaryAttr::get(context, values);
     }
     return attr;
   };
   SmallVector<Attribute> annotations;
   for (Attribute annotation : raw)
-    annotations.push_back(retarget(annotation));
+    annotations.push_back(retarget(annotation, false));
   circuit->setAttr("rawAnnotations", ArrayAttr::get(context, annotations));
   circuit.setName(wrapperName);
   return success();
