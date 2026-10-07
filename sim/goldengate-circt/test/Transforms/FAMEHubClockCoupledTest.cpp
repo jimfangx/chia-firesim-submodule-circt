@@ -3,6 +3,8 @@
 // Evaluate FIRRTL connects, simultaneous host state and actual gate enables;
 // compare the trace with FAMEHubClockCoupledOracle.scala.
 #include "goldengate/FAMEInputChannel.h"
+#include "goldengate/FAMEOutputChannel.h"
+#include "goldengate/AnnotationClasses.h"
 #include "goldengate/FAMEClockEnable.h"
 #include "goldengate/FAMEClockGate.h"
 #include "goldengate/FAMEFiredState.h"
@@ -20,6 +22,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include <functional>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -54,9 +57,29 @@ struct Interpreter {
   Interpreter(FModuleOp t, FModuleOp m, InstanceOp instance) : top(t), model(m) {
     for (unsigned i = 0; i < m.getNumPorts(); ++i)
       aliases[m.getArgument(i)] = instance.getResult(i);
+    // Channelization emits aggregate connects. Project their actual fields,
+    // including ready's reversed flow, without rebuilding the wiring by hand.
+    OpBuilder builder(top.getContext());
+    std::function<void(Value, Value, Location)> connect =
+        [&](Value dest, Value src, Location loc) {
+      if (auto bundle = dyn_cast<BundleType>(dest.getType())) {
+        for (const auto &element : bundle.getElements()) {
+          auto d = field(builder, loc, dest, element.name.getValue());
+          auto s = field(builder, loc, src, element.name.getValue());
+          connect(element.isFlip ? s : d, element.isFlip ? d : s, loc);
+        }
+      } else {
+        require(drivers.emplace(key(dest), src).second, "multiple drivers");
+      }
+    };
     for (auto scope : {top, model})
-      for (auto c : scope.getOps<StrictConnectOp>())
-        require(drivers.emplace(key(c.getDest()), c.getSrc()).second, "multiple drivers");
+      for (auto &operation : llvm::make_early_inc_range(scope.getBodyBlock()->getOperations())) {
+        builder.setInsertionPoint(&operation);
+        if (auto c = dyn_cast<StrictConnectOp>(operation))
+          connect(c.getDest(), c.getSrc(), c.getLoc());
+        else if (auto c = dyn_cast<ConnectOp>(operation))
+          connect(c.getDest(), c.getSrc(), c.getLoc());
+      }
   }
   uint64_t eval(Value v) {
     auto k = key(v);
@@ -162,10 +185,8 @@ void outputValidRejections(MLIRContext &ctx) {
 
 void run(MLIRContext &ctx, bool reversed, const char *output) {
   std::string common = R"mlir(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
-    in %in0_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>,
-    in %in1_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>,
-    out %out0_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>,
-    out %out1_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>)mlir";
+    in %in0: !firrtl.uint<16>, in %in1: !firrtl.uint<16>,
+    out %out0: !firrtl.uint<16>, out %out1: !firrtl.uint<16>)mlir";
   auto payload = reversed ? "_1: clock, _0: clock" : "_0: clock, _1: clock";
   auto root = parseSourceString<ModuleOp>(
     "module { firrtl.circuit \"Top\" { firrtl.module @Top(" + common + ") {} "
@@ -177,20 +198,129 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
       %clock1 = firrtl.subfield %bits[_1] : !firrtl.bundle<)mlir" + payload + R"mlir(>
       %state0 = firrtl.reg %clock0 : !firrtl.clock, !firrtl.uint<16>
       %state1 = firrtl.reg %clock1 : !firrtl.clock, !firrtl.uint<16>
-      %input0 = firrtl.subfield %in0_sink[bits] : !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>
-      %input1 = firrtl.subfield %in1_sink[bits] : !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>
-      %sum0 = firrtl.add %state0, %input0 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
-      %sum1 = firrtl.add %state1, %input1 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
+      %sum0 = firrtl.add %state0, %in0 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
+      %sum1 = firrtl.add %state1, %in1 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
       %next0 = firrtl.bits %sum0 15 to 0 : (!firrtl.uint<17>) -> !firrtl.uint<16>
       %next1 = firrtl.bits %sum1 15 to 0 : (!firrtl.uint<17>) -> !firrtl.uint<16>
       firrtl.strictconnect %state0, %next0 : !firrtl.uint<16>
       firrtl.strictconnect %state1, %next1 : !firrtl.uint<16>
+      firrtl.strictconnect %out0, %next0 : !firrtl.uint<16>
+      firrtl.strictconnect %out1, %next1 : !firrtl.uint<16>
     } } })mlir", &ctx);
   require(bool(root), "coupled fixture parse");
   auto circuit = *root->getOps<CircuitOp>().begin();
   auto top = *circuit.getOps<FModuleOp>().begin();
   auto model = *std::next(circuit.getOps<FModuleOp>().begin());
   auto loc = model.getLoc(); OpBuilder b(&ctx); std::string error;
+  b.setInsertionPointToEnd(top.getBodyBlock());
+  auto instance = b.create<InstanceOp>(loc, model, "model");
+  for (unsigned i = 0; i < top.getNumPorts(); ++i) {
+    bool input = model.getPortDirection(i) == Direction::In;
+    b.create<StrictConnectOp>(loc, input ? instance.getResult(i) : top.getArgument(i),
+                             input ? top.getArgument(i) : instance.getResult(i));
+  }
+  // Use the real pre-FAME annotation boundary to discover dependencies and
+  // build both model and wrapper interfaces. Port indices and instances are
+  // invalidated by each rewrite; re-analyze only the unconsumed annotations.
+  SmallVector<Attribute> annotations;
+  for (StringRef name : {"in0", "in1", "out0", "out1"}) {
+    bool input = name.starts_with("in");
+    auto target = [&](StringRef module) {
+      return b.getStringAttr(("~Top|" + module + ">" + name).str());
+    };
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelPorts)),
+        b.getNamedAttr("localName", b.getStringAttr(name)),
+        b.getNamedAttr("ports", b.getArrayAttr({target("Model")}))}));
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr(name)),
+        b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+            b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+            b.getNamedAttr("latency", b.getI64IntegerAttr(0))})),
+        b.getNamedAttr("sources", b.getArrayAttr(input ? ArrayRef<Attribute>{} : ArrayRef<Attribute>{target("Top")})),
+        b.getNamedAttr("sinks", b.getArrayAttr(input ? ArrayRef<Attribute>{target("Top")} : ArrayRef<Attribute>{}))}));
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto selection = goldengate::analyzeFAMEDataSelection(circuit, model, error);
+  require(selection && selection->inputs.size() == 2 && selection->outputs.size() == 2,
+          "coupled data selection: " + error);
+  struct SelectedChannel { std::string globalName, localName; bool input; };
+  SmallVector<SelectedChannel> selected;
+  SmallVector<std::string> inputNames, outputNames;
+  SmallVector<goldengate::LocalChannelDependency> dependencies;
+  for (unsigned i = 0; i < selection->inputs.size(); ++i) {
+    const auto &entry = selection->inputs[i];
+    require(entry.localName == "in" + std::to_string(i) && entry.fieldCount == 1 &&
+            entry.kind == goldengate::ChannelKind::Pipe, "pre-FAME input selection differs");
+    selected.push_back({entry.globalName, entry.localName, true});
+    inputNames.push_back(entry.localName);
+  }
+  for (unsigned i = 0; i < selection->outputs.size(); ++i) {
+    const auto &entry = selection->outputs[i];
+    require(entry.localName == "out" + std::to_string(i) && entry.fieldCount == 1 &&
+            entry.dependency.inputChannels == std::vector<std::string>{"in" + std::to_string(i)},
+            "pre-FAME combinational channel dependencies differ");
+    dependencies.push_back(entry.dependency);
+    selected.push_back({entry.globalName, entry.localName, false});
+    outputNames.push_back(entry.localName);
+  }
+  for (const auto &next : selected) {
+    auto hierarchy = goldengate::analyzeTopHierarchy(circuit, error);
+    require(bool(hierarchy), error);
+    SmallVector<goldengate::ModelPortGroup> groups;
+    SmallVector<goldengate::GGChannelConnection, 0> connections;
+    for (auto attribute : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      Annotation annotation(attribute);
+      if (annotation.isClass(goldengate::AnnotationClasses::ChannelPorts)) {
+        auto group = goldengate::analyzeModelPortGroup(circuit, annotation, error);
+        require(bool(group), error);
+        groups.push_back(std::move(*group));
+      } else if (annotation.isClass(goldengate::AnnotationClasses::ChannelConnection)) {
+        auto connection = goldengate::analyzeChannelConnection(circuit, annotation, error);
+        require(bool(connection), error);
+        connections.push_back(std::move(*connection));
+      }
+    }
+    SmallVector<goldengate::ModelChannelBinding> bindings;
+    for (const auto &connection : connections) {
+      auto bound = goldengate::bindChannelToModels(connection, *hierarchy, groups, error);
+      require(bool(bound), error);
+      bindings.append(bound->begin(), bound->end());
+    }
+    auto plan = goldengate::analyzeFAMEPorts(*hierarchy, bindings, connections, {model}, error);
+    require(bool(plan), error);
+    const auto &planned = next.input ? plan->sinks : plan->sources;
+    auto channel = llvm::find_if(planned, [&](const auto &entry) {
+      return entry.binding->globalName == next.globalName;
+    });
+    require(channel != planned.end(), "selected data channel has no native port plan");
+    require(succeeded(next.input ?
+        goldengate::rewriteFAMEInputChannel(*hierarchy, *channel, error) :
+        goldengate::rewriteFAMEOutputChannel(*hierarchy, *channel, error)), error);
+    SmallVector<Attribute> remaining;
+    for (auto attribute : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      Annotation annotation(attribute);
+      auto global = annotation.getMember<StringAttr>("globalName");
+      auto local = annotation.getMember<StringAttr>("localName");
+      if ((!global || global.getValue() != next.globalName) &&
+          (!local || local.getValue() != next.localName))
+        remaining.push_back(attribute);
+    }
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(remaining));
+  }
+  require(circuit->getAttrOfType<ArrayAttr>("rawAnnotations").empty(),
+          "data channel annotations were not consumed");
+  instance = *top.getOps<InstanceOp>().begin();
+  for (unsigned i = 0; i < 4; ++i) {
+    auto name = std::string(i < 2 ? "in" : "out") + std::to_string(i % 2) +
+                (i < 2 ? "_sink" : "_source");
+    require(model.getPortName(2 + i) == name &&
+            top.getPortName(2 + i) == "model_" + name &&
+            model.getPorts()[2 + i].type == top.getPorts()[2 + i].type &&
+            isa<BundleType>(model.getPorts()[2 + i].type),
+            "native channelization produced an unexpected port identity/type");
+  }
   b.setInsertionPointToStart(model.getBodyBlock());
   auto bits = field(b, loc, model.getArgument(6), "bits");
   SmallVector<Value> raw(2), enabled(2), targetState;
@@ -202,37 +332,22 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
     require(succeeded(goldengate::addFAMEClockGate(circuit, model, name, error, token)), error);
     enabled[i] = goldengate::lookupFAMEClockEnable(model, name, error);
   }
-  SmallVector<goldengate::FAMEFiredChannel> channels{
-    {"in0", true, raw[0]}, {"in1", true, raw[1]},
-    {"out0", false, enabled[0]}, {"out1", false, enabled[1]}};
+  SmallVector<goldengate::FAMEFiredChannel> channels;
+  for (unsigned i = 0; i < inputNames.size(); ++i)
+    channels.push_back({inputNames[i], true, raw[i]});
+  for (unsigned i = 0; i < outputNames.size(); ++i)
+    channels.push_back({outputNames[i], false, enabled[i]});
   require(succeeded(goldengate::ensureFAMEFiredRegisters(model, channels, error)), error);
   require(succeeded(goldengate::rewriteFAMEFiredStates(model, channels, error)), error);
   require(succeeded(goldengate::rewriteFAMEOutputValids(model,
-              {{"out0", {"in0"}, {}, {}}, {"out1", {"in1"}, {}, {}}}, error)), error);
-  require(succeeded(goldengate::rewriteFAMEInputReadies(model, {"in0", "in1"}, error)), error);
+              dependencies, error)), error);
+  require(succeeded(goldengate::rewriteFAMEInputReadies(model, inputNames, error)), error);
   require(succeeded(goldengate::rewriteFAMEFinishing(model,
-              {"in0", "in1"}, {"out0", "out1"}, "bridge_clocks", error)), error);
+              inputNames, outputNames, "bridge_clocks", error)), error);
   b.setInsertionPointToEnd(model.getBodyBlock());
   for (auto r : model.getOps<RegOp>()) targetState.push_back(r.getResult());
   require(targetState.size() == 2, "target state missing");
-  for (unsigned i = 0; i < 2; ++i) {
-    auto sum = b.create<AddPrimOp>(loc, targetState[i],
-        field(b, loc, model.getArgument(2 + i), "bits"));
-    auto data = b.create<BitsPrimOp>(loc, sum, 15, 0);
-    b.create<StrictConnectOp>(loc, field(b, loc, model.getArgument(4 + i), "bits"), data);
-  }
-
   b.setInsertionPointToEnd(top.getBodyBlock());
-  auto instance = b.create<InstanceOp>(loc, model, "model");
-  for (unsigned i = 0; i < 2; ++i)
-    b.create<StrictConnectOp>(loc, instance.getResult(i), top.getArgument(i));
-  for (unsigned i = 2; i < 6; ++i)
-    for (StringRef member : {"ready", "valid", "bits"}) {
-      auto outer = field(b, loc, top.getArgument(i), member);
-      auto inner = field(b, loc, instance.getResult(i), member);
-      bool intoModel = (i < 4) != (member == "ready");
-      b.create<StrictConnectOp>(loc, intoModel ? inner : outer, intoModel ? outer : inner);
-    }
   auto clockPort = instance.getResult(6);
   auto ready = field(b, loc, clockPort, "ready");
   auto schedule = goldengate::analyzeRationalClockSchedule(

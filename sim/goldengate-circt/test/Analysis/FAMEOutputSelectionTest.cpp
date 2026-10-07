@@ -126,7 +126,7 @@ void run(MLIRContext &context, unsigned rejection) {
   group("tx_ready_local", {"ready"});
   group("rx_local", {"data", "inputValid"});
   group("rx_ready_local", {"reverseReady"});
-  group("trigger_local", {"trigger"});
+  group(rejection == 10 ? "rx_local" : "trigger_local", {"trigger"});
   group("other_input", {"data"}, "Other");
   group("other_print", {"printf"}, "Other");
   if (rejection == 3) group("ambiguous_print", {"printfB"});
@@ -174,7 +174,10 @@ void run(MLIRContext &context, unsigned rejection) {
   require(succeeded(verify(*root)), "output selection fixture invalid");
   auto before = dump(*root);
   std::string error;
-  auto selected = goldengate::analyzeFAMEOutputSelection(circuit, model, error);
+  auto dataSelection = goldengate::analyzeFAMEDataSelection(circuit, model, error);
+  auto selected = dataSelection
+      ? std::optional<SmallVector<goldengate::FAMEOutputSelection>>(dataSelection->outputs)
+      : std::nullopt;
   require(dump(*root) == before, "output selection mutated IR/annotations");
   if (rejection) {
     require(!selected && !error.empty(), "unsafe output selection accepted: " +
@@ -185,6 +188,20 @@ void run(MLIRContext &context, unsigned rejection) {
     return;
   }
   require(selected && selected->size() == 4, "expected four selected outputs: " + error);
+  require(dataSelection->inputs.size() == 3 &&
+              dataSelection->inputs[0].globalName == "tx_ready_global" &&
+              dataSelection->inputs[0].localName == "tx_ready_local" &&
+              dataSelection->inputs[0].kind == goldengate::ChannelKind::DecoupledReverse &&
+              dataSelection->inputs[0].fieldCount == 1 &&
+              dataSelection->inputs[1].globalName == "rx_global" &&
+              dataSelection->inputs[1].localName == "rx_local" &&
+              dataSelection->inputs[1].kind == goldengate::ChannelKind::DecoupledForward &&
+              dataSelection->inputs[1].fieldCount == 2 &&
+              dataSelection->inputs[2].globalName == "trigger_global" &&
+              dataSelection->inputs[2].localName == "trigger_local" &&
+              dataSelection->inputs[2].kind == goldengate::ChannelKind::Pipe &&
+              dataSelection->inputs[2].fieldCount == 1,
+          "input selection lost annotation order, model isolation or payload shape");
   const char *global[] = {"arbitrary_print_second", "tx_global", "rx_ready_global",
                           "arbitrary_print_first"};
   const char *local[] = {"print_local_b", "tx_local", "rx_ready_local", "print_local_a"};
@@ -333,14 +350,36 @@ void newlySynthesizedPrintBundle(MLIRContext &context) {
   require(succeeded(verify(*root)), "new Print bundle lowering produced invalid IR");
 }
 } // namespace
-int main() {
+int main(int argc, char **argv) {
   try {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    for (unsigned rejection = 0; rejection <= 9; ++rejection) run(context, rejection);
+    if (argc == 4 && StringRef(argv[1]) == "--data-selection") {
+      auto root = parseSourceFile<ModuleOp>(argv[2], &context);
+      require(bool(root), "data-selection boundary parse failed");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      FModuleOp model;
+      for (auto candidate : circuit.getOps<FModuleOp>())
+        if (candidate.getName() == argv[3]) model = candidate;
+      require(bool(model), "data-selection boundary model missing");
+      auto before = dump(*root);
+      std::string error;
+      auto selection = goldengate::analyzeFAMEDataSelection(circuit, model, error);
+      require(bool(selection), error);
+      require(before == dump(*root), "data selection mutated boundary");
+      for (const auto &input : selection->inputs)
+        llvm::outs() << "INPUT " << input.globalName << " " << input.localName
+                     << " " << input.fieldCount << '\n';
+      for (const auto &output : selection->outputs)
+        llvm::outs() << "OUTPUT " << output.globalName << " " << output.localName
+                     << " " << output.fieldCount << '\n';
+      return 0;
+    }
+    require(argc == 1, "usage: test [--data-selection boundary.mlir model]");
+    for (unsigned rejection = 0; rejection <= 10; ++rejection) run(context, rejection);
     newlySynthesizedPrintBundle(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
-                    "dependencies and model isolation passed; 9 unsafe selections "
+                    "dependencies, all data inputs and model isolation passed; 10 unsafe selections "
                     "rejected without mutation\n";
     return 0;
   } catch (const std::exception &e) {

@@ -1130,10 +1130,11 @@ int main(int argc, char **argv) {
       llvm::outs() << "Inferred CIRCT model ports in "
                    << inferredPortsIRPath << '\n';
 
-      // Snapshot annotation-selected outputs and all data input dependencies
+      // Snapshot annotation-selected inputs, outputs and data dependencies
       // before channelization changes port identities. This baseline path
       // currently supports one model/clock hub.
       llvm::SmallVector<goldengate::FAMEOutputSelection> selectedOutputs;
+      llvm::SmallVector<goldengate::FAMEInputSelection> selectedInputs;
       FModuleOp selectedOutputModel;
       for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {
         Annotation annotation(attr);
@@ -1155,11 +1156,12 @@ int main(int argc, char **argv) {
       }
       if (!selectedOutputModel)
         return fail("FAME output selection has no transformed model");
-      auto outputSelection = goldengate::analyzeFAMEOutputSelection(
+      auto dataSelection = goldengate::analyzeFAMEDataSelection(
           circuit, selectedOutputModel, error);
-      if (!outputSelection)
-        return fail("FAME output selection: " + error);
-      selectedOutputs = std::move(*outputSelection);
+      if (!dataSelection)
+        return fail("FAME data selection: " + error);
+      selectedInputs = std::move(dataSelection->inputs);
+      selectedOutputs = std::move(dataSelection->outputs);
       llvm::json::Array outputInventory;
       for (const auto &output : selectedOutputs) {
         llvm::json::Array dependencies;
@@ -1181,6 +1183,21 @@ int main(int argc, char **argv) {
           llvm::json::Object{{"model", selectedOutputModel.getName().str()},
                              {"outputs", std::move(outputInventory)}}));
       selectionOut.close();
+      llvm::json::Array inputInventory;
+      for (const auto &input : selectedInputs)
+        inputInventory.push_back(llvm::json::Object{
+            {"globalName", input.globalName}, {"localName", input.localName},
+            {"fieldCount", input.fieldCount}});
+      llvm::SmallString<256> inputSelectionPath(outputDir);
+      llvm::sys::path::append(inputSelectionPath, "fame-input-selection.json");
+      llvm::raw_fd_ostream inputSelectionOut(inputSelectionPath, selectionWriteError);
+      if (selectionWriteError)
+        return fail("cannot write FAME input selection: " +
+                    selectionWriteError.message());
+      inputSelectionOut << llvm::formatv("{0:2}\n", llvm::json::Value(
+          llvm::json::Object{{"model", selectedOutputModel.getName().str()},
+                             {"inputs", std::move(inputInventory)}}));
+      inputSelectionOut.close();
 
       auto currentAnnotations =
           circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
@@ -1411,13 +1428,12 @@ int main(int argc, char **argv) {
       llvm::outs() << "Gated the CIRCT FAME target clock in "
                    << clockGateIRPath << '\n';
 
-      // Rewrite the first six scalar sinks, the block-device response bundle,
-      // the UART receive sink, the AXI ready sinks, and the AXI response
-      // bundles, the TSI channels, and the trace trigger pipes. Resolve
-      // targets after each mutation so port indices remain current.
+      // Convert every selected data input. Selection is captured before any
+      // port mutation; each iteration rebuilds bindings from retained targets.
+      // Channel names, payload sizes and ordinals carry no selection semantics.
       llvm::SmallVector<std::string> convertedInputs;
-      llvm::SmallVector<std::string> convertedGlobalInputs;
-      for (unsigned channelIndex = 0; channelIndex < 17; ++channelIndex) {
+      unsigned channelIndex = 0;
+      for (const auto &selectedInput : selectedInputs) {
       auto dataHierarchy = goldengate::analyzeTopHierarchy(circuit, error);
       if (!dataHierarchy)
         return fail("FAME data hierarchy: " + error);
@@ -1429,63 +1445,21 @@ int main(int argc, char **argv) {
         if (!annotation.isClass(goldengate::AnnotationClasses::ChannelConnection))
           continue;
         auto name = annotation.getMember<mlir::StringAttr>("globalName");
-        if (!name || name.getValue() == clockChannel->name ||
-            llvm::is_contained(convertedGlobalInputs, name.getValue().str()))
-          continue;
-        if (channelIndex == 6 && name.getValue() != "ep_bdev_resp_fwd")
-          continue;
-        if (channelIndex == 7 && name.getValue() != "ep_1_uart_rxd")
-          continue;
-        if (channelIndex == 8 && name.getValue() != "ep_2_axi4_ar_rev")
-          continue;
-        if (channelIndex == 9 && name.getValue() != "ep_2_axi4_aw_rev")
-          continue;
-        if (channelIndex == 10 && name.getValue() != "ep_2_axi4_w_rev")
-          continue;
-        if (channelIndex == 11 && name.getValue() != "ep_2_axi4_b_fwd")
-          continue;
-        if (channelIndex == 12 && name.getValue() != "ep_2_axi4_r_fwd")
-          continue;
-        if (channelIndex == 13 && name.getValue() != "ep_3_tsi_in_fwd")
-          continue;
-        if (channelIndex == 14 && name.getValue() != "ep_3_tsi_out_rev")
-          continue;
-        if (channelIndex == 15 && name.getValue() != "tracerv_triggerDebit")
-          continue;
-        if (channelIndex == 16 && name.getValue() != "tracerv_triggerCredit")
+        if (!name || name.getValue() != selectedInput.globalName)
           continue;
         auto candidate = goldengate::analyzeChannelConnection(
             circuit, annotation, error);
         if (!candidate)
           return fail("FAME data channel: " + error);
-        if (((channelIndex < 6 || (channelIndex >= 7 && channelIndex <= 10)) &&
-             (candidate->kind == goldengate::ChannelKind::Pipe ||
-              candidate->kind == goldengate::ChannelKind::DecoupledReverse) &&
-             candidate->sinks.size() == 1) ||
-            (channelIndex == 6 &&
-             candidate->kind == goldengate::ChannelKind::DecoupledForward &&
-             candidate->sinks.size() == 3) ||
-            (channelIndex == 11 &&
-             candidate->kind == goldengate::ChannelKind::DecoupledForward &&
-             candidate->sinks.size() == 4) ||
-            (channelIndex == 12 &&
-             candidate->kind == goldengate::ChannelKind::DecoupledForward &&
-             candidate->sinks.size() == 6) ||
-            (channelIndex == 13 &&
-             candidate->kind == goldengate::ChannelKind::DecoupledForward &&
-             candidate->sinks.size() == 2) ||
-            (channelIndex == 14 &&
-             candidate->kind == goldengate::ChannelKind::DecoupledReverse &&
-             candidate->sinks.size() == 1) ||
-            (channelIndex >= 15 && channelIndex <= 16 &&
-             candidate->kind == goldengate::ChannelKind::Pipe &&
-             candidate->sinks.size() == 1)) {
-          dataChannel = std::move(*candidate);
-          break;
-        }
+        if (dataChannel || candidate->kind != selectedInput.kind ||
+            candidate->sinks.size() != selectedInput.fieldCount)
+          return fail("FAME input selection changed during channelization: " +
+                      selectedInput.globalName);
+        dataChannel = std::move(*candidate);
       }
       if (!dataChannel)
-        return fail("FAME block-device response input channel is missing");
+        return fail("selected FAME input channel is missing: " +
+                    selectedInput.globalName);
       llvm::SmallVector<goldengate::ModelPortGroup> dataGroups;
       for (auto attr : dataAnnotations) {
         Annotation annotation(attr);
@@ -1502,7 +1476,10 @@ int main(int argc, char **argv) {
       if (!dataBindings || dataBindings->size() != 1)
         return fail("FAME data model binding: " + error);
       auto dataGroup = *dataBindings->front().portGroup;
-      if (dataGroup.ports.size() != dataChannel->sinks.size())
+      if (dataGroup.name != selectedInput.localName ||
+          dataGroup.module.getOperation() != selectedOutputModel.getOperation() ||
+          dataGroup.direction != Direction::In ||
+          dataGroup.ports.size() != dataChannel->sinks.size())
         return fail("FAME input model port count differs from its channel");
       llvm::SmallVector<goldengate::GGChannelConnection, 0> dataChannels;
       dataChannels.push_back(*dataChannel);
@@ -1609,7 +1586,7 @@ int main(int argc, char **argv) {
         return fail("FAME data channel produced invalid FIRRTL IR");
       llvm::SmallString<256> dataIRPath(outputDir);
       llvm::SmallString<256> dataAnnotationPath(outputDir);
-      llvm::StringRef ordinal = channelIndex == 0   ? "first"
+      std::string ordinal = channelIndex == 0   ? "first"
                                 : channelIndex == 1 ? "second"
                                 : channelIndex == 2 ? "third"
                                 : channelIndex == 3 ? "fourth"
@@ -1625,7 +1602,8 @@ int main(int argc, char **argv) {
                                 : channelIndex == 13 ? "fourteenth"
                                 : channelIndex == 14 ? "fifteenth"
                                 : channelIndex == 15 ? "sixteenth"
-                                                     : "seventeenth";
+                                : channelIndex == 16 ? "seventeenth"
+                                                     : std::to_string(channelIndex + 1);
       llvm::sys::path::append(
           dataIRPath, "post-fame-" + ordinal + "-input-channel.mlir");
       llvm::sys::path::append(
@@ -1684,7 +1662,7 @@ int main(int argc, char **argv) {
       llvm::outs() << "Added CIRCT FAME input controls for "
                    << dataChannel->name << " in " << dataControlIRPath << '\n';
       convertedInputs.push_back(dataGroup.name);
-      convertedGlobalInputs.push_back(dataChannel->name);
+      ++channelIndex;
       }
 
       // Retain the input-only cycle equation as a verified intermediate
@@ -1699,7 +1677,9 @@ int main(int argc, char **argv) {
         return fail("FAME partial cycle completion produced invalid FIRRTL IR");
       llvm::SmallString<256> finishingIRPath(outputDir);
       llvm::sys::path::append(finishingIRPath,
-                              "post-fame-seventeen-input-finishing.mlir");
+                              convertedInputs.size() == 17
+                                  ? "post-fame-seventeen-input-finishing.mlir"
+                                  : "post-fame-input-finishing.mlir");
       std::error_code finishingWriteError;
       llvm::raw_fd_ostream finishingOut(finishingIRPath,
                                         finishingWriteError);

@@ -65,6 +65,27 @@ struct FAMEOutputSelection {
   LocalChannelDependency dependency;
 };
 
+struct FAMEInputSelection {
+  std::string globalName;
+  std::string localName;
+  ChannelKind kind;
+  unsigned fieldCount;
+};
+
+// Snapshot every bound data channel in connection annotation order. The
+// explicit clock channel is excluded; names and payload counts remain valid
+// while subsequent port rewrites invalidate the original binding indices.
+// No annotations consumed/produced or IR mutation. Output dependencies use
+// the normalized scalar target graph, before any decoupled ports are added.
+struct FAMEDataSelection {
+  llvm::SmallVector<FAMEInputSelection> inputs;
+  llvm::SmallVector<FAMEOutputSelection> outputs;
+};
+
+std::optional<FAMEDataSelection>
+analyzeFAMEDataSelection(circt::firrtl::CircuitOp circuit,
+                        circt::firrtl::FModuleOp model, std::string &error);
+
 std::optional<llvm::SmallVector<FAMEOutputSelection>>
 analyzeFAMEOutputSelection(circt::firrtl::CircuitOp circuit,
                            circt::firrtl::FModuleOp model, std::string &error);

@@ -300,6 +300,66 @@ Run the fired-state boundary binary as
 `--output-valids <candidate.mlir> <fame-output-selection.json>` to reconstruct
 the predicates. The coupled/Scala invocation remains as described above.
 
+## Annotation-selected data channelization (iteration 22)
+
+`analyzeFAMEDataSelection` snapshots both input and output data channels before
+port mutation, retaining their global/local identities, channel kind, payload
+field count and graph-derived output dependencies. Explicit target-clock
+channels are excluded. Duplicate local input names now fail without mutation;
+the selection test also checks connection annotation order, heterogeneous
+channel kinds and isolation from another model's inputs. The existing output
+selection API delegates to this shared analysis.
+
+The active `--compile-baseline` path uses this snapshot to channelize every
+selected data input. It previously selected exactly 17 inputs with hardcoded
+Rocket channel names, payload counts and ordinal-specific conditions. Each
+iteration now resolves the selected global identity against fresh annotations
+and hierarchy bindings, checking its local identity and shape before the
+existing CIRCT rewrite. Input controls and cycle completion use the resulting
+complete input list. Historical intermediate filenames remain for the
+17-input Rocket case; they no longer select channels.
+
+The coupled fixture starts with scalar data ports and their actual arithmetic
+drivers. It discovers channel dependencies through the production analysis,
+then calls the real input/output port rewrites with fresh bindings after each
+mutation. Its interpreter projects the resulting aggregate connects, including
+flipped ready fields. Both 8192-cycle traces exactly match fresh executions of
+the Scala `FAMETransform`/rational-token oracle, with the same hashes and payload
+coverage recorded for iteration 21. Both native circuits lower to Verilog.
+The ClockRecord interface and domain-to-lane assignment are still constructed
+in the fixture; data channelization and dependencies are no longer supplied
+by hand.
+
+A local invocation of the native compiler on the current harness handoff emits
+simulator RTL and collateral successfully. Its `fame-input-selection.json`
+matches the 17 annotation-selected inputs in the saved pre-FAME boundary.
+Compared with the immutable U250 `design/FireSim-generated.sv` named above,
+the emitted FireSim module matches all 17 input and 25 output handshake
+identities, all 84 data-handshake directions/widths and all 72 payload ports
+present in SFC RTL. SFC removes some unused payload fields that CIRCT retains;
+no byte-for-byte RTL claim is made. All 25 output-valid predicates and the
+clock-ready predicate match after expanding wire aliases and normalizing
+Boolean conjunction/disjunction order. Completion also matches when the
+explicit native clock-valid input is set to the bridge's constant valid token,
+which SFC folds away. The recreated 42 fired-register contracts pass 2688
+reset/completion/handshake cases on this new candidate.
+
+The comparison uses the current harness handoff as candidate input and reads
+the immutable SFC RTL as reference. An initial direct import of the immutable
+raw `*.fir`/`*.anno.json` pair was rejected for duplicate `BridgeAnnotation`s
+on `PeekPokeBridge`; the fixture was left untouched. This raw-import issue
+does not establish compatibility with that original annotation container.
+
+Evidence is in the mutable generated-source
+`iteration22-channelization-oracle/`: native/Scala traces and FIRRTL outputs,
+`compiler-candidate/`, `compiler.{stdout,stderr}.log`,
+`rocket-data-selection.log`, `rocket-finishing.log`, `rocket-output-valids.log`,
+`comparison.json` and `tests-final.log`. Eleven focused CTest checks pass after
+the final build. Build logs are `goldengate-circt-build/iteration22-*.log`.
+The selection boundary command is
+`goldengate-fame-output-selection-test --data-selection <pre-FAME.mlir> FireSim`.
+No manager gates were launched.
+
 ## Remaining work
 
 The hub FAME boundary now uses all ordered clock domains. The active compiler
@@ -309,8 +369,9 @@ is recorded in [RationalClockBridge.md](RationalClockBridge.md); the inner
 scheduler comparison is in
 [RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next feed
 the coupled payload fixture through production channelization and dependency
-analysis, replacing its manually constructed channel interface/dependency set.
-The baseline's data/bridge
-configuration remains Rocket specific.
+analysis for its clock ports as well: start with scalar clocks and output
+aliases, then use the clock-domain analyses and hub-clock port rewrite to
+derive the ClockRecord and lane assignments. The baseline supports one
+model/clock hub and its bridge configuration remains Rocket specific.
 Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing differential
 remain incomplete.

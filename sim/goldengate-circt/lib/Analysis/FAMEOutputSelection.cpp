@@ -5,15 +5,15 @@
 
 using namespace circt::firrtl;
 
-std::optional<llvm::SmallVector<goldengate::FAMEOutputSelection>>
-goldengate::analyzeFAMEOutputSelection(CircuitOp circuit, FModuleOp model,
-                                       std::string &error) {
+std::optional<goldengate::FAMEDataSelection>
+goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
+                                    std::string &error) {
   auto hierarchy = analyzeTopHierarchy(circuit, error);
   if (!hierarchy)
     return std::nullopt;
   auto annotations = circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
   if (!annotations) {
-    error = "FAME output selection needs retained channel annotations";
+    error = "FAME data selection needs retained channel annotations";
     return std::nullopt;
   }
   llvm::SmallVector<ModelPortGroup> groups;
@@ -27,8 +27,9 @@ goldengate::analyzeFAMEOutputSelection(CircuitOp circuit, FModuleOp model,
     groups.push_back(std::move(*group));
   }
   llvm::SmallVector<ModelChannelBinding> modelBindings;
-  llvm::SmallVector<FAMEOutputSelection> outputs;
-  std::set<std::string> globalNames, localOutputs;
+  FAMEDataSelection selection;
+  auto &outputs = selection.outputs;
+  std::set<std::string> globalNames, localOutputs, localInputs;
   std::set<unsigned> boundPorts;
   for (auto attr : annotations) {
     Annotation annotation(attr);
@@ -57,8 +58,16 @@ goldengate::analyzeFAMEOutputSelection(CircuitOp circuit, FModuleOp model,
           return std::nullopt;
         }
       modelBindings.push_back(binding);
-      if (binding.portGroup->direction != Direction::Out)
+      if (binding.portGroup->direction == Direction::In) {
+        if (!localInputs.insert(binding.portGroup->name).second) {
+          error = "duplicate local FAME input: " + binding.portGroup->name;
+          return std::nullopt;
+        }
+        selection.inputs.push_back({channel->name, binding.portGroup->name,
+                                    channel->kind,
+                                    unsigned(channel->sinks.size())});
         continue;
+      }
       if (!localOutputs.insert(binding.portGroup->name).second) {
         error = "duplicate local FAME output: " + binding.portGroup->name;
         return std::nullopt;
@@ -88,5 +97,14 @@ goldengate::analyzeFAMEOutputSelection(CircuitOp circuit, FModuleOp model,
     }
     output.dependency = *dependency;
   }
-  return outputs;
+  return selection;
+}
+
+std::optional<llvm::SmallVector<goldengate::FAMEOutputSelection>>
+goldengate::analyzeFAMEOutputSelection(CircuitOp circuit, FModuleOp model,
+                                     std::string &error) {
+  auto selection = analyzeFAMEDataSelection(circuit, model, error);
+  if (!selection)
+    return std::nullopt;
+  return std::move(selection->outputs);
 }

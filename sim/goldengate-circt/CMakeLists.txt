@@ -502,6 +502,10 @@ if(BUILD_TESTING)
     COMMAND goldengate-fame-hub-clock-domains-test --reversed)
   add_executable(goldengate-fame-hub-clock-coupled-test
     test/Transforms/FAMEHubClockCoupledTest.cpp
+    lib/Analysis/FAMEOutputSelection.cpp lib/Analysis/FAMEPortAnalysis.cpp
+    lib/Analysis/ChannelAnalysis.cpp lib/Analysis/ModelAnalysis.cpp
+    lib/Analysis/HierarchyAnalysis.cpp lib/Analysis/CombDependencyAnalysis.cpp
+    lib/Support/TargetUtils.cpp lib/Transforms/FAMEOutputChannel.cpp
     lib/Transforms/FAMEInputChannel.cpp lib/Transforms/FAMEFiredState.cpp
     lib/Transforms/FAMEFinishing.cpp lib/Transforms/FAMEInputReady.cpp
     lib/Transforms/FAMEOutputValid.cpp lib/Transforms/RationalClockTokenGenerator.cpp)
