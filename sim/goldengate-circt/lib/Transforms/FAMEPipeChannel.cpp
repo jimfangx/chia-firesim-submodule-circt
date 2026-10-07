@@ -309,6 +309,27 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
       error = "wrapper is missing a PipeChannel module for " + channel.name;
       return failure();
     }
+    // The wrapper's positional connects are the SimWrapper PipeChannel ABI.
+    // A symbol match alone is insufficient: preflight the complete typed
+    // interface before creating any wrapper or instance operation.
+    auto *context = circuit.getContext();
+    auto bit = UIntType::get(context, 1, false);
+    SmallVector<Type> types{ClockType::get(context), bit, bit, bit,
+                           channel.payload, bit, bit, channel.payload};
+    StringRef names[] = {"clock", "reset", "io_in_ready", "io_in_valid",
+                         "io_in_bits", "io_out_ready", "io_out_valid",
+                         "io_out_bits"};
+    bool compatible = pipe.getNumPorts() == types.size();
+    for (unsigned i = 0; compatible && i < types.size(); ++i)
+      compatible = pipe.getPortName(i) == names[i] &&
+          pipe.getPortType(i) == types[i] &&
+          pipe.getPortDirection(i) ==
+              ((i == 2 || i == 6 || i == 7) ? Direction::Out : Direction::In);
+    if (!compatible) {
+      error = "PipeChannel interface differs from boundary payload for " +
+              channel.name;
+      return failure();
+    }
     pipes.push_back(pipe);
   }
   for (Operation &op : circuit.getBodyBlock()->getOperations())

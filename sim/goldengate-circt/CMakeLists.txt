@@ -524,6 +524,10 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-fame-hub-clock-coupled COMMAND goldengate-fame-hub-clock-coupled-test)
   add_test(NAME goldengate-fame-hub-clock-coupled-reversed
     COMMAND goldengate-fame-hub-clock-coupled-test --reversed)
+  add_test(NAME goldengate-fame-hub-queued-pipe
+    COMMAND goldengate-fame-hub-clock-coupled-test --queued)
+  add_test(NAME goldengate-fame-hub-queued-pipe-reversed
+    COMMAND goldengate-fame-hub-clock-coupled-test --queued-reversed)
   add_executable(goldengate-fame-channel-clock-domains-test
     test/Transforms/FAMEChannelClockDomainsTest.cpp
     lib/Analysis/FAMEChannelClockDomains.cpp lib/Analysis/CombDependencyAnalysis.cpp

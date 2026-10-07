@@ -273,6 +273,37 @@ void checkRejectedTypes(MLIRContext &context) {
   require(succeeded(verify(*root)), "distinct payload definitions failed verification");
 }
 
+// A compatible symbol must also implement the complete positional queue ABI.
+// A failure must leave the circuit unchanged, including earlier valid queues.
+void checkRejectedQueueInterfaces(MLIRContext &context) {
+  for (unsigned mutation = 0; mutation < 5; ++mutation) {
+    auto root = fixture(context);
+    auto circuit = circuitOf(*root);
+    std::string error;
+    require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
+    auto original = moduleNamed(circuit, "GGFAMEPipe32");
+    auto originalPorts = original.getPorts();
+    SmallVector<PortInfo> ports(originalPorts.begin(), originalPorts.end());
+    if (mutation == 0) ports.pop_back();
+    if (mutation == 1) ports[4].type = UIntType::get(&context, 31);
+    if (mutation == 4) ports[4].type = SIntType::get(&context, 32);
+    if (mutation == 2) ports[5].direction = Direction::Out;
+    if (mutation == 3) std::swap(ports[3], ports[5]);
+    OpBuilder builder(original);
+    builder.create<FModuleOp>(original.getLoc(), original.getNameAttr(),
+                             original.getConventionAttr(), ports);
+    original.erase();
+    std::string before;
+    llvm::raw_string_ostream(before) << *root;
+    auto result = goldengate::addFAMEPipeWrapper(circuit, error);
+    require(failed(result) && error.find("interface differs") != std::string::npos,
+            "queue interface mutation " + std::to_string(mutation) + ": " + error);
+    std::string after;
+    llvm::raw_string_ostream(after) << *root;
+    require(before == after, "incompatible queue partially constructed wrapper");
+  }
+}
+
 // Evaluate the generated FIRRTL operations, then compare each edge with a
 // token FIFO reference. This exercises the emitted queue rather than a copy
 // of its Boolean recurrence. The reference enqueues only when not full, just
@@ -375,6 +406,7 @@ int main(int argc, char **argv) {
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
     checkWrapper(context);
+    checkRejectedQueueInterfaces(context);
     checkRejectedAnnotations(context);
     checkRejectedTypes(context);
     for (unsigned width : {0, 1, 3, 32, 40, 64})

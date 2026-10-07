@@ -33,6 +33,8 @@ mlir::LogicalResult addFAMEBoundaryPipeChannels(
     circt::firrtl::CircuitOp circuit, std::string &error);
 // Connect each annotated boundary pipe in a simulator-facing wrapper, using
 // the endpoint's port direction to distinguish model and bridge sources.
+// Validate every queue definition's port names, directions and exact payload
+// types before creating the wrapper; incompatible definitions fail atomically.
 // ReadyValid channels initially pass through and are replaced by the following
 // ReadyValidChannel transform. Clock channels still pass through.
 mlir::LogicalResult addFAMEPipeWrapper(circt::firrtl::CircuitOp circuit,

@@ -459,12 +459,11 @@ calls `addClockBridge`, which maps ordered rational lanes, their source/sink
 targets and the fastest-clock counter. The actual Scala bridge comparison
 is recorded in [RationalClockBridge.md](RationalClockBridge.md); the inner
 scheduler comparison is in
-[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next feed
-the coupled payload fixture through production data PipeChannel queues, while
-retaining the complete clock bridge mapping and checking payload delivery under
-independent stalls. The current fixture consumes data annotations before
-SimulationMapping and preserves its direct data schedule; queue behavior is
-covered separately. The baseline supports one
+[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). The coupled
+payload fixture now also covers four production data queues; the differential
+is recorded in [FAMEHubQueuedPipe.md](FAMEHubQueuedPipe.md). Next extend that
+queued schedule to latency-one reset seeding and passive aggregate payloads.
+The baseline supports one
 model/clock hub and its bridge configuration remains Rocket specific.
 Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing differential
 remain incomplete.

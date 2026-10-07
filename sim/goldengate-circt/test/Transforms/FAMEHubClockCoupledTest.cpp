@@ -46,6 +46,7 @@ Value field(OpBuilder &b, Location loc, Value port, StringRef name) {
 // results, so ready feeds the producer through the constructed FIRRTL graph.
 struct Interpreter {
   SmallVector<FModuleOp> scopes;
+  SmallVector<FModuleOp> instanceCopies;
   llvm::DenseMap<Value, Value> aliases;
   std::map<std::string, Value> drivers;
   std::map<std::string, uint64_t> memo;
@@ -60,8 +61,9 @@ struct Interpreter {
     return std::to_string(reinterpret_cast<uintptr_t>(v.getAsOpaquePointer()));
   }
   Interpreter(CircuitOp circuit, FModuleOp top) {
-    // Each real module has one instance in this fixture. Keep aliases from
-    // block arguments to actual instance results across every wrapper stage.
+    // Elaborate repeated definitions into private interpreter copies so each
+    // queue instance owns independent registers. The exported compiler IR
+    // retains the shared definition and the actual instance connections.
     std::function<void(FModuleOp)> visit = [&](FModuleOp scope) {
       require(!llvm::is_contained(scopes, scope), "multiply instantiated fixture module");
       scopes.push_back(scope);
@@ -70,6 +72,10 @@ struct Interpreter {
         for (auto module : circuit.getOps<FModuleOp>())
           if (module.getName() == instance.getModuleName()) child = module;
         if (!child) continue; // AbstractClockGate extmodule: observe its CE.
+        if (llvm::is_contained(scopes, child)) {
+          child = cast<FModuleOp>(child->clone());
+          instanceCopies.push_back(child);
+        }
         for (unsigned i = 0; i < child.getNumPorts(); ++i)
           aliases[child.getArgument(i)] = instance.getResult(i);
         visit(child);
@@ -103,6 +109,9 @@ struct Interpreter {
         else if (auto c = dyn_cast<ConnectOp>(operation))
           connect(c.getDest(), c.getSrc(), c.getLoc());
       }
+  }
+  ~Interpreter() {
+    for (auto copy : instanceCopies) copy->destroy();
   }
   uint64_t eval(Value v) {
     auto k = key(v);
@@ -212,7 +221,7 @@ void outputValidRejections(MLIRContext &ctx) {
   llvm::errs() << "Passed two atomic flipped-valid rejections\n";
 }
 
-void run(MLIRContext &ctx, bool reversed, const char *output) {
+void run(MLIRContext &ctx, bool reversed, bool queued, const char *output) {
   std::string common = R"mlir(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
     in %in0: !firrtl.uint<16>, in %in1: !firrtl.uint<16>,
     out %out0: !firrtl.uint<16>, out %out1: !firrtl.uint<16>,
@@ -501,7 +510,23 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
           b.getNamedAttr("clocks", b.getArrayAttr(clockInfo))})),
       b.getNamedAttr("channelMapping", b.getDictionaryAttr({
           b.getNamedAttr("clocks", b.getStringAttr("bridge_clocks"))}))});
-  circuit->setAttr("rawAnnotations", b.getArrayAttr({boundaryClock.getDictionary(&ctx), bridge}));
+  SmallVector<Attribute> boundaryAnnotations{boundaryClock.getDictionary(&ctx), bridge};
+  if (queued) {
+    for (const auto &channel : channels) {
+      auto endpoint = "~Top|Top>model_" + channel.name +
+          (channel.isInput ? "_sink.bits" : "_source.bits");
+      boundaryAnnotations.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+          b.getNamedAttr("globalName", b.getStringAttr(channel.name)),
+          b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+              b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+              b.getNamedAttr("latency", b.getI64IntegerAttr(0))})),
+          b.getNamedAttr(channel.isInput ? "sinks" : "sources", b.getArrayAttr({b.getStringAttr(endpoint)}))}));
+    }
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(boundaryAnnotations));
+    require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(boundaryAnnotations));
   require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
   require(succeeded(goldengate::addFAMEClockChannel(circuit, error)), error);
   require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
@@ -578,16 +603,22 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
       sim.memo[sim.key(top.getArgument(4 + i)) + ".ready"] = i == 0 ?
           cycle % 97 >= 29 && cycle % 7 != 0 : cycle % 83 >= 37 && cycle % 11 != 0;
     }
-    auto evalField = [&](unsigned port, StringRef member) {
-      auto k = sim.key(top.getArgument(port)) + "." + member.str();
+    auto evalPortField = [&](FModuleOp scope, unsigned port, StringRef member) {
+      auto k = sim.key(scope.getArgument(port)) + "." + member.str();
       return sim.memo.count(k) ? sim.memo.at(k) : sim.eval(sim.drivers.at(k));
+    };
+    auto evalField = [&](unsigned port, StringRef member) {
+      return evalPortField(top, port, member);
+    };
+    auto hubField = [&](unsigned port, StringRef member) {
+      return evalPortField(model, port, member);
     };
     unsigned mask = sim.eval(tokens[0]) | sim.eval(tokens[1]) << 1;
     unsigned done = sim.eval(finishing), enableMask = 0, firedMask = 0, inReady = 0, outValid = 0, ceMask = 0;
     for (unsigned i = 0; i < 2; ++i) {
       enableMask |= sim.eval(enabled[i]) << i;
-      inReady |= evalField(2 + i, "ready") << i;
-      outValid |= evalField(4 + i, "valid") << i;
+      inReady |= hubField(2 + i, "ready") << i;
+      outValid |= hubField(4 + i, "valid") << i;
       ceMask |= sim.eval(gates.lookup("bridge_clocks_" + std::to_string(i), false).getResult(1)) << i;
     }
     for (unsigned i = 0; i < channels.size(); ++i)
@@ -595,7 +626,16 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
     llvm::outs() << "TRACE " << cycle << ' ' << mask << ' ' << done << ' ' << enableMask << ' '
       << firedMask << ' ' << inReady << ' ' << outValid << ' ' << ceMask << ' '
       << sim.eval(targetState[0]) << ' ' << sim.eval(targetState[1]) << ' '
-      << evalField(4, "bits") << ' ' << evalField(5, "bits") << '\n';
+      << hubField(4, "bits") << ' ' << hubField(5, "bits");
+    unsigned externalReady = evalField(2, "ready") | evalField(3, "ready") << 1;
+    unsigned externalValid = evalField(4, "valid") | evalField(5, "valid") << 1;
+    if (queued)
+      llvm::outs() << ' ' << externalReady << ' ' << externalValid << ' '
+        << ((externalValid & 1) ? evalField(4, "bits") : 0) << ' '
+        << ((externalValid & 2) ? evalField(5, "bits") : 0) << ' '
+        << (hubField(2, "valid") | hubField(3, "valid") << 1) << ' '
+        << hubField(2, "bits") << ' ' << hubField(3, "bits");
+    llvm::outs() << '\n';
     require(sim.eval(targetState[0]) == expectedState[0] &&
             sim.eval(targetState[1]) == expectedState[1], "target-cycle state trajectory differs");
     require(!reset || !ceMask, "host reset advanced target state");
@@ -606,17 +646,18 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
     // Observe each actual output handshake, including early independent firing.
     for (unsigned i = 0; i < 2; ++i) {
       auto data = evalField(4 + i, "bits");
-      require(data == ((expectedState[i] + inputBits[i]) & 65535),
+      auto hubInput = hubField(2 + i, "bits");
+      require(hubField(4 + i, "bits") == ((expectedState[i] + hubInput) & 65535),
               "output payload does not reflect target state and current input");
       if (!reset && blocked[i])
-        require((outValid & (1 << i)) && data == blockedBits[i],
+        require((externalValid & (1 << i)) && data == blockedBits[i],
                 "valid output token changed while backpressured");
-      blocked[i] = !reset && (outValid & (1 << i)) && !evalField(4 + i, "ready");
+      blocked[i] = !reset && (externalValid & (1 << i)) && !evalField(4 + i, "ready");
       blockedBits[i] = data;
-      if (pending[i] && (inReady & (1 << i))) { pending[i] = false; ++inputCount[i]; }
-      if (evalField(4 + i, "ready") && (outValid & (1 << i)) && !reset) ++outputCount[i];
+      if (pending[i] && (externalReady & (1 << i))) { pending[i] = false; ++inputCount[i]; }
+      if (evalField(4 + i, "ready") && (externalValid & (1 << i)) && !reset) ++outputCount[i];
       edges[i] += (ceMask >> i) & 1;
-      if ((ceMask >> i) & 1) expectedState[i] = (expectedState[i] + inputBits[i]) & 65535;
+      if ((ceMask >> i) & 1) expectedState[i] = (expectedState[i] + hubInput) & 65535;
     }
     sim.edge();
     // Check the connected producer holds its next edge token while blocked.
@@ -636,13 +677,16 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
 int main(int argc, char **argv) {
   try {
     require(argc <= 3 && (argc == 1 || StringRef(argv[1]) == "--normal" ||
-                         StringRef(argv[1]) == "--reversed"),
-            "usage: FAMEHubClockCoupledTest [--normal|--reversed [output.mlir]]");
+                         StringRef(argv[1]) == "--reversed" || StringRef(argv[1]) == "--queued" ||
+                         StringRef(argv[1]) == "--queued-reversed"),
+            "usage: FAMEHubClockCoupledTest [--normal|--reversed|--queued|--queued-reversed [output.mlir]]");
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     clockRecordRejections(ctx);
     outputValidRejections(ctx);
-    bool reversed = argc > 1 && StringRef(argv[1]) == "--reversed";
-    run(ctx, reversed, argc > 2 ? argv[2] : nullptr);
+    bool reversed = argc > 1 && (StringRef(argv[1]) == "--reversed" ||
+                                StringRef(argv[1]) == "--queued-reversed");
+    bool queued = argc > 1 && StringRef(argv[1]).starts_with("--queued");
+    run(ctx, reversed, queued, argc > 2 ? argv[2] : nullptr);
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
