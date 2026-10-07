@@ -1168,8 +1168,12 @@ int main(int argc, char **argv) {
         llvm::json::Array dependencies;
         for (const auto &input : output.dependency.inputChannels)
           dependencies.push_back(input);
+        llvm::json::Array aliases;
+        for (const auto &alias : output.globalAliases)
+          aliases.push_back(alias);
         outputInventory.push_back(llvm::json::Object{
             {"globalName", output.globalName}, {"localName", output.localName},
+            {"globalAliases", std::move(aliases)},
             {"fieldCount", output.fieldCount},
             {"inputChannels", std::move(dependencies)}});
       }
@@ -1778,10 +1782,12 @@ int main(int argc, char **argv) {
                                               rename.oldModel, rename.newModel);
         rewrittenOutputAnnotations.push_back(annotation.getAttr());
       }
-      if (outputTopRenames != expectedFields ||
+      if (outputTopRenames != expectedFields * (1 + selectedOutput.globalAliases.size()) ||
           outputModelRenames != expectedFields ||
-          outputValidRenames != (expectedKind == goldengate::ChannelKind::DecoupledForward) ||
-          outputReadyRenames != (expectedKind == goldengate::ChannelKind::DecoupledReverse))
+          outputValidRenames != (expectedKind == goldengate::ChannelKind::DecoupledForward) *
+                                   (1 + selectedOutput.globalAliases.size()) ||
+          outputReadyRenames != (expectedKind == goldengate::ChannelKind::DecoupledReverse) *
+                                   (1 + selectedOutput.globalAliases.size()))
         return fail("FAME output annotation targets were not unique");
       circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(
           &context, rewrittenOutputAnnotations));
@@ -4956,12 +4962,21 @@ int main(int argc, char **argv) {
     return fail("invalid FAME top port plan: " + fameError);
   if (rewriteOutputChannel) {
     llvm::StringRef name(argv[7]);
+    auto requested = llvm::find_if(typedBindings, [&](const auto &binding) {
+      return binding.globalName == name &&
+             binding.portGroup->direction == Direction::Out;
+    });
     auto selected = llvm::find_if(famePlan->sources, [&](const auto &port) {
-      return port.binding->globalName == name;
+      return requested != typedBindings.end() &&
+             port.binding->instance == requested->instance &&
+             port.binding->portGroup == requested->portGroup;
     });
     if (name.empty() || selected == famePlan->sources.end())
       return fail("FAME output channel is missing: " + name.str());
     const auto &binding = *selected->binding;
+    unsigned branchCount = llvm::count_if(typedBindings, [&](const auto &entry) {
+      return entry.instance == binding.instance && entry.portGroup == binding.portGroup;
+    });
     if (binding.instancePorts.empty())
       return fail("FAME output channel has no model ports");
     auto model = binding.portGroup->module;
@@ -5022,7 +5037,6 @@ int main(int argc, char **argv) {
     unsigned topTargets = 0, modelTargets = 0;
     for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {
       Annotation annotation(attr);
-      auto globalName = annotation.getMember<mlir::StringAttr>("globalName");
       auto localName = annotation.getMember<mlir::StringAttr>("localName");
       auto rename = [&](llvm::StringRef member, llvm::StringRef from,
                         llvm::StringRef to) {
@@ -5044,8 +5058,7 @@ int main(int argc, char **argv) {
           annotation.setMember(member, mlir::ArrayAttr::get(&context, updated));
         return changed;
       };
-      if (annotation.isClass(goldengate::AnnotationClasses::ChannelConnection) &&
-          globalName && globalName.getValue() == name)
+      if (annotation.isClass(goldengate::AnnotationClasses::ChannelConnection))
         for (const auto &entry : renames)
           topTargets += rename("sources", entry.oldTop, entry.newTop);
       // SFC's RenameMap also updates handshake cross references.
@@ -5066,7 +5079,7 @@ int main(int argc, char **argv) {
           modelTargets += rename("ports", entry.oldModel, entry.newModel);
       annotations.push_back(annotation.getAttr());
     }
-    if (topTargets != renames.size() || modelTargets != renames.size())
+    if (topTargets != renames.size() * branchCount || modelTargets != renames.size())
       return fail("FAME output channel annotation targets were not unique");
     circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(&context, annotations));
     if (mlir::failed(mlir::verify(*module)))

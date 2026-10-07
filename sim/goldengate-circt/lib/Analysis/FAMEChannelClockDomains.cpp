@@ -38,6 +38,7 @@ goldengate::analyzeFAMEChannelClockDomains(
   SmallVector<FAMEChannelClockDomain> result;
   std::set<std::string> globals;
   std::set<std::pair<std::string, Direction>> locals;
+  std::set<const ModelPortGroup *> outputGroups;
   for (auto attr : raw) {
     Annotation anno(attr);
     if (!anno.isClass(AnnotationClasses::ChannelConnection)) continue;
@@ -53,6 +54,11 @@ goldengate::analyzeFAMEChannelClockDomains(
     for (const auto &binding : *bindings) {
       const auto &group = *binding.portGroup;
       if (group.module != model) continue;
+      // Shared output branches use one local producer FSM and therefore one
+      // domain assignment. bindChannelToModels checks each branch's clock.
+      if (group.direction == Direction::Out &&
+          !outputGroups.insert(binding.portGroup).second)
+        continue;
       if (!locals.emplace(group.name, group.direction).second || !group.clockPort) {
         error = "missing or duplicate associated channel clock: " + group.name;
         return std::nullopt;

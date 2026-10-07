@@ -133,11 +133,11 @@ void run(MLIRContext &context, unsigned rejection) {
   if (rejection == 5) annotations.erase(annotations.begin());
   auto channel = [&](StringRef name, StringRef kind,
                      ArrayRef<StringRef> sources, ArrayRef<StringRef> sinks,
-                     StringRef valid = "", StringRef ready = "") {
+                     StringRef valid = "", StringRef ready = "", unsigned latency = 0) {
     SmallVector<NamedAttribute> info{
         b.getNamedAttr("class", b.getStringAttr(kind))};
     if (kind == AnnotationClasses::PipeChannel)
-      info.push_back(b.getNamedAttr("latency", b.getI64IntegerAttr(0)));
+      info.push_back(b.getNamedAttr("latency", b.getI64IntegerAttr(latency)));
     if (!valid.empty()) {
       bool source = !sources.empty();
       info.push_back(b.getNamedAttr(source ? "validSource" : "validSink",
@@ -169,7 +169,19 @@ void run(MLIRContext &context, unsigned rejection) {
   channel("other_input_global", AnnotationClasses::PipeChannel, {}, {"otherData"});
   if (rejection == 8)
     channel("second_claim_on_print_b", AnnotationClasses::PipeChannel,
-            {"printfB"}, {});
+            {"printfB"}, {}, "", "", 1);
+  if (rejection == 11 || rejection == 12)
+    channel("tx_alias", AnnotationClasses::DecoupledForwardChannel,
+            rejection == 12 ? ArrayRef<StringRef>{"forwardData", "forwardValid"}
+                            : ArrayRef<StringRef>{"forwardValid", "forwardData"},
+            {}, "forwardValid", "ready");
+  if (rejection == 13)
+    channel("changed_kind", AnnotationClasses::PipeChannel,
+            {"forwardValid", "forwardData"}, {});
+  if (rejection == 14)
+    channel("partial_payload", AnnotationClasses::PipeChannel, {"forwardData"}, {});
+  if (rejection == 15)
+    channel("input_alias", AnnotationClasses::DecoupledReverseChannel, {}, {"ready"});
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   require(succeeded(verify(*root)), "output selection fixture invalid");
   auto before = dump(*root);
@@ -179,12 +191,9 @@ void run(MLIRContext &context, unsigned rejection) {
       ? std::optional<SmallVector<goldengate::FAMEOutputSelection>>(dataSelection->outputs)
       : std::nullopt;
   require(dump(*root) == before, "output selection mutated IR/annotations");
-  if (rejection) {
+  if (rejection && rejection != 8 && rejection != 11) {
     require(!selected && !error.empty(), "unsafe output selection accepted: " +
                                           std::to_string(rejection));
-    if (rejection == 8)
-      require(error == "two FAME channels claim model port: printfB",
-              "shared output port did not fail at the channel ownership check");
     return;
   }
   require(selected && selected->size() == 4, "expected four selected outputs: " + error);
@@ -222,6 +231,18 @@ void run(MLIRContext &context, unsigned rejection) {
                 output.dependency.unresolvedCauses.empty(),
             "output lost data/ready/trigger dependencies");
   }
+  require((*selected)[0].globalAliases ==
+              (rejection == 8 ? std::vector<std::string>{"second_claim_on_print_b"}
+                              : std::vector<std::string>{}),
+          "shared output branch did not retain one producer and its dependencies");
+  require((*selected)[1].globalAliases ==
+              (rejection == 11 ? std::vector<std::string>{"tx_alias"}
+                               : std::vector<std::string>{}),
+          "multiport shared producer lost ordered branch identity");
+  if (rejection == 8) {
+    llvm::outs() << "PRODUCER printfB branches 2\n";
+  }
+  if (rejection == 11) return;
   error.clear();
   auto otherSelection = goldengate::analyzeFAMEOutputSelection(circuit, other, error);
   require(otherSelection && otherSelection->size() == 1 &&
@@ -373,13 +394,18 @@ int main(int argc, char **argv) {
       for (const auto &output : selection->outputs)
         llvm::outs() << "OUTPUT " << output.globalName << " " << output.localName
                      << " " << output.fieldCount << '\n';
+      for (const auto &output : selection->outputs) {
+        llvm::outs() << "BRANCH " << output.globalName << " " << output.localName << '\n';
+        for (const auto &alias : output.globalAliases)
+          llvm::outs() << "BRANCH " << alias << " " << output.localName << '\n';
+      }
       return 0;
     }
     require(argc == 1, "usage: test [--data-selection boundary.mlir model]");
-    for (unsigned rejection = 0; rejection <= 10; ++rejection) run(context, rejection);
+    for (unsigned rejection = 0; rejection <= 15; ++rejection) run(context, rejection);
     newlySynthesizedPrintBundle(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
-                    "dependencies, all data inputs and model isolation passed; 10 unsafe selections "
+                    "dependencies, scalar/multiport shared producers, all data inputs and model isolation passed; 13 unsafe selections "
                     "rejected without mutation\n";
     return 0;
   } catch (const std::exception &e) {

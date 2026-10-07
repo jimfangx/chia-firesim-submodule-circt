@@ -102,6 +102,26 @@ void fixture(MLIRContext &ctx) {
   for (const auto &a : *assignments)
     require(a.modelClockName == (StringRef(a.localName).ends_with("0") ? "clock0" : "clock1"),
             "clock identity followed port or annotation order");
+  // A second global output on this same clock must reuse the producer's
+  // assignment. Every branch still has to agree with its local clock.
+  Annotation alias(annos[1]);
+  alias.setMember("globalName", b.getStringAttr("out1_alias"));
+  annos.push_back(alias.getAttr());
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
+  before = dump(*root);
+  error.clear();
+  auto shared = goldengate::analyzeFAMEChannelClockDomains(circuit, model, domains, error);
+  require(shared && shared->size() == 4 && dump(*root) == before,
+          "shared producer created another clock-domain FSM: " + error);
+  alias.setMember("clock", b.getStringAttr("~Top|Top>alias0"));
+  annos.back() = alias.getAttr();
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
+  before = dump(*root); error.clear();
+  require(!goldengate::analyzeFAMEChannelClockDomains(circuit, model, domains, error) &&
+              !error.empty() && dump(*root) == before,
+          "shared producer's different clock accepted");
+  annos.pop_back();
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
   // All rejections must leave the boundary unchanged.
   auto aliasConnect = *std::next(model.getOps<StrictConnectOp>().begin());
   Value original = aliasConnect.getSrc();

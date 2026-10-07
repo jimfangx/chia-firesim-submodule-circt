@@ -31,6 +31,8 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
   auto &outputs = selection.outputs;
   std::set<std::string> globalNames, localOutputs, localInputs;
   std::set<unsigned> boundPorts;
+  llvm::SmallVector<const ModelPortGroup *> outputGroups;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> outputOrders;
   for (auto attr : annotations) {
     Annotation annotation(attr);
     if (!annotation.isClass(AnnotationClasses::ChannelConnection))
@@ -51,6 +53,34 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
       auto boundModule = binding.portGroup->module;
       if (boundModule.getOperation() != model.getOperation())
         continue;
+      if (binding.portGroup->direction == Direction::Out) {
+        // InferModelPorts has already deduplicated (clock, ordered ports).
+        // Binding matches port sets, so check order again before sharing a
+        // producer. Sorting here would silently accept reversed payloads.
+        llvm::SmallVector<unsigned> orderedPorts;
+        for (const auto &source : channel->sources)
+          for (const auto &connection : hierarchy->connections)
+            if (source.port && source.module == hierarchy->top &&
+                connection.topPort == *source.port &&
+                connection.instance == binding.instance)
+              orderedPorts.push_back(connection.instancePort);
+        auto previous = llvm::find(outputGroups, binding.portGroup);
+        if (previous != outputGroups.end()) {
+          unsigned index = previous - outputGroups.begin();
+          auto &output = outputs[index];
+          if (orderedPorts != outputOrders[index] ||
+              output.kind != channel->kind ||
+              output.fieldCount != channel->sources.size()) {
+            error = "shared FAME output changes payload order or kind: " +
+                    channel->name;
+            return std::nullopt;
+          }
+          output.globalAliases.push_back(channel->name);
+          continue;
+        }
+        outputGroups.push_back(binding.portGroup);
+        outputOrders.push_back(std::move(orderedPorts));
+      }
       for (unsigned port : binding.instancePorts)
         if (!boundPorts.insert(port).second) {
           error = "two FAME channels claim model port: " +
@@ -73,7 +103,7 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
         return std::nullopt;
       }
       outputs.push_back({channel->name, binding.portGroup->name, channel->kind,
-                         unsigned(channel->sources.size()), {}});
+                         unsigned(channel->sources.size()), {}, {}});
     }
   }
   auto dependencies = analyzeLocalChannelDependencies(model, modelBindings);

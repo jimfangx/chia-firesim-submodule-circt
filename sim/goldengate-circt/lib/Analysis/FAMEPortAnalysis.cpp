@@ -183,6 +183,18 @@ goldengate::analyzeFAMEPorts(
     return std::nullopt;
   }
 
+  auto orderedSources = [&](const GGChannelConnection &channel,
+                            const ModelChannelBinding &binding) {
+    llvm::SmallVector<unsigned> ports;
+    for (const auto &endpoint : channel.sources)
+      for (const auto &connection : hierarchy.connections)
+        if (endpoint.port && endpoint.module == top &&
+            connection.topPort == *endpoint.port &&
+            connection.instance == binding.instance)
+          ports.push_back(connection.instancePort);
+    return ports;
+  };
+
   for (const auto &binding : bindings) {
     auto model = binding.portGroup->module;
     if (!llvm::is_contained(transformedModules, model))
@@ -192,10 +204,6 @@ goldengate::analyzeFAMEPorts(
     std::string portName = instance.getName().str() + "_" +
                            binding.portGroup->name +
                            (source ? "_source" : "_sink");
-    if (!newNames.insert(portName).second) {
-      error = "two transformed channels claim top port " + portName;
-      return std::nullopt;
-    }
     auto channel = llvm::find_if(channels, [&](const GGChannelConnection &c) {
       return c.name == binding.globalName;
     });
@@ -206,8 +214,30 @@ goldengate::analyzeFAMEPorts(
     auto type = channelPortType(*channel, source, top.getContext(), error);
     if (!type)
       return std::nullopt;
-    auto &ports = source ? plan.sources : plan.sinks;
-    ports.push_back({&binding, std::move(portName), *type});
+    if (newNames.insert(portName).second) {
+      auto &ports = source ? plan.sources : plan.sinks;
+      ports.push_back({&binding, std::move(portName), *type});
+    } else {
+      // Multiple global branches may describe the same local output. SFC
+      // creates one host source port, while preserving every branch annotation.
+      auto previous = llvm::find_if(plan.sources, [&](const auto &port) {
+        return port.portName == portName;
+      });
+      auto previousChannel = previous == plan.sources.end() ? channels.end()
+          : llvm::find_if(channels, [&](const auto &entry) {
+              return entry.name == previous->binding->globalName;
+            });
+      if (!source || previous == plan.sources.end() ||
+          previous->binding->instance != binding.instance ||
+          previous->binding->portGroup != binding.portGroup ||
+          previousChannel == channels.end() || previousChannel->kind != channel->kind ||
+          previous->type != *type ||
+          orderedSources(*previousChannel, *previous->binding) !=
+              orderedSources(*channel, binding)) {
+        error = "two transformed channels claim top port " + portName;
+        return std::nullopt;
+      }
+    }
 
     for (unsigned modelPort : binding.instancePorts) {
       bool found = false;

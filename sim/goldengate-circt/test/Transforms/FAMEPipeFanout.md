@@ -174,12 +174,59 @@ candidate IR boundaries are gzip-compressed, retaining the compared wrapper.
 
 The harness-owned iteration 28 gates passed the smoke, portable suite (90,141
 checks, `0x78194504c338c229`), and Rocket suite (90,805 checks,
-`0x5f3744639d41ea35`). Iteration 29 changes await harness verification, and the
+`0x5f3744639d41ea35`). The harness also reported those iteration 29 gates passed; the
 UART-bearing SFC differential baseline remains pending.
 
-This supplies discovery for the post-FAME boundary. Pre-FAME shared producers
-still fail native output selection and exclusive-output rewrite checks. The
-next smallest step is deduplicating equal output groups during selection and
-channelizing their common producer once, renaming every branch to that source.
+This supplies discovery for the post-FAME boundary. Pre-FAME output selection
+now deduplicates identical ordered model payloads on the same associated
+clock, retains additional global branch names in `globalAliases`, and computes
+dependencies once per producer. Clock-domain analysis validates every branch's
+clock and supplies one assignment per producer. The top-port planner also
+creates one source port per shared producer, checking binding, type, kind and
+ordered source identity before reusing it. Source annotation renaming in
+the compiler accounts for all branches referencing the same scalar top port.
+`FAMEOutputSelectionTest.cpp` checks scalar and multiport sharing, unchanged
+dependencies, reversed payload order, changed kind, partial overlap, and input
+ownership; the scalar case also channelizes the selected producer through the
+real FIRRTL rewrite. `FAMEChannelClockDomainsTest.cpp` checks that sharing adds
+no domain FSM and a different-clock branch fails without mutation.
+`FAMESharedProducerOracle.scala` executes unchanged production InferModelPorts
+and FAMETransform host renames: shared scalar and aggregate payloads each have
+one local output, both scalar branches resolve to the same model/top source,
+and changed clocks, reversed order, and partial overlap fail. Scala's aggregate
+representative name depends on map iteration; comparisons use payload identity.
+
+Iteration 30 evidence is under the mutable generated-source directory's
+`iteration30-shared-producer/`. Four focused CTests pass. Native and freshly
+executed Scala scalar fixtures both report `PRODUCER printfB branches 2`.
+The native compiler also ingests the oracle's exact
+`scala/post-infer-model-ports.sfc.fir` and `.json`, plans one source port, and
+channelizes it when requested by the second global branch name. Both branch
+mappings, both output connection targets, the output model-group target, and
+the single UInt8 model/top source ports match production
+`scala/post-host-renames.sfc.json`. This comparison covers output FAME
+annotations; other annotation classes are outside the standalone rewrite's
+comparison. `producer-comparison.json` records the compared targets.
+The fresh Rocket selection retains its 25 output names, payload sizes and
+dependencies; it contains no shared output groups. Comparing its
+`post-infer-model-ports.mlir` against immutable U250
+`design/FireSim-generated.sv` matches all 17 input and 25 output clock FSM
+assignments, including phase and reset. The four queue interfaces and 22
+singleton valid/ready bindings also match that RTL. These recorded Rocket
+boundaries do not exercise shared producers; the production Scala fixtures
+provide that comparison. The fresh native compiler emits simulator RTL and
+collateral with empty stderr. Iteration 30 manager gates await the harness, and
+the UART-bearing SFC differential baseline remains pending.
+The final candidate is `compiler-candidate-final/`; its remaining-fanout
+annotations are unchanged from iteration 29. Clock results are in
+`golden-clock-comparison-final.stdout`, and queue results are in
+`golden-interface-comparison.json`. Completed large MLIR boundaries are
+gzip-compressed, retaining the two compared boundaries.
+
+Physical output channelization still requires one top connection per scalar
+model port. Distinct top aliases of a common model producer remain unsupported,
+as do shared groups mixing channel kinds (Scala's deduper ignores kind). The
+next smallest step is collapsing those physical aliases into one source port
+and renaming each branch before post-FAME fanout discovery.
 Mixed fanout also still needs bridge bindings to resolve each external queue
 output independently from the retained upstream producer identity.

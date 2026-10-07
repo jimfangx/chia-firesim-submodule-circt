@@ -5,6 +5,7 @@
 #include "goldengate/CombDependencyAnalysis.h"
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace goldengate {
 // The top-level channel interface that FAMETransform will create. These are
@@ -63,6 +64,9 @@ struct FAMEOutputSelection {
   ChannelKind kind;
   unsigned fieldCount;
   LocalChannelDependency dependency;
+  // Additional global branches sharing this local producer, in connection
+  // annotation order. One local output selection means one producer FSM.
+  std::vector<std::string> globalAliases;
 };
 
 struct FAMEInputSelection {
