@@ -1310,7 +1310,6 @@ int main(int argc, char **argv) {
           *clockHierarchy, *clockBindings, clockChannels, clockModels, error);
       if (!clockPlan || clockPlan->sinks.size() != 1)
         return fail("FAME clock port plan: " + error);
-      auto newModelClock = clockGroup->name + "_sink";
       if (failed(goldengate::rewriteFAMEHubClockChannel(
               *clockHierarchy, clockPlan->sinks.front(), *clockDomains,
               enableAutoILA, error)))
@@ -1362,56 +1361,13 @@ int main(int argc, char **argv) {
       auto clockModel = dyn_cast<FModuleOp>(clockGroup->module.getOperation());
       if (!clockModel)
         return fail("FAME target clock model is not an internal module");
-      std::optional<unsigned> channelPort;
-      for (unsigned i = 0; i < clockModel.getNumPorts(); ++i)
-        if (clockModel.getPortName(i) == newModelClock)
-          channelPort = i;
-      if (!channelPort)
-        return fail("FAME target clock channel port is missing");
-      mlir::OpBuilder clockBuilder(&clockModel.getBodyBlock()->front());
-      auto clockPayload = clockBuilder.create<SubfieldOp>(
-          clockModel.getLoc(),
-          clockModel.getBodyBlock()->getArgument(*channelPort), "bits");
-      std::map<std::string, mlir::Value> rawClockTokens, inputClockEnables;
-      for (const auto &domain : *clockDomains) {
-        mlir::Value bits = clockPayload.getResult();
-        if (!domain.payloadField.empty())
-          bits = clockBuilder.create<SubfieldOp>(
-              clockModel.getLoc(), bits, domain.payloadField).getResult();
-        rawClockTokens.emplace(domain.modelClockName, bits);
-        auto flag = clockBuilder.create<AsUIntPrimOp>(clockModel.getLoc(), bits);
-        inputClockEnables.emplace(domain.modelClockName, flag.getResult());
-        if (failed(goldengate::addFAMEClockEnable(
-                clockModel, domain.modelClockName, flag.getResult(), error)))
-          return fail("FAME target clock enable: " + error);
-      }
-      if (failed(mlir::verify(*module)))
-        return fail("FAME target clock enable produced invalid FIRRTL IR");
-      llvm::SmallString<256> clockEnableIRPath(outputDir);
-      llvm::sys::path::append(clockEnableIRPath,
-                              "post-fame-clock-enable.mlir");
-      std::error_code clockEnableWriteError;
-      llvm::raw_fd_ostream clockEnableOut(clockEnableIRPath,
-                                         clockEnableWriteError);
-      if (clockEnableWriteError)
-        return fail("cannot write FAME clock-enable MLIR: " +
-                    clockEnableWriteError.message());
-      module->print(clockEnableOut);
-      clockEnableOut << '\n';
-      clockEnableOut.close();
-      llvm::outs() << "Added CIRCT FAME target clock enable in "
-                   << clockEnableIRPath << '\n';
-
-      for (const auto &domain : *clockDomains) {
-        if (failed(goldengate::addFAMEClockGate(
-                circuit, clockModel, domain.modelClockName, error,
-                rawClockTokens.at(domain.modelClockName))))
-          return fail("FAME target clock gate: " + error);
-        if (failed(goldengate::addFAMEClockConstraint(
-                circuit, clockModel, domain.modelClockName,
-                domain.clockInfo, error)))
-          return fail("FAME hub clock XDC: " + error);
-      }
+      auto clockControls = goldengate::constructFAMEHubClockControls(
+          circuit, clockModel, clockGroup->name, *clockDomains, error);
+      if (!clockControls)
+        return fail(error);
+      std::map<std::string, mlir::Value> inputClockEnables;
+      for (const auto &control : *clockControls)
+        inputClockEnables.emplace(control.modelClockName, control.inputEnable);
       if (failed(mlir::verify(*module)))
         return fail("FAME target clock gate produced invalid FIRRTL IR");
       llvm::SmallString<256> clockGateIRPath(outputDir);

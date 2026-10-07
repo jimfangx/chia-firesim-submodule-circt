@@ -360,6 +360,55 @@ The selection boundary command is
 `goldengate-fame-output-selection-test --data-selection <pre-FAME.mlir> FireSim`.
 No manager gates were launched.
 
+## Shared production hub clock controls (iteration 23)
+
+`constructFAMEHubClockControls` now owns the active compiler's raw Clock
+selectors, UInt token flags, buffered enable registers, abstract gates and
+generated-clock constraint attributes. It checks the complete scalar Clock or
+passive ClockRecord payload against ordered domain metadata before creating
+any controls. The result associates raw input and buffered output flags with
+the original model clock identity. Malformed shape/order metadata fails without
+mutation; later construction failures do not promise rollback. The combined
+driver boundary is `post-fame-clock-gate.mlir`; the former enable-only dump is
+no longer emitted.
+
+The coupled fixture now starts with scalar clock ports and output aliases.
+Production domain and associated-clock analyses capture identities before
+`rewriteFAMEHubClockChannel` constructs the ClockRecord. Data fired controls
+select the shared helper's raw/buffered flags through these captured identities.
+Output aliases are internalized and checked against their actual gate outputs.
+Five malformed control metadata cases per annotation order leave IR unchanged.
+The producer schedule and lane fields come from the ordered domain records.
+For local producer integration the wrapper clock input becomes a same-type
+internal wire, retaining the channel rewrite's aggregate connect and flipped
+ready flow. This does not yet exercise the complete `addClockBridge` mapping.
+
+Both 8192-cycle native traces exactly match fresh executions of the preserved
+Scala oracle: normal SHA256
+`0d6d75877b969a9f85a257631bb8c29083ff312a1c0a6c827286590b5869c8d4`
+and reversed SHA256
+`8b62879eceff156a37298af0d8556a6eccad199cd566a9c6e34258ac18b62be2`.
+Both native circuits lower through firtool. An attempted direct input-clock
+association failed native dependency analysis and an executable Scala variant;
+the complete fixture keeps the oracle's output-alias associations.
+
+A fresh local invocation of the actual native compiler emits Rocket RTL and
+collateral. Against the immutable U250 `design/FireSim-generated.sv` named
+above, all 17 raw-input and 25 buffered-output clock assignments match. The
+emitted clock-ready and completion predicates also match after wire expansion
+and Boolean normalization, setting clock-valid to the bridge's constant valid
+token as in iteration 22. Against the immutable
+`design/FireSim-generated.implementation.xdc`, all three commands match clock
+name, host-clock source, gate output, divide-by-one and setup/hold values.
+The generated instance hierarchy spelling differs: the candidate retains
+additional simulator wrappers, whose path is resolved by InstanceGraph.
+
+Evidence is in mutable `iteration23-clock-boundary/`: `compiler-candidate/`,
+`compiler.{stdout,stderr}.log`, native/Scala normal and reversed traces,
+native MLIR/SV outputs, `rocket-domains.log`, `comparison.json`,
+`build-final.log` and `tests-final.log`. All 11 focused CTest checks pass.
+No harness-owned manager gates were launched in this iteration.
+
 ## Remaining work
 
 The hub FAME boundary now uses all ordered clock domains. The active compiler
@@ -368,10 +417,9 @@ targets and the fastest-clock counter. The actual Scala bridge comparison
 is recorded in [RationalClockBridge.md](RationalClockBridge.md); the inner
 scheduler comparison is in
 [RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next feed
-the coupled payload fixture through production channelization and dependency
-analysis for its clock ports as well: start with scalar clocks and output
-aliases, then use the clock-domain analyses and hub-clock port rewrite to
-derive the ClockRecord and lane assignments. The baseline supports one
+the coupled payload fixture through the complete production `addClockBridge`
+mapping and ClockRecord-to-BoolVector adaptation, preserving the same trace
+comparison under stalls and reversed annotation order. The baseline supports one
 model/clock hub and its bridge configuration remains Rocket specific.
 Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing differential
 remain incomplete.

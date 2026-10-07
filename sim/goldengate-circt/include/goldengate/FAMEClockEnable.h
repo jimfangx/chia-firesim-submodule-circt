@@ -2,10 +2,32 @@
 #pragma once
 
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "goldengate/FAMEPortAnalysis.h"
 #include <map>
 #include <string>
 
 namespace goldengate {
+struct FAMEHubClockControl {
+  std::string modelClockName;
+  mlir::Value inputEnable;
+  mlir::Value outputEnable;
+};
+
+// Requires a channelized hub, host controls and ordered pre-channelization
+// domain metadata. Validates the complete passive Clock/ClockRecord payload
+// against that order before selecting any lane. Consumes/produces no retained
+// annotations; creates enable registers, abstract gates and generated-clock
+// constraint attributes, replacing target clock reads through field identity.
+// Hierarchy and port analyses are preserved; state/operation scans are stale.
+// Returns raw input flags and buffered output flags in metadata order, keyed
+// by original model clock identity rather than current declaration names.
+std::optional<llvm::SmallVector<FAMEHubClockControl>>
+constructFAMEHubClockControls(circt::firrtl::CircuitOp circuit,
+                             circt::firrtl::FModuleOp model,
+                             llvm::StringRef clockChannelName,
+                             llvm::ArrayRef<FAMEHubClockDomain> domains,
+                             std::string &error);
+
 // Generated host state is identified by its original model clock, independent
 // of declaration uniquing/renaming. Requires a module body; consumes/produces
 // no annotations and does not mutate IR. Recollect after state creation.

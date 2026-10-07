@@ -22,6 +22,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
+#include <algorithm>
 #include <functional>
 #include <map>
 #include <set>
@@ -186,18 +187,17 @@ void outputValidRejections(MLIRContext &ctx) {
 void run(MLIRContext &ctx, bool reversed, const char *output) {
   std::string common = R"mlir(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
     in %in0: !firrtl.uint<16>, in %in1: !firrtl.uint<16>,
-    out %out0: !firrtl.uint<16>, out %out1: !firrtl.uint<16>)mlir";
-  auto payload = reversed ? "_1: clock, _0: clock" : "_0: clock, _1: clock";
+    out %out0: !firrtl.uint<16>, out %out1: !firrtl.uint<16>,
+    in %bridge_clocks_0: !firrtl.clock, in %bridge_clocks_1: !firrtl.clock,
+    out %alias0: !firrtl.clock, out %alias1: !firrtl.clock)mlir";
   auto root = parseSourceString<ModuleOp>(
     "module { firrtl.circuit \"Top\" { firrtl.module @Top(" + common + ") {} "
-    "firrtl.module private @Model(" + common +
-    ", in %bridge_clocks_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<" + payload + ">>) {\n" +
+    "firrtl.module private @Model(" + common + ") {\n" +
     R"mlir(%targetCycleFinishing = firrtl.wire : !firrtl.uint<1>
-      %bits = firrtl.subfield %bridge_clocks_sink[bits] : !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<)mlir" + payload + R"mlir(>>
-      %clock0 = firrtl.subfield %bits[_0] : !firrtl.bundle<)mlir" + payload + R"mlir(>
-      %clock1 = firrtl.subfield %bits[_1] : !firrtl.bundle<)mlir" + payload + R"mlir(>
-      %state0 = firrtl.reg %clock0 : !firrtl.clock, !firrtl.uint<16>
-      %state1 = firrtl.reg %clock1 : !firrtl.clock, !firrtl.uint<16>
+      firrtl.strictconnect %alias0, %bridge_clocks_0 : !firrtl.clock
+      firrtl.strictconnect %alias1, %bridge_clocks_1 : !firrtl.clock
+      %state0 = firrtl.reg %bridge_clocks_0 : !firrtl.clock, !firrtl.uint<16>
+      %state1 = firrtl.reg %bridge_clocks_1 : !firrtl.clock, !firrtl.uint<16>
       %sum0 = firrtl.add %state0, %in0 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
       %sum1 = firrtl.add %state1, %in1 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
       %next0 = firrtl.bits %sum0 15 to 0 : (!firrtl.uint<17>) -> !firrtl.uint<16>
@@ -222,19 +222,46 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
   // Use the real pre-FAME annotation boundary to discover dependencies and
   // build both model and wrapper interfaces. Port indices and instances are
   // invalidated by each rewrite; re-analyze only the unconsumed annotations.
-  SmallVector<Attribute> annotations;
+  SmallVector<Attribute> annotations, clockTopTargets, clockModelTargets, clockInfo;
+  for (unsigned lane = 0; lane < 2; ++lane) {
+    auto physical = reversed ? 1 - lane : lane;
+    auto name = "bridge_clocks_" + std::to_string(physical);
+    clockTopTargets.push_back(b.getStringAttr("~Top|Top>" + name));
+    clockModelTargets.push_back(b.getStringAttr("~Top|Model>" + name));
+    clockInfo.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("name", b.getStringAttr("domain" + std::to_string(lane))),
+        b.getNamedAttr("multiplier", b.getI64IntegerAttr(1)),
+        b.getNamedAttr("divisor", b.getI64IntegerAttr(lane + 2))}));
+  }
+  annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelPorts)),
+      b.getNamedAttr("localName", b.getStringAttr("bridge_clocks")),
+      b.getNamedAttr("ports", b.getArrayAttr(clockModelTargets))}));
+  annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+      b.getNamedAttr("globalName", b.getStringAttr("bridge_clocks")),
+      b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::TargetClockChannel)),
+          b.getNamedAttr("clockInfo", b.getArrayAttr(clockInfo)),
+          b.getNamedAttr("perClockMFMR", b.getArrayAttr({b.getI64IntegerAttr(2), b.getI64IntegerAttr(3)}))})),
+      b.getNamedAttr("sinks", b.getArrayAttr(clockTopTargets))}));
   for (StringRef name : {"in0", "in1", "out0", "out1"}) {
     bool input = name.starts_with("in");
     auto target = [&](StringRef module) {
       return b.getStringAttr(("~Top|" + module + ">" + name).str());
     };
+    // The SFC handoff associates channels with output Clock aliases. Both
+    // directions must recover their scalar source through the target graph.
+    auto clock = "alias" + name.take_back(1).str();
     annotations.push_back(b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelPorts)),
         b.getNamedAttr("localName", b.getStringAttr(name)),
+        b.getNamedAttr("clockPort", b.getStringAttr("~Top|Model>" + clock)),
         b.getNamedAttr("ports", b.getArrayAttr({target("Model")}))}));
     annotations.push_back(b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
         b.getNamedAttr("globalName", b.getStringAttr(name)),
+        b.getNamedAttr("clock", b.getStringAttr("~Top|Top>" + clock)),
         b.getNamedAttr("channelInfo", b.getDictionaryAttr({
             b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
             b.getNamedAttr("latency", b.getI64IntegerAttr(0))})),
@@ -265,6 +292,36 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
     selected.push_back({entry.globalName, entry.localName, false});
     outputNames.push_back(entry.localName);
   }
+  auto hierarchy = goldengate::analyzeTopHierarchy(circuit, error);
+  require(bool(hierarchy), error);
+  auto clockGroup = goldengate::analyzeModelPortGroup(circuit, Annotation(annotations[0]), error);
+  auto clockConnection = goldengate::analyzeChannelConnection(circuit, Annotation(annotations[1]), error);
+  require(clockGroup && clockConnection, error);
+  SmallVector<goldengate::ModelPortGroup> clockGroups{*clockGroup};
+  auto clockBinding = goldengate::bindChannelToModels(*clockConnection, *hierarchy, clockGroups, error);
+  require(clockBinding && clockBinding->size() == 1, error);
+  auto domains = goldengate::analyzeFAMEHubClockDomains(*clockConnection, *hierarchy, clockBinding->front(), error);
+  require(domains && domains->size() == 2, error);
+  auto channelClocks = goldengate::analyzeFAMEChannelClockDomains(circuit, model, *domains, error);
+  require(channelClocks && channelClocks->size() == 4, error);
+  for (const auto &channel : *channelClocks)
+    require(channel.modelClockName == "bridge_clocks_" + channel.localName.substr(channel.localName.size() - 1),
+            "associated channel alias resolved to the wrong clock domain");
+  auto clockPlan = goldengate::analyzeFAMEPorts(*hierarchy, *clockBinding, {*clockConnection}, {model}, error);
+  require(clockPlan && clockPlan->sinks.size() == 1, error);
+  require(succeeded(goldengate::rewriteFAMEHubClockChannel(*hierarchy, clockPlan->sinks.front(), *domains, false, error)), error);
+  // Keep all data clock references transferred by the clock rewrite, consume
+  // only the clock's own annotation pair before reanalyzing the data boundary.
+  SmallVector<Attribute> dataAnnotations;
+  for (auto attribute : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    Annotation annotation(attribute);
+    auto global = annotation.getMember<StringAttr>("globalName");
+    auto local = annotation.getMember<StringAttr>("localName");
+    if ((!global || global.getValue() != "bridge_clocks") &&
+        (!local || local.getValue() != "bridge_clocks"))
+      dataAnnotations.push_back(attribute);
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(dataAnnotations));
   for (const auto &next : selected) {
     auto hierarchy = goldengate::analyzeTopHierarchy(circuit, error);
     require(bool(hierarchy), error);
@@ -321,22 +378,69 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
             isa<BundleType>(model.getPorts()[2 + i].type),
             "native channelization produced an unexpected port identity/type");
   }
-  b.setInsertionPointToStart(model.getBodyBlock());
-  auto bits = field(b, loc, model.getArgument(6), "bits");
-  SmallVector<Value> raw(2), enabled(2), targetState;
-  for (unsigned i = 0; i < 2; ++i) {
-    auto name = "bridge_clocks_" + std::to_string(i);
-    auto token = field(b, loc, bits, "_" + std::to_string(i));
-    raw[i] = b.create<AsUIntPrimOp>(loc, token);
-    require(succeeded(goldengate::addFAMEClockEnable(model, name, raw[i], error)), error);
-    require(succeeded(goldengate::addFAMEClockGate(circuit, model, name, error, token)), error);
-    enabled[i] = goldengate::lookupFAMEClockEnable(model, name, error);
+  // Shape/order failures must leave both clock domains unmodified. A partial
+  // first-domain enable/gate would conceal a bad second lane in larger hubs.
+  for (unsigned bad = 0; bad < 5; ++bad) {
+    auto invalid = *domains;
+    if (bad == 0) std::reverse(invalid.begin(), invalid.end());
+    if (bad == 1) invalid[1].payloadField = "missing";
+    if (bad == 2) invalid[1].modelClockName = invalid[0].modelClockName;
+    if (bad == 3) invalid[1].modelClockName.clear();
+    if (bad == 4) invalid.pop_back();
+    auto before = dump(root->getOperation());
+    error.clear();
+    require(!goldengate::constructFAMEHubClockControls(circuit, model, "bridge_clocks", invalid, error) &&
+                !error.empty() && before == dump(root->getOperation()),
+            "bad ordered clock controls mutated the model");
+  }
+  error.clear();
+  auto controls = goldengate::constructFAMEHubClockControls(circuit, model, "bridge_clocks", *domains, error);
+  require(controls && controls->size() == domains->size(), error);
+  SmallVector<Value> enabled(2), targetState;
+  for (const auto &control : *controls) {
+    auto physical = control.modelClockName == "bridge_clocks_0" ? 0u : 1u;
+    enabled[physical] = control.outputEnable;
   }
   SmallVector<goldengate::FAMEFiredChannel> channels;
-  for (unsigned i = 0; i < inputNames.size(); ++i)
-    channels.push_back({inputNames[i], true, raw[i]});
-  for (unsigned i = 0; i < outputNames.size(); ++i)
-    channels.push_back({outputNames[i], false, enabled[i]});
+  auto channelEnable = [&](StringRef name, Direction direction) {
+    auto channel = llvm::find_if(*channelClocks, [&](const auto &entry) {
+      return entry.localName == name && entry.direction == direction;
+    });
+    require(channel != channelClocks->end(), "missing snapshotted channel clock");
+    auto control = llvm::find_if(*controls, [&](const auto &entry) {
+      return entry.modelClockName == channel->modelClockName;
+    });
+    require(control != controls->end(), "missing generated channel clock controls");
+    return direction == Direction::In ? control->inputEnable : control->outputEnable;
+  };
+  for (const auto &name : inputNames)
+    channels.push_back({name, true, channelEnable(name, Direction::In)});
+  for (const auto &name : outputNames)
+    channels.push_back({name, false, channelEnable(name, Direction::Out)});
+  require(succeeded(goldengate::internalizeFAMEOutputClocks(top, model, "model", error)), error);
+  instance = *top.getOps<InstanceOp>().begin();
+  goldengate::FAMEClockGateIndex aliasGates;
+  require(succeeded(aliasGates.collect(model, error)), error);
+  for (unsigned physical = 0; physical < 2; ++physical) {
+    auto aliasName = "alias" + std::to_string(physical);
+    auto clockName = "bridge_clocks_" + std::to_string(physical);
+    Value alias;
+    for (auto wire : model.getOps<WireOp>())
+      if (wire.getName() == aliasName) alias = wire.getResult();
+    require(bool(alias), "output clock alias was not internalized");
+    unsigned matches = 0;
+    for (auto connection : model.getOps<StrictConnectOp>())
+      if (connection.getDest() == alias) {
+        require(connection.getSrc() == aliasGates.lookup(clockName, false).getResult(2),
+                "output clock alias does not read its gated domain");
+        ++matches;
+      }
+    require(matches == 1, "internalized clock alias lost its unique driver");
+    for (auto module : {top, model})
+      for (unsigned port = 0; port < module.getNumPorts(); ++port)
+        require(module.getPortName(port) != aliasName,
+                "output clock alias remains in transformed interface");
+  }
   require(succeeded(goldengate::ensureFAMEFiredRegisters(model, channels, error)), error);
   require(succeeded(goldengate::rewriteFAMEFiredStates(model, channels, error)), error);
   require(succeeded(goldengate::rewriteFAMEOutputValids(model,
@@ -348,10 +452,25 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
   for (auto r : model.getOps<RegOp>()) targetState.push_back(r.getResult());
   require(targetState.size() == 2, "target state missing");
   b.setInsertionPointToEnd(top.getBodyBlock());
-  auto clockPort = instance.getResult(6);
+  std::optional<unsigned> wrapperClockPort;
+  for (unsigned i = 0; i < top.getNumPorts(); ++i)
+    if (top.getPortName(i) == "model_bridge_clocks_sink") wrapperClockPort = i;
+  require(bool(wrapperClockPort), "channelized wrapper clock port missing");
+  // The local clock bridge consumes the wrapper clock sink. Internalize its
+  // port to a same-type wire, retaining the actual channelization connect and
+  // its flipped ready flow into the emitted rational producer.
+  auto oldClockPort = top.getArgument(*wrapperClockPort);
+  b.setInsertionPointToStart(top.getBodyBlock());
+  Value clockPort = b.create<WireOp>(loc, oldClockPort.getType(), "producer_clock_tokens").getResult();
+  oldClockPort.replaceAllUsesWith(clockPort);
+  llvm::BitVector removed(top.getNumPorts());
+  removed.set(*wrapperClockPort);
+  top.erasePorts(removed);
+  b.setInsertionPointToEnd(top.getBodyBlock());
   auto ready = field(b, loc, clockPort, "ready");
-  auto schedule = goldengate::analyzeRationalClockSchedule(
-      {{"domain0", 1, 2, 2}, {"domain1", 1, 3, 3}}, error);
+  SmallVector<goldengate::RationalClockInfo> orderedClocks;
+  for (const auto &domain : *domains) orderedClocks.push_back(domain.clockInfo);
+  auto schedule = goldengate::analyzeRationalClockSchedule(orderedClocks, error);
   require(bool(schedule), error);
   auto tokens = goldengate::buildRationalClockTokens(b, loc,
       top.getArgument(0), top.getArgument(1), ready, *schedule);
@@ -361,7 +480,7 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
   for (unsigned lane = 0; lane < 2; ++lane) {
     auto token = b.create<AsClockPrimOp>(loc, tokens[lane]);
     b.create<StrictConnectOp>(loc, field(b, loc, instanceBits,
-        "_" + std::to_string(reversed ? 1 - lane : lane)), token.getResult());
+        (*domains)[lane].payloadField), token.getResult());
   }
   require(succeeded(verify(*root)), "coupled FIRRTL verification");
   if (output) {

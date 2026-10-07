@@ -64,6 +64,7 @@ add_executable(goldengate-circt
   lib/Transforms/FAMEHostControl.cpp
   lib/Transforms/FAMEInputChannel.cpp
   lib/Transforms/FAMEHubClockChannel.cpp
+  lib/Transforms/FAMEHubClockControls.cpp
   lib/Transforms/FAMEAnnotations.cpp
   lib/Transforms/FAMEOutputChannel.cpp
   lib/Transforms/FAMEPipeChannel.cpp
@@ -505,7 +506,10 @@ if(BUILD_TESTING)
     lib/Analysis/FAMEOutputSelection.cpp lib/Analysis/FAMEPortAnalysis.cpp
     lib/Analysis/ChannelAnalysis.cpp lib/Analysis/ModelAnalysis.cpp
     lib/Analysis/HierarchyAnalysis.cpp lib/Analysis/CombDependencyAnalysis.cpp
-    lib/Support/TargetUtils.cpp lib/Transforms/FAMEOutputChannel.cpp
+    lib/Analysis/FAMEChannelClockDomains.cpp
+    lib/Support/TargetUtils.cpp lib/Support/XDCEmission.cpp
+    lib/Transforms/FAMEHubClockChannel.cpp lib/Transforms/FAMEHubClockControls.cpp
+    lib/Transforms/FAMEOutputChannel.cpp
     lib/Transforms/FAMEInputChannel.cpp lib/Transforms/FAMEFiredState.cpp
     lib/Transforms/FAMEFinishing.cpp lib/Transforms/FAMEInputReady.cpp
     lib/Transforms/FAMEOutputValid.cpp lib/Transforms/RationalClockTokenGenerator.cpp)
