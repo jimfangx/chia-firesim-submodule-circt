@@ -3,9 +3,9 @@
 `RationalClockTokenGenerator.cpp` ports the preserved inner generator in
 `midas/src/main/scala/midas/widgets/ClockBridge.scala`. It creates FIRRTL
 operations in an existing clock producer. `SingleClockBridge.cpp` now uses
-this component on the active compiler path; its wrapper still accepts one
-1:1 clock. Multi-clock scheduling is tested independently before widening
-that wrapper and its annotation retargeting.
+this component on the active compiler path for every ordered constructor
+clock. The wrapper, fastest-clock counter and annotation retargeting are
+covered by [RationalClockBridge.md](RationalClockBridge.md).
 
 The input is the ordered `clockInfo` array, a host Clock, synchronous UInt<1>
 reset and downstream UInt<1> ready. `analyzeRationalClockSchedule` rejects an
@@ -97,11 +97,10 @@ diff -u "$gg_evidence/scala-observations.log" "$gg_evidence/circt-observations.l
 
 ## Remaining boundary
 
-Next widen the existing ClockBridge wrapper to the ordered Vec[N] clock
-sink/source targets and call this scheduler for all retained constructor
-clocks. Preserve Scala's fastest-clock cycle counter selection (last lane
-on equal rates), decoded MCR bank and emitted headers. MFMR must be validated
-against ceil(period/minimumPeriod), independently of token scheduling. Full
-multi-clock simulation mapping, Rocket-specific bridge assumptions, FAME-5
-and the missing SFC UART-bearing workload reference remain unresolved.
-FireSim manager verification remains harness-owned.
+The ordered Vec[N] wrapper now calls this scheduler for all retained clocks,
+validates MFMR against ceil(period/minimumPeriod), and preserves Scala's
+fastest-clock counter and six-word driver ABI. See the full bridge comparison
+linked above. A coupled multiclock ClockBridge-to-FAME hub differential,
+Rocket-specific bridge assumptions, FAME-5 and the missing SFC UART-bearing
+workload reference remain unresolved. FireSim manager verification remains
+harness-owned.

@@ -153,13 +153,13 @@ contract and all three commands in `design/FireSim-generated.implementation.xdc`
 
 ## Remaining work
 
-The hub FAME boundary now uses all ordered clock domains. The full baseline
-still calls `addSingleClockBridge`, which accepts one 1:1 clock with MFMR 1.
-Rational ClockBridge token scheduling is now implemented and compared with
-the actual Scala generator for nine schedules; see
-[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next widen
-the ClockBridge wrapper and ordered sink/source annotation retargeting, and
-select the fastest clock for its target-cycle counter before enabling a
-complete multiclock bridge path. The baseline's data/bridge configuration also
-remains Rocket specific. Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing
-differential remain incomplete.
+The hub FAME boundary now uses all ordered clock domains. The active compiler
+calls `addClockBridge`, which maps ordered rational lanes, their source/sink
+targets and the fastest-clock counter. The actual Scala bridge comparison
+is recorded in [RationalClockBridge.md](RationalClockBridge.md); the inner
+scheduler comparison is in
+[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next couple
+the rational producer to the multiclock FAME hub under independent data-channel
+stalls. The baseline's data/bridge configuration remains Rocket specific.
+Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing differential
+remain incomplete.

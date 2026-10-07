@@ -4,16 +4,16 @@
 // Annotations consumed: none; BridgeIO identity transfers to the producer hPort.
 // Annotations produced: clock channel source at the producer; copied boundary
 // ports transfer to the new top, while the clock sink remains on the inner top.
-// IR mutations: add a single-clock producer, its decoded MCR register bank,
+// IR mutations: add an ordered rational-clock producer, its decoded MCR bank,
 // and an outer wrapper exposing that bank for subsequent control-bus mapping.
 // Analyses required: retained target resolution. Analyses preserved: inner model,
 // clock domain and channel identities, including clockInfo and perClockMFMR.
-// Output invariants: one always-valid Boolean clock token, synchronous reset of
+// Output invariants: always-valid ordered Vec[Bool] clock tokens, sync reset of
 // 64-bit hCycle/tCycle; target progress counted only on accepted clock tokens.
 // Unreset snapshots capture pre-edge counters on latch writes at words 2/5;
 // words 0/1 and 3/4 read saved low/high halves. Permissions match MCRIO.bindReg.
-// Scope: ClockBridge.scala and Widget.genWideRORegInit for one 1:1 clock with
-// 32-bit MCR words. Nasti transport, driver header and multiclock remain pending.
+// Scope: ClockBridge.scala rational scheduling and Widget.genWideRORegInit with
+// 32-bit MCR words. Transport and driver emission are subsequent mapping steps.
 #include "goldengate/SingleClockBridge.h"
 #include "goldengate/RationalClockTokenGenerator.h"
 #include "goldengate/AnnotationClasses.h"
@@ -25,24 +25,24 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
+LogicalResult goldengate::addClockBridge(CircuitOp circuit,
                                               std::string &error) {
   constexpr llvm::StringLiteral producerName = "GGSingleClockBridge";
   constexpr llvm::StringLiteral wrapperName = "GGClockBridgeWrapper";
   constexpr llvm::StringLiteral controlName = "clockBridge_mcr";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
   if (circuit.getName() != "GGFAMEPipeWrapper")
-    return reject("single clock bridge requires the active FAME PipeChannel wrapper");
+    return reject("clock bridge requires the active FAME PipeChannel wrapper");
   FModuleOp inner;
   for (auto &op : circuit.getBodyBlock()->getOperations()) {
     auto module = dyn_cast<FModuleLike>(&op);
     if (!module) continue;
     if (module.getModuleName() == producerName || module.getModuleName() == wrapperName)
-      return reject("single clock bridge module or wrapper already exists");
+      return reject("clock bridge module or wrapper already exists");
     if (module.getModuleName() == circuit.getName()) inner = dyn_cast<FModuleOp>(&op);
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!inner || !raw) return reject("single clock bridge requires a top and retained annotations");
+  if (!inner || !raw) return reject("clock bridge requires a top and retained annotations");
   DictionaryAttr bridge, channel;
   unsigned bridgeIndex = 0, channelIndex = 0;
   for (auto [i, attr] : llvm::enumerate(raw)) {
@@ -59,7 +59,7 @@ LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
       channel = cast<DictionaryAttr>(attr); channelIndex = i;
     }
   }
-  if (!bridge || !channel) return reject("single clock bridge constructor or clock channel is missing");
+  if (!bridge || !channel) return reject("clock bridge constructor or clock channel is missing");
   auto key = bridge.getAs<DictionaryAttr>("widgetConstructorKey");
   auto clocks = key ? key.getAs<ArrayAttr>("clocks") : ArrayAttr();
   auto info = channel.getAs<DictionaryAttr>("channelInfo");
@@ -67,54 +67,80 @@ LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
   auto mapping = bridge.getAs<DictionaryAttr>("channelMapping");
   auto name = channel.getAs<StringAttr>("globalName");
   if (!key || key.getAs<StringAttr>("class") != "firesim.lib.bridges.ClockParameters" ||
-      !clocks || clocks.size() != 1 || clocks != info.getAs<ArrayAttr>("clockInfo") ||
-      !ratios || ratios.size() != 1 || !isa<IntegerAttr>(ratios[0]) ||
-      cast<IntegerAttr>(ratios[0]).getInt() != 1 || !name || !mapping ||
+      !clocks || clocks.empty() || clocks != info.getAs<ArrayAttr>("clockInfo") ||
+      !ratios || ratios.size() != clocks.size() || !name || !mapping ||
       mapping.size() != 1 || mapping.getAs<StringAttr>("clocks") != name)
-    return reject("single clock bridge needs one matching constructor clock, channel and MFMR=1");
-  auto clock = dyn_cast<DictionaryAttr>(clocks[0]);
-  auto mult = clock ? clock.getAs<IntegerAttr>("multiplier") : IntegerAttr();
-  auto div = clock ? clock.getAs<IntegerAttr>("divisor") : IntegerAttr();
-  if (!mult || !div || mult.getInt() <= 0 || mult.getInt() != div.getInt())
-    return reject("single clock bridge supports only a positive 1:1 rational clock");
-  auto schedule = analyzeRationalClockSchedule(
-      {RationalClockInfo{"", uint64_t(mult.getInt()), uint64_t(div.getInt()), 1}}, error);
+    return reject("clock bridge needs matching ordered constructor clocks, channel and MFMRs");
+  SmallVector<RationalClockInfo> clockInfo;
+  unsigned fastestIndex = 0;
+  double fastestFrequency = 0;
+  for (auto [i, attr] : llvm::enumerate(clocks)) {
+    auto clock = dyn_cast<DictionaryAttr>(attr);
+    auto mult = clock ? clock.getAs<IntegerAttr>("multiplier") : IntegerAttr();
+    auto div = clock ? clock.getAs<IntegerAttr>("divisor") : IntegerAttr();
+    auto clockName = clock ? clock.getAs<StringAttr>("name") : StringAttr();
+    auto mfmr = dyn_cast<IntegerAttr>(ratios[i]);
+    if (!mult || !div || mult.getInt() <= 0 || div.getInt() <= 0 ||
+        !clockName || !mfmr || mfmr.getInt() <= 0)
+      return reject("clock bridge needs named positive rational clocks and MFMRs");
+    clockInfo.push_back({clockName.getValue().str(), uint64_t(mult.getInt()),
+                         uint64_t(div.getInt()), uint64_t(mfmr.getInt())});
+    // Match ClockBridgeModule's Double frequency sort, including its last-lane
+    // tie selection. Exact period comparison would change rounded Double ties.
+    double frequency = double(mult.getInt()) / double(div.getInt());
+    if (frequency >= fastestFrequency) {
+      fastestFrequency = frequency;
+      fastestIndex = i;
+    }
+  }
+  auto schedule = analyzeRationalClockSchedule(clockInfo, error);
   if (!schedule) return failure();
+  unsigned minPeriod = *llvm::min_element(schedule->periods);
+  for (auto [i, period] : llvm::enumerate(schedule->periods))
+    if (clockInfo[i].mfmr != (period + minPeriod - 1) / minPeriod)
+      return reject("clock bridge MFMR does not match the ordered rational clock periods");
   auto sinks = channel.getAs<ArrayAttr>("sinks");
   auto sources = channel.getAs<ArrayAttr>("sources");
-  if (!sinks || sinks.size() != 1 || (sources && !sources.empty()) || channel.get("clock"))
-    return reject("single clock bridge needs one boundary clock sink");
+  if (!sinks || sinks.size() != clocks.size() || (sources && !sources.empty()) || channel.get("clock"))
+    return reject("clock bridge needs one ordered boundary sink per clock");
   auto spelling = dyn_cast<StringAttr>(sinks[0]);
   auto target = spelling ? resolveAnnotationTarget(circuit, spelling.getValue(), error) : std::nullopt;
   if (!target || target->module != inner || !target->port)
-    return reject("single clock bridge sink must resolve to the active wrapper port");
+    return reject("clock bridge sink must resolve to the active wrapper port");
   unsigned clockPort = *target->port;
   auto *context = circuit.getContext();
   auto bit = UIntType::get(context, 1, false);
   auto token = dyn_cast<BundleType>(inner.getPortType(clockPort));
   auto bits = token ? token.getElementIndex("bits") : std::nullopt;
   auto vector = bits ? dyn_cast<FVectorType>(token.getElements()[*bits].type) : FVectorType();
-  if (!token || token.getElements().size() != 3 || !vector || vector.getNumElements() != 1 ||
-      vector.getElementType() != bit || target->fieldID != token.getFieldID(*bits) + vector.getFieldID(0) ||
+  if (!token || token.getElements().size() != 3 || !vector || vector.getNumElements() != clocks.size() ||
+      vector.getElementType() != bit ||
       !token.getElement("ready") || !token.getElement("valid") ||
       token.getElement("ready")->type != bit || !token.getElement("ready")->isFlip ||
       token.getElement("valid")->type != bit || token.getElement("valid")->isFlip ||
       token.getElements()[*bits].isFlip || inner.getPortDirection(clockPort) != Direction::In)
-    return reject("single clock bridge needs a Decoupled Vec[Bool](1) sink");
+    return reject("clock bridge needs a Decoupled Vec[Bool] sink matching clock count");
+  for (auto [i, attr] : llvm::enumerate(sinks)) {
+    auto spelling = dyn_cast<StringAttr>(attr);
+    auto lane = spelling ? resolveAnnotationTarget(circuit, spelling.getValue(), error) : std::nullopt;
+    if (!lane || lane->module != inner || lane->port != clockPort ||
+        lane->fieldID != token.getFieldID(*bits) + vector.getFieldID(i))
+      return reject("clock bridge sinks must resolve to bits[i] in constructor clock order");
+  }
   std::optional<unsigned> hostClock, hostReset;
   for (auto [i, port] : llvm::enumerate(inner.getPorts())) {
     if (port.name.getValue() == controlName)
-      return reject("single clock bridge decoded MCR boundary port already exists");
+      return reject("clock bridge decoded MCR boundary port already exists");
     if (port.name.getValue() == "hostClock" && port.direction == Direction::In && isa<ClockType>(port.type)) hostClock = i;
     if (port.name.getValue() == "hostReset" && port.direction == Direction::In && port.type == bit) hostReset = i;
   }
-  if (!hostClock || !hostReset) return reject("single clock bridge needs hostClock and synchronous hostReset inputs");
+  if (!hostClock || !hostReset) return reject("clock bridge needs hostClock and synchronous hostReset inputs");
   bool instantiated = false;
   circuit.walk([&](InstanceOp i) { instantiated |= i.getModuleName() == inner.getName(); });
-  if (instantiated) return reject("single clock bridge requires an uninstantiated top wrapper");
+  if (instantiated) return reject("clock bridge requires an uninstantiated top wrapper");
 
-  // Validate before mutation. FindScaledPeriodGCD normalizes the only period to
-  // one, so every token carries an edge. Backpressure never deasserts valid.
+  // Validate all schedule, metadata and endpoint contracts before mutation.
+  // Keep the existing producer symbol for control/header mapping compatibility.
   OpBuilder b(circuit.getBodyBlock(), circuit.getBodyBlock()->begin());
   Location loc = circuit.getLoc();
   auto wide = UIntType::get(context, 64, false);
@@ -156,10 +182,11 @@ LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
   auto field = [&](Value v, llvm::StringRef n) { return b.create<SubfieldOp>(loc, v, n).getResult(); };
   Value one = b.create<ConstantOp>(loc, bit, APInt(1, 1));
   b.create<StrictConnectOp>(loc, field(arg(2), "valid"), one);
-  Value lane = b.create<SubindexOp>(loc, field(arg(2), "bits"), 0);
   auto edgeBits = buildRationalClockTokens(b, loc, arg(0), arg(1),
       field(arg(2), "ready"), *schedule);
-  b.create<StrictConnectOp>(loc, lane, edgeBits.front());
+  Value payload = field(arg(2), "bits");
+  for (auto [i, edge] : llvm::enumerate(edgeBits))
+    b.create<StrictConnectOp>(loc, b.create<SubindexOp>(loc, payload, i), edge);
   Value zero = b.create<ConstantOp>(loc, wide, APInt(64, 0));
   Value hCycle = b.create<RegResetOp>(loc, wide, arg(0), arg(1), zero, "hCycle").getResult();
   Value tCycle = b.create<RegResetOp>(loc, wide, arg(0), arg(1), zero, "tCycleFastest").getResult();
@@ -169,7 +196,7 @@ LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
     return b.create<BitsPrimOp>(loc, sum, 63, 0);
   };
   Value fire = b.create<AndPrimOp>(loc, field(arg(2), "ready"), field(arg(2), "valid"));
-  Value fastestFire = b.create<AndPrimOp>(loc, fire, lane);
+  Value fastestFire = b.create<AndPrimOp>(loc, fire, edgeBits[fastestIndex]);
   b.create<StrictConnectOp>(loc, hCycle, next(hCycle));
   b.create<StrictConnectOp>(loc, tCycle, b.create<MuxPrimOp>(loc, fastestFire, next(tCycle), tCycle));
   b.create<StrictConnectOp>(loc, arg(3), hCycle);
@@ -263,7 +290,11 @@ LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
   newBridge.set("target", b.getStringAttr(newPrefix + "|" + producerName.str() + ">hPort"));
   annotations[bridgeIndex] = newBridge.getDictionary(context);
   NamedAttrList newChannel(cast<DictionaryAttr>(annotations[channelIndex]));
-  newChannel.set("sources", b.getArrayAttr({b.getStringAttr(newPrefix + "|" + producerName.str() + ">hPort.bits[0]")}));
+  SmallVector<Attribute> clockSources;
+  for (unsigned i = 0; i < clocks.size(); ++i)
+    clockSources.push_back(b.getStringAttr(newPrefix + "|" + producerName.str() +
+                                          ">hPort.bits[" + std::to_string(i) + "]"));
+  newChannel.set("sources", b.getArrayAttr(clockSources));
   annotations[channelIndex] = newChannel.getDictionary(context);
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   circuit.setName(wrapperName);

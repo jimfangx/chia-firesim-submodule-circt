@@ -25,20 +25,29 @@ FModuleOp named(CircuitOp circuit, StringRef name) {
 }
 // Use the real clock producer; the small surrounding graph supplies the
 // allocation/binding contracts from ControlWidgetWrites/ControlReadDispatch.
-OwningOpRef<ModuleOp> clockFixture(MLIRContext &ctx) {
+OwningOpRef<ModuleOp> clockFixture(MLIRContext &ctx, unsigned lanes = 1) {
   auto root = parseSourceString<ModuleOp>(
       "module { firrtl.circuit \"GGFAMEPipeWrapper\" { firrtl.module @GGFAMEPipeWrapper("
       "in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, "
-      "in %ticks: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: vector<uint<1>, 1>>) {} }}", &ctx);
+      "in %ticks: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: vector<uint<1>, " + std::to_string(lanes) + ">>) {} }}", &ctx);
   require(bool(root), "clock fixture parse"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
   auto clock = b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr("base")),
     b.getNamedAttr("multiplier",b.getI64IntegerAttr(1)),b.getNamedAttr("divisor",b.getI64IntegerAttr(1))});
-  auto clocks = b.getArrayAttr({clock});
+  SmallVector<Attribute> clockValues, mfmrs, sinks;
+  for (unsigned i = 0; i < lanes; ++i) {
+    NamedAttrList c(clock);
+    c.set("name",b.getStringAttr("clock"+std::to_string(i)));
+    c.set("divisor",b.getI64IntegerAttr(i+1));
+    clockValues.push_back(c.getDictionary(&ctx));
+    mfmrs.push_back(b.getI64IntegerAttr(i+1));
+    sinks.push_back(b.getStringAttr("~GGFAMEPipeWrapper|GGFAMEPipeWrapper>ticks.bits["+std::to_string(i)+"]"));
+  }
+  auto clocks = b.getArrayAttr(clockValues);
   auto info = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::TargetClockChannel)),
-    b.getNamedAttr("clockInfo",clocks),b.getNamedAttr("perClockMFMR",b.getArrayAttr({b.getI64IntegerAttr(1)}))});
+    b.getNamedAttr("clockInfo",clocks),b.getNamedAttr("perClockMFMR",b.getArrayAttr(mfmrs))});
   auto channel = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
     b.getNamedAttr("globalName",b.getStringAttr("clockBridge_clocks")),b.getNamedAttr("channelInfo",info),
-    b.getNamedAttr("sinks",b.getArrayAttr({b.getStringAttr("~GGFAMEPipeWrapper|GGFAMEPipeWrapper>ticks.bits[0]")}))});
+    b.getNamedAttr("sinks",b.getArrayAttr(sinks))});
   auto key = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("firesim.lib.bridges.ClockParameters")),
     b.getNamedAttr("clocks",clocks)});
   auto bridge = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::BridgeIO)),
@@ -46,10 +55,10 @@ OwningOpRef<ModuleOp> clockFixture(MLIRContext &ctx) {
     b.getNamedAttr("channelMapping",b.getDictionaryAttr({b.getNamedAttr("clocks",b.getStringAttr("clockBridge_clocks"))}))});
   c->setAttr("rawAnnotations",b.getArrayAttr({channel,bridge})); return root;
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
-  auto root = clockFixture(ctx); auto c = *root->getOps<CircuitOp>().begin();
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned lanes = 1) {
+  auto root = clockFixture(ctx,lanes); auto c = *root->getOps<CircuitOp>().begin();
   std::string error;
-  require(succeeded(goldengate::addSingleClockBridge(c, error)), error);
+  require(succeeded(goldengate::addClockBridge(c, error)), error);
   OpBuilder b(&ctx); auto loc = c.getLoc(); auto top = named(c, "GGClockBridgeWrapper");
   b.setInsertionPointToEnd(c.getBodyBlock());
   auto decoder = b.create<FModuleOp>(loc, b.getStringAttr("GGControlAddressDecode"),
@@ -133,6 +142,11 @@ int main(int argc, char **argv) {
                      "#include \"bridges/clock.h\"", "#ifdef GET_BRIDGE_CONSTRUCTOR",
                      "offsetof(CLOCKBRIDGEMODULE_struct, tCycle_latch) == 5 * sizeof(uint64_t)"})
       require(StringRef(body).contains(text), "allocation, widget index or driver ABI differs");
+    for (unsigned lanes : {2U,3U}) {
+      auto rational = fixture(ctx,0,lanes);
+      require(run(*rational->getOps<CircuitOp>().begin())==body,
+              "rational clock lanes changed six-word driver ABI");
+    }
     auto before = dump(*root); std::string error;
     require(failed(goldengate::prepareClockBridgeHeader(c,error)) && dump(*root) == before, "duplicate constructor changed IR");
     for (unsigned bad = 1; bad <= 18; ++bad) {

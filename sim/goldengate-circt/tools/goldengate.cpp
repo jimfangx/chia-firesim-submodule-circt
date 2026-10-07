@@ -2012,10 +2012,10 @@ int main(int argc, char **argv) {
         return fail("cannot write active FAME wrapper annotations: " + error);
       llvm::outs() << "Activated CIRCT FAME PipeChannel wrapper in "
                    << activeIRPath << '\n';
-      if (failed(goldengate::addSingleClockBridge(circuit, error)))
-        return fail("single ClockBridge mapping: " + error);
+      if (failed(goldengate::addClockBridge(circuit, error)))
+        return fail("rational ClockBridge mapping: " + error);
       if (failed(mlir::verify(*module)))
-        return fail("single ClockBridge mapping produced invalid FIRRTL IR");
+        return fail("rational ClockBridge mapping produced invalid FIRRTL IR");
       llvm::SmallString<256> clockBridgeIRPath(outputDir), clockBridgeAnnotationPath(outputDir);
       llvm::sys::path::append(clockBridgeIRPath, "post-fame-clock-bridge.mlir");
       llvm::sys::path::append(clockBridgeAnnotationPath, "post-fame-clock-bridge-all.json");

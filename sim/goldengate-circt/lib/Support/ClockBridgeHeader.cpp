@@ -7,7 +7,7 @@
 // Addresses/index derive from matching live read/write allocation catalogs.
 // Validate six 32-bit slots, 64-bit snapshot slices and latch SSA before mutation.
 // Output: GET_BRIDGE_CONSTRUCTOR and GET_SUBSTRUCT_CHECKS clock driver sections.
-// Scope: single-clock, 32-bit MCR implementation; other drivers remain pending.
+// Scope: ordered rational-clock producer with the 32-bit MCR snapshot bank.
 #include "goldengate/ClockBridgeHeader.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
