@@ -2,6 +2,7 @@
 // Execute the production wrapper and independently score each broadcast FIFO.
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/FAMEPipeChannel.h"
+#include "goldengate/RemainingFanout.h"
 #include "goldengate/FAMEClockChannel.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/HW/HWDialect.h"
@@ -229,6 +230,15 @@ void rejected(MLIRContext &ctx) {
 void run(MLIRContext &ctx, const char *output, bool targetSource) {
   auto root = targetSource ? targetFixture(ctx) : fixture(ctx); auto circuit = *root->getOps<CircuitOp>().begin();
   std::string error;
+  if (targetSource) {
+    // Exercise post-FAME discovery rather than supplying the model fanout.
+    SmallVector<Attribute> raw;
+    for (Attribute attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+      if (cast<DictionaryAttr>(attr).getAs<StringAttr>("class") !=
+          goldengate::AnnotationClasses::ChannelFanout) raw.push_back(attr);
+    circuit->setAttr("rawAnnotations", ArrayAttr::get(&ctx, raw));
+    require(succeeded(goldengate::addRemainingFanoutAnnotations(circuit, error)), error);
+  }
   require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
   require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
   auto wrapper = named(circuit, "GGFAMEPipeWrapper");

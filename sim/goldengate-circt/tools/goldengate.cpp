@@ -59,6 +59,7 @@
 #include "goldengate/FAMEInputChannel.h"
 #include "goldengate/FAMEClockEnable.h"
 #include "goldengate/FAMEAnnotations.h"
+#include "goldengate/RemainingFanout.h"
 #include "goldengate/FAMEInputReady.h"
 #include "goldengate/FAMEPortAnalysis.h"
 #include "goldengate/FAMEOutputValid.h"
@@ -1856,6 +1857,12 @@ int main(int argc, char **argv) {
                    << outputChannel->name << " in " << outputControlIRPath << '\n';
       }
       // All output payload, valid, fired and finishing rewrites are complete.
+      if (failed(goldengate::addRemainingFanoutAnnotations(circuit, error)))
+        return fail("FAME remaining fanout annotations: " + error);
+      llvm::SmallString<256> fanoutAnnotationPath(outputDir);
+      llvm::sys::path::append(fanoutAnnotationPath, "post-fame-remaining-fanout.json");
+      if (failed(goldengate::emitFAMEAnnotations(circuit, fanoutAnnotationPath, error)))
+        return fail("cannot export FAME remaining fanout annotations: " + error);
       // Print hosts consume these scalar latency-zero tokens directly, using
       // the retained constructors and channel mappings. Stop before global
       // simulator wrappers, MMIO allocation, streams and driver collateral.

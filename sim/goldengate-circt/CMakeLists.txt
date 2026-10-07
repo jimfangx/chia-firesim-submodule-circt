@@ -66,6 +66,7 @@ add_executable(goldengate-circt
   lib/Transforms/FAMEHubClockChannel.cpp
   lib/Transforms/FAMEHubClockControls.cpp
   lib/Transforms/FAMEAnnotations.cpp
+  lib/Transforms/RemainingFanout.cpp
   lib/Transforms/FAMEOutputChannel.cpp
   lib/Transforms/FAMEPipeChannel.cpp
   lib/Transforms/FAMEReadyValidChannel.cpp
@@ -1435,6 +1436,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-pipe-channel COMMAND goldengate-pipe-channel-test)
   add_executable(goldengate-pipe-fanout-test
     test/Transforms/FAMEPipeFanoutTest.cpp
+    lib/Transforms/RemainingFanout.cpp
     lib/Transforms/FAMEPipeChannel.cpp
     lib/Transforms/FAMEClockChannel.cpp
     lib/Support/TargetUtils.cpp)
@@ -1446,6 +1448,16 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-pipe-fanout COMMAND goldengate-pipe-fanout-test)
   add_test(NAME goldengate-target-pipe-fanout COMMAND goldengate-pipe-fanout-test target)
+  add_executable(goldengate-remaining-fanout-test
+    test/Transforms/RemainingFanoutTest.cpp
+    lib/Transforms/RemainingFanout.cpp lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-remaining-fanout-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-remaining-fanout-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-remaining-fanout-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-remaining-fanout-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-remaining-fanout COMMAND goldengate-remaining-fanout-test)
   add_executable(goldengate-ready-valid-channel-test
     test/Transforms/FAMEReadyValidChannelTest.cpp
     lib/Transforms/FAMEReadyValidChannel.cpp

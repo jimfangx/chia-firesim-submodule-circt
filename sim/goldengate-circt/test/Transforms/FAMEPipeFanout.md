@@ -115,8 +115,8 @@ queue ABIs and 22 singleton enqueue-valid/source-ready bindings, recorded in
 `golden-interface-comparison.json`. The immutable recorded fixtures still contain
 no fanout annotation, so this does not establish recorded mixed-fanout parity.
 
-The full compiler does not yet synthesize Scala's `AddRemainingFanoutAnnotations`
-for deduplicated model sources. Bridge token engines also currently require
+At the iteration 28 boundary the full compiler did not synthesize Scala's
+`AddRemainingFanoutAnnotations` for shared model sources. Bridge token engines require
 boundary annotation endpoints to resolve to the active wrapper, so binding a
 mixed group to a native UART/TSI/Print bridge needs explicit external endpoint
 resolution that preserves the common upstream source identity. The tested change
@@ -129,3 +129,57 @@ The harness-owned iteration 27 gates passed (portable suite 90,141 checks,
 `0x78194504c338c229`; Rocket suite 90,805 checks, `0x5f3744639d41ea35`). Current
 changes await the next manager verification. UART-bearing SFC differential
 baseline remains pending; neither these tests nor those gates complete the port.
+
+## Remaining model fanout discovery (iteration 29)
+
+`RemainingFanout.cpp` now synthesizes `FAMEChannelFanoutAnnotation` from live
+post-FAME source identities. The compiler invokes it after all output channel
+and control rewrites, before queue construction, and emits
+`post-fame-remaining-fanout.json`. Its key is an ordered sequence of CIRCT
+module/port/field identities. It ignores channel latency, clock, and sinks,
+deduplicates names within each group, and preserves first group/name occurrence.
+All existing annotations, including bridge fanouts, remain in order. Like the
+production Scala transform, this is an append-only, one-shot step; a second
+execution appends the groups again. Invalid local output references fail before
+mutation. Hierarchical or internal declaration sources remain unsupported.
+
+`RemainingFanoutTest.cpp` and `RemainingFanoutOracle.scala` execute native and
+unchanged production Scala discovery with interleaved groups, different latencies
+and clocks, loopback sinks, repeated channel names, non-Pipe channels, and bridge
+sources. Both produce exactly `a0,a1`, `b0,b1`, `ordered0,ordered1`; reversed source
+order forms a distinct singleton. Native tests additionally reject stale,
+foreign-circuit, and input-port targets atomically. The target-source behavioral
+fixture now removes its supplied fanout annotation and runs discovery before
+production queue/wrapper construction.
+
+Evidence is in the generated Rocket directory's `iteration29-remaining-fanout`.
+The new Rocket annotation boundary preserves all 104 input FAME annotations,
+including seven bridge fanout annotations, and adds no model fanout groups for
+this singleton-source input (`rocket-fanout-preservation.json`). The recorded
+immutable U250 `design/FireSim-generated.sv` again matches the candidate's four
+eight-port queue interfaces and 22 singleton enqueue-valid/source-ready bindings
+(`golden-interface-comparison.json`). The recorded primary fixture's annotation
+files contain no FAME fanout annotation and cannot prove shared-source behavior.
+
+The generated target fanout trace, native bridge fanout trace, and freshly
+executed Scala queue trace match all eight numeric fields on all 4,096 cycles,
+with zero mismatches and TRACE SHA256
+`f9ffd07a4da90a748a6ad729480e93ef4efd07cf990636e9dc5c8ff8ad128c01`.
+The target wrapper matches all 16 normalized production Scala `SimWrapper`
+branch/source connections. Twelve focused native CTests pass. The exported
+target wrapper lowers through firtool to SystemVerilog; a fresh native Rocket
+compiler run emits simulator RTL and collateral with empty stderr. This local
+compiler execution does not run any manager verification gate. Large completed
+candidate IR boundaries are gzip-compressed, retaining the compared wrapper.
+
+The harness-owned iteration 28 gates passed the smoke, portable suite (90,141
+checks, `0x78194504c338c229`), and Rocket suite (90,805 checks,
+`0x5f3744639d41ea35`). Iteration 29 changes await harness verification, and the
+UART-bearing SFC differential baseline remains pending.
+
+This supplies discovery for the post-FAME boundary. Pre-FAME shared producers
+still fail native output selection and exclusive-output rewrite checks. The
+next smallest step is deduplicating equal output groups during selection and
+channelizing their common producer once, renaming every branch to that source.
+Mixed fanout also still needs bridge bindings to resolve each external queue
+output independently from the retained upstream producer identity.
