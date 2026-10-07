@@ -168,6 +168,55 @@ object FAMESharedProducerOracle extends App {
   }
   require(reversedAliasesRejected, "Scala accepted a reordered aggregate alias branch")
   println(s"PRODUCER $multiProducer physical aliases 4 fields data valid one token target")
+  // Transport kind belongs to each global branch, not to the deduplicated
+  // model producer. A forward target connection and a pipe observer share
+  // the same ordered valid/data payload and the same host source port.
+  val mixedLow = new LowFirrtlCompiler().compile(CircuitState(Parser.parse(
+    multiAliasInput.replace("    input inData : UInt<8>",
+      "    input inData : UInt<8>\n    input inReady : UInt<1>") +
+      "    model.inReady <= inReady\n"), ChirrtlForm), Nil)
+  val mixedState = multiAliasState(Seq("right_data", "right_valid"))
+  val mixedAnnotations = mixedState.annotations.map {
+    case a: FAMEChannelConnectionAnnotation if a.globalName == "left_" =>
+      a.copy(channelInfo = DecoupledForwardChannel.source(rt("left_valid"), rt("inReady")))
+    case a => a
+  } :+ FAMEChannelConnectionAnnotation("reverse", DecoupledReverseChannel,
+    Some(rt("alias0")), None, Some(Seq(rt("inReady"))))
+  val mixedInferred = new InferModelPorts().execute(mixedLow.copy(annotations = mixedAnnotations))
+  val mixedAnalysis = new FAMEChannelAnalysis(mixedInferred)
+  val mixedOutputs = mixedAnalysis.modelOutputChannelPortMap(ModuleTarget("Top", "Model"))
+  require(mixedOutputs.size == 1)
+  val mixedProducer = mixedOutputs.keys.head
+  val mixedRenames = transform.hostDecouplingRenames(mixedAnalysis)
+  for (branch <- Seq("left_", "right_")) {
+    require(mixedAnalysis.chNameToModelSourcePortName(branch) == s"${mixedProducer}_source")
+    for (leaf <- Seq("data", "valid"))
+      require(RTRenamer.exact(mixedRenames)(rt(s"$branch$leaf")) ==
+        rt(s"model_${mixedProducer}_source").field("bits").field(leaf))
+  }
+  val mixedRenamed = mixedInferred.annotations.flatMap(_.update(mixedRenames))
+    .collect { case a: FAMEChannelConnectionAnnotation => a }
+  require(mixedRenamed.find(_.globalName == "left_").get.channelInfo ==
+    DecoupledForwardChannel.source(
+      rt(s"model_${mixedProducer}_source").field("bits").field("valid"),
+      rt("model_inReady_sink").field("bits")))
+  require(mixedRenamed.find(_.globalName == "right_").get.channelInfo == PipeChannel(1))
+  println(s"PRODUCER $mixedProducer mixed forward/pipe branches 2 one token target")
+  for (reverseFirst <- Seq(true, false)) {
+    val branches = Seq(
+      source("left_", Seq("left_valid")).copy(channelInfo = DecoupledReverseChannel),
+      source("right_", Seq("right_valid"), latency = 1))
+    val reverseInferred = new InferModelPorts().execute(multiAliasLow.copy(annotations =
+      Seq(FAMEHostClock(rt("hostClock")), FAMEHostReset(rt("hostReset")),
+        FAMETransformAnnotation(ModuleTarget("Top", "Model"))) ++
+        (if (reverseFirst) branches else branches.reverse)))
+    val reverseAnalysis = new FAMEChannelAnalysis(reverseInferred)
+    val reverseOutputs = reverseAnalysis.modelOutputChannelPortMap(ModuleTarget("Top", "Model"))
+    require(reverseOutputs.size == 1 && reverseOutputs.keys.head == "valid")
+    for (branch <- Seq("left_", "right_"))
+      require(reverseAnalysis.chNameToModelSourcePortName(branch) == "valid_source")
+  }
+  println("PRODUCER valid mixed reverse/pipe branches one token target in both orders")
   def writeBoundary(directory: java.io.File, boundary: CircuitState, renames: RenameMap): Unit = {
     directory.mkdirs()
     val fir = new java.io.PrintWriter(new java.io.File(directory, "post-infer-model-ports.sfc.fir"))
@@ -183,6 +232,7 @@ object FAMESharedProducerOracle extends App {
     writeBoundary(new java.io.File(args(0), "distinct-top-aliases"), aliasInferred, aliasRenames)
     writeBoundary(new java.io.File(args(0), "distinct-multiport-aliases"),
       multiAliasInferred, multiAliasRenames)
+    writeBoundary(new java.io.File(args(0), "mixed-forward-pipe"), mixedInferred, mixedRenames)
   }
-  println("PASS production shared scalar/aggregate producer; common bits rename; four incompatible groups rejected")
+  println("PASS production shared scalar/aggregate and mixed-kind producers; common bits rename; four incompatible groups rejected")
 }

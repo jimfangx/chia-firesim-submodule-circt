@@ -1170,7 +1170,7 @@ int main(int argc, char **argv) {
           dependencies.push_back(input);
         llvm::json::Array aliases;
         for (const auto &alias : output.globalAliases)
-          aliases.push_back(alias);
+          aliases.push_back(alias.name);
         outputInventory.push_back(llvm::json::Object{
             {"globalName", output.globalName}, {"localName", output.localName},
             {"globalAliases", std::move(aliases)},
@@ -1792,10 +1792,10 @@ int main(int argc, char **argv) {
       }
       if (outputTopRenames != expectedFields * (1 + selectedOutput.globalAliases.size()) ||
           outputModelRenames != expectedFields ||
-          outputValidRenames != (expectedKind == goldengate::ChannelKind::DecoupledForward) *
-                                   (1 + selectedOutput.globalAliases.size()) ||
-          outputReadyRenames != (expectedKind == goldengate::ChannelKind::DecoupledReverse) *
-                                   (1 + selectedOutput.globalAliases.size()))
+          outputValidRenames != selectedOutput.countBranches(
+                                   goldengate::ChannelKind::DecoupledForward) ||
+          outputReadyRenames != selectedOutput.countBranches(
+                                   goldengate::ChannelKind::DecoupledReverse))
         return fail("FAME output annotation targets were not unique");
       circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(
           &context, rewrittenOutputAnnotations));

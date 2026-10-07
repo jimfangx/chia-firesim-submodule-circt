@@ -30,6 +30,7 @@ std::string dump(Operation *op) {
 // A pair of data directions and two unrelated printf channels. Connection
 // order, local channel names, and physical port order deliberately differ.
 void run(MLIRContext &context, unsigned rejection) {
+  const bool physicalAlias = rejection >= 16 && rejection <= 20;
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Top" {
       firrtl.module @Top(in %hostClock: !firrtl.clock,
@@ -66,7 +67,7 @@ void run(MLIRContext &context, unsigned rejection) {
     bool input = model.getPortDirection(i) == Direction::In;
     b.create<StrictConnectOp>(top.getLoc(), input ? m : t, input ? t : m);
   }
-  if (rejection >= 16) {
+  if (physicalAlias) {
     PortInfo alias(b.getStringAttr("secondPrintf"), UIntType::get(&context, 8),
                    Direction::Out);
     alias.sym = circt::hw::InnerSymAttr::get(b.getStringAttr("alias_payload"));
@@ -177,7 +178,8 @@ void run(MLIRContext &context, unsigned rejection) {
   channel("tx_global", AnnotationClasses::DecoupledForwardChannel,
           {"forwardValid", "forwardData"}, {}, "forwardValid", "ready");
   channel("other_print_global", AnnotationClasses::PipeChannel, {"otherPrintf"}, {});
-  channel("rx_ready_global", AnnotationClasses::DecoupledReverseChannel,
+  channel("rx_ready_global", rejection == 22 ? AnnotationClasses::PipeChannel
+          : AnnotationClasses::DecoupledReverseChannel,
           {"reverseReady"}, {});
   channel(rejection == 1 ? "arbitrary_print_second" : "arbitrary_print_first",
           AnnotationClasses::PipeChannel, {"printfA"}, {});
@@ -186,9 +188,9 @@ void run(MLIRContext &context, unsigned rejection) {
           {"inputValid", "data"}, "inputValid", "reverseReady");
   channel("trigger_global", AnnotationClasses::PipeChannel, {}, {"trigger"});
   channel("other_input_global", AnnotationClasses::PipeChannel, {}, {"otherData"});
-  if (rejection == 8 || (rejection >= 16 && rejection != 17))
+  if (rejection == 8 || (physicalAlias && rejection != 17))
     channel("second_claim_on_print_b", AnnotationClasses::PipeChannel,
-            rejection >= 16 ? ArrayRef<StringRef>{"secondPrintf"}
+            physicalAlias ? ArrayRef<StringRef>{"secondPrintf"}
                             : ArrayRef<StringRef>{"printfB"}, {}, "", "", 1);
   if (rejection == 11 || rejection == 12)
     channel("tx_alias", AnnotationClasses::DecoupledForwardChannel,
@@ -198,6 +200,9 @@ void run(MLIRContext &context, unsigned rejection) {
   if (rejection == 13)
     channel("changed_kind", AnnotationClasses::PipeChannel,
             {"forwardValid", "forwardData"}, {});
+  if (rejection == 21 || rejection == 22)
+    channel("ready_pipe_observer", rejection == 22 ? AnnotationClasses::DecoupledReverseChannel
+            : AnnotationClasses::PipeChannel, {"reverseReady"}, {});
   if (rejection == 14)
     channel("partial_payload", AnnotationClasses::PipeChannel, {"forwardData"}, {});
   if (rejection == 15)
@@ -211,7 +216,7 @@ void run(MLIRContext &context, unsigned rejection) {
       ? std::optional<SmallVector<goldengate::FAMEOutputSelection>>(dataSelection->outputs)
       : std::nullopt;
   require(dump(*root) == before, "output selection mutated IR/annotations");
-  if (rejection && rejection != 8 && rejection != 11 && rejection < 16) {
+  if (rejection && rejection != 8 && rejection != 11 && rejection != 13 && rejection < 16) {
     require(!selected && !error.empty(), "unsafe output selection accepted: " +
                                           std::to_string(rejection));
     return;
@@ -243,7 +248,7 @@ void run(MLIRContext &context, unsigned rejection) {
   for (unsigned i = 0; i < 4; ++i) {
     const auto &output = (*selected)[i];
     require(output.globalName == global[i] && output.localName == local[i] &&
-                output.kind == kinds[i] && output.fieldCount == (i == 1 ? 2u : 1u),
+                output.kind == (rejection == 22 && i == 2 ? goldengate::ChannelKind::Pipe : kinds[i]) && output.fieldCount == (i == 1 ? 2u : 1u),
             "output order/name/kind/field count differs from annotations");
     require(output.dependency.outputChannel == local[i] &&
                 output.dependency.inputChannels == dependencies[i] &&
@@ -251,16 +256,31 @@ void run(MLIRContext &context, unsigned rejection) {
                 output.dependency.unresolvedCauses.empty(),
             "output lost data/ready/trigger dependencies");
   }
-  require((*selected)[0].globalAliases ==
-              ((rejection == 8 || (rejection >= 16 && rejection != 17)) ? std::vector<std::string>{"second_claim_on_print_b"}
+  auto aliasNames = [](const auto &output) {
+    std::vector<std::string> names;
+    for (const auto &alias : output.globalAliases) names.push_back(alias.name);
+    return names;
+  };
+  require(aliasNames((*selected)[0]) ==
+              ((rejection == 8 || (physicalAlias && rejection != 17)) ? std::vector<std::string>{"second_claim_on_print_b"}
                               : std::vector<std::string>{}),
           "shared output branch did not retain one producer and its dependencies");
-  require((*selected)[1].globalAliases ==
-              (rejection == 11 ? std::vector<std::string>{"tx_alias"}
+  require(aliasNames((*selected)[1]) ==
+              (rejection == 13 ? std::vector<std::string>{"changed_kind"}
+               : rejection == 11 ? std::vector<std::string>{"tx_alias"}
                                : std::vector<std::string>{}),
           "multiport shared producer lost ordered branch identity");
   if (rejection == 8) {
     llvm::outs() << "PRODUCER printfB branches 2\n";
+  }
+  if (rejection == 13 || rejection == 21 || rejection == 22) {
+    unsigned producer = rejection == 13 ? 1 : 2;
+    auto &output = (*selected)[producer];
+    require(output.globalAliases.size() == 1 &&
+                output.countBranches(goldengate::ChannelKind::Pipe) == 1 &&
+                output.countBranches(rejection == 13 ? goldengate::ChannelKind::DecoupledForward
+                                                    : goldengate::ChannelKind::DecoupledReverse) == 1,
+            "mixed transport branches lost their individual kinds");
   }
   if (rejection == 11) return;
   error.clear();
@@ -302,12 +322,34 @@ void run(MLIRContext &context, unsigned rejection) {
   // Exercise the selected arbitrary Print channel through the actual FAME IR
   // rewrite: its data driver must move under token.bits, with a typed host
   // handshake on both the wrapper and model source ports.
-  if (rejection >= 17) {
+  if (rejection >= 17 && rejection <= 20) {
     auto beforeRewrite = dump(*root);
     require(failed(goldengate::rewriteFAMEOutputChannel(
                 *hierarchy, plan->sources.front(), error)) && !error.empty(),
             "unsafe output alias rewrite accepted: " + std::to_string(rejection));
     require(beforeRewrite == dump(*root), "rejected output alias mutated IR");
+    return;
+  }
+  if (rejection == 13 || rejection == 21 || rejection == 22) {
+    unsigned producer = rejection == 13 ? 1 : 2;
+    require(succeeded(goldengate::rewriteFAMEOutputChannel(
+                *hierarchy, plan->sources[producer], error)), error);
+    require(succeeded(verify(*root)), "mixed-kind producer rewrite invalid");
+    require(top.getNumPorts() == (rejection == 13 ? 11u : 12u) &&
+                model.getNumPorts() == (rejection == 13 ? 9u : 10u),
+            "mixed-kind branches produced duplicate model/top token ports");
+    if (rejection == 13) {
+      unsigned preserved = 0;
+      for (auto connect : model.getOps<StrictConnectOp>())
+        if (auto field = connect.getDest().getDefiningOp<SubfieldOp>()) {
+          preserved += field.getFieldName() == "forwardData" &&
+                       connect.getSrc() == forward.getResult();
+          preserved += field.getFieldName() == "forwardValid" &&
+                       connect.getSrc() == arg(3);
+        }
+      require(preserved == 2, "mixed-kind producer changed target payload drivers");
+    }
+    llvm::outs() << "PRODUCER mixed transport branches 2 one token port\n";
     return;
   }
   require(succeeded(goldengate::rewriteFAMEOutputChannel(
@@ -544,17 +586,17 @@ int main(int argc, char **argv) {
       for (const auto &output : selection->outputs) {
         llvm::outs() << "BRANCH " << output.globalName << " " << output.localName << '\n';
         for (const auto &alias : output.globalAliases)
-          llvm::outs() << "BRANCH " << alias << " " << output.localName << '\n';
+          llvm::outs() << "BRANCH " << alias.name << " " << output.localName << '\n';
       }
       return 0;
     }
     require(argc == 1, "usage: test [--data-selection boundary.mlir model]");
-    for (unsigned rejection = 0; rejection <= 20; ++rejection) run(context, rejection);
+    for (unsigned rejection = 0; rejection <= 22; ++rejection) run(context, rejection);
     for (unsigned rejection = 0; rejection <= 7; ++rejection)
       multiportAliases(context, rejection);
     newlySynthesizedPrintBundle(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
-                    "dependencies, scalar/multiport shared producers, all data inputs and model isolation passed; 13 unsafe selections "
+                    "dependencies, scalar/multiport and mixed-kind shared producers, all data inputs and model isolation passed; 12 unsafe selections "
                     "rejected without mutation; scalar physical aliases collapsed and four unsafe rewrites rejected atomically\n";
     return 0;
   } catch (const std::exception &e) {

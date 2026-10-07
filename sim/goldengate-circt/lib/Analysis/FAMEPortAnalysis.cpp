@@ -230,7 +230,7 @@ goldengate::analyzeFAMEPorts(
       if (!source || previous == plan.sources.end() ||
           previous->binding->instance != binding.instance ||
           previous->binding->portGroup != binding.portGroup ||
-          previousChannel == channels.end() || previousChannel->kind != channel->kind ||
+          previousChannel == channels.end() ||
           previous->type != *type ||
           orderedSources(*previousChannel, *previous->binding) !=
               orderedSources(*channel, binding)) {

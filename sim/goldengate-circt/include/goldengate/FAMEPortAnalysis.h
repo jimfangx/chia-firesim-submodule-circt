@@ -58,15 +58,27 @@ analyzeFAMEChannelClockDomains(circt::firrtl::CircuitOp circuit,
 // Capture names and dependencies before any port rewrite invalidates indices.
 // Selection follows connection annotation order; payload order stays in the
 // connection's source list, independently of the model's physical port order.
+struct FAMEOutputBranch {
+  std::string name;
+  ChannelKind kind;
+};
+
 struct FAMEOutputSelection {
   std::string globalName;
   std::string localName;
+  // The representative branch kind; the common producer has no transport kind.
   ChannelKind kind;
   unsigned fieldCount;
   LocalChannelDependency dependency;
   // Additional global branches sharing this local producer, in connection
   // annotation order. One local output selection means one producer FSM.
-  std::vector<std::string> globalAliases;
+  std::vector<FAMEOutputBranch> globalAliases;
+  unsigned countBranches(ChannelKind requested) const {
+    unsigned count = kind == requested;
+    for (const auto &alias : globalAliases)
+      count += alias.kind == requested;
+    return count;
+  }
 };
 
 struct FAMEInputSelection {

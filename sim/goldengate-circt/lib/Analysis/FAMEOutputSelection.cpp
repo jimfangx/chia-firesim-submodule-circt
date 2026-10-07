@@ -69,13 +69,14 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
           unsigned index = previous - outputGroups.begin();
           auto &output = outputs[index];
           if (orderedPorts != outputOrders[index] ||
-              output.kind != channel->kind ||
               output.fieldCount != channel->sources.size()) {
-            error = "shared FAME output changes payload order or kind: " +
+            error = "shared FAME output changes payload order: " +
                     channel->name;
             return std::nullopt;
           }
-          output.globalAliases.push_back(channel->name);
+          // ModulePortDeduper keys on clock and ordered ports. Transport kind
+          // stays on each global branch and does not create another FSM.
+          output.globalAliases.push_back({channel->name, channel->kind});
           continue;
         }
         outputGroups.push_back(binding.portGroup);

@@ -179,7 +179,7 @@ UART-bearing SFC differential baseline remains pending.
 
 This supplies discovery for the post-FAME boundary. Pre-FAME output selection
 now deduplicates identical ordered model payloads on the same associated
-clock, retains additional global branch names in `globalAliases`, and computes
+clock, retains additional global branch identities in `globalAliases`, and computes
 dependencies once per producer. Clock-domain analysis validates every branch's
 clock and supplies one assignment per producer. The top-port planner also
 creates one source port per shared producer, checking binding, type, kind and
@@ -319,3 +319,41 @@ step is to establish the SFC mixed-kind producer boundary and preserve each
 branch's independent queue/handshake semantics. Mixed fanout also needs bridge
 bindings to resolve each external queue output independently from the retained
 upstream producer identity.
+
+Iteration 33 makes producer selection and port planning independent of global
+transport kind, matching SFC's ModulePortDeduper key (clock, ordered ports).
+Each additional branch retains its name and kind in FAMEOutputBranch; the
+compiler counts forward valid and reverse ready annotation renames per branch
+instead of assuming every alias has the representative branch's kind. The
+existing payload type, order, clock, dependency and input-ownership checks
+remain in place. This is producer channelization progress; mixed transport
+fanout through the simulator wrapper remains unimplemented and unvalidated.
+
+The production Scala probe now executes forward/pipe sharing of distinct
+valid/data aliases and reverse/pipe sharing of a scalar in both branch orders.
+Before the fix, CIRCT rejected the exact Scala forward/pipe FIRRTL and
+annotations with `two transformed channels claim top port model_right__source`.
+After the fix, requesting either global branch produces the same native IR:
+one model/top token bundle and one instance connection, retaining the original
+data and valid drivers. Structured output annotation comparison matches both
+branch classes and clocks, four source targets, two model targets, and the
+forward validSource against `scala/mixed-forward-pipe/post-host-renames.sfc.json`.
+The standalone output rewrite leaves input readySink and raw DontTouch targets
+outside this comparison. Evidence is under mutable generated sources in
+`iteration33-mixed-producers/mixed-comparison.json`.
+
+Six focused CTests pass. They include forward/pipe and reverse/pipe producer
+rewrites, both reverse/pipe representative orders, unchanged combinational
+dependencies and target drivers, and the existing unsafe selection and alias
+rejection cases. The fresh native Rocket compile emits simulator SystemVerilog
+and collateral with empty stderr. Comparing its `post-infer-model-ports.mlir`
+and `post-fame-first-pipe-wrapper.mlir` against immutable U250
+`design/FireSim-generated.sv` matches 17 input and 25 output clock assignments,
+four eight-port queue interfaces, and 22 singleton enqueue valid/ready bindings.
+`golden-clock-comparison.stdout` and `golden-interface-comparison.json` record
+these results. The recorded Rocket annotations contain no shared producer
+fanout, so they do not exercise the new mixed-kind case. Recorded UInt0 queue
+payloads still differ from current Rocket UInt3/UInt64 payloads; these structural
+matches are not whole-design equivalence. The harness owns the next compile
+and Verilator gates. The iteration 32 harness passed smoke and both required
+Rocket suites, with the UART-bearing SFC differential baseline still pending.
