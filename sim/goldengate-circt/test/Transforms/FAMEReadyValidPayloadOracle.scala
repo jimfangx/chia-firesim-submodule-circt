@@ -14,9 +14,10 @@ object FAMEReadyValidPayloadOracle extends App {
   val destination = new java.io.File(args(0)); destination.mkdirs()
   val mode = args.lift(1).getOrElse("flat")
   val nested = mode == "nested"
-  val singleton = mode == "singleton"
+  val singleton = mode == "singleton" || mode == "selected"
   val zero = mode == "zero"
-  val payload = if (singleton) "{ group : { inner : { x : SInt<3> }, empty : { } }, valid : UInt<1> }"
+  val payload = if (mode == "selected") "{ group : { inner : { x : SInt<3>, ignored : UInt<5> }, ignored : UInt<2> }, valid : UInt<1> }"
+                else if (singleton) "{ group : { inner : { x : SInt<3> }, empty : { } }, valid : UInt<1> }"
                 else if (zero) "{ group : { x : SInt<3>, pad : SInt<0> }, valid : UInt<1> }"
                 else if (nested) "{ group : { x : SInt<3>, pad : SInt<0>, inner : { y : UInt<4>, valid : UInt<1> } }, valid : UInt<1> }"
                 else "{ x : SInt<3>, pad : SInt<0>, y : UInt<5>, valid : UInt<1> }"

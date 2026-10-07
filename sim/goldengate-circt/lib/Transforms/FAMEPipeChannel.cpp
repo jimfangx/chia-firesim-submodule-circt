@@ -545,6 +545,10 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
   std::string oldModule = "|" + oldName;
   std::string newModule = "|" + wrapperName.str();
   auto externalRenames = wrapper->getAttrOfType<DictionaryAttr>("goldengate.externalTargetRenames");
+  std::set<std::string> internalTargets;
+  if (auto targets = wrapper->getAttrOfType<ArrayAttr>("goldengate.internalTargets"))
+    for (auto target : targets)
+      internalTargets.insert(cast<StringAttr>(target).getValue().str());
   std::set<std::string> innerOnlyPorts;
   for (auto module : circuit.getOps<FModuleOp>())
     if (module.getName() == oldName)
@@ -566,6 +570,9 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
   std::function<Attribute(Attribute, bool)> retarget =
       [&](Attribute attr, bool targetDomain) -> Attribute {
     if (auto string = dyn_cast<StringAttr>(attr)) {
+      // Filtered payload leaves remain on the retained target, even when their
+      // spelling coincides with a normalized external leaf.
+      targetDomain |= internalTargets.count(string.getValue().str()) != 0;
       if (!targetDomain && externalRenames)
         if (auto replacement = externalRenames.getAs<StringAttr>(string.getValue()))
           string = replacement;

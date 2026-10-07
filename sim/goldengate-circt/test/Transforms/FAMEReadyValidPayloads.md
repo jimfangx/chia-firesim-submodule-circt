@@ -1,3 +1,69 @@
+# Annotation-selected ready/valid payloads — iteration 37
+
+The native wrapper now uses the annotation's data-leaf subset, following
+`ChannelizedWrapperIO.payloadTypeMap` and `SimUtils.buildChannelType`. It packs
+selected leaves in declaration order, computes queue width from that subset,
+and normalizes the reduced external payload. Unselected target outputs remain
+unused. Unselected target inputs receive CIRCT `InvalidValueOp` connections,
+matching the initialization in `SimulationMapping.initStmt`. Selected endpoint
+annotations transfer to the normalized wrapper; excluded leaves and ancestor
+bundles containing them retain their original identity on the inner target.
+The target-valid endpoint, unique integer leaf endpoints, and positive selected
+width are still required. Unsupported flips, clocks, vectors, or unknown widths
+anywhere in the target payload remain rejected before mutation.
+
+The executable production Scala probe now includes `selected`: nested SInt<3>
+data with unselected UInt<5> and UInt<2> siblings, in both orientations. The old
+native pass rejected this exact FIRRTL/annotation handoff. The new pass ingests
+it and matches all 14 exposed nonzero port leaves (names, signed widths, and
+directions), 28 control bindings, and four typed payload bindings. Both native
+queues have width three. Both unselected target input leaves are explicitly
+invalidated. The other four production probes continue to match their complete
+external interfaces.
+
+The final native Rocket compile exits zero, emits simulator SystemVerilog and
+annotated collateral, and has empty stderr.
+
+Eight focused CTests pass: ready/valid channels, four hub clock/queued-pipe
+cases, and TSI, BlockDev, and FASED token mapping. The ready/valid test exhausts
+3-bit and 7/8-bit selected packing in both orientations, checks excluded-leaf
+and ancestor annotation resolution, and rejects a selected payload missing
+its target-valid endpoint without constructing queues. Existing independent
+FIFO scoreboards still cover 60,000 randomized host cycles.
+
+Evidence is in
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration37-selected-rv/`:
+
+- `scala-selected/{post-fame.sfc.fir,post-fame.sfc.json,signed-wrapper.sfc.fir}`;
+  `before.stderr` records the old native rejection.
+- `ingested-selected-wrapper.mlir` and `.active.mlir` record the actual native
+  transforms; the four earlier modes have fresh Scala/native artifacts too.
+- `preflight-ctest.stdout`, `final-ctest.stdout`, and `dependent-ctest.stdout`.
+- `boundary-comparison.json` and `compare-boundaries.py` record the structured
+  comparisons. The initial build failed LLVM's default SmallVector inline-size
+  limit; `build-attempt1.stdout` retains that diagnostic. Explicit zero inline
+  storage for the excluded-leaf list fixes it. `ctest-stale-binary.stdout` was
+  produced after that failed build and is not validation of this change.
+- `compiler-candidate/post-fame-ready-valid-wrapper.mlir`, emitted simulator
+  RTL/collateral, and `compiler.stdout` / `compiler.stderr`. A preliminary
+  compiler run was cancelled to rebuild with the final ancestor-target fix;
+  the `compiler-pre-ancestor.cancelled.*` logs distinguish it from the final run.
+
+The exact immutable comparison artifact is
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+The fresh native Rocket wrapper matches 138 direct control bindings with zero
+differences and 70 payload bindings. Twenty current AXI payload bindings still
+have no corresponding direct assignment in the fixture. This establishes
+boundary correspondence, not payload-width parity or whole-design equivalence.
+The fixture does not exercise filtered nested signed payloads; those use the
+fresh production Scala probe.
+
+Iteration 36's harness passed CIRCT replacertl and all required Verilator
+workloads. Verification for this change remains harness-owned; the UART-bearing
+SFC differential baseline is pending. The next smallest step is a production
+Scala probe for zero-total-width ready/valid payloads, followed by native queue
+and endpoint support if that probe confirms the contract.
+
 # Normalized external ready/valid payloads — iteration 36
 
 The native ready/valid wrapper now implements the external payload shape from

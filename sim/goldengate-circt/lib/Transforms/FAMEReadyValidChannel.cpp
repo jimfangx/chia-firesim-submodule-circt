@@ -63,6 +63,7 @@ struct Pair {
   SmallVector<PayloadLeaf> leaves;
   bool targetSource;
   BundleType externalType;
+  SmallVector<PayloadLeaf, 0> excluded;
 };
 
 LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
@@ -146,7 +147,7 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
     // a nested leaf named valid remains payload data.
     unsigned width = 0;
     std::set<unsigned> fields;
-    SmallVector<PayloadLeaf> leaves;
+    SmallVector<PayloadLeaf> allLeaves;
     SmallVector<StringAttr> path;
     std::function<bool(FIRRTLType, unsigned)> collect =
         [&](FIRRTLType type, unsigned fieldID) {
@@ -166,7 +167,7 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
       if (leafWidth > std::numeric_limits<unsigned>::max() - width) return false;
       width += leafWidth;
       fields.insert(fieldID);
-      leaves.push_back({path, integer});
+      allLeaves.push_back({path, integer, {}});
       return true;
     };
     unsigned bitsID = ft.getFieldID(*ft.getElementIndex("bits"));
@@ -185,7 +186,8 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
     Annotation ra(rev->second);
     auto revEndpoints = ra.getMember<ArrayAttr>(source ? "sinks" : "sources");
     auto revOpposite = ra.getMember<ArrayAttr>(source ? "sources" : "sinks");
-    bool validEndpoints = a.getMember<Attribute>("clock") == ra.getMember<Attribute>("clock") && width > 0 && endpoints && endpoints.size() == fields.size() &&
+    std::set<unsigned> selected;
+    bool validEndpoints = a.getMember<Attribute>("clock") == ra.getMember<Attribute>("clock") && endpoints && !endpoints.empty() &&
                           (!opposite || opposite.empty()) && revEndpoints &&
                           revEndpoints.size() == 1 && (!revOpposite || revOpposite.empty());
     if (validEndpoints) {
@@ -193,7 +195,7 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
         auto spelling = dyn_cast<StringAttr>(endpoint);
         auto t = spelling ? goldengate::resolveAnnotationTarget(circuit, spelling.getValue(), error)
                           : std::nullopt;
-        if (!t || t->module != top || t->port != f->port || (!t->fieldID || !fields.erase(*t->fieldID))) {
+        if (!t || t->module != top || t->port != f->port || (!t->fieldID || !fields.count(*t->fieldID) || !selected.insert(*t->fieldID).second)) {
           validEndpoints = false; break;
         }
       }
@@ -202,7 +204,25 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
                         : std::nullopt;
       validEndpoints &= t && t->module == top && t->port == r->port && t->fieldID == r->fieldID;
     }
-    if (!validEndpoints || !names.insert(base).second ||
+    validEndpoints &= selected.count(*f->fieldID) != 0;
+    SmallVector<PayloadLeaf> leaves;
+    SmallVector<PayloadLeaf, 0> excluded;
+    width = 0;
+    for (auto &leaf : allLeaves) {
+      unsigned fieldID = bitsID;
+      FIRRTLBaseType type = payload;
+      for (auto name : leaf.path) {
+        auto bundle = cast<BundleType>(type);
+        unsigned index = *bundle.getElementIndex(name.getValue());
+        fieldID += bundle.getFieldID(index);
+        type = bundle.getElements()[index].type;
+      }
+      if (selected.count(fieldID)) {
+        width += leaf.type.getWidthOrSentinel();
+        leaves.push_back(leaf);
+      } else excluded.push_back(leaf);
+    }
+    if (!validEndpoints || !width || !names.insert(base).second ||
         !used.insert(*f->port).second || !used.insert(*r->port).second) {
       error = "ReadyValidChannel " + base + " has missing, shared or inconsistent endpoints";
       return failure();
@@ -212,21 +232,22 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
     // the shape decision even though they consume no packed queue bits.
     SmallVector<PayloadLeaf> normalizedLeaves;
     bool ambiguous = false;
-    std::function<FIRRTLBaseType(BundleType, bool)> normalize =
-        [&](BundleType bundle, bool root) -> FIRRTLBaseType {
+    std::function<FIRRTLBaseType(BundleType, bool, unsigned)> normalize =
+        [&](BundleType bundle, bool root, unsigned fieldID) -> FIRRTLBaseType {
       SmallVector<BundleType::BundleElement> elements;
       SmallVector<SmallVector<PayloadLeaf>> children;
       std::set<std::string> normalizedNames;
-      for (auto field : bundle.getElements()) {
+      for (auto [index, field] : llvm::enumerate(bundle.getElements())) {
         if (root && field.name.getValue() == "valid") continue;
         auto name = field.name.getValue();
         if (root) name.consume_front("bits_");
         auto normalizedName = StringAttr::get(circuit.getContext(), name);
         size_t start = normalizedLeaves.size();
         FIRRTLBaseType type;
+        unsigned childID = fieldID + bundle.getFieldID(index);
         if (auto nested = dyn_cast<BundleType>(field.type))
-          type = normalize(nested, false);
-        else {
+          type = normalize(nested, false, childID);
+        else if (selected.count(childID)) {
           type = field.type;
           normalizedLeaves.push_back({{}, cast<IntType>(type), {}});
         }
@@ -245,7 +266,7 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
       return elements.size() == 1 ? elements[0].type
                                  : FIRRTLBaseType(BundleType::get(circuit.getContext(), elements));
     };
-    auto normalized = normalize(payload, true);
+    auto normalized = normalize(payload, true, bitsID);
     if (ambiguous || !normalized || normalizedLeaves.size() != leaves.size()) {
       error = "ReadyValidChannel " + base + " has ambiguous normalized payload names";
       return failure();
@@ -258,7 +279,7 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
     SmallVector<BundleType::BundleElement> externalElements(ft.getElements().begin(), ft.getElements().end());
     externalElements[*ft.getElementIndex("bits")].type = validPayload;
     pairs.push_back({base, *f->port, *r->port, width, std::move(leaves), source,
-                     BundleType::get(circuit.getContext(), externalElements)});
+                     BundleType::get(circuit.getContext(), externalElements), std::move(excluded)});
     reverse.erase(rev);
   }
   if (!reverse.empty()) {
@@ -417,12 +438,23 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
   for (auto c : passthroughs) c.erase();
   SmallVector<Attribute> portTypes(wrapper.getPortTypes().begin(), wrapper.getPortTypes().end());
   NamedAttrList renames;
+  std::set<std::string> internalTargetNames;
   for (const auto &p : pairs) {
     unsigned port = wrapperPorts.at(p.forward);
     portTypes[port] = TypeAttr::get(p.externalType);
     wrapper.getArgument(port).setType(p.externalType);
     std::string prefix = "~" + circuit.getName().str() + "|" + top.getName().str() +
                          ">" + top.getPortName(p.forward).str() + ".bits";
+    for (const auto &leaf : p.excluded) {
+      // Ancestor targets describe an aggregate containing excluded fields;
+      // preserve that original aggregate identity on the retained target too.
+      std::string target = prefix;
+      internalTargetNames.insert(target);
+      for (auto name : leaf.path) {
+        target += "." + name.getValue().str();
+        internalTargetNames.insert(target);
+      }
+    }
     for (const auto &leaf : p.leaves) {
       std::string oldTarget = prefix, newTarget = prefix + ".bits";
       for (auto name : leaf.path) oldTarget += "." + name.getValue().str();
@@ -432,6 +464,10 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
   }
   wrapper.setPortTypes(portTypes);
   wrapper->setAttr("goldengate.externalTargetRenames", renames.getDictionary(circuit.getContext()));
+  SmallVector<Attribute> internalTargets;
+  for (const auto &name : internalTargetNames)
+    internalTargets.push_back(StringAttr::get(circuit.getContext(), name));
+  wrapper->setAttr("goldengate.internalTargets", ArrayAttr::get(circuit.getContext(), internalTargets));
   OpBuilder b(wrapper.getBodyBlock(), wrapper.getBodyBlock()->end());
   Location loc = wrapper.getLoc();
   auto field = [&](Value v, llvm::StringRef name) -> Value { return b.create<SubfieldOp>(loc, v, name); };
@@ -465,6 +501,15 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     connect(arg(15), field(deqR, "valid"));
     // SimWrapper.genReadyValidChannel uses an always-valid false reset token.
     connect(arg(16), zero); connect(arg(17), one);
+    // SimulationMapping.initStmt invalidates target-instance inputs before
+    // attaching the selected channels. Unselected output leaves are unused;
+    // unselected input leaves must not consume external token bits.
+    if (!p.targetSource)
+      for (const auto &leaf : p.excluded) {
+        Value dest = field(fInternal, "bits");
+        for (auto name : leaf.path) dest = field(dest, name.getValue());
+        connect(dest, b.create<InvalidValueOp>(loc, leaf.type));
+      }
     Value packed;
     unsigned offset = p.width;
     for (const auto &leaf : p.leaves) {

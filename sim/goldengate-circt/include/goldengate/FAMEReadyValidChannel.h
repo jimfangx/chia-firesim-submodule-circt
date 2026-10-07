@@ -9,9 +9,14 @@ namespace goldengate {
 mlir::LogicalResult addFAMEReadyValidChannel(circt::firrtl::CircuitOp circuit,
                                             unsigned payloadWidth,
                                             std::string &error);
-// Resolve boundary pairs from annotations, recursively pack passive integer bundle leaves,
+// Resolve boundary pairs from annotations, recursively pack annotation-selected passive integer bundle leaves,
 // normalize external Valid payloads like SimUtils.buildChannelType, and replace
-// passthroughs in the existing pipe wrapper. Activation transfers leaf renames.
+// passthroughs in the existing pipe wrapper. Excluded target input leaves are
+// invalidated as in SimulationMapping; activation retains their metadata on the
+// inner target and transfers selected leaf renames. Requires known-width passive
+// integer payloads, positive selected width, an uninstantiated wrapper, and unique
+// leaf endpoints including target-valid. Consumes no annotations; preserves the
+// target hierarchy and records explicit wrapper target transfers.
 mlir::LogicalResult addFAMEBoundaryReadyValidChannels(
     circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

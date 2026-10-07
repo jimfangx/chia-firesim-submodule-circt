@@ -172,6 +172,8 @@ module { firrtl.circuit "Top" {
   if (bad == 22) replace("group: bundle<x: sint<3>, pad: sint<0>, inner: bundle<y: uint<4>, valid: uint<1>>>",
                          "group: bundle<x: sint<3>, pad: sint<0>>");
   if (bad == 23) replace("y: uint<5>", "bits_x: uint<5>");
+  if (bad == 24) replace("x: uint<3>, pad: uint<0>, y: uint<5>",
+      "group: bundle<inner: bundle<x: sint<3>, ignored: uint<5>>, ignored: uint<2>>");
   auto root = parseSourceString<ModuleOp>(text, &context);
   require(bool(root), "cannot parse payload fixture");
   OpBuilder b(&context);
@@ -188,6 +190,8 @@ module { firrtl.circuit "Top" {
       if (i == 0 && bad == 17) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner"), target("group.inner.valid"), target("valid")});
       if (i == 0 && bad == 18) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner.y"), target("group.inner.y"), target("valid")});
     }
+    if (bad == 25) endpoints = b.getArrayAttr({target("x"), target("pad"), target("y")});
+    if (bad == 24) endpoints = b.getArrayAttr({target("valid"), target("group.inner.x")});
     if (bad == 23) endpoints = b.getArrayAttr({target("x"), target("pad"), target("bits_x"), target("valid")});
     if (bad == 21) endpoints = b.getArrayAttr({target("group.inner.x"), target("valid")});
     if (bad == 22) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("valid")});
@@ -211,6 +215,14 @@ module { firrtl.circuit "Top" {
     auto revInfo = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledReverseChannel))});
     if (!(bad == 1 && i == 0)) annotations.push_back(annotation("_rev", revInfo, b.getArrayAttr({rt}), i != 0));
   }
+  if (bad == 24)
+    annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("test.PreservedPayload")),
+      b.getNamedAttr("targets", b.getArrayAttr({
+        b.getStringAttr("~Top|Top>a.bits.group.inner.ignored"),
+        b.getStringAttr("~Top|Top>b.bits.group.ignored"),
+        b.getStringAttr("~Top|Top>a.bits.group.inner"),
+        b.getStringAttr("~Top|Top>b.bits")}))}));
   auto c = *root->getOps<CircuitOp>().begin(); c->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   return root;
 }
@@ -347,6 +359,7 @@ void wrapper(MLIRContext &context, const char *output) {
 // A nested "valid" is data, while only the direct valid controls the queue.
 void nestedPayload(MLIRContext &context) {
   for (unsigned variant = 12; variant <= 20; ++variant) {
+    if (variant == 16) continue; // Annotation-selected subset is tested below.
     auto root = fixture(context, variant);
     auto circuit = *root->getOps<CircuitOp>().begin();
     std::string error;
@@ -515,6 +528,94 @@ void normalizedPayload(MLIRContext &context) {
         "unsafe wrapper normalization partially mutated circuit");
   }
 }
+// Selected leaves determine width and shape; excluded target input leaves
+// receive invalid values, and metadata for excluded leaves stays on the target.
+void selectedPayload(MLIRContext &context) {
+  for (unsigned variant : {16u, 24u}) {
+    auto root = fixture(context, variant);
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    std::string error;
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), error);
+    auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+    unsigned checked = 0, invalid = 0;
+    for (auto connect : wrapper.getOps<ConnectOp>())
+      if (connect.getSrc().getDefiningOp<InvalidValueOp>()) ++invalid;
+    require(invalid == (variant == 24 ? 2u : 0u), "excluded sink leaves are not invalidated");
+    for (auto instance : wrapper.getOps<InstanceOp>()) {
+      if (!instance.getName().starts_with("ReadyValidChannel_")) continue;
+      bool send = instance.getName() == "ReadyValidChannel_send";
+      unsigned width = variant == 24 ? 3 : (send ? 7 : 8);
+      require(instance.getModuleName() == "GGFAMEReadyValid" + std::to_string(width),
+              "queue width includes excluded leaves");
+      Value packed; SmallVector<Value> unpacked;
+      for (auto connect : wrapper.getOps<ConnectOp>()) {
+        if (connect.getDest() == instance.getResult(4)) packed = connect.getSrc();
+        Value src = connect.getSrc();
+        if (auto cast = src.getDefiningOp<AsSIntPrimOp>()) src = cast.getInput();
+        if (auto slice = src.getDefiningOp<BitsPrimOp>(); slice && slice.getInput() == instance.getResult(11))
+          unpacked.push_back(connect.getSrc());
+      }
+      SmallVector<Value> leaves;
+      std::function<void(Value)> flatten = [&](Value v) {
+        if (auto cat = v.getDefiningOp<CatPrimOp>()) {
+          flatten(cat.getOperand(0)); flatten(cat.getOperand(1));
+        } else {
+          if (auto cast = v.getDefiningOp<AsUIntPrimOp>()) v = cast.getInput();
+          leaves.push_back(v);
+        }
+      };
+      flatten(packed);
+      require(leaves.size() == (variant == 24 ? 1u : (send ? 2u : 3u)), "excluded leaf packed into channel");
+      require(unpacked.size() == leaves.size(), "selected payload unpack count");
+      Interpreter evaluation(wrapper);
+      for (uint64_t pattern = 0; pattern < (uint64_t(1) << width); ++pattern) {
+        evaluation.memo.clear();
+        unsigned offset = width;
+        for (auto leaf : leaves) {
+          unsigned bits = cast<IntType>(leaf.getType()).getWidthOrSentinel();
+          offset -= bits; evaluation.memo[leaf] = (pattern >> offset) & ((uint64_t(1) << bits) - 1);
+        }
+        evaluation.memo[instance.getResult(11)] = pattern;
+        require(evaluation.eval(packed) == pattern, "selected packing changed bits");
+        offset = width;
+        for (auto leaf : unpacked) {
+          unsigned bits = cast<IntType>(leaf.getType()).getWidthOrSentinel(); offset -= bits;
+          require(evaluation.eval(leaf) == ((pattern >> offset) & ((uint64_t(1) << bits) - 1)), "selected unpack changed bits");
+        }
+      }
+      ++checked;
+    }
+    require(checked == 2, "selected payload orientations missing");
+    require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+    for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      auto anno = cast<DictionaryAttr>(attr);
+      for (StringRef member : {"sources", "sinks", "targets"})
+        if (auto targets = anno.getAs<ArrayAttr>(member))
+          for (auto attr : targets) {
+            auto target = goldengate::resolveAnnotationTarget(circuit, cast<StringAttr>(attr).getValue(), error);
+            require(bool(target), "selected or excluded annotation failed resolution: " + error);
+            require(target->module == (member == "targets" ? named(circuit, "Top") : wrapper),
+                    "excluded metadata left target or selected endpoint left wrapper");
+          }
+    }
+    require(succeeded(verify(*root)), "selected payload IR verification failed");
+  }
+}
+void missingSelectedValid(MLIRContext &context) {
+  auto root = fixture(context, 25);
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  std::string error;
+  require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+  auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+  auto original = wrapper.getPortType(2);
+  require(failed(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)),
+          "selected data with missing target-valid accepted");
+  require(wrapper.getPortType(2) == original &&
+      !llvm::any_of(circuit.getOps<FModuleOp>(), [](FModuleOp m) {
+        return m.getName().starts_with("GGFAMEReadyValid");
+      }), "missing target-valid partially rewrote circuit");
+}
 // Secondary fanout removal shifts all following ReadyValid port ordinals.
 // Match the retained target by identity when replacing its passthroughs.
 void fanoutWrapper(MLIRContext &context) {
@@ -561,6 +662,8 @@ int main(int argc, char **argv) {
     signedScalar(context);
     nestedPayload(context);
     normalizedPayload(context);
+    selectedPayload(context);
+    missingSelectedValid(context);
     fanoutWrapper(context);
     for (unsigned width : {1, 8, 32}) behavior(context, width);
     if (argc > 3) {
