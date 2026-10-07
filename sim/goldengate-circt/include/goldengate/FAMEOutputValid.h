@@ -12,6 +12,8 @@ namespace goldengate {
 // Annotations consumed/produced: none.
 // IR mutations: replace output-valid connect sources with FIRRTL expressions.
 // Analysis required: local combinational input-channel dependencies.
+// Source and dependency valid fields must be passive UInt<1>, as constructed
+// by SFC HasModelPort. Reject peer-driven flipped valids before any mutation.
 mlir::LogicalResult rewriteFAMEOutputValids(
     circt::firrtl::FModuleOp module,
     llvm::ArrayRef<LocalChannelDependency> dependencies, std::string &error);

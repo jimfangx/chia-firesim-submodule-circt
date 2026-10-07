@@ -252,6 +252,54 @@ expressions for structural comparison with SFC RTL. Source the mandatory
 FireSim environment before these local compiler commands. No manager gates
 were launched.
 
+## Input-dependent payload differential (iteration 21)
+
+The coupled fixture now feeds sticky 16-bit payloads into each target domain.
+Each gated target register accumulates its current input modulo 65536, and
+each output combinationally adds that register and input. The native pass uses
+the corresponding input-valid dependency for each output, matching the actual
+Scala `FAMETransform` result. Input payloads stay fixed until accepted; both
+interpreters independently accumulate the expected target state on emitted
+gate CE. The native test also checks that valid output payloads remain stable
+under backpressure, including long independent stalls and host resets.
+
+This work exposed a production validation gap: `rewriteFAMEOutputValids`
+accepted a flipped `valid` field on a source or dependency sink, even though
+Scala `HasModelPort` constructs passive `UInt<1>` valids. It could drive a
+peer-owned source valid or read the wrong-direction dependency. The helper
+now rejects both cases before changing any channel. Two fixtures put a valid
+output first and a malformed output/dependency second, checking that the
+complete module remains unchanged. Before the fix the regression failed with
+`flipped valid field accepted or partially rewritten`.
+
+All 8192 trace rows match the preserved Scala oracle in each clock ordering,
+including both target states and both output payloads. Normal order has 600
+non-reset completions, 7587 stalled host cycles and 449/300 target edges;
+reversed order has 575 completions, 7612 stalls and 287/430 edges. The trace
+hashes are `0d6d75877b969a9f85a257631bb8c29083ff312a1c0a6c827286590b5869c8d4`
+and `8b62879eceff156a37298af0d8556a6eccad199cd566a9c6e34258ac18b62be2`.
+Both native circuits pass FIRRTL verification and firtool Verilog lowering.
+Ten focused CTest checks pass; the two coupled checks pass again after adding
+the explicit blocked-output assertions. No manager gates were launched.
+
+For the immutable comparison, the fixed output-valid helper is reapplied to
+`circt-ingestion/post-fame-twenty-fifth-output-control.mlir`, using the captured
+pre-channelization `fame-output-selection.json` dependency analysis. All 25
+rewritten predicates match the FireSim module's assignments in the immutable
+U250 `design/FireSim-generated.sv` named above. The comparison preserves exact
+channel/register names, negation, and operand multiplicity while normalizing
+conjunction association/order. This establishes Rocket compatibility; the
+immutable single-clock fixture does not supply a multiclock payload oracle.
+
+Evidence is in the mutable generated-source `iteration21-payload-oracle/`:
+`native-{normal,reversed}.{mlir,trace,sv}`, `scala-{normal,reversed}.trace`,
+the Scala `hub.sfc.fir`/`producer.sfc.fir` outputs, `rocket-output-valids.log`,
+`comparison.json`, `tests.log` and `tests-final-payload.log`. Build logs are
+`goldengate-circt-build/iteration21-{build,boundary-build,final-build}.log`.
+Run the fired-state boundary binary as
+`--output-valids <candidate.mlir> <fame-output-selection.json>` to reconstruct
+the predicates. The coupled/Scala invocation remains as described above.
+
 ## Remaining work
 
 The hub FAME boundary now uses all ordered clock domains. The active compiler
@@ -259,9 +307,10 @@ calls `addClockBridge`, which maps ordered rational lanes, their source/sink
 targets and the fastest-clock counter. The actual Scala bridge comparison
 is recorded in [RationalClockBridge.md](RationalClockBridge.md); the inner
 scheduler comparison is in
-[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next extend
-the coupled fixture to input-dependent target state and compare the emitted
-output token values under independent stalls. The baseline's data/bridge
+[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next feed
+the coupled payload fixture through production channelization and dependency
+analysis, replacing its manually constructed channel interface/dependency set.
+The baseline's data/bridge
 configuration remains Rocket specific.
 Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing differential
 remain incomplete.

@@ -12,6 +12,8 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include <map>
 #include <stdexcept>
 
@@ -489,7 +491,56 @@ std::string predicate(FModuleOp m, Value value) {
   if (auto o = value.getDefiningOp<OrPrimOp>())
     return "(" + predicate(m, o.getLhs()) + " | " + predicate(m, o.getRhs()) +
            ")";
+  if (auto n = value.getDefiningOp<NotPrimOp>())
+    return "(~" + predicate(m, n.getInput()) + ")";
   throw std::runtime_error("unexpected completion operation");
+}
+// Reapply the production output-valid pass using the independently captured
+// pre-channelization dependency analysis, then expose its Boolean trees for
+// comparison with immutable SFC RTL. Do not recover inputs from old rules.
+void outputValidsBoundary(MLIRContext &context, const char *path,
+                         const char *dependencyPath) {
+  auto root = parseSourceFile<ModuleOp>(path, &context);
+  require(bool(root), "output-valid boundary parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  FModuleOp m;
+  for (auto candidate : circuit.getOps<FModuleOp>())
+    if (candidate.getName() == "FireSim") m = candidate;
+  require(bool(m), "output-valid FireSim model missing");
+  auto buffer = llvm::MemoryBuffer::getFile(dependencyPath);
+  require(bool(buffer), "cannot read output dependencies");
+  auto parsed = llvm::json::parse((*buffer)->getBuffer());
+  if (!parsed) throw std::runtime_error(llvm::toString(parsed.takeError()));
+  auto *object = parsed->getAsObject();
+  auto *outputs = object ? object->getArray("outputs") : nullptr;
+  require(outputs && outputs->size() == 25, "expected 25 Rocket output dependencies");
+  SmallVector<goldengate::LocalChannelDependency> deps;
+  for (auto &entry : *outputs) {
+    auto *output = entry.getAsObject();
+    auto name = output ? output->getString("localName") : std::nullopt;
+    auto *inputs = output ? output->getArray("inputChannels") : nullptr;
+    require(name && inputs, "malformed output dependency");
+    goldengate::LocalChannelDependency dep{name->str(), {}, {}, {}};
+    for (auto &input : *inputs) {
+      auto inputName = input.getAsString();
+      require(bool(inputName), "malformed dependency input");
+      dep.inputChannels.push_back(inputName->str());
+    }
+    deps.push_back(std::move(dep));
+  }
+  std::string error;
+  require(succeeded(goldengate::rewriteFAMEOutputValids(m, deps, error)), error.c_str());
+  require(succeeded(verify(m)), "rewritten Rocket output-valid IR verification failed");
+  auto emit = [&](Value dest, Value src) {
+    auto f = dest.getDefiningOp<SubfieldOp>();
+    auto port = f ? dyn_cast<BlockArgument>(f.getInput()) : BlockArgument();
+    if (port && f.getFieldName() == "valid" &&
+        m.getPortDirection(port.getArgNumber()) == Direction::Out)
+      llvm::outs() << "OUTPUT_VALID " << m.getPortName(port.getArgNumber())
+                   << "_valid " << predicate(m, src) << '\n';
+  };
+  for (auto c : m.getOps<ConnectOp>()) emit(c.getDest(), c.getSrc());
+  for (auto c : m.getOps<StrictConnectOp>()) emit(c.getDest(), c.getSrc());
 }
 void virtualControls(MLIRContext &context, const char *path) {
   auto root = parseSourceFile<ModuleOp>(path, &context);
@@ -1040,7 +1091,9 @@ int main(int argc, char **argv) {
     collidingIdentities(context);
     finishingBehavior(context);
     noDataFinishingRejections(context);
-    if (argc == 3 && std::string(argv[1]) == "--virtual-controls")
+    if (argc == 4 && std::string(argv[1]) == "--output-valids")
+      outputValidsBoundary(context, argv[2], argv[3]);
+    else if (argc == 3 && std::string(argv[1]) == "--virtual-controls")
       virtualControls(context, argv[2]);
     else if (argc == 3 && std::string(argv[1]) == "--clock-controls")
       clockControls(context, argv[2]);
@@ -1058,7 +1111,8 @@ int main(int argc, char **argv) {
               "candidate.mlir | --clock-controls candidate.mlir | "
               "--mixed-controls candidate.mlir | "
               "--input-only-controls candidate.mlir | "
-              "--selected-controls candidate.mlir]");
+              "--selected-controls candidate.mlir | --output-valids "
+              "candidate.mlir dependencies.json]");
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

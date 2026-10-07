@@ -39,7 +39,11 @@ LogicalResult goldengate::rewriteFAMEOutputValids(
   auto hasValid = [](Value port) {
     auto type = dyn_cast_or_null<BundleType>(port.getType());
     auto index = type ? type.getElementIndex("valid") : std::nullopt;
-    return index && type.getElements()[*index].type ==
+    // HasModelPort's decoupled valid is always passive. A flipped source
+    // valid belongs to the peer, and a flipped sink valid cannot supply the
+    // target's combinational dependency. Check both before building any rule.
+    return index && !type.getElements()[*index].isFlip &&
+           type.getElements()[*index].type ==
                         UIntType::get(port.getContext(), 1, false);
   };
 

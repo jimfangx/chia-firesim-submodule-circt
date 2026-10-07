@@ -130,10 +130,40 @@ void clockRecordRejections(MLIRContext &ctx) {
   llvm::errs() << "Passed seven atomic ClockRecord completion rejections\n";
 }
 
+void outputValidRejections(MLIRContext &ctx) {
+  // HasModelPort constructs passive valid fields; a flipped field is driven
+  // by the peer. Reject it before even a preceding valid channel is rewritten.
+  for (bool flippedInput : {false, true}) {
+    auto root = parseSourceString<ModuleOp>(
+        "module { firrtl.circuit \"Model\" { firrtl.module @Model("
+        "in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, "
+        "in %in0_sink: !firrtl.bundle<ready flip: uint<1>, valid" +
+        std::string(flippedInput ? " flip" : "") + ": uint<1>, bits: uint<16>>, "
+        "out %out0_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>, "
+        "out %out1_source: !firrtl.bundle<ready flip: uint<1>, valid" +
+        std::string(flippedInput ? "" : " flip") + ": uint<1>, bits: uint<16>>) { "
+        "%done = firrtl.wire : !firrtl.uint<1> } } }", &ctx);
+    require(bool(root), "output valid rejection fixture parse");
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    auto model = *circuit.getOps<FModuleOp>().begin();
+    for (auto w : model.getOps<WireOp>()) w.setName("targetCycleFinishing");
+    std::string error;
+    require(succeeded(goldengate::ensureFAMEFiredRegisters(model,
+            {{"out0", false, {}}, {"out1", false, {}}}, error)), error);
+    auto before = dump(root->getOperation());
+    require(failed(goldengate::rewriteFAMEOutputValids(model,
+            {{"out0", {}, {}, {}}, {"out1", {"in0"}, {}, {}}}, error)) &&
+            error.find("valid port") != std::string::npos &&
+            before == dump(root->getOperation()),
+            "flipped valid field accepted or partially rewritten");
+  }
+  llvm::errs() << "Passed two atomic flipped-valid rejections\n";
+}
+
 void run(MLIRContext &ctx, bool reversed, const char *output) {
   std::string common = R"mlir(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
-    in %in0_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<1>>,
-    in %in1_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<1>>,
+    in %in0_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>,
+    in %in1_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>,
     out %out0_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>,
     out %out1_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>)mlir";
   auto payload = reversed ? "_1: clock, _0: clock" : "_0: clock, _1: clock";
@@ -147,10 +177,10 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
       %clock1 = firrtl.subfield %bits[_1] : !firrtl.bundle<)mlir" + payload + R"mlir(>
       %state0 = firrtl.reg %clock0 : !firrtl.clock, !firrtl.uint<16>
       %state1 = firrtl.reg %clock1 : !firrtl.clock, !firrtl.uint<16>
-      %one = firrtl.constant 1 : !firrtl.uint<16>
-      %three = firrtl.constant 3 : !firrtl.uint<16>
-      %sum0 = firrtl.add %state0, %one : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
-      %sum1 = firrtl.add %state1, %three : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
+      %input0 = firrtl.subfield %in0_sink[bits] : !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>
+      %input1 = firrtl.subfield %in1_sink[bits] : !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<16>>
+      %sum0 = firrtl.add %state0, %input0 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
+      %sum1 = firrtl.add %state1, %input1 : (!firrtl.uint<16>, !firrtl.uint<16>) -> !firrtl.uint<17>
       %next0 = firrtl.bits %sum0 15 to 0 : (!firrtl.uint<17>) -> !firrtl.uint<16>
       %next1 = firrtl.bits %sum1 15 to 0 : (!firrtl.uint<17>) -> !firrtl.uint<16>
       firrtl.strictconnect %state0, %next0 : !firrtl.uint<16>
@@ -178,15 +208,19 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
   require(succeeded(goldengate::ensureFAMEFiredRegisters(model, channels, error)), error);
   require(succeeded(goldengate::rewriteFAMEFiredStates(model, channels, error)), error);
   require(succeeded(goldengate::rewriteFAMEOutputValids(model,
-              {{"out0", {}, {}, {}}, {"out1", {}, {}, {}}}, error)), error);
+              {{"out0", {"in0"}, {}, {}}, {"out1", {"in1"}, {}, {}}}, error)), error);
   require(succeeded(goldengate::rewriteFAMEInputReadies(model, {"in0", "in1"}, error)), error);
   require(succeeded(goldengate::rewriteFAMEFinishing(model,
               {"in0", "in1"}, {"out0", "out1"}, "bridge_clocks", error)), error);
   b.setInsertionPointToEnd(model.getBodyBlock());
   for (auto r : model.getOps<RegOp>()) targetState.push_back(r.getResult());
   require(targetState.size() == 2, "target state missing");
-  for (unsigned i = 0; i < 2; ++i)
-    b.create<StrictConnectOp>(loc, field(b, loc, model.getArgument(4 + i), "bits"), targetState[i]);
+  for (unsigned i = 0; i < 2; ++i) {
+    auto sum = b.create<AddPrimOp>(loc, targetState[i],
+        field(b, loc, model.getArgument(2 + i), "bits"));
+    auto data = b.create<BitsPrimOp>(loc, sum, 15, 0);
+    b.create<StrictConnectOp>(loc, field(b, loc, model.getArgument(4 + i), "bits"), data);
+  }
 
   b.setInsertionPointToEnd(top.getBodyBlock());
   auto instance = b.create<InstanceOp>(loc, model, "model");
@@ -228,21 +262,31 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
   for (auto w : model.getOps<WireOp>())
     if (w.getName() == "targetCycleFinishing") finishing = w.getResult();
   bool pending[2] = {false, false};
+  uint64_t inputBits[2] = {0, 0}, expectedState[2] = {0, 0};
+  bool blocked[2] = {false, false};
+  uint64_t blockedBits[2] = {0, 0};
   uint64_t edges[2] = {0, 0}, outputCount[2] = {0, 0}, inputCount[2] = {0, 0};
   unsigned stalls = 0, unequal = 0, completed = 0;
   for (unsigned cycle = 0; cycle < 8192; ++cycle) {
     bool reset = cycle < 3 || cycle == 4096 || cycle == 4097;
-    if (reset) pending[0] = pending[1] = false;
+    if (reset) {
+      pending[0] = pending[1] = false;
+      inputBits[0] = inputBits[1] = 0;
+    }
     else {
-      pending[0] |= cycle % 11 == 3 || cycle % 43 > 37;
-      pending[1] |= cycle % 17 == 5 || cycle % 61 > 53;
+      if (!pending[0] && (cycle % 11 == 3 || cycle % 43 > 37)) {
+        pending[0] = true; inputBits[0] = (cycle * 73 + 19) & 65535;
+      }
+      if (!pending[1] && (cycle % 17 == 5 || cycle % 61 > 53)) {
+        pending[1] = true; inputBits[1] = (cycle * 151 + 41) & 65535;
+      }
     }
     sim.memo.clear();
     sim.memo[sim.key(top.getArgument(0))] = 0;
     sim.memo[sim.key(top.getArgument(1))] = reset;
     for (unsigned i = 0; i < 2; ++i) {
       sim.memo[sim.key(top.getArgument(2 + i)) + ".valid"] = pending[i];
-      sim.memo[sim.key(top.getArgument(2 + i)) + ".bits"] = 0;
+      sim.memo[sim.key(top.getArgument(2 + i)) + ".bits"] = inputBits[i];
       sim.memo[sim.key(top.getArgument(4 + i)) + ".ready"] = i == 0 ?
           cycle % 97 >= 29 && cycle % 7 != 0 : cycle % 83 >= 37 && cycle % 11 != 0;
     }
@@ -262,9 +306,10 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
       firedMask |= sim.eval(fired.lookup(channels[i].name)) << i;
     llvm::outs() << "TRACE " << cycle << ' ' << mask << ' ' << done << ' ' << enableMask << ' '
       << firedMask << ' ' << inReady << ' ' << outValid << ' ' << ceMask << ' '
-      << sim.eval(targetState[0]) << ' ' << sim.eval(targetState[1]) << '\n';
-    require(sim.eval(targetState[0]) == (edges[0] & 65535) &&
-            sim.eval(targetState[1]) == ((edges[1] * 3) & 65535), "target-cycle state trajectory differs");
+      << sim.eval(targetState[0]) << ' ' << sim.eval(targetState[1]) << ' '
+      << evalField(4, "bits") << ' ' << evalField(5, "bits") << '\n';
+    require(sim.eval(targetState[0]) == expectedState[0] &&
+            sim.eval(targetState[1]) == expectedState[1], "target-cycle state trajectory differs");
     require(!reset || !ceMask, "host reset advanced target state");
     if (!done && !reset) ++stalls;
     if (enableMask == 1 || enableMask == 2) ++unequal;
@@ -272,9 +317,18 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
     auto heldMask = mask;
     // Observe each actual output handshake, including early independent firing.
     for (unsigned i = 0; i < 2; ++i) {
+      auto data = evalField(4 + i, "bits");
+      require(data == ((expectedState[i] + inputBits[i]) & 65535),
+              "output payload does not reflect target state and current input");
+      if (!reset && blocked[i])
+        require((outValid & (1 << i)) && data == blockedBits[i],
+                "valid output token changed while backpressured");
+      blocked[i] = !reset && (outValid & (1 << i)) && !evalField(4 + i, "ready");
+      blockedBits[i] = data;
       if (pending[i] && (inReady & (1 << i))) { pending[i] = false; ++inputCount[i]; }
       if (evalField(4 + i, "ready") && (outValid & (1 << i)) && !reset) ++outputCount[i];
       edges[i] += (ceMask >> i) & 1;
+      if ((ceMask >> i) & 1) expectedState[i] = (expectedState[i] + inputBits[i]) & 65535;
     }
     sim.edge();
     // Check the connected producer holds its next edge token while blocked.
@@ -298,6 +352,7 @@ int main(int argc, char **argv) {
             "usage: FAMEHubClockCoupledTest [--normal|--reversed [output.mlir]]");
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     clockRecordRejections(ctx);
+    outputValidRejections(ctx);
     bool reversed = argc > 1 && StringRef(argv[1]) == "--reversed";
     run(ctx, reversed, argc > 2 ? argv[2] : nullptr);
     return 0;

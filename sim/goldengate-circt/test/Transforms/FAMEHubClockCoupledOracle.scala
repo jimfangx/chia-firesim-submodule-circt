@@ -15,18 +15,18 @@ object FAMEHubClockCoupledOracle extends App {
   module Model :
     input bridge_clocks_1 : Clock
     input bridge_clocks_0 : Clock
-    input in0 : UInt<1>
-    input in1 : UInt<1>
+    input in0 : UInt<16>
+    input in1 : UInt<16>
     output out0 : UInt<16>
     output out1 : UInt<16>
     output targetClock0 : Clock
     output targetClock1 : Clock
     reg state0 : UInt<16>, bridge_clocks_0
     reg state1 : UInt<16>, bridge_clocks_1
-    state0 <= add(state0, UInt<16>(1))
-    state1 <= add(state1, UInt<16>(3))
-    out0 <= state0
-    out1 <= state1
+    state0 <= add(state0, in0)
+    state1 <= add(state1, in1)
+    out0 <= add(state0, in0)
+    out1 <= add(state1, in1)
     targetClock0 <= bridge_clocks_0
     targetClock1 <= bridge_clocks_1
   module Top :
@@ -34,8 +34,8 @@ object FAMEHubClockCoupledOracle extends App {
     input hostReset : UInt<1>
     input bridge_clocks_0 : Clock
     input bridge_clocks_1 : Clock
-    input in0 : UInt<1>
-    input in1 : UInt<1>
+    input in0 : UInt<16>
+    input in1 : UInt<16>
     output out0 : UInt<16>
     output out1 : UInt<16>
     output targetClock0 : Clock
@@ -155,14 +155,23 @@ object FAMEHubClockCoupledOracle extends App {
     .fields.find(_.name=="bits").get.tpe.asInstanceOf[BundleType]
   require(payload.fields.map(_.name)==clockNames.map(_.stripPrefix("bridge_clocks")))
   val pending = Array(false,false)
+  val inputPayload = Array(BigInt(0),BigInt(0))
+  val expectedState = Array(BigInt(0),BigInt(0))
   def bit(value: Boolean): BigInt = if(value) BigInt(1) else BigInt(0)
   def mask(values: Seq[BigInt]): BigInt = values.zipWithIndex.map { case (v,i) => v<<i }.foldLeft(BigInt(0))(_|_)
   for(cycle <- 0 until 8192) {
     val reset = cycle<3 || cycle==4096 || cycle==4097
-    if(reset) { pending(0)=false; pending(1)=false }
-    else {
-      if(cycle%11==3 || cycle%43>37) pending(0)=true
-      if(cycle%17==5 || cycle%61>53) pending(1)=true
+    if(reset) {
+      for(i <- 0 until 2) { pending(i)=false; inputPayload(i)=BigInt(0) }
+    } else {
+      if(!pending(0) && (cycle%11==3 || cycle%43>37)) {
+        pending(0)=true
+        inputPayload(0)=BigInt((cycle*73+19)&65535)
+      }
+      if(!pending(1) && (cycle%17==5 || cycle%61>53)) {
+        pending(1)=true
+        inputPayload(1)=BigInt((cycle*151+41)&65535)
+      }
     }
     hub.memo=Map.empty
     producer.memo=Map.empty
@@ -182,7 +191,8 @@ object FAMEHubClockCoupledOracle extends App {
         producer.get(s"io_bits_$lane")
       case "in0_sink.valid" => bit(pending(0))
       case "in1_sink.valid" => bit(pending(1))
-      case "in0_sink.bits" | "in1_sink.bits" => BigInt(0)
+      case "in0_sink.bits" => inputPayload(0)
+      case "in1_sink.bits" => inputPayload(1)
       case "out0_source.ready" => bit(cycle%97>=29 && cycle%7!=0)
       case "out1_source.ready" => bit(cycle%83>=37 && cycle%11!=0)
     }
@@ -193,7 +203,11 @@ object FAMEHubClockCoupledOracle extends App {
     val inputReady=mask((0 until 2).map(i => hub.get(s"in${i}_sink.ready")))
     val outputValid=mask((0 until 2).map(i => hub.get(s"out${i}_source.valid")))
     val ce=mask((0 until 2).map(i => hub.get(s"bridge_clocks_${i}_buffer.CE")))
-    println(s"TRACE $cycle $tokens $finishing $enabled $fired $inputReady $outputValid $ce ${hub.get("state0")} ${hub.get("state1")}")
+    for(i <- 0 until 2)
+      require(hub.get(s"state$i")==expectedState(i), s"target state mismatch at cycle $cycle, lane $i")
+    println(s"TRACE $cycle $tokens $finishing $enabled $fired $inputReady $outputValid $ce ${hub.get("state0")} ${hub.get("state1")} ${hub.get("out0_source.bits")} ${hub.get("out1_source.bits")}")
+    for(i <- 0 until 2) if(((ce>>i)&1)!=0)
+      expectedState(i)=(expectedState(i)+inputPayload(i))&65535
     val nextHub=hub.next
     val nextProducer=producer.next
     for(i <- 0 until 2) if(reset || (pending(i) && ((inputReady>>i)&1)!=0)) pending(i)=false
