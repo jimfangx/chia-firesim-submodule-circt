@@ -191,6 +191,67 @@ Iteration 19 evidence is under the mutable generated-source directory
 The actual compiler and three relevant native test binaries build successfully;
 four focused CTest checks pass. No manager gates were launched by this change.
 
+## Coupled rational producer and hub completion
+
+`FAMEHubClockCoupledTest.cpp` constructs the actual native rational producer
+and connects its ready signal to a two-domain hub built with the production
+FAME enable, gate, fired-state, input-ready, output-valid and finishing helpers.
+The two target registers advance by 1 and 3 only on their actual gate CE.
+The producer lanes have ratios 1/2 and 1/3; reversing the ClockRecord field
+order reverses their physical domain assignment. Independent sticky input
+valids, independent output-ready stalls, and a mid-run host reset exercise
+early firing, disabled domains and producer backpressure.
+
+This regression failed before the production fix with
+`missing Clock-typed target clock sink bridge_clocks`. `rewriteFAMEFinishing`
+now accepts the nonempty passive record of scalar Clock leaves produced by
+`HasModelPort`, applying the record's single valid/ready handshake once.
+Data-only, empty, mixed, flipped, nested and vector payloads, and a ClockRecord
+wrongly listed as a data input, reject before mutation. Seven new atomic
+rejection cases check that contract.
+
+`FAMEHubClockCoupledOracle.scala` executes the preserved Scala FAME transform
+and elaborates the actual Scala rational generator. Both interpreters evaluate
+the emitted operations, updating host registers simultaneously and target
+registers only on emitted gate CE. All 8,192 rows in each clock ordering match
+exactly: producer tokens, completion, buffered enables, fired state,
+input-ready, output-valid, gate CE and both target states. Normal order gives
+705 non-reset completions and 528/352 target edges; reversed order gives
+653 completions and 326/489 edges. Both runs include over 7,400 stalled host
+cycles. Unreset target state is seeded to zero in both interpreters; this is
+an IR differential, not a physical initialization guarantee or a multiclock
+manager simulation. The native fixture begins at the channelized model
+boundary; prior hub tests cover its annotation and port conversion.
+
+The modified finishing helper is also reapplied to the captured Rocket
+`circt-ingestion/post-fame-twenty-fifth-output-control.mlir`. Its clock-ready
+predicate matches the normalized Boolean tree in the immutable U250
+`design/FireSim-generated.sv` named above: exactly 17 input-valid terms and
+25 output `(fired | (ready & valid))` terms. Completion matches with the
+recorded constant-valid scalar clock. The immutable Rocket has one clock and
+does not exercise the ClockRecord rejection.
+
+Iteration 20 evidence is in the mutable generated-source directory
+`iteration20-coupled-hub/`: `native-{normal,reversed}.{mlir,trace,sv}`,
+`scala-{normal,reversed}.trace`, each Scala directory's `hub.sfc.fir` and
+`producer.sfc.fir`, `rocket-finishing.log`, `comparison.json` and `tests.log`.
+The compiler and both relevant test binaries build; 17 focused CTest checks
+pass. CIRCT firtool lowers both coupled native circuits to Verilog successfully.
+The build logs are `goldengate-circt-build/iteration20-build{,-final}.log`.
+
+To reproduce, build `goldengate-circt`,
+`goldengate-fame-hub-clock-coupled-test` and
+`goldengate-fame-fired-state-test` in the configured CMake directory. Run the
+coupled binary with `--normal <output.mlir>` and `--reversed <output.mlir>`;
+stdout is the trace. Compile the Scala oracle using the existing midas compile
+dependency classpath and Scala 2.13.10 compiler, then run it with an output
+directory and, for reversed order, a second `--reversed` argument. Compare
+every trace row. The fired-state binary takes the captured Rocket MLIR as its
+sole argument and prints the reconstructed `COMPLETION` and `CLOCK_READY`
+expressions for structural comparison with SFC RTL. Source the mandatory
+FireSim environment before these local compiler commands. No manager gates
+were launched.
+
 ## Remaining work
 
 The hub FAME boundary now uses all ordered clock domains. The active compiler
@@ -198,8 +259,9 @@ calls `addClockBridge`, which maps ordered rational lanes, their source/sink
 targets and the fastest-clock counter. The actual Scala bridge comparison
 is recorded in [RationalClockBridge.md](RationalClockBridge.md); the inner
 scheduler comparison is in
-[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next couple
-the rational producer to the multiclock FAME hub under independent data-channel
-stalls. The baseline's data/bridge configuration remains Rocket specific.
+[RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next extend
+the coupled fixture to input-dependent target state and compare the emitted
+output token values under independent stalls. The baseline's data/bridge
+configuration remains Rocket specific.
 Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing differential
 remain incomplete.

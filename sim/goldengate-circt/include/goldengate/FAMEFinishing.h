@@ -15,6 +15,9 @@ namespace goldengate {
 // valid is constant one and no clock-ready connect or port is created.
 // Requires decoupled data ports with one-bit fired registers and resolved
 // module-body connect semantics. All data ports must be listed exactly once.
+// A real clock sink carries one Clock or a nonempty passive ClockRecord of
+// scalar Clock leaves. Both use one handshake, excluded from the data inputs.
+// Mixed, empty, flipped or nested payload records are rejected before mutation.
 // Fired state resolves through goldengate.fameFiredChannel; untagged legacy
 // models retain name-based compatibility. Duplicate identities reject atomically.
 // Annotations consumed/produced: none. Analyses required/preserved: none.

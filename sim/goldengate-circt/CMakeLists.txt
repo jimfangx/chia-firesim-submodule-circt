@@ -500,6 +500,20 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-fame-hub-clock-domains COMMAND goldengate-fame-hub-clock-domains-test)
   add_test(NAME goldengate-fame-hub-clock-domains-reversed
     COMMAND goldengate-fame-hub-clock-domains-test --reversed)
+  add_executable(goldengate-fame-hub-clock-coupled-test
+    test/Transforms/FAMEHubClockCoupledTest.cpp
+    lib/Transforms/FAMEInputChannel.cpp lib/Transforms/FAMEFiredState.cpp
+    lib/Transforms/FAMEFinishing.cpp lib/Transforms/FAMEInputReady.cpp
+    lib/Transforms/FAMEOutputValid.cpp lib/Transforms/RationalClockTokenGenerator.cpp)
+  target_compile_features(goldengate-fame-hub-clock-coupled-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-hub-clock-coupled-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-hub-clock-coupled-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-hub-clock-coupled-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-hub-clock-coupled COMMAND goldengate-fame-hub-clock-coupled-test)
+  add_test(NAME goldengate-fame-hub-clock-coupled-reversed
+    COMMAND goldengate-fame-hub-clock-coupled-test --reversed)
   add_executable(goldengate-fame-channel-clock-domains-test
     test/Transforms/FAMEChannelClockDomainsTest.cpp
     lib/Analysis/FAMEChannelClockDomains.cpp lib/Analysis/CombDependencyAnalysis.cpp

@@ -38,8 +38,20 @@ bool hasClockToken(Value port) {
   if (!bundle || !hasDecoupledFields(port))
     return false;
   auto bits = bundle.getElementIndex("bits");
-  return bits && !bundle.getElements()[*bits].isFlip &&
-         isa<ClockType>(bundle.getElements()[*bits].type);
+  if (!bits || bundle.getElements()[*bits].isFlip)
+    return false;
+  auto payload = bundle.getElements()[*bits].type;
+  if (isa<ClockType>(payload))
+    return true;
+  // HasModelPort packs several scalar Clock ports into a ClockRecord. The
+  // whole record is one clock token, with one valid/ready handshake. Require
+  // the same passive, nonempty set of Clock leaves produced by that boundary;
+  // a mixed data bundle must not silently become the completion clock.
+  auto record = dyn_cast<BundleType>(payload);
+  return record && !record.getElements().empty() &&
+         llvm::all_of(record.getElements(), [](BundleType::BundleElement e) {
+           return !e.isFlip && isa<ClockType>(e.type);
+         });
 }
 } // namespace
 
@@ -79,7 +91,7 @@ LogicalResult goldengate::rewriteFAMEFinishing(
   if (!virtualClock)
     clockPort = lookupPort((clockChannel + "_sink").str(), Direction::In);
   if (!virtualClock && (!clockPort || !hasClockToken(clockPort))) {
-    error = "missing Clock-typed target clock sink " + clockChannel.str();
+    error = "missing Clock/ClockRecord target clock sink " + clockChannel.str();
     return failure();
   }
 
