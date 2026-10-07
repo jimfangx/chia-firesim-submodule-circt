@@ -1719,31 +1719,37 @@ int main(int argc, char **argv) {
         return name;
       };
       for (unsigned modelPort : outputBindings->front().instancePorts) {
-        std::optional<unsigned> topPort;
+        std::set<unsigned> topPorts;
         for (const auto &connection : outputHierarchy->connections)
           if (connection.instance == outputBindings->front().instance &&
               connection.instancePort == modelPort) {
-            if (topPort)
-              return fail("FAME output has multiple top connections");
-            topPort = connection.topPort;
+            topPorts.insert(connection.topPort);
           }
-        if (!topPort)
+        if (topPorts.empty())
           return fail("FAME output has no top connection");
-        auto oldTop = outputHierarchy->top.getPortName(*topPort);
-        auto oldModel = outputGroup.module.getPortName(modelPort);
-        auto topField = outputBindings->front().instancePorts.size() == 1
-                            ? std::string()
-                            : ("." + removeCommonPrefix(oldTop, outputChannel->name).str());
-        auto modelField = outputBindings->front().instancePorts.size() == 1
+        if (topPorts.size() > 1 && expectedFields != 1)
+          return fail("FAME multiport output aliases are not yet supported");
+        // Top targets rename per alias; the common model target renames once.
+        bool firstAlias = true;
+        for (unsigned topPort : topPorts) {
+          auto oldTop = outputHierarchy->top.getPortName(topPort);
+          auto oldModel = outputGroup.module.getPortName(modelPort);
+          auto topField = outputBindings->front().instancePorts.size() == 1
                               ? std::string()
-                              : ("." + removeCommonPrefix(oldModel, outputGroup.name).str());
-        outputRenames.push_back({
-            prefix + outputHierarchy->top.getName().str() + ">" + oldTop.str(),
-            prefix + outputHierarchy->top.getName().str() + ">" +
-                outputPort.portName + ".bits" + topField,
-            prefix + outputGroup.module.getName().str() + ">" + oldModel.str(),
-            prefix + outputGroup.module.getName().str() + ">" +
-                outputGroup.name + "_source.bits" + modelField});
+                              : ("." + removeCommonPrefix(oldTop, outputChannel->name).str());
+          auto modelField = outputBindings->front().instancePorts.size() == 1
+                                ? std::string()
+                                : ("." + removeCommonPrefix(oldModel, outputGroup.name).str());
+          outputRenames.push_back({
+              prefix + outputHierarchy->top.getName().str() + ">" + oldTop.str(),
+              prefix + outputHierarchy->top.getName().str() + ">" +
+                  outputPort.portName + ".bits" + topField,
+              firstAlias ? prefix + outputGroup.module.getName().str() + ">" + oldModel.str()
+                         : std::string(),
+              prefix + outputGroup.module.getName().str() + ">" +
+                  outputGroup.name + "_source.bits" + modelField});
+          firstAlias = false;
+        }
       }
       if (failed(goldengate::rewriteFAMEOutputChannel(
               *outputHierarchy, outputPort, error)))
@@ -1794,8 +1800,8 @@ int main(int argc, char **argv) {
       for (const auto &rename : outputRenames)
         if (enableAutoILA && (failed(goldengate::transferFAMEPortDebugTargets(
                 circuit, rename.oldTop, rename.newTop, error)) ||
-            failed(goldengate::transferFAMEPortDebugTargets(
-                circuit, rename.oldModel, rename.newModel, error))))
+            (!rename.oldModel.empty() && failed(goldengate::transferFAMEPortDebugTargets(
+                circuit, rename.oldModel, rename.newModel, error)))))
           return fail("FAME output debug target transfer: " + error);
       if (failed(mlir::verify(*module)))
         return fail("FAME output produced invalid FIRRTL IR");
@@ -4994,34 +5000,38 @@ int main(int argc, char **argv) {
       return portName;
     };
     for (unsigned modelPort : binding.instancePorts) {
-      std::optional<unsigned> topPort;
+      std::set<unsigned> topPorts;
       for (const auto &connection : hierarchy->connections)
         if (connection.instance == binding.instance &&
             connection.instancePort == modelPort) {
-          if (topPort)
-            return fail("FAME output channel has multiple top connections");
-          topPort = connection.topPort;
+          topPorts.insert(connection.topPort);
         }
-      if (!topPort)
+      if (topPorts.empty())
         return fail("FAME output channel has no top port");
-      auto oldTopName = hierarchy->top.getPortName(*topPort);
-      auto oldModelName = model.getPortName(modelPort);
-      std::string topSuffix, modelSuffix;
-      if (binding.instancePorts.size() > 1) {
-        topSuffix = ("." + removeCommonPrefix(oldTopName,
-                                                binding.globalName)).str();
-        modelSuffix = ("." + removeCommonPrefix(
-                                 oldModelName, binding.portGroup->name)).str();
+      if (topPorts.size() > 1 && binding.instancePorts.size() != 1)
+        return fail("FAME multiport output aliases are not yet supported");
+      bool firstAlias = true;
+      for (unsigned topPort : topPorts) {
+        auto oldTopName = hierarchy->top.getPortName(topPort);
+        auto oldModelName = model.getPortName(modelPort);
+        std::string topSuffix, modelSuffix;
+        if (binding.instancePorts.size() > 1) {
+          topSuffix = ("." + removeCommonPrefix(oldTopName,
+                                                  binding.globalName)).str();
+          modelSuffix = ("." + removeCommonPrefix(
+                                   oldModelName, binding.portGroup->name)).str();
+        }
+        std::string topPrefix = "~" + circuit.getName().str() + "|" +
+                                hierarchy->top.getName().str() + ">";
+        std::string modelPrefix = "~" + circuit.getName().str() + "|" +
+                                  model.getModuleName().str() + ">";
+        renames.push_back({topPrefix + oldTopName.str(),
+                           topPrefix + selected->portName + ".bits" + topSuffix,
+                           firstAlias ? modelPrefix + oldModelName.str() : std::string(),
+                           modelPrefix + binding.portGroup->name +
+                               "_source.bits" + modelSuffix});
+        firstAlias = false;
       }
-      std::string topPrefix = "~" + circuit.getName().str() + "|" +
-                              hierarchy->top.getName().str() + ">";
-      std::string modelPrefix = "~" + circuit.getName().str() + "|" +
-                                model.getModuleName().str() + ">";
-      renames.push_back({topPrefix + oldTopName.str(),
-                         topPrefix + selected->portName + ".bits" + topSuffix,
-                         modelPrefix + oldModelName.str(),
-                         modelPrefix + binding.portGroup->name +
-                             "_source.bits" + modelSuffix});
     }
     std::string rewriteError;
     if (mlir::failed(goldengate::rewriteFAMEOutputChannel(
@@ -5030,8 +5040,8 @@ int main(int argc, char **argv) {
     for (const auto &rename : renames)
       if (failed(goldengate::transferFAMEPortDebugTargets(
               circuit, rename.oldTop, rename.newTop, rewriteError)) ||
-          failed(goldengate::transferFAMEPortDebugTargets(
-              circuit, rename.oldModel, rename.newModel, rewriteError)))
+          (!rename.oldModel.empty() && failed(goldengate::transferFAMEPortDebugTargets(
+              circuit, rename.oldModel, rename.newModel, rewriteError))))
         return fail("FAME output debug target transfer: " + rewriteError);
     llvm::SmallVector<mlir::Attribute> annotations;
     unsigned topTargets = 0, modelTargets = 0;
@@ -5079,7 +5089,8 @@ int main(int argc, char **argv) {
           modelTargets += rename("ports", entry.oldModel, entry.newModel);
       annotations.push_back(annotation.getAttr());
     }
-    if (topTargets != renames.size() * branchCount || modelTargets != renames.size())
+    if (topTargets != binding.instancePorts.size() * branchCount ||
+        modelTargets != binding.instancePorts.size())
       return fail("FAME output channel annotation targets were not unique");
     circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(&context, annotations));
     if (mlir::failed(mlir::verify(*module)))

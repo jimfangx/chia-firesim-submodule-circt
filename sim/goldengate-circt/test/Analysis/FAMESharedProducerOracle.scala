@@ -43,8 +43,9 @@ object FAMESharedProducerOracle extends App {
   def source(name: String, ports: Seq[String], clock: String = "alias0", latency: Int = 0) =
     FAMEChannelConnectionAnnotation(name, PipeChannel(latency), Some(rt(clock)),
       Some(ports.map(rt)), None)
-  def state(first: Seq[String], second: Seq[String], secondClock: String = "alias0") =
-    low.copy(annotations = Seq(
+  def state(first: Seq[String], second: Seq[String], secondClock: String = "alias0",
+      base: CircuitState = low) =
+    base.copy(annotations = Seq(
       FAMEHostClock(rt("hostClock")), FAMEHostReset(rt("hostReset")),
       FAMETransformAnnotation(ModuleTarget("Top", "Model")),
       FAMEChannelConnectionAnnotation("input", PipeChannel(0), Some(rt("alias0")),
@@ -80,15 +81,36 @@ object FAMESharedProducerOracle extends App {
     catch { case e: RuntimeException if e.getMessage.contains("partially overlapping") => rejected = true }
     require(rejected, "Scala accepted incompatible shared producer")
   }
-  if (args.nonEmpty) {
-    val directory = new java.io.File(args(0)); directory.mkdirs()
+  // Distinct wrapper ports driven by the same scalar model producer must
+  // share its local port and both move to the same host payload target.
+  val aliasInput = input.replace("  module Top :", "  module Top :\n    output secondPrintf : UInt<8>") +
+    "    secondPrintf <= model.printfB\n"
+  val aliasLow = new LowFirrtlCompiler().compile(
+    CircuitState(Parser.parse(aliasInput), ChirrtlForm), Nil)
+  val aliasInferred = new InferModelPorts().execute(
+    state(Seq("printfB"), Seq("secondPrintf"), base = aliasLow))
+  val aliasAnalysis = new FAMEChannelAnalysis(aliasInferred)
+  require(aliasAnalysis.modelOutputChannelPortMap(ModuleTarget("Top", "Model")).size == 1)
+  val aliasRenames = transform.hostDecouplingRenames(aliasAnalysis)
+  for (port <- Seq("printfB", "secondPrintf")) {
+    require(RTRenamer.exact(aliasRenames)(rt(port)) ==
+      rt("model_printfB_source").field("bits"))
+    require(aliasAnalysis.staleTopPorts.contains(rt(port)))
+  }
+  println("PRODUCER printfB physical aliases 2 one token target")
+  def writeBoundary(directory: java.io.File, boundary: CircuitState, renames: RenameMap): Unit = {
+    directory.mkdirs()
     val fir = new java.io.PrintWriter(new java.io.File(directory, "post-infer-model-ports.sfc.fir"))
-    try fir.write(inferred.circuit.serialize) finally fir.close()
+    try fir.write(boundary.circuit.serialize) finally fir.close()
     val anno = new java.io.PrintWriter(new java.io.File(directory, "post-infer-model-ports.sfc.json"))
-    try anno.write(JsonProtocol.serialize(inferred.annotations)) finally anno.close()
+    try anno.write(JsonProtocol.serialize(boundary.annotations)) finally anno.close()
     val renamed = new java.io.PrintWriter(new java.io.File(directory, "post-host-renames.sfc.json"))
-    try renamed.write(JsonProtocol.serialize(inferred.annotations.flatMap(_.update(renames))))
+    try renamed.write(JsonProtocol.serialize(boundary.annotations.flatMap(_.update(renames))))
     finally renamed.close()
+  }
+  if (args.nonEmpty) {
+    writeBoundary(new java.io.File(args(0)), inferred, renames)
+    writeBoundary(new java.io.File(args(0), "distinct-top-aliases"), aliasInferred, aliasRenames)
   }
   println("PASS production shared scalar/aggregate producer; common bits rename; three incompatible groups rejected")
 }

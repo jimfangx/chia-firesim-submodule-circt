@@ -66,6 +66,25 @@ void run(MLIRContext &context, unsigned rejection) {
     bool input = model.getPortDirection(i) == Direction::In;
     b.create<StrictConnectOp>(top.getLoc(), input ? m : t, input ? t : m);
   }
+  if (rejection >= 16) {
+    PortInfo alias(b.getStringAttr("secondPrintf"), UIntType::get(&context, 8),
+                   Direction::Out);
+    alias.sym = circt::hw::InnerSymAttr::get(b.getStringAttr("alias_payload"));
+    alias.annotations = AnnotationSet(b.getArrayAttr({b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr("firrtl.transforms.DontTouchAnnotation"))})}));
+    unsigned aliasPort = top.getNumPorts();
+    top.insertPorts({{aliasPort, alias}});
+    b.create<StrictConnectOp>(top.getLoc(),
+        top.getBodyBlock()->getArgument(aliasPort), instance.getResult(8));
+    if (rejection == 18)
+      b.create<NodeOp>(top.getLoc(), instance.getResult(8), "extra_use");
+    if (rejection == 19)
+      top.setPortSymbolsAttr(8, circt::hw::InnerSymAttr::get(
+          b.getStringAttr("other_payload")));
+    if (rejection == 20)
+      b.create<NodeOp>(top.getLoc(), top.getBodyBlock()->getArgument(aliasPort),
+                       "extra_alias_use");
+  }
   auto otherInstance = b.create<InstanceOp>(top.getLoc(), other, "other");
   b.create<StrictConnectOp>(top.getLoc(), otherInstance.getResult(0),
                            top.getBodyBlock()->getArgument(10));
@@ -167,9 +186,10 @@ void run(MLIRContext &context, unsigned rejection) {
           {"inputValid", "data"}, "inputValid", "reverseReady");
   channel("trigger_global", AnnotationClasses::PipeChannel, {}, {"trigger"});
   channel("other_input_global", AnnotationClasses::PipeChannel, {}, {"otherData"});
-  if (rejection == 8)
+  if (rejection == 8 || (rejection >= 16 && rejection != 17))
     channel("second_claim_on_print_b", AnnotationClasses::PipeChannel,
-            {"printfB"}, {}, "", "", 1);
+            rejection >= 16 ? ArrayRef<StringRef>{"secondPrintf"}
+                            : ArrayRef<StringRef>{"printfB"}, {}, "", "", 1);
   if (rejection == 11 || rejection == 12)
     channel("tx_alias", AnnotationClasses::DecoupledForwardChannel,
             rejection == 12 ? ArrayRef<StringRef>{"forwardData", "forwardValid"}
@@ -191,7 +211,7 @@ void run(MLIRContext &context, unsigned rejection) {
       ? std::optional<SmallVector<goldengate::FAMEOutputSelection>>(dataSelection->outputs)
       : std::nullopt;
   require(dump(*root) == before, "output selection mutated IR/annotations");
-  if (rejection && rejection != 8 && rejection != 11) {
+  if (rejection && rejection != 8 && rejection != 11 && rejection < 16) {
     require(!selected && !error.empty(), "unsafe output selection accepted: " +
                                           std::to_string(rejection));
     return;
@@ -232,7 +252,7 @@ void run(MLIRContext &context, unsigned rejection) {
             "output lost data/ready/trigger dependencies");
   }
   require((*selected)[0].globalAliases ==
-              (rejection == 8 ? std::vector<std::string>{"second_claim_on_print_b"}
+              ((rejection == 8 || (rejection >= 16 && rejection != 17)) ? std::vector<std::string>{"second_claim_on_print_b"}
                               : std::vector<std::string>{}),
           "shared output branch did not retain one producer and its dependencies");
   require((*selected)[1].globalAliases ==
@@ -282,6 +302,14 @@ void run(MLIRContext &context, unsigned rejection) {
   // Exercise the selected arbitrary Print channel through the actual FAME IR
   // rewrite: its data driver must move under token.bits, with a typed host
   // handshake on both the wrapper and model source ports.
+  if (rejection >= 17) {
+    auto beforeRewrite = dump(*root);
+    require(failed(goldengate::rewriteFAMEOutputChannel(
+                *hierarchy, plan->sources.front(), error)) && !error.empty(),
+            "unsafe output alias rewrite accepted: " + std::to_string(rejection));
+    require(beforeRewrite == dump(*root), "rejected output alias mutated IR");
+    return;
+  }
   require(succeeded(goldengate::rewriteFAMEOutputChannel(
               *hierarchy, plan->sources.front(), error)), error);
   require(succeeded(verify(*root)), "selected Print output rewrite invalid");
@@ -290,6 +318,18 @@ void run(MLIRContext &context, unsigned rejection) {
               top.getPorts()[8].type == plan->sources.front().type &&
               model.getPorts()[8].type == plan->sources.front().type,
           "selected Print output did not become a matching token interface");
+  if (rejection == 16) {
+    require(top.getNumPorts() == 12 &&
+                llvm::range_size(top.getPorts()[8].sym) == 1 &&
+                (*top.getPorts()[8].sym.begin()).getName().getValue() ==
+                    "alias_payload" &&
+                (*top.getPorts()[8].sym.begin()).getFieldID() ==
+                    plan->sources.front().type.getFieldID(2),
+            "physical alias collapse lost payload identity or retained an old port");
+    require(!cast<ArrayAttr>(top.getPortAnnotationsAttr()[8]).empty(),
+            "physical alias collapse lost DontTouch metadata");
+    llvm::outs() << "PRODUCER printfB physical aliases 2 one token port\n";
+  }
   bool payloadDriven = false;
   for (auto connect : model.getOps<StrictConnectOp>())
     if (auto field = connect.getDest().getDefiningOp<SubfieldOp>())
@@ -402,11 +442,11 @@ int main(int argc, char **argv) {
       return 0;
     }
     require(argc == 1, "usage: test [--data-selection boundary.mlir model]");
-    for (unsigned rejection = 0; rejection <= 15; ++rejection) run(context, rejection);
+    for (unsigned rejection = 0; rejection <= 20; ++rejection) run(context, rejection);
     newlySynthesizedPrintBundle(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
                     "dependencies, scalar/multiport shared producers, all data inputs and model isolation passed; 13 unsafe selections "
-                    "rejected without mutation\n";
+                    "rejected without mutation; scalar physical aliases collapsed and four unsafe rewrites rejected atomically\n";
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

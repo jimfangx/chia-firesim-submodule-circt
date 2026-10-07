@@ -215,18 +215,59 @@ assignments, including phase and reset. The four queue interfaces and 22
 singleton valid/ready bindings also match that RTL. These recorded Rocket
 boundaries do not exercise shared producers; the production Scala fixtures
 provide that comparison. The fresh native compiler emits simulator RTL and
-collateral with empty stderr. Iteration 30 manager gates await the harness, and
-the UART-bearing SFC differential baseline remains pending.
+collateral with empty stderr. Iteration 30 harness gates passed CIRCT replacertl and Verilator smoke,
+portable Spike, and Rocket suites (90,141 and 90,805 checks respectively).
+The UART-bearing SFC differential baseline remains pending.
 The final candidate is `compiler-candidate-final/`; its remaining-fanout
 annotations are unchanged from iteration 29. Clock results are in
 `golden-clock-comparison-final.stdout`, and queue results are in
 `golden-interface-comparison.json`. Completed large MLIR boundaries are
 gzip-compressed, retaining the two compared boundaries.
 
-Physical output channelization still requires one top connection per scalar
-model port. Distinct top aliases of a common model producer remain unsupported,
-as do shared groups mixing channel kinds (Scala's deduper ignores kind). The
-next smallest step is collapsing those physical aliases into one source port
-and renaming each branch before post-FAME fanout discovery.
+Iteration 31 collapses distinct scalar top aliases of one model producer into
+one typed source interface through FIRRTL operations. It validates every old
+port's annotation coverage, payload, direction, metadata, and direct wiring
+before mutation; all instance-result uses must be those alias connects.
+Unannotated outputs and other uses therefore fail rather than disappear.
+Transferable wrapper DontTouch metadata and one payload symbol survive the
+collapse. Multiple symbolic identities on the common payload fail atomically.
+Both compiler output rewrite paths rename every old top reference and rename
+the common model reference once. Source counts still follow branch count,
+including repeated references to the same physical alias.
+
+`FAMEOutputSelectionTest.cpp` covers a distinct physical alias, its unchanged
+model data driver, one token interface, and transferred wrapper metadata.
+Four additional cases reject unannotated aliases, extra model-result uses,
+conflicting symbols, and extra top-alias uses without changing IR. Six focused
+CTests pass, including coupled clock and queued-pipe traces in both orders.
+The extended production Scala oracle confirms one InferModelPorts group and
+both alias targets mapping to `model_printfB_source.bits`. The native compiler
+ingests those exact FIRRTL/annotation files and channelizes the producer when
+requested by the second branch. Both output connection classes, clocks,
+latencies and source targets, plus the common model-group target, match
+`scala/distinct-top-aliases/post-host-renames.sfc.json` in
+`iteration31-output-aliases/`. `alias-comparison.json` records this comparison.
+The probe compares production renames and model deduplication; it does not claim
+a normalized full Scala FAME RTL result for this synthetic circuit. The
+standalone native output rewrite leaves raw model DontTouch and input targets
+outside that output-only comparison.
+
+The fresh native Rocket candidate emits simulator RTL and collateral with
+empty stderr. Its `post-infer-model-ports.mlir` matches all 17 input and 25
+output clock assignments, including phase and reset, in immutable U250
+`design/FireSim-generated.sv`. Its `post-fame-first-pipe-wrapper.mlir` matches
+four queue interfaces and 22 singleton valid/ready bindings in the same
+artifact. `golden-clock-comparison.stdout` and
+`golden-interface-comparison.json` record those checks. The immutable compiler
+annotation fixtures have no fanout annotation, and these recorded Rocket
+boundaries do not exercise physical output alias collapse. Recorded UInt0
+payloads also differ from current UInt3/UInt64 payloads; these comparisons are
+not whole-design equivalence. Completed large MLIR files are compressed,
+retaining the two compared boundaries. Iteration 31 manager gates await the
+harness; no manager action was started by the implementation agent.
+
+Distinct physical aliases of multiport groups and shared groups mixing channel
+kinds remain unsupported. The next smallest step is multiport alias collapse,
+including ordered leaf identity and per-branch payload field renaming.
 Mixed fanout also still needs bridge bindings to resolve each external queue
 output independently from the retained upstream producer identity.

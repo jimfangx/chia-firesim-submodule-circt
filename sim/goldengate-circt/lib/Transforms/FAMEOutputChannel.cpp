@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEOutputChannel.h"
+#include "goldengate/AnnotationClasses.h"
 #include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "llvm/ADT/BitVector.h"
@@ -251,50 +252,89 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
       return failure();
     }
 
-  std::optional<unsigned> topPort;
+  std::set<unsigned> topPorts;
   for (const auto &connection : hierarchy.connections)
     if (connection.instance == instance &&
-        connection.instancePort == modelPort) {
-      if (topPort) {
-        error = "FAME output channel has multiple top connections";
-        return failure();
-      }
-      topPort = connection.topPort;
-    }
-  if (!topPort || top.getPortDirection(*topPort) != Direction::Out ||
-      top.getPorts()[*topPort].type != payloadType) {
+        connection.instancePort == modelPort)
+      topPorts.insert(connection.topPort);
+  if (topPorts.empty()) {
     error = "FAME output channel has no matching top port";
     return failure();
   }
   llvm::SmallVector<Annotation> wrapperAnnotations;
   llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
-  if (failed(collectFAMEWrapperPayloadMetadata(
-          top, *topPort, channel.type, {}, wrapperAnnotations,
-          wrapperSymbols, error)) ||
-      failed(collectFAMEPayloadSymbols(
-          model, modelPort, channel.type, {}, modelSymbols, error)))
-    return failure();
-  Value oldTop = top.getBodyBlock()->getArgument(*topPort);
+  llvm::SmallVector<Operation *> oldConnections;
   Value oldInstance = instance.getResult(modelPort);
-  Operation *oldConnection = nullptr;
-  for (OpOperand &use : oldTop.getUses()) {
-    Operation *connect = use.getOwner();
-    auto strict = dyn_cast<StrictConnectOp>(connect);
-    auto ordinary = dyn_cast<ConnectOp>(connect);
-    if ((!strict && !ordinary) ||
-        (strict && (strict.getDest() != oldTop ||
-                    strict.getSrc() != oldInstance)) ||
-        (ordinary && (ordinary.getDest() != oldTop ||
-                      ordinary.getSrc() != oldInstance)) || oldConnection) {
-      error = "FAME output channel has nontrivial top wiring";
+  auto circuit = top->getParentOfType<CircuitOp>();
+  for (unsigned topPort : topPorts) {
+    if (top.getPortDirection(topPort) != Direction::Out ||
+        top.getPorts()[topPort].type != payloadType) {
+      error = "FAME output alias has incompatible direction or payload";
       return failure();
     }
-    oldConnection = connect;
+    // SFC only removes connections whose old top targets are channel sources.
+    // An unannotated alias is a surviving output, not part of this producer.
+    if (topPorts.size() > 1) {
+      std::string target = "~" + circuit.getName().str() + "|" +
+                           top.getName().str() + ">" +
+                           top.getPortName(topPort).str();
+      bool covered = false;
+      if (auto annotations = circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+        for (auto attr : annotations) {
+          Annotation annotation(attr);
+          if (!annotation.isClass(goldengate::AnnotationClasses::ChannelConnection))
+            continue;
+          auto sources = annotation.getMember<ArrayAttr>("sources");
+          auto info = annotation.getMember<DictionaryAttr>("channelInfo");
+          auto kind = info ? info.getAs<StringAttr>("class") : StringAttr();
+          if (!sources || sources.size() != 1 || !kind ||
+              (kind.getValue() != goldengate::AnnotationClasses::PipeChannel &&
+               kind.getValue() != goldengate::AnnotationClasses::DecoupledForwardChannel &&
+               kind.getValue() != goldengate::AnnotationClasses::DecoupledReverseChannel))
+            continue;
+          auto source = dyn_cast<StringAttr>(sources[0]);
+          covered |= source && source.getValue() == target;
+        }
+      if (!covered) {
+        error = "FAME output alias is not an annotated scalar channel source";
+        return failure();
+      }
+    }
+    if (failed(collectFAMEWrapperPayloadMetadata(
+            top, topPort, channel.type, {}, wrapperAnnotations,
+            wrapperSymbols, error)))
+      return failure();
+    Value oldTop = top.getBodyBlock()->getArgument(topPort);
+    Operation *oldConnection = nullptr;
+    for (OpOperand &use : oldTop.getUses()) {
+      Operation *connect = use.getOwner();
+      auto strict = dyn_cast<StrictConnectOp>(connect);
+      auto ordinary = dyn_cast<ConnectOp>(connect);
+      if ((!strict && !ordinary) ||
+          (strict && (strict.getDest() != oldTop ||
+                      strict.getSrc() != oldInstance)) ||
+          (ordinary && (ordinary.getDest() != oldTop ||
+                        ordinary.getSrc() != oldInstance)) || oldConnection) {
+        error = "FAME output channel has nontrivial top wiring";
+        return failure();
+      }
+      oldConnection = connect;
+    }
+    if (!oldConnection) {
+      error = "FAME output alias has no direct connection";
+      return failure();
+    }
+    oldConnections.push_back(oldConnection);
   }
-  if (!oldConnection || !oldInstance.hasOneUse()) {
-    error = "FAME output channel is not exclusively connected to its top port";
+  for (OpOperand &use : oldInstance.getUses())
+    if (!llvm::is_contained(oldConnections, use.getOwner())) {
+      error = "FAME output channel has a use outside its top aliases";
+      return failure();
+    }
+  if (failed(collectFAMEPayloadSymbols(
+          model, modelPort, channel.type, {}, modelSymbols, error)))
     return failure();
-  }
+  unsigned topInsert = *topPorts.begin();
 
   auto *context = top.getContext();
   PortInfo modelInfo(StringAttr::get(context, modelName), channel.type,
@@ -324,11 +364,13 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
   eraseModel.set(modelPort + 1);
   model.erasePorts(eraseModel);
 
-  top.insertPorts({{*topPort, topInfo}});
-  Value newTop = top.getBodyBlock()->getArgument(*topPort);
-  oldConnection->erase();
+  top.insertPorts({{topInsert, topInfo}});
+  Value newTop = top.getBodyBlock()->getArgument(topInsert);
+  for (auto *connection : oldConnections)
+    connection->erase();
   llvm::BitVector eraseTop(top.getNumPorts());
-  eraseTop.set(*topPort + 1);
+  for (unsigned port : topPorts)
+    eraseTop.set(port + 1);
   top.erasePorts(eraseTop);
 
   InstanceOp expanded = instance.cloneAndInsertPorts({{modelPort, modelInfo}});
