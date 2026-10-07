@@ -1,3 +1,48 @@
+# Nested ready/valid payloads — iteration 35
+
+`FAMEReadyValidChannel.cpp` now traverses passive bundles recursively, resolves
+annotation endpoints to leaf field IDs, and packs known-width UInt/SInt leaves
+in declaration order. It excludes only the direct target-valid field. Nested
+leaves named `valid` remain data. Zero-width leaves retain their target identity
+without consuming queue bits. The pass preflights all pairs before rewriting;
+missing, duplicate, and ancestor endpoints, nested flips, clocks, vectors, and
+unknown widths fail without constructing queues.
+
+The production Scala probe accepts a two-level bundle containing SInt<3>,
+SInt<0>, UInt<4>, and a nested UInt<1> named `valid`, in both orientations. Its
+annotation endpoints are deliberately reversed. Scala's `buildChannelType`
+flattens the sole `group` container; the native wrapper retains input target
+paths. After that explicit normalization, all 28 control bindings and 12 typed
+payload bindings match the lowered Scala wrapper. SFC drops the zero-width
+signed leaf during lowering; native retains it until normal type lowering.
+
+Five focused CTests passed. The ready/valid CTest also passed after adding the
+reordered-endpoint case. Native tests exhaust all 256 packed patterns in both
+orientations and both endpoint orders, and retain the 60,000-cycle independent
+queue scoreboards. Both flat and nested production Scala probes pass.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration35-nested-rv/`:
+
+- `scala/post-fame.sfc.fir`, `scala/post-fame.sfc.json`, and `scala/signed-wrapper.sfc.fir`.
+- `ingested-nested-wrapper.mlir`, `ctest.stdout`, `order-ctest.stdout`, and `native.stdout`.
+- `boundary-comparison.json`, `comparison.stdout`, and `compare-boundaries.py`.
+- `compiler-candidate/post-fame-ready-valid-wrapper.mlir` and emitted simulator RTL.
+
+The fresh Rocket candidate matches 138 direct ready/valid control bindings and
+70 payload field bindings in the immutable U250
+`...sfc-golden-2026-10-01/design/FireSim-generated.sv` artifact whose full path
+is recorded below. Twenty current AXI payload bindings still have no matching
+direct assignment in that fixture. The recorded Rocket payloads are flat and
+unsigned; this comparison does not prove nested behavior, width parity, or
+whole-design equivalence. Nested behavior uses the executable Scala probe.
+
+Iteration 34's harness passed CIRCT replacertl and the required Verilator
+suites. Gates for this change remain harness-owned; the UART-bearing SFC
+baseline remains pending. The next small step is matching Scala's singleton
+payload/container normalization at the external wrapper interface, using this
+nested probe to check names and types as well as leaf correspondence.
+
 # Signed ready/valid payloads — iteration 34
 
 The production `SimUtils.buildChannelType` retains both UInt and SInt leaves.

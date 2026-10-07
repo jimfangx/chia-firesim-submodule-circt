@@ -4,6 +4,8 @@
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
+#include <functional>
+#include <limits>
 #include <map>
 #include <set>
 
@@ -49,10 +51,15 @@ Queue queue(OpBuilder &b, Location loc, Value clock, Value reset,
           flow ? b.create<MuxPrimOp>(loc, v0, d0, enqBits).getResult() : d0};
 }
 
+struct PayloadLeaf {
+  SmallVector<StringAttr> path;
+  IntType type;
+};
+
 struct Pair {
   std::string name;
   unsigned forward, reverse, width;
-  BundleType payload;
+  SmallVector<PayloadLeaf> leaves;
   bool targetSource;
 };
 
@@ -132,19 +139,44 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
       error = "ReadyValidChannel " + base + " has incompatible Decoupled ports";
       return failure();
     }
-    // SimUtils.buildChannelType preserves signed leaves. Pack their bit
-    // patterns without sign extension; reconstruct the original type on dequeue.
-    // Reject unhandled aggregates instead of silently losing payload bits.
+    // SimUtils.buildChannelType traverses bundles in declaration order and
+    // preserves integer leaf types. Only the direct target-valid is control;
+    // a nested leaf named valid remains payload data.
     unsigned width = 0;
     std::set<unsigned> fields;
+    SmallVector<PayloadLeaf> leaves;
+    SmallVector<StringAttr> path;
+    std::function<bool(FIRRTLType, unsigned)> collect =
+        [&](FIRRTLType type, unsigned fieldID) {
+      if (auto bundle = dyn_cast<BundleType>(type)) {
+        for (auto [i, field] : llvm::enumerate(bundle.getElements())) {
+          if (field.isFlip) return false;
+          path.push_back(field.name);
+          bool accepted = collect(field.type, fieldID + bundle.getFieldID(i));
+          path.pop_back();
+          if (!accepted) return false;
+        }
+        return true;
+      }
+      auto integer = dyn_cast<IntType>(type);
+      if (!integer || integer.getWidthOrSentinel() < 0) return false;
+      unsigned leafWidth = integer.getWidthOrSentinel();
+      if (leafWidth > std::numeric_limits<unsigned>::max() - width) return false;
+      width += leafWidth;
+      fields.insert(fieldID);
+      leaves.push_back({path, integer});
+      return true;
+    };
+    unsigned bitsID = ft.getFieldID(*ft.getElementIndex("bits"));
+    fields.insert(bitsID + payload.getFieldID(*payload.getElementIndex("valid")));
     for (auto [i, field] : llvm::enumerate(payload.getElements())) {
-      auto integer = dyn_cast<IntType>(field.type);
-      if (!integer || integer.getWidthOrSentinel() < 0 || field.isFlip) {
-        error = "ReadyValidChannel " + base + " needs known-width passive integer fields";
+      if (field.name.getValue() == "valid") continue;
+      path.push_back(field.name);
+      if (field.isFlip || !collect(field.type, bitsID + payload.getFieldID(i))) {
+        error = "ReadyValidChannel " + base + " needs known-width passive integer bundle leaves";
         return failure();
       }
-      if (field.name.getValue() != "valid") width += integer.getWidthOrSentinel();
-      fields.insert(ft.getFieldID(*ft.getElementIndex("bits")) + payload.getFieldID(i));
+      path.pop_back();
     }
     auto endpoints = a.getMember<ArrayAttr>(source ? "sources" : "sinks");
     auto opposite = a.getMember<ArrayAttr>(source ? "sinks" : "sources");
@@ -173,7 +205,7 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
       error = "ReadyValidChannel " + base + " has missing, shared or inconsistent endpoints";
       return failure();
     }
-    pairs.push_back({base, *f->port, *r->port, width, payload, source});
+    pairs.push_back({base, *f->port, *r->port, width, std::move(leaves), source});
     reverse.erase(rev);
   }
   if (!reverse.empty()) {
@@ -355,20 +387,22 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     connect(arg(16), zero); connect(arg(17), one);
     Value packed;
     unsigned offset = p.width;
-    for (auto f : p.payload.getElements()) {
-      if (f.name.getValue() == "valid") continue;
-      unsigned width = cast<IntType>(f.type).getWidthOrSentinel();
-      Value input = field(field(enqF, "bits"), f.name.getValue());
-      Value output = field(field(deqF, "bits"), f.name.getValue());
+    for (const auto &leaf : p.leaves) {
+      unsigned width = leaf.type.getWidthOrSentinel();
+      Value input = field(enqF, "bits"), output = field(deqF, "bits");
+      for (auto name : leaf.path) {
+        input = field(input, name.getValue());
+        output = field(output, name.getValue());
+      }
       if (!width) {
         // Zero-width fields carry no token information; FIRRTL retains their
         // target identity until normal type lowering removes them.
         connect(output, input); continue;
       }
-      if (isa<SIntType>(f.type)) input = b.create<AsUIntPrimOp>(loc, input);
+      if (isa<SIntType>(leaf.type)) input = b.create<AsUIntPrimOp>(loc, input);
       packed = packed ? b.create<CatPrimOp>(loc, packed, input).getResult() : input;
       Value slice = b.create<BitsPrimOp>(loc, arg(11), offset - 1, offset - width);
-      if (isa<SIntType>(f.type)) slice = b.create<AsSIntPrimOp>(loc, slice);
+      if (isa<SIntType>(leaf.type)) slice = b.create<AsSIntPrimOp>(loc, slice);
       connect(output, slice);
       offset -= width;
     }

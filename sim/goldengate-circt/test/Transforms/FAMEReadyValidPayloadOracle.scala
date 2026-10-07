@@ -1,5 +1,5 @@
 // See LICENSE for license details.
-// Exercise the production SimWrapper with signed payload leaves in both
+// Exercise the production SimWrapper with flat/nested integer leaves in both
 // bridge orientations. Keep this probe outside the immutable Rocket fixtures.
 import firrtl._
 import firrtl.ir._
@@ -12,13 +12,16 @@ import org.chipsalliance.cde.config.Parameters
 object FAMEReadyValidPayloadOracle extends App {
   implicit val p: Parameters = Parameters.empty
   val destination = new java.io.File(args(0)); destination.mkdirs()
-  val input = Parser.parse("""circuit Top :
+  val nested = args.lift(1).contains("nested")
+  val payload = if (nested) "{ group : { x : SInt<3>, pad : SInt<0>, inner : { y : UInt<4>, valid : UInt<1> } }, valid : UInt<1> }"
+                else "{ x : SInt<3>, pad : SInt<0>, y : UInt<5>, valid : UInt<1> }"
+  val input = Parser.parse(s"""circuit Top :
     module Top :
       input hostClock : Clock
       input hostReset : UInt<1>
-      output a : { flip ready : UInt<1>, valid : UInt<1>, bits : { x : SInt<3>, pad : SInt<0>, y : UInt<5>, valid : UInt<1> } }
+      output a : { flip ready : UInt<1>, valid : UInt<1>, bits : $payload }
       input ar : { flip ready : UInt<1>, valid : UInt<1>, bits : UInt<1> }
-      input b : { flip ready : UInt<1>, valid : UInt<1>, bits : { x : SInt<3>, pad : SInt<0>, y : UInt<5>, valid : UInt<1> } }
+      input b : { flip ready : UInt<1>, valid : UInt<1>, bits : $payload }
       output br : { flip ready : UInt<1>, valid : UInt<1>, bits : UInt<1> }
       input ticks : { flip ready : UInt<1>, valid : UInt<1>, bits : Clock }
       skip
@@ -28,7 +31,10 @@ object FAMEReadyValidPayloadOracle extends App {
     case (name, port, reverse, source) =>
       val valid = target(port).field("valid")
       val ready = target(reverse)
-      val fields = Seq("x", "pad", "y", "valid").map(target(port).field(_))
+      val paths = if (nested) Seq("group.x", "group.pad", "group.inner.y", "group.inner.valid", "valid")
+                  else Seq("x", "pad", "y", "valid")
+      // Endpoint order must not change the payload type or leaf binding.
+      val fields = (if (nested) paths.reverse else paths).map(_.split("\\.").foldLeft(target(port))((t, f) => t.field(f)))
       val info = if (source) DecoupledForwardChannel.source(valid, ready)
                  else DecoupledForwardChannel.sink(valid, ready)
       Seq(FAMEChannelConnectionAnnotation(name + "_fwd", info, None,
@@ -48,8 +54,9 @@ object FAMEReadyValidPayloadOracle extends App {
   for (port <- Seq("a", "b")) {
     val signed = wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_x").get
     require(signed.tpe == SIntType(IntWidth(3)), s"$port lost signed payload type")
-    val unsigned = wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_y").get
-    require(unsigned.tpe == UIntType(IntWidth(5)), s"$port lost unsigned payload type")
+    val unsigned = wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_${if (nested) "inner_y" else "y"}").get
+    if (nested) require(wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_inner_valid").get.tpe == UIntType(IntWidth(1)), "nested valid must remain data")
+    require(unsigned.tpe == UIntType(IntWidth(if (nested) 4 else 5)), s"$port lost unsigned payload type")
   }
   def write(name: String, text: String): Unit = {
     val out = new java.io.PrintWriter(new java.io.File(destination, name))
@@ -58,5 +65,5 @@ object FAMEReadyValidPayloadOracle extends App {
   write("post-fame.sfc.fir", input.serialize)
   write("post-fame.sfc.json", firrtl.annotations.JsonProtocol.serialize(annotations))
   write("signed-wrapper.sfc.fir", circuit.serialize)
-  println("PASS signed ReadyValidChannel payloads: SInt<3>, SInt<0>, UInt<5>; both orientations")
+  println(s"PASS ReadyValidChannel payloads: nested=$nested; signed/unsigned leaves, both orientations")
 }

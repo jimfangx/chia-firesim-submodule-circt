@@ -158,7 +158,16 @@ module { firrtl.circuit "Top" {
   if (bad == 9) replace("x: uint<3>", "x flip: uint<3>");
   if (bad == 10) replace("y: uint<5>", "y: bundle<nested: uint<5>>");
   if (bad == 11) replace("y: uint<5>", "y: uint<0>");
+  if (bad >= 12) {
+    replace("x: uint<3>, pad: uint<0>, y: uint<5>",
+            "group: bundle<x: sint<3>, pad: sint<0>, inner: bundle<y: uint<4>, valid: uint<1>>>");
+    if (bad == 13) replace("y: uint<4>", "y: clock");
+    if (bad == 14) replace("inner: bundle", "inner flip: bundle");
+    if (bad == 15) replace("y: uint<4>", "y: vector<uint<2>, 2>");
+    if (bad == 19) replace("y: uint<4>", "y: uint");
+  }
   auto root = parseSourceString<ModuleOp>(text, &context);
+  require(bool(root), "cannot parse payload fixture");
   OpBuilder b(&context);
   SmallVector<Attribute> annotations;
   for (unsigned i = 0; i < 2; ++i) {
@@ -166,6 +175,14 @@ module { firrtl.circuit "Top" {
     auto target = [&](llvm::StringRef suffix) { return b.getStringAttr("~Top|Top>" + port + ".bits." + suffix); };
     auto rt = b.getStringAttr("~Top|Top>" + ready + ".bits");
     auto endpoints = b.getArrayAttr({target("x"), target("pad"), target("y"), target("valid")});
+    if (bad >= 12) {
+      endpoints = b.getArrayAttr({target("group.x"), target("group.pad"),
+          target("group.inner.y"), target("group.inner.valid"), target("valid")});
+      if (i == 0 && bad == 16) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner.y"), target("valid")});
+      if (i == 0 && bad == 17) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner"), target("group.inner.valid"), target("valid")});
+      if (i == 0 && bad == 18) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner.y"), target("group.inner.y"), target("valid")});
+    }
+    if (bad == 20) endpoints = b.getArrayAttr({target("valid"), target("group.inner.valid"), target("group.inner.y"), target("group.pad"), target("group.x")});
     auto info = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledForwardChannel)),
       b.getNamedAttr(i == 0 ? "validSource" : "validSink", target("valid")),
       b.getNamedAttr(i == 0 ? "readySink" : "readySource", bad == 3 && i == 0 ? target("valid") : rt)});
@@ -315,6 +332,84 @@ void wrapper(MLIRContext &context, const char *output) {
     require(succeeded(verify(*root)), "active wrapper failed verification");
   }
 }
+// Nested target identity must survive bundle traversal and packed transport.
+// A nested "valid" is data, while only the direct valid controls the queue.
+void nestedPayload(MLIRContext &context) {
+  for (unsigned variant = 12; variant <= 20; ++variant) {
+    auto root = fixture(context, variant);
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    std::string error;
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    auto result = goldengate::addFAMEBoundaryReadyValidChannels(circuit, error);
+    if (variant != 12 && variant != 20) {
+      require(failed(result), "malformed nested payload accepted");
+      require(!llvm::any_of(circuit.getOps<FModuleOp>(), [](FModuleOp m) {
+        return m.getName().starts_with("GGFAMEReadyValid");
+      }), "rejected nested payload mutated circuit");
+      continue;
+    }
+    require(succeeded(result), error);
+    require(succeeded(verify(*root)), "nested wrapper failed verification");
+    auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+    std::function<std::string(Value)> endpoint = [&](Value value) -> std::string {
+      if (auto field = value.getDefiningOp<SubfieldOp>())
+        return endpoint(field.getInput()) + "." +
+            cast<BundleType>(field.getInput().getType()).getElements()[field.getFieldIndex()].name.getValue().str();
+      if (auto arg = dyn_cast<BlockArgument>(value))
+        return "external." + wrapper.getPortName(arg.getArgNumber()).str();
+      if (auto instance = value.getDefiningOp<InstanceOp>())
+        return instance.getName().str() + "." + instance.getPortName(cast<OpResult>(value).getResultNumber()).str();
+      return "expression";
+    };
+    std::map<std::string, Value> drivers;
+    for (auto connect : wrapper.getOps<ConnectOp>())
+      require(drivers.emplace(endpoint(connect.getDest()), connect.getSrc()).second,
+              "duplicate nested payload driver");
+    unsigned instances = 0;
+    for (auto instance : wrapper.getOps<InstanceOp>()) {
+      if (!instance.getName().starts_with("ReadyValidChannel_")) continue;
+      require(instance.getModuleName() == "GGFAMEReadyValid8", "nested payload width");
+      bool send = instance.getName() == "ReadyValidChannel_send";
+      std::string enq = send ? "target_FAMETop.a" : "external.b";
+      std::string deq = send ? "external.a" : "target_FAMETop.b";
+      auto packed = drivers.at(endpoint(instance.getResult(4)));
+      SmallVector<Value> inputs;
+      std::function<void(Value)> flatten = [&](Value value) {
+        if (auto cat = value.getDefiningOp<CatPrimOp>()) {
+          flatten(cat.getOperand(0)); flatten(cat.getOperand(1));
+        } else {
+          if (auto cast = value.getDefiningOp<AsUIntPrimOp>()) value = cast.getInput();
+          inputs.push_back(value);
+        }
+      };
+      flatten(packed);
+      require(inputs.size() == 3 && endpoint(inputs[0]) == enq + ".bits.group.x" &&
+          endpoint(inputs[1]) == enq + ".bits.group.inner.y" &&
+          endpoint(inputs[2]) == enq + ".bits.group.inner.valid", "nested pack field identity/order");
+      require(bool(drivers.at(deq + ".bits.group.x").getDefiningOp<AsSIntPrimOp>()),
+              "nested signed leaf type lost");
+      require(endpoint(drivers.at(deq + ".bits.group.pad")) == enq + ".bits.group.pad",
+              "nested zero-width identity lost");
+      Interpreter evaluation(wrapper);
+      for (uint64_t bits = 0; bits < 256; ++bits) {
+        evaluation.memo.clear();
+        evaluation.memo[inputs[0]] = bits >> 5;
+        evaluation.memo[inputs[1]] = (bits >> 1) & 15;
+        evaluation.memo[inputs[2]] = bits & 1;
+        evaluation.memo[instance.getResult(11)] = bits;
+        require(evaluation.eval(packed) == bits, "nested payload packing changed bits");
+        require(evaluation.eval(drivers.at(deq + ".bits.group.x")) == bits >> 5 &&
+            evaluation.eval(drivers.at(deq + ".bits.group.inner.y")) == ((bits >> 1) & 15) &&
+            evaluation.eval(drivers.at(deq + ".bits.group.inner.valid")) == (bits & 1),
+            "nested payload unpacking changed bits");
+      }
+      ++instances;
+    }
+    require(instances == 2, "nested payload must cover both orientations");
+    require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(verify(*root)), "active nested wrapper failed verification");
+  }
+}
 // Secondary fanout removal shifts all following ReadyValid port ordinals.
 // Match the retained target by identity when replacing its passthroughs.
 void fanoutWrapper(MLIRContext &context) {
@@ -359,6 +454,7 @@ int main(int argc, char **argv) {
   try {
     wrapper(context, argc > 1 ? argv[1] : nullptr);
     signedScalar(context);
+    nestedPayload(context);
     fanoutWrapper(context);
     for (unsigned width : {1, 8, 32}) behavior(context, width);
     if (argc > 3) {
@@ -376,5 +472,5 @@ int main(int argc, char **argv) {
     }
   }
   catch (const std::exception &e) { llvm::errs() << "ReadyValidChannel: " << e.what() << '\n'; return 1; }
-  llvm::outs() << "ReadyValidChannel: both orientations, signed/unsigned exhaustive payloads, malformed pairs and 60000 randomized cycles passed\n";
+  llvm::outs() << "ReadyValidChannel: both orientations, nested/signed/unsigned exhaustive payloads, malformed pairs and 60000 randomized cycles passed\n";
 }
