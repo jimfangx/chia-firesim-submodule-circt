@@ -174,6 +174,25 @@ void fixture(MLIRContext &ctx, bool reversed) {
     b.getNamedAttr("localName", b.getStringAttr("bridge_clocks")),
     b.getNamedAttr("ports", b.getArrayAttr(modelTargets))});
   annos.push_back(connection); annos.push_back(ports);
+  // Associated domain references are independent of channel endpoint lists.
+  // Multiple data channels may share one clock; these must not contribute to
+  // the exactly-once checks for the clock channel's sinks/ports.
+  for (unsigned i = 0; i < domains->size(); ++i) {
+    const auto &d = (*domains)[i];
+    for (unsigned shared = 0; shared < 2; ++shared) {
+      annos.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr("data" + std::to_string(i) + std::to_string(shared))),
+        b.getNamedAttr("clock", b.getStringAttr("~Top|Top>" + d.topClockName)),
+        b.getNamedAttr("sinks", b.getArrayAttr({})),
+        b.getNamedAttr("metadata", b.getStringAttr("associated clock"))}));
+      annos.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelPorts)),
+        b.getNamedAttr("localName", b.getStringAttr("data" + std::to_string(i) + std::to_string(shared))),
+        b.getNamedAttr("clockPort", b.getStringAttr("~Top|Model>" + d.modelClockName)),
+        b.getNamedAttr("ports", b.getArrayAttr({}))}));
+    }
+  }
   auto retained = b.getArrayAttr(annos);
   circuit->setAttr("rawAnnotations", retained);
   for (unsigned bad = 0; bad < 7; ++bad) {
@@ -182,7 +201,7 @@ void fixture(MLIRContext &ctx, bool reversed) {
     if (bad == 0) std::reverse(badDomains.begin(), badDomains.end());
     if (bad == 1) badDomains[0].modelClockName = "stale";
     if (bad == 2) badAnnos.push_back(connection);
-    if (bad == 3) badAnnos.pop_back();
+    if (bad == 3) badAnnos.erase(badAnnos.begin() + 6);
     if (bad == 4) badAnnos.push_back(b.getDictionaryAttr({
       b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::InternalFpgaDebug))}));
     if (bad == 5 || bad == 6) {
@@ -222,6 +241,35 @@ void fixture(MLIRContext &ctx, bool reversed) {
   }
   require(cast<DictionaryAttr>(rewritten[5]).getAs<StringAttr>("metadata") ==
               connection.getAs<StringAttr>("metadata"), "clock metadata changed");
+  for (unsigned i = 0; i < domains->size(); ++i) {
+    auto suffix = ".bits." + (*domains)[i].payloadField;
+    for (unsigned shared = 0; shared < 2; ++shared) {
+      unsigned index = 7 + i * 4 + shared * 2;
+      auto global = cast<DictionaryAttr>(rewritten[index]);
+      auto local = cast<DictionaryAttr>(rewritten[index + 1]);
+      auto topTarget = "~Top|Top>" + plan->sinks.front().portName + suffix;
+      auto modelTarget = "~Top|Model>bridge_clocks_sink" + suffix;
+      require(global.getAs<StringAttr>("clock").getValue() == topTarget &&
+                  local.getAs<StringAttr>("clockPort").getValue() == modelTarget,
+              "associated clock still identifies an erased hub port");
+      for (auto target : {topTarget, modelTarget}) {
+        auto resolved = goldengate::resolveAnnotationTarget(circuit, target, error);
+        require(resolved && resolved->port && resolved->fieldID &&
+                    isa<ClockType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
+                        resolved->module.getPorts()[*resolved->port].type,
+                        *resolved->fieldID)), "associated clock is not a live Clock leaf");
+      }
+      NamedAttrList expectedGlobal(cast<DictionaryAttr>(annos[index]));
+      expectedGlobal.set("clock", b.getStringAttr(topTarget));
+      NamedAttrList expectedLocal(cast<DictionaryAttr>(annos[index + 1]));
+      expectedLocal.set("clockPort", b.getStringAttr(modelTarget));
+      require(global == expectedGlobal.getDictionary(&ctx) &&
+                  local == expectedLocal.getDictionary(&ctx),
+              "associated-clock transfer changed other annotation members");
+      if (shared == 0)
+        llvm::outs() << "ASSOCIATED " << topTarget << ' ' << modelTarget << '\n';
+    }
+  }
   b.setInsertionPointToStart(model.getBodyBlock());
   unsigned tokenPort = 0;
   while (tokenPort < model.getNumPorts() &&
@@ -347,8 +395,30 @@ void rocket(MLIRContext &ctx, const char *boundary, const char *golden, const ch
   auto plan = goldengate::analyzeFAMEPorts(*hierarchy, *bindings, {*channel},
                                          {bindings->front().portGroup->module}, error);
   require(plan && plan->sinks.size() == 1, error);
+  auto retained = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(succeeded(goldengate::rewriteFAMEHubClockChannel(
               *hierarchy, plan->sinks.front(), *domains, true, error)), error);
+  auto rewritten = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(rewritten.size() == retained.size(), "Rocket annotation archive size changed");
+  unsigned associated = 0;
+  for (auto [before, after] : llvm::zip(retained, rewritten)) {
+    Annotation oldAnno(before), newAnno(after);
+    StringRef member;
+    if (oldAnno.isClass(goldengate::AnnotationClasses::ChannelConnection)) member = "clock";
+    if (oldAnno.isClass(goldengate::AnnotationClasses::ChannelPorts)) member = "clockPort";
+    if (member.empty()) continue;
+    auto clock = oldAnno.getMember<StringAttr>(member);
+    if (!clock) continue;
+    require(newAnno.getMember<StringAttr>(member) == clock,
+            "Rocket output clock alias was rewritten as an input domain");
+    auto resolved = goldengate::resolveAnnotationTarget(circuit, clock.getValue(), error);
+    require(resolved && resolved->port && resolved->fieldID &&
+                isa<ClockType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
+                    resolved->module.getPorts()[*resolved->port].type,
+                    *resolved->fieldID)), "Rocket associated clock no longer resolves");
+    ++associated;
+  }
+  require(associated == 84, "Rocket associated clock coverage differs");
   for (auto target : {"~FAMETop|FAMETop>" + plan->sinks.front().portName + ".bits",
                      std::string("~FAMETop|FireSim>clockBridge_clocks_0_sink.bits")}) {
     auto resolved = goldengate::resolveAnnotationTarget(circuit, target, error);
@@ -361,6 +431,7 @@ void rocket(MLIRContext &ctx, const char *boundary, const char *golden, const ch
             "immutable SFC RTL lacks corresponding scalar clock payload");
   }
   print(d);
+  llvm::outs() << "Rocket " << associated << " associated clock references unchanged and live\n";
   llvm::outs() << "Rocket scalar clock identity, ratio and MFMR match immutable SFC annotation\n";
 }
 } // namespace

@@ -151,6 +151,46 @@ The corresponding scalar payload exists in the immutable U250
 `design/FireSim-generated.sv`; the gate comparison also matches that RTL's CE
 contract and all three commands in `design/FireSim-generated.implementation.xdc`.
 
+## Associated clock references at hub channelization
+
+`rewriteFAMEHubClockChannel` also transfers
+`FAMEChannelConnectionAnnotation.clock` and
+`FAMEChannelPortsAnnotation.clockPort` when they identify an erased hub input.
+They receive the same scalar `.bits` or ordered `.bits.<field>` replacement as
+that input. Surviving output aliases remain unchanged. Shared associated
+references do not count toward the clock channel's unique endpoint occurrences.
+This follows `FAMETransform.hostDecouplingRenames` and the explicit `update`
+methods in `midas/passes/fame/Annotations.scala`.
+
+The new native regression failed on the previous production helper with
+`associated clock still identifies an erased hub port`. In each of the normal
+and reversed two-clock orders it now checks four shared global/local reference
+pairs, exact preservation of other annotation members, and resolution to live
+Clock leaves. The existing 13 analysis and seven rewrite rejection cases still
+leave IR unchanged. `FAMEHubClockOracle.scala` invokes the annotation update
+APIs against the actual Scala transform's RenameMap: its two associated-reference
+pairs, four endpoints, two domain records and 64 enable/gate rows match native
+observations in both orders. The direct clock associations are transfer probes;
+the complete Scala fixture uses output aliases for local domain analysis. These
+tests do not establish full two-clock simulator support or a coupled producer/
+hub state trajectory.
+
+The captured Rocket `circt-ingestion/post-fame-host-control.mlir` is rewritten
+through the changed helper. All 84 associated references (42 global and 42 local)
+retain their original output aliases and resolve to Clock ports. The candidate's
+ordered clock name, ratio 1/1 and MFMR 1 match the immutable primary
+`firechip.chip.FireSim.FireSimRocketConfig.anno.json` above; its scalar clock
+payload is also present in the immutable U250 `design/FireSim-generated.sv`
+above. The recorded Rocket has one domain and does not exercise the direct-input
+reference defect.
+
+Iteration 19 evidence is under the mutable generated-source directory
+`iteration19-hub-clock-references/`: `regression-before.log`, `build.log`,
+`tests.log`, `scala-{normal,reversed}.log`, `native-{normal,reversed}.log`,
+`sfc-{two-clock,reversed}.fir`, `rocket-comparison.log` and `comparison.json`.
+The actual compiler and three relevant native test binaries build successfully;
+four focused CTest checks pass. No manager gates were launched by this change.
+
 ## Remaining work
 
 The hub FAME boundary now uses all ordered clock domains. The active compiler

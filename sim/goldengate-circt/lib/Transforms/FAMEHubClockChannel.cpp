@@ -103,6 +103,21 @@ LogicalResult goldengate::rewriteFAMEHubClockChannel(
     anno.setMember(member, ArrayAttr::get(circuit.getContext(), replaced));
     return true;
   };
+  // SFC's hostDecouplingRenames also applies to ChannelConnection.clock and
+  // ChannelPorts.clockPort. Transfer exact input identities to the same Clock
+  // payload leaves; surviving output aliases and unrelated domains stay put.
+  // Associated references may be shared by many channels and do not count as
+  // occurrences of the clock channel's own endpoint lists.
+  auto rewriteAssociatedClock = [&](Annotation &anno, llvm::StringRef member) {
+    auto target = anno.getMember<StringAttr>(member);
+    if (!target) return;
+    for (const auto *renames : {&topRenames, &modelRenames}) {
+      auto found = renames->find(target.getValue().str());
+      if (found == renames->end()) continue;
+      anno.setMember(member, StringAttr::get(circuit.getContext(), found->second.replacement));
+      return;
+    }
+  };
   for (auto attr : raw) {
     Annotation anno(attr);
     if (anno.isClass(AnnotationClasses::ChannelConnection) &&
@@ -111,6 +126,10 @@ LogicalResult goldengate::rewriteFAMEHubClockChannel(
     if (anno.isClass(AnnotationClasses::ChannelPorts) &&
         !rewriteTargets(anno, "ports", modelRenames, orderedModelTargets))
       return reject("retained hub clock ports disagree with domain order");
+    if (anno.isClass(AnnotationClasses::ChannelConnection))
+      rewriteAssociatedClock(anno, "clock");
+    if (anno.isClass(AnnotationClasses::ChannelPorts))
+      rewriteAssociatedClock(anno, "clockPort");
     if (transferDebug && anno.isClass(AnnotationClasses::InternalFpgaDebug)) {
       auto target = anno.getMember<StringAttr>("target");
       if (!target) return reject("FPGA debug annotation lacks a string target");

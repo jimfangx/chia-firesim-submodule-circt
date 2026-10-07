@@ -72,6 +72,17 @@ object FAMEHubClockOracle extends App {
     require(targets.size == 1)
     println(s"TARGET ${targets.head.serialize}")
   }
+  // Execute the annotation APIs against the actual transform's RenameMap.
+  // Direct input clock associations are probes of the transfer boundary:
+  // the complete hub fixture above uses output aliases for local analysis.
+  for (name <- clockNames) {
+    val global = FAMEChannelConnectionAnnotation("probe", PipeChannel(0),
+      Some(top.ref(name)), None, None).update(result.renames.get).head
+      .asInstanceOf[FAMEChannelConnectionAnnotation]
+    val local = FAMEChannelPortsAnnotation("probe", Some(model.ref(name)),
+      Seq.empty).update(result.renames.get).head.asInstanceOf[FAMEChannelPortsAnnotation]
+    println(s"ASSOCIATED ${global.clock.get.serialize} ${local.clockPort.get.serialize}")
+  }
   val writer = new java.io.PrintWriter(args(0))
   try writer.write(result.circuit.serialize) finally writer.close()
   def statements(stmt: Statement): Seq[Statement] = stmt match {

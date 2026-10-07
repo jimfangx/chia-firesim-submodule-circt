@@ -18,6 +18,8 @@ mlir::LogicalResult rewriteFAMEInputChannel(const TopHierarchy &hierarchy,
 
 // Channelize all ordered hub Clock inputs and explicitly transfer retained
 // ChannelConnection sinks/ChannelPorts ports to scalar bits or bundle leaves.
+// Transfer associated clock/clockPort references to erased input clocks to the
+// same Clock leaves; preserve surviving output aliases and shared references.
 // Optionally transfer both spellings of private FPGA debug targets. Preflight
 // domain identities, payload/retained target order and unique occurrences before
 // mutation; preserve unrelated annotations, list order and attached identities
