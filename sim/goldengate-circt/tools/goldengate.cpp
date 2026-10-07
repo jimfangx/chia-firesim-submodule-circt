@@ -1285,11 +1285,6 @@ int main(int argc, char **argv) {
             return assignment.modelClockName;
         return std::nullopt;
       };
-      // Clock annotation renaming and raw payload construction still need a
-      // multi-domain rewrite. Validate all assignments before mutating ports.
-      if (clockDomains->size() != 1)
-        return fail("baseline FAME clock annotation rewrite currently requires one hub clock domain");
-      const auto &clockDomain = clockDomains->front();
       llvm::SmallVector<FModuleLike> clockModels;
       clockModels.push_back(clockGroup->module);
       llvm::SmallVector<goldengate::GGChannelConnection, 0> clockChannels;
@@ -1298,12 +1293,10 @@ int main(int argc, char **argv) {
           *clockHierarchy, *clockBindings, clockChannels, clockModels, error);
       if (!clockPlan || clockPlan->sinks.size() != 1)
         return fail("FAME clock port plan: " + error);
-      auto oldTopClock = clockDomain.topClockName;
-      auto oldModelClock = clockDomain.modelClockName;
-      auto newTopClock = clockPlan->sinks.front().portName;
       auto newModelClock = clockGroup->name + "_sink";
-      if (failed(goldengate::rewriteFAMEInputChannel(
-              *clockHierarchy, clockPlan->sinks.front(), error)))
+      if (failed(goldengate::rewriteFAMEHubClockChannel(
+              *clockHierarchy, clockPlan->sinks.front(), *clockDomains,
+              enableAutoILA, error)))
         return fail("FAME clock input channel: " + error);
       auto renameClock = [&](Annotation &annotation, llvm::StringRef member,
                              llvm::StringRef from, llvm::StringRef to) {
@@ -1326,33 +1319,6 @@ int main(int argc, char **argv) {
         return count;
       };
       std::string prefix = "~" + circuit.getName().str() + "|";
-      auto topName = clockHierarchy->top.getName().str();
-      auto modelName = clockGroup->module.getName().str();
-      llvm::SmallVector<mlir::Attribute> clockAnnotations;
-      unsigned topRenames = 0, modelRenames = 0;
-      for (auto attr : currentAnnotations) {
-        Annotation annotation(attr);
-        if (annotation.isClass(goldengate::AnnotationClasses::ChannelConnection))
-          topRenames += renameClock(annotation, "sinks",
-                                    prefix + topName + ">" + oldTopClock,
-                                    prefix + topName + ">" + newTopClock + ".bits");
-        if (annotation.isClass(goldengate::AnnotationClasses::ChannelPorts))
-          modelRenames += renameClock(annotation, "ports",
-                                      prefix + modelName + ">" + oldModelClock,
-                                      prefix + modelName + ">" + newModelClock + ".bits");
-        clockAnnotations.push_back(annotation.getAttr());
-      }
-      if (topRenames != 1 || modelRenames != 1)
-        return fail("FAME clock channel annotation targets were not unique");
-      circuit->setAttr("rawAnnotations",
-                       mlir::ArrayAttr::get(&context, clockAnnotations));
-      if (enableAutoILA && (failed(goldengate::transferFAMEPortDebugTargets(
-              circuit, prefix + topName + ">" + oldTopClock,
-              prefix + topName + ">" + newTopClock + ".bits", error)) ||
-          failed(goldengate::transferFAMEPortDebugTargets(
-              circuit, prefix + modelName + ">" + oldModelClock,
-              prefix + modelName + ">" + newModelClock + ".bits", error))))
-        return fail("FAME clock debug target transfer: " + error);
       if (failed(mlir::verify(*module)))
         return fail("FAME clock channel produced invalid FIRRTL IR");
       llvm::SmallString<256> clockIRPath(outputDir);
@@ -1386,16 +1352,22 @@ int main(int argc, char **argv) {
       if (!channelPort)
         return fail("FAME target clock channel port is missing");
       mlir::OpBuilder clockBuilder(&clockModel.getBodyBlock()->front());
-      auto clockBits = clockBuilder.create<SubfieldOp>(
+      auto clockPayload = clockBuilder.create<SubfieldOp>(
           clockModel.getLoc(),
           clockModel.getBodyBlock()->getArgument(*channelPort), "bits");
-      auto clockFlag = clockBuilder.create<AsUIntPrimOp>(
-          clockModel.getLoc(), clockBits.getResult());
-      std::map<std::string, mlir::Value> inputClockEnables{
-          {oldModelClock, clockFlag.getResult()}};
-      if (failed(goldengate::addFAMEClockEnable(
-              clockModel, oldModelClock, clockFlag.getResult(), error)))
-        return fail("FAME target clock enable: " + error);
+      std::map<std::string, mlir::Value> rawClockTokens, inputClockEnables;
+      for (const auto &domain : *clockDomains) {
+        mlir::Value bits = clockPayload.getResult();
+        if (!domain.payloadField.empty())
+          bits = clockBuilder.create<SubfieldOp>(
+              clockModel.getLoc(), bits, domain.payloadField).getResult();
+        rawClockTokens.emplace(domain.modelClockName, bits);
+        auto flag = clockBuilder.create<AsUIntPrimOp>(clockModel.getLoc(), bits);
+        inputClockEnables.emplace(domain.modelClockName, flag.getResult());
+        if (failed(goldengate::addFAMEClockEnable(
+                clockModel, domain.modelClockName, flag.getResult(), error)))
+          return fail("FAME target clock enable: " + error);
+      }
       if (failed(mlir::verify(*module)))
         return fail("FAME target clock enable produced invalid FIRRTL IR");
       llvm::SmallString<256> clockEnableIRPath(outputDir);
@@ -1413,14 +1385,16 @@ int main(int argc, char **argv) {
       llvm::outs() << "Added CIRCT FAME target clock enable in "
                    << clockEnableIRPath << '\n';
 
-      if (failed(goldengate::addFAMEClockGate(
-              circuit, clockModel, oldModelClock, error,
-              clockBits.getResult())))
-        return fail("FAME target clock gate: " + error);
-      if (failed(goldengate::addFAMEClockConstraint(
-              circuit, clockModel, oldModelClock,
-              clockDomain.clockInfo, error)))
-        return fail("FAME hub clock XDC: " + error);
+      for (const auto &domain : *clockDomains) {
+        if (failed(goldengate::addFAMEClockGate(
+                circuit, clockModel, domain.modelClockName, error,
+                rawClockTokens.at(domain.modelClockName))))
+          return fail("FAME target clock gate: " + error);
+        if (failed(goldengate::addFAMEClockConstraint(
+                circuit, clockModel, domain.modelClockName,
+                domain.clockInfo, error)))
+          return fail("FAME hub clock XDC: " + error);
+      }
       if (failed(mlir::verify(*module)))
         return fail("FAME target clock gate produced invalid FIRRTL IR");
       llvm::SmallString<256> clockGateIRPath(outputDir);

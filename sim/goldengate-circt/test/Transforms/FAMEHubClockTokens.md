@@ -123,11 +123,40 @@ Earlier local comparison attempts exposed a test parser that did not follow
 SFC's intermediate input transition wires; the final comparison resolves those
 wires and checks host reset separately. No manager gates were launched here.
 
+## Ordered clock payload rewriting
+
+The actual compiler driver now channelizes every captured hub domain through
+`rewriteFAMEHubClockChannel`. The helper preflights the original port identities,
+payload field order, retained target order and unique annotation occurrences before erasing
+ports. It transfers ChannelConnection sinks and ChannelPorts ports to scalar
+`.bits` or ordered `.bits.<field>` targets, and optionally transfers private FPGA
+debug selections in both ReferenceTarget and ComponentName spelling. Other
+annotation members and archive order remain intact. The driver creates each raw
+Clock leaf and UInt flag, then each buffered enable, gate and constraint using
+the captured original clock identity.
+
+`FAMEHubClockDomainsTest.cpp` runs this same helper with reversed physical clock
+ports and both annotation orders. Four emitted payload targets, two domain
+metadata records and 64 HUB rows (256 enable/CE evaluations) match the preserved
+Scala transform's actual RenameMap and hardware expressions in each order.
+Seven malformed rewrite cases per order leave IR unchanged, in addition to the
+existing analysis rejections. Each target state register uses its own gate.
+
+Iteration 15 evidence is under `iteration15-hub-payload/`: native and Scala
+normal/reversed observations, `rocket-payload.log`, `rocket-gate-xdc.log`, native
+build logs and `tests-final.log` (27 focused CTest checks). Applying the new
+helper to actual Rocket `post-fame-host-control.mlir` retains the scalar Clock
+payload and matches ratio/MFMR against the immutable primary annotation above.
+The corresponding scalar payload exists in the immutable U250
+`design/FireSim-generated.sv`; the gate comparison also matches that RTL's CE
+contract and all three commands in `design/FireSim-generated.implementation.xdc`.
+
 ## Remaining work
 
-The baseline driver still requires one hub clock while its clock payload
-construction and annotation renames handle scalar bits. Next, use all ordered
-domain records for those rewrites and construct each domain's raw token,
-buffered enable and gate before enabling multiple clocks in the full hub path.
-Manager gates remain harness-owned;
-FAME-5 and the SFC UART-bearing differential remain incomplete.
+The hub FAME boundary now uses all ordered clock domains. The full baseline
+still calls `addSingleClockBridge`, which accepts one 1:1 clock with MFMR 1.
+Next, port rational ClockBridge token scheduling for two domains and compare
+its output token sequence with Scala before enabling a complete multiclock
+bridge path. The baseline's data/bridge configuration also remains Rocket
+specific. Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing
+differential remain incomplete.

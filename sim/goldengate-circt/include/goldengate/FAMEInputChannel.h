@@ -16,6 +16,17 @@ mlir::LogicalResult rewriteFAMEInputChannel(const TopHierarchy &hierarchy,
                                              const FAMETopChannelPort &channel,
                                              std::string &error);
 
+// Channelize all ordered hub Clock inputs and explicitly transfer retained
+// ChannelConnection sinks/ChannelPorts ports to scalar bits or bundle leaves.
+// Optionally transfer both spellings of private FPGA debug targets. Preflight
+// domain identities, payload/retained target order and unique occurrences before
+// mutation; preserve unrelated annotations, list order and attached identities
+// under rewriteFAMEInputChannel's policy. Refresh hierarchy/port analyses.
+mlir::LogicalResult rewriteFAMEHubClockChannel(
+    const TopHierarchy &hierarchy, const FAMETopChannelPort &channel,
+    llvm::ArrayRef<FAMEHubClockDomain> domains, bool transferDebug,
+    std::string &error);
+
 // Introduce the clock token alongside the original target clock so the gate
 // can replace its uses before the scalar port is removed.
 mlir::LogicalResult addFAMEClockChannelToken(

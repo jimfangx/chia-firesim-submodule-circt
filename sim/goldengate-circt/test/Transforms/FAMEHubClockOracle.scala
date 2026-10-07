@@ -66,6 +66,12 @@ object FAMEHubClockOracle extends App {
     )
   }
   val result = new FAMETransform().execute(low.copy(annotations = annos))
+  // Observe the actual hostDecouplingRenames emitted by FAMETransform.
+  for (name <- clockNames; owner <- Seq(top, model)) {
+    val targets = result.renames.get.get(owner.ref(name)).get
+    require(targets.size == 1)
+    println(s"TARGET ${targets.head.serialize}")
+  }
   val writer = new java.io.PrintWriter(args(0))
   try writer.write(result.circuit.serialize) finally writer.close()
   def statements(stmt: Statement): Seq[Statement] = stmt match {

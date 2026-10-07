@@ -63,6 +63,7 @@ add_executable(goldengate-circt
   lib/Transforms/FAMEFinishing.cpp
   lib/Transforms/FAMEHostControl.cpp
   lib/Transforms/FAMEInputChannel.cpp
+  lib/Transforms/FAMEHubClockChannel.cpp
   lib/Transforms/FAMEAnnotations.cpp
   lib/Transforms/FAMEOutputChannel.cpp
   lib/Transforms/FAMEPipeChannel.cpp
@@ -488,7 +489,7 @@ if(BUILD_TESTING)
     lib/Analysis/FAMEPortAnalysis.cpp lib/Analysis/ModelAnalysis.cpp
     lib/Analysis/HierarchyAnalysis.cpp lib/Analysis/ChannelAnalysis.cpp
     lib/Support/TargetUtils.cpp lib/Support/XDCEmission.cpp
-    lib/Transforms/FAMEInputChannel.cpp)
+    lib/Transforms/FAMEInputChannel.cpp lib/Transforms/FAMEHubClockChannel.cpp)
   target_compile_features(goldengate-fame-hub-clock-domains-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fame-hub-clock-domains-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fame-hub-clock-domains-test PRIVATE

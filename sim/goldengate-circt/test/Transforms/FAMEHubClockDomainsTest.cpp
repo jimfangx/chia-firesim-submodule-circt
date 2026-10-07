@@ -5,12 +5,16 @@
 #include "goldengate/FAMEClockGate.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/XDCEmission.h"
+#include "goldengate/TargetUtils.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/JSON.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/APSInt.h"
+#include "goldengate/FAMEClockEnable.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -28,6 +32,16 @@ std::string dump(Operation *op) {
   llvm::raw_string_ostream out(text);
   op->print(out);
   return text;
+}
+unsigned eval(Value v, const llvm::DenseMap<Value, unsigned> &values) {
+  if (auto found = values.find(v); found != values.end()) return found->second;
+  if (auto c = v.getDefiningOp<ConstantOp>()) return c.getValue().getZExtValue();
+  if (auto p = v.getDefiningOp<AsUIntPrimOp>()) return eval(p.getInput(), values);
+  if (auto p = v.getDefiningOp<NotPrimOp>()) return !eval(p.getInput(), values);
+  if (auto p = v.getDefiningOp<AndPrimOp>()) return eval(p.getLhs(), values) & eval(p.getRhs(), values);
+  if (auto p = v.getDefiningOp<MuxPrimOp>())
+    return eval(p.getSel(), values) ? eval(p.getHigh(), values) : eval(p.getLow(), values);
+  throw std::runtime_error("unexpected hub-clock expression");
 }
 void print(const goldengate::FAMEHubClockDomain &d) {
   llvm::outs() << "DOMAIN " << d.modelClockName << ' ' << d.payloadField
@@ -137,8 +151,77 @@ void fixture(MLIRContext &ctx, bool reversed) {
   auto plan = goldengate::analyzeFAMEPorts(*hierarchy, *bindings, {channel},
                                          {model}, error);
   require(plan && plan->sinks.size() == 1, error);
-  require(succeeded(goldengate::rewriteFAMEInputChannel(
-              *hierarchy, plan->sinks.front(), error)), error);
+  SmallVector<Attribute> topTargets, modelTargets, annos;
+  for (const auto &d : *domains) {
+    topTargets.push_back(b.getStringAttr("~Top|Top>" + d.topClockName));
+    modelTargets.push_back(b.getStringAttr("~Top|Model>" + d.modelClockName));
+    for (auto target : {"~Top|Top>" + d.topClockName,
+                        "Top.Model." + d.modelClockName})
+      annos.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::InternalFpgaDebug)),
+        b.getNamedAttr("target", b.getStringAttr(target))}));
+  }
+  auto unrelated = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("unrelated")),
+                                        b.getNamedAttr("target", b.getStringAttr("~Top|Model>state0"))});
+  annos.push_back(unrelated);
+  auto connection = b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+    b.getNamedAttr("globalName", b.getStringAttr("bridge_clocks")),
+    b.getNamedAttr("sinks", b.getArrayAttr(topTargets)),
+    b.getNamedAttr("metadata", b.getStringAttr("retain ratio/MFMR order"))});
+  auto ports = b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelPorts)),
+    b.getNamedAttr("localName", b.getStringAttr("bridge_clocks")),
+    b.getNamedAttr("ports", b.getArrayAttr(modelTargets))});
+  annos.push_back(connection); annos.push_back(ports);
+  auto retained = b.getArrayAttr(annos);
+  circuit->setAttr("rawAnnotations", retained);
+  for (unsigned bad = 0; bad < 7; ++bad) {
+    auto badDomains = *domains;
+    auto badAnnos = annos;
+    if (bad == 0) std::reverse(badDomains.begin(), badDomains.end());
+    if (bad == 1) badDomains[0].modelClockName = "stale";
+    if (bad == 2) badAnnos.push_back(connection);
+    if (bad == 3) badAnnos.pop_back();
+    if (bad == 4) badAnnos.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::InternalFpgaDebug))}));
+    if (bad == 5 || bad == 6) {
+      auto targets = bad == 5 ? topTargets : modelTargets;
+      std::reverse(targets.begin(), targets.end());
+      NamedAttrList stale(cast<DictionaryAttr>(badAnnos[bad]));
+      stale.set(bad == 5 ? "sinks" : "ports", b.getArrayAttr(targets));
+      badAnnos[bad] = stale.getDictionary(&ctx);
+    }
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(badAnnos));
+    auto before = dump(*root); error.clear();
+    require(failed(goldengate::rewriteFAMEHubClockChannel(
+                *hierarchy, plan->sinks.front(), badDomains, true, error)) &&
+                !error.empty() && dump(*root) == before, "invalid hub rewrite changed IR");
+  }
+  circuit->setAttr("rawAnnotations", retained); error.clear();
+  require(succeeded(goldengate::rewriteFAMEHubClockChannel(
+              *hierarchy, plan->sinks.front(), *domains, true, error)), error);
+  auto rewritten = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(rewritten.size() == annos.size() && rewritten[4] == unrelated,
+          "clock rewrite lost unrelated annotations or archive order");
+  for (unsigned i = 0; i < domains->size(); ++i) {
+    auto suffix = ".bits." + (*domains)[i].payloadField;
+    auto topTarget = "~Top|Top>" + plan->sinks.front().portName + suffix;
+    auto modelTarget = "~Top|Model>bridge_clocks_sink" + suffix;
+    require(cast<DictionaryAttr>(rewritten[i * 2]).getAs<StringAttr>("target").getValue() == topTarget &&
+            cast<DictionaryAttr>(rewritten[i * 2 + 1]).getAs<StringAttr>("target").getValue() ==
+                "Top.Model.bridge_clocks_sink" + suffix, "debug spelling or domain field differs");
+    require(cast<DictionaryAttr>(rewritten[5]).getAs<ArrayAttr>("sinks")[i] == b.getStringAttr(topTarget) &&
+            cast<DictionaryAttr>(rewritten[6]).getAs<ArrayAttr>("ports")[i] == b.getStringAttr(modelTarget),
+            "retained clock target order differs");
+    for (auto target : {topTarget, modelTarget}) {
+      auto resolved = goldengate::resolveAnnotationTarget(circuit, target, error);
+      require(resolved && resolved->port && resolved->fieldID && *resolved->fieldID > 0, error);
+      llvm::outs() << "TARGET " << target << '\n';
+    }
+  }
+  require(cast<DictionaryAttr>(rewritten[5]).getAs<StringAttr>("metadata") ==
+              connection.getAs<StringAttr>("metadata"), "clock metadata changed");
   b.setInsertionPointToStart(model.getBodyBlock());
   unsigned tokenPort = 0;
   while (tokenPort < model.getNumPorts() &&
@@ -147,8 +230,10 @@ void fixture(MLIRContext &ctx, bool reversed) {
   auto bits = b.create<SubfieldOp>(model.getLoc(), model.getArgument(tokenPort), "bits");
   // Consume the captured records after scalar port erasure. The original
   // numeric indices are deliberately never consulted at this boundary.
+  std::map<std::string, Value> tokens;
   for (const auto &d : *domains) {
     auto token = b.create<SubfieldOp>(model.getLoc(), bits.getResult(), d.payloadField);
+    tokens.emplace(d.modelClockName, token.getResult());
     auto flag = b.create<AsUIntPrimOp>(model.getLoc(), token.getResult());
     require(succeeded(goldengate::addFAMEClockEnable(
                 model, d.modelClockName, flag.getResult(), error)), error);
@@ -173,10 +258,34 @@ void fixture(MLIRContext &ctx, bool reversed) {
     require(gate && state.getClockVal() == gate.getResult(2),
             "ordered plan gated the wrong domain");
   }
+  auto finishing = *model.getOps<WireOp>().begin();
+  for (unsigned mask = 0; mask < 64; ++mask) {
+    llvm::DenseMap<Value, unsigned> values{{finishing.getResult(), (mask >> 4) & 1},
+                                         {model.getArgument(1), (mask >> 5) & 1}};
+    SmallVector<Value> observations;
+    for (unsigned i = 0; i < 2; ++i) {
+      auto name = "bridge_clocks_" + std::to_string(i);
+      auto enabled = goldengate::lookupFAMEClockEnable(model, name, error);
+      require(bool(enabled), error);
+      values[tokens.at(name)] = (mask >> i) & 1;
+      values[enabled] = (mask >> (i + 2)) & 1;
+      for (auto connect : model.getOps<StrictConnectOp>())
+        if (connect.getDest() == enabled) observations.push_back(connect.getSrc());
+    }
+    for (unsigned i = 0; i < 2; ++i) {
+      auto gate = gates.lookup("bridge_clocks_" + std::to_string(i), false);
+      for (auto connect : model.getOps<StrictConnectOp>())
+        if (connect.getDest() == gate.getResult(1)) observations.push_back(connect.getSrc());
+    }
+    require(observations.size() == 4, "enable/gate assignments missing");
+    llvm::outs() << "HUB " << mask;
+    for (auto value : observations) llvm::outs() << ' ' << eval(value, values);
+    llvm::outs() << '\n';
+  }
   require(succeeded(verify(*root)), "ordered hub construction invalid");
 }
 
-void rocket(MLIRContext &ctx, const char *boundary, const char *golden) {
+void rocket(MLIRContext &ctx, const char *boundary, const char *golden, const char *rtl) {
   auto root = parseSourceFile<ModuleOp>(boundary, &ctx);
   require(bool(root), "Rocket host-control boundary parse");
   auto circuit = *root->getOps<CircuitOp>().begin();
@@ -235,6 +344,22 @@ void rocket(MLIRContext &ctx, const char *boundary, const char *golden) {
     }
   }
   require(matched == 1, "golden clock bridge not uniquely matched");
+  auto plan = goldengate::analyzeFAMEPorts(*hierarchy, *bindings, {*channel},
+                                         {bindings->front().portGroup->module}, error);
+  require(plan && plan->sinks.size() == 1, error);
+  require(succeeded(goldengate::rewriteFAMEHubClockChannel(
+              *hierarchy, plan->sinks.front(), *domains, true, error)), error);
+  for (auto target : {"~FAMETop|FAMETop>" + plan->sinks.front().portName + ".bits",
+                     std::string("~FAMETop|FireSim>clockBridge_clocks_0_sink.bits")}) {
+    auto resolved = goldengate::resolveAnnotationTarget(circuit, target, error);
+    require(resolved && resolved->port && resolved->fieldID, error);
+  }
+  require(succeeded(verify(*root)), "Rocket scalar clock rewrite invalid");
+  if (rtl) {
+    auto sv = llvm::MemoryBuffer::getFile(rtl);
+    require(bool(sv) && (*sv)->getBuffer().contains("clockBridge_clocks_0_sink_bits"),
+            "immutable SFC RTL lacks corresponding scalar clock payload");
+  }
   print(d);
   llvm::outs() << "Rocket scalar clock identity, ratio and MFMR match immutable SFC annotation\n";
 }
@@ -244,7 +369,7 @@ int main(int argc, char **argv) {
     MLIRContext ctx;
     ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     if (argc == 2 && StringRef(argv[1]) == "--reversed") fixture(ctx, true);
-    else if (argc == 3) rocket(ctx, argv[1], argv[2]);
+    else if (argc == 3 || argc == 4) rocket(ctx, argv[1], argv[2], argc == 4 ? argv[3] : nullptr);
     else fixture(ctx, false);
     return 0;
   } catch (const std::exception &e) {
