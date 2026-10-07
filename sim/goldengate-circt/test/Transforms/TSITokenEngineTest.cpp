@@ -21,7 +21,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool normalized = false) {
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGSimulationMasterBoundWrapper\" { firrtl.module @GGSimulationMasterBoundWrapper() {} } }", &ctx);
   require(bool(root), "fixture parse failed");
   auto c = *root->getOps<CircuitOp>().begin();
@@ -29,7 +29,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
   OpBuilder b(c.getBodyBlock(), c.getBodyBlock()->begin());
   auto uint = [&](unsigned w) { return UIntType::get(&ctx, w, false); };
   auto bit = uint(1);
-  auto forward = BundleType::get(&ctx, {{b.getStringAttr("bits"), false, uint(32)}, {b.getStringAttr("valid"), false, bit}});
+  auto forward = normalized
+      ? BundleType::get(&ctx, {{b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, uint(32)}})
+      : BundleType::get(&ctx, {{b.getStringAttr("bits"), false, uint(32)}, {b.getStringAttr("valid"), false, bit}});
   SmallVector<PortInfo> ports{{b.getStringAttr("hostClock"), ClockType::get(&ctx), Direction::In},
       {b.getStringAttr("hostReset"), bit, Direction::In}};
   const llvm::StringRef locals[]{"tsi_in_rev", "tsi_out_fwd", "reset", "tsi_in_fwd", "tsi_out_rev"};
@@ -151,8 +153,8 @@ void behavior(MLIRContext &ctx) {
   require(fires && startsOnFire && stalledReset, "missing gate/priority coverage");
   llvm::outs() << samples << " TSI cycle/reset/priority comparisons passed\n";
 }
-void wiring(MLIRContext &ctx) {
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void wiring(MLIRContext &ctx, bool normalized = false) {
+  auto root = fixture(ctx, normalized); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addTSITokenEngine(c, error)), error);
   auto wrapper = named(c, "GGTSITokenWrapper"); Interpreter sim(wrapper);
   require(wrapper.getNumPorts() == 7, "incorrect wrapper boundary");
@@ -213,6 +215,6 @@ void annotationsAndRejection(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { behavior(ctx); wiring(ctx); annotationsAndRejection(ctx); return 0; }
+  try { behavior(ctx); wiring(ctx); wiring(ctx, true); annotationsAndRejection(ctx); return 0; }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

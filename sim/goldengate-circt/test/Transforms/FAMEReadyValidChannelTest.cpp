@@ -2,6 +2,7 @@
 #include "goldengate/FAMEReadyValidChannel.h"
 #include "goldengate/FAMEPipeChannel.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLDialect.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
@@ -158,7 +159,7 @@ module { firrtl.circuit "Top" {
   if (bad == 9) replace("x: uint<3>", "x flip: uint<3>");
   if (bad == 10) replace("y: uint<5>", "y: bundle<nested: uint<5>>");
   if (bad == 11) replace("y: uint<5>", "y: uint<0>");
-  if (bad >= 12) {
+  if (bad >= 12 && bad <= 22) {
     replace("x: uint<3>, pad: uint<0>, y: uint<5>",
             "group: bundle<x: sint<3>, pad: sint<0>, inner: bundle<y: uint<4>, valid: uint<1>>>");
     if (bad == 13) replace("y: uint<4>", "y: clock");
@@ -166,6 +167,11 @@ module { firrtl.circuit "Top" {
     if (bad == 15) replace("y: uint<4>", "y: vector<uint<2>, 2>");
     if (bad == 19) replace("y: uint<4>", "y: uint");
   }
+  if (bad == 21) replace("group: bundle<x: sint<3>, pad: sint<0>, inner: bundle<y: uint<4>, valid: uint<1>>>",
+                         "group: bundle<inner: bundle<x: sint<3>>, empty: bundle<>>");
+  if (bad == 22) replace("group: bundle<x: sint<3>, pad: sint<0>, inner: bundle<y: uint<4>, valid: uint<1>>>",
+                         "group: bundle<x: sint<3>, pad: sint<0>>");
+  if (bad == 23) replace("y: uint<5>", "bits_x: uint<5>");
   auto root = parseSourceString<ModuleOp>(text, &context);
   require(bool(root), "cannot parse payload fixture");
   OpBuilder b(&context);
@@ -175,13 +181,16 @@ module { firrtl.circuit "Top" {
     auto target = [&](llvm::StringRef suffix) { return b.getStringAttr("~Top|Top>" + port + ".bits." + suffix); };
     auto rt = b.getStringAttr("~Top|Top>" + ready + ".bits");
     auto endpoints = b.getArrayAttr({target("x"), target("pad"), target("y"), target("valid")});
-    if (bad >= 12) {
+    if (bad >= 12 && bad <= 22) {
       endpoints = b.getArrayAttr({target("group.x"), target("group.pad"),
           target("group.inner.y"), target("group.inner.valid"), target("valid")});
       if (i == 0 && bad == 16) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner.y"), target("valid")});
       if (i == 0 && bad == 17) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner"), target("group.inner.valid"), target("valid")});
       if (i == 0 && bad == 18) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner.y"), target("group.inner.y"), target("valid")});
     }
+    if (bad == 23) endpoints = b.getArrayAttr({target("x"), target("pad"), target("bits_x"), target("valid")});
+    if (bad == 21) endpoints = b.getArrayAttr({target("group.inner.x"), target("valid")});
+    if (bad == 22) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("valid")});
     if (bad == 20) endpoints = b.getArrayAttr({target("valid"), target("group.inner.valid"), target("group.inner.y"), target("group.pad"), target("group.x")});
     auto info = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DecoupledForwardChannel)),
       b.getNamedAttr(i == 0 ? "validSource" : "validSink", target("valid")),
@@ -285,6 +294,8 @@ void wrapper(MLIRContext &context, const char *output) {
           auto constant = drivers.at(io(port)).getDefiningOp<ConstantOp>();
           require(constant && constant.getValue().getZExtValue() == (port == 17), "wrapper reset token mismatch");
         }
+        std::string enqBits = enq + (send ? ".bits" : ".bits.bits");
+        std::string deqBits = deq + (send ? ".bits.bits" : ".bits");
         auto pack = drivers.at(io(4)).getDefiningOp<CatPrimOp>();
         auto uncast = [&](Value v, bool isSigned, bool packing) {
           if (isSigned) {
@@ -296,16 +307,16 @@ void wrapper(MLIRContext &context, const char *output) {
           return v;
         };
         bool signedX = bad == 5 || bad == 7, signedY = bad == 6 || bad == 7;
-        require(pack && endpoint(uncast(pack.getOperand(0), signedX, true)) == enq + ".bits.x" &&
-                        endpoint(uncast(pack.getOperand(1), signedY, true)) == enq + ".bits.y", "payload packing lost field identity");
+        require(pack && endpoint(uncast(pack.getOperand(0), signedX, true)) == enqBits + ".x" &&
+                        endpoint(uncast(pack.getOperand(1), signedY, true)) == enqBits + ".y", "payload packing lost field identity");
         for (auto [field, high, low] : std::initializer_list<std::tuple<const char *, unsigned, unsigned>>{
             {"x", 7, 5}, {"y", 4, 0}}) {
-          auto value = drivers.at(deq + ".bits." + field);
+          auto value = drivers.at(deqBits + "." + field);
           auto slice = uncast(value, std::string(field) == "x" ? signedX : signedY, false).getDefiningOp<BitsPrimOp>();
           require(slice && slice.getOperand() == i.getResult(11) && slice.getHi() == high && slice.getLo() == low,
                   "payload unpacking lost field identity");
         }
-        require(endpoint(drivers.at(deq + ".bits.pad")) == enq + ".bits.pad",
+        require(endpoint(drivers.at(deqBits + ".pad")) == enqBits + ".pad",
                 "zero-width payload identity changed");
         // Exhaust every 3/5-bit pattern, including signed minima and -1.
         // The queue transports bits; sign interpretation belongs to the leaves.
@@ -316,8 +327,8 @@ void wrapper(MLIRContext &context, const char *output) {
           evaluation.memo[uncast(pack.getOperand(1), signedY, true)] = value & 31;
           evaluation.memo[i.getResult(11)] = value;
           require(evaluation.eval(pack.getResult()) == value, "payload pack sign-extended or reordered bits");
-          require(evaluation.eval(drivers.at(deq + ".bits.x")) == value >> 5 &&
-                  evaluation.eval(drivers.at(deq + ".bits.y")) == (value & 31),
+          require(evaluation.eval(drivers.at(deqBits + ".x")) == value >> 5 &&
+                  evaluation.eval(drivers.at(deqBits + ".y")) == (value & 31),
                   "payload unpack changed signed bit pattern");
         }
         ++instances;
@@ -372,6 +383,8 @@ void nestedPayload(MLIRContext &context) {
       bool send = instance.getName() == "ReadyValidChannel_send";
       std::string enq = send ? "target_FAMETop.a" : "external.b";
       std::string deq = send ? "external.a" : "target_FAMETop.b";
+      std::string enqBits = enq + (send ? ".bits.group" : ".bits.bits");
+      std::string deqBits = deq + (send ? ".bits.bits" : ".bits.group");
       auto packed = drivers.at(endpoint(instance.getResult(4)));
       SmallVector<Value> inputs;
       std::function<void(Value)> flatten = [&](Value value) {
@@ -383,12 +396,12 @@ void nestedPayload(MLIRContext &context) {
         }
       };
       flatten(packed);
-      require(inputs.size() == 3 && endpoint(inputs[0]) == enq + ".bits.group.x" &&
-          endpoint(inputs[1]) == enq + ".bits.group.inner.y" &&
-          endpoint(inputs[2]) == enq + ".bits.group.inner.valid", "nested pack field identity/order");
-      require(bool(drivers.at(deq + ".bits.group.x").getDefiningOp<AsSIntPrimOp>()),
+      require(inputs.size() == 3 && endpoint(inputs[0]) == enqBits + ".x" &&
+          endpoint(inputs[1]) == enqBits + ".inner.y" &&
+          endpoint(inputs[2]) == enqBits + ".inner.valid", "nested pack field identity/order");
+      require(bool(drivers.at(deqBits + ".x").getDefiningOp<AsSIntPrimOp>()),
               "nested signed leaf type lost");
-      require(endpoint(drivers.at(deq + ".bits.group.pad")) == enq + ".bits.group.pad",
+      require(endpoint(drivers.at(deqBits + ".pad")) == enqBits + ".pad",
               "nested zero-width identity lost");
       Interpreter evaluation(wrapper);
       for (uint64_t bits = 0; bits < 256; ++bits) {
@@ -398,9 +411,9 @@ void nestedPayload(MLIRContext &context) {
         evaluation.memo[inputs[2]] = bits & 1;
         evaluation.memo[instance.getResult(11)] = bits;
         require(evaluation.eval(packed) == bits, "nested payload packing changed bits");
-        require(evaluation.eval(drivers.at(deq + ".bits.group.x")) == bits >> 5 &&
-            evaluation.eval(drivers.at(deq + ".bits.group.inner.y")) == ((bits >> 1) & 15) &&
-            evaluation.eval(drivers.at(deq + ".bits.group.inner.valid")) == (bits & 1),
+        require(evaluation.eval(drivers.at(deqBits + ".x")) == bits >> 5 &&
+            evaluation.eval(drivers.at(deqBits + ".inner.y")) == ((bits >> 1) & 15) &&
+            evaluation.eval(drivers.at(deqBits + ".inner.valid")) == (bits & 1),
             "nested payload unpacking changed bits");
       }
       ++instances;
@@ -408,6 +421,98 @@ void nestedPayload(MLIRContext &context) {
     require(instances == 2, "nested payload must cover both orientations");
     require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
     require(succeeded(verify(*root)), "active nested wrapper failed verification");
+  }
+}
+// Singleton collapse is structural: a zero-width sibling still prevents
+// collapsing the record. Activation must resolve every renamed leaf target.
+void normalizedPayload(MLIRContext &context) {
+  for (unsigned variant : {21u, 22u}) {
+    auto root = fixture(context, variant);
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    std::string error;
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), error);
+    auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+    for (unsigned port : {2u, 4u}) {
+      auto host = cast<BundleType>(wrapper.getPortType(port));
+      auto valid = cast<BundleType>(host.getElement("bits")->type);
+      auto payload = valid.getElement("bits")->type;
+      if (variant == 21) require(payload == SIntType::get(&context, 3), "singleton payload did not collapse to signed scalar");
+      else {
+        auto record = dyn_cast<BundleType>(payload);
+        require(record && record.getElements().size() == 2 &&
+            record.getElement("x")->type == SIntType::get(&context, 3) &&
+            record.getElement("pad")->type == SIntType::get(&context, 0),
+            "zero-width sibling changed normalization shape");
+      }
+    }
+    unsigned patterns = 0;
+    for (auto instance : wrapper.getOps<InstanceOp>()) {
+      if (!instance.getName().starts_with("ReadyValidChannel_")) continue;
+      Value packed, unpacked;
+      for (auto connect : wrapper.getOps<ConnectOp>()) {
+        if (connect.getDest() == instance.getResult(4)) packed = connect.getSrc();
+        if (auto restore = connect.getSrc().getDefiningOp<AsSIntPrimOp>())
+          if (auto slice = restore.getInput().getDefiningOp<BitsPrimOp>(); slice && slice.getInput() == instance.getResult(11))
+            unpacked = connect.getSrc();
+      }
+      auto cast = packed.getDefiningOp<AsUIntPrimOp>();
+      require(cast && unpacked, "normalized signed scalar binding missing");
+      Interpreter evaluation(wrapper);
+      for (uint64_t bits = 0; bits < 8; ++bits) {
+        evaluation.memo.clear(); evaluation.memo[cast.getInput()] = bits;
+        evaluation.memo[instance.getResult(11)] = bits;
+        require(evaluation.eval(packed) == bits && evaluation.eval(unpacked) == bits,
+                "normalized signed scalar changed a bit pattern");
+        ++patterns;
+      }
+    }
+    require(patterns == 16, "normalized scalar must cover both orientations");
+    require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+    auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    unsigned leaves = 0;
+    for (auto attr : raw) {
+      auto annotation = cast<DictionaryAttr>(attr);
+      for (StringRef member : {"sources", "sinks"})
+        if (auto endpoints = annotation.getAs<ArrayAttr>(member))
+          for (auto endpoint : endpoints) {
+            auto spelling = cast<StringAttr>(endpoint);
+            auto target = goldengate::resolveAnnotationTarget(circuit, spelling.getValue(), error);
+            require(target && target->module == wrapper, "normalized annotation failed to resolve: " + error);
+            ++leaves;
+          }
+    }
+    require(leaves == (variant == 21 ? 6u : 8u), "normalized annotation leaf count");
+    require(succeeded(verify(*root)), "normalized active wrapper failed verification");
+  }
+  {
+    auto root = fixture(context, 23);
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    std::string error;
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    require(failed(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), "colliding normalized payload names accepted");
+    require(!llvm::any_of(circuit.getOps<FModuleOp>(), [](FModuleOp m) { return m.getName().starts_with("GGFAMEReadyValid"); }),
+            "ambiguous normalization partially mutated circuit");
+  }
+  for (bool instantiated : {false, true}) {
+    auto root = fixture(context, 0);
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    std::string error;
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+    OpBuilder b(&context);
+    if (instantiated) {
+      auto top = named(circuit, "Top"); b.setInsertionPointToEnd(top.getBodyBlock());
+      b.create<InstanceOp>(top.getLoc(), wrapper, "unexpected_wrapper");
+    } else {
+      b.setInsertionPointToEnd(wrapper.getBodyBlock());
+      b.create<SubfieldOp>(wrapper.getLoc(), wrapper.getArgument(2), "bits");
+    }
+    auto originalType = wrapper.getPortType(2);
+    require(failed(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), "unsafe wrapper mutation accepted");
+    require(wrapper.getPortType(2) == originalType &&
+        !llvm::any_of(circuit.getOps<FModuleOp>(), [](FModuleOp m) { return m.getName().starts_with("GGFAMEReadyValid"); }),
+        "unsafe wrapper normalization partially mutated circuit");
   }
 }
 // Secondary fanout removal shifts all following ReadyValid port ordinals.
@@ -455,6 +560,7 @@ int main(int argc, char **argv) {
     wrapper(context, argc > 1 ? argv[1] : nullptr);
     signedScalar(context);
     nestedPayload(context);
+    normalizedPayload(context);
     fanoutWrapper(context);
     for (unsigned width : {1, 8, 32}) behavior(context, width);
     if (argc > 3) {
@@ -468,7 +574,11 @@ int main(int argc, char **argv) {
       require(succeeded(verify(*root)), "ingested ReadyValid wrapper failed verification");
       std::error_code ec; llvm::raw_fd_ostream out(argv[3], ec);
       require(!ec, "cannot write ingested wrapper evidence");
-      root->print(out);
+      root->print(out); out.close();
+      require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+      require(succeeded(verify(*root)), "activated imported boundary failed verification");
+      llvm::raw_fd_ostream active(std::string(argv[3]) + ".active.mlir", ec);
+      require(!ec, "cannot write activated wrapper evidence"); root->print(active);
     }
   }
   catch (const std::exception &e) { llvm::errs() << "ReadyValidChannel: " << e.what() << '\n'; return 1; }

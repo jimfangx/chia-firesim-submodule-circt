@@ -22,7 +22,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool normalized = false) {
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGBlockDevResponseSchedulerWrapper\" { firrtl.module @GGBlockDevResponseSchedulerWrapper() {} } }", &ctx);
   require(bool(root), "fixture parse failed");
   auto c = *root->getOps<CircuitOp>().begin();
@@ -51,9 +51,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
             name == "bits_len" || name == "bits_strb" ? 8 :
             name == "bits_id" || name == "bits_region" || name == "bits_qos" || name == "bits_cache" ? 4 :
             name == "bits_size" || name == "bits_prot" ? 3 : name == "bits_resp" || name == "bits_burst" ? 2 : 1;
-        elements.push_back({b.getStringAttr(name), false, uint(w)});
+        if (!normalized || name != "valid")
+          elements.push_back({b.getStringAttr(normalized ? name.substr(5) : name), false, uint(w)});
       }
       payload = BundleType::get(&ctx, elements);
+      if (normalized) payload = BundleType::get(&ctx, {
+          {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
     }
     auto token = BundleType::get(&ctx, {{b.getStringAttr("ready"), true, bit},
         {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
@@ -65,7 +68,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
   auto str = [&](llvm::StringRef n, llvm::StringRef v) { return b.getNamedAttr(n, b.getStringAttr(v)); };
   auto dict = [&](std::initializer_list<NamedAttribute> a) { return b.getDictionaryAttr(a); };
   auto path = [&](unsigned j, llvm::StringRef suffix) {
-    return b.getStringAttr("~GGBlockDevResponseSchedulerWrapper|GGBlockDevResponseSchedulerWrapper>token" + std::to_string(j) + suffix.str());
+    std::string normalizedSuffix = suffix.str();
+    if (normalized && suffix.starts_with(".bits.bits_")) normalizedSuffix.replace(10, 1, ".");
+    return b.getStringAttr("~GGBlockDevResponseSchedulerWrapper|GGBlockDevResponseSchedulerWrapper>token" + std::to_string(j) + normalizedSuffix);
   };
   SmallVector<Attribute> raw{dict({str("class", goldengate::AnnotationClasses::BridgeIO),
       str("widgetClass", "midas.models.FASEDMemoryTimingModel"), str("target", "~FireSim|FireSim>ep_0"),
@@ -213,8 +218,8 @@ void behavior(MLIRContext &ctx) {
   require(excluded && pendingReset && hostResetFire, "missing FASED reset/capacity coverage");
   llvm::outs() << samples << " FASED token/reset/AXI payload cases passed\n";
 }
-void wiring(MLIRContext &ctx) {
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void wiring(MLIRContext &ctx, bool normalized = false) {
+  auto root = fixture(ctx, normalized); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDTokenEngine(c, error)), error);
   auto wrapper = named(c, "GGFASEDTokenWrapper"); Interpreter sim(wrapper);
   require(wrapper.getNumPorts() == 10, "incorrect seven-port FASED boundary");
@@ -240,11 +245,17 @@ void wiring(MLIRContext &ctx) {
     for (unsigned j = 0; j < 11; ++j) {
       auto token = cast<BundleType>(inner.getResult(j+2).getType()); auto payload = token.getElement("bits")->type;
       SmallVector<std::pair<std::string,unsigned>> fields;
-      if (auto b = dyn_cast<BundleType>(payload)) for (auto e : b.getElements()) fields.emplace_back(e.name.str(), *cast<UIntType>(e.type).getWidth());
-      else fields.emplace_back("", 1);
+      if (auto b = dyn_cast<BundleType>(payload)) {
+        if (normalized) {
+          auto data = cast<BundleType>(b.getElement("bits")->type);
+          for (auto e : data.getElements()) fields.emplace_back("bits_" + e.name.str(), *cast<UIntType>(e.type).getWidth());
+          fields.emplace_back("valid", 1);
+        } else for (auto e : b.getElements()) fields.emplace_back(e.name.str(), *cast<UIntType>(e.type).getWidth());
+      } else fields.emplace_back("", 1);
       for (auto [name,width] : fields) {
         uint64_t value = rng() & APInt::getLowBitsSet(64,width).getZExtValue();
         std::string tokenField = "bits" + (name.empty() ? "" : "." + name);
+        if (normalized && llvm::StringRef(name).starts_with("bits_")) tokenField = "bits.bits." + name.substr(5);
         std::string hostField = j == 5 ? "hBits.reset" : "hBits.axi4." + channels[j].str() + "." +
             (name.empty() ? "ready" : name == "valid" ? "valid" : "bits." + name.substr(5));
         if (j < 6) { sim.put(inner.getResult(j+2), tokenField, value);
@@ -294,6 +305,6 @@ void rejection(MLIRContext &ctx) {
 }
 int main() {
   try { MLIRContext ctx; ctx.getOrLoadDialect<FIRRTLDialect>(); ctx.getOrLoadDialect<circt::hw::HWDialect>();
-    behavior(ctx); wiring(ctx); rejection(ctx); return 0;
+    behavior(ctx); wiring(ctx); wiring(ctx, true); rejection(ctx); return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

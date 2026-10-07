@@ -54,6 +54,7 @@ Queue queue(OpBuilder &b, Location loc, Value clock, Value reset,
 struct PayloadLeaf {
   SmallVector<StringAttr> path;
   IntType type;
+  SmallVector<StringAttr> externalPath;
 };
 
 struct Pair {
@@ -61,6 +62,7 @@ struct Pair {
   unsigned forward, reverse, width;
   SmallVector<PayloadLeaf> leaves;
   bool targetSource;
+  BundleType externalType;
 };
 
 LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
@@ -205,7 +207,58 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
       error = "ReadyValidChannel " + base + " has missing, shared or inconsistent endpoints";
       return failure();
     }
-    pairs.push_back({base, *f->port, *r->port, width, std::move(leaves), source});
+    // SimUtils.buildChannelType removes empty/singleton containers before
+    // SimWrapper wraps the payload in Valid. Zero-width leaves participate in
+    // the shape decision even though they consume no packed queue bits.
+    SmallVector<PayloadLeaf> normalizedLeaves;
+    bool ambiguous = false;
+    std::function<FIRRTLBaseType(BundleType, bool)> normalize =
+        [&](BundleType bundle, bool root) -> FIRRTLBaseType {
+      SmallVector<BundleType::BundleElement> elements;
+      SmallVector<SmallVector<PayloadLeaf>> children;
+      std::set<std::string> normalizedNames;
+      for (auto field : bundle.getElements()) {
+        if (root && field.name.getValue() == "valid") continue;
+        auto name = field.name.getValue();
+        if (root) name.consume_front("bits_");
+        auto normalizedName = StringAttr::get(circuit.getContext(), name);
+        size_t start = normalizedLeaves.size();
+        FIRRTLBaseType type;
+        if (auto nested = dyn_cast<BundleType>(field.type))
+          type = normalize(nested, false);
+        else {
+          type = field.type;
+          normalizedLeaves.push_back({{}, cast<IntType>(type), {}});
+        }
+        if (!type) continue;
+        if (!normalizedNames.insert(name.str()).second) { ambiguous = true; return {}; }
+        elements.push_back({normalizedName, false, type});
+        children.emplace_back(normalizedLeaves.begin() + start, normalizedLeaves.end());
+        normalizedLeaves.resize(start);
+      }
+      if (elements.empty()) return {};
+      for (auto [i, child] : llvm::enumerate(children))
+        for (auto leaf : child) {
+          if (elements.size() > 1) leaf.externalPath.insert(leaf.externalPath.begin(), elements[i].name);
+          normalizedLeaves.push_back(std::move(leaf));
+        }
+      return elements.size() == 1 ? elements[0].type
+                                 : FIRRTLBaseType(BundleType::get(circuit.getContext(), elements));
+    };
+    auto normalized = normalize(payload, true);
+    if (ambiguous || !normalized || normalizedLeaves.size() != leaves.size()) {
+      error = "ReadyValidChannel " + base + " has ambiguous normalized payload names";
+      return failure();
+    }
+    for (auto [i, leaf] : llvm::enumerate(leaves))
+      leaf.externalPath = std::move(normalizedLeaves[i].externalPath);
+    auto validPayload = BundleType::get(circuit.getContext(), {
+        {StringAttr::get(circuit.getContext(), "valid"), false, bit},
+        {StringAttr::get(circuit.getContext(), "bits"), false, normalized}});
+    SmallVector<BundleType::BundleElement> externalElements(ft.getElements().begin(), ft.getElements().end());
+    externalElements[*ft.getElementIndex("bits")].type = validPayload;
+    pairs.push_back({base, *f->port, *r->port, width, std::move(leaves), source,
+                     BundleType::get(circuit.getContext(), externalElements)});
     reverse.erase(rev);
   }
   if (!reverse.empty()) {
@@ -328,6 +381,12 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
       }
       wrapperPorts.emplace(port, *external);
     }
+  bool instantiated = false;
+  circuit.walk([&](InstanceOp i) { instantiated |= i.getModuleName() == wrapper.getName(); });
+  if (instantiated) {
+    error = "ReadyValidChannel wrapper must be normalized before instantiation";
+    return failure();
+  }
   std::set<unsigned> widths;
   SmallVector<ConnectOp> passthroughs;
   for (const auto &p : pairs) {
@@ -342,6 +401,10 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
           found = c;
         }
       if (!found) { error = "ReadyValidChannel port is already connected"; return failure(); }
+      if (!internal.hasOneUse() || !external.hasOneUse()) {
+        error = "ReadyValidChannel port has unexpected wrapper uses";
+        return failure();
+      }
       passthroughs.push_back(found);
     }
   }
@@ -352,6 +415,23 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
   for (unsigned width : widths)
     if (failed(addFAMEReadyValidChannel(circuit, width, error))) return failure();
   for (auto c : passthroughs) c.erase();
+  SmallVector<Attribute> portTypes(wrapper.getPortTypes().begin(), wrapper.getPortTypes().end());
+  NamedAttrList renames;
+  for (const auto &p : pairs) {
+    unsigned port = wrapperPorts.at(p.forward);
+    portTypes[port] = TypeAttr::get(p.externalType);
+    wrapper.getArgument(port).setType(p.externalType);
+    std::string prefix = "~" + circuit.getName().str() + "|" + top.getName().str() +
+                         ">" + top.getPortName(p.forward).str() + ".bits";
+    for (const auto &leaf : p.leaves) {
+      std::string oldTarget = prefix, newTarget = prefix + ".bits";
+      for (auto name : leaf.path) oldTarget += "." + name.getValue().str();
+      for (auto name : leaf.externalPath) newTarget += "." + name.getValue().str();
+      renames.set(oldTarget, StringAttr::get(circuit.getContext(), newTarget));
+    }
+  }
+  wrapper.setPortTypes(portTypes);
+  wrapper->setAttr("goldengate.externalTargetRenames", renames.getDictionary(circuit.getContext()));
   OpBuilder b(wrapper.getBodyBlock(), wrapper.getBodyBlock()->end());
   Location loc = wrapper.getLoc();
   auto field = [&](Value v, llvm::StringRef name) -> Value { return b.create<SubfieldOp>(loc, v, name); };
@@ -389,11 +469,15 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     unsigned offset = p.width;
     for (const auto &leaf : p.leaves) {
       unsigned width = leaf.type.getWidthOrSentinel();
-      Value input = field(enqF, "bits"), output = field(deqF, "bits");
-      for (auto name : leaf.path) {
-        input = field(input, name.getValue());
-        output = field(output, name.getValue());
-      }
+      auto payloadLeaf = [&](Value port, bool external) {
+        Value value = field(port, "bits");
+        if (external) value = field(value, "bits");
+        for (auto name : external ? leaf.externalPath : leaf.path)
+          value = field(value, name.getValue());
+        return value;
+      };
+      Value input = payloadLeaf(enqF, !p.targetSource);
+      Value output = payloadLeaf(deqF, p.targetSource);
       if (!width) {
         // Zero-width fields carry no token information; FIRRTL retains their
         // target identity until normal type lowering removes them.

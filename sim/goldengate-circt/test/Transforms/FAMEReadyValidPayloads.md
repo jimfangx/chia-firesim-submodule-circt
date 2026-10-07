@@ -1,3 +1,65 @@
+# Normalized external ready/valid payloads — iteration 36
+
+The native ready/valid wrapper now implements the external payload shape from
+`SimUtils.buildChannelType` and `ChannelizedWrapperIO.payloadTypeMap`: exclude
+the direct target-valid leaf, remove empty containers, recursively collapse
+single-field containers, and strip root `bits_` prefixes. Zero-width integer
+leaves participate in these shape decisions until ordinary type lowering.
+The external host token carries `Valid(normalizedPayload)`; the retained target
+keeps its original post-FAME type. CIRCT Subfield/Cat/Bits and signed casts bind
+the two views through the existing queues. Wrapper activation retargets exact
+annotation leaf names while preserving associated target clock identities.
+
+The pass rejects ambiguous normalized names, already instantiated wrappers,
+and unexpected port uses before changing types or building queues. TSI,
+BlockDev, and FASED token mapping accept the normalized interface and resolve
+its leaf field IDs by name. Their earlier flat contracts remain accepted.
+
+Four production Scala probes pass: flat, nested, nested singleton with an
+empty sibling, and a signed payload with a zero-width sibling. The native
+compiler ingests each exact FIRRTL/annotation pair, applies the wrapper passes,
+and verifies the resulting IR before and after activation. The exposed nonzero
+leaf names, signed widths, and directions match Scala exactly: respectively
+16, 18, 14, and 14 leaves across both orientations. The nested probe also
+matches all 28 control bindings and 12 typed payload bindings. SFC removes
+zero-width leaves during lowering; the native pre-lowering wrapper retains them.
+
+Eight focused CTests pass: four hub clock/queued-pipe tests, ready/valid channels,
+and the TSI, BlockDev, and FASED token engines. These include exhaustive signed
+packing/unpacking, independent queue scoreboards, annotation target resolution,
+and bridge handshake/payload mappings under both accepted interface shapes.
+The first fresh Rocket compile exposed TSI's fixed field-order assumption;
+the name-based descriptor check and normalized TSI mapping test cover that fix.
+The subsequent full native Rocket compile emits simulator SystemVerilog and
+annotated collateral with exit status zero and empty stderr.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration36-normalized-rv/`:
+
+- `scala-{flat,nested,singleton,zero}/signed-wrapper.sfc.fir` and their exact inputs.
+- `ingested-*-wrapper.mlir` and corresponding `.active.mlir` artifacts.
+- `ctest.stdout`, `normalization-ctest.stdout`, `consumer-ctest.stdout`,
+  `fased-ctest.stdout`, and `tsi-ctest.stdout`. The initial FASED test traversal
+  failed on the new nested bundle; the corrected traversal passes.
+- `boundary-comparison.json`, `comparison.stdout`, and `compare-boundaries.py`.
+- `compiler-candidate/post-fame-ready-valid-wrapper.mlir`, simulator RTL,
+  and `compiler.stdout`/`compiler.stderr`; attempt-one logs retain the TSI failure.
+
+Against the immutable artifact
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+the fresh native wrapper matches 138 direct control bindings with no differences
+and 70 payload bindings. Twenty current AXI bindings (user, region, W id, and
+response) have no corresponding direct assignment in the recorded fixture.
+This comparison establishes boundary correspondence, not width parity or
+whole-design equivalence. Signed and nested behavior uses the fresh Scala probes.
+
+Iteration 35's harness passed CIRCT replacertl and both required Verilator
+regression suites. Gates for this change remain harness-owned; the UART-bearing
+SFC baseline is still pending. Payloads must currently have a positive total
+width and enumerate every data leaf. The next smallest porting step is Scala's
+annotation-selected payload filtering, using a probe with an unselected sibling
+to check normalization, queue width, and target identity.
+
 # Nested ready/valid payloads — iteration 35
 
 `FAMEReadyValidChannel.cpp` now traverses passive bundles recursively, resolves

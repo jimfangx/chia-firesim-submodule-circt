@@ -85,6 +85,15 @@ LogicalResult goldengate::addTSITokenEngine(CircuitOp circuit, std::string &erro
     auto expected = BundleType::get(ctx, {{StringAttr::get(ctx, "ready"), true, bit},
                                          {StringAttr::get(ctx, "valid"), false, bit},
                                          {StringAttr::get(ctx, "bits"), false, payload}});
+    // Valid(buildChannelType) places target-valid before the scalar word.
+    // The earlier flat handoff remains useful for standalone engine tests.
+    if (forward && token != expected) {
+      payload = BundleType::get(ctx, {{StringAttr::get(ctx, "valid"), false, bit},
+                                    {StringAttr::get(ctx, "bits"), false, word}});
+      expected = BundleType::get(ctx, {{StringAttr::get(ctx, "ready"), true, bit},
+                                      {StringAttr::get(ctx, "valid"), false, bit},
+                                      {StringAttr::get(ctx, "bits"), false, payload}});
+    }
     if (token != expected || inner.getPortDirection(port) != (j < 3 ? Direction::Out : Direction::In))
       return reject("TSI endpoint needs a correctly directed 32-bit Decoupled or Bool token");
     std::set<unsigned> expectedIDs;
@@ -114,7 +123,10 @@ LogicalResult goldengate::addTSITokenEngine(CircuitOp circuit, std::string &erro
       auto t = spelling ? resolveAnnotationTarget(circuit, spelling.getValue(), error) : std::nullopt;
       auto token = cast<BundleType>(inner.getPortType(port));
       unsigned id = token.getFieldID(*token.getElementIndex("bits"));
-      if (valid) id += cast<BundleType>(token.getElement("bits")->type).getFieldID(1);
+      if (valid) {
+        auto payload = cast<BundleType>(token.getElement("bits")->type);
+        id += payload.getFieldID(*payload.getElementIndex("valid"));
+      }
       if (!t || t->module != inner || t->port != port || t->fieldID != id)
         return reject("TSI forward descriptor disagrees with its handshake endpoints");
     }

@@ -21,7 +21,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool normalized = false) {
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGTSIBridgeBoundWrapper\" { firrtl.module @GGTSIBridgeBoundWrapper() {} } }", &ctx);
   require(bool(root), "fixture parse failed");
   auto c = *root->getOps<CircuitOp>().begin();
@@ -44,9 +44,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
       SmallVector<BundleType::BundleElement> elements;
       for (auto &name : fields[j]) {
         unsigned w = name == "bits_data" ? 64 : name == "bits_len" || name == "bits_offset" ? 32 : 1;
-        elements.push_back({b.getStringAttr(name), false, uint(w)});
+        if (!normalized || name != "valid")
+          elements.push_back({b.getStringAttr(normalized ? name.substr(5) : name), false, uint(w)});
       }
       payload = BundleType::get(&ctx, elements);
+      if (normalized) payload = BundleType::get(&ctx, {
+          {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
     }
     auto token = BundleType::get(&ctx, {{b.getStringAttr("ready"), true, bit},
         {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
@@ -58,7 +61,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
   auto str = [&](llvm::StringRef n, llvm::StringRef v) { return b.getNamedAttr(n, b.getStringAttr(v)); };
   auto dict = [&](std::initializer_list<NamedAttribute> a) { return b.getDictionaryAttr(a); };
   auto path = [&](unsigned j, llvm::StringRef suffix) {
-    return b.getStringAttr("~GGTSIBridgeBoundWrapper|GGTSIBridgeBoundWrapper>token" + std::to_string(j) + suffix.str());
+    std::string normalizedSuffix = suffix.str();
+    if (normalized && suffix.starts_with(".bits.bits_")) normalizedSuffix.replace(10, 1, ".");
+    return b.getStringAttr("~GGTSIBridgeBoundWrapper|GGTSIBridgeBoundWrapper>token" + std::to_string(j) + normalizedSuffix);
   };
   SmallVector<Attribute> raw{dict({str("class", goldengate::AnnotationClasses::BridgeIO),
       str("widgetClass", "firechip.goldengateimplementations.BlockDevBridgeModule"), str("target", "~FireSim|FireSim>ep_0"),
@@ -331,8 +336,8 @@ void writeTracker(MLIRContext &ctx) {
       << " count updates during reset, failures " << assertionFailures[0] << "/"
       << assertionFailures[1] << "/" << assertionFailures[2] << "\n";
 }
-void wiring(MLIRContext &ctx) {
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void wiring(MLIRContext &ctx, bool normalized = false) {
+  auto root = fixture(ctx, normalized); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addBlockDevTokenEngine(c, error)), error);
   auto wrapper = named(c, "GGBlockDevTokenWrapper"); Interpreter sim(wrapper);
   require(wrapper.getNumPorts() == 14, "incorrect wrapper boundary");
@@ -380,12 +385,14 @@ void wiring(MLIRContext &ctx) {
   for (unsigned j = 0; j < 9; ++j) for (unsigned k = 0; k < tokenFields[j].size(); ++k) {
     unsigned width = llvm::StringRef(hostFields[j][k]).ends_with(".data") ? 64 : hostFields[j][k].find(".len") != std::string::npos || hostFields[j][k].find(".offset") != std::string::npos || j > 6 ? 32 : 1;
     uint64_t value = width == 64 ? 0xF123456789ABCDEFull : width == 32 ? 0x87654321u : 1;
+    std::string tokenField = tokenFields[j][k];
+    if (normalized && llvm::StringRef(tokenField).starts_with("bits.bits_")) tokenField.replace(9, 1, ".");
     if (j < 4) {
-      sim.put(inner.getResult(j + 2), tokenFields[j][k], value);
+      sim.put(inner.getResult(j + 2), tokenField, value);
       require(sim.output(widget.getResult(2), "hBits." + hostFields[j][k]).getZExtValue() == value, "toHost payload mapping differs");
     } else {
       sim.put(widget.getResult(2), "hBits." + hostFields[j][k], value);
-      require(sim.output(inner.getResult(j + 2), tokenFields[j][k]).getZExtValue() == value, "fromHost payload mapping differs");
+      require(sim.output(inner.getResult(j + 2), tokenField).getZExtValue() == value, "fromHost payload mapping differs");
     }
     ++leaves;
   }
@@ -442,6 +449,6 @@ void annotationsAndRejection(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { behavior(ctx); writeTracker(ctx); wiring(ctx); annotationsAndRejection(ctx); return 0; }
+  try { behavior(ctx); writeTracker(ctx); wiring(ctx); wiring(ctx, true); annotationsAndRejection(ctx); return 0; }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

@@ -10,7 +10,8 @@ mlir::LogicalResult addFAMEReadyValidChannel(circt::firrtl::CircuitOp circuit,
                                             unsigned payloadWidth,
                                             std::string &error);
 // Resolve boundary pairs from annotations, recursively pack passive integer bundle leaves,
-// and replace their passthrough connections in the existing pipe wrapper.
+// normalize external Valid payloads like SimUtils.buildChannelType, and replace
+// passthroughs in the existing pipe wrapper. Activation transfers leaf renames.
 mlir::LogicalResult addFAMEBoundaryReadyValidChannels(
     circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

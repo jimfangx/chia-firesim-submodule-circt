@@ -544,6 +544,7 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
   std::string newCircuit = "~" + wrapperName.str();
   std::string oldModule = "|" + oldName;
   std::string newModule = "|" + wrapperName.str();
+  auto externalRenames = wrapper->getAttrOfType<DictionaryAttr>("goldengate.externalTargetRenames");
   std::set<std::string> innerOnlyPorts;
   for (auto module : circuit.getOps<FModuleOp>())
     if (module.getName() == oldName)
@@ -565,6 +566,9 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
   std::function<Attribute(Attribute, bool)> retarget =
       [&](Attribute attr, bool targetDomain) -> Attribute {
     if (auto string = dyn_cast<StringAttr>(attr)) {
+      if (!targetDomain && externalRenames)
+        if (auto replacement = externalRenames.getAs<StringAttr>(string.getValue()))
+          string = replacement;
       llvm::StringRef value = string.getValue();
       if (value == oldCircuit)
         return StringAttr::get(context, newCircuit);

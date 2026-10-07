@@ -123,6 +123,20 @@ LogicalResult goldengate::addFASEDTokenEngine(CircuitOp circuit, std::string &er
     } else fields.push_back("");
     auto token = bundle({{b.getStringAttr("ready"), true, bit}, {b.getStringAttr("valid"), false, bit},
         {b.getStringAttr("bits"), false, payload}});
+    // Canonical SimWrapper ports carry Valid(buildChannelType(payload)).
+    // Accept the earlier flat boundary as well for standalone token-engine use.
+    if (forward && inner.getPortType(port) != token) {
+      auto bits = payloads[j];
+      bool scalar = bits.getElements().size() == 1;
+      auto normalized = scalar ? bits.getElements()[0].type : FIRRTLBaseType(bits);
+      payload = bundle({{b.getStringAttr("valid"), false, bit},
+                        {b.getStringAttr("bits"), false, normalized}});
+      token = bundle({{b.getStringAttr("ready"), true, bit}, {b.getStringAttr("valid"), false, bit},
+                      {b.getStringAttr("bits"), false, payload}});
+      fields.clear();
+      for (auto e : bits.getElements()) fields.push_back(scalar ? "bits" : "bits." + e.name.str());
+      fields.push_back("valid");
+    }
     if (inner.getPortType(port) != token || inner.getPortDirection(port) != (j < 6 ? Direction::Out : Direction::In))
       return reject("FASED endpoint has an unsupported payload or direction");
     // Preserve endpoint order: each descriptor leaf identifies its corresponding
@@ -131,7 +145,16 @@ LogicalResult goldengate::addFASEDTokenEngine(CircuitOp circuit, std::string &er
     for (auto [k, endpoint] : llvm::enumerate(ends)) {
       auto s = dyn_cast<StringAttr>(endpoint);
       auto e = s ? resolveAnnotationTarget(circuit, s.getValue(), error) : std::nullopt;
-      unsigned id = base + (forward ? cast<BundleType>(payload).getFieldID(k) : 0);
+      unsigned id = base;
+      if (forward) {
+        FIRRTLBaseType type = payload;
+        SmallVector<llvm::StringRef> components; llvm::StringRef(fields[k]).split(components, '.');
+        for (auto component : components) {
+          auto record = cast<BundleType>(type);
+          unsigned index = *record.getElementIndex(component);
+          id += record.getFieldID(index); type = record.getElements()[index].type;
+        }
+      }
       if (!e || e->module != inner || e->port != port || e->fieldID != id)
         return reject("FASED payload endpoints are missing, shared or reordered");
     }
@@ -240,7 +263,7 @@ LogicalResult goldengate::addFASEDTokenEngine(CircuitOp circuit, std::string &er
     connect(field(token, j < 6 ? "ready" : "valid"), gate);
     Value bits = field(token, "bits");
     for (unsigned k = 0; k < paths[j].size(); ++k) {
-      Value leaf = payloadFields[j][k].empty() ? bits : field(bits, payloadFields[j][k]);
+      Value leaf = payloadFields[j][k].empty() ? bits : path(bits, payloadFields[j][k]);
       Value target = path(hb, paths[j][k]); connect(j < 6 ? target : leaf, j < 6 ? leaf : target);
     }
   }
