@@ -10,6 +10,8 @@ object FAMEHubClockOracle extends App {
   module Model :
     input bridge_clocks_1 : Clock
     input bridge_clocks_0 : Clock
+    input in0 : UInt<1>
+    input in1 : UInt<1>
     output out0 : UInt<1>
     output out1 : UInt<1>
     output targetClock0 : Clock
@@ -27,6 +29,8 @@ object FAMEHubClockOracle extends App {
     input hostReset : UInt<1>
     input bridge_clocks_0 : Clock
     input bridge_clocks_1 : Clock
+    input in0 : UInt<1>
+    input in1 : UInt<1>
     output out0 : UInt<1>
     output out1 : UInt<1>
     output targetClock0 : Clock
@@ -34,6 +38,8 @@ object FAMEHubClockOracle extends App {
     inst model of Model
     model.bridge_clocks_0 <= bridge_clocks_0
     model.bridge_clocks_1 <= bridge_clocks_1
+    model.in0 <= in0
+    model.in1 <= in1
     out0 <= model.out0
     out1 <= model.out1
     targetClock0 <= model.targetClock0
@@ -54,7 +60,9 @@ object FAMEHubClockOracle extends App {
     val clk = "targetClock" + index
     Seq(
       FAMEChannelPortsAnnotation(out, Some(model.ref(clk)), Seq(model.ref(out))),
-      FAMEChannelConnectionAnnotation(out, PipeChannel(0), Some(top.ref(clk)), Some(Seq(top.ref(out))), None)
+      FAMEChannelConnectionAnnotation(out, PipeChannel(0), Some(top.ref(clk)), Some(Seq(top.ref(out))), None),
+      FAMEChannelPortsAnnotation("in" + index, Some(model.ref(clk)), Seq(model.ref("in" + index))),
+      FAMEChannelConnectionAnnotation("in" + index, PipeChannel(0), Some(top.ref(clk)), None, Some(Seq(top.ref("in" + index))))
     )
   }
   val result = new FAMETransform().execute(low.copy(annotations = annos))
@@ -100,6 +108,7 @@ object FAMEHubClockOracle extends App {
     case DoPrim(PrimOps.AsUInt, Seq(input), _, _) => evaluate(input, values)
     case DoPrim(PrimOps.Not, Seq(input), _, _) => 1 - evaluate(input, values)
     case DoPrim(PrimOps.And, Seq(left, right), _, _) => evaluate(left, values) & evaluate(right, values)
+    case DoPrim(PrimOps.Or, Seq(left, right), _, _) => evaluate(left, values) | evaluate(right, values)
     case other => values(other.serialize)
   }
   // Evaluate the actual emitted expressions, including cross-domain cases.
@@ -118,5 +127,28 @@ object FAMEHubClockOracle extends App {
   }
   result.annotations.collect { case anno: midas.InternalXDCAnnotation =>
     println("XDC " + anno.toString)
+  }
+  // Evaluate each actual data-channel FSM with independent raw tokens and
+  // buffered enables; declaration/annotation order must not swap domains.
+  val names = Seq("in0", "in1", "out0", "out1")
+  val fired = names.map { name =>
+    val reg = body.collectFirst { case r: DefRegister if r.name.startsWith(name + "_fired") => r }.get
+    require(reg.init.asInstanceOf[UIntLiteral].value == (if (name.startsWith("in")) 1 else 0))
+    name -> reg.name
+  }.toMap
+  for (mask <- 0 until 256) {
+    val values = Map(
+      "bridge_clocks_sink.bits._0" -> (mask & 1),
+      "bridge_clocks_sink.bits._1" -> ((mask >> 1) & 1),
+      "bridge_clocks_0_enabled" -> ((mask >> 2) & 1),
+      "bridge_clocks_1_enabled" -> ((mask >> 3) & 1),
+      "targetCycleFinishing" -> ((mask >> 4) & 1)) ++ names.flatMap { name =>
+      val suffix = if (name.startsWith("in")) "_sink" else "_source"
+      Seq(fired(name) -> ((mask >> 5) & 1),
+        (name + suffix + ".ready") -> ((mask >> 6) & 1),
+        (name + suffix + ".valid") -> ((mask >> 7) & 1))
+    }
+    val states = names.map(name => evaluate(connects(fired(name)), values))
+    println(s"FIRED $mask ${states.mkString(" ")}")
   }
 }

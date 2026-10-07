@@ -1273,10 +1273,22 @@ int main(int argc, char **argv) {
           *clockChannel, *clockHierarchy, clockBindings->front(), error);
       if (!clockDomains)
         return fail(error);
-      // Downstream data-channel control still uses one domain. Validate the
-      // complete ordered plan before any clock-channel mutation.
+      auto channelClockDomains = goldengate::analyzeFAMEChannelClockDomains(
+          circuit, selectedOutputModel, *clockDomains, error);
+      if (!channelClockDomains)
+        return fail("FAME channel clock domains: " + error);
+      auto channelClockName = [&](llvm::StringRef global, llvm::StringRef local,
+                                  Direction direction) -> std::optional<std::string> {
+        for (const auto &assignment : *channelClockDomains)
+          if (assignment.globalName == global && assignment.localName == local &&
+              assignment.direction == direction)
+            return assignment.modelClockName;
+        return std::nullopt;
+      };
+      // Clock annotation renaming and raw payload construction still need a
+      // multi-domain rewrite. Validate all assignments before mutating ports.
       if (clockDomains->size() != 1)
-        return fail("baseline FAME data-channel control currently requires one hub clock domain");
+        return fail("baseline FAME clock annotation rewrite currently requires one hub clock domain");
       const auto &clockDomain = clockDomains->front();
       llvm::SmallVector<FModuleLike> clockModels;
       clockModels.push_back(clockGroup->module);
@@ -1379,6 +1391,8 @@ int main(int argc, char **argv) {
           clockModel.getBodyBlock()->getArgument(*channelPort), "bits");
       auto clockFlag = clockBuilder.create<AsUIntPrimOp>(
           clockModel.getLoc(), clockBits.getResult());
+      std::map<std::string, mlir::Value> inputClockEnables{
+          {oldModelClock, clockFlag.getResult()}};
       if (failed(goldengate::addFAMEClockEnable(
               clockModel, oldModelClock, clockFlag.getResult(), error)))
         return fail("FAME target clock enable: " + error);
@@ -1661,8 +1675,14 @@ int main(int argc, char **argv) {
       auto dataModel = dyn_cast<FModuleOp>(dataGroup.module.getOperation());
       if (!dataModel || dataModel != clockModel)
         return fail("FAME input is not in the target clock model");
+      auto inputClockName = channelClockName(dataChannel->name, dataGroup.name,
+                                             Direction::In);
+      auto inputEnable = inputClockName ? inputClockEnables.find(*inputClockName)
+                                       : inputClockEnables.end();
+      if (inputEnable == inputClockEnables.end())
+        return fail("FAME input has no captured hub clock domain");
       llvm::SmallVector<goldengate::FAMEFiredChannel> thisInput{
-          {dataGroup.name, true, clockFlag.getResult()}};
+          {dataGroup.name, true, inputEnable->second}};
       if (failed(goldengate::ensureFAMEFiredRegisters(
               dataModel, thisInput, error)))
         return fail("FAME input fired register: " + error);
@@ -1883,8 +1903,12 @@ int main(int argc, char **argv) {
 
       llvm::SmallVector<goldengate::FAMEFiredChannel> thisOutputFired{
           {outputGroup.name, false, {}}};
+      auto outputClockName = channelClockName(outputChannel->name,
+                                              outputGroup.name, Direction::Out);
+      if (!outputClockName)
+        return fail("FAME output has no captured hub clock domain");
       mlir::Value outputClockEnable = goldengate::lookupFAMEClockEnable(
-          clockModel, oldModelClock, error);
+          clockModel, *outputClockName, error);
       if (!outputClockEnable)
         return fail("FAME output clock enable: " + error);
       thisOutputFired.front().clockDomainEnable = outputClockEnable;

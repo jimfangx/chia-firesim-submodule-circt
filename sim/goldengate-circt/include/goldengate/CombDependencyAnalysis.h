@@ -41,4 +41,11 @@ struct LocalChannelDependency {
 std::vector<LocalChannelDependency> analyzeLocalChannelDependencies(
     circt::firrtl::FModuleOp module,
     llvm::ArrayRef<ModelChannelBinding> bindings);
+
+// FAMETransform.genMetadata requires exactly one reachable module port other
+// than the annotated alias; it must be a scalar input Clock. Includes output
+// aliases and non-clock dependencies (e.g. mux selectors) in the uniqueness
+// check. Requires the same normalized boundary as the channel analysis above.
+std::optional<unsigned> analyzeLocalChannelClockSource(
+    circt::firrtl::FModuleOp module, unsigned clockPort, std::string &error);
 } // namespace goldengate

@@ -87,10 +87,47 @@ focused checks). The gate comparison again matches the immutable U250 RTL
 contract and all three generated-clock XDC commands listed above. These local
 tests do not start the harness-owned manager verification gates.
 
+## Data-channel clock assignments
+
+`analyzeFAMEChannelClockDomains` resolves each bound data channel's associated
+model clock alias before any channelization erases ports. It uses the native
+FIRRTL field/hierarchy connectivity analysis and captures global/local channel
+names, direction and original hub clock identity. As in Scala `genMetadata`,
+the alias must reach exactly one other model port, a scalar input Clock in the
+hub. UInt mux selectors, intermediate output aliases, undriven clocks, missing
+hub sources and stale domain identities fail without mutating IR. A hub data
+channel without an associated clock is rejected; virtual-clock behavior stays
+in its existing separate path.
+
+The actual baseline compiler consumes these assignments when selecting each
+input's raw-token enable and each output's tagged buffered enable. It no longer
+assumes a data channel belongs to the first hub domain. The synthetic native
+test consumes the captured names after scalar clock/alias ports are gone,
+including reversed physical clock/payload declarations. Its 256 `FIRED` rows
+(1,024 transitions) match the preserved Scala oracle in both clock annotation
+orders. Each generated input fired register resets to one; each output resets
+to zero. Cases with different raw tokens and buffered enables check the token
+phase as well as domain identity.
+
+The actual Rocket `post-fame-host-control.mlir` yields 42 channel assignments.
+The native comparison resolves the immutable U250 RTL's named transition wires
+and matches all 17 input raw-token reset/transition equations and all 25 output
+buffered-enable reset/transition equations in `design/FireSim-generated.sv`
+listed above. This fixture provides only one domain; the two-domain differential
+comes from the additional executable Scala fixture, not the immutable Rocket.
+
+Iteration 14 evidence is under `iteration14-channel-clocks/`: successful native
+build logs, `sfc-two-clock.fir`, `sfc-reversed.fir`, Scala/native `FIRED` rows,
+`rocket-domains-final.log` and `tests-final.log` (27 focused CTest checks).
+Earlier local comparison attempts exposed a test parser that did not follow
+SFC's intermediate input transition wires; the final comparison resolves those
+wires and checks host reset separately. No manager gates were launched here.
+
 ## Remaining work
 
-The baseline driver still requires one hub clock because downstream data
-channels use one enable. Next, use the ordered records for all clock annotation
-renames and input/output FSM clock-enable selection before enabling multiple
-clocks in the full hub path. Manager gates remain harness-owned;
+The baseline driver still requires one hub clock while its clock payload
+construction and annotation renames handle scalar bits. Next, use all ordered
+domain records for those rewrites and construct each domain's raw token,
+buffered enable and gate before enabling multiple clocks in the full hub path.
+Manager gates remain harness-owned;
 FAME-5 and the SFC UART-bearing differential remain incomplete.

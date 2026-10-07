@@ -21,11 +21,15 @@ struct Trace {
   // Input order follows CheckCombLoops' simplified named-signal graph.
   std::vector<PortField> inputPorts;
   std::set<std::string> blockers;
+  // CheckCombLoops' simplified port graph also retains intermediate output
+  // ports. FAME clock metadata checks that complete set, not only inputs.
+  std::set<unsigned> declaredPorts;
 };
 
 class LocalPortTracer {
 public:
-  explicit LocalPortTracer(FModuleOp module) : module(module) {
+  explicit LocalPortTracer(FModuleOp module, bool retainPorts = false)
+      : module(module), retainPorts(retainPorts) {
     auto circuit = module->getParentOfType<CircuitOp>();
     for (auto &op : circuit.getBodyBlock()->getOperations())
       if (auto child = dyn_cast<FModuleLike>(&op))
@@ -162,6 +166,9 @@ private:
         cached != cachedValues.end())
       return cached->second;
     Trace result;
+    if (auto arg = dyn_cast<BlockArgument>(fieldRef.getValue()); retainPorts &&
+        arg && arg.getOwner() == current.getBodyBlock())
+      result.declaredPorts.insert(arg.getArgNumber());
     if (!active.insert(fieldRef).second) {
       result.blockers.insert(current.getName().str() + ":combinational cycle");
       return result;
@@ -181,6 +188,8 @@ private:
             result.inputPorts.end())
           result.inputPorts.push_back(input);
       result.blockers.insert(other.blockers.begin(), other.blockers.end());
+      result.declaredPorts.insert(other.declaredPorts.begin(),
+                                  other.declaredPorts.end());
     };
     auto mergeSource = [&](Value source, unsigned sourceFieldID = 0) {
       auto ref = getFieldRefFromValue(source).getSubField(sourceFieldID);
@@ -425,6 +434,7 @@ private:
   }
 
   FModuleOp module;
+  bool retainPorts;
   std::map<std::string, FModuleLike> modules;
   DenseSet<Operation *> indexed;
   DenseSet<Operation *> conditionalModules;
@@ -441,6 +451,29 @@ private:
   std::set<ModulePortField> activePorts;
 };
 } // namespace
+
+std::optional<unsigned> goldengate::analyzeLocalChannelClockSource(
+    FModuleOp module, unsigned clockPort, std::string &error) {
+  if (clockPort >= module.getNumPorts() ||
+      !isa<ClockType>(module.getPortType(clockPort))) {
+    error = "channel clock is not a scalar model Clock port";
+    return std::nullopt;
+  }
+  LocalPortTracer tracer(module, true);
+  auto traced = tracer.trace(clockPort);
+  if (!traced.blockers.empty()) {
+    error = "unresolved channel clock connectivity: " + *traced.blockers.begin();
+    return std::nullopt;
+  }
+  traced.declaredPorts.erase(clockPort);
+  if (traced.declaredPorts.size() != 1 || traced.inputPorts.size() != 1 ||
+      traced.inputPorts.front().second != 0 ||
+      !isa<ClockType>(module.getPortType(traced.inputPorts.front().first))) {
+    error = "channel clock must depend on exactly one scalar input Clock port";
+    return std::nullopt;
+  }
+  return traced.inputPorts.front().first;
+}
 
 std::vector<goldengate::LocalChannelDependency>
 goldengate::analyzeLocalChannelDependencies(

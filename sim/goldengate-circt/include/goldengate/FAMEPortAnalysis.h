@@ -39,6 +39,21 @@ analyzeFAMEHubClockDomains(const GGChannelConnection &channel,
                            const ModelChannelBinding &binding,
                            std::string &error);
 
+// Stable data-channel assignment captured before hub/alias ports are erased.
+// Input FSMs use this domain's raw token; output FSMs use its enabled register.
+struct FAMEChannelClockDomain {
+  std::string globalName;
+  std::string localName;
+  circt::firrtl::Direction direction;
+  std::string modelClockName;
+};
+
+std::optional<llvm::SmallVector<FAMEChannelClockDomain>>
+analyzeFAMEChannelClockDomains(circt::firrtl::CircuitOp circuit,
+                              circt::firrtl::FModuleOp model,
+                              llvm::ArrayRef<FAMEHubClockDomain> domains,
+                              std::string &error);
+
 // Capture names and dependencies before any port rewrite invalidates indices.
 // Selection follows connection annotation order; payload order stays in the
 // connection's source list, independently of the model's physical port order.
