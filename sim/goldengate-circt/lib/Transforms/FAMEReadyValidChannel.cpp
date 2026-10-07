@@ -280,12 +280,27 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     if (wrapper.getPortName(i) == "hostReset") reset = i;
   }
   if (!clock || !reset) { error = "ReadyValidChannel wrapper lacks host controls"; return failure(); }
+  std::map<unsigned, unsigned> wrapperPorts;
+  for (const auto &pair : pairs)
+    for (unsigned port : {pair.forward, pair.reverse}) {
+      std::optional<unsigned> external;
+      for (unsigned i = 0; i < wrapper.getNumPorts(); ++i)
+        if (wrapper.getPortName(i) == top.getPortName(port) &&
+            wrapper.getPortType(i) == top.getPortType(port) &&
+            wrapper.getPortDirection(i) == top.getPortDirection(port))
+          external = i;
+      if (!external) {
+        error = "ReadyValidChannel wrapper lacks matching port identity";
+        return failure();
+      }
+      wrapperPorts.emplace(port, *external);
+    }
   std::set<unsigned> widths;
   SmallVector<ConnectOp> passthroughs;
   for (const auto &p : pairs) {
     widths.insert(p.width);
     for (unsigned port : {p.forward, p.reverse}) {
-      Value internal = child.getResult(port), external = wrapper.getBodyBlock()->getArgument(port);
+      Value internal = child.getResult(port), external = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(port));
       ConnectOp found;
       for (auto c : wrapper.getOps<ConnectOp>())
         if ((c.getDest() == internal && c.getSrc() == external) ||
@@ -317,8 +332,8 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     auto instance = b.create<InstanceOp>(loc, definition, "ReadyValidChannel_" + p.name);
     auto arg = [&](unsigned i) { return instance.getResult(i); };
     Value fInternal = child.getResult(p.forward), rInternal = child.getResult(p.reverse);
-    Value fExternal = wrapper.getBodyBlock()->getArgument(p.forward);
-    Value rExternal = wrapper.getBodyBlock()->getArgument(p.reverse);
+    Value fExternal = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(p.forward));
+    Value rExternal = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(p.reverse));
     Value enqF = p.targetSource ? fInternal : fExternal, enqR = p.targetSource ? rInternal : rExternal;
     Value deqF = p.targetSource ? fExternal : fInternal, deqR = p.targetSource ? rExternal : rInternal;
     connect(arg(0), wrapper.getBodyBlock()->getArgument(*clock));

@@ -35,6 +35,10 @@ mlir::LogicalResult addFAMEBoundaryPipeChannels(
 // the endpoint's port direction to distinguish model and bridge sources.
 // Validate every queue definition's port names, directions and exact payload
 // types before creating the wrapper; incompatible definitions fail atomically.
+// ChannelFanout groups of bridge-sourced sinks share one external primary
+// input and broadcast atomically to independent queues. Secondary inputs are
+// omitted; their annotation targets retain the inner target module identity.
+// Validate group membership and equal payload types before any mutation.
 // ReadyValid channels initially pass through and are replaced by the following
 // ReadyValidChannel transform. Clock channels still pass through.
 mlir::LogicalResult addFAMEPipeWrapper(circt::firrtl::CircuitOp circuit,

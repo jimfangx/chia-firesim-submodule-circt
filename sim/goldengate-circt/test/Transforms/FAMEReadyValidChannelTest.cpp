@@ -241,10 +241,48 @@ void wrapper(MLIRContext &context) {
     require(succeeded(verify(*root)), "active wrapper failed verification");
   }
 }
+// Secondary fanout removal shifts all following ReadyValid port ordinals.
+// Match the retained target by identity when replacing its passthroughs.
+void fanoutWrapper(MLIRContext &context) {
+  auto root = fixture(context, 0);
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = named(circuit, "Top"); OpBuilder b(&context);
+  auto bit = UIntType::get(&context, 1);
+  auto type = BundleType::get(&context, {{b.getStringAttr("ready"), true, bit},
+      {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, bit}});
+  SmallVector<std::pair<unsigned, PortInfo>> additions;
+  for (StringRef name : {"forkPrimary", "forkSecondary"})
+    additions.emplace_back(2, PortInfo(b.getStringAttr(name), type, Direction::In));
+  top.insertPorts(additions);
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  for (StringRef name : {"forkPrimary", "forkSecondary"})
+    annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+      b.getNamedAttr("globalName", b.getStringAttr(name)),
+      b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+        b.getNamedAttr("latency", b.getI64IntegerAttr(0))})),
+      b.getNamedAttr("sinks", b.getArrayAttr({b.getStringAttr("~Top|Top>" + name + ".bits")}))}));
+  annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelFanout)),
+      b.getNamedAttr("channelNames", b.getArrayAttr({b.getStringAttr("forkPrimary"), b.getStringAttr("forkSecondary")}))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  std::string error;
+  require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
+  require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+  require(succeeded(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), error);
+  require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+  require(succeeded(verify(*root)), "fanout shifted ReadyValid wrapper failed verification");
+  auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+  require(wrapper.getNumPorts() == top.getNumPorts()-1 && wrapper.getPortName(3) == "a",
+          "secondary fanout port was not removed before ReadyValid mapping");
+}
+
 } // namespace
 int main() {
   MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { wrapper(context); for (unsigned width : {1, 8, 32}) behavior(context, width); }
+  try { wrapper(context); fanoutWrapper(context); for (unsigned width : {1, 8, 32}) behavior(context, width); }
   catch (const std::exception &e) { llvm::errs() << "ReadyValidChannel: " << e.what() << '\n'; return 1; }
   llvm::outs() << "ReadyValidChannel: both orientations, malformed pairs and 60000 randomized cycles passed\n";
 }

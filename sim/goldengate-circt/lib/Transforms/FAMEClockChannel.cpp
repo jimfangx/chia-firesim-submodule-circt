@@ -9,6 +9,10 @@
 using namespace circt::firrtl;
 using namespace mlir;
 
+// Requires: an inactive pipe wrapper and its retained target clock port.
+// Secondary bridge fanout inputs may be absent from the wrapper: resolve the
+// surviving clock port by name/type/direction rather than its old ordinal.
+// Transfers clock endpoints to Boolean wrapper tokens, preserving domain metadata.
 LogicalResult goldengate::addFAMEClockChannel(CircuitOp circuit,
                                              std::string &error) {
   auto reject = [&](llvm::StringRef reason) {
@@ -64,6 +68,9 @@ LogicalResult goldengate::addFAMEClockChannel(CircuitOp circuit,
       return reject("clock channel has duplicate sink fields");
     fieldIDs.push_back(*target->fieldID);
   }
+  std::optional<unsigned> wrapperPort;
+  for (unsigned i = 0; i < wrapper.getNumPorts(); ++i)
+    if (wrapper.getPortName(i) == top.getPortName(*port)) wrapperPort = i;
   auto bit = UIntType::get(circuit.getContext(), 1, false);
   auto type = dyn_cast<BundleType>(top.getPortType(*port));
   if (!type || type.getElements().size() != 3 ||
@@ -72,9 +79,8 @@ LogicalResult goldengate::addFAMEClockChannel(CircuitOp circuit,
       type.getElement("ready")->type != bit || !type.getElement("ready")->isFlip ||
       type.getElement("valid")->type != bit || type.getElement("valid")->isFlip ||
       type.getElement("bits")->isFlip || top.getPortDirection(*port) != Direction::In ||
-      wrapper.getPorts().size() != top.getPorts().size() ||
-      wrapper.getPortName(*port) != top.getPortName(*port) ||
-      wrapper.getPortType(*port) != type || wrapper.getPortDirection(*port) != Direction::In)
+      !wrapperPort || wrapper.getPortType(*wrapperPort) != type ||
+      wrapper.getPortDirection(*wrapperPort) != Direction::In)
     return reject("clock channel has an incompatible Decoupled Clock port");
 
   uint64_t bitsID = type.getFieldID(*type.getElementIndex("bits"));
@@ -113,7 +119,7 @@ LogicalResult goldengate::addFAMEClockChannel(CircuitOp circuit,
   });
   if (wrapperInstantiated)
     return reject("clock wrapper port must be converted before instantiation");
-  Value external = wrapper.getBodyBlock()->getArgument(*port);
+  Value external = wrapper.getBodyBlock()->getArgument(*wrapperPort);
   Value internal = child.getResult(*port);
   ConnectOp bulk;
   for (auto *use : external.getUsers()) {
@@ -132,7 +138,7 @@ LogicalResult goldengate::addFAMEClockChannel(CircuitOp circuit,
   elements[*type.getElementIndex("bits")].type = FVectorType::get(bit, sinks.size());
   auto tokenType = BundleType::get(circuit.getContext(), elements);
   SmallVector<Attribute> portTypes(wrapper.getPortTypes().begin(), wrapper.getPortTypes().end());
-  portTypes[*port] = TypeAttr::get(tokenType);
+  portTypes[*wrapperPort] = TypeAttr::get(tokenType);
   bulk.erase();
   wrapper.setPortTypes(portTypes);
   external.setType(tokenType);
@@ -151,7 +157,7 @@ LogicalResult goldengate::addFAMEClockChannel(CircuitOp circuit,
     Value token = builder.create<SubindexOp>(loc, tokenBits, i);
     builder.create<ConnectOp>(loc, destination, builder.create<AsClockPrimOp>(loc, token));
     newSinks.push_back(builder.getStringAttr("~" + circuit.getName().str() + "|" +
-        wrapper.getName().str() + ">" + wrapper.getPortName(*port).str() +
+        wrapper.getName().str() + ">" + wrapper.getPortName(*wrapperPort).str() +
         ".bits[" + std::to_string(i) + "]"));
   }
   // Boundary endpoints now refer to Boolean tokens; clockInfo and MFMR stay

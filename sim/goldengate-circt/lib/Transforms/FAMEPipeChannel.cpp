@@ -68,6 +68,7 @@ struct BoundaryPipe {
   unsigned port;
   FIRRTLBaseType payload;
   unsigned latency;
+  unsigned sourcePort; // Primary bridge input for an annotated fanout group.
 };
 
 // Resolve the post-FAME payload target to a live CIRCT port. Channel clock
@@ -151,7 +152,42 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
       return failure();
     }
     pipes.push_back({name.getValue().str(), port, payload,
-                     static_cast<unsigned>(latency.getUInt())});
+                     static_cast<unsigned>(latency.getUInt()), port});
+  }
+  // ChannelExcision separates bridge-sourced sinks; SimWrapper groups them
+  // by ChannelFanout's first name and exposes only that primary input.
+  std::map<std::string, unsigned> byName;
+  for (auto [i, pipe] : llvm::enumerate(pipes)) byName.emplace(pipe.name, i);
+  std::set<unsigned> grouped;
+  for (Attribute attr : raw) {
+    Annotation annotation(attr);
+    if (!annotation.isClass(goldengate::AnnotationClasses::ChannelFanout))
+      continue;
+    auto names = annotation.getMember<ArrayAttr>("channelNames");
+    if (!names || names.empty()) {
+      error = "PipeChannel fanout needs nonempty channelNames";
+      return failure();
+    }
+    SmallVector<unsigned> members;
+    for (Attribute name : names) {
+      auto spelling = dyn_cast<StringAttr>(name);
+      auto found = spelling ? byName.find(spelling.getValue().str()) : byName.end();
+      if (found == byName.end() || !grouped.insert(found->second).second) {
+        error = "PipeChannel fanout has a missing or repeated channel";
+        return failure();
+      }
+      members.push_back(found->second);
+    }
+    auto &primary = pipes[members.front()];
+    for (unsigned index : members) {
+      auto &pipe = pipes[index];
+      if (top.getPortDirection(pipe.port) != Direction::In ||
+          pipe.payload != primary.payload) {
+        error = "PipeChannel fanout requires bridge-sourced sinks with identical payload types";
+        return failure();
+      }
+      pipe.sourcePort = primary.port;
+    }
   }
   return success();
 }
@@ -356,7 +392,16 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
     return failure();
   }
   auto targetPorts = target.getPorts();
-  SmallVector<PortInfo> ports(targetPorts.begin(), targetPorts.end());
+  std::set<unsigned> secondaryPorts;
+  for (const auto &channel : channels)
+    if (channel.port != channel.sourcePort) secondaryPorts.insert(channel.port);
+  SmallVector<PortInfo> ports;
+  std::map<unsigned, unsigned> wrapperPorts;
+  for (auto [i, port] : llvm::enumerate(targetPorts)) {
+    if (secondaryPorts.count(i)) continue;
+    wrapperPorts.emplace(i, ports.size());
+    ports.push_back(port);
+  }
   OpBuilder builder(circuit.getBodyBlock(), circuit.getBodyBlock()->begin());
   auto wrapper = builder.create<FModuleOp>(
       circuit.getLoc(), StringAttr::get(circuit.getContext(), wrapperName),
@@ -364,13 +409,13 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
   builder.setInsertionPointToStart(wrapper.getBodyBlock());
   Location loc = wrapper.getLoc();
   auto child = builder.create<InstanceOp>(loc, target, "target_FAMETop");
-  for (unsigned i = 0, n = ports.size(); i < n; ++i) {
+  for (unsigned i = 0, n = targetPorts.size(); i < n; ++i) {
     bool isChannelPort = false;
     for (const auto &channel : channels)
       isChannelPort |= i == channel.port;
     if (isChannelPort)
       continue;
-    Value external = wrapper.getBodyBlock()->getArgument(i);
+    Value external = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(i));
     Value internal = child.getResult(i);
     if (target.getPortDirection(i) == Direction::In)
       builder.create<ConnectOp>(loc, internal, external);
@@ -380,26 +425,49 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
   auto field = [&](Value bundle, llvm::StringRef name) {
     return builder.create<SubfieldOp>(loc, bundle, name).getResult();
   };
+  SmallVector<InstanceOp> queues;
+  std::map<unsigned, SmallVector<unsigned>> groups;
   for (auto [index, channel] : llvm::enumerate(channels)) {
     auto queue = builder.create<InstanceOp>(loc, pipes[index],
                                              "PipeChannel_" + channel.name);
+    queues.push_back(queue);
+    groups[channel.sourcePort].push_back(index);
     Value internal = child.getResult(channel.port);
-    Value external = wrapper.getBodyBlock()->getArgument(channel.port);
-    // A target source enqueues into the host queue. A bridge source enqueues
-    // from the wrapper input, and the target sink dequeues the same queue.
     bool targetSource = target.getPortDirection(channel.port) == Direction::Out;
-    Value source = targetSource ? internal : external;
-    Value sink = targetSource ? external : internal;
+    Value sink = targetSource ? wrapper.getArgument(wrapperPorts.at(channel.port))
+                              : internal;
     builder.create<ConnectOp>(loc, queue.getResult(0),
-                              wrapper.getBodyBlock()->getArgument(*clockPort));
+                              wrapper.getArgument(wrapperPorts.at(*clockPort)));
     builder.create<ConnectOp>(loc, queue.getResult(1),
-                              wrapper.getBodyBlock()->getArgument(*resetPort));
-    builder.create<ConnectOp>(loc, field(source, "ready"), queue.getResult(2));
-    builder.create<ConnectOp>(loc, queue.getResult(3), field(source, "valid"));
-    builder.create<ConnectOp>(loc, queue.getResult(4), field(source, "bits"));
+                              wrapper.getArgument(wrapperPorts.at(*resetPort)));
     builder.create<ConnectOp>(loc, queue.getResult(5), field(sink, "ready"));
     builder.create<ConnectOp>(loc, field(sink, "valid"), queue.getResult(6));
     builder.create<ConnectOp>(loc, field(sink, "bits"), queue.getResult(7));
+  }
+  for (const auto &[port, members] : groups) {
+    Value source = target.getPortDirection(port) == Direction::Out
+                       ? child.getResult(port)
+                       : wrapper.getArgument(wrapperPorts.at(port));
+    Value sourceValid = field(source, "valid");
+    Value sourceBits = field(source, "bits");
+    Value ready;
+    for (unsigned index : members) {
+      Value laneReady = queues[index].getResult(2);
+      ready = ready ? builder.create<AndPrimOp>(loc, ready, laneReady).getResult()
+                    : laneReady;
+    }
+    builder.create<ConnectOp>(loc, field(source, "ready"), ready);
+    for (unsigned index : members) {
+      // DecoupledHelper.fire(q.ready) excludes that queue's own ready.
+      // Every enqueue handshake is consequently the same atomic broadcast,
+      // without creating a ready-to-valid feedback dependency on that queue.
+      Value valid = sourceValid;
+      for (unsigned peer : members)
+        if (peer != index)
+          valid = builder.create<AndPrimOp>(loc, valid, queues[peer].getResult(2));
+      builder.create<ConnectOp>(loc, queues[index].getResult(3), valid);
+      builder.create<ConnectOp>(loc, queues[index].getResult(4), sourceBits);
+    }
   }
   return success();
 }
@@ -411,12 +479,12 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
     error = "PipeChannel wrapper is already active";
     return failure();
   }
-  bool foundWrapper = false;
+  FModuleLike wrapper;
   for (Operation &op : circuit.getBodyBlock()->getOperations())
     if (auto module = dyn_cast<FModuleLike>(&op);
         module && module.getModuleName() == wrapperName)
-      foundWrapper = true;
-  if (!foundWrapper) {
+      wrapper = module;
+  if (!wrapper) {
     error = "PipeChannel wrapper module is missing";
     return failure();
   }
@@ -430,6 +498,13 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
   std::string newCircuit = "~" + wrapperName.str();
   std::string oldModule = "|" + oldName;
   std::string newModule = "|" + wrapperName.str();
+  std::set<std::string> innerOnlyPorts;
+  for (auto module : circuit.getOps<FModuleOp>())
+    if (module.getName() == oldName)
+      for (auto port : module.getPorts())
+        if (!llvm::any_of(wrapper.getPorts(), [&](const PortInfo &external) {
+              return external.name == port.name;
+            })) innerOnlyPorts.insert(port.name.getValue().str());
   std::function<Attribute(Attribute, bool)> retarget =
       [&](Attribute attr, bool targetDomain) -> Attribute {
     if (auto string = dyn_cast<StringAttr>(attr)) {
@@ -441,8 +516,14 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
       std::string suffix = value.drop_front(oldName.size() + 1).str();
       if (suffix == oldModule)
         return StringAttr::get(context, newCircuit + newModule);
-      if (!targetDomain && llvm::StringRef(suffix).starts_with(oldModule + ">"))
-        suffix.replace(0, oldModule.size() + 1, newModule + ">");
+      if (!targetDomain && llvm::StringRef(suffix).starts_with(oldModule + ">")) {
+        auto reference = llvm::StringRef(suffix).drop_front(oldModule.size() + 1);
+        auto portName = reference.take_front(reference.find_first_of(".["));
+        bool exposed = !innerOnlyPorts.count(portName.str());
+        // Secondary fanout sinks stay on the retained inner target. They are
+        // fed by independent queues, not external wrapper inputs.
+        if (exposed) suffix.replace(0, oldModule.size() + 1, newModule + ">");
+      }
       return StringAttr::get(context, newCircuit + suffix);
     }
     if (auto array = dyn_cast<ArrayAttr>(attr)) {
