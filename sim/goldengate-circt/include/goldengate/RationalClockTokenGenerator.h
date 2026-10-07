@@ -21,4 +21,13 @@ std::optional<RationalClockSchedule> analyzeRationalClockSchedule(
 llvm::SmallVector<mlir::Value> buildRationalClockTokens(
     mlir::OpBuilder &builder, mlir::Location loc, mlir::Value clock,
     mlir::Value reset, mlir::Value ready, const RationalClockSchedule &schedule);
+
+// Materialize ClockTokenVector's complete Decoupled Vec[Bool] producer. The
+// caller supplies an output channel with one Boolean lane per schedule period.
+// Valid is always one; the channel's flipped ready field advances countdowns.
+// Return the same ordered lane values for the bridge's target-cycle counter.
+llvm::SmallVector<mlir::Value> buildRationalClockChannel(
+    mlir::OpBuilder &builder, mlir::Location loc, mlir::Value clock,
+    mlir::Value reset, mlir::Value channel,
+    const RationalClockSchedule &schedule);
 } // namespace goldengate

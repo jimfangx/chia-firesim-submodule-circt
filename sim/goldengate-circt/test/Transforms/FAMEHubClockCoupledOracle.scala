@@ -59,7 +59,7 @@ object FAMEHubClockCoupledOracle extends App {
     FAMEHostClock(top.ref("hostClock")), FAMEHostReset(top.ref("hostReset")),
     FAMETransformAnnotation(model),
     FAMEChannelPortsAnnotation("bridge_clocks", None, clockNames.map(model.ref)),
-    FAMEChannelConnectionAnnotation("bridge_clocks", TargetClockChannel(Seq(RationalClock("domain0", 1, 2), RationalClock("domain1", 1, 3)), Seq(2, 3)), None, None, Some(clockNames.map(top.ref)))
+    FAMEChannelConnectionAnnotation("bridge_clocks", TargetClockChannel(Seq(RationalClock("domain0", 1, 2), RationalClock("domain1", 1, 3)), Seq(1, 2)), None, None, Some(clockNames.map(top.ref)))
   ) ++ (0 until 2).flatMap { index =>
     val out = "out" + index
     val clk = "targetClock" + index

@@ -12,7 +12,9 @@
 #include "goldengate/FAMEFinishing.h"
 #include "goldengate/FAMEInputReady.h"
 #include "goldengate/FAMEOutputValid.h"
-#include "goldengate/RationalClockTokenGenerator.h"
+#include "goldengate/FAMEPipeChannel.h"
+#include "goldengate/FAMEClockChannel.h"
+#include "goldengate/SingleClockBridge.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -43,7 +45,7 @@ Value field(OpBuilder &b, Location loc, Value port, StringRef name) {
 // Canonical field identities bridge model arguments to their actual instance
 // results, so ready feeds the producer through the constructed FIRRTL graph.
 struct Interpreter {
-  FModuleOp top, model;
+  SmallVector<FModuleOp> scopes;
   llvm::DenseMap<Value, Value> aliases;
   std::map<std::string, Value> drivers;
   std::map<std::string, uint64_t> memo;
@@ -52,12 +54,28 @@ struct Interpreter {
   std::string key(Value v) {
     if (auto f = v.getDefiningOp<SubfieldOp>())
       return key(f.getInput()) + "." + f.getFieldName().str();
+    if (auto i = v.getDefiningOp<SubindexOp>())
+      return key(i.getInput()) + "[" + std::to_string(i.getIndex()) + "]";
     if (aliases.count(v)) return key(aliases.lookup(v));
     return std::to_string(reinterpret_cast<uintptr_t>(v.getAsOpaquePointer()));
   }
-  Interpreter(FModuleOp t, FModuleOp m, InstanceOp instance) : top(t), model(m) {
-    for (unsigned i = 0; i < m.getNumPorts(); ++i)
-      aliases[m.getArgument(i)] = instance.getResult(i);
+  Interpreter(CircuitOp circuit, FModuleOp top) {
+    // Each real module has one instance in this fixture. Keep aliases from
+    // block arguments to actual instance results across every wrapper stage.
+    std::function<void(FModuleOp)> visit = [&](FModuleOp scope) {
+      require(!llvm::is_contained(scopes, scope), "multiply instantiated fixture module");
+      scopes.push_back(scope);
+      for (auto instance : scope.getOps<InstanceOp>()) {
+        FModuleOp child;
+        for (auto module : circuit.getOps<FModuleOp>())
+          if (module.getName() == instance.getModuleName()) child = module;
+        if (!child) continue; // AbstractClockGate extmodule: observe its CE.
+        for (unsigned i = 0; i < child.getNumPorts(); ++i)
+          aliases[child.getArgument(i)] = instance.getResult(i);
+        visit(child);
+      }
+    };
+    visit(top);
     // Channelization emits aggregate connects. Project their actual fields,
     // including ready's reversed flow, without rebuilding the wiring by hand.
     OpBuilder builder(top.getContext());
@@ -69,11 +87,15 @@ struct Interpreter {
           auto s = field(builder, loc, src, element.name.getValue());
           connect(element.isFlip ? s : d, element.isFlip ? d : s, loc);
         }
+      } else if (auto vector = dyn_cast<FVectorType>(dest.getType())) {
+        for (unsigned i = 0; i < vector.getNumElements(); ++i)
+          connect(builder.create<SubindexOp>(loc, dest, i),
+                  builder.create<SubindexOp>(loc, src, i), loc);
       } else {
         require(drivers.emplace(key(dest), src).second, "multiple drivers");
       }
     };
-    for (auto scope : {top, model})
+    for (auto scope : scopes)
       for (auto &operation : llvm::make_early_inc_range(scope.getBodyBlock()->getOperations())) {
         builder.setInsertionPoint(&operation);
         if (auto c = dyn_cast<StrictConnectOp>(operation))
@@ -107,15 +129,21 @@ struct Interpreter {
   }
   void edge() {
     llvm::DenseMap<Value, uint64_t> next;
-    for (auto scope : {top, model}) {
+    for (auto scope : scopes) {
       for (auto r : scope.getOps<RegResetOp>())
         next[r.getResult()] = eval(r.getResetSignal()) ? eval(r.getResetValue()) : eval(drivers.at(key(r.getResult())));
       for (auto r : scope.getOps<RegOp>()) {
         // Target registers are clocked by the actual AbstractClockGate.O.
         auto clock = dyn_cast<OpResult>(r.getClockVal());
         auto gate = clock ? dyn_cast<InstanceOp>(clock.getOwner()) : InstanceOp();
-        require(gate && clock.getResultNumber() == 2, "target state lacks gated clock");
-        next[r.getResult()] = eval(gate.getResult(1)) ? eval(drivers.at(key(r.getResult()))) : state.lookup(r.getResult());
+        if (gate) {
+          require(gate.getModuleName() == "AbstractClockGate" && clock.getResultNumber() == 2,
+                  "target state lacks gated clock");
+          next[r.getResult()] = eval(gate.getResult(1)) ? eval(drivers.at(key(r.getResult()))) : state.lookup(r.getResult());
+        } else {
+          // ClockBridge counter snapshot registers advance on hostClock.
+          next[r.getResult()] = eval(drivers.at(key(r.getResult())));
+        }
       }
     }
     state = std::move(next);
@@ -243,7 +271,7 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
       b.getNamedAttr("channelInfo", b.getDictionaryAttr({
           b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::TargetClockChannel)),
           b.getNamedAttr("clockInfo", b.getArrayAttr(clockInfo)),
-          b.getNamedAttr("perClockMFMR", b.getArrayAttr({b.getI64IntegerAttr(2), b.getI64IntegerAttr(3)}))})),
+          b.getNamedAttr("perClockMFMR", b.getArrayAttr({b.getI64IntegerAttr(1), b.getI64IntegerAttr(2)}))})),
       b.getNamedAttr("sinks", b.getArrayAttr(clockTopTargets))}));
   for (StringRef name : {"in0", "in1", "out0", "out1"}) {
     bool input = name.starts_with("in");
@@ -451,44 +479,63 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
   b.setInsertionPointToEnd(model.getBodyBlock());
   for (auto r : model.getOps<RegOp>()) targetState.push_back(r.getResult());
   require(targetState.size() == 2, "target state missing");
-  b.setInsertionPointToEnd(top.getBodyBlock());
-  std::optional<unsigned> wrapperClockPort;
+  std::optional<unsigned> targetClockPort;
   for (unsigned i = 0; i < top.getNumPorts(); ++i)
-    if (top.getPortName(i) == "model_bridge_clocks_sink") wrapperClockPort = i;
-  require(bool(wrapperClockPort), "channelized wrapper clock port missing");
-  // The local clock bridge consumes the wrapper clock sink. Internalize its
-  // port to a same-type wire, retaining the actual channelization connect and
-  // its flipped ready flow into the emitted rational producer.
-  auto oldClockPort = top.getArgument(*wrapperClockPort);
-  b.setInsertionPointToStart(top.getBodyBlock());
-  Value clockPort = b.create<WireOp>(loc, oldClockPort.getType(), "producer_clock_tokens").getResult();
-  oldClockPort.replaceAllUsesWith(clockPort);
-  llvm::BitVector removed(top.getNumPorts());
-  removed.set(*wrapperClockPort);
-  top.erasePorts(removed);
-  b.setInsertionPointToEnd(top.getBodyBlock());
-  auto ready = field(b, loc, clockPort, "ready");
-  SmallVector<goldengate::RationalClockInfo> orderedClocks;
-  for (const auto &domain : *domains) orderedClocks.push_back(domain.clockInfo);
-  auto schedule = goldengate::analyzeRationalClockSchedule(orderedClocks, error);
-  require(bool(schedule), error);
-  auto tokens = goldengate::buildRationalClockTokens(b, loc,
-      top.getArgument(0), top.getArgument(1), ready, *schedule);
-  auto one = b.create<ConstantOp>(loc, UIntType::get(&ctx, 1), APInt(1, 1));
-  b.create<StrictConnectOp>(loc, field(b, loc, clockPort, "valid"), one.getResult());
-  auto instanceBits = field(b, loc, clockPort, "bits");
-  for (unsigned lane = 0; lane < 2; ++lane) {
-    auto token = b.create<AsClockPrimOp>(loc, tokens[lane]);
-    b.create<StrictConnectOp>(loc, field(b, loc, instanceBits,
-        (*domains)[lane].payloadField), token.getResult());
+    if (top.getPortName(i) == "model_bridge_clocks_sink") targetClockPort = i;
+  require(bool(targetClockPort), "channelized target clock port missing");
+  // Recreate the post-FAME boundary annotation with the retained ordered
+  // ClockRecord leaves. SimulationMapping then converts that actual interface
+  // to Vec[Bool] and attaches the actual ClockBridge producer instance.
+  SmallVector<Attribute> clockSinks;
+  for (const auto &domain : *domains)
+    clockSinks.push_back(b.getStringAttr("~Top|Top>model_bridge_clocks_sink.bits." +
+                                        domain.payloadField));
+  NamedAttrList boundaryClock(cast<DictionaryAttr>(annotations[1]));
+  boundaryClock.set("sinks", b.getArrayAttr(clockSinks));
+  auto bridge = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::BridgeIO)),
+      b.getNamedAttr("target", b.getStringAttr("~Top|Top>clockBridge")),
+      b.getNamedAttr("widgetClass", b.getStringAttr("midas.widgets.ClockBridgeModule")),
+      b.getNamedAttr("widgetConstructorKey", b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr("firesim.lib.bridges.ClockParameters")),
+          b.getNamedAttr("clocks", b.getArrayAttr(clockInfo))})),
+      b.getNamedAttr("channelMapping", b.getDictionaryAttr({
+          b.getNamedAttr("clocks", b.getStringAttr("bridge_clocks"))}))});
+  circuit->setAttr("rawAnnotations", b.getArrayAttr({boundaryClock.getDictionary(&ctx), bridge}));
+  require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+  require(succeeded(goldengate::addFAMEClockChannel(circuit, error)), error);
+  require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+  require(succeeded(goldengate::addClockBridge(circuit, error)), error);
+  FModuleOp producer;
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    if (module.getName() == circuit.getName()) top = module;
+    if (module.getName() == "GGSingleClockBridge") producer = module;
   }
+  require(top.getName() == "GGClockBridgeWrapper" && bool(producer),
+          "production clock bridge hierarchy missing");
+  b.setInsertionPointToEnd(producer.getBodyBlock());
+  Value tokenBits = field(b, loc, producer.getArgument(2), "bits");
+  SmallVector<Value> tokens;
+  for (unsigned lane = 0; lane < domains->size(); ++lane)
+    tokens.push_back(b.create<SubindexOp>(loc, tokenBits, lane));
   require(succeeded(verify(*root)), "coupled FIRRTL verification");
   if (output) {
-    std::error_code ec; llvm::raw_fd_ostream out(output, ec);
-    require(!ec, ec.message()); root->print(out); out << '\n';
+    // Retain the mapped identities separately. The active compiler consumes
+    // raw annotations before the CIRCT backend, so lower an equivalent clone
+    // with that compiler-owned transport attribute removed.
+    auto write = [&](StringRef path, ModuleOp artifact) {
+      std::error_code ec; llvm::raw_fd_ostream out(path, ec);
+      require(!ec, ec.message()); artifact->print(out); out << '\n';
+    };
+    write(std::string(output) + ".mapped.mlir", *root);
+    OwningOpRef<ModuleOp> lowered(cast<ModuleOp>(root->clone()));
+    for (auto cloneCircuit : lowered->getOps<CircuitOp>())
+      cloneCircuit->removeAttr("rawAnnotations");
+    require(succeeded(verify(*lowered)), "lowering clone FIRRTL verification");
+    write(output, *lowered);
   }
 
-  Interpreter sim(top, model, instance);
+  Interpreter sim(circuit, top);
   goldengate::FAMEClockGateIndex gates;
   goldengate::FAMEFiredRegisterIndex fired;
   require(succeeded(gates.collect(model, error)) && succeeded(fired.collect(model, error)), error);
@@ -518,6 +565,13 @@ void run(MLIRContext &ctx, bool reversed, const char *output) {
     sim.memo.clear();
     sim.memo[sim.key(top.getArgument(0))] = 0;
     sim.memo[sim.key(top.getArgument(1))] = reset;
+    auto mcrKey = sim.key(top.getArgument(top.getNumPorts() - 1));
+    sim.memo[mcrKey + ".wstrb"] = 0;
+    for (unsigned slot = 0; slot < 6; ++slot) {
+      sim.memo[mcrKey + ".read[" + std::to_string(slot) + "].ready"] = 0;
+      sim.memo[mcrKey + ".write[" + std::to_string(slot) + "].valid"] = 0;
+      sim.memo[mcrKey + ".write[" + std::to_string(slot) + "].bits"] = 0;
+    }
     for (unsigned i = 0; i < 2; ++i) {
       sim.memo[sim.key(top.getArgument(2 + i)) + ".valid"] = pending[i];
       sim.memo[sim.key(top.getArgument(2 + i)) + ".bits"] = inputBits[i];

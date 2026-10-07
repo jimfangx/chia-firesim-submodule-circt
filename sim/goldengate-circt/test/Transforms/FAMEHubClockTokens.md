@@ -409,6 +409,49 @@ native MLIR/SV outputs, `rocket-domains.log`, `comparison.json`,
 `build-final.log` and `tests-final.log`. All 11 focused CTest checks pass.
 No harness-owned manager gates were launched in this iteration.
 
+## Production clock bridge mapping (iteration 24)
+
+`buildRationalClockChannel` now emits the complete ClockTokenVector producer:
+constant valid, flipped ready and ordered Boolean vector lanes. The active
+`addClockBridge` implementation uses it and consumes its returned lane values
+for the fastest-clock counter.
+
+The coupled fixture now invokes the production `addFAMEPipeWrapper`,
+`addFAMEClockChannel`, `activateFAMEPipeWrapper` and `addClockBridge` functions.
+Its interpreter follows actual instance arguments through the generated bridge,
+pipe wrapper, target top and model; aggregate projection includes vector lanes
+and flipped ready flow. The manual clock wire and direct scheduler construction
+are gone. Original annotated IR is preserved as `.mapped.mlir`; only a verified
+clone has raw annotations removed for backend lowering.
+
+Production bridge preflight exposed inconsistent fixture MFMRs: periods 2 and
+3 have MFMRs 1 and 2 relative to the fastest clock. Both native and Scala fixture
+inputs now use these values throughout FAME and SimulationMapping. No Scala
+compiler source or immutable oracle artifact was changed. Reversed order
+changes physical clock identity, retaining the ordered rational ratios.
+
+Fresh actual Scala FAME and rational-generator executions still match every
+one of the 8192 native observations in each order, with the iteration 23 hashes
+above. Both complete mapped native circuits lower through firtool. Six focused
+CTest checks pass; after the final fixture metadata correction, both coupled
+checks were rerun and pass.
+
+A fresh invocation of the native Rocket compiler emits RTL and collateral.
+Against the immutable primary
+`firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json`,
+the candidate clock name, ratio, MFMR and retained constructor match. Against
+the immutable U250 `design/FireSim-generated.sv` named above, the mapped Rocket
+producer's constant valid and lane plus all six decoded counter read words
+match after interface and snapshot name normalization. The immutable fixtures
+contain one clock; multiclock evidence comes from the actual Scala execution.
+
+Evidence is in mutable `iteration24-bridge-mapping/`: `compiler-candidate/`,
+compiler logs, `rocket-mapping.log`, producer MLIR/SV, mapped/lowering fixture
+MLIR/SV, native/Scala traces, `trace-comparison.json`, `golden-comparison.json`,
+build and test logs. No manager verification gates were launched.
+Most large candidate MLIR snapshots are gzip-compressed; the five inference
+and clock-mapping boundaries remain directly readable.
+
 ## Remaining work
 
 The hub FAME boundary now uses all ordered clock domains. The active compiler
@@ -417,9 +460,11 @@ targets and the fastest-clock counter. The actual Scala bridge comparison
 is recorded in [RationalClockBridge.md](RationalClockBridge.md); the inner
 scheduler comparison is in
 [RationalClockTokenGenerator.md](RationalClockTokenGenerator.md). Next feed
-the coupled payload fixture through the complete production `addClockBridge`
-mapping and ClockRecord-to-BoolVector adaptation, preserving the same trace
-comparison under stalls and reversed annotation order. The baseline supports one
+the coupled payload fixture through production data PipeChannel queues, while
+retaining the complete clock bridge mapping and checking payload delivery under
+independent stalls. The current fixture consumes data annotations before
+SimulationMapping and preserves its direct data schedule; queue behavior is
+covered separately. The baseline supports one
 model/clock hub and its bridge configuration remains Rocket specific.
 Manager gates remain harness-owned; FAME-5 and the SFC UART-bearing differential
 remain incomplete.

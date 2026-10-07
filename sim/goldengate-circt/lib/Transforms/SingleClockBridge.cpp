@@ -181,12 +181,8 @@ LogicalResult goldengate::addClockBridge(CircuitOp circuit,
   auto arg = [&](unsigned i) { return producer.getBodyBlock()->getArgument(i); };
   auto field = [&](Value v, llvm::StringRef n) { return b.create<SubfieldOp>(loc, v, n).getResult(); };
   Value one = b.create<ConstantOp>(loc, bit, APInt(1, 1));
-  b.create<StrictConnectOp>(loc, field(arg(2), "valid"), one);
-  auto edgeBits = buildRationalClockTokens(b, loc, arg(0), arg(1),
-      field(arg(2), "ready"), *schedule);
-  Value payload = field(arg(2), "bits");
-  for (auto [i, edge] : llvm::enumerate(edgeBits))
-    b.create<StrictConnectOp>(loc, b.create<SubindexOp>(loc, payload, i), edge);
+  auto edgeBits = buildRationalClockChannel(b, loc, arg(0), arg(1),
+                                           arg(2), *schedule);
   Value zero = b.create<ConstantOp>(loc, wide, APInt(64, 0));
   Value hCycle = b.create<RegResetOp>(loc, wide, arg(0), arg(1), zero, "hCycle").getResult();
   Value tCycle = b.create<RegResetOp>(loc, wide, arg(0), arg(1), zero, "tCycleFastest").getResult();

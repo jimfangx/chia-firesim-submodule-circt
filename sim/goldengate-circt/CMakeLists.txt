@@ -509,6 +509,8 @@ if(BUILD_TESTING)
     lib/Analysis/FAMEChannelClockDomains.cpp
     lib/Support/TargetUtils.cpp lib/Support/XDCEmission.cpp
     lib/Transforms/FAMEHubClockChannel.cpp lib/Transforms/FAMEHubClockControls.cpp
+    lib/Transforms/FAMEPipeChannel.cpp lib/Transforms/FAMEClockChannel.cpp
+    lib/Transforms/SingleClockBridge.cpp
     lib/Transforms/FAMEOutputChannel.cpp
     lib/Transforms/FAMEInputChannel.cpp lib/Transforms/FAMEFiredState.cpp
     lib/Transforms/FAMEFinishing.cpp lib/Transforms/FAMEInputReady.cpp

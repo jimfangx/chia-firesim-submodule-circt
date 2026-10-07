@@ -16,7 +16,8 @@ accepts rational schedules without a 1:1 lane, matching ClockBridgeModule;
 the target-side RationalClockBridge constructor's base-clock requirement is a
 separate input contract.
 
-The emitter uses `buildRationalClockTokens` for every lane. Valid remains one;
+The emitter uses `buildRationalClockChannel` for the complete Decoupled vector,
+including `buildRationalClockTokens` for every lane. Valid remains one;
 ready advances countdowns and stalls hold the complete vector. hCycle advances
 each host cycle. tCycleFastest advances only when an accepted token contains
 the selected fastest lane. Selection follows the Scala Double frequency sort,

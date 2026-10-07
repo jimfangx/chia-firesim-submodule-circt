@@ -107,3 +107,28 @@ SmallVector<Value> goldengate::buildRationalClockTokens(
   }
   return tokens;
 }
+
+SmallVector<Value> goldengate::buildRationalClockChannel(
+    OpBuilder &b, Location loc, Value clock, Value reset, Value channel,
+    const RationalClockSchedule &schedule) {
+  auto type = cast<BundleType>(channel.getType());
+  auto bit = UIntType::get(b.getContext(), 1, false);
+  auto vector = cast<FVectorType>(type.getElement("bits")->type);
+  assert(type.getElements().size() == 3 &&
+         type.getElement("ready")->type == bit &&
+         type.getElement("ready")->isFlip &&
+         type.getElement("valid")->type == bit &&
+         !type.getElement("valid")->isFlip &&
+         !type.getElement("bits")->isFlip &&
+         vector.getElementType() == bit &&
+         vector.getNumElements() == schedule.periods.size());
+  Value ready = b.create<SubfieldOp>(loc, channel, "ready");
+  Value valid = b.create<SubfieldOp>(loc, channel, "valid");
+  Value bits = b.create<SubfieldOp>(loc, channel, "bits");
+  b.create<StrictConnectOp>(loc, valid,
+      b.create<ConstantOp>(loc, bit, APInt(1, 1)));
+  auto tokens = buildRationalClockTokens(b, loc, clock, reset, ready, schedule);
+  for (auto [i, token] : llvm::enumerate(tokens))
+    b.create<StrictConnectOp>(loc, b.create<SubindexOp>(loc, bits, i), token);
+  return tokens;
+}
