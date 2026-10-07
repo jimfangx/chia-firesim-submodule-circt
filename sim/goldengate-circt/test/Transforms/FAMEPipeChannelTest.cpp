@@ -11,6 +11,8 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/Path.h"
 #include <deque>
 #include <random>
 #include <stdexcept>
@@ -189,28 +191,116 @@ void checkRejectedAnnotations(MLIRContext &context) {
   }
 }
 
+// Each endpoint still names one bits field, even when that field contains a
+// nested aggregate. These are payload types, not multi-endpoint annotations.
+OwningOpRef<ModuleOp> typedFixture(MLIRContext &context, llvm::StringRef spelling) {
+  std::string input = "module { firrtl.circuit \"FAMETop\" { "
+      "firrtl.module @FAMETop(in %hostClock: !firrtl.clock, "
+      "in %hostReset: !firrtl.uint<1>, "
+      "out %tokens: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: " +
+      spelling.str() + ">) {} }}";
+  auto root = parseSourceString<ModuleOp>(input, &context);
+  require(bool(root), "typed fixture parse failed");
+  OpBuilder b(&context);
+  circuitOf(*root)->setAttr("rawAnnotations", b.getArrayAttr({
+      pipeAnnotation(b, "typed", "sources", "tokens", 1)}));
+  return root;
+}
+
+FModuleOp queueModule(CircuitOp circuit) {
+  for (auto module : circuit.getOps<FModuleOp>())
+    if (module.getPortName(0) == "clock")
+      return module;
+  throw std::runtime_error("missing queue module");
+}
+
+void checkTypedBoundary(MLIRContext &context, llvm::StringRef spelling) {
+  auto root = typedFixture(context, spelling);
+  auto circuit = circuitOf(*root);
+  auto payload = cast<BundleType>(moduleNamed(circuit, "FAMETop").getPortType(2))
+                     .getElement("bits")->type;
+  std::string error;
+  require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
+  auto pipe = queueModule(circuit);
+  require(pipe.getPortType(4) == payload && pipe.getPortType(7) == payload,
+          "queue must preserve payload type in both directions");
+  require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+  require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+  require(succeeded(verify(*root)), "typed wrapper verification failed");
+  auto target = goldengate::resolveAnnotationTarget(circuit,
+      "~GGFAMEPipeWrapper|GGFAMEPipeWrapper>tokens.bits", error);
+  require(target && target->port == 2 &&
+          target->fieldID ==
+              cast<BundleType>(target->module.getPortType(2)).getFieldID(2),
+          "typed endpoint retarget mismatch");
+}
+
+void checkRejectedTypes(MLIRContext &context) {
+  for (llvm::StringRef spelling : {"uint", "sint", "clock", "analog<8>",
+      "bundle<x flip: uint<8>>", "bundle<x: uint<8>, y: clock>",
+      "vector<uint, 2>"}) {
+    auto root = typedFixture(context, spelling);
+    auto circuit = circuitOf(*root);
+    auto payload = cast<BundleType>(moduleNamed(circuit, "FAMETop").getPortType(2))
+                       .getElement("bits")->type;
+    std::string error;
+    require(failed(goldengate::addFAMEBoundaryPipeChannels(circuit, error)),
+            "unsupported boundary payload must fail");
+    require(failed(goldengate::addFAMEPipeChannel(circuit, payload, 1, error)),
+            "unsupported direct payload must fail");
+    require(std::distance(circuit.getOps<FModuleOp>().begin(),
+                          circuit.getOps<FModuleOp>().end()) == 1,
+            "unsupported types must fail before mutation");
+  }
+  // Equal packed widths do not imply equal payload types or field names.
+  auto root = fixture(context);
+  auto circuit = circuitOf(*root);
+  auto bit = UIntType::get(&context, 1);
+  auto uint = UIntType::get(&context, 13);
+  auto sint = SIntType::get(&context, 13);
+  auto recordA = BundleType::get(&context, {
+      {StringAttr::get(&context, "a"), false, uint}});
+  auto recordB = BundleType::get(&context, {
+      {StringAttr::get(&context, "b"), false, uint}});
+  auto vector = FVectorType::get(bit, 13);
+  std::string error;
+  for (FIRRTLBaseType type : {FIRRTLBaseType(uint), FIRRTLBaseType(sint),
+      FIRRTLBaseType(recordA), FIRRTLBaseType(recordB), FIRRTLBaseType(vector)})
+    require(succeeded(goldengate::addFAMEPipeChannel(circuit, type, 1, error)), error);
+  require(std::distance(circuit.getOps<FModuleOp>().begin(),
+                        circuit.getOps<FModuleOp>().end()) == 6,
+          "different payload types need distinct definitions");
+  require(succeeded(verify(*root)), "distinct payload definitions failed verification");
+}
+
 // Evaluate the generated FIRRTL operations, then compare each edge with a
 // token FIFO reference. This exercises the emitted queue rather than a copy
 // of its Boolean recurrence. The reference enqueues only when not full, just
 // as Scala ShiftQueue(2) does even when a simultaneous dequeue frees space.
-void checkQueueBehavior(MLIRContext &context, unsigned width, unsigned latency) {
-  auto root = fixture(context);
+void checkQueueBehavior(MLIRContext &context, llvm::StringRef spelling,
+                        unsigned latency, llvm::StringRef shape = "",
+                        llvm::StringRef outputDirectory = "") {
+  auto root = typedFixture(context, spelling);
   auto circuit = circuitOf(*root);
   std::string error;
-  require(succeeded(goldengate::addFAMEPipeChannel(circuit, width, latency, error)), error);
-  auto pipe = moduleNamed(circuit, "GGFAMEPipe" + std::to_string(width) +
-                                      (latency == 0 ? "_L0" : ""));
+  auto payload = cast<BundleType>(moduleNamed(circuit, "FAMETop").getPortType(2))
+                     .getElement("bits")->type;
+  unsigned width = *getBitWidth(payload);
+  require(succeeded(goldengate::addFAMEPipeChannel(circuit, payload, latency, error)), error);
+  auto pipe = queueModule(circuit);
   require(succeeded(verify(*root)), "queue failed MLIR verification");
   llvm::DenseMap<Value, uint64_t> state;
   std::deque<uint64_t> tokens;
   std::mt19937_64 random(0x143 + width + latency);
   uint64_t mask = width == 64 ? ~uint64_t(0) : (uint64_t(1) << width) - 1;
   bool initializing = false;
-  for (unsigned cycle = 0; cycle < 10000; ++cycle) {
+  for (unsigned cycle = 0; cycle < (shape.empty() ? 10000 : 512); ++cycle) {
     bool reset = cycle < 3 || cycle % 97 < 2;
-    bool inputValid = random() & 1;
-    bool outputReady = random() & 1;
-    uint64_t inputBits = random() & mask;
+    bool inputValid = shape.empty() ? random() & 1 : cycle % 7 != 0;
+    bool outputReady = shape.empty() ? random() & 1 : cycle % 11 >= 4;
+    uint64_t inputBits = (shape.empty()
+        ? random()
+        : (cycle * 0x143ull + 0x1234) ^ (cycle % 2 ? 0xa5a50000ull : 0)) & mask;
     llvm::DenseMap<Value, uint64_t> values, next;
     auto arg = [&](unsigned i) { return pipe.getBodyBlock()->getArgument(i); };
     values[arg(0)] = 0;
@@ -229,7 +319,9 @@ void checkQueueBehavior(MLIRContext &context, unsigned width, unsigned latency) 
           next[connect.getDest()] = values.lookup(connect.getSrc());
         else
           values[connect.getDest()] = values.lookup(connect.getSrc());
-      } else if (isa<NotPrimOp>(&op))
+      } else if (isa<BitCastOp>(&op))
+        values[op.getResult(0)] = values.lookup(op.getOperand(0));
+      else if (isa<NotPrimOp>(&op))
         values[op.getResult(0)] = !values.lookup(op.getOperand(0));
       else if (isa<AndPrimOp>(&op))
         values[op.getResult(0)] = values.lookup(op.getOperand(0)) & values.lookup(op.getOperand(1));
@@ -245,6 +337,10 @@ void checkQueueBehavior(MLIRContext &context, unsigned width, unsigned latency) 
     require(values.lookup(arg(6)) == !tokens.empty(), "output valid mismatch");
     if (!tokens.empty())
       require(values.lookup(arg(7)) == tokens.front(), "output token mismatch under stalls/reset");
+    if (!shape.empty())
+      llvm::outs() << "TRACE " << shape << " " << latency << " " << cycle << " "
+                   << values.lookup(arg(2)) << " " << values.lookup(arg(6)) << " "
+                   << (tokens.empty() ? 0 : values.lookup(arg(7))) << "\n";
     for (auto reg : pipe.getOps<RegResetOp>())
       if (values.lookup(reg.getResetSignal()))
         next[reg.getResult()] = values.lookup(reg.getResetValue());
@@ -259,22 +355,44 @@ void checkQueueBehavior(MLIRContext &context, unsigned width, unsigned latency) 
     }
     initializing = latency == 1 && reset;
   }
+  if (!outputDirectory.empty()) {
+    moduleNamed(circuit, "FAMETop").erase();
+    circuit->removeAttr("rawAnnotations");
+    circuit.setName(pipe.getName());
+    require(succeeded(verify(*root)), "exported queue verification failed");
+    llvm::SmallString<256> path(outputDirectory);
+    llvm::sys::path::append(path, shape.str() + "-" + std::to_string(latency) + ".mlir");
+    std::error_code ec;
+    llvm::raw_fd_ostream output(path, ec);
+    require(!ec, "cannot write native payload fixture");
+    root->print(output);
+  }
 }
 } // namespace
 
-int main() {
+int main(int argc, char **argv) {
   MLIRContext context;
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
     checkWrapper(context);
     checkRejectedAnnotations(context);
-    for (unsigned width : {1, 3, 32, 40, 64})
+    checkRejectedTypes(context);
+    for (unsigned width : {0, 1, 3, 32, 40, 64})
       for (unsigned latency : {0, 1})
-        checkQueueBehavior(context, width, latency);
+        checkQueueBehavior(context, "uint<" + std::to_string(width) + ">", latency);
+    for (auto [shape, spelling] : {
+        std::pair<llvm::StringRef, llvm::StringRef>{"zero", "uint<0>"},
+        {"signed", "sint<13>"}, {"vector", "vector<uint<5>, 3>"},
+        {"nested", "bundle<flag: uint<1>, inner: bundle<signed: sint<7>, unsigned: uint<9>>, lanes: vector<uint<5>, 3>>"}}) {
+      checkTypedBoundary(context, spelling);
+      for (unsigned latency : {0, 1})
+        checkQueueBehavior(context, spelling, latency, argc == 2 ? shape : "",
+                           argc == 2 ? argv[1] : "");
+    }
   } catch (const std::exception &error) {
     llvm::errs() << "FAME PipeChannel test failed: " << error.what() << '\n';
     return 1;
   }
-  llvm::outs() << "FAME PipeChannel: annotation, wiring, rejection and 100000 queue cycles passed\n";
+  llvm::outs() << "FAME PipeChannel: annotation/wiring/rejection and typed queue cycles passed\n";
   return 0;
 }

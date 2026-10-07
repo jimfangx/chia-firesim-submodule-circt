@@ -5,13 +5,30 @@
 #include <string>
 
 namespace goldengate {
-// Materialize a two-entry scalar PipeChannel. Latency one inserts a zero
+// Materialize a two-entry UInt PipeChannel. Latency one inserts a zero
 // token after reset; latency zero starts empty, as in Scala PipeChannel.
 mlir::LogicalResult addFAMEPipeChannel(circt::firrtl::CircuitOp circuit,
                                       unsigned payloadWidth, unsigned latency,
                                       std::string &error);
-// Discover scalar boundary pipes from retained channel annotations and create
-// one module definition for each (payload width, latency) pair.
+// Typed payloads may be UInt/SInt leaves, passive bundles, or vectors of those
+// types with known widths (including zero). A complete payload is one token;
+// all fields share the same queue occupancy, stall, and initialization rules.
+// Reject unsupported types before creating any module or operation.
+// Requires: a live circuit, non-const payload type, latency zero or one, and
+// no colliding module symbol. Consumes/produces no annotations. Mutates: adds
+// a FIRRTL module containing host-clocked queue state and handshake logic.
+// Requires no analyses; preserves existing module/port identities. Rebuild
+// cached instance/symbol analyses after construction. Produces a verified
+// passive payload interface with two token slots and typed zero initialization.
+mlir::LogicalResult addFAMEPipeChannel(circt::firrtl::CircuitOp circuit,
+                                      circt::firrtl::FIRRTLBaseType payloadType,
+                                      unsigned latency, std::string &error);
+// Discover single-endpoint boundary pipes from retained channel annotations
+// and create one module definition for each (payload type, latency) pair.
+// Requires: post-FAME Decoupled ports and retained PipeChannel annotations
+// naming complete bits fields with matching direction. Consumes/produces no
+// annotations. Validates every endpoint and symbol before adding definitions;
+// mutation/analysis/output contracts are otherwise the same as above.
 mlir::LogicalResult addFAMEBoundaryPipeChannels(
     circt::firrtl::CircuitOp circuit, std::string &error);
 // Connect each annotated boundary pipe in a simulator-facing wrapper, using

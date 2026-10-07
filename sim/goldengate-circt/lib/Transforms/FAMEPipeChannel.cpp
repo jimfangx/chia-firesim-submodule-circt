@@ -5,7 +5,11 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/Support/SHA256.h"
+#include "llvm/Support/raw_ostream.h"
+#include <climits>
 #include <functional>
+#include <map>
 #include <set>
 
 using namespace circt::firrtl;
@@ -14,15 +18,55 @@ using namespace mlir;
 namespace {
 constexpr llvm::StringLiteral wrapperName = "GGFAMEPipeWrapper";
 
-std::string pipeModuleName(unsigned width, unsigned latency) {
-  // Preserve the names of the previously materialized latency-one modules.
-  return "GGFAMEPipe" + std::to_string(width) + (latency == 0 ? "_L0" : "");
+// PipeChannel(gen) stores integer leaves without changing their types. In
+// particular UInt<0> still carries valid/ready tokens (present in the SFC U250
+// oracle). Clock/reset/analog leaves, flips, consts and unknown widths cannot
+// be transported by this data queue.
+bool isPayloadType(FIRRTLBaseType type) {
+  if (!type || !type.isRegisterType())
+    return false;
+  auto width = getBitWidth(type);
+  if (!width || *width > INT32_MAX)
+    return false;
+  if (auto integer = dyn_cast<IntType>(type))
+    return integer.getWidthOrSentinel() >= 0;
+  if (auto bundle = dyn_cast<BundleType>(type))
+    return llvm::all_of(bundle.getElements(), [](BundleType::BundleElement e) {
+      return isPayloadType(e.type);
+    });
+  if (auto vector = dyn_cast<FVectorType>(type))
+    return isPayloadType(vector.getElementType());
+  return false;
+}
+
+std::string pipeModuleName(FIRRTLBaseType type, unsigned latency) {
+  std::string name = "GGFAMEPipe";
+  // Preserve legacy UInt module names. Type, not packed width, identifies a
+  // definition: equal-width SInt/UInt and differently shaped aggregates must
+  // not share incompatible ports. Hash the full printed type deterministically.
+  if (auto integer = dyn_cast<UIntType>(type))
+    name += std::to_string(integer.getWidthOrSentinel());
+  else if (auto integer = dyn_cast<SIntType>(type))
+    name += "S" + std::to_string(integer.getWidthOrSentinel());
+  else {
+    std::string spelling;
+    llvm::raw_string_ostream stream(spelling);
+    stream << type;
+    llvm::SHA256 hash;
+    hash.update(spelling);
+    name += "T";
+    for (uint8_t byte : hash.final()) {
+      name += "0123456789abcdef"[byte >> 4];
+      name += "0123456789abcdef"[byte & 15];
+    }
+  }
+  return name + (latency == 0 ? "_L0" : "");
 }
 
 struct BoundaryPipe {
   std::string name;
   unsigned port;
-  unsigned width;
+  FIRRTLBaseType payload;
   unsigned latency;
 };
 
@@ -87,10 +131,9 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
     auto ready = type ? type.getElementIndex("ready") : std::nullopt;
     auto valid = type ? type.getElementIndex("valid") : std::nullopt;
     auto bits = type ? type.getElementIndex("bits") : std::nullopt;
-    auto payload = bits ? dyn_cast<UIntType>(type.getElements()[*bits].type)
-                        : UIntType();
+    auto payload = bits ? type.getElements()[*bits].type : FIRRTLBaseType();
     if (!type || type.getElements().size() != 3 || !ready || !valid ||
-        !bits || !payload || payload.getWidthOrSentinel() <= 0 ||
+        !bits || !isPayloadType(payload) || !getBitWidth(payload) ||
         !type.getElements()[*ready].isFlip ||
         type.getElements()[*valid].isFlip || type.getElements()[*bits].isFlip ||
         type.getElements()[*ready].type != bit ||
@@ -98,7 +141,7 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
         target->fieldID != type.getFieldID(*bits) ||
         top.getPortDirection(port) != (hasSource ? Direction::Out : Direction::In)) {
       error = "PipeChannel " + name.getValue().str() +
-              " requires a scalar Decoupled payload target with matching direction";
+              " requires a passive integer Decoupled payload target with matching direction";
       return failure();
     }
     if (!usedPorts.insert(port).second ||
@@ -107,8 +150,7 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
               " shares a port or name; channel fanout is not implemented";
       return failure();
     }
-    pipes.push_back({name.getValue().str(), port,
-                     static_cast<unsigned>(payload.getWidthOrSentinel()),
+    pipes.push_back({name.getValue().str(), port, payload,
                      static_cast<unsigned>(latency.getUInt())});
   }
   return success();
@@ -119,12 +161,21 @@ LogicalResult goldengate::addFAMEPipeChannel(CircuitOp circuit,
                                              unsigned payloadWidth,
                                              unsigned latency,
                                              std::string &error) {
-  if (!payloadWidth || latency > 1) {
-    error = "PipeChannel requires positive payload width and latency zero or one";
+  return addFAMEPipeChannel(circuit,
+      UIntType::get(circuit.getContext(), payloadWidth, false), latency, error);
+}
+
+LogicalResult goldengate::addFAMEPipeChannel(CircuitOp circuit,
+                                             FIRRTLBaseType data,
+                                             unsigned latency,
+                                             std::string &error) {
+  auto width = data ? getBitWidth(data) : std::nullopt;
+  if (!isPayloadType(data) || !width || latency > 1) {
+    error = "PipeChannel requires a passive integer payload with known widths and latency zero or one";
     return failure();
   }
   auto *context = circuit.getContext();
-  std::string name = pipeModuleName(payloadWidth, latency);
+  std::string name = pipeModuleName(data, latency);
   for (Operation &op : circuit.getBodyBlock()->getOperations())
     if (auto module = dyn_cast<FModuleLike>(&op);
         module && module.getModuleName() == name) {
@@ -132,7 +183,6 @@ LogicalResult goldengate::addFAMEPipeChannel(CircuitOp circuit,
       return failure();
     }
   auto bit = UIntType::get(context, 1, false);
-  auto data = UIntType::get(context, payloadWidth, false);
   auto clock = ClockType::get(context);
   SmallVector<PortInfo> ports{
       {StringAttr::get(context, "clock"), clock, Direction::In},
@@ -153,7 +203,13 @@ LogicalResult goldengate::addFAMEPipeChannel(CircuitOp circuit,
   Value zero = builder.create<ConstantOp>(loc, bit, APInt(1, 0));
   Value initializing, zeroData;
   if (latency == 1) {
-    zeroData = builder.create<ConstantOp>(loc, data, APInt(payloadWidth, 0));
+    // Match 0.U.asTypeOf(gen), including signed and aggregate payloads.
+    auto zeroType = UIntType::get(context, *width, false);
+    Value packedZero = builder.create<ConstantOp>(
+        loc, zeroType, APInt(*width, 0));
+    zeroData = data == zeroType
+                   ? packedZero
+                   : builder.create<BitCastOp>(loc, data, packedZero).getResult();
     initializing = builder.create<RegOp>(loc, bit, arg(0), "initializing").getResult();
   }
   Value valid0 = builder.create<RegResetOp>(loc, bit, arg(0), arg(1), zero,
@@ -215,20 +271,22 @@ LogicalResult goldengate::addFAMEBoundaryPipeChannels(CircuitOp circuit,
   SmallVector<BoundaryPipe> channels;
   if (failed(findBoundaryPipes(circuit, target, channels, error)))
     return failure();
-  std::set<std::pair<unsigned, unsigned>> definitions;
+  std::map<std::string, std::pair<FIRRTLBaseType, unsigned>> definitions;
   for (const auto &channel : channels)
-    definitions.emplace(channel.width, channel.latency);
+    definitions.emplace(pipeModuleName(channel.payload, channel.latency),
+                        std::make_pair(channel.payload, channel.latency));
   // Check all symbol collisions before changing the circuit.
   for (Operation &op : circuit.getBodyBlock()->getOperations())
     if (auto module = dyn_cast<FModuleLike>(&op))
-      for (auto [width, latency] : definitions)
-        if (module.getModuleName() == pipeModuleName(width, latency)) {
+      for (const auto &[name, definition] : definitions)
+        if (module.getModuleName() == name) {
           error = "PipeChannel module already exists: " +
                   module.getModuleName().str();
           return failure();
         }
-  for (auto [width, latency] : definitions)
-    if (failed(addFAMEPipeChannel(circuit, width, latency, error)))
+  for (const auto &[name, definition] : definitions)
+    if (failed(addFAMEPipeChannel(circuit, definition.first, definition.second,
+                                  error)))
       return failure();
   return success();
 }
@@ -245,7 +303,7 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
     for (Operation &op : circuit.getBodyBlock()->getOperations())
       if (auto module = dyn_cast<FModuleOp>(&op);
           module && module.getName() ==
-                        pipeModuleName(channel.width, channel.latency))
+                        pipeModuleName(channel.payload, channel.latency))
         pipe = module;
     if (!pipe) {
       error = "wrapper is missing a PipeChannel module for " + channel.name;
