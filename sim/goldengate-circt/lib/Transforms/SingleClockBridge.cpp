@@ -15,6 +15,7 @@
 // Scope: ClockBridge.scala and Widget.genWideRORegInit for one 1:1 clock with
 // 32-bit MCR words. Nasti transport, driver header and multiclock remain pending.
 #include "goldengate/SingleClockBridge.h"
+#include "goldengate/RationalClockTokenGenerator.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
@@ -76,6 +77,9 @@ LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
   auto div = clock ? clock.getAs<IntegerAttr>("divisor") : IntegerAttr();
   if (!mult || !div || mult.getInt() <= 0 || mult.getInt() != div.getInt())
     return reject("single clock bridge supports only a positive 1:1 rational clock");
+  auto schedule = analyzeRationalClockSchedule(
+      {RationalClockInfo{"", uint64_t(mult.getInt()), uint64_t(div.getInt()), 1}}, error);
+  if (!schedule) return failure();
   auto sinks = channel.getAs<ArrayAttr>("sinks");
   auto sources = channel.getAs<ArrayAttr>("sources");
   if (!sinks || sinks.size() != 1 || (sources && !sources.empty()) || channel.get("clock"))
@@ -153,7 +157,9 @@ LogicalResult goldengate::addSingleClockBridge(CircuitOp circuit,
   Value one = b.create<ConstantOp>(loc, bit, APInt(1, 1));
   b.create<StrictConnectOp>(loc, field(arg(2), "valid"), one);
   Value lane = b.create<SubindexOp>(loc, field(arg(2), "bits"), 0);
-  b.create<StrictConnectOp>(loc, lane, one);
+  auto edgeBits = buildRationalClockTokens(b, loc, arg(0), arg(1),
+      field(arg(2), "ready"), *schedule);
+  b.create<StrictConnectOp>(loc, lane, edgeBits.front());
   Value zero = b.create<ConstantOp>(loc, wide, APInt(64, 0));
   Value hCycle = b.create<RegResetOp>(loc, wide, arg(0), arg(1), zero, "hCycle").getResult();
   Value tCycle = b.create<RegResetOp>(loc, wide, arg(0), arg(1), zero, "tCycleFastest").getResult();

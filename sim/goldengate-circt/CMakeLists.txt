@@ -70,6 +70,7 @@ add_executable(goldengate-circt
   lib/Transforms/FAMEReadyValidChannel.cpp
   lib/Transforms/FAMEClockChannel.cpp
   lib/Transforms/SingleClockBridge.cpp
+  lib/Transforms/RationalClockTokenGenerator.cpp
   lib/Transforms/ClockBridgeControl.cpp
   lib/Transforms/ControlErrorSlave.cpp
   lib/Transforms/ControlAddressDecode.cpp
@@ -744,6 +745,7 @@ if(BUILD_TESTING)
     test/Support/ClockBridgeHeaderTest.cpp
     lib/Support/ClockBridgeHeader.cpp lib/Support/SimulationMasterHeader.cpp
     lib/Support/MetasimInterfaceHeader.cpp lib/Transforms/SingleClockBridge.cpp
+    lib/Transforms/RationalClockTokenGenerator.cpp
     lib/Support/TargetUtils.cpp lib/Support/AnnotationEmission.cpp)
   target_compile_features(goldengate-clock-bridge-header-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-clock-bridge-header-test PRIVATE -fno-rtti)
@@ -1427,16 +1429,27 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-clock-channel-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-clock-channel COMMAND goldengate-clock-channel-test)
+  add_executable(goldengate-rational-clock-token-test
+    test/Transforms/RationalClockTokenGeneratorTest.cpp
+    lib/Transforms/RationalClockTokenGenerator.cpp)
+  target_compile_features(goldengate-rational-clock-token-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-rational-clock-token-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-rational-clock-token-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-rational-clock-token-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-rational-clock-token COMMAND goldengate-rational-clock-token-test)
   add_executable(goldengate-single-clock-bridge-test
     test/Transforms/SingleClockBridgeTest.cpp
     lib/Transforms/SingleClockBridge.cpp
+    lib/Transforms/RationalClockTokenGenerator.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-single-clock-bridge-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-single-clock-bridge-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-single-clock-bridge-test PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
   target_link_libraries(goldengate-single-clock-bridge-test PRIVATE
-    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-single-clock-bridge COMMAND goldengate-single-clock-bridge-test)
   add_executable(goldengate-clock-bridge-control-test
     test/Transforms/ClockBridgeControlTest.cpp
