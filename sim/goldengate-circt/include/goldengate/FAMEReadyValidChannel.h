@@ -9,7 +9,7 @@ namespace goldengate {
 mlir::LogicalResult addFAMEReadyValidChannel(circt::firrtl::CircuitOp circuit,
                                             unsigned payloadWidth,
                                             std::string &error);
-// Resolve boundary pairs from annotations, pack their passive UInt fields,
+// Resolve boundary pairs from annotations, pack their passive integer fields,
 // and replace their passthrough connections in the existing pipe wrapper.
 mlir::LogicalResult addFAMEBoundaryReadyValidChannels(
     circt::firrtl::CircuitOp circuit, std::string &error);

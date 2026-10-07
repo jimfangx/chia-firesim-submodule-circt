@@ -11,6 +11,7 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/FileSystem.h"
 #include <deque>
 #include <functional>
 #include <map>
@@ -57,7 +58,8 @@ struct Interpreter {
     else if (auto bits = dyn_cast_or_null<BitsPrimOp>(op)) {
       unsigned width = bits.getHi() - bits.getLo() + 1;
       result = (eval(op->getOperand(0)) >> bits.getLo()) & ((uint64_t(1) << width) - 1);
-    } else throw std::runtime_error("unsupported operation or missing driver");
+    } else if (op && isa<AsUIntPrimOp, AsSIntPrimOp>(op)) result = eval(op->getOperand(0));
+    else throw std::runtime_error("unsupported operation or missing driver");
     active.erase(v); memo[v] = result; return result;
   }
   Value arg(unsigned index) { return module.getBodyBlock()->getArgument(index); }
@@ -136,7 +138,7 @@ void behavior(MLIRContext &context, unsigned width) {
 }
 
 OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned bad) {
-  auto root = parseSourceString<ModuleOp>(R"mlir(
+  std::string text = R"mlir(
 module { firrtl.circuit "Top" {
  firrtl.module @Top(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
  out %a: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<x: uint<3>, pad: uint<0>, y: uint<5>, valid: uint<1>>>,
@@ -144,7 +146,19 @@ module { firrtl.circuit "Top" {
  in %b: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<x: uint<3>, pad: uint<0>, y: uint<5>, valid: uint<1>>>,
  out %br: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<1>>) {}
 } }
-)mlir", &context);
+)mlir";
+  auto replace = [&](const std::string &from, const std::string &to) {
+    for (size_t pos = 0; (pos = text.find(from, pos)) != std::string::npos; pos += to.size())
+      text.replace(pos, from.size(), to);
+  };
+  if (bad == 5 || bad == 7 || bad == 11) replace("x: uint<3>", "x: sint<3>");
+  if (bad == 6 || bad == 7) replace("y: uint<5>", "y: sint<5>");
+  if (bad >= 5 && bad <= 7) replace("pad: uint<0>", "pad: sint<0>");
+  if (bad == 8) replace("x: uint<3>", "x: clock");
+  if (bad == 9) replace("x: uint<3>", "x flip: uint<3>");
+  if (bad == 10) replace("y: uint<5>", "y: bundle<nested: uint<5>>");
+  if (bad == 11) replace("y: uint<5>", "y: uint<0>");
+  auto root = parseSourceString<ModuleOp>(text, &context);
   OpBuilder b(&context);
   SmallVector<Attribute> annotations;
   for (unsigned i = 0; i < 2; ++i) {
@@ -174,13 +188,42 @@ module { firrtl.circuit "Top" {
   auto c = *root->getOps<CircuitOp>().begin(); c->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   return root;
 }
-void wrapper(MLIRContext &context) {
-  for (unsigned bad = 0; bad < 5; ++bad) {
+// A single nonempty signed leaf must enter the UInt queue through a cast even
+// when there is no CatPrimOp to coerce its type implicitly.
+void signedScalar(MLIRContext &context) {
+  auto root = fixture(context, 11);
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  std::string error;
+  require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+  require(succeeded(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), error);
+  require(succeeded(verify(*root)), "single signed payload failed verification");
+  auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+  unsigned checked = 0;
+  for (auto instance : wrapper.getOps<InstanceOp>()) {
+    if (!instance.getName().starts_with("ReadyValidChannel_")) continue;
+    require(instance.getModuleName() == "GGFAMEReadyValid3", "single signed leaf width");
+    for (auto connect : wrapper.getOps<ConnectOp>()) {
+      if (connect.getDest() != instance.getResult(4)) continue;
+      auto cast = connect.getSrc().getDefiningOp<AsUIntPrimOp>();
+      require(bool(cast) && cast.getInput().getType() == SIntType::get(&context, 3),
+              "single signed leaf lacks unsigned queue input");
+      Interpreter evaluation(wrapper);
+      for (uint64_t bits = 0; bits < 8; ++bits) {
+        evaluation.memo.clear(); evaluation.memo[cast.getInput()] = bits;
+        require(evaluation.eval(cast.getResult()) == bits, "single signed leaf changed bits");
+      }
+      ++checked;
+    }
+  }
+  require(checked == 2, "single signed leaf must cover both bridge orientations");
+}
+void wrapper(MLIRContext &context, const char *output) {
+  for (unsigned bad = 0; bad < 11; ++bad) {
     auto root = fixture(context, bad); auto c = *root->getOps<CircuitOp>().begin();
     std::string error;
     require(succeeded(goldengate::addFAMEPipeWrapper(c, error)), error);
     auto result = goldengate::addFAMEBoundaryReadyValidChannels(c, error);
-    if (bad) {
+    if (bad && !(bad >= 5 && bad <= 7)) {
       require(failed(result), "invalid pair accepted");
       require(!llvm::any_of(c.getOps<FModuleOp>(), [](FModuleOp m) { return m.getName().starts_with("GGFAMEReadyValid"); }), "mutated rejected circuit");
       continue;
@@ -226,17 +269,48 @@ void wrapper(MLIRContext &context) {
           require(constant && constant.getValue().getZExtValue() == (port == 17), "wrapper reset token mismatch");
         }
         auto pack = drivers.at(io(4)).getDefiningOp<CatPrimOp>();
-        require(pack && endpoint(pack.getOperand(0)) == enq + ".bits.x" &&
-                        endpoint(pack.getOperand(1)) == enq + ".bits.y", "payload packing lost field identity");
+        auto uncast = [&](Value v, bool isSigned, bool packing) {
+          if (isSigned) {
+            auto *op = v.getDefiningOp();
+            require(op && (packing ? isa<AsUIntPrimOp>(op) : isa<AsSIntPrimOp>(op)),
+                    "signed payload lost its type conversion");
+            return op->getOperand(0);
+          }
+          return v;
+        };
+        bool signedX = bad == 5 || bad == 7, signedY = bad == 6 || bad == 7;
+        require(pack && endpoint(uncast(pack.getOperand(0), signedX, true)) == enq + ".bits.x" &&
+                        endpoint(uncast(pack.getOperand(1), signedY, true)) == enq + ".bits.y", "payload packing lost field identity");
         for (auto [field, high, low] : std::initializer_list<std::tuple<const char *, unsigned, unsigned>>{
             {"x", 7, 5}, {"y", 4, 0}}) {
-          auto slice = drivers.at(deq + ".bits." + field).getDefiningOp<BitsPrimOp>();
+          auto value = drivers.at(deq + ".bits." + field);
+          auto slice = uncast(value, std::string(field) == "x" ? signedX : signedY, false).getDefiningOp<BitsPrimOp>();
           require(slice && slice.getOperand() == i.getResult(11) && slice.getHi() == high && slice.getLo() == low,
                   "payload unpacking lost field identity");
+        }
+        require(endpoint(drivers.at(deq + ".bits.pad")) == enq + ".bits.pad",
+                "zero-width payload identity changed");
+        // Exhaust every 3/5-bit pattern, including signed minima and -1.
+        // The queue transports bits; sign interpretation belongs to the leaves.
+        Interpreter evaluation(w);
+        for (uint64_t value = 0; value < 256; ++value) {
+          evaluation.memo.clear();
+          evaluation.memo[uncast(pack.getOperand(0), signedX, true)] = value >> 5;
+          evaluation.memo[uncast(pack.getOperand(1), signedY, true)] = value & 31;
+          evaluation.memo[i.getResult(11)] = value;
+          require(evaluation.eval(pack.getResult()) == value, "payload pack sign-extended or reordered bits");
+          require(evaluation.eval(drivers.at(deq + ".bits.x")) == value >> 5 &&
+                  evaluation.eval(drivers.at(deq + ".bits.y")) == (value & 31),
+                  "payload unpack changed signed bit pattern");
         }
         ++instances;
       }
     require(instances == 2, "both pair orientations must materialize");
+    if (output && bad == 5) {
+      std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+      require(!ec, "cannot write signed wrapper evidence");
+      root->print(out);
+    }
     require(succeeded(goldengate::activateFAMEPipeWrapper(c, error)), error);
     require(succeeded(verify(*root)), "active wrapper failed verification");
   }
@@ -280,9 +354,27 @@ void fanoutWrapper(MLIRContext &context) {
 }
 
 } // namespace
-int main() {
+int main(int argc, char **argv) {
   MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { wrapper(context); fanoutWrapper(context); for (unsigned width : {1, 8, 32}) behavior(context, width); }
+  try {
+    wrapper(context, argc > 1 ? argv[1] : nullptr);
+    signedScalar(context);
+    fanoutWrapper(context);
+    for (unsigned width : {1, 8, 32}) behavior(context, width);
+    if (argc > 3) {
+      // Exercise an ingested production-Scala boundary, not a rebuilt fixture.
+      auto root = parseSourceFile<ModuleOp>(argv[2], &context);
+      require(bool(root), "cannot parse ingested boundary");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      std::string error;
+      require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+      require(succeeded(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), error);
+      require(succeeded(verify(*root)), "ingested ReadyValid wrapper failed verification");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[3], ec);
+      require(!ec, "cannot write ingested wrapper evidence");
+      root->print(out);
+    }
+  }
   catch (const std::exception &e) { llvm::errs() << "ReadyValidChannel: " << e.what() << '\n'; return 1; }
-  llvm::outs() << "ReadyValidChannel: both orientations, malformed pairs and 60000 randomized cycles passed\n";
+  llvm::outs() << "ReadyValidChannel: both orientations, signed/unsigned exhaustive payloads, malformed pairs and 60000 randomized cycles passed\n";
 }

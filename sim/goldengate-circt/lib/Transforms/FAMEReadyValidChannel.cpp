@@ -132,17 +132,18 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
       error = "ReadyValidChannel " + base + " has incompatible Decoupled ports";
       return failure();
     }
-    // The SFC handoff is lowered to a flat bundle of passive UInt fields.
+    // SimUtils.buildChannelType preserves signed leaves. Pack their bit
+    // patterns without sign extension; reconstruct the original type on dequeue.
     // Reject unhandled aggregates instead of silently losing payload bits.
     unsigned width = 0;
     std::set<unsigned> fields;
     for (auto [i, field] : llvm::enumerate(payload.getElements())) {
-      auto uint = dyn_cast<UIntType>(field.type);
-      if (!uint || uint.getWidthOrSentinel() < 0 || field.isFlip) {
-        error = "ReadyValidChannel " + base + " needs known-width passive UInt fields";
+      auto integer = dyn_cast<IntType>(field.type);
+      if (!integer || integer.getWidthOrSentinel() < 0 || field.isFlip) {
+        error = "ReadyValidChannel " + base + " needs known-width passive integer fields";
         return failure();
       }
-      if (field.name.getValue() != "valid") width += uint.getWidthOrSentinel();
+      if (field.name.getValue() != "valid") width += integer.getWidthOrSentinel();
       fields.insert(ft.getFieldID(*ft.getElementIndex("bits")) + payload.getFieldID(i));
     }
     auto endpoints = a.getMember<ArrayAttr>(source ? "sources" : "sinks");
@@ -356,7 +357,7 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     unsigned offset = p.width;
     for (auto f : p.payload.getElements()) {
       if (f.name.getValue() == "valid") continue;
-      unsigned width = cast<UIntType>(f.type).getWidthOrSentinel();
+      unsigned width = cast<IntType>(f.type).getWidthOrSentinel();
       Value input = field(field(enqF, "bits"), f.name.getValue());
       Value output = field(field(deqF, "bits"), f.name.getValue());
       if (!width) {
@@ -364,8 +365,11 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
         // target identity until normal type lowering removes them.
         connect(output, input); continue;
       }
+      if (isa<SIntType>(f.type)) input = b.create<AsUIntPrimOp>(loc, input);
       packed = packed ? b.create<CatPrimOp>(loc, packed, input).getResult() : input;
-      connect(output, b.create<BitsPrimOp>(loc, arg(11), offset - 1, offset - width));
+      Value slice = b.create<BitsPrimOp>(loc, arg(11), offset - 1, offset - width);
+      if (isa<SIntType>(f.type)) slice = b.create<AsSIntPrimOp>(loc, slice);
+      connect(output, slice);
       offset -= width;
     }
     connect(arg(4), packed);
