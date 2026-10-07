@@ -1,4 +1,4 @@
-# Bridge-sourced PipeChannel fanout
+# PipeChannel fanout and model loopbacks
 
 `addFAMEPipeWrapper` consumes `FAMEChannelFanoutAnnotation.channelNames` in
 annotation order. The first name selects the shared bridge input. Each member
@@ -18,10 +18,20 @@ ports also requires clock and ReadyValid wrapper connections to resolve ports
 by name, type, and direction rather than their old target indices. Annotation
 activation retains secondary sink references on the inner target.
 
-Supported groups have bridge-sourced, single-endpoint channels and identical
-payload types. Validation precedes mutation and rejects empty groups, unknown
-names, duplicate or overlapping membership, mismatched types, and target-sourced
-groups. Target-sourced fanout and loopback channels remain future work.
+Supported groups have identical complete payload types. Bridge-sourced groups
+retain distinct model sinks. Target-sourced groups share exactly one producer
+port and have model loopback sinks plus at most one bridge sink. Each loopback
+has one source and one sink. Wrapper IO omits internal sinks and, for internal-only
+groups, the producer. The shared source annotations retain the inner target
+identity even when one branch exposes a wrapper output: that output is downstream
+of its queue. A standalone model loopback uses the same queue construction.
+
+Validation precedes mutation and rejects empty groups, unknown names, duplicate
+or overlapping membership, mismatched endpoint types, repeated sinks, different
+target producer ports, split or absent fanout groups for shared producers, and
+multiple bridge outputs sharing one source. Scala `ChannelizedWrapperIO`
+deduplicates identical source targets on wrapper IO; exposing multiple independent
+bridge outputs there would diverge from the oracle.
 
 ## Differential fixture
 
@@ -75,4 +85,47 @@ paths and compared bindings are recorded in `golden-interface-comparison.json`.
 Recorded zero-width payloads and current Rocket UInt3/UInt64 payloads remain a
 preexisting fixture difference. Neither this comparison nor the synthetic
 fixture establishes whole-design RTL equivalence or completion of the port.
-The next small step is target-sourced fanout with independent external sinks.
+
+## Target-sourced differential extension (iteration 28)
+
+`FAMEPipeFanoutTest` now also executes a three-branch target source: fork0 drives
+one external bridge output, while fork1/fork2 drive retained model sinks. Latencies
+are again 0, 1, 0. Tests inspect actual target-source readiness and actual bridge
+and model output ports. The existing bridge trace, new target trace, and executed
+Scala queue trace match all eight fields on all 4,096 cycles with the SHA256 above.
+Each executes 2,335 transfers, 1,379 source stalls, and two latency-one reset seeds.
+
+`FAMEPipeFanoutBoundaryOracle.scala` elaborates production `midas.core.SimWrapper`
+for mixed fanout, internal-only fanout, and a single model loopback. It reverses
+fanout name order to exercise primary-name independence for target sources. The
+mixed native wrapper matches 16 normalized production Scala branch/source
+connections: upstream bits/valid/ready, every queue enqueue, each sink's dequeue
+ready, and the bridge/model valid/payload outputs. Native tests also verify hidden
+internal ports, shifted clock ports, preserved source/sink annotation targets,
+and atomic rejection of six malformed target fanouts (in addition to six malformed
+bridge groups). Eleven focused CTests pass; after adding the last rejection cases,
+both fanout CTests pass again. Native mixed fanout lowers through firtool to RTL.
+
+Artifacts are in the generated Rocket directory's `iteration28-target-pipe-fanout`:
+`target-fanout.mlir`, `target-fanout.sv`, the three traces, `scala-boundary/*.sfc.fir`,
+`boundary-comparison.json`, `trace-comparison.json`, and the fresh compiler output.
+The compiler emits Rocket simulator RTL and collateral with empty stderr. The
+same immutable U250 `design/FireSim-generated.sv` comparison matches all four
+queue ABIs and 22 singleton enqueue-valid/source-ready bindings, recorded in
+`golden-interface-comparison.json`. The immutable recorded fixtures still contain
+no fanout annotation, so this does not establish recorded mixed-fanout parity.
+
+The full compiler does not yet synthesize Scala's `AddRemainingFanoutAnnotations`
+for deduplicated model sources. Bridge token engines also currently require
+boundary annotation endpoints to resolve to the active wrapper, so binding a
+mixed group to a native UART/TSI/Print bridge needs explicit external endpoint
+resolution that preserves the common upstream source identity. The tested change
+implements the annotated post-FAME queue/wrapper boundary; it does not establish
+end-to-end mixed-fanout integration. The next smallest step is generating and
+validating target-source fanout annotations after native FAME source deduplication,
+then teaching bridge bindings to resolve the queue output separately.
+
+The harness-owned iteration 27 gates passed (portable suite 90,141 checks,
+`0x78194504c338c229`; Rocket suite 90,805 checks, `0x5f3744639d41ea35`). Current
+changes await the next manager verification. UART-bearing SFC differential
+baseline remains pending; neither these tests nor those gates complete the port.

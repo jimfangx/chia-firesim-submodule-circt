@@ -102,6 +102,119 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
   return root;
 }
+// One bridge output and two retained model sinks share one target producer.
+OwningOpRef<ModuleOp> targetFixture(MLIRContext &ctx, unsigned bad = 0) {
+  OpBuilder b(&ctx); auto loc = b.getUnknownLoc();
+  auto root = ModuleOp::create(loc); b.setInsertionPointToStart(root.getBody());
+  auto circuit = b.create<CircuitOp>(loc, b.getStringAttr("Top"));
+  b.setInsertionPointToStart(circuit.getBodyBlock());
+  auto bit = UIntType::get(&ctx, 1), data = UIntType::get(&ctx, 16);
+  auto decoupled = [&](FIRRTLBaseType payload) {
+    return BundleType::get(&ctx, {{b.getStringAttr("ready"), true, bit},
+        {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
+  };
+  SmallVector<PortInfo> ports{{b.getStringAttr("hostClock"), ClockType::get(&ctx), Direction::In},
+      {b.getStringAttr("hostReset"), bit, Direction::In},
+      {b.getStringAttr("producer_source"), decoupled(data), Direction::Out},
+      {b.getStringAttr("model1_sink"), decoupled(bad == 4 ? FIRRTLBaseType(SIntType::get(&ctx,16)) : data), Direction::In},
+      {b.getStringAttr("model2_sink"), decoupled(data), Direction::In},
+      {b.getStringAttr("ticks"), decoupled(ClockType::get(&ctx)), Direction::In},
+      {b.getStringAttr("sourceValid"), bit, Direction::In},
+      {b.getStringAttr("sourceBits"), data, Direction::In},
+      {b.getStringAttr("sourceReady"), bit, Direction::Out}};
+  for (unsigned i = 1; i < 3; ++i) {
+    ports.push_back({b.getStringAttr("ready" + std::to_string(i)), bit, Direction::In});
+    ports.push_back({b.getStringAttr("valid" + std::to_string(i)), bit, Direction::Out});
+    ports.push_back({b.getStringAttr("bits" + std::to_string(i)), ports[2+i].type.cast<BundleType>().getElement("bits")->type, Direction::Out});
+  }
+  if (bad == 6) ports.push_back({b.getStringAttr("other_source"), decoupled(data), Direction::Out});
+  auto target = b.create<FModuleOp>(loc, b.getStringAttr("Top"),
+      ConventionAttr::get(&ctx, Convention::Internal), ports);
+  b.setInsertionPointToStart(target.getBodyBlock());
+  Value producer = target.getArgument(2);
+  b.create<ConnectOp>(loc, field(b, loc, producer, "valid"), target.getArgument(6));
+  b.create<ConnectOp>(loc, field(b, loc, producer, "bits"), target.getArgument(7));
+  b.create<ConnectOp>(loc, target.getArgument(8), field(b, loc, producer, "ready"));
+  Value one = b.create<ConstantOp>(loc, bit, APInt(1, 1));
+  b.create<ConnectOp>(loc, field(b, loc, target.getArgument(5), "ready"), one);
+  for (unsigned i = 1; i < 3; ++i) {
+    Value channel = target.getArgument(2+i);
+    b.create<ConnectOp>(loc, field(b, loc, channel, "ready"), target.getArgument(6+3*i));
+    b.create<ConnectOp>(loc, target.getArgument(7+3*i), field(b, loc, channel, "valid"));
+    b.create<ConnectOp>(loc, target.getArgument(8+3*i), field(b, loc, channel, "bits"));
+  }
+  SmallVector<Attribute> annotations;
+  for (unsigned i = 0; i < 3; ++i) {
+    SmallVector<NamedAttribute> fields{
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+      b.getNamedAttr("globalName", b.getStringAttr("fork" + std::to_string(i))),
+      b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+        b.getNamedAttr("latency", b.getI64IntegerAttr(i == 1 ? 1 : 0))})),
+      b.getNamedAttr("sources", b.getArrayAttr({b.getStringAttr(bad == 6 && i == 2 ? "~Top|Top>other_source.bits" : "~Top|Top>producer_source.bits")}))};
+    if (i && !(bad == 2 && i == 2)) fields.push_back(b.getNamedAttr("sinks", b.getArrayAttr({
+      b.getStringAttr("~Top|Top>model" + std::to_string(bad == 3 ? 1 : i) + "_sink.bits")})));
+    annotations.push_back(b.getDictionaryAttr(fields));
+  }
+  if (bad != 1) annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelFanout)),
+    b.getNamedAttr("channelNames", b.getArrayAttr(bad == 5 ?
+        SmallVector<Attribute>{b.getStringAttr("fork0"), b.getStringAttr("fork1")} :
+        SmallVector<Attribute>{b.getStringAttr("fork0"), b.getStringAttr("fork1"), b.getStringAttr("fork2")}))}));
+  if (bad == 5) annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelFanout)),
+    b.getNamedAttr("channelNames", b.getArrayAttr({b.getStringAttr("fork2")}))}));
+  // Reuse the production clock annotation from the bridge fixture.
+  auto clockRoot = fixture(ctx);
+  auto clockCircuit = *clockRoot->getOps<CircuitOp>().begin();
+  auto clockAnnotations = clockCircuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  annotations.push_back(clockAnnotations[clockAnnotations.size()-1]);
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  return root;
+}
+void targetRejected(MLIRContext &ctx) {
+  for (unsigned bad = 1; bad <= 6; ++bad) {
+    auto root = targetFixture(ctx, bad); auto circuit = *root->getOps<CircuitOp>().begin();
+    auto before = dump(root->getOperation()); std::string error;
+    require(failed(goldengate::addFAMEBoundaryPipeChannels(circuit, error)) && !error.empty(),
+            "malformed target fanout accepted");
+    require(before == dump(root->getOperation()), "target fanout rejection mutated input");
+    require(failed(goldengate::addFAMEPipeWrapper(circuit, error)) &&
+            before == dump(root->getOperation()), "target wrapper rejection was not atomic");
+  }
+}
+void internalChannels(MLIRContext &ctx) {
+  for (unsigned count : {1u, 2u}) {
+    auto root = targetFixture(ctx); auto circuit = *root->getOps<CircuitOp>().begin();
+    auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> annotations;
+    for (unsigned i = 1; i <= count; ++i) annotations.push_back(raw[i]);
+    OpBuilder b(&ctx);
+    if (count == 2) annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelFanout)),
+      b.getNamedAttr("channelNames", b.getArrayAttr({b.getStringAttr("fork2"), b.getStringAttr("fork1")}))}));
+    annotations.push_back(raw[raw.size()-1]);
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+    std::string error;
+    require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+    for (auto port : wrapper.getPorts())
+      require(port.name != "producer_source" && port.name != "model1_sink" &&
+              (count != 2 || port.name != "model2_sink"), "internal channel exposed a wrapper endpoint");
+    require(succeeded(goldengate::addFAMEClockChannel(circuit, error)), error);
+    require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(verify(*root)), "internal channel circuit verification");
+    for (unsigned i = 0; i < count; ++i) {
+      auto channel = cast<DictionaryAttr>(circuit->getAttrOfType<ArrayAttr>("rawAnnotations")[i]);
+      for (StringRef side : {StringRef("sources"), StringRef("sinks")}) {
+        auto path = cast<StringAttr>(channel.getAs<ArrayAttr>(side)[0]);
+        auto endpoint = goldengate::resolveAnnotationTarget(circuit, path.getValue(), error);
+        require(endpoint && endpoint->module.getModuleName() == "Top", "internal endpoint identity changed");
+      }
+    }
+  }
+}
 void rejected(MLIRContext &ctx) {
   for (unsigned bad = 1; bad <= 6; ++bad) {
     auto root = fixture(ctx, bad); auto circuit = *root->getOps<CircuitOp>().begin();
@@ -113,8 +226,8 @@ void rejected(MLIRContext &ctx) {
             before == dump(root->getOperation()), "wrapper rejection was not atomic");
   }
 }
-void run(MLIRContext &ctx, const char *output) {
-  auto root = fixture(ctx); auto circuit = *root->getOps<CircuitOp>().begin();
+void run(MLIRContext &ctx, const char *output, bool targetSource) {
+  auto root = targetSource ? targetFixture(ctx) : fixture(ctx); auto circuit = *root->getOps<CircuitOp>().begin();
   std::string error;
   require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
   require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
@@ -126,10 +239,15 @@ void run(MLIRContext &ctx, const char *output) {
   require(succeeded(verify(*root)), "fanout circuit verification");
   for (unsigned i = 0; i < 3; ++i) {
     auto attr = cast<DictionaryAttr>(circuit->getAttrOfType<ArrayAttr>("rawAnnotations")[i]);
-    auto path = cast<StringAttr>(attr.getAs<ArrayAttr>("sinks")[0]).getValue();
-    auto target = goldengate::resolveAnnotationTarget(circuit, path, error);
-    require(target && target->module.getModuleName() == (i ? "Top" : "GGFAMEPipeWrapper"),
-            "fanout endpoint lost wrapper/inner target identity");
+    for (StringRef side : {StringRef("sources"), StringRef("sinks")}) {
+      auto endpoints = attr.getAs<ArrayAttr>(side);
+      if (!endpoints) continue;
+      auto path = cast<StringAttr>(endpoints[0]).getValue();
+      auto target = goldengate::resolveAnnotationTarget(circuit, path, error);
+      require(target && target->module.getModuleName() ==
+              (targetSource || i ? "Top" : "GGFAMEPipeWrapper"),
+              "fanout endpoint lost wrapper/inner target identity");
+    }
   }
   if (output) {
     std::error_code ec; llvm::raw_fd_ostream out(output, ec); require(!ec, "export fanout fixture");
@@ -139,9 +257,15 @@ void run(MLIRContext &ctx, const char *output) {
   }
   OpBuilder b(&ctx); b.setInsertionPointToEnd(wrapper.getBodyBlock());
   Value source = wrapper.getArgument(2);
-  Value inReady = field(b, wrapper.getLoc(), source, "ready");
-  Value inValid = field(b, wrapper.getLoc(), source, "valid");
-  Value inBits = field(b, wrapper.getLoc(), source, "bits");
+  Value inReady = targetSource ? wrapper.getArgument(6) : field(b, wrapper.getLoc(), source, "ready");
+  Value inValid = targetSource ? wrapper.getArgument(4) : field(b, wrapper.getLoc(), source, "valid");
+  Value inBits = targetSource ? wrapper.getArgument(5) : field(b, wrapper.getLoc(), source, "bits");
+  Value bridgeReady, bridgeValid, bridgeBits;
+  if (targetSource) {
+    bridgeReady = field(b, wrapper.getLoc(), source, "ready");
+    bridgeValid = field(b, wrapper.getLoc(), source, "valid");
+    bridgeBits = field(b, wrapper.getLoc(), source, "bits");
+  }
   SmallVector<InstanceOp> queues(3);
   for (auto instance : wrapper.getOps<InstanceOp>())
     for (unsigned i = 0; i < 3; ++i)
@@ -160,7 +284,10 @@ void run(MLIRContext &ctx, const char *output) {
     sim.memo[sim.key(wrapper.getArgument(0))] = 0;
     sim.memo[sim.key(wrapper.getArgument(1))] = reset;
     sim.memo[sim.key(inValid)] = pending; sim.memo[sim.key(inBits)] = bits;
-    for (unsigned i = 0; i < 3; ++i) sim.memo[sim.key(wrapper.getArgument(4+3*i))] = ready[i];
+    for (unsigned i = 0; i < 3; ++i) {
+      Value sinkReady = targetSource && i == 0 ? bridgeReady : wrapper.getArgument(4+3*i);
+      sim.memo[sim.key(sinkReady)] = ready[i];
+    }
     unsigned sourceReady = sim.eval(inReady), outMask = 0, validMask = 0, readyMask = 0;
     uint64_t outBits[3];
     for (unsigned i = 0; i < 3; ++i) {
@@ -173,8 +300,10 @@ void run(MLIRContext &ctx, const char *output) {
       require(valid == !fifos[i].empty() && (!valid || data == fifos[i].front()), "FIFO payload mismatch");
       highWater[i] = std::max(highWater[i], unsigned(fifos[i].size()));
       // Observe through the retained target, not only its queue output.
-      require(sim.eval(wrapper.getArgument(5+3*i)) == valid &&
-              sim.eval(wrapper.getArgument(6+3*i)) == data, "target sink wiring mismatch");
+      Value sinkValid = targetSource && i == 0 ? bridgeValid : wrapper.getArgument(5+3*i);
+      Value sinkBits = targetSource && i == 0 ? bridgeBits : wrapper.getArgument(6+3*i);
+      require(sim.eval(sinkValid) == valid && sim.eval(sinkBits) == data,
+              "target/bridge sink wiring mismatch");
     }
     require(sourceReady == (readyMask == 7), "broadcast readiness mismatch");
     for (unsigned i = 0; i < 3; ++i)
@@ -203,7 +332,11 @@ void run(MLIRContext &ctx, const char *output) {
 } // namespace
 int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { rejected(ctx); run(ctx, argc > 1 ? argv[1] : nullptr); }
+  try {
+    rejected(ctx); targetRejected(ctx); internalChannels(ctx);
+    bool targetSource = argc > 1 && StringRef(argv[argc-1]) == "target";
+    run(ctx, argc > 1 && StringRef(argv[1]) != "target" ? argv[1] : nullptr, targetSource);
+  }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
   return 0;
 }

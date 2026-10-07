@@ -68,7 +68,9 @@ struct BoundaryPipe {
   unsigned port;
   FIRRTLBaseType payload;
   unsigned latency;
-  unsigned sourcePort; // Primary bridge input for an annotated fanout group.
+  unsigned sourcePort; // Shared target output or primary bridge input.
+  bool targetSource;
+  bool loopback;
 };
 
 // Resolve the post-FAME payload target to a live CIRCT port. Channel clock
@@ -85,7 +87,7 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
     error = "PipeChannel construction needs a top module and retained annotations";
     return failure();
   }
-  std::set<unsigned> usedPorts;
+  std::set<unsigned> usedSinks;
   std::set<std::string> usedNames;
   auto bit = UIntType::get(circuit.getContext(), 1, false);
   for (Attribute attr : raw) {
@@ -107,58 +109,69 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
     auto sinks = annotation.getMember<ArrayAttr>("sinks");
     bool hasSource = sources && !sources.empty();
     bool hasSink = sinks && !sinks.empty();
-    if (hasSource == hasSink) {
-      error = "PipeChannel " + name.getValue().str() +
-              " is not a single boundary connection; loopbacks are not implemented";
+    if (!hasSource && !hasSink) {
+      error = "PipeChannel " + name.getValue().str() + " has no endpoint";
       return failure();
     }
-    auto endpoints = hasSource ? sources : sinks;
-    if (endpoints.size() != 1) {
-      error = "PipeChannel " + name.getValue().str() +
-              " has multiple endpoints; aggregated pipes are not implemented";
+    auto resolvePort = [&](ArrayAttr endpoints, Direction direction,
+                           unsigned &port, FIRRTLBaseType &payload) -> LogicalResult {
+      if (endpoints.size() != 1) {
+        error = "PipeChannel " + name.getValue().str() +
+                " requires one complete payload per endpoint";
+        return failure();
+      }
+      auto spelling = dyn_cast<StringAttr>(endpoints[0]);
+      auto target = spelling ? goldengate::resolveAnnotationTarget(
+                                   circuit, spelling.getValue(), error)
+                             : std::nullopt;
+      if (!target || target->module != top || !target->port) {
+        error = "PipeChannel " + name.getValue().str() +
+                " payload must resolve to a top-level port: " + error;
+        return failure();
+      }
+      port = *target->port;
+      auto type = dyn_cast<BundleType>(top.getPortType(port));
+      auto ready = type ? type.getElementIndex("ready") : std::nullopt;
+      auto valid = type ? type.getElementIndex("valid") : std::nullopt;
+      auto bits = type ? type.getElementIndex("bits") : std::nullopt;
+      payload = bits ? type.getElements()[*bits].type : FIRRTLBaseType();
+      if (!type || type.getElements().size() != 3 || !ready || !valid ||
+          !bits || !isPayloadType(payload) || !getBitWidth(payload) ||
+          !type.getElements()[*ready].isFlip ||
+          type.getElements()[*valid].isFlip || type.getElements()[*bits].isFlip ||
+          type.getElements()[*ready].type != bit ||
+          type.getElements()[*valid].type != bit ||
+          target->fieldID != type.getFieldID(*bits) ||
+          top.getPortDirection(port) != direction) {
+        error = "PipeChannel " + name.getValue().str() +
+                " requires a passive integer Decoupled payload target with matching direction";
+        return failure();
+      }
+      return success();
+    };
+    unsigned sourcePort = 0, sinkPort = 0;
+    FIRRTLBaseType sourceType, sinkType;
+    if ((hasSource && failed(resolvePort(sources, Direction::Out, sourcePort, sourceType))) ||
+        (hasSink && failed(resolvePort(sinks, Direction::In, sinkPort, sinkType))))
       return failure();
-    }
-    auto spelling = dyn_cast<StringAttr>(endpoints[0]);
-    auto target = spelling ? goldengate::resolveAnnotationTarget(
-                                 circuit, spelling.getValue(), error)
-                           : std::nullopt;
-    if (!target || target->module != top || !target->port) {
-      error = "PipeChannel " + name.getValue().str() +
-              " payload must resolve to a top-level port: " + error;
-      return failure();
-    }
-    unsigned port = *target->port;
-    auto type = dyn_cast<BundleType>(top.getPortType(port));
-    auto ready = type ? type.getElementIndex("ready") : std::nullopt;
-    auto valid = type ? type.getElementIndex("valid") : std::nullopt;
-    auto bits = type ? type.getElementIndex("bits") : std::nullopt;
-    auto payload = bits ? type.getElements()[*bits].type : FIRRTLBaseType();
-    if (!type || type.getElements().size() != 3 || !ready || !valid ||
-        !bits || !isPayloadType(payload) || !getBitWidth(payload) ||
-        !type.getElements()[*ready].isFlip ||
-        type.getElements()[*valid].isFlip || type.getElements()[*bits].isFlip ||
-        type.getElements()[*ready].type != bit ||
-        type.getElements()[*valid].type != bit ||
-        target->fieldID != type.getFieldID(*bits) ||
-        top.getPortDirection(port) != (hasSource ? Direction::Out : Direction::In)) {
-      error = "PipeChannel " + name.getValue().str() +
-              " requires a passive integer Decoupled payload target with matching direction";
-      return failure();
-    }
-    if (!usedPorts.insert(port).second ||
+    if ((hasSource && hasSink && sourceType != sinkType) ||
+        (hasSink && !usedSinks.insert(sinkPort).second) ||
         !usedNames.insert(name.getValue().str()).second) {
       error = "PipeChannel " + name.getValue().str() +
-              " shares a port or name; channel fanout is not implemented";
+              " has incompatible endpoints or repeats a sink or name";
       return failure();
     }
-    pipes.push_back({name.getValue().str(), port, payload,
-                     static_cast<unsigned>(latency.getUInt()), port});
+    unsigned port = hasSink ? sinkPort : sourcePort;
+    pipes.push_back({name.getValue().str(), port, hasSource ? sourceType : sinkType,
+                     static_cast<unsigned>(latency.getUInt()),
+                     hasSource ? sourcePort : port, hasSource, hasSource && hasSink});
   }
-  // ChannelExcision separates bridge-sourced sinks; SimWrapper groups them
-  // by ChannelFanout's first name and exposes only that primary input.
+  // SimWrapper forks one source into independent queues. Bridge sources
+  // select the first sink's external input; target sources share a live port.
   std::map<std::string, unsigned> byName;
   for (auto [i, pipe] : llvm::enumerate(pipes)) byName.emplace(pipe.name, i);
   std::set<unsigned> grouped;
+  std::map<unsigned, unsigned> groupPrimary;
   for (Attribute attr : raw) {
     Annotation annotation(attr);
     if (!annotation.isClass(goldengate::AnnotationClasses::ChannelFanout))
@@ -181,12 +194,36 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
     auto &primary = pipes[members.front()];
     for (unsigned index : members) {
       auto &pipe = pipes[index];
-      if (top.getPortDirection(pipe.port) != Direction::In ||
-          pipe.payload != primary.payload) {
-        error = "PipeChannel fanout requires bridge-sourced sinks with identical payload types";
+      if (pipe.targetSource != primary.targetSource ||
+          pipe.payload != primary.payload ||
+          (pipe.targetSource && pipe.sourcePort != primary.sourcePort)) {
+        error = "PipeChannel fanout needs one source direction, identical payloads and a shared target source";
         return failure();
       }
-      pipe.sourcePort = primary.port;
+      groupPrimary[index] = members.front();
+      if (!pipe.targetSource) pipe.sourcePort = primary.port;
+    }
+  }
+  std::map<unsigned, SmallVector<unsigned>> targetGroups;
+  for (auto [index, pipe] : llvm::enumerate(pipes))
+    if (pipe.targetSource) targetGroups[pipe.sourcePort].push_back(index);
+  for (const auto &[port, members] : targetGroups) {
+    unsigned externalSinks = 0;
+    for (unsigned index : members) {
+      const auto &pipe = pipes[index];
+      externalSinks += !pipe.loopback;
+      if (members.size() > 1 &&
+          (!grouped.count(index) || !grouped.count(members.front()) ||
+           groupPrimary.at(index) != groupPrimary.at(members.front()))) {
+        error = "shared target PipeChannel source needs a fanout annotation";
+        return failure();
+      }
+    }
+    // Scala ChannelizedWrapperIO deduplicates identical source targets. Only
+    // one queue may drive that external output; other queues must feed models.
+    if (externalSinks > 1) {
+      error = "target PipeChannel fanout supports at most one bridge sink";
+      return failure();
     }
   }
   return success();
@@ -393,8 +430,17 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
   }
   auto targetPorts = target.getPorts();
   std::set<unsigned> secondaryPorts;
+  std::set<unsigned> exposedSources;
+  for (const auto &channel : channels) {
+    if (channel.targetSource && !channel.loopback)
+      exposedSources.insert(channel.sourcePort);
+    if (channel.loopback ||
+        (!channel.targetSource && channel.port != channel.sourcePort))
+      secondaryPorts.insert(channel.port);
+  }
   for (const auto &channel : channels)
-    if (channel.port != channel.sourcePort) secondaryPorts.insert(channel.port);
+    if (channel.targetSource && !exposedSources.count(channel.sourcePort))
+      secondaryPorts.insert(channel.sourcePort);
   SmallVector<PortInfo> ports;
   std::map<unsigned, unsigned> wrapperPorts;
   for (auto [i, port] : llvm::enumerate(targetPorts)) {
@@ -412,7 +458,7 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
   for (unsigned i = 0, n = targetPorts.size(); i < n; ++i) {
     bool isChannelPort = false;
     for (const auto &channel : channels)
-      isChannelPort |= i == channel.port;
+      isChannelPort |= i == channel.port || i == channel.sourcePort;
     if (isChannelPort)
       continue;
     Value external = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(i));
@@ -433,9 +479,9 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
     queues.push_back(queue);
     groups[channel.sourcePort].push_back(index);
     Value internal = child.getResult(channel.port);
-    bool targetSource = target.getPortDirection(channel.port) == Direction::Out;
-    Value sink = targetSource ? wrapper.getArgument(wrapperPorts.at(channel.port))
-                              : internal;
+    Value sink = channel.targetSource && !channel.loopback
+                     ? wrapper.getArgument(wrapperPorts.at(channel.port))
+                     : internal;
     builder.create<ConnectOp>(loc, queue.getResult(0),
                               wrapper.getArgument(wrapperPorts.at(*clockPort)));
     builder.create<ConnectOp>(loc, queue.getResult(1),
@@ -505,6 +551,17 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
         if (!llvm::any_of(wrapper.getPorts(), [&](const PortInfo &external) {
               return external.name == port.name;
             })) innerOnlyPorts.insert(port.name.getValue().str());
+  std::set<std::string> modelSources;
+  for (Attribute attr : raw) {
+    Annotation annotation(attr);
+    auto sources = annotation.getMember<ArrayAttr>("sources");
+    auto sinks = annotation.getMember<ArrayAttr>("sinks");
+    if (annotation.isClass(AnnotationClasses::ChannelConnection) &&
+        sources && sinks && !sources.empty() && !sinks.empty())
+      for (Attribute source : sources)
+        if (auto spelling = dyn_cast<StringAttr>(source))
+          modelSources.insert(spelling.getValue().str());
+  }
   std::function<Attribute(Attribute, bool)> retarget =
       [&](Attribute attr, bool targetDomain) -> Attribute {
     if (auto string = dyn_cast<StringAttr>(attr)) {
@@ -535,15 +592,26 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
     if (auto dict = dyn_cast<DictionaryAttr>(attr)) {
       SmallVector<NamedAttribute> values;
       Annotation annotation(dict);
+      auto sources = annotation.getMember<ArrayAttr>("sources");
+      auto sinks = annotation.getMember<ArrayAttr>("sinks");
+      bool loopback = annotation.isClass(AnnotationClasses::ChannelConnection) &&
+                      sources && !sources.empty() && sinks && !sinks.empty();
+      bool sharedModelSource = sources && llvm::any_of(sources, [&](Attribute source) {
+        auto spelling = dyn_cast<StringAttr>(source);
+        return spelling && modelSources.count(spelling.getValue().str());
+      });
       for (NamedAttribute value : dict)
         // A channel's associated clock names the retained target domain.
         // SimWrapper.genClockChannel changes the wrapper payload to Vec[Bool],
         // while the target still owns its scalar Clock / ClockRecord leaves.
-        // Only boundary endpoints move to wrapper ports; moving a clock leaf
-        // there either loses its Clock type or leaves an invalid record path.
+        // Shared model sources stay upstream of queues on the retained target;
+        // their exposed wrapper port is a queue output, a different endpoint.
+        // Moving a clock leaf loses its Clock type or invalidates a record path.
         values.emplace_back(value.getName(), retarget(value.getValue(),
             targetDomain || (annotation.isClass(AnnotationClasses::ChannelConnection) &&
-                             value.getName().getValue() == "clock")));
+                (value.getName().getValue() == "clock" ||
+                 (loopback && value.getName().getValue() == "sinks") ||
+                 (sharedModelSource && value.getName().getValue() == "sources")))));
       return DictionaryAttr::get(context, values);
     }
     return attr;

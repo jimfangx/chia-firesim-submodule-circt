@@ -1445,6 +1445,7 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-pipe-fanout-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-pipe-fanout COMMAND goldengate-pipe-fanout-test)
+  add_test(NAME goldengate-target-pipe-fanout COMMAND goldengate-pipe-fanout-test target)
   add_executable(goldengate-ready-valid-channel-test
     test/Transforms/FAMEReadyValidChannelTest.cpp
     lib/Transforms/FAMEReadyValidChannel.cpp

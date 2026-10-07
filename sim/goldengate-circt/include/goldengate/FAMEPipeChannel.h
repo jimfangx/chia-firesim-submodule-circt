@@ -23,10 +23,12 @@ mlir::LogicalResult addFAMEPipeChannel(circt::firrtl::CircuitOp circuit,
 mlir::LogicalResult addFAMEPipeChannel(circt::firrtl::CircuitOp circuit,
                                       circt::firrtl::FIRRTLBaseType payloadType,
                                       unsigned latency, std::string &error);
-// Discover single-endpoint boundary pipes from retained channel annotations
+// Discover single-payload boundary and model loopback pipes from retained
+// channel annotations
 // and create one module definition for each (payload type, latency) pair.
 // Requires: post-FAME Decoupled ports and retained PipeChannel annotations
-// naming complete bits fields with matching direction. Consumes/produces no
+// naming complete bits fields with matching direction. Model loopbacks have
+// one source and one sink with identical payload types. Consumes/produces no
 // annotations. Validates every endpoint and symbol before adding definitions;
 // mutation/analysis/output contracts are otherwise the same as above.
 mlir::LogicalResult addFAMEBoundaryPipeChannels(
@@ -38,7 +40,10 @@ mlir::LogicalResult addFAMEBoundaryPipeChannels(
 // ChannelFanout groups of bridge-sourced sinks share one external primary
 // input and broadcast atomically to independent queues. Secondary inputs are
 // omitted; their annotation targets retain the inner target module identity.
-// Validate group membership and equal payload types before any mutation.
+// Target-sourced groups share one target output and feed model loopback sinks
+// plus at most one external bridge sink. Internal-only source/sink ports are
+// omitted. Every branch retains its own queue and latency. Validate group
+// membership, unique sinks and equal payload types before any mutation.
 // ReadyValid channels initially pass through and are replaced by the following
 // ReadyValidChannel transform. Clock channels still pass through.
 mlir::LogicalResult addFAMEPipeWrapper(circt::firrtl::CircuitOp circuit,
@@ -52,7 +57,9 @@ mlir::LogicalResult addFAMEPipeWrapper(circt::firrtl::CircuitOp circuit,
 // Mutates circuit identity and annotation targets, preserving module IR and
 // target-domain identities. No analysis is required; cached circuit/target
 // analyses must be rebuilt after activation. Boundary endpoints name wrapper
-// ports while associated clocks continue to name inner target ports.
+// ports while associated clocks continue to name inner target ports. Model
+// loopback endpoints and target fanout sources retain the inner module; an
+// exposed queue output must not replace the identity of its upstream source.
 mlir::LogicalResult activateFAMEPipeWrapper(
     circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
