@@ -1,3 +1,63 @@
+# Zero-total-width ready/valid payloads — iteration 38
+
+The executable Scala `SimWrapper` accepts a selected SInt<0> scalar and a
+record containing SInt<0>/UInt<0> leaves. The previous native pass rejected
+their exact FIRRTL/annotation handoffs. The native pass now distinguishes a
+selected zero-bit data leaf from an annotation containing only target-valid;
+the latter still fails before mutation. Selected zero-width leaves retain
+their type, normalized shape, and annotation identity until FIRRTL lowering.
+
+`GGFAMEReadyValid0` transports target-valid through its forward flow queue,
+retains the reverse flow queue and reference occupancy, and keeps the same
+host completion and reset-token state as nonzero channels. A CIRCT UInt<0>
+constant drives packed data instead of constructing an underflowing slice.
+Target enqueue/dequeue events still occur without payload bits to store.
+
+The `zero-only` and `zero-record` production Scala probes each match all 12
+nonzero external leaves and 28 control bindings in both orientations. All five
+previous production probes still match their interfaces. Standard firtool
+lowering of the actual native zero-width module removes zero-bit data ports
+and storage, preserves both reference occupancy registers, and matches all 17
+ports of the separately lowered production Scala module. This is a port/state
+comparison, not RTL equivalence. The fresh native Rocket compile exits zero,
+emits simulator SystemVerilog and annotated collateral, and has empty stderr.
+
+Eight focused CTests pass: ready/valid, four hub clock/queued-pipe cases, and
+TSI, BlockDev, and FASED token mapping. Independent FIFO scoreboards cover
+80,000 randomized cycles at widths 0, 1, 8, and 32. The zero-width run has
+6,209 target completions, 197 reset tokens, 11,607 cycles with delayed host
+completion, and 641 forward-flow bypasses. Fixtures also check zero scalar and
+record shapes and resolve every transferred endpoint after activation.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration38-zero-rv/`:
+
+- `scala-{zero-only,zero-record}/`: exact post-FAME FIRRTL, annotations, and
+  production Scala wrapper. `before.stdout`/`before.stderr` retain rejection
+  by the previous native binary.
+- `ingested-{zero-only,zero-record}-wrapper.mlir` and `.active.mlir`, with fresh
+  artifacts for all five previous probes too.
+- `ctest.stdout`, `dependent-ctest.stdout`, and `native-zero-only.stdout`.
+- `zero-channel.mlir`, `zero-channel.sfc.fir`, their lowered `.sv` artifacts,
+  and `zero-lowering-comparison.json`.
+- `compare-boundaries.py`, `comparison.stdout`, and `boundary-comparison.json`.
+- `compiler-candidate/post-fame-ready-valid-wrapper.mlir`, simulator
+  RTL/collateral, and `compiler.stdout` / `compiler.stderr`.
+
+The exact immutable artifact compared is
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+The fresh Rocket wrapper matches 138 direct control bindings with zero
+differences and 70 payload bindings. Twenty AXI payload bindings still lack a
+corresponding direct assignment in the fixture. The recorded Rocket fixture
+does not exercise zero-total-width payloads; those use the fresh production
+Scala probes. These checks do not establish whole-design equivalence.
+
+Iteration 37's harness passed CIRCT replacertl and all required Verilator
+workloads. Gates for this change remain harness-owned; the UART-bearing SFC
+differential baseline remains pending. The next smallest step is to probe
+zero-width endpoint annotation handling through the native retained-target
+LowerTypes boundary against the production Scala lowering contract.
+
 # Annotation-selected ready/valid payloads — iteration 37
 
 The native wrapper now uses the annotation's data-leaf subset, following

@@ -222,7 +222,7 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
         leaves.push_back(leaf);
       } else excluded.push_back(leaf);
     }
-    if (!validEndpoints || !width || !names.insert(base).second ||
+    if (!validEndpoints || leaves.empty() || !names.insert(base).second ||
         !used.insert(*f->port).second || !used.insert(*r->port).second) {
       error = "ReadyValidChannel " + base + " has missing, shared or inconsistent endpoints";
       return failure();
@@ -293,7 +293,6 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
 LogicalResult goldengate::addFAMEReadyValidChannel(CircuitOp circuit,
                                                   unsigned width,
                                                   std::string &error) {
-  if (!width) { error = "ReadyValidChannel payload must have positive width"; return failure(); }
   for (auto m : circuit.getOps<FModuleLike>())
     if (m.getModuleName() == moduleName(width)) {
       error = "ReadyValidChannel module already exists"; return failure();
@@ -335,7 +334,8 @@ LogicalResult goldengate::addFAMEReadyValidChannel(CircuitOp circuit,
   auto lor = [&](Value a, Value c) -> Value { return b.create<OrPrimOp>(loc, a, c); };
   Value zero = b.create<ConstantOp>(loc, bit, APInt(1, 0));
   Value fwdReady = wire(bit, "enqFwdQ_deq_ready"), revReady = wire(bit, "deqRevQ_deq_ready");
-  Value packed = b.create<CatPrimOp>(loc, arg(3), arg(4));
+  Value packed = arg(3);
+  if (width) packed = b.create<CatPrimOp>(loc, arg(3), arg(4));
   Queue fwd = queue(b, loc, arg(0), arg(1), arg(6), packed, fwdReady, true, "enqFwdQ");
   Queue rev = queue(b, loc, arg(0), arg(1), arg(15), arg(9), revReady, true, "deqRevQ");
   Value deqFired = b.create<RegResetOp>(loc, bit, arg(0), arg(1), zero, "deqFwdFired").getResult();
@@ -354,7 +354,11 @@ LogicalResult goldengate::addFAMEReadyValidChannel(CircuitOp circuit,
   connect(enqFired, b.create<MuxPrimOp>(loc, fire, zero, enqDone));
   connect(deqFired, b.create<MuxPrimOp>(loc, fire, zero, deqDone));
   Value fwdValid = b.create<BitsPrimOp>(loc, fwd.bits, width, width);
-  Value fwdBits = b.create<BitsPrimOp>(loc, fwd.bits, width - 1, 0);
+  // A zero-bit payload still transports target-valid and advances all three
+  // queues. Never form an underflowing data slice for the valid-only token.
+  Value fwdBits;
+  if (width) fwdBits = b.create<BitsPrimOp>(loc, fwd.bits, width - 1, 0);
+  else fwdBits = b.create<ConstantOp>(loc, data, APInt(0u, uint64_t(0)));
   Value last = b.create<RegOp>(loc, data, arg(0), "enqBitsLast").getResult();
   connect(last, b.create<MuxPrimOp>(loc, fire, fwdBits, last));
   Value refReset = lor(arg(1), land(fire, arg(16)));
@@ -430,7 +434,7 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     }
   }
   for (auto m : circuit.getOps<FModuleLike>())
-    if (widths.count(0) || llvm::any_of(widths, [&](unsigned width) {
+    if (llvm::any_of(widths, [&](unsigned width) {
           return m.getModuleName() == moduleName(width);
         })) { error = "ReadyValidChannel module symbol collision"; return failure(); }
   for (unsigned width : widths)
@@ -535,6 +539,9 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
       connect(output, slice);
       offset -= width;
     }
+    if (!packed)
+      packed = b.create<ConstantOp>(loc, UIntType::get(b.getContext(), 0),
+                                    APInt(0u, uint64_t(0)));
     connect(arg(4), packed);
   }
   return success();

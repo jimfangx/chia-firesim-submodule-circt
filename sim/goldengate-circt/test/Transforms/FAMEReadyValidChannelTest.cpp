@@ -174,6 +174,10 @@ module { firrtl.circuit "Top" {
   if (bad == 23) replace("y: uint<5>", "bits_x: uint<5>");
   if (bad == 24) replace("x: uint<3>, pad: uint<0>, y: uint<5>",
       "group: bundle<inner: bundle<x: sint<3>, ignored: uint<5>>, ignored: uint<2>>");
+  if (bad == 26) replace("x: uint<3>, pad: uint<0>, y: uint<5>",
+      "group: bundle<inner: bundle<x: sint<0>>, ignored: uint<5>>");
+  if (bad == 27) replace("x: uint<3>, pad: uint<0>, y: uint<5>",
+      "group: bundle<x: sint<0>, pad: uint<0>>");
   auto root = parseSourceString<ModuleOp>(text, &context);
   require(bool(root), "cannot parse payload fixture");
   OpBuilder b(&context);
@@ -190,6 +194,8 @@ module { firrtl.circuit "Top" {
       if (i == 0 && bad == 17) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner"), target("group.inner.valid"), target("valid")});
       if (i == 0 && bad == 18) endpoints = b.getArrayAttr({target("group.x"), target("group.pad"), target("group.inner.y"), target("group.inner.y"), target("valid")});
     }
+    if (bad == 26) endpoints = b.getArrayAttr({target("group.inner.x"), target("valid")});
+    if (bad == 27) endpoints = b.getArrayAttr({target("group.pad"), target("valid"), target("group.x")});
     if (bad == 25) endpoints = b.getArrayAttr({target("x"), target("pad"), target("y")});
     if (bad == 24) endpoints = b.getArrayAttr({target("valid"), target("group.inner.x")});
     if (bad == 23) endpoints = b.getArrayAttr({target("x"), target("pad"), target("bits_x"), target("valid")});
@@ -436,6 +442,63 @@ void nestedPayload(MLIRContext &context) {
     require(succeeded(verify(*root)), "active nested wrapper failed verification");
   }
 }
+// Zero-bit data is not an empty annotation payload: selected leaves still
+// normalize and transfer their identity, while all valid/ready state is queued.
+void zeroPayload(MLIRContext &context) {
+  for (unsigned variant : {26u, 27u}) {
+    auto root = fixture(context, variant);
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    std::string error;
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)), error);
+    require(succeeded(verify(*root)), "zero payload wrapper failed verification");
+    auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+    for (unsigned port : {2u, 4u}) {
+      auto host = cast<BundleType>(wrapper.getPortType(port));
+      auto valid = cast<BundleType>(host.getElement("bits")->type);
+      auto payload = valid.getElement("bits")->type;
+      if (variant == 26) require(payload == SIntType::get(&context, 0), "zero singleton lost signed type");
+      else {
+        auto record = dyn_cast<BundleType>(payload);
+        require(record && record.getElements().size() == 2 &&
+          record.getElement("x")->type == SIntType::get(&context, 0) &&
+          record.getElement("pad")->type == UIntType::get(&context, 0),
+          "zero record lost structural normalization");
+      }
+    }
+    unsigned channels = 0;
+    for (auto instance : wrapper.getOps<InstanceOp>()) {
+      if (!instance.getName().starts_with("ReadyValidChannel_")) continue;
+      require(instance.getModuleName() == "GGFAMEReadyValid0", "zero payload uses a nonzero data queue");
+      Value packed;
+      for (auto connect : wrapper.getOps<ConnectOp>())
+        if (connect.getDest() == instance.getResult(4)) packed = connect.getSrc();
+      auto zero = packed.getDefiningOp<ConstantOp>();
+      require(zero && zero.getType() == UIntType::get(&context, 0) && zero.getValue().isZero(),
+              "zero packed input has no valid zero-width driver");
+      ++channels;
+    }
+    require(channels == 2, "zero payload must support both orientations");
+    require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(verify(*root)), "activated zero wrapper failed verification");
+    unsigned leaves = 0;
+    for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      auto annotation = cast<DictionaryAttr>(attr);
+      for (StringRef member : {"sources", "sinks"})
+        if (auto endpoints = annotation.getAs<ArrayAttr>(member))
+          for (auto endpoint : endpoints) {
+            auto spelling = cast<StringAttr>(endpoint);
+            auto target = goldengate::resolveAnnotationTarget(circuit, spelling.getValue(), error);
+            require(bool(target), "zero leaf annotation no longer resolves");
+            require(spelling.getValue().starts_with("~GGFAMEPipeWrapper|GGFAMEPipeWrapper>"),
+                    "zero endpoint retained old top identity");
+            ++leaves;
+          }
+    }
+    require(leaves == (variant == 26 ? 6u : 8u), "zero leaf annotation count changed");
+  }
+}
+
 // Singleton collapse is structural: a zero-width sibling still prevents
 // collapsing the record. Activation must resolve every renamed leaf target.
 void normalizedPayload(MLIRContext &context) {
@@ -662,10 +725,11 @@ int main(int argc, char **argv) {
     signedScalar(context);
     nestedPayload(context);
     normalizedPayload(context);
+    zeroPayload(context);
     selectedPayload(context);
     missingSelectedValid(context);
     fanoutWrapper(context);
-    for (unsigned width : {1, 8, 32}) behavior(context, width);
+    for (unsigned width : {0, 1, 8, 32}) behavior(context, width);
     if (argc > 3) {
       // Exercise an ingested production-Scala boundary, not a rebuilt fixture.
       auto root = parseSourceFile<ModuleOp>(argv[2], &context);
@@ -685,5 +749,5 @@ int main(int argc, char **argv) {
     }
   }
   catch (const std::exception &e) { llvm::errs() << "ReadyValidChannel: " << e.what() << '\n'; return 1; }
-  llvm::outs() << "ReadyValidChannel: both orientations, nested/signed/unsigned exhaustive payloads, malformed pairs and 60000 randomized cycles passed\n";
+  llvm::outs() << "ReadyValidChannel: both orientations, nested/signed/unsigned exhaustive payloads, malformed pairs and 80000 randomized cycles passed\n";
 }

@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // Exercise the production SimWrapper with flat/nested/singleton leaves in both
-// bridge orientations. Keep this probe outside the immutable Rocket fixtures.
+// bridge orientations, including zero-total-width payloads. Keep this probe
+// outside the immutable Rocket fixtures.
 import firrtl._
 import firrtl.ir._
 import firrtl.annotations.ReferenceTarget
@@ -15,8 +16,11 @@ object FAMEReadyValidPayloadOracle extends App {
   val mode = args.lift(1).getOrElse("flat")
   val nested = mode == "nested"
   val singleton = mode == "singleton" || mode == "selected"
+  val zeroOnly = mode == "zero-only" || mode == "zero-record"
   val zero = mode == "zero"
-  val payload = if (mode == "selected") "{ group : { inner : { x : SInt<3>, ignored : UInt<5> }, ignored : UInt<2> }, valid : UInt<1> }"
+  val payload = if (mode == "zero-only") "{ group : { inner : { x : SInt<0> }, ignored : UInt<5> }, valid : UInt<1> }"
+                else if (mode == "zero-record") "{ group : { x : SInt<0>, pad : UInt<0> }, valid : UInt<1> }"
+                else if (mode == "selected") "{ group : { inner : { x : SInt<3>, ignored : UInt<5> }, ignored : UInt<2> }, valid : UInt<1> }"
                 else if (singleton) "{ group : { inner : { x : SInt<3> }, empty : { } }, valid : UInt<1> }"
                 else if (zero) "{ group : { x : SInt<3>, pad : SInt<0> }, valid : UInt<1> }"
                 else if (nested) "{ group : { x : SInt<3>, pad : SInt<0>, inner : { y : UInt<4>, valid : UInt<1> } }, valid : UInt<1> }"
@@ -37,7 +41,9 @@ object FAMEReadyValidPayloadOracle extends App {
     case (name, port, reverse, source) =>
       val valid = target(port).field("valid")
       val ready = target(reverse)
-      val paths = if (singleton) Seq("group.inner.x", "valid")
+      val paths = if (mode == "zero-only") Seq("group.inner.x", "valid")
+                  else if (mode == "zero-record") Seq("group.x", "group.pad", "valid")
+                  else if (singleton) Seq("group.inner.x", "valid")
                   else if (zero) Seq("group.x", "group.pad", "valid")
                   else if (nested) Seq("group.x", "group.pad", "group.inner.y", "group.inner.valid", "valid")
                   else Seq("x", "pad", "y", "valid")
@@ -60,12 +66,19 @@ object FAMEReadyValidPayloadOracle extends App {
   val circuit = new LowFirrtlCompiler().compile(CircuitState(Parser.parse(chirrtl), ChirrtlForm), Nil).circuit
   val wrapper = circuit.modules.collectFirst { case m: Module if m.name == circuit.main => m }.get
   for (port <- Seq("a", "b")) {
-    val signed = wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits${if (singleton) "" else "_x"}").get
-    require(signed.tpe == SIntType(IntWidth(3)), s"$port lost signed payload type")
-    if (!singleton && !zero) {
-      val unsigned = wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_${if (nested) "inner_y" else "y"}").get
-      if (nested) require(wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_inner_valid").get.tpe == UIntType(IntWidth(1)), "nested valid must remain data")
-      require(unsigned.tpe == UIntType(IntWidth(if (nested) 4 else 5)), s"$port lost unsigned payload type")
+    if (zeroOnly) {
+      require(!wrapper.ports.exists(_.name.startsWith(s"channelPorts_${port}_bits_bits")), s"$port retained zero-width payload")
+      require(wrapper.ports.exists(_.name == s"channelPorts_${port}_bits_valid"), s"$port lost target-valid")
+      require(wrapper.ports.exists(_.name == s"channelPorts_${port}_valid"), s"$port lost host-valid")
+      require(wrapper.ports.exists(_.name == s"channelPorts_${port}_ready"), s"$port lost host-ready")
+    } else {
+      val signed = wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits${if (singleton) "" else "_x"}").get
+      require(signed.tpe == SIntType(IntWidth(3)), s"$port lost signed payload type")
+      if (!singleton && !zero) {
+        val unsigned = wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_${if (nested) "inner_y" else "y"}").get
+        if (nested) require(wrapper.ports.find(_.name == s"channelPorts_${port}_bits_bits_inner_valid").get.tpe == UIntType(IntWidth(1)), "nested valid must remain data")
+        require(unsigned.tpe == UIntType(IntWidth(if (nested) 4 else 5)), s"$port lost unsigned payload type")
+      }
     }
   }
   def write(name: String, text: String): Unit = {
@@ -75,5 +88,5 @@ object FAMEReadyValidPayloadOracle extends App {
   write("post-fame.sfc.fir", input.serialize)
   write("post-fame.sfc.json", firrtl.annotations.JsonProtocol.serialize(annotations))
   write("signed-wrapper.sfc.fir", circuit.serialize)
-  println(s"PASS ReadyValidChannel payloads: mode=$mode; signed/unsigned leaves, both orientations")
+  println(s"PASS ReadyValidChannel payloads: mode=$mode; typed payloads and token controls, both orientations")
 }

@@ -5,7 +5,8 @@
 
 namespace goldengate {
 // Scala ReadyValidChannel with two flow queues, a two-entry reference queue,
-// and separate host forward/reverse completion state. Payloads are packed UInt.
+// and separate host forward/reverse completion state. Payloads are packed UInt,
+// including zero-bit payloads with queued valid tokens.
 mlir::LogicalResult addFAMEReadyValidChannel(circt::firrtl::CircuitOp circuit,
                                             unsigned payloadWidth,
                                             std::string &error);
@@ -14,7 +15,7 @@ mlir::LogicalResult addFAMEReadyValidChannel(circt::firrtl::CircuitOp circuit,
 // passthroughs in the existing pipe wrapper. Excluded target input leaves are
 // invalidated as in SimulationMapping; activation retains their metadata on the
 // inner target and transfers selected leaf renames. Requires known-width passive
-// integer payloads, positive selected width, an uninstantiated wrapper, and unique
+// integer payloads, at least one selected data leaf, an uninstantiated wrapper, and unique
 // leaf endpoints including target-valid. Consumes no annotations; preserves the
 // target hierarchy and records explicit wrapper target transfers.
 mlir::LogicalResult addFAMEBoundaryReadyValidChannels(
