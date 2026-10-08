@@ -3762,6 +3762,25 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, xilinxAnnotations, error)))
         return fail("Xilinx host specialization annotations: " + error);
       llvm::outs() << "Specialized CIRCT abstract clocks to Xilinx BUFGCE in " << xilinxPath << '\n';
+      // Driver analyses consume the deliberately retained assembly boundaries.
+      // Collapse those boundaries only once every header has been prepared;
+      // XDC then resolves the final, shallow native CIRCT instance graph.
+      if (!enableAutoILA)
+        if (int result = prepareDriverHeaders()) return result;
+      llvm::SmallString<256> normalizedRTLPath(outputDir);
+      llvm::sys::path::append(normalizedRTLPath, outputBase + ".sv");
+      unsigned inlinedHostWrappers = 0;
+      if (failed(goldengate::normalizeHostHierarchy(
+              *module, normalizedRTLPath, inlinedHostWrappers, error)))
+        return fail("host hierarchy normalization: " + error);
+      llvm::SmallString<256> normalizedHierarchyPath(outputDir);
+      llvm::sys::path::append(normalizedHierarchyPath, "post-host-hierarchy-normalization.mlir");
+      std::error_code hierarchyError;
+      llvm::raw_fd_ostream hierarchyOut(normalizedHierarchyPath, hierarchyError);
+      if (hierarchyError) return fail("cannot write normalized host hierarchy: " + hierarchyError.message());
+      module->print(hierarchyOut); hierarchyOut << '\n'; hierarchyOut.close();
+      llvm::outs() << "Inlined " << inlinedHostWrappers
+                   << " CIRCT host assembly wrappers in " << normalizedHierarchyPath << '\n';
       if (failed(goldengate::prepareXDCOutput(circuit, error)))
         return fail("XDC output preparation: " + error);
       if (enableAutoILA) {
@@ -3774,7 +3793,7 @@ int main(int argc, char **argv) {
           updated.push_back(attr);
         }
         circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(&context, updated));
-      } else if (int result = prepareDriverHeaders()) return result;
+      }
       llvm::SmallString<256> xdcAnnotations(outputDir);
       llvm::sys::path::append(xdcAnnotations, "post-fame-xdc-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, xdcAnnotations, error)))

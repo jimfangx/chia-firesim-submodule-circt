@@ -814,6 +814,17 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-metasim-interface-header-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-metasim-interface-header COMMAND goldengate-metasim-interface-header-test)
+  add_executable(goldengate-host-hierarchy-test
+    test/Support/HostHierarchyTest.cpp lib/Support/SimulatorRTL.cpp
+    lib/Support/XDCEmission.cpp lib/Support/AnnotationEmission.cpp)
+  target_compile_features(goldengate-host-hierarchy-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-host-hierarchy-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-host-hierarchy-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-host-hierarchy-test PRIVATE
+    CIRCTFirtool CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
+    MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-host-hierarchy COMMAND goldengate-host-hierarchy-test)
   add_executable(goldengate-simulator-rtl-test
     test/Support/SimulatorRTLTest.cpp lib/Support/SimulatorRTL.cpp
     lib/Transforms/LowerTypes.cpp lib/Support/TargetUtils.cpp)

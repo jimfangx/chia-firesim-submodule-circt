@@ -5,6 +5,17 @@
 #include <string>
 
 namespace goldengate {
+// Collapse the single-use host assembly wrapper chain after driver analysis,
+// before XDC path resolution. Target/bridge/SRAM modules and boundaries owning
+// inner symbols or explicit XDC references stay hierarchical.
+// Native CIRCT inlining maintains connections, annotations and inner symbols.
+// The serialized archive remains historical; inline blackboxes are attached
+// before dead-module elimination and must not be replayed afterwards.
+// Failure leaves the source IR unchanged. Repeated calls are a no-op.
+mlir::LogicalResult normalizeHostHierarchy(mlir::ModuleOp source,
+                                         llvm::StringRef outputFilename,
+                                         unsigned &inlinedWrappers,
+                                         std::string &error);
 // Match CIRCT's generated memory initializer and share one 32-bit random
 // draw across chunks and rows, as SFC's replicated initialization word does.
 // Unknown loop shapes, guards, bounds and extra consumers remain unchanged.

@@ -9,6 +9,9 @@
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
+#include "circt/Dialect/FIRRTL/Passes.h"
+#include "circt/Support/Namespace.h"
+#include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/HW/HWOps.h"
 #include "circt/Dialect/OM/OMDialect.h"
@@ -21,11 +24,14 @@
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringMap.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
+#include <functional>
 
 using namespace mlir;
 using namespace circt;
@@ -242,6 +248,8 @@ void terminateUnusedInstanceOutputs(ModuleOp module) {
 LogicalResult attachInlineBlackBoxes(firrtl::CircuitOp circuit,
                                     StringRef outputFilename,
                                     std::string &error) {
+  if (circuit->hasAttr("goldengate.inlineBlackBoxesPrepared"))
+    return success();
   auto archive = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!archive)
     return success();
@@ -318,6 +326,168 @@ LogicalResult attachInlineBlackBoxes(firrtl::CircuitOp circuit,
   return success();
 }
 } // namespace
+
+LogicalResult goldengate::normalizeHostHierarchy(ModuleOp source,
+                                                StringRef outputFilename,
+                                                unsigned &inlinedWrappers,
+                                                std::string &error) {
+  using namespace firrtl;
+  inlinedWrappers = 0;
+  auto reject = [&](StringRef reason) {
+    error = reason.str();
+    return failure();
+  };
+  auto circuits = source.getOps<CircuitOp>();
+  if (std::distance(circuits.begin(), circuits.end()) != 1 ||
+      failed(verify(source)))
+    return reject("host hierarchy requires one valid FIRRTL circuit");
+  auto original = *circuits.begin();
+  if (original->hasAttr("goldengate.hostHierarchyNormalized"))
+    return success();
+  auto *context = source.getContext();
+  context->loadDialect<debug::DebugDialect>();
+  OwningOpRef<ModuleOp> candidate = cast<ModuleOp>(source->clone());
+  auto circuit = *candidate->getOps<CircuitOp>().begin();
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw)
+    return reject("host hierarchy requires retained annotations");
+  SymbolTable symbols(circuit);
+  auto top = dyn_cast_or_null<FModuleOp>(symbols.lookup("FPGATop"));
+  if (!top)
+    return reject("host hierarchy requires the assembled FPGATop");
+
+  // Explicit user XDC references must remain resolvable. Preserve every
+  // module mentioned in their local or nonlocal paths rather than rewriting
+  // serialized reference strings. Generated clock constraints are attached
+  // to actual target instances and follow the final instance graph.
+  llvm::StringSet<> protectedModules;
+  std::function<void(Attribute)> protect = [&](Attribute attr) {
+    if (!attr) return;
+    if (auto text = dyn_cast<StringAttr>(attr)) {
+      StringRef value = text.getValue();
+      if (!value.starts_with("~")) return;
+      auto hierarchy = value.split('|').second.split('>').first;
+      SmallVector<StringRef> path;
+      hierarchy.split(path, '/');
+      if (!path.empty()) protectedModules.insert(path.front());
+      for (auto step : ArrayRef<StringRef>(path).drop_front())
+        protectedModules.insert(step.split(':').second);
+    } else if (auto array = dyn_cast<ArrayAttr>(attr)) {
+      for (auto item : array) protect(item);
+    } else if (auto dict = dyn_cast<DictionaryAttr>(attr)) {
+      for (auto item : dict) protect(item.getValue());
+    }
+  };
+  for (auto attr : raw) {
+    auto annotation = dyn_cast<DictionaryAttr>(attr);
+    auto cls = annotation ? annotation.getAs<StringAttr>("class") : StringAttr();
+    if (cls && cls.getValue() == AnnotationClasses::InternalXDC)
+      protect(annotation.get("argumentList"));
+  }
+  // An attached inner symbol is scoped to its owning module. Keep that
+  // boundary even when no retained JSON annotation mentions it; consumers
+  // may already hold native InnerRefAttr identities. Preserve symbol-bearing
+  // instances as well, since inlining their children removes the instance.
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    bool hasSymbols = false;
+    for (unsigned port = 0; port < module.getNumPorts(); ++port) {
+      auto symbol = module.getPortSymbolAttr(port);
+      hasSymbols |= symbol && !symbol.empty();
+    }
+    module.walk([&](Operation *op) {
+      auto symbol = op->getAttrOfType<hw::InnerSymAttr>("inner_sym");
+      hasSymbols |= symbol && !symbol.empty();
+      if (auto instance = dyn_cast<InstanceOp>(op))
+        if (symbol && !symbol.empty())
+          protectedModules.insert(instance.getModuleName());
+    });
+    if (hasSymbols) protectedModules.insert(module.getName());
+  }
+
+  llvm::DenseMap<Attribute, unsigned> uses;
+  circuit.walk([&](InstanceOp instance) { ++uses[instance.getModuleNameAttr()]; });
+  SmallVector<FModuleOp> wrappers;
+  llvm::DenseSet<Operation *> visited;
+  FModuleOp parent = top;
+  while (visited.insert(parent.getOperation()).second) {
+    InstanceOp sim;
+    for (auto instance : parent.getOps<InstanceOp>())
+      if (instance.getName() == "sim") {
+        if (sim) return reject("ambiguous host assembly wrapper chain");
+        sim = instance;
+      }
+    if (!sim) break;
+    auto child = dyn_cast_or_null<FModuleOp>(symbols.lookup(sim.getModuleName()));
+    if (!child || !child.getName().starts_with("GG") ||
+        !child.getName().ends_with("Wrapper")) break;
+    // Retain the innermost simulation boundary (channel/target wrapper).
+    // Only assembly modules that themselves forward through `sim` qualify.
+    bool forwards = false;
+    for (auto instance : child.getOps<InstanceOp>())
+      forwards |= instance.getName() == "sim";
+    if (!forwards) break;
+    if (uses[sim.getModuleNameAttr()] != 1)
+      return reject("host assembly wrapper must have one instance");
+    if (!protectedModules.count(child.getName())) wrappers.push_back(child);
+    parent = child;
+  }
+  if (wrappers.empty()) return success();
+
+  // Attach retained blackbox sources before the native inliner removes dead
+  // modules. RTL emission then uses those attached annotations, not obsolete
+  // module targets from the historical archive.
+  if (failed(attachInlineBlackBoxes(circuit, outputFilename, error)))
+    return failure();
+  circuit->setAttr("goldengate.inlineBlackBoxesPrepared", UnitAttr::get(context));
+  llvm::DenseSet<Operation *> existing;
+  top.walk([&](Operation *op) { existing.insert(op); });
+  auto inlineAnno = DictionaryAttr::get(context, {
+      {StringAttr::get(context, "class"),
+       StringAttr::get(context, "firrtl.passes.InlineAnnotation")}});
+  for (auto wrapper : wrappers) {
+    // Builders leave assembly modules public. Once their unique instance is
+    // inlined they are internal implementation details, not exported roots;
+    // otherwise CIRCT retains every progressively flattened duplicate body.
+    SymbolTable::setSymbolVisibility(wrapper, SymbolTable::Visibility::Private);
+    AnnotationSet annotations(wrapper);
+    annotations.addAnnotations(ArrayRef<Attribute>{inlineAnno});
+    annotations.applyToOperation(wrapper);
+  }
+  PassManager passes(context);
+  passes.nest<CircuitOp>().addPass(createInlinerPass());
+  if (failed(passes.run(*candidate)))
+    return reject("CIRCT host assembly wrapper inlining failed");
+
+  // Native inlining prefixes names with every removed instance. Bound those
+  // names too: sim_sim_... is a construction artifact, not a useful identity.
+  // Existing declarations and explicit XDC roots keep their original names.
+  // CIRCT inner symbols remain untouched and retain their native rename map.
+  if (!protectedModules.count(top.getName())) {
+    circt::Namespace names;
+    for (auto name : top.getPortNames())
+      names.newName(cast<StringAttr>(name).getValue());
+    SmallVector<Operation *> shorten;
+    top.walk([&](Operation *op) {
+      auto name = op->getAttrOfType<StringAttr>("name");
+      if (!name) return;
+      if (!existing.count(op) && name.getValue().starts_with("sim_sim_"))
+        shorten.push_back(op);
+      else names.newName(name.getValue());
+    });
+    for (auto *op : shorten) {
+      StringRef base = op->getAttrOfType<StringAttr>("name").getValue();
+      while (base.consume_front("sim_")) {}
+      op->setAttr("name", StringAttr::get(context, names.newName(base)));
+    }
+  }
+  circuit->setAttr("goldengate.hostHierarchyNormalized", UnitAttr::get(context));
+  if (failed(verify(*candidate)))
+    return reject("host hierarchy normalization produced invalid FIRRTL IR");
+  inlinedWrappers = wrappers.size();
+  original->setAttrs(circuit->getAttrs());
+  original.getBody().takeBody(circuit.getBody());
+  return success();
+}
 
 LogicalResult goldengate::emitSimulatorRTL(ModuleOp source,
                                           StringRef inputFilename,
