@@ -221,6 +221,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--extract-sram-models";
   bool analyzeSRAMChannels =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-sram-channels";
+  bool rewriteSRAMModels =
+      argc == 7 && llvm::StringRef(argv[6]) == "--rewrite-sram-models";
   bool rewriteSRAMTransport =
       argc == 7 && llvm::StringRef(argv[6]) == "--rewrite-sram-transport";
   bool rewriteSRAMParentFAME =
@@ -341,7 +343,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !wrapRAMModel && !emitAsyncRAM && !materializeRAM && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
+       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !rewriteSRAMModels && !wrapRAMModel && !emitAsyncRAM && !materializeRAM && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -354,7 +356,7 @@ int main(int argc, char **argv) {
                     "--rewrite-fame-output-channel channel | "
                     "--rewrite-fame-inputs-with-output all|channel[,channel...] | "
                     "--apply-fame-defaults | --promote-passthrough | "
-                    "--extract-models | --wrap-top | --update-bridge-clocks | "
+                    "--rewrite-sram-models | --extract-models | --wrap-top | --update-bridge-clocks | "
                     "--label-multithreaded-models=on|off | "
                     "--infer-default-clocks | "
                     "--excise-channels | --infer-model-ports | "
@@ -4252,7 +4254,7 @@ int main(int argc, char **argv) {
     return 0;
   };
 
-  if (analyzeSRAMChannels || rewriteSRAMClocks || rewriteSRAMFAME || rewriteSRAMTransport || rewriteSRAMParentFAME) {
+  if (analyzeSRAMChannels || rewriteSRAMClocks || rewriteSRAMFAME || rewriteSRAMTransport || rewriteSRAMParentFAME || rewriteSRAMModels) {
     std::string error;
     unsigned wrapped = 0, promoted = 0;
     if (failed(goldengate::prepareSRAMModelChannels(
@@ -4278,6 +4280,9 @@ int main(int argc, char **argv) {
     if (dependencyError) return fail("cannot write SRAM channel dependencies");
     dependencyOut << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(dependencies)));
     unsigned clockModels = 0;
+    if (rewriteSRAMModels &&
+        failed(goldengate::rewriteSRAMTimingModels(circuit, clockModels, error)))
+      return fail("SRAM timing models: " + error);
     if (rewriteSRAMClocks &&
         failed(goldengate::rewriteSRAMVirtualClocks(circuit, clockModels, error)))
       return fail("SRAM virtual clocks: " + error);
@@ -4293,9 +4298,9 @@ int main(int argc, char **argv) {
     if (failed(mlir::verify(*module)))
       return fail("SRAM clock/channel boundary produced invalid FIRRTL IR");
     llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
-    llvm::sys::path::append(firPath, rewriteSRAMParentFAME ? "post-sram-parent-fame.fir" : rewriteSRAMTransport ? "post-sram-transport.fir" : rewriteSRAMFAME ? "post-sram-fame.fir" : rewriteSRAMClocks ? "post-sram-clocks.fir"
+    llvm::sys::path::append(firPath, rewriteSRAMModels ? "post-sram-models.fir" : rewriteSRAMParentFAME ? "post-sram-parent-fame.fir" : rewriteSRAMTransport ? "post-sram-transport.fir" : rewriteSRAMFAME ? "post-sram-fame.fir" : rewriteSRAMClocks ? "post-sram-clocks.fir"
                                                    : "post-sram-channels.fir");
-    llvm::sys::path::append(annotationPath, rewriteSRAMParentFAME ? "post-sram-parent-fame-all.json" : rewriteSRAMTransport ? "post-sram-transport-all.json" : rewriteSRAMFAME ? "post-sram-fame-all.json" : rewriteSRAMClocks ? "post-sram-clocks-all.json"
+    llvm::sys::path::append(annotationPath, rewriteSRAMModels ? "post-sram-models-all.json" : rewriteSRAMParentFAME ? "post-sram-parent-fame-all.json" : rewriteSRAMTransport ? "post-sram-transport-all.json" : rewriteSRAMFAME ? "post-sram-fame-all.json" : rewriteSRAMClocks ? "post-sram-clocks-all.json"
                                                           : "post-sram-channels-all.json");
     std::error_code ec;
     llvm::raw_fd_ostream out(firPath, ec);
@@ -4310,6 +4315,12 @@ int main(int argc, char **argv) {
       return fail("cannot export SRAM channel annotations: " + error);
     llvm::outs() << "Prepared channels for " << wrapped << " SRAM wrappers after "
                  << promoted << " promotions in " << firPath << '\n';
+    if (rewriteSRAMModels) {
+      if (failed(goldengate::emitOutputFiles(circuit, outputDir, "post-sram-models", error)))
+        return fail("SRAM collateral emission: " + error);
+      llvm::outs() << "Materialized native timing models and XDC for " << clockModels
+                   << " SRAM definitions\n";
+    }
     if (rewriteSRAMFAME)
       llvm::outs() << "Constructed virtual-clock FAME FSMs for " << clockModels
                    << " SRAM definitions\n";

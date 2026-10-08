@@ -20,6 +20,8 @@
 #include "goldengate/LowerTypes.h"
 #include "goldengate/PromotePassthroughConnections.h"
 #include "goldengate/RemainingFanout.h"
+#include "goldengate/RAMModelAdapter.h"
+#include "goldengate/XDCEmission.h"
 #include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "llvm/ADT/BitVector.h"
@@ -793,4 +795,57 @@ LogicalResult goldengate::rewriteSRAMPipeTransport(CircuitOp circuit, unsigned &
 LogicalResult goldengate::rewriteSRAMParentFAME(CircuitOp circuit, unsigned &rewritten,
                                                std::string &error) {
   return rewriteSRAMBoundary(circuit, rewritten, error, true, false);
+}
+
+/// Required input invariants: prepared ground scalar parent/SRAM channels,
+/// supported read/write payloads and one XDC circuit path mapping.
+/// Annotations consumed: XDC paths/snippets; memory/channel targets transfer
+/// through FAME and remain on the adapter ports. Annotations produced: XDC
+/// output files. IR mutations: FAME state, queues and async RAM implementations.
+/// Analyses required: hierarchy, channel binding, dependencies and typed targets.
+/// Analyses preserved: none. Output invariants: verified executable memory
+/// transport; only surviving hub gates contribute generated-clock constraints.
+LogicalResult goldengate::rewriteSRAMTimingModels(
+    CircuitOp circuit, unsigned &rewritten, std::string &error) {
+  rewritten = 0;
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  auto raw = (*staged)->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "SRAM timing models require retained memory annotations";
+    return failure();
+  }
+  SmallVector<std::string> names;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (!anno.isClass(AnnotationClasses::ModelReadPort) &&
+        !anno.isClass(AnnotationClasses::ModelWritePort) &&
+        !anno.isClass(AnnotationClasses::ModelReadWritePort)) continue;
+    auto addr = anno.getMember<StringAttr>("addr");
+    auto target = addr ? resolveAnnotationTarget(*staged, addr.getValue(), error)
+                       : std::nullopt;
+    if (!target || !isa<FModuleOp>(target->module.getOperation())) return failure();
+    auto name = target->module.getName().str();
+    if (!llvm::is_contained(names, name)) names.push_back(std::move(name));
+  }
+  unsigned count = 0;
+  if (failed(rewriteSRAMFAMEImpl(*staged, count, error, true, true))) return failure();
+  for (const auto &name : names) {
+    FModuleOp wrapper, implementation;
+    for (auto model : staged->getOps<FModuleOp>())
+      if (model.getName() == name) wrapper = model;
+    RAMModelParameters parameters;
+    if (failed(materializeRAMModel(*staged, wrapper, implementation, parameters, error)))
+      return failure();
+  }
+  // Resolve constraints while native gate identity and the complete transport
+  // hierarchy still exist. FIRRTL text export cannot retain these attributes.
+  if (failed(prepareXDCOutput(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "SRAM timing models produced invalid FIRRTL IR";
+    return failure();
+  }
+  circuit->setAttrs((*staged)->getAttrs());
+  circuit.getBody().takeBody(staged->getBody());
+  rewritten = names.size();
+  return success();
 }

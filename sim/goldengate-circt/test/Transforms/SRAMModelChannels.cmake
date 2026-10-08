@@ -411,3 +411,57 @@ execute_process(COMMAND "${COMPILER}" "${OUTPUT}/single.fir"
 if(status EQUAL 0 OR NOT stderr MATCHES "data target has unsupported retained annotation metadata")
   message(FATAL_ERROR "Unknown SRAM data metadata was not rejected: ${stdout}\n${stderr}")
 endif()
+
+# Carry native gate identity through transport and RAM replacement before XDC
+# export. Virtual SRAM gates must disappear with the original wrapper bodies;
+# only the surviving hub gate is constrained, even with four RAM instances.
+file(READ "${FIXTURES}/SRAMModelChannels.json" timing_annos)
+string(JSON timing_count LENGTH "${timing_annos}")
+string(JSON timing_annos SET "${timing_annos}" ${timing_count}
+  "{\"class\":\"midas.targetutils.xdc.XDCPathToCircuitAnnotation\",\"preLinkPath\":\"pre/link\",\"postLinkPath\":\"post/link\"}")
+string(JSON timing_annos SET "${timing_annos}" 1 channelInfo perClockMFMR 0 "3")
+file(WRITE "${OUTPUT}/timing-models.json" "${timing_annos}")
+file(READ "${FIXTURES}/SRAMModelChannels.fir" timing_input)
+string(REGEX REPLACE "      readwriter => rw\n" "" timing_input "${timing_input}")
+string(REGEX REPLACE "    ram\\.rw[^\n]*\n" "" timing_input "${timing_input}")
+file(WRITE "${OUTPUT}/timing-models.fir" "${timing_input}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/timing-models.fir"
+  --annotation-file "${OUTPUT}/timing-models.json"
+  --output-dir "${OUTPUT}/timing-models" --rewrite-sram-models
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM timing/transport boundary failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/timing-models/post-sram-models.fir" timing_fir)
+file(READ "${OUTPUT}/timing-models/post-sram-models.implementation.xdc" implementation_xdc)
+file(READ "${OUTPUT}/timing-models/post-sram-models.synthesis.xdc" synthesis_xdc)
+string(REGEX MATCHALL "inst [^\n]*_buffer of AbstractClockGate" surviving_gates "${timing_fir}")
+list(LENGTH surviving_gates gate_count)
+if(NOT gate_count EQUAL 1 OR NOT timing_fir MATCHES "module RamModel" OR
+   NOT timing_fir MATCHES "inst model of RamModel" OR
+   NOT implementation_xdc MATCHES "post/link/target_FAMETop/Top/clock_buffer/O" OR
+   NOT implementation_xdc MATCHES "set_multicycle_path 3 -setup" OR
+   NOT implementation_xdc MATCHES "set_multicycle_path 2 -hold" OR
+   synthesis_xdc MATCHES "create_generated_clock")
+  message(FATAL_ERROR "Native timing/storage/clock collateral differs: gates=${gate_count}, XDC=${implementation_xdc}")
+endif()
+# A late collateral failure must leave no partial candidate output, despite
+# already constructing FAME, transport and RAM bodies on the staged circuit.
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/timing-models.fir"
+  --annotation-file "${FIXTURES}/SRAMModelChannels.json"
+  --output-dir "${OUTPUT}/missing-xdc-path" --rewrite-sram-models
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "exactly one circuit path annotation" OR
+   EXISTS "${OUTPUT}/missing-xdc-path/post-sram-models.fir")
+  message(FATAL_ERROR "Missing XDC path did not reject the complete staged boundary: ${stdout}\n${stderr}")
+endif()
+message(STATUS "Passed native SRAM timing/transport/XDC boundary and late failure rejection")
+
+execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
+  --annotation-file "${OUTPUT}/timing-models.json"
+  --output-dir "${OUTPUT}/unsupported-timing-port" --rewrite-sram-models
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "does not support readwrite ports" OR
+   EXISTS "${OUTPUT}/unsupported-timing-port/post-sram-models.fir")
+  message(FATAL_ERROR "Unsupported timing ABI was not rejected: ${stdout}\n${stderr}")
+endif()

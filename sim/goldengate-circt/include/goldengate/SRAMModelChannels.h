@@ -54,4 +54,12 @@ mlir::LogicalResult rewriteSRAMParentFAME(
 // Commits only a verified clone. Optional timing-model replacement is separate.
 mlir::LogicalResult rewriteSRAMPipeTransport(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
+// Complete the optional prepared-memory boundary: parent/SRAM FAME, pipe
+// transport, native async RAM materialization and hierarchy-resolved XDC.
+// Requires the transport invariants, supported MemPortAnnotation ABIs, and
+// exactly one XDCPathToCircuitAnnotation. Commits a verified circuit clone;
+// any unsupported memory or collateral leaves all definitions unchanged.
+mlir::LogicalResult rewriteSRAMTimingModels(
+    circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
+
 }

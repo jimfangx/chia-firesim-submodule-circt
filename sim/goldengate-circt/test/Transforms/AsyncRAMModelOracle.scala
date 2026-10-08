@@ -53,7 +53,8 @@ object AsyncRAMModelCompare extends App {
   import AsyncRAMModelFiles._
   val directory = new java.io.File(args(0))
   val materialized = args.lift(1).contains("--materialized")
-  val boundary = if (materialized) "post-ram-model" else "post-async-ram"
+  val sramTiming = args.lift(1).contains("--sram-timing")
+  val boundary = if (sramTiming) "post-sram-models" else if (materialized) "post-ram-model" else "post-async-ram"
   def statements(s: Statement): Seq[Statement] = {
     val out = mutable.ArrayBuffer[Statement]()
     def visit(v: Statement): Unit = { out += v; v.foreachStmt(visit) }
@@ -127,7 +128,7 @@ object AsyncRAMModelCompare extends App {
       (values, next, write, ref("data.read_data_async.addr").toInt)
     }
   }
-  for (name <- (if (materialized) Seq("golden-rocket", "aggregate") else
+  for (name <- (if (sramTiming) Seq("fanout", "golden-rocket") else if (materialized) Seq("golden-rocket", "aggregate") else
       Seq("golden-rocket", "aggregate", "multiport"))) {
     val reference = new Machine(selected(new java.io.File(directory, s"$name.expected.fir")))
     val native = new Machine(selected(new java.io.File(directory, s"$name-native/$boundary.fir")))
@@ -136,7 +137,9 @@ object AsyncRAMModelCompare extends App {
     val actualAnnotations = JsonProtocol.deserialize(read(new java.io.File(directory,
       s"$name-native/$boundary-all.json")))
     val inputAnnotations = JsonProtocol.deserialize(read(new java.io.File(directory, s"$name.input.json")))
-    require(actualAnnotations == inputAnnotations, "emitter changed annotations")
+    // The complete SRAM boundary intentionally transfers targets and emits
+    // XDC; SRAMTimingModelsCompare checks its full annotation multiset.
+    if (!sramTiming) require(actualAnnotations == inputAnnotations, "emitter changed annotations")
     val random = new scala.util.Random(0x55L)
     def values(widths: Map[String, Int]) = widths.map { case (n, w) => n -> BigInt(w, random) }
     var state = values(reference.regs)

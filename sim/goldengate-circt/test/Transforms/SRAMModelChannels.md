@@ -748,16 +748,89 @@ java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMMod
   "$evidence" --materialized
 ```
 
+## Complete optional SRAM timing/transport boundary (iteration 57)
+
+`--rewrite-sram-models` now carries one prepared CIRCT circuit through parent
+and SRAM FAME, pipe transport, native async RAM materialization, and XDC
+resolution. `rewriteSRAMTimingModels` discovers selected definitions from typed
+memory-port targets and performs the entire rewrite on a verified circuit
+clone. Unsupported timing ABIs or late XDC failures discard that clone. The
+CLI emits `post-sram-models.fir`, its complete annotation sidecar, and the two
+`post-sram-models` XDC files.
+
+Hub controls already attached generated-clock metadata to actual gate
+operations. Exporting and re-importing FIRRTL between the earlier isolated
+boundaries lost those attributes. The combined boundary resolves them after
+transport insertion and SRAM body replacement, before text export. Virtual
+SRAM gates disappear with the replaced bodies; only surviving hub gates
+contribute constraints. CTest checks four promoted SRAM instances, MFMR=3
+setup and MFMR-1 hold, comment-only synthesis collateral, unsupported readwrite
+ports and a late missing-path failure. The existing readwrite fixture remains
+unchanged; its supported timing probe removes those ports in a mutable copy.
+
+The exact immutable source is
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`.
+It contains Rocket's `rf : UInt<64>[31]` at line 145182. Fresh production SFC
+preparation selects that register file and complete Rocket external channels.
+`SRAMTimingModelsOracle.scala` independently runs unchanged SFC preparation,
+FAMETransform, EmitAndWrapRAMModels and WriteXDCFile. No supplied host module
+or SFC-transformed model is ingested by the native candidate.
+
+The structured comparison passes for 21 adapter equations, 61 hub control
+equations, four instances and 72 retained annotations on the fanout probe;
+Rocket matches 29 adapter equations, 1,029 hub control equations, one instance
+and 1,248 retained annotations. Hub/adapter ABIs, generated FAME register
+contracts, memory command indices and both XDC bodies match. Annotation
+normalization accounts only for circuit/container insertion, legal hub-instance
+uniquing, and conversion of the scalar Clock token to its Boolean vector lane.
+The XDC oracle supplies the outer transport container as a path prefix, then
+SFC independently expands the actual hub/gate hierarchy below it. Ordinary
+Rocket register-expression serialization still differs between normalization
+pipelines; this comparator checks generated FAME controls rather than claiming
+complete target RTL equivalence.
+
+`AsyncRAMModelCompare --sram-timing` evaluates the actual native host operations
+from these complete candidate circuits against SFC over 40,000 transitions,
+including arbitrary register states, reset, backpressure, responses and writes.
+All 39 focused SRAM/RAM/FAME/XDC CTests pass. Both complete candidate hierarchies
+lower through pinned CIRCT firtool to split SystemVerilog; the mutable lowering
+copies remove only the exporter's public-module keyword for FIRRTL 1.2 parser
+compatibility.
+
+Direct comparison with the immutable U250 build-tree
+`design/FireSim-generated.implementation.xdc` confirms the same host-clock
+source, divide-by=1, setup=1 and hold=0 contract. Clock names and gate paths
+intentionally differ because the probe isolates Rocket instead of the full
+FireSim hub. `design/FireSim-generated.synthesis.xdc` matches the comment-only
+native synthesis body exactly. The fixture root is
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01`.
+
+Mutable evidence lives under `iteration57-sram-timing-models/` in the U250
+generated directory: preparation and RAM/XDC oracle outputs, complete native
+candidates, `comparison.log`, `timing-comparison.log`, `golden-clock-contract.log`,
+`ctest.log` and both lowering logs/RTL directories. After sourcing the FireSim
+environment and compiling the Scala oracle files, reproduce with:
+
+```sh
+java -Xmx8G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.SRAMTimingModelsOracle "$evidence"
+"$native_compiler" "$evidence/golden-rocket.input.fir" \
+  --annotation-file "$evidence/golden-rocket.input.json" \
+  --output-dir "$evidence/golden-rocket-native" --rewrite-sram-models
+"$native_compiler" "$evidence/fanout.input.fir" \
+  --annotation-file "$evidence/fanout.input.json" \
+  --output-dir "$evidence/fanout-native" --rewrite-sram-models
+java -Xmx8G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.SRAMTimingModelsCompare "$evidence"
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMModelCompare "$evidence" --sram-timing
+```
+
 ## Remaining scope
 
-Shared SRAM definitions now have native FAME data/clock hardware with distinct
-instance bindings, native transport for complete scalar parent graphs, and
-native host-module creation, command/response adapters and async timing hardware.
-Optional memory selection is still absent from the default FireSim build.
-SRAM generated-clock collateral also needs integration. Legacy retained
-domain-clock annotations have the same erased top-clock references as SFC after
-FAME; later consumers must use captured domain identity rather than resolve
-those as surviving ports. The next smallest step is the selected-memory
-end-to-end boundary and generated-clock collateral comparison, followed by
-optional selection in the FireSim compiler pipeline. FAME-5 and wider memory
-shapes remain separate incomplete work.
+Shared SRAM definitions now have a combined native FAME, transport, timing-model
+and generated-clock collateral boundary. Optional memory selection is still
+absent from the default FireSim build, and full selected-memory Rocket runtime
+verification remains pending. Legacy retained domain-clock annotations have
+the same erased top-clock references as SFC after FAME; later consumers must
+use captured domain identity. The next smallest step is optional selection
+through the FireSim compiler pipeline, preserving this combined boundary and
+letting the harness exercise its transformed RTL. Readwrite/wider memory shapes
+and FAME-5 remain separate incomplete work.
