@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/SRAMModelChannels.h"
+#include "goldengate/AnnotationClasses.h"
 #include "goldengate/ChannelExcision.h"
 #include "goldengate/ExtractModel.h"
 #include "goldengate/FAMEDefaults.h"
@@ -68,4 +69,58 @@ LogicalResult goldengate::prepareSRAMModelChannels(
     return failure();
   }
   return success();
+}
+
+std::optional<llvm::SmallVector<goldengate::SRAMModelDependencies>>
+goldengate::analyzeSRAMModelDependencies(CircuitOp circuit, std::string &error) {
+  auto hierarchy = analyzeTopHierarchy(circuit, error);
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!hierarchy || !raw) {
+    if (error.empty()) error = "SRAM dependency analysis needs retained annotations";
+    return std::nullopt;
+  }
+  SmallVector<ModelPortGroup> groups;
+  SmallVector<FModuleOp> models;
+  for (Attribute attr : raw) {
+    Annotation annotation(attr);
+    if (annotation.isClass(AnnotationClasses::ChannelPorts)) {
+      auto group = analyzeModelPortGroup(circuit, annotation, error);
+      if (!group) return std::nullopt;
+      groups.push_back(std::move(*group));
+    } else if (annotation.isClass(AnnotationClasses::FAMETransform)) {
+      auto spelling = annotation.getMember<StringAttr>("target");
+      auto target = spelling ? resolveAnnotationTarget(circuit, spelling.getValue(), error)
+                             : std::nullopt;
+      auto model = target ? dyn_cast<FModuleOp>(target->module.getOperation()) : FModuleOp();
+      if (!model || target->port) {
+        if (error.empty()) error = "SRAM FAME target is not an internal module";
+        return std::nullopt;
+      }
+      if (!llvm::is_contained(models, model)) models.push_back(model);
+    }
+  }
+  SmallVector<ModelChannelBinding> bindings;
+  for (Attribute attr : raw) {
+    Annotation annotation(attr);
+    if (!annotation.isClass(AnnotationClasses::ChannelConnection)) continue;
+    auto channel = analyzeChannelConnection(circuit, annotation, error);
+    if (!channel) return std::nullopt;
+    auto bound = bindChannelToModels(*channel, *hierarchy, groups, error);
+    if (!bound) return std::nullopt;
+    bindings.append(bound->begin(), bound->end());
+  }
+  SmallVector<SRAMModelDependencies> result;
+  for (auto model : models) {
+    auto outputs = analyzeLocalChannelDependencies(model, bindings);
+    for (const auto &output : outputs) {
+      if (!output.unresolvedPorts.empty() || !output.unresolvedCauses.empty()) {
+        error = "SRAM model " + model.getName().str() + " output " +
+                output.outputChannel + " has unresolved dependencies";
+        for (const auto &cause : output.unresolvedCauses) error += ": " + cause;
+        return std::nullopt;
+      }
+    }
+    result.push_back({model, std::move(outputs)});
+  }
+  return result;
 }

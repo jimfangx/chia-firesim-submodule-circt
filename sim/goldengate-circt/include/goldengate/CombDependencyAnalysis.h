@@ -38,6 +38,8 @@ struct LocalChannelDependency {
   std::vector<std::string> unresolvedCauses;
 };
 
+// One result per module-local output group, even when several instances or
+// global branches bind that same group. Global transports are not deduplicated.
 std::vector<LocalChannelDependency> analyzeLocalChannelDependencies(
     circt::firrtl::FModuleOp module,
     llvm::ArrayRef<ModelChannelBinding> bindings);

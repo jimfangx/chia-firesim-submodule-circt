@@ -4245,6 +4245,25 @@ int main(int argc, char **argv) {
     if (failed(goldengate::prepareSRAMModelChannels(
             *module, circuit, wrapped, promoted, error)))
       return fail("SRAM model channels: " + error);
+    auto modelDependencies = goldengate::analyzeSRAMModelDependencies(circuit, error);
+    if (!modelDependencies)
+      return fail("SRAM model dependencies: " + error);
+    llvm::json::Array dependencies;
+    for (auto model : *modelDependencies)
+      for (const auto &output : model.outputs) {
+        llvm::json::Array inputs;
+        for (const auto &input : output.inputChannels) inputs.push_back(input);
+        dependencies.push_back(llvm::json::Object{
+            {"module", model.module.getName().str()},
+            {"output_channel", output.outputChannel},
+            {"input_channels", std::move(inputs)}});
+      }
+    llvm::SmallString<256> dependencyPath(outputDir);
+    llvm::sys::path::append(dependencyPath, "post-sram-channel-dependencies.json");
+    std::error_code dependencyError;
+    llvm::raw_fd_ostream dependencyOut(dependencyPath, dependencyError);
+    if (dependencyError) return fail("cannot write SRAM channel dependencies");
+    dependencyOut << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(dependencies)));
     llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
     llvm::sys::path::append(firPath, "post-sram-channels.fir");
     llvm::sys::path::append(annotationPath, "post-sram-channels-all.json");

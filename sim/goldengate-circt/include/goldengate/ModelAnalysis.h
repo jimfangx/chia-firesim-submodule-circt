@@ -31,6 +31,9 @@ analyzeModelPortGroup(circt::firrtl::CircuitOp circuit,
 // Join a global channel to local model ports through FIRRTL SSA connections.
 // This deliberately compares port identities: reverse decoupled and target
 // clock channels need not share their local FAMEChannelPorts name.
+// A global clock exported by another module has no local clockPort: SFC
+// assigns that model a virtual clock channel. The clock-owning model must
+// still have an exact local port/instance match.
 std::optional<llvm::SmallVector<ModelChannelBinding>>
 bindChannelToModels(const GGChannelConnection &channel,
                     const TopHierarchy &hierarchy,

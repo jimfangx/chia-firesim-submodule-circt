@@ -58,6 +58,33 @@ if(NOT models EQUAL 2 OR NOT unique_models EQUAL models OR
 endif()
 message(STATUS "Passed SRAM fanout, four clock domains, and unique model/port annotations")
 
+# FAME operates on module definitions, so four RAM instances must have only
+# two local output dependency records. Read latency 1 breaks both data paths.
+file(READ "${OUTPUT}/post-sram-channel-dependencies.json" dependencies)
+string(JSON dependency_count LENGTH "${dependencies}")
+if(NOT dependency_count EQUAL 46)
+  message(FATAL_ERROR "SRAM dependency graph has ${dependency_count} outputs, expected 46")
+endif()
+set(output_keys)
+set(ram_outputs 0)
+foreach(index RANGE 0 45)
+  string(JSON module GET "${dependencies}" ${index} module)
+  string(JSON output GET "${dependencies}" ${index} output_channel)
+  list(APPEND output_keys "${module}/${output}")
+  if(module STREQUAL "ram")
+    math(EXPR ram_outputs "${ram_outputs} + 1")
+    string(JSON inputs LENGTH "${dependencies}" ${index} input_channels)
+    if(NOT inputs EQUAL 0)
+      message(FATAL_ERROR "Synchronous SRAM output ${output} has combinational inputs")
+    endif()
+  endif()
+endforeach()
+list(REMOVE_DUPLICATES output_keys)
+list(LENGTH output_keys unique_outputs)
+if(NOT unique_outputs EQUAL dependency_count OR NOT ram_outputs EQUAL 2)
+  message(FATAL_ERROR "Repeated SRAM instances duplicated local FAME dependencies")
+endif()
+
 # Existing labels and protection must also survive without being re-emitted.
 file(READ "${FIXTURES}/SRAMModelChannels.json" seeded)
 string(JSON seed_count LENGTH "${seeded}")

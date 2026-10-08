@@ -136,9 +136,19 @@ goldengate::bindChannelToModels(const GGChannelConnection &channel,
       if (channel.clock && channel.clock->port &&
           channel.clock->module == hierarchy.top)
         clockConnection = lookupConnection(*channel.clock->port);
-      if (!match->clockPort || !clockConnection ||
-          clockConnection->instance != entry.instance ||
-          clockConnection->instancePort != *match->clockPort) {
+      // SFC projects the global clock into a local clockPort only on the
+      // module exporting it. A promoted SRAM on the other end uses a virtual
+      // clock channel; its group deliberately has no associated clockPort.
+      // Do not accept a missing local annotation on the clock-owning model.
+      bool localClock = clockConnection &&
+          clockConnection->instance == entry.instance;
+      auto clockInstance = clockConnection ? clockConnection->instance : InstanceOp();
+      bool remoteClock = clockConnection &&
+          clockInstance.getModuleName() != entry.instance.getModuleName();
+      if (!clockConnection ||
+          (match->clockPort ? (!localClock ||
+              clockConnection->instancePort != *match->clockPort)
+                           : !remoteClock)) {
         error = "model channel clock disagrees with global clock: " +
                 channel.name;
         return std::nullopt;

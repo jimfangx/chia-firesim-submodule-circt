@@ -480,10 +480,15 @@ goldengate::analyzeLocalChannelDependencies(
     FModuleOp module, llvm::ArrayRef<ModelChannelBinding> bindings) {
   LocalPortTracer tracer(module);
   std::vector<LocalChannelDependency> result;
+  std::set<const ModelPortGroup *> seenOutputs;
   for (const auto &output : bindings) {
     if (output.portGroup->module != module ||
-        output.portGroup->direction != Direction::Out)
+        output.portGroup->direction != Direction::Out ||
+        !seenOutputs.insert(output.portGroup).second)
       continue;
+    // InferModelPorts groups belong to module definitions. Repeated model
+    // instances and fanout branches share the same dependency description,
+    // while instance transports and physical state remain distinct.
     LocalChannelDependency dependency;
     dependency.outputChannel = output.portGroup->name;
     std::set<std::string> seenInputs;

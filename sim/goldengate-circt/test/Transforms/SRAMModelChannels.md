@@ -7,8 +7,12 @@ module-local port grouping. This follows `MidasTransforms.scala`'s ordering and
 stops at the graph consumed by `FAMETransform.scala`. The input must already have
 a wrapped top, a target-clock channel, and resolved last-connect semantics.
 
-The boundary emits `post-sram-channels.fir` and
-`post-sram-channels-all.json`. FIRRTL 1.2 statements and a large line margin let
+The boundary emits `post-sram-channels.fir`,
+`post-sram-channels-all.json`, and `post-sram-channel-dependencies.json`.
+It binds global channels back to inferred local groups and runs the native
+combinational analysis used by FAME output-valid generation. Unsupported paths
+fail the boundary instead of producing an apparently independent output.
+FIRRTL 1.2 statements and a large line margin let
 the pinned Scala parser inspect the candidate directly. The comparator ignores
 CIRCT's `public` module keyword, which the old parser does not understand.
 
@@ -89,10 +93,61 @@ Iteration 45 artifacts are under the mutable U250 generated directory's
 baseline also passed through all FAME channel/control rewrites and PrintBridge
 host binding with empty stderr. Manager verification remains harness-owned.
 
+## Dependency boundary (iteration 46)
+
+The new analysis exposed a clock-binding mismatch. SFC projects a global
+channel clock into `clockPort` only for the module exporting that clock.
+The SRAM on the other end has no local `clockPort` and uses FAME's virtual
+clock channel. Native binding now accepts that remote clock while continuing
+to require exact port/instance identity on the owner. Unit tests reject a
+missing owner clock, a falsely RAM-local clock, and a clock from the wrong side
+without changing IR.
+
+Native combinational analysis now emits one result per module-local output
+group, including when four SRAM instances or multiple transport branches
+bind the same group. Every global channel and binding remains present.
+`test/Analysis/SRAMChannelDependenciesOracle.scala` compares these results
+with the unchanged `FAMEChannelAnalysis`/`CheckCombLoops` graph using
+`FAMETransform`'s LI-BDN step 2. It compares input-channel sets because AND
+dependency order does not affect output validity, and rejects duplicate
+native output identities. It also writes the SFC dependency artifacts.
+
+Fresh preparation from the immutable `.sfc.fir` above produces:
+
+| Input | Model definitions | Local outputs | Dependency edges |
+| --- | ---: | ---: | ---: |
+| Four-instance fanout | 2 | 46 | 0 |
+| Golden Rocket register file | 2 | 10 | 4 |
+
+Both graphs match SFC. The synchronous reader/readwriter outputs have no
+combinational input dependencies. Each of Rocket's two asynchronous register
+file reads depends on its own address and enable channels; write inputs do
+not enter those output-valid conditions. The structure/annotation comparison
+still passes with the counts above. All six focused tests pass, including
+combinational dependency and channel-clock-domain regressions. A fresh native
+baseline through PrintBridge host binding passes with empty stderr.
+
+Artifacts are under `iteration46-sram-dependencies/` in the same mutable
+U250 generated directory: `oracle/golden-rocket.channels.sfc.fir/json`,
+`oracle/golden-rocket.dependencies.sfc.json`, the corresponding native
+`golden-rocket-candidate/` outputs, fanout artifacts, build and comparison
+logs, `ctest.log`, and `baseline.stdout/stderr`. Compile the additional
+`test/Analysis/SRAMChannelDependenciesOracle.scala` alongside the two oracle
+files above, then run:
+
+```sh
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMChannelDependenciesOracle "$evidence"
+ctest --test-dir "$native_build" --output-on-failure \
+  -R 'goldengate-(sram-model-channels|comb-dependency|fame-output-selection|fame-channel-clock-domains|extract-model|label-sram-models)$'
+```
+
 ## Remaining scope
 
 This establishes the optional SRAM channel graph. It does not yet connect
 optional memory selection to the default FireSim build, perform FAME hardware
 rewriting on these promoted models, or emit the abstract RAM timing models.
-The next step is to compare the register file's combinational channel
-dependencies before applying the native FAME rewrite to its SRAM model.
+The next step is to construct the virtual clock and fired-state rules for one
+promoted SRAM model using this verified dependency graph. Repeated model
+instances still need instance-aware data-port rewriting; this boundary does
+not claim those hardware transformations or abstract RAM model emission.

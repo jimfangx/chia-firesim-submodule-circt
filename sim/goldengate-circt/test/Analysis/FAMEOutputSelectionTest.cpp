@@ -559,6 +559,63 @@ void multiportAliases(MLIRContext &context, unsigned rejection) {
   }
   llvm::outs() << "PRODUCER tx_ physical aliases 4 ordered leaves 2 one token port\n";
 }
+// SRAM channels name the hub's exported clock. The RAM's local group has no
+// clockPort, matching FAMEChannelAnalysis's projection into each module.
+void remoteModelClock(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(out %hubClock: !firrtl.clock,
+          out %hubData: !firrtl.uint<8>, in %ramData: !firrtl.uint<8>,
+          in %ramClock: !firrtl.clock) {}
+      firrtl.module private @Hub(out %clock: !firrtl.clock,
+          out %data: !firrtl.uint<8>) {}
+      firrtl.module private @RAM(in %clock: !firrtl.clock,
+          in %data: !firrtl.uint<8>) {}
+    }
+  })mlir", &context);
+  require(bool(root), "remote model clock fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto it = circuit.getOps<FModuleOp>().begin();
+  auto top = *it++, hub = *it++, ram = *it;
+  OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
+  auto hubInstance = b.create<InstanceOp>(top.getLoc(), hub, "hub");
+  auto ramInstance = b.create<InstanceOp>(top.getLoc(), ram, "ram");
+  for (unsigned i = 0; i < 2; ++i) {
+    b.create<StrictConnectOp>(top.getLoc(), top.getArgument(i), hubInstance.getResult(i));
+    b.create<StrictConnectOp>(top.getLoc(), ramInstance.getResult(i), top.getArgument(i == 0 ? 3 : 2));
+  }
+  std::string error;
+  auto hierarchy = goldengate::analyzeTopHierarchy(circuit, error);
+  require(bool(hierarchy), error);
+  auto target = [&](StringRef name) {
+    auto value = goldengate::resolveAnnotationTarget(circuit, ("~Top|Top>" + name).str(), error);
+    require(bool(value), error);
+    return *value;
+  };
+  goldengate::GGChannelConnection channel;
+  channel.name = "data"; channel.kind = goldengate::ChannelKind::Pipe;
+  channel.latency = 0; channel.clock = target("hubClock");
+  channel.sources.push_back(target("hubData"));
+  channel.sinks.push_back(target("ramData"));
+  SmallVector<goldengate::ModelPortGroup> groups{
+    {"data", hub, Direction::Out, 0, {1}},
+    {"data", ram, Direction::In, std::nullopt, {1}}};
+  auto before = dump(*root);
+  auto bindings = goldengate::bindChannelToModels(channel, *hierarchy, groups, error);
+  require(bindings && bindings->size() == 2 && dump(*root) == before,
+          "hub clock/virtual SRAM clock binding failed: " + error);
+  for (unsigned bad = 0; bad < 3; ++bad) {
+    auto invalid = groups;
+    auto connection = channel;
+    if (bad == 0) invalid[0].clockPort.reset(); // Owner must retain its clock identity.
+    if (bad == 1) invalid[1].clockPort = 0; // Remote clock cannot be RAM-local.
+    if (bad == 2) connection.clock = target("ramClock");
+    error.clear();
+    require(!goldengate::bindChannelToModels(connection, *hierarchy, invalid, error) &&
+                !error.empty() && dump(*root) == before,
+            "invalid remote clock binding accepted or mutated IR");
+  }
+}
 } // namespace
 int main(int argc, char **argv) {
   try {
@@ -595,6 +652,7 @@ int main(int argc, char **argv) {
     for (unsigned rejection = 0; rejection <= 7; ++rejection)
       multiportAliases(context, rejection);
     newlySynthesizedPrintBundle(context);
+    remoteModelClock(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
                     "dependencies, scalar/multiport and mixed-kind shared producers, all data inputs and model isolation passed; 12 unsafe selections "
                     "rejected without mutation; scalar physical aliases collapsed and four unsafe rewrites rejected atomically\n";
