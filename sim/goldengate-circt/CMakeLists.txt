@@ -39,6 +39,7 @@ add_executable(goldengate-circt
   lib/Transforms/PromotePassthroughConnections.cpp
   lib/Transforms/ExtractModel.cpp
   lib/Transforms/WrapTop.cpp
+  lib/Transforms/LabelSRAMModels.cpp
   lib/Transforms/LowerTypes.cpp
   lib/Transforms/AutoCounterResetGate.cpp
   lib/Transforms/AutoCounterPrintfValues.cpp
@@ -175,6 +176,15 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-label-sram-models-test
+    test/Transforms/LabelSRAMModelsTest.cpp lib/Transforms/LabelSRAMModels.cpp)
+  target_compile_features(goldengate-label-sram-models-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-label-sram-models-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-label-sram-models-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-label-sram-models-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-label-sram-models COMMAND goldengate-label-sram-models-test)
   add_executable(goldengate-comb-dependency-test
     test/Analysis/CombDependencyAnalysisTest.cpp
     lib/Analysis/CombDependencyAnalysis.cpp lib/Transforms/LowerTypes.cpp

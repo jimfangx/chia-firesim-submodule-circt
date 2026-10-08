@@ -10,6 +10,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/LabelSRAMModels.h"
 #include "goldengate/AnnotationEmission.h"
 #include "goldengate/MetasimInterfaceHeader.h"
 #include "goldengate/SimulationMasterHeader.h"
@@ -231,6 +232,7 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--promote-aggregate-bridges";
   bool resolveDontTouch =
       argc == 7 && llvm::StringRef(argv[6]) == "--resolve-dont-touch";
+  bool labelSRAMs = argc == 7 && llvm::StringRef(argv[6]) == "--label-sram-models";
   bool lowerTypes =
       argc == 7 && llvm::StringRef(argv[6]) == "--lower-types";
   bool analyzeAutoCounter =
@@ -320,7 +322,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
+       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -339,7 +341,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
+                    "--label-sram-models | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -4183,6 +4185,34 @@ int main(int argc, char **argv) {
     out << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(summary)));
     llvm::outs() << "Resolved " << events.size()
                  << " AutoCounter events in " << path << '\n';
+    return 0;
+  }
+
+  if (labelSRAMs) {
+    std::string error;
+    // This optional transform precedes LowerTypes in MidasTransforms. Resolve
+    // CHIRRTL memories without splitting aggregate data or their identities.
+    mlir::PassManager normalization(&context);
+    normalization.nest<CircuitOp>().addNestedPass<FModuleOp>(createLowerCHIRRTLPass());
+    normalization.addNestedPass<CircuitOp>(createInferWidthsPass());
+    normalization.addNestedPass<CircuitOp>(createInferResetsPass());
+    if (failed(normalization.run(*module)))
+      return fail("SRAM high-form normalization failed");
+    unsigned extracted = 0;
+    if (failed(goldengate::labelSRAMModels(circuit, extracted, error)))
+      return fail("LabelSRAMModels: " + error);
+    if (failed(mlir::verify(*module)))
+      return fail("LabelSRAMModels produced invalid FIRRTL IR");
+    llvm::SmallString<256> irPath(outputDir), annotationPath(outputDir);
+    llvm::sys::path::append(irPath, "post-wrap-sram-models.mlir");
+    llvm::sys::path::append(annotationPath, "post-wrap-sram-models-all.json");
+    std::error_code ec;
+    llvm::raw_fd_ostream out(irPath, ec);
+    if (ec) return fail("cannot write SRAM wrapper IR: " + ec.message());
+    module->print(out); out << '\n'; out.close();
+    if (failed(goldengate::emitAllAnnotations(circuit, annotationPath, error)))
+      return fail("cannot export SRAM wrapper annotations: " + error);
+    llvm::outs() << "Extracted " << extracted << " CIRCT SRAM models in " << irPath << '\n';
     return 0;
   }
 
