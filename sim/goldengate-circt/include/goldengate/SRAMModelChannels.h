@@ -41,6 +41,10 @@ mlir::LogicalResult rewriteSRAMFAME(
 // Construct both parent and SRAM FAME definitions at the SFC FAMETransform
 // boundary, before SimWrapper queues. Shares the transport preconditions and
 // transaction, but leaves channel ports exposed for boundary comparisons.
+// Direct scalar top passthroughs become whole Decoupled connections, with
+// endpoint targets and wrapper payload identities transferred to bits. Require
+// unique PipeChannel endpoints, exclusive ground wiring and unused new names;
+// unsupported fanout/metadata fails before committing the circuit clone.
 mlir::LogicalResult rewriteSRAMParentFAME(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
 // Construct the parent clock hub and directly promoted SRAM FAME models, then

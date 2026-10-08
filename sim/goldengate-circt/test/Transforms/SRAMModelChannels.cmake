@@ -299,6 +299,104 @@ if(NOT parent_fired_count EQUAL 65 OR parent_fir MATCHES "circuit GGFAMEPipeWrap
 endif()
 message(STATUS "Passed native parent/SRAM FAME boundary before queue construction")
 
+# Bridge passthroughs are promoted top connections, not model ports. Exercise
+# unsigned and signed payloads and retained source-list order/multiplicity.
+file(READ "${FIXTURES}/SRAMModelChannels.fir" passthrough_fir)
+string(REPLACE "    inst Top of Top" "    input loop_in : UInt<8>\n    output loop_out : UInt<8>\n    input signed_in : SInt<13>\n    output signed_out : SInt<13>\n    loop_out <= loop_in\n    signed_out <= signed_in\n    inst Top of Top" passthrough_fir "${passthrough_fir}")
+file(WRITE "${OUTPUT}/passthrough.fir" "${passthrough_fir}")
+file(READ "${FIXTURES}/SRAMModelChannels.json" passthrough_annos)
+string(JSON passthrough_count LENGTH "${passthrough_annos}")
+foreach(port loop_in loop_out signed_in signed_out)
+  if(port MATCHES "_in$")
+    set(endpoint sinks)
+  else()
+    set(endpoint sources)
+  endif()
+  string(JSON passthrough_annos SET "${passthrough_annos}" ${passthrough_count}
+    "{\"class\":\"midas.passes.fame.FAMEChannelConnectionAnnotation\",\"globalName\":\"external_${port}\",\"channelInfo\":{\"class\":\"midas.passes.fame.PipeChannel\",\"latency\":0},\"${endpoint}\":[\"~FAMETop|FAMETop>${port}\"]}")
+  math(EXPR passthrough_count "${passthrough_count} + 1")
+endforeach()
+string(JSON passthrough_annos SET "${passthrough_annos}" ${passthrough_count}
+  "{\"class\":\"firrtl.transforms.CombinationalPath\",\"sink\":\"~FAMETop|FAMETop>signed_out\",\"sources\":[\"~FAMETop|FAMETop>signed_in\",\"~FAMETop|FAMETop>signed_in\"]}")
+math(EXPR passthrough_count "${passthrough_count} + 1")
+file(WRITE "${OUTPUT}/passthrough.json" "${passthrough_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/passthrough.fir"
+  --annotation-file "${OUTPUT}/passthrough.json"
+  --output-dir "${OUTPUT}/passthrough" --rewrite-sram-parent-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Top passthrough FAME failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/passthrough/post-sram-parent-fame.fir" passthrough_output)
+foreach(pair loop signed)
+  if(pair STREQUAL "loop")
+    set(payload "UInt<8>")
+  else()
+    set(payload "SInt<13>")
+  endif()
+  foreach(direction input output)
+    if(direction STREQUAL "input")
+      set(suffix in_sink)
+    else()
+      set(suffix out_source)
+    endif()
+    string(FIND "${passthrough_output}" "${direction} external_${pair}_${suffix} : { flip ready : UInt<1>, valid : UInt<1>, bits : ${payload} }" port)
+    if(port LESS 0)
+      message(FATAL_ERROR "Top passthrough ${pair} ${direction} Decoupled ABI differs")
+    endif()
+  endforeach()
+  string(FIND "${passthrough_output}" "external_${pair}_out_source <= external_${pair}_in_sink" connection)
+  if(connection LESS 0 OR passthrough_output MATCHES "(input|output) ${pair}_(in|out) :")
+    message(FATAL_ERROR "Top passthrough ${pair} has stale scalar ports or incomplete handshake")
+  endif()
+endforeach()
+file(READ "${OUTPUT}/passthrough/post-sram-parent-fame-all.json" passthrough_metadata)
+string(JSON metadata_count LENGTH "${passthrough_metadata}")
+math(EXPR metadata_last "${metadata_count} - 1")
+set(path_matches 0)
+foreach(index RANGE 0 ${metadata_last})
+  string(JSON class GET "${passthrough_metadata}" ${index} class)
+  if(class STREQUAL "firrtl.transforms.CombinationalPath")
+    math(EXPR path_matches "${path_matches} + 1")
+    string(JSON sink GET "${passthrough_metadata}" ${index} sink)
+    string(JSON sources LENGTH "${passthrough_metadata}" ${index} sources)
+    string(JSON first GET "${passthrough_metadata}" ${index} sources 0)
+    string(JSON second GET "${passthrough_metadata}" ${index} sources 1)
+    if(NOT sink STREQUAL "~FAMETop|FAMETop>external_signed_out_source.bits" OR
+       NOT sources EQUAL 2 OR NOT first STREQUAL "~FAMETop|FAMETop>external_signed_in_sink.bits" OR
+       NOT first STREQUAL second)
+      message(FATAL_ERROR "Top passthrough CombinationalPath payload identity/multiplicity differs")
+    endif()
+  endif()
+endforeach()
+if(NOT path_matches EQUAL 1)
+  message(FATAL_ERROR "Top passthrough lost or duplicated CombinationalPath")
+endif()
+string(JSON passthrough_annos SET "${passthrough_annos}" ${passthrough_count}
+  "{\"class\":\"example.UnsupportedPortAnnotation\",\"target\":\"~FAMETop|FAMETop>loop_in\"}")
+file(WRITE "${OUTPUT}/passthrough-unsupported.json" "${passthrough_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/passthrough.fir"
+  --annotation-file "${OUTPUT}/passthrough-unsupported.json"
+  --output-dir "${OUTPUT}/passthrough-unsupported" --rewrite-sram-parent-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "data target has unsupported retained annotation metadata" OR
+   EXISTS "${OUTPUT}/passthrough-unsupported/post-sram-parent-fame.fir")
+  message(FATAL_ERROR "Unsupported top passthrough metadata was not rejected atomically: ${stdout}\n${stderr}")
+endif()
+message(STATUS "Passed unsigned/signed top passthrough Decoupled wiring and ordered metadata transfer")
+
+# Generated channel names may not replace unrelated surviving scalar ports.
+string(REPLACE "    input loop_in : UInt<8>" "    input external_loop_in_sink : UInt<8>\n    input loop_in : UInt<8>" collision_fir "${passthrough_fir}")
+file(WRITE "${OUTPUT}/passthrough-name-collision.fir" "${collision_fir}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/passthrough-name-collision.fir"
+  --annotation-file "${OUTPUT}/passthrough.json"
+  --output-dir "${OUTPUT}/passthrough-name-collision" --rewrite-sram-parent-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "channel name already exists" OR
+   EXISTS "${OUTPUT}/passthrough-name-collision/post-sram-parent-fame.fir")
+  message(FATAL_ERROR "Top passthrough name collision was not rejected atomically: ${stdout}\n${stderr}")
+endif()
+
 # Unknown metadata referring to a replaced data port needs its own transfer
 # policy. Reject it instead of recursively changing arbitrary annotation text.
 file(READ "${FIXTURES}/SRAMModelChannels.json" data_seed)

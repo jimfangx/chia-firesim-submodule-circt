@@ -440,6 +440,58 @@ java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
   midas.passes.fame.SRAMParentFAMECompare "$evidence"
 ```
 
+## Top passthrough transport (iteration 52)
+
+The parent boundary now recognizes direct top input-to-output SSA connects
+with unique scalar `PipeChannel` endpoints. It constructs whole Decoupled
+connections, forwarding payload and valid toward the output and ready toward
+the input. It removes the original scalar ports and transfers their retained
+targets to `.bits`, using the existing wrapper annotation/inner-symbol policy.
+Analysis precedes port mutation; names survive index changes during model
+channelization. Unsupported metadata and generated-name collisions reject the
+staged circuit before any candidate FIRRTL is published.
+
+The same immutable Rocket `sfc.fir` listed above was prepared again by the
+unchanged Scala passes. Fresh `FAMETransform` and production `SimWrapper`
+oracles are in `iteration52-top-passthrough/oracle/` beneath the mutable U250
+generated directory. Native candidates are
+`golden-rocket-parent-fame/post-sram-parent-fame.fir` with its annotation sidecar
+and `golden-rocket-transport/post-sram-transport.fir`.
+`parent-comparison-final.log` records:
+
+- All 39 combinational-path annotations match, preserving target identity,
+  source order and multiplicity. The six remaining iteration 51 path mismatches
+  are resolved.
+- Both Rocket top passthroughs match SFC's Decoupled port types and whole-bundle
+  connections. The ten register-file channel ABIs and all memory semantic
+  fields still match; the 515 common parent ports remain identical.
+- Full native Rocket transport succeeds and has 524 queues, matching SFC's
+  queue count and payload-type multiplicities. The six passthrough/fanout
+  queues match every payload, valid, ready, destination and host-control
+  equation, including the shared bridge inputs' ready reductions.
+
+Eight native parent output aliases still have extra channel ports and
+completion conditions. This comparison explicitly retains that discrepancy;
+queue-count agreement does not establish complete transport equivalence.
+All 513 common finishing and 512 clock-ready conditions match after expanding
+native reduction nodes.
+
+CTest additionally covers unsigned and signed top passthrough payloads,
+duplicate ordered source metadata, unsupported metadata and name collisions.
+An initial negative test for raw input fanout was corrected: channel excision
+legally gives those branches separate input ports before FAME. Eleven focused
+tests and the direct baseline through PrintBridge host binding pass.
+Manager verification remains harness-owned.
+
+Reproduce the parent comparison as above, and additionally emit the transport
+candidate before running the extended comparator:
+
+```sh
+"$native_compiler" "$evidence/oracle/golden-rocket.channels-input.fir" \
+  --annotation-file "$evidence/oracle/golden-rocket.channels-input.json" \
+  --output-dir "$evidence/golden-rocket-transport" --rewrite-sram-transport
+```
+
 ## Remaining scope
 
 Shared SRAM definitions now have native FAME data/clock hardware with distinct
@@ -449,6 +501,6 @@ abstract RAM timing-model replacement and SRAM generated-clock collateral
 integration remain pending. Legacy retained domain-clock annotations have the
 same erased top-clock references as SFC after FAME; later consumers must use
 captured domain identity rather than resolve those as surviving ports. The
-next step is to channelize the complete golden Rocket probe's top passthrough
-ports and transfer their annotations, then address the eight output aliases
-and compare the full queue transport boundary.
+next step is to canonicalize the eight equivalent parent output aliases at
+model-port inference, then require complete parent ABI/completion equality
+and compare every queue's payload and handshake equations.

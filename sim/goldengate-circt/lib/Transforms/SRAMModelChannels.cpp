@@ -19,7 +19,9 @@
 #include "goldengate/LabelSRAMModels.h"
 #include "goldengate/LowerTypes.h"
 #include "goldengate/PromotePassthroughConnections.h"
+#include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
+#include "llvm/ADT/BitVector.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/Pass/PassManager.h"
@@ -259,6 +261,121 @@ struct SRAMDataPort {
   BundleType type;
 };
 
+// SFC transformTop promotes bridge-to-bridge scalar passthroughs to whole
+// Decoupled connects. Capture SSA endpoints before model rewrites invalidate
+// port indices; these endpoints have no model binding of their own.
+struct SRAMTopPassthrough {
+  std::string input, output;
+  PortInfo sink, source;
+  Operation *connect;
+};
+
+std::optional<SmallVector<SRAMTopPassthrough>> analyzeSRAMTopPassthroughs(
+    const goldengate::TopHierarchy &hierarchy,
+    ArrayRef<goldengate::GGChannelConnection> channels,
+    std::map<std::string, std::string> &renames, std::string &error) {
+  using namespace goldengate;
+  auto top = hierarchy.top;
+  auto *context = top.getContext();
+  SmallVector<SRAMTopPassthrough> result;
+  std::set<unsigned> claimed;
+  std::set<std::string> names;
+  for (auto p : top.getPorts()) names.insert(p.getName().str());
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name"))
+      names.insert(name.getValue().str());
+  });
+  auto endpointChannel = [&](unsigned port, bool source) -> const GGChannelConnection * {
+    const GGChannelConnection *found = nullptr;
+    for (const auto &channel : channels) {
+      auto &endpoints = source ? channel.sources : channel.sinks;
+      for (const auto &endpoint : endpoints) {
+        if (endpoint.module != top || endpoint.port != port) continue;
+        if (found || endpoints.size() != 1 || endpoint.fieldID.value_or(0) != 0 ||
+            channel.kind != ChannelKind::Pipe) {
+          error = "SRAM top passthrough requires unique scalar PipeChannel endpoints";
+          return nullptr;
+        }
+        found = &channel;
+      }
+    }
+    return found;
+  };
+  for (Operation &op : *top.getBodyBlock()) {
+    Value dest, src;
+    if (auto connect = dyn_cast<ConnectOp>(op)) {
+      dest = connect.getDest(); src = connect.getSrc();
+    } else if (auto connect = dyn_cast<StrictConnectOp>(op)) {
+      dest = connect.getDest(); src = connect.getSrc();
+    } else continue;
+    auto output = dyn_cast<BlockArgument>(dest), input = dyn_cast<BlockArgument>(src);
+    if (!output || !input || output.getOwner() != top.getBodyBlock() ||
+        input.getOwner() != top.getBodyBlock() || isa<ClockType>(dest.getType())) continue;
+    auto sourceChannel = endpointChannel(output.getArgNumber(), true);
+    if (!error.empty()) return std::nullopt;
+    if (!sourceChannel) continue; // Not a transformed bridge passthrough.
+    auto sinkChannel = endpointChannel(input.getArgNumber(), false);
+    if (!error.empty()) return std::nullopt;
+    if (!sinkChannel || top.getPortDirection(output.getArgNumber()) != Direction::Out ||
+        top.getPortDirection(input.getArgNumber()) != Direction::In ||
+        !isa<UIntType, SIntType>(src.getType()) || src.getType() != dest.getType() ||
+        !src.hasOneUse() || !dest.hasOneUse() ||
+        !claimed.insert(input.getArgNumber()).second ||
+        !claimed.insert(output.getArgNumber()).second ||
+        llvm::any_of(hierarchy.connections, [&](const TopPortConnection &connection) {
+          return connection.topPort == input.getArgNumber() ||
+                 connection.topPort == output.getArgNumber();
+        })) {
+      error = "SRAM top passthrough requires an exclusive ground input-to-output connection";
+      return std::nullopt;
+    }
+    auto bit = UIntType::get(context, 1);
+    auto type = BundleType::get(context,
+        {{StringAttr::get(context, "ready"), true, bit},
+         {StringAttr::get(context, "valid"), false, bit},
+         {StringAttr::get(context, "bits"), false, cast<FIRRTLBaseType>(src.getType())}});
+    auto portInfo = [&](unsigned port, StringRef name, Direction direction) -> std::optional<PortInfo> {
+      if (!names.insert(name.str()).second) {
+        error = "SRAM top passthrough channel name already exists: " + name.str();
+        return std::nullopt;
+      }
+      SmallVector<Annotation> annotations;
+      SmallVector<circt::hw::InnerSymPropertiesAttr> symbols;
+      if (failed(collectFAMEWrapperPayloadMetadata(top, port, type, {}, annotations, symbols, error)))
+        return std::nullopt;
+      PortInfo info(StringAttr::get(context, name), type, direction);
+      info.annotations = AnnotationSet(annotations, context);
+      if (!symbols.empty()) info.sym = circt::hw::InnerSymAttr::get(context, symbols);
+      return info;
+    };
+    auto sink = portInfo(input.getArgNumber(), sinkChannel->name + "_sink", Direction::In);
+    auto source = portInfo(output.getArgNumber(), sourceChannel->name + "_source", Direction::Out);
+    if (!sink || !source) return std::nullopt;
+    auto oldInput = top.getPortName(input.getArgNumber()).str();
+    auto oldOutput = top.getPortName(output.getArgNumber()).str();
+    auto prefix = "~" + top->getParentOfType<CircuitOp>().getName().str() + "|" + top.getName().str() + ">";
+    renames[prefix + oldInput] = prefix + sink->getName().str() + ".bits";
+    renames[prefix + oldOutput] = prefix + source->getName().str() + ".bits";
+    result.push_back({oldInput, oldOutput, *sink, *source, &op});
+  }
+  return result;
+}
+
+void rewriteSRAMTopPassthroughs(FModuleOp top, ArrayRef<SRAMTopPassthrough> passthroughs) {
+  for (const auto &p : passthroughs) {
+    unsigned end = top.getNumPorts();
+    top.insertPorts({{end, p.sink}, {end, p.source}});
+    auto *block = top.getBodyBlock();
+    OpBuilder builder(p.connect);
+    builder.create<ConnectOp>(p.connect->getLoc(), block->getArgument(end + 1), block->getArgument(end));
+    p.connect->erase();
+    llvm::BitVector erase(top.getNumPorts());
+    for (unsigned i = 0; i < end; ++i)
+      if (top.getPortName(i) == p.input || top.getPortName(i) == p.output) erase.set(i);
+    top.erasePorts(erase);
+  }
+}
+
 LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
                                   std::string &error, bool withParent = false,
                                   bool withQueues = true) {
@@ -378,6 +495,12 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   if (!plan) return failure();
   SmallVector<SRAMDataPort, 0> ports;
   std::map<std::string, std::string> renames;
+  SmallVector<SRAMTopPassthrough> passthroughs;
+  if (withParent) {
+    auto analyzed = analyzeSRAMTopPassthroughs(*hierarchy, channels, renames, error);
+    if (!analyzed) return failure();
+    passthroughs = std::move(*analyzed);
+  }
   auto target = [&](FModuleOp module, StringRef port) {
     return "~" + circuit.getName().str() + "|" + module.getName().str() + ">" + port.str();
   };
@@ -627,6 +750,7 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
                                     model == hub ? clockLocal + "_sink" : "", error))) return failure();
   }
   if (withParent) {
+    rewriteSRAMTopPassthroughs(hierarchy->top, passthroughs);
     if (failed(removeFAMEStaleTopClocks(hierarchy->top, error))) return failure();
     if (withQueues && (failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
         failed(addFAMEPipeWrapper(circuit, error)) ||

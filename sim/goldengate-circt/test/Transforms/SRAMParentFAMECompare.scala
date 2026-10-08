@@ -70,6 +70,23 @@ object SRAMParentFAMECompare extends App {
   require(extraPorts == knownAliases, s"unexpected parent ABI mismatch: $extraPorts")
   println(s"PASS ${expectedABI.size} common parent ports; REMAINING ${extraPorts.size} duplicate output-alias channels")
 
+  // transformTop connects whole Decoupled bundles, including flipped ready.
+  // Checking payload annotations alone would miss a scalar-only passthrough.
+  val actualTop = Hardware(module(native, native.main))
+  val expectedTop = Hardware(module(sfc, sfc.main))
+  val actualTopABI = abi(actualTop.module); val expectedTopABI = abi(expectedTop.module)
+  for ((source, sink, oldSource, oldSink) <- Seq(
+      ("external_io_fpu_hartid_source", "external_io_hartid_sink", "io_fpu_hartid", "io_hartid"),
+      ("external_io_fpu_ll_resp_data_source", "external_io_dmem_resp_bits_data_sink", "io_fpu_ll_resp_data", "io_dmem_resp_bits_data"))) {
+    for (port <- Seq(source, sink))
+      require(actualTopABI.get(port) == expectedTopABI.get(port), s"passthrough $port Decoupled ABI differs")
+    require(!actualTopABI.contains(oldSource) && !actualTopABI.contains(oldSink), "stale passthrough scalar port remains")
+    require(actualTop.connects(source).serialize == sink &&
+      actualTop.connects(source).serialize == expectedTop.connects(source).serialize,
+      s"$source payload/valid/ready passthrough differs")
+  }
+  println("PASS two top passthroughs: Decoupled ABI and complete payload/valid/ready connections match SFC")
+
   // Expand the emitted nodes before comparing completion. The only accepted
   // additional terms correspond to the eight independently observed alias ports.
   // Every common SFC condition, including clock valid, must remain identical.
@@ -124,10 +141,65 @@ object SRAMParentFAMECompare extends App {
   val actualPaths = paths(native, "golden-rocket-parent-fame/post-sram-parent-fame-all.json")
   require(expectedPaths.size == 39 && actualPaths.size == 39, "path annotation multiplicity differs")
   val matches = expectedPaths.intersect(actualPaths)
-  require(matches.size == 33, s"unexpected path transfer match count: ${matches.size}")
-  val missing = expectedPaths.diff(actualPaths); val extra = actualPaths.diff(expectedPaths)
-  require(extra.forall(a => compact(render(a)).contains(">io_hartid\"") ||
-    compact(render(a)).contains(">io_dmem_resp_bits_data\"")), "unexpected metadata mismatch beyond unchannelized passthroughs")
-  println("PASS 33/39 CombinationalPath records: actual model bindings, ordered sources and payload targets; REMAINING six top passthrough records")
-  for ((s, n) <- missing.zip(extra)) println(s"REMAINING path: SFC=${compact(render(s))}; native=${compact(render(n))}")
+  require(matches.size == 39, s"path transfer mismatch: SFC=${expectedPaths.diff(actualPaths)}; native=${actualPaths.diff(expectedPaths)}")
+  println("PASS 39/39 CombinationalPath records: actual model bindings, ordered sources, payload targets and multiplicity")
+
+  val transport = circuit("golden-rocket-transport/post-sram-transport.fir")
+  val wrapper = circuit("oracle/golden-rocket.transport-wrapper.sfc.fir")
+  val nativeWrapper = Hardware(module(transport, transport.main))
+  val sfcWrapper = Hardware(module(wrapper, wrapper.main))
+  def queues(h: Hardware) = h.stmts.collect {
+    case i: WDefInstance if i.module.startsWith("GGFAMEPipe") || i.module.startsWith("PipeChannel") => i
+  }
+  val actualQueues = queues(nativeWrapper); val expectedQueues = queues(sfcWrapper)
+  require(actualQueues.size == 524 && expectedQueues.size == 524, "complete Rocket pipe multiplicity differs")
+  def payloads(c: Circuit, qs: Seq[WDefInstance]) = qs.map(q =>
+    c.modules.find(_.name == q.module).get.ports.find(_.name == "io_in_bits").get.tpe.serialize)
+    .groupMapReduce(identity)(_ => 1)(_ + _)
+  require(payloads(transport, actualQueues) == payloads(wrapper, expectedQueues), "complete Rocket queue payload widths differ")
+  println("PASS complete Rocket transport: 524 queues and their payload-type multiplicities match production SimWrapper")
+
+  def topIdentities(h: Hardware): Map[String, String] = {
+    val instances = h.stmts.collect { case i: WDefInstance => i.name -> i.module }.toMap
+    h.module.ports.map { p =>
+      val binding = h.connects.get(p.name).map(_.serialize).orElse(h.connects.collectFirst {
+        case (lhs, rhs) if rhs.serialize == p.name => lhs
+      })
+      val child = binding.toSeq.map(_.split("\\.")).find(x => x.length == 2 && instances.contains(x(0)))
+      p.name -> child.map(x => "model." + instances(x(0)) + "." + x(1)).getOrElse("top." + p.name)
+    }.toMap
+  }
+  def normalized(text: String, identities: Map[String, String]): String = {
+    val flat = text.replaceAll("target\\.([A-Za-z0-9_]+)_(bits|valid|ready)", "target.$1.$2")
+      .replaceAll("channelPorts_([A-Za-z0-9_]+)_(bits|valid|ready)", "bridge.$1.$2")
+      .replace("target_FAMETop.", "target.")
+      .replaceAll("(?<![A-Za-z0-9_.])external_([A-Za-z0-9_]+)\\.(bits|valid|ready)", "bridge.external_$1.$2")
+    "target\\.([A-Za-z0-9_]+)\\.(bits|valid|ready)".r.replaceAllIn(flat, m =>
+      identities(m.group(1)) + "." + m.group(2))
+  }
+  val nids = topIdentities(actualTop); val sids = topIdentities(expectedTop)
+  val affected = Seq("io_hartid", "io_hartid_1", "io_dmem_resp_bits_data", "io_dmem_resp_bits_data_1",
+    "io_fpu_hartid", "io_fpu_ll_resp_data").map("PipeChannel_external_" + _)
+  for (q <- affected) {
+    val nq = actualQueues.find(_.name == q).get; val sq = expectedQueues.find(_.name == q).get
+    for (field <- Seq("io_in_bits", "io_in_valid", "io_out_ready")) {
+      val key = q + "." + field
+      require(normalized(nativeWrapper.canonical(nativeWrapper.connects(key)), nids) ==
+        normalized(sfcWrapper.canonical(sfcWrapper.connects(key)), sids), s"$key transport equation differs")
+    }
+    for (field <- Seq("io_out_bits", "io_out_valid")) {
+      def destination(h: Hardware) = h.connects.collectFirst {
+        case (lhs, rhs) if rhs.serialize == q + "." + field => lhs
+      }.get
+      require(normalized(destination(nativeWrapper), nids) == normalized(destination(sfcWrapper), sids), s"$q/$field destination differs")
+    }
+    require(nativeWrapper.connects(q + ".clock").serialize == "hostClock" &&
+      nativeWrapper.connects(q + ".reset").serialize == "hostReset" &&
+      sfcWrapper.connects(q + ".clock").serialize == "clock" &&
+      sfcWrapper.connects(q + ".reset").serialize == "reset", s"$q host controls differ")
+  }
+  for (port <- Seq("external_io_hartid_sink", "external_io_dmem_resp_bits_data_sink"))
+    require(normalized(nativeWrapper.canonical(nativeWrapper.connects(port + ".ready")), nids) ==
+      normalized(sfcWrapper.canonical(sfcWrapper.connects("channelPorts_" + port + "_ready")), sids), s"$port fanout ready differs")
+  println("PASS six passthrough/fanout queues: payload, valid, ready, destination and host-control equations match SFC")
 }
