@@ -62,13 +62,8 @@ object SRAMParentFAMECompare extends App {
     statements(expectedRam).collect { case m: DefMemory => m.copy(info = NoInfo) }, "golden rf memory semantics differ")
   println("PASS golden rf: ten channel ABIs and all memory semantic fields")
   val actualABI = abi(module(native, "Rocket")); val expectedABI = abi(module(sfc, "Rocket"))
-  require(expectedABI.forall { case (name, value) => actualABI.get(name).contains(value) }, "common Rocket port ABI differs")
-  val extraPorts = actualABI.keySet -- expectedABI.keySet
-  val knownAliases = Set("io_imem_bht_update_bits_pc", "io_ptw_sfence_valid", "io_ptw_sfence_bits_rs1",
-    "io_ptw_sfence_bits_rs2", "io_ptw_sfence_bits_addr", "io_ptw_sfence_bits_asid",
-    "io_ptw_sfence_bits_hv", "io_ptw_sfence_bits_hg").map(_ + "_source")
-  require(extraPorts == knownAliases, s"unexpected parent ABI mismatch: $extraPorts")
-  println(s"PASS ${expectedABI.size} common parent ports; REMAINING ${extraPorts.size} duplicate output-alias channels")
+  require(actualABI == expectedABI, s"Rocket port ABI differs: missing=${expectedABI.toSet -- actualABI.toSet}; extra=${actualABI.toSet -- expectedABI.toSet}")
+  println(s"PASS all ${expectedABI.size} parent ports: names, directions and complete types match SFC")
 
   // transformTop connects whole Decoupled bundles, including flipped ready.
   // Checking payload annotations alone would miss a scalar-only passthrough.
@@ -87,9 +82,8 @@ object SRAMParentFAMECompare extends App {
   }
   println("PASS two top passthroughs: Decoupled ABI and complete payload/valid/ready connections match SFC")
 
-  // Expand the emitted nodes before comparing completion. The only accepted
-  // additional terms correspond to the eight independently observed alias ports.
-  // Every common SFC condition, including clock valid, must remain identical.
+  // Expand emitted reduction nodes, preserving condition multiplicity.
+  // Every SFC condition, including clock valid, must remain identical.
   val actualHW = Hardware(module(native, "Rocket"))
   val expectedHW = Hardware(module(sfc, "Rocket"))
   def completionTerms(h: Hardware, e: Expression): Seq[String] = e match {
@@ -97,16 +91,11 @@ object SRAMParentFAMECompare extends App {
     case DoPrim(PrimOps.And, Seq(a, b), _, _) => completionTerms(h, a) ++ completionTerms(h, b)
     case other => Seq(h.canonical(other))
   }
-  val aliasConditions = knownAliases.map { port =>
-    val reg = port.stripSuffix("_source") + "_fired_0"
-    s"or(and($port.ready,$port.valid),$reg)"
-  }
   for (key <- Seq("targetCycleFinishing", "clock_sink.ready")) {
     val actual = completionTerms(actualHW, actualHW.connects(key))
     val expected = completionTerms(expectedHW, expectedHW.connects(key))
-    require(actual.diff(expected).toSet == aliasConditions && expected.diff(actual).isEmpty &&
-      actual.size == expected.size + aliasConditions.size, s"$key completion conditions differ beyond known aliases")
-    println(s"PASS $key: ${expected.size} SFC conditions after expanding native nodes; eight known alias conditions remain")
+    require(actual.sorted == expected.sorted, s"$key completion conditions differ: missing=${expected.diff(actual)}; extra=${actual.diff(expected)}")
+    println(s"PASS $key: all ${expected.size} SFC conditions and their multiplicities match")
   }
 
   def paths(c: Circuit, json: String): Seq[JValue] = {
@@ -170,36 +159,67 @@ object SRAMParentFAMECompare extends App {
     }.toMap
   }
   def normalized(text: String, identities: Map[String, String]): String = {
-    val flat = text.replaceAll("target\\.([A-Za-z0-9_]+)_(bits|valid|ready)", "target.$1.$2")
-      .replaceAll("channelPorts_([A-Za-z0-9_]+)_(bits|valid|ready)", "bridge.$1.$2")
+    val flat = queueIdentity(text).replaceAll("(?<![A-Za-z0-9_.])target\\.([A-Za-z0-9_]+)_(bits|valid|ready)", "target.$1.$2")
+      .replaceAll("(?<![A-Za-z0-9_.])channelPorts_([A-Za-z0-9_]+)_(bits|valid|ready)", "bridge.$1.$2")
       .replace("target_FAMETop.", "target.")
-      .replaceAll("(?<![A-Za-z0-9_.])external_([A-Za-z0-9_]+)\\.(bits|valid|ready)", "bridge.external_$1.$2")
-    "target\\.([A-Za-z0-9_]+)\\.(bits|valid|ready)".r.replaceAllIn(flat, m =>
+    val external = "(?<![A-Za-z0-9_.])([A-Za-z0-9_]+)\\.(bits|valid|ready)".r.replaceAllIn(flat, m =>
+      if (identities.contains(m.group(1))) "bridge." + m.matched else m.matched)
+    val resolved = "(?<![A-Za-z0-9_.])bridge\\.([A-Za-z0-9_]+)\\.(bits|valid|ready)".r.replaceAllIn(external, m =>
+      "bridge." + identities.getOrElse(m.group(1),
+        throw new IllegalArgumentException(s"unbound bridge port ${m.group(1)} in $text / $external")) + "." + m.group(2))
+    "(?<![A-Za-z0-9_.])target\\.([A-Za-z0-9_]+)\\.(bits|valid|ready)".r.replaceAllIn(resolved, m =>
       identities(m.group(1)) + "." + m.group(2))
   }
+  // SFC disambiguates the hub instance Rocket as Rocket_; pipe names embed
+  // that physical spelling. Endpoint comparison still uses model identities.
+  def queueIdentity(name: String): String =
+    name.replace("PipeChannel_Rocket__rf_", "PipeChannel_Rocket_rf_")
+      .replace("__to__Rocket__rf_", "__to__Rocket_rf_")
   val nids = topIdentities(actualTop); val sids = topIdentities(expectedTop)
-  val affected = Seq("io_hartid", "io_hartid_1", "io_dmem_resp_bits_data", "io_dmem_resp_bits_data_1",
-    "io_fpu_hartid", "io_fpu_ll_resp_data").map("PipeChannel_external_" + _)
-  for (q <- affected) {
-    val nq = actualQueues.find(_.name == q).get; val sq = expectedQueues.find(_.name == q).get
+  val actualByName = actualQueues.map(q => queueIdentity(q.name) -> q).toMap
+  val expectedByName = expectedQueues.map(q => queueIdentity(q.name) -> q).toMap
+  require(actualByName.size == 524 && expectedByName.size == 524 &&
+    actualByName.keySet == expectedByName.keySet,
+    s"pipe identities differ or collide: missing=${expectedByName.keySet -- actualByName.keySet}; extra=${actualByName.keySet -- expectedByName.keySet}")
+  for (q <- expectedByName.keys.toSeq.sorted) {
+    val nq = actualByName(q); val sq = expectedByName(q)
+    require(module(transport, nq.module).ports.find(_.name == "io_in_bits").get.tpe ==
+      module(wrapper, sq.module).ports.find(_.name == "io_in_bits").get.tpe,
+      s"$q payload type differs")
     for (field <- Seq("io_in_bits", "io_in_valid", "io_out_ready")) {
-      val key = q + "." + field
-      require(normalized(nativeWrapper.canonical(nativeWrapper.connects(key)), nids) ==
-        normalized(sfcWrapper.canonical(sfcWrapper.connects(key)), sids), s"$key transport equation differs")
+      val actual = normalized(nativeWrapper.canonical(nativeWrapper.connects(nq.name + "." + field)), nids)
+      val expected = normalized(sfcWrapper.canonical(sfcWrapper.connects(sq.name + "." + field)), sids)
+      require(actual == expected, s"$q.$field transport equation differs: native=$actual; SFC=$expected")
     }
     for (field <- Seq("io_out_bits", "io_out_valid")) {
-      def destination(h: Hardware) = h.connects.collectFirst {
-        case (lhs, rhs) if rhs.serialize == q + "." + field => lhs
-      }.get
-      require(normalized(destination(nativeWrapper), nids) == normalized(destination(sfcWrapper), sids), s"$q/$field destination differs")
+      def destinations(h: Hardware, name: String, ids: Map[String, String]) = h.connects.collect {
+        case (lhs, rhs) if rhs.serialize == name + "." + field => normalized(lhs, ids)
+      }.toSet
+      val actual = destinations(nativeWrapper, nq.name, nids)
+      val expected = destinations(sfcWrapper, sq.name, sids)
+      // Earlier bridge alias queues have no output consumer after SFC
+      // resolves last-connect semantics on their shared wrapper output.
+      require(actual == expected, s"$q/$field destinations differ: native=$actual; SFC=$expected")
     }
-    require(nativeWrapper.connects(q + ".clock").serialize == "hostClock" &&
-      nativeWrapper.connects(q + ".reset").serialize == "hostReset" &&
-      sfcWrapper.connects(q + ".clock").serialize == "clock" &&
-      sfcWrapper.connects(q + ".reset").serialize == "reset", s"$q host controls differ")
+    require(nativeWrapper.connects(nq.name + ".clock").serialize == "hostClock" &&
+      nativeWrapper.connects(nq.name + ".reset").serialize == "hostReset" &&
+      sfcWrapper.connects(sq.name + ".clock").serialize == "clock" &&
+      sfcWrapper.connects(sq.name + ".reset").serialize == "reset", s"$q host controls differ")
   }
   for (port <- Seq("external_io_hartid_sink", "external_io_dmem_resp_bits_data_sink"))
     require(normalized(nativeWrapper.canonical(nativeWrapper.connects(port + ".ready")), nids) ==
       normalized(sfcWrapper.canonical(sfcWrapper.connects("channelPorts_" + port + "_ready")), sids), s"$port fanout ready differs")
-  println("PASS six passthrough/fanout queues: payload, valid, ready, destination and host-control equations match SFC")
+  def modelSourceReadies(h: Hardware, ids: Map[String, String]) = h.connects.toSeq.flatMap {
+    case (lhs, rhs) =>
+      val key = normalized(lhs, ids)
+      if (key.startsWith("model.") && key.endsWith(".ready"))
+        Some(key -> normalized(h.canonical(rhs), ids))
+      else None
+  }.toMap
+  val actualReadies = modelSourceReadies(nativeWrapper, nids)
+  val expectedReadies = modelSourceReadies(sfcWrapper, sids)
+  require(actualReadies == expectedReadies,
+    s"model-source ready reductions differ: missing=${expectedReadies.toSet -- actualReadies.toSet}; extra=${actualReadies.toSet -- expectedReadies.toSet}")
+  println(s"PASS all ${expectedReadies.size} model-source ready reductions, including output-alias fanout")
+  println("PASS all 524 queues: payload, valid, ready, destinations and host-control equations match SFC")
 }

@@ -208,22 +208,13 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
   for (auto [index, pipe] : llvm::enumerate(pipes))
     if (pipe.targetSource) targetGroups[pipe.sourcePort].push_back(index);
   for (const auto &[port, members] : targetGroups) {
-    unsigned externalSinks = 0;
     for (unsigned index : members) {
-      const auto &pipe = pipes[index];
-      externalSinks += !pipe.loopback;
       if (members.size() > 1 &&
           (!grouped.count(index) || !grouped.count(members.front()) ||
            groupPrimary.at(index) != groupPrimary.at(members.front()))) {
         error = "shared target PipeChannel source needs a fanout annotation";
         return failure();
       }
-    }
-    // Scala ChannelizedWrapperIO deduplicates identical source targets. Only
-    // one queue may drive that external output; other queues must feed models.
-    if (externalSinks > 1) {
-      error = "target PipeChannel fanout supports at most one bridge sink";
-      return failure();
     }
   }
   return success();
@@ -431,9 +422,15 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
   auto targetPorts = target.getPorts();
   std::set<unsigned> secondaryPorts;
   std::set<unsigned> exposedSources;
-  for (const auto &channel : channels) {
-    if (channel.targetSource && !channel.loopback)
+  std::map<unsigned, unsigned> externalDrivers;
+  for (auto [index, channel] : llvm::enumerate(channels)) {
+    if (channel.targetSource && !channel.loopback) {
       exposedSources.insert(channel.sourcePort);
+      // ChannelizedWrapperIO deduplicates identical output targets. Scala
+      // connects every alias queue to that output in channel order; the last
+      // connect supplies its bits/valid. All queues read the shared ready.
+      externalDrivers[channel.sourcePort] = index;
+    }
     if (channel.loopback ||
         (!channel.targetSource && channel.port != channel.sourcePort))
       secondaryPorts.insert(channel.port);
@@ -487,8 +484,11 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
     builder.create<ConnectOp>(loc, queue.getResult(1),
                               wrapper.getArgument(wrapperPorts.at(*resetPort)));
     builder.create<ConnectOp>(loc, queue.getResult(5), field(sink, "ready"));
-    builder.create<ConnectOp>(loc, field(sink, "valid"), queue.getResult(6));
-    builder.create<ConnectOp>(loc, field(sink, "bits"), queue.getResult(7));
+    if (!channel.targetSource || channel.loopback ||
+        externalDrivers.at(channel.sourcePort) == index) {
+      builder.create<ConnectOp>(loc, field(sink, "valid"), queue.getResult(6));
+      builder.create<ConnectOp>(loc, field(sink, "bits"), queue.getResult(7));
+    }
   }
   for (const auto &[port, members] : groups) {
     Value source = target.getPortDirection(port) == Direction::Out

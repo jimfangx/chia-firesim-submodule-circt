@@ -108,24 +108,10 @@ object SRAMModelChannelsCompare extends App {
         case i: WDefInstance => instances(i.name) = i.module
         case _ =>
       }
-      // SFC's LowForm cleanup can bind two top outputs to one hub output
-      // instead of its explicit output-to-output alias. Prove equivalence
-      // from those direct assignments; do not treat arbitrary expressions
-      // or merely equal port names as equivalent.
-      val hubModule = circuit.modules.find(_.name == hub).get.asInstanceOf[Module]
-      val outputTypes = hubModule.ports.filter(_.direction == Output).map(p => p.name -> p.tpe).toMap
-      val aliases = scala.collection.mutable.Map[String, String]()
-      visit(hubModule.body) {
-        case Connect(_, WRef(p, _, _, _), WRef(q, _, _, _))
-            if outputTypes.contains(p) && outputTypes.get(q).contains(outputTypes(p)) => aliases(p) = q
-        case _ =>
-      }
-      def canonicalPort(port: String, seen: Set[String] = Set.empty): String = {
-        assert(!seen(port), s"cyclic hub output alias: $port")
-        aliases.get(port).map(p => canonicalPort(p, seen + port)).getOrElse(port)
-      }
+      // Resolve actual instance bindings without treating distinct alias
+      // outputs as equivalent. Promotion must select the same source port.
       def identity(instance: String, port: String): String =
-        s"~${circuit.main}|${instances(instance)}/${if (instances(instance) == hub) "hub" else instance}>${if (instances(instance) == hub) canonicalPort(port) else port}"
+        s"~${circuit.main}|${instances(instance)}/${if (instances(instance) == hub) "hub" else instance}>$port"
       val bindings = scala.collection.mutable.Map[String, String]()
       def bind(port: String, instance: String, childPort: String): Unit = {
         val key = s"~${circuit.main}|${circuit.main}>$port"

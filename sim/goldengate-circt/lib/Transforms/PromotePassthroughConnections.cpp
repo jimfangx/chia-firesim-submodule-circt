@@ -52,7 +52,8 @@ private:
   }
 
   std::optional<Value> trace(FModuleOp module, Value value,
-                             llvm::DenseSet<Value> &active) {
+                             llvm::DenseSet<Value> &active,
+                             Value outputRoot = {}) {
     if (!active.insert(value).second)
       return std::nullopt;
     auto finish = [&](std::optional<Value> result) {
@@ -65,30 +66,41 @@ private:
         return finish(std::nullopt);
       if (module.getPortDirection(argument.getArgNumber()) == Direction::In)
         return finish(value);
+      // Retain the last output on an identity path. If its driver is opaque
+      // (a primitive, register or memory), that output is the model source.
+      // An output-to-output alias must not acquire a separate FAME channel.
+      outputRoot = value;
     }
     if (auto instance = value.getDefiningOp<InstanceOp>()) {
       unsigned port = cast<OpResult>(value).getResultNumber();
       auto child = modules.find(instance.getModuleName().str());
       if (child == modules.end())
-        return finish(value);
+        return finish(outputRoot ? outputRoot : value);
       if (child->second.getPortDirection(port) == Direction::Out) {
         auto childSource =
             trace(child->second,
                   child->second.getBodyBlock()->getArgument(port), active);
-        auto input = childSource ? dyn_cast<BlockArgument>(*childSource)
-                                 : BlockArgument();
-        if (!input || input.getOwner() != child->second.getBodyBlock() ||
-            child->second.getPortDirection(input.getArgNumber()) !=
-                Direction::In)
-          return finish(value);
-        return finish(trace(module, instance.getResult(input.getArgNumber()),
-                            active));
+        auto portRoot = childSource ? dyn_cast<BlockArgument>(*childSource)
+                                    : BlockArgument();
+        if (!portRoot || portRoot.getOwner() != child->second.getBodyBlock())
+          return finish(outputRoot ? outputRoot : value);
+        if (child->second.getPortDirection(portRoot.getArgNumber()) ==
+            Direction::Out)
+          return finish(outputRoot ? outputRoot
+                                   : instance.getResult(portRoot.getArgNumber()));
+        return finish(trace(module, instance.getResult(portRoot.getArgNumber()),
+                            active, outputRoot));
       }
       // An instance input is a sink in its parent.  Continue through its
       // parent-side connect below, just as for a wire.
     }
     if (auto node = value.getDefiningOp<NodeOp>())
-      return finish(trace(module, node->getOperand(0), active));
+      return finish(trace(module, node->getOperand(0), active, outputRoot));
+    // A register's next-state connect is not an identity edge through the
+    // register. Only wires and instance inputs may follow their drivers.
+    if (auto *definition = value.getDefiningOp();
+        definition && !isa<WireOp, InstanceOp>(definition))
+      return finish(outputRoot ? std::optional<Value>(outputRoot) : std::nullopt);
 
     // Only exact whole-value connects are wire identities.  A FIRRTL
     // primitive, aggregate field, or multiply driven value is not one.
@@ -97,8 +109,8 @@ private:
       return finish(std::nullopt);
     auto driver = moduleDrivers.source.find(value);
     if (driver == moduleDrivers.source.end())
-      return finish(std::nullopt);
-    return finish(trace(module, driver->second, active));
+      return finish(outputRoot ? std::optional<Value>(outputRoot) : std::nullopt);
+    return finish(trace(module, driver->second, active, outputRoot));
   }
 
   std::map<std::string, FModuleOp> modules;

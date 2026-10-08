@@ -33,7 +33,7 @@ object SRAMPipeTransportOracle extends App {
     val input = new ResolveAndCheck().runTransform(CircuitState(
       Parser.parse(read(s"oracle/$name.channels.sfc.fir")), LowForm,
       JsonProtocol.deserialize(read(s"oracle/$name.channels.sfc.json"))))
-    val fame = new FAMETransform().runTransform(input)
+    val fame = AddRemainingFanoutAnnotations.runTransform(new FAMETransform().runTransform(input))
     write(s"oracle/$name.transport-fame.sfc.fir", fame.circuit.serialize)
     write(s"oracle/$name.transport-fame.sfc.json", JsonProtocol.serialize(fame.annotations))
     implicit val parameters: Parameters = Parameters.empty

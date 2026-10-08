@@ -492,6 +492,66 @@ candidate before running the extended comparator:
   --output-dir "$evidence/golden-rocket-transport" --rewrite-sram-transport
 ```
 
+## Original output identities and shared bridge queues (iteration 53)
+
+`PromotePassthroughConnections` now retains the original model output reached
+through exact SSA wire/node/output aliases. It stops at primitives, memories,
+registers (including their next-state connects), and opaque child outputs.
+Input passthroughs still traverse hierarchy. Width conversions, ambiguous
+drivers, cycles and clock sinks are not promoted. The model body is unchanged;
+only wrapper source operands change, so `InferModelPorts` can deduplicate the
+same physical output groups as SFC before constructing fired-state hardware.
+
+Fresh Scala preparation of the immutable compiler fixture
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`
+matches native preparation on all 1,765 annotation records, 525 channels,
+523 local groups, 540 top ports and the selected register file's memory
+semantics. The channel comparator no longer equates distinct alias ports;
+it checks the actual model bindings. The four-instance preparation probe
+also matches all 197 annotation records.
+
+The strict pre-queue comparison matches all 515 Rocket port names, directions
+and types, all 513 finishing and 512 clock-ready conditions with their
+multiplicities, all 39 combinational-path records, both top passthroughs,
+and all ten register-file channel ABIs/memory semantic fields. The eight
+duplicate alias channels and their additional completion terms are removed.
+
+Transport initially rejected the newly shared sources because the SRAM path
+omitted `AddRemainingFanoutAnnotations`. It now invokes the existing native
+analysis after FAME renames and before queue construction, matching the
+production `MidasTransforms` order. The Scala transport probe was also missing
+this step; it now executes the unchanged production pass before `SimWrapper`.
+Earlier transport counts remain useful, but did not test the atomic enqueue
+equations for these eight alias groups.
+
+`FAMEPipeChannel` now supports multiple bridge channels sharing one target
+output. Scala's `ChannelizedWrapperIO` deduplicates their external output;
+all queues receive its ready and the final channel in annotation order drives
+its bits/valid after last-connect resolution. The native wrapper emits that
+single final driver explicitly while preserving all queues and the producer's
+atomic ready reduction. A typed SSA regression covers alias identity and
+unsafe paths. The fanout interpreter covers both bridge-alias orders with
+different queue latencies, reset and backpressure.
+
+The complete Rocket transport comparison now matches all 524 queue payload
+types, payload/valid/ready connections, output destinations and host controls,
+plus all 367 model-source ready reductions. The four-instance probe matches
+all register reset/transition rules and handshake equations and all 52
+internal queues. Twelve focused CTests pass, including the new output-identity
+test, signed payload/output-clock/fired-state tests, coupled clock/pipe tests
+in both channel orders, and pipe fanout tests. A direct default native compile
+through PrintBridge host binding also passes. FireSim manager verification
+for this change remains harness-owned; iteration 52's supplied replacertl and
+Verilator workload results validate the preceding checkpoint.
+
+Mutable evidence is under `iteration53-output-aliases/` in the U250 generated
+directory: `oracle/golden-rocket.channels.sfc.{fir,json}`,
+`oracle/golden-rocket.transport-fame.sfc.{fir,json}`,
+`oracle/golden-rocket.transport-wrapper.sfc.fir`, both native candidates,
+`channels-comparison-final.log`, `parent-comparison-final.log`,
+`fanout-comparison-final.log` and `ctest-final.log`. No candidate is compiled
+by SFC; the comparison parses and inspects native FIRRTL directly.
+
 ## Remaining scope
 
 Shared SRAM definitions now have native FAME data/clock hardware with distinct
@@ -501,6 +561,6 @@ abstract RAM timing-model replacement and SRAM generated-clock collateral
 integration remain pending. Legacy retained domain-clock annotations have the
 same erased top-clock references as SFC after FAME; later consumers must use
 captured domain identity rather than resolve those as surviving ports. The
-next step is to canonicalize the eight equivalent parent output aliases at
-model-port inference, then require complete parent ABI/completion equality
-and compare every queue's payload and handshake equations.
+next step is to port abstract SRAM timing-model replacement on a selected
+memory, compare its model/channel boundary against SFC, then integrate optional
+memory selection and generated-clock collateral into the default compiler.

@@ -19,6 +19,7 @@
 #include "goldengate/LabelSRAMModels.h"
 #include "goldengate/LowerTypes.h"
 #include "goldengate/PromotePassthroughConnections.h"
+#include "goldengate/RemainingFanout.h"
 #include "FAMEPortAnnotations.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "llvm/ADT/BitVector.h"
@@ -752,7 +753,8 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   if (withParent) {
     rewriteSRAMTopPassthroughs(hierarchy->top, passthroughs);
     if (failed(removeFAMEStaleTopClocks(hierarchy->top, error))) return failure();
-    if (withQueues && (failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
+    if (withQueues && (failed(addRemainingFanoutAnnotations(circuit, error)) ||
+        failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
         failed(addFAMEPipeWrapper(circuit, error)) ||
         failed(addFAMEClockChannel(circuit, error)) ||
         failed(activateFAMEPipeWrapper(circuit, error)))) return failure();

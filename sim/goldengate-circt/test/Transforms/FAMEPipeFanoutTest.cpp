@@ -151,9 +151,9 @@ OwningOpRef<ModuleOp> targetFixture(MLIRContext &ctx, unsigned bad = 0) {
       b.getNamedAttr("globalName", b.getStringAttr("fork" + std::to_string(i))),
       b.getNamedAttr("channelInfo", b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
-        b.getNamedAttr("latency", b.getI64IntegerAttr(i == 1 ? 1 : 0))})),
+        b.getNamedAttr("latency", b.getI64IntegerAttr(i == 1 || (bad == 7 && i == 2) ? 1 : 0))})),
       b.getNamedAttr("sources", b.getArrayAttr({b.getStringAttr(bad == 6 && i == 2 ? "~Top|Top>other_source.bits" : "~Top|Top>producer_source.bits")}))};
-    if (i && !(bad == 2 && i == 2)) fields.push_back(b.getNamedAttr("sinks", b.getArrayAttr({
+    if (i && !((bad == 2 || bad == 7) && i == 2)) fields.push_back(b.getNamedAttr("sinks", b.getArrayAttr({
       b.getStringAttr("~Top|Top>model" + std::to_string(bad == 3 ? 1 : i) + "_sink.bits")})));
     annotations.push_back(b.getDictionaryAttr(fields));
   }
@@ -175,6 +175,7 @@ OwningOpRef<ModuleOp> targetFixture(MLIRContext &ctx, unsigned bad = 0) {
 }
 void targetRejected(MLIRContext &ctx) {
   for (unsigned bad = 1; bad <= 6; ++bad) {
+    if (bad == 2) continue; // Two bridge aliases are a legal shared output.
     auto root = targetFixture(ctx, bad); auto circuit = *root->getOps<CircuitOp>().begin();
     auto before = dump(root->getOperation()); std::string error;
     require(failed(goldengate::addFAMEBoundaryPipeChannels(circuit, error)) && !error.empty(),
@@ -182,6 +183,62 @@ void targetRejected(MLIRContext &ctx) {
     require(before == dump(root->getOperation()), "target fanout rejection mutated input");
     require(failed(goldengate::addFAMEPipeWrapper(circuit, error)) &&
             before == dump(root->getOperation()), "target wrapper rejection was not atomic");
+  }
+}
+void bridgeAliases(MLIRContext &ctx) {
+  for (bool reversed : {false, true}) {
+    auto root = targetFixture(ctx, 7);
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    OpBuilder b(&ctx);
+    auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> annotations(raw.begin(), raw.end());
+    if (reversed) std::swap(annotations[0], annotations[2]);
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+    std::string error;
+    require(succeeded(goldengate::addFAMEBoundaryPipeChannels(circuit, error)), error);
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(verify(*root)), "shared bridge aliases produced invalid IR");
+    auto wrapper = named(circuit, "GGFAMEPipeWrapper");
+    SmallVector<InstanceOp> queues(3);
+    for (auto instance : wrapper.getOps<InstanceOp>())
+      for (unsigned i = 0; i < 3; ++i)
+        if (instance.getName() == "PipeChannel_fork" + std::to_string(i)) queues[i] = instance;
+    b.setInsertionPointToEnd(wrapper.getBodyBlock());
+    auto port = [&](StringRef name) {
+      for (unsigned i = 0; i < wrapper.getNumPorts(); ++i)
+        if (wrapper.getPortName(i) == name) return wrapper.getArgument(i);
+      throw std::runtime_error("missing alias fixture port " + name.str());
+    };
+    Value producer = port("producer_source");
+    Value ready = field(b, wrapper.getLoc(), producer, "ready");
+    Value valid = field(b, wrapper.getLoc(), producer, "valid");
+    Value bits = field(b, wrapper.getLoc(), producer, "bits");
+    Interpreter sim(circuit, wrapper);
+    unsigned distinct = 0, stalls = 0;
+    for (unsigned cycle = 0; cycle < 256; ++cycle) {
+      sim.memo.clear();
+      sim.memo[sim.key(port("hostClock"))] = 0;
+      sim.memo[sim.key(port("hostReset"))] = cycle < 2 || cycle == 128;
+      sim.memo[sim.key(port("sourceValid"))] = cycle % 7 != 0;
+      sim.memo[sim.key(port("sourceBits"))] = cycle * 29;
+      sim.memo[sim.key(ready)] = cycle % 13 > 4;
+      sim.memo[sim.key(port("ready1"))] = cycle % 17 > 3;
+      unsigned last = reversed ? 0 : 2;
+      require(sim.eval(valid) == sim.eval(queues[last].getResult(6)) &&
+              sim.eval(bits) == sim.eval(queues[last].getResult(7)),
+              "shared bridge output did not use final channel's queue");
+      require(sim.eval(queues[0].getResult(5)) == sim.eval(ready) &&
+              sim.eval(queues[2].getResult(5)) == sim.eval(ready),
+              "bridge alias queues do not share external ready");
+      unsigned allReady = 1;
+      for (auto queue : queues) allReady &= sim.eval(queue.getResult(2));
+      require(sim.eval(port("sourceReady")) == allReady,
+              "shared bridge source omitted a queue readiness condition");
+      distinct += sim.eval(queues[0].getResult(6)) != sim.eval(queues[2].getResult(6));
+      stalls += !allReady;
+      sim.edge();
+    }
+    require(distinct > 0 && stalls > 10, "bridge alias/reset/backpressure coverage incomplete");
   }
 }
 void internalChannels(MLIRContext &ctx) {
@@ -343,7 +400,7 @@ void run(MLIRContext &ctx, const char *output, bool targetSource) {
 int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
-    rejected(ctx); targetRejected(ctx); internalChannels(ctx);
+    rejected(ctx); targetRejected(ctx); internalChannels(ctx); bridgeAliases(ctx);
     bool targetSource = argc > 1 && StringRef(argv[argc-1]) == "target";
     run(ctx, argc > 1 && StringRef(argv[1]) != "target" ? argv[1] : nullptr, targetSource);
   }
