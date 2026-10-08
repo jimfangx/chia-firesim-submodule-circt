@@ -38,6 +38,11 @@ mlir::LogicalResult rewriteSRAMVirtualClocks(
 // so unsupported instances/metadata leave the original circuit unchanged.
 mlir::LogicalResult rewriteSRAMFAME(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
+// Construct both parent and SRAM FAME definitions at the SFC FAMETransform
+// boundary, before SimWrapper queues. Shares the transport preconditions and
+// transaction, but leaves channel ports exposed for boundary comparisons.
+mlir::LogicalResult rewriteSRAMParentFAME(
+    circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
 // Construct the parent clock hub and directly promoted SRAM FAME models, then
 // join scalar PipeChannel endpoints with host-clocked queues. Requires one hub,
 // scalar integer data groups and complete model coverage; no ready-valid pairs.

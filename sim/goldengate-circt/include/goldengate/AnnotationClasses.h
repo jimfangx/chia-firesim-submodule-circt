@@ -47,6 +47,8 @@ struct AnnotationClasses {
       "midas.passes.fame.ModelReadWritePort";
   static constexpr llvm::StringLiteral DontTouch =
       "firrtl.transforms.DontTouchAnnotation";
+  static constexpr llvm::StringLiteral CombinationalPath =
+      "firrtl.transforms.CombinationalPath";
   static constexpr llvm::StringLiteral AutoCounter =
       "midas.targetutils.AutoCounterFirrtlAnnotation";
   static constexpr llvm::StringLiteral InternalAutoCounter =

@@ -25,9 +25,11 @@ object SRAMPipeTransportOracle extends App {
     def visit(s: Statement): Unit = { result += s; s.foreachStmt(visit) }
     visit(module.body); result.toSeq
   }
-  // The isolated Rocket preparation intentionally omits non-SRAM channels.
-  // It is covered by SRAMFAMEOracle, not a complete parent transport oracle.
-  for ((name, hub, ram, count) <- Seq(("fanout", "Top", "ram", 4))) {
+  // The default isolated Rocket probe omits its external channels. The complete
+  // variant supplies them independently before running these production passes.
+  val probes = Seq(("fanout", "Top", "ram", 4)) ++
+    (if (args.lift(1).contains("complete")) Seq(("golden-rocket", "Rocket", "rf", 1)) else Nil)
+  for ((name, hub, ram, count) <- probes) {
     val input = new ResolveAndCheck().runTransform(CircuitState(
       Parser.parse(read(s"oracle/$name.channels.sfc.fir")), LowForm,
       JsonProtocol.deserialize(read(s"oracle/$name.channels.sfc.json"))))

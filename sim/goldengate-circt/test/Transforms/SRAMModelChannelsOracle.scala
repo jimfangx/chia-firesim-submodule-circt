@@ -35,12 +35,31 @@ object SRAMModelChannelsOracle extends App {
       }
     }
     visit(main)
-    val circuit = parsed.copy(main = main, modules = parsed.modules.filter(m => reachable(m.name)))
+    val complete = name == "golden-rocket" && args.lift(2).contains("complete")
+    val circuit = parsed.copy(main = main, modules = parsed.modules.filter(m => reachable(m.name)).map {
+      case m: Module if complete && m.name == main => m.copy(
+        ports = m.ports :+ Port(NoInfo, "external_clock", Output, ClockType),
+        body = Block(Seq(m.body, Connect(NoInfo, WRef("external_clock", ClockType, PortKind, SinkFlow),
+          WRef("clock", ClockType, PortKind, SourceFlow)))))
+      case m => m
+    })
     val clockChannel = FAMEChannelConnectionAnnotation.sink(
       "targetClock", TargetClockChannel(Seq(RationalClock("base", 1, 1)), Seq(1)),
       None, Seq(ModuleTarget(main, main).ref("clock")))
+    // A complete Rocket probe also supplies its external token channels. Keep
+    // the historical SRAM-only boundary available for the narrower comparison.
+    val external = if (complete) {
+      circuit.modules.find(_.name == main).get.ports.filterNot(_.tpe == ClockType).map { p =>
+        val endpoint = ModuleTarget(main, main).ref(p.name)
+        // Bridge-facing channels identify a source clock exported by the hub.
+        val clock = Some(ModuleTarget(main, main).ref("external_clock"))
+        if (p.direction == Input)
+          FAMEChannelConnectionAnnotation.sink("external_" + p.name, PipeChannel(0), clock, Seq(endpoint))
+        else FAMEChannelConnectionAnnotation.source("external_" + p.name, PipeChannel(0), clock, Seq(endpoint))
+      }
+    } else Seq.empty
     val input = CircuitState(circuit, LowForm, Seq(
-      FirrtlMemModelAnnotation(ModuleTarget(main, parent).ref(memory)), clockChannel))
+      FirrtlMemModelAnnotation(ModuleTarget(main, parent).ref(memory)), clockChannel) ++ external)
     val wrapped = new LowFirrtlCompiler().compile(WrapTop.runTransform(input), Nil)
     write(name + ".channels-input.fir", wrapped.circuit.serialize)
     write(name + ".channels-input.json", JsonProtocol.serialize(wrapped.annotations))

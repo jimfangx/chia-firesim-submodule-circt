@@ -205,6 +205,57 @@ foreach(instance Top_m0_p0_ram Top_m0_p1_ram Top_m1_p0_ram Top_m1_p1_ram)
 endforeach()
 message(STATUS "Passed native single/shared SRAM FAME state and per-instance payload bindings")
 
+# CheckCombLoops metadata has a defined sink/source rename policy. Preserve
+# source order and multiplicity; validate all targets before channel mutation.
+file(READ "${FIXTURES}/SRAMModelChannels.json" path_seed)
+string(JSON path_count LENGTH "${path_seed}")
+string(JSON path_seed SET "${path_seed}" ${path_count}
+  "{\"class\":\"firrtl.transforms.CombinationalPath\",\"sink\":\"~FAMETop|ram>r_data\",\"sources\":[\"~FAMETop|ram>r_en\",\"~FAMETop|ram>r_addr\",\"~FAMETop|ram>r_en\"]}")
+file(WRITE "${OUTPUT}/combinational-path.json" "${path_seed}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/single.fir"
+  --annotation-file "${OUTPUT}/combinational-path.json"
+  --output-dir "${OUTPUT}/combinational-path" --rewrite-sram-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM CombinationalPath transfer failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/combinational-path/post-sram-fame-all.json" path_result)
+string(JSON path_result_count LENGTH "${path_result}")
+math(EXPR path_last "${path_result_count} - 1")
+set(paths 0)
+foreach(index RANGE 0 ${path_last})
+  string(JSON class GET "${path_result}" ${index} class)
+  if(class STREQUAL "firrtl.transforms.CombinationalPath")
+    math(EXPR paths "${paths} + 1")
+    string(JSON sink GET "${path_result}" ${index} sink)
+    string(JSON sources LENGTH "${path_result}" ${index} sources)
+    string(JSON first GET "${path_result}" ${index} sources 0)
+    string(JSON second GET "${path_result}" ${index} sources 1)
+    string(JSON third GET "${path_result}" ${index} sources 2)
+    if(NOT sink STREQUAL "~FAMETop|ram>r_data_source.bits" OR NOT sources EQUAL 3 OR
+       NOT first STREQUAL "~FAMETop|ram>r_en_sink.bits" OR
+       NOT second STREQUAL "~FAMETop|ram>r_addr_sink.bits" OR NOT third STREQUAL first)
+      message(FATAL_ERROR "CombinationalPath payload identity/order differs")
+    endif()
+  endif()
+endforeach()
+if(NOT paths EQUAL 1)
+  message(FATAL_ERROR "CombinationalPath annotation multiplicity differs")
+endif()
+foreach(bad_sink "~FAMETop|ram>r_addr" "~FAMETop|ram>missing")
+  string(JSON invalid_path SET "${path_seed}" ${path_count} sink "\"${bad_sink}\"")
+  file(WRITE "${OUTPUT}/invalid-path.json" "${invalid_path}")
+  execute_process(COMMAND "${COMPILER}" "${OUTPUT}/single.fir"
+    --annotation-file "${OUTPUT}/invalid-path.json"
+    --output-dir "${OUTPUT}/invalid-path" --rewrite-sram-fame
+    RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+  if(status EQUAL 0 OR NOT stderr MATCHES "CombinationalPath needs a ground output sink and input sources" OR
+     EXISTS "${OUTPUT}/invalid-path/post-sram-fame.fir")
+    message(FATAL_ERROR "Invalid CombinationalPath sink was not rejected atomically: ${stdout}\n${stderr}")
+  endif()
+endforeach()
+message(STATUS "Passed CombinationalPath ordered payload transfer and atomic invalid-target rejection")
+
 # Transform both ends of the closed four-instance graph and put actual native
 # queues between parent and SRAM channels. Internal data channels must not be
 # exposed as bridge inputs; only the Boolean clock packet crosses the wrapper.
@@ -231,6 +282,22 @@ if(NOT queue_count EQUAL 52 OR NOT transport_fired_count EQUAL 65 OR
   message(FATAL_ERROR "SRAM transport lacks complete native hardware: queues=${queue_count}, fired=${transport_fired_count}")
 endif()
 message(STATUS "Passed native 52-pipe parent/SRAM transport and raw/buffered clock FSM rules")
+
+execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
+  --annotation-file "${FIXTURES}/SRAMModelChannels.json"
+  --output-dir "${OUTPUT}/parent-fame" --rewrite-sram-parent-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM parent FAME boundary failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/parent-fame/post-sram-parent-fame.fir" parent_fir)
+string(REGEX MATCHALL "reg [^\n]*_fired_[0-9]+ : UInt<1>" parent_fired "${parent_fir}")
+list(LENGTH parent_fired parent_fired_count)
+if(NOT parent_fired_count EQUAL 65 OR parent_fir MATCHES "circuit GGFAMEPipeWrapper" OR
+   parent_fir MATCHES "inst PipeChannel_" OR NOT parent_fir MATCHES "circuit FAMETop")
+  message(FATAL_ERROR "Parent FAME boundary has missing FSMs or premature queues")
+endif()
+message(STATUS "Passed native parent/SRAM FAME boundary before queue construction")
 
 # Unknown metadata referring to a replaced data port needs its own transfer
 # policy. Reject it instead of recursively changing arbitrary annotation text.

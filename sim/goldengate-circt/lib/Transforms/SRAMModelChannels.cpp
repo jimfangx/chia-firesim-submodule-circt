@@ -260,9 +260,10 @@ struct SRAMDataPort {
 };
 
 LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
-                                  std::string &error, bool withTransport = false) {
+                                  std::string &error, bool withParent = false,
+                                  bool withQueues = true) {
   using namespace goldengate;
-  if (withTransport) {
+  if (withParent) {
     // Promotion can leave repeated parent writes. Resolve last-connect order
     // before following clock aliases, as the SFC LowForm preparation does.
     PassManager normalization(circuit.getContext(), CircuitOp::getOperationName());
@@ -336,7 +337,7 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   SmallVector<FAMEHubClockDomain> domains;
   SmallVector<FAMEChannelClockDomain> assignments;
   std::optional<FAMETopChannelPort> clockPort;
-  if (withTransport) {
+  if (withParent) {
     for (const auto &channel : channels) {
       if (channel.kind != ChannelKind::TargetClock && channel.kind != ChannelKind::Pipe) {
         error = "SRAM transport requires scalar pipe data channels";
@@ -390,6 +391,17 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
           })) {
         if (clockPort) { error = "SRAM transport has multiple clock groups"; return failure(); }
         clockPort = port;
+        // CombinationalPath also records exported clock aliases. SFC transfers
+        // clock-channel input references to bits, while retaining historical
+        // output-clock identities after the ancillary ports are internalized.
+        for (unsigned index : group.ports)
+          renames[target(model, model.getPortName(index))] =
+              target(model, group.name + "_sink") + ".bits";
+        for (const auto &connection : hierarchy->connections)
+          if (connection.instance == binding.instance &&
+              llvm::is_contained(group.ports, connection.instancePort))
+            renames[target(hierarchy->top, hierarchy->top.getPortName(connection.topPort))] =
+                target(hierarchy->top, port.portName) + ".bits";
         continue;
       }
       if (group.ports.size() != 1 || (group.clockPort && model != hub) || binding.instancePorts.size() != 1 ||
@@ -460,7 +472,29 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   };
   for (auto attr : raw) {
     Annotation anno(attr);
+    if (anno.isClass(AnnotationClasses::CombinationalPath) && referencesData(attr)) {
+      // CheckCombLoops emits an ordered source list and a sink, then SFC's
+      // hostDecouplingRenames transfers those references to channel payloads.
+      // Validate this schema before permitting the recursive target transfer;
+      // other strings in an unknown annotation still have no rename policy.
+      auto sink = anno.getMember<StringAttr>("sink");
+      auto sources = anno.getMember<ArrayAttr>("sources");
+      auto validPort = [&](Attribute value, Direction direction) {
+        auto spelling = dyn_cast<StringAttr>(value);
+        auto target = spelling ? resolveAnnotationTarget(circuit, spelling.getValue(), error)
+                               : std::nullopt;
+        return target && target->port && target->fieldID.value_or(0) == 0 &&
+               target->module.getPortDirection(*target->port) == direction &&
+               isa<UIntType, SIntType, ClockType>(target->module.getPortType(*target->port));
+      };
+      if (cast<DictionaryAttr>(attr).size() != 3 || !sink || !sources || !validPort(sink, Direction::Out) ||
+          !llvm::all_of(sources, [&](Attribute source) { return validPort(source, Direction::In); })) {
+        error = "SRAM FAME CombinationalPath needs a ground output sink and input sources";
+        return failure();
+      }
+    }
     if (referencesData(attr) && !anno.isClass(AnnotationClasses::DontTouch) &&
+        !anno.isClass(AnnotationClasses::CombinationalPath) &&
         !anno.isClass(AnnotationClasses::ChannelPorts) &&
         !anno.isClass(AnnotationClasses::ChannelConnection) &&
         !anno.isClass(AnnotationClasses::ModelReadPort) &&
@@ -473,7 +507,7 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   // Clock rewriting transfers clock endpoint annotations itself. Do not later
   // replay the scalar snapshot and undo those schema-aware transfers.
   SmallVector<FAMEHubClockControl> controls;
-  if (withTransport) {
+  if (withParent) {
     if (!clockPort || failed(addFAMEHostControl(circuit, hub, error))) return failure();
     auto current = analyzeTopHierarchy(circuit, error);
     if (!current) return failure();
@@ -592,23 +626,24 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     if (failed(groupFAMEChannelPorts(hierarchy->top, model, instance,
                                     model == hub ? clockLocal + "_sink" : "", error))) return failure();
   }
-  if (withTransport) {
-    if (failed(removeFAMEStaleTopClocks(hierarchy->top, error)) ||
-        failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
+  if (withParent) {
+    if (failed(removeFAMEStaleTopClocks(hierarchy->top, error))) return failure();
+    if (withQueues && (failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
         failed(addFAMEPipeWrapper(circuit, error)) ||
         failed(addFAMEClockChannel(circuit, error)) ||
-        failed(activateFAMEPipeWrapper(circuit, error))) return failure();
+        failed(activateFAMEPipeWrapper(circuit, error)))) return failure();
   }
   return success();
 }
 } // namespace
 
 static LogicalResult rewriteSRAMBoundary(CircuitOp circuit, unsigned &rewritten,
-                                         std::string &error, bool transport) {
+                                         std::string &error, bool transport,
+                                         bool queues = true) {
   rewritten = 0;
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   unsigned count = 0;
-  if (failed(rewriteSRAMFAMEImpl(*staged, count, error, transport))) return failure();
+  if (failed(rewriteSRAMFAMEImpl(*staged, count, error, transport, queues))) return failure();
   if (failed(verify(*staged))) {
     error = "SRAM FAME produced invalid FIRRTL IR";
     return failure();
@@ -627,4 +662,9 @@ LogicalResult goldengate::rewriteSRAMFAME(CircuitOp circuit, unsigned &rewritten
 LogicalResult goldengate::rewriteSRAMPipeTransport(CircuitOp circuit, unsigned &rewritten,
                                                   std::string &error) {
   return rewriteSRAMBoundary(circuit, rewritten, error, true);
+}
+
+LogicalResult goldengate::rewriteSRAMParentFAME(CircuitOp circuit, unsigned &rewritten,
+                                               std::string &error) {
+  return rewriteSRAMBoundary(circuit, rewritten, error, true, false);
 }

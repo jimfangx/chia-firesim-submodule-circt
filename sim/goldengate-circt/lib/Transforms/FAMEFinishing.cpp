@@ -202,12 +202,29 @@ LogicalResult goldengate::rewriteFAMEFinishing(
   Location loc = insertionPoint ? insertionPoint->getLoc() : module.getLoc();
   // Scala's And.reduce begins with the first channel condition.  Preserve
   // that shape so an ordinary FAME model does not gain an extra AND gate.
+  // Large hubs otherwise export one enormous inline expression. Materialize
+  // electrical nodes periodically so the FIRRTL 1.2 comparison boundary stays
+  // readable by SFC without changing the reduction or adding state/gates.
+  std::set<std::string> names;
+  for (auto port : module.getPorts()) names.insert(port.getName().str());
+  module.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name"))
+      names.insert(name.getValue().str());
+  });
+  unsigned conditions = 0, group = 0;
+  unsigned totalConditions = inputs.size() + outputs.size();
   Value allReady;
   auto addCondition = [&](Value condition) {
     allReady = allReady
                    ? builder.create<AndPrimOp>(loc, allReady, condition)
                          .getResult()
                    : condition;
+    if (totalConditions > 64 && ++conditions % 32 == 0 && conditions < totalConditions) {
+      std::string name;
+      do { name = "allFiredOrFiring_group_" + std::to_string(group++); }
+      while (!names.insert(name).second);
+      allReady = builder.create<NodeOp>(loc, allReady, name).getResult();
+    }
   };
   for (const auto &channel : outputs) {
     Value ready = builder.create<SubfieldOp>(loc, channel.port, "ready");

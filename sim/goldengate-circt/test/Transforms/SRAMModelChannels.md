@@ -376,6 +376,70 @@ java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
   midas.passes.fame.SRAMPipeTransportCompare "$evidence"
 ```
 
+## Complete golden Rocket parent boundary (iteration 51)
+
+The same immutable `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` above
+now supplies a second probe with every external Rocket data port independently
+assigned a scalar pipe channel. The probe exports the hub clock for these
+bridge-facing channels. It runs unchanged production SFC preparation,
+`FAMETransform`, and `SimWrapper`; no Scala transformation runs on the native
+candidate. The historical isolated SRAM probe remains available.
+
+This comparison first exposed retained `firrtl.transforms.CombinationalPath`
+metadata without a native transfer policy. SRAM FAME now validates its ground
+output sink and ordered input sources, then transfers changed targets to their
+Decoupled payloads. Clock-input references also transfer to the clock payload,
+matching SFC. CTest checks source order and duplicates, and rejects missing or
+input-direction sinks before committing the cloned circuit.
+
+`--rewrite-sram-parent-fame` emits verified parent/SRAM FAME hardware before
+queue construction. This is the boundary corresponding to SFC's full
+`FAMETransform`. Large completion reductions now use named FIRRTL nodes every
+32 conditions when there are more than 64 data channels. This preserves the
+ordered AND reduction while avoiding multiline inline expressions that the
+pinned SFC parser cannot read. The comparison expands those nodes and checks
+all 513 SFC finishing conditions and 512 clock-ready conditions.
+
+`SRAMParentFAMECompare.scala` confirms ten SRAM channel ABIs, every memory
+semantic field, 515 common parent ports, and 33 of 39 combinational-path
+records including ordered source targets. It explicitly reports two remaining
+differences instead of treating this as complete transport equivalence:
+
+- Eight native output aliases still have separate channel ports and completion
+  conditions; SFC maps them to the equivalent canonical hub outputs.
+- Six path records still refer to scalar top passthroughs (`io_hartid` and
+  `io_dmem_resp_bits_data`, and their outgoing aliases). SFC moves these to
+  external channel payloads. Full native transport rejects at
+  `PipeChannel external_io_hartid requires a passive integer Decoupled payload
+  target with matching direction`.
+
+The complete preparation graph has 525 channels in both compilers. Native
+local groups/protection records exceed SFC by eight, consistent with the alias
+port difference. The four-instance closed transport still matches SFC's 67
+register transitions, 72 handshake/completion/gate equations and all 52 queue
+endpoint pairs. All ten focused CTests pass after rebuilding the shared
+finishing helper. The default native compiler also passes through PrintBridge
+host binding with empty stderr. Manager verification remains harness-owned.
+
+Mutable evidence is in `iteration51-rocket-sram-transport/` beneath the U250
+generated directory. It includes independent SFC preparation/full-FAME/wrapper
+artifacts, `golden-rocket-parent-fame/post-sram-parent-fame.fir` and its sidecar,
+`parent-comparison.log`, `fanout-comparison.log`, `ctest-final.log`, and the
+full transport rejection in `native.stderr`. Compile the new comparator
+alongside the existing Scala oracles, then reproduce with:
+
+```sh
+java -Xmx12G -cp "$oracle_classes:$midas_classpath" SRAMModelChannelsOracle \
+  "$evidence/oracle" "$immutable_sfc_fir" complete
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMPipeTransportOracle "$evidence" complete
+"$native_compiler" "$evidence/oracle/golden-rocket.channels-input.fir" \
+  --annotation-file "$evidence/oracle/golden-rocket.channels-input.json" \
+  --output-dir "$evidence/golden-rocket-parent-fame" --rewrite-sram-parent-fame
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMParentFAMECompare "$evidence"
+```
+
 ## Remaining scope
 
 Shared SRAM definitions now have native FAME data/clock hardware with distinct
@@ -385,5 +449,6 @@ abstract RAM timing-model replacement and SRAM generated-clock collateral
 integration remain pending. Legacy retained domain-clock annotations have the
 same erased top-clock references as SFC after FAME; later consumers must use
 captured domain identity rather than resolve those as surviving ports. The
-next step is to supply the isolated golden Rocket parent's surrounding input
-and output channels, then compare its complete SRAM transport boundary.
+next step is to channelize the complete golden Rocket probe's top passthrough
+ports and transfer their annotations, then address the eight output aliases
+and compare the full queue transport boundary.
