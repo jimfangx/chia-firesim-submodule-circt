@@ -6,6 +6,7 @@
 
 # Simulation memory map emitted by the MIDAS compiler
 header := $(GENERATED_DIR)/$(BASE_FILE_NAME).const.h
+verilog_header := $(GENERATED_DIR)/$(BASE_FILE_NAME).const.vh
 
 # The midas-generated simulator RTL which will be baked into the FPGA shell project
 simulator_verilog := $(GENERATED_DIR)/$(BASE_FILE_NAME).sv
@@ -63,7 +64,7 @@ endif
 goldengate-circt-force:
 
 # An existing SFC .sv must never make the CIRCT selection appear successful.
-$(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) goldengate-circt-force
+$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) goldengate-circt-force
 	cmake -S $(firesim_base_dir)/goldengate-circt -B $(goldengate_circt_build) -G Ninja \
 		-DCIRCT_DIR=$(GOLDENGATE_CIRCT_PREFIX)/lib/cmake/circt \
 		-DZLIB_ROOT=$(abspath $(GOLDENGATE_CIRCT_PREFIX)/..)
@@ -87,12 +88,13 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) 
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).implementation.xdc $(GENERATED_DIR)/$(BASE_FILE_NAME).implementation.xdc
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).defines.vh $(GENERATED_DIR)/$(BASE_FILE_NAME).defines.vh
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).const.h $(header)
+	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).const.vh $(verilog_header)
 	@for collateral in $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl; do \
 		if test -f "$$collateral"; then cp "$$collateral" $(GENERATED_DIR)/; fi; \
 	done
 	cp $(GENERATED_DIR)/circt-ingestion/post-bridge-extraction-all.json $(fame_annos)
 else ifeq ($(GOLDENGATE_COMPILER),sfc)
-$(simulator_verilog) $(simulator_xdc) $(header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
+$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
 	$(call run_jar_scala_main,$(firesim_base_dir),$(FIRESIM_MAIN_CP),midas.stage.GoldenGateMain,\
 		-i $(FIRRTL_FILE) \
 		-td $(GENERATED_DIR) \

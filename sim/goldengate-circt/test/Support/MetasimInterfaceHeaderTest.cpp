@@ -48,12 +48,15 @@ std::string run(CircuitOp circuit, StringRef name) {
   std::string error;
   require(succeeded(goldengate::prepareMetasimInterfaceHeader(circuit, name, error)), error);
   auto result = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  require(result.size() == archive.size() + 1, "header annotation count");
+  require(result.size() == archive.size() + 2, "header annotation count");
   for (unsigned i = 0; i < archive.size(); ++i)
     require(archive[i] == result[i], "changed existing annotation");
   unsigned i = 0;
   for (auto module : circuit.getOps<FModuleLike>())
     require(bodies[i++] == dump(module.getOperation()), "changed circuit semantics");
+  auto verilog = cast<DictionaryAttr>(result[result.size() - 2]);
+  require(verilog.getAs<StringAttr>("class").getValue() == goldengate::AnnotationClasses::OutputFile &&
+          verilog.getAs<StringAttr>("fileSuffix").getValue() == ".const.vh", "Verilog header output annotation");
   auto output = cast<DictionaryAttr>(result[result.size() - 1]);
   require(output.getAs<StringAttr>("class").getValue() == goldengate::AnnotationClasses::OutputFile &&
           output.getAs<StringAttr>("fileSuffix").getValue() == ".const.h", "header output annotation");
@@ -67,6 +70,22 @@ int main(int argc, char **argv) {
     auto positive = fixture(context);
     auto circuit = *positive->getOps<CircuitOp>().begin();
     auto body = run(circuit, "Quoted\"\\\nTarget");
+    auto annotations = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    auto verilog = cast<DictionaryAttr>(annotations[annotations.size() - 2])
+                       .getAs<StringAttr>("body").getValue();
+    for (auto expected : {"`define CTRL_ID_BITS 3\n", "`define CTRL_ADDR_BITS 20\n",
+         "`define CTRL_DATA_BITS 64\n", "`define MEM_ID_BITS 5\n",
+         "`define MEM_ADDR_BITS 40\n", "`define MEM_DATA_BITS 128\n",
+         "`define CPU_MANAGED_AXI4_ID_BITS 7\n", "`define CPU_MANAGED_AXI4_ADDR_BITS 48\n",
+         "`define CPU_MANAGED_AXI4_DATA_BITS 256\n", "`define CPU_MANAGED_AXI4_PRESENT 1\n",
+         "`define QSFP_DATA_BITS 512\n", "`define MEM_HAS_CHANNEL0 1\n"})
+      require(verilog.contains(expected), "Verilog interface width or presence macro");
+    require(!verilog.contains("MEM_HAS_CHANNEL1") && !verilog.contains("FPGA_MANAGED_AXI4_PRESENT") &&
+            !verilog.contains("QSFP_HAS_CHANNEL") && !verilog.contains("MEM_HAS_CHANNEL-1"),
+            "unexpected metasim endpoint macro");
+    require(verilog.contains("`ifndef __QUOTED___TARGET_H\n") &&
+            verilog.contains("`endif // __QUOTED___TARGET_H\n"),
+            "Verilog guard must escape punctuation and newlines");
     for (auto expected : {".ctrl = AXI4Config{3, 20, 64}", ".mem = AXI4Config{5, 40, 128}",
          ".cpu_managed = AXI4Config{7, 48, 256}", ".mem_num_channels = 1",
          ".fpga_managed = std::nullopt", ".qsfp = FPGATopQSFPConfig{512, 0}",
@@ -75,11 +94,21 @@ int main(int argc, char **argv) {
     std::string error, before = dump(*positive);
     require(failed(goldengate::prepareMetasimInterfaceHeader(circuit, "FireSim", error)) &&
             dump(*positive) == before, "duplicate output changed IR");
-    for (unsigned bad = 1; bad <= 6; ++bad) {
+    for (unsigned bad = 1; bad <= 8; ++bad) {
       auto negative = fixture(context, bad);
       auto c = *negative->getOps<CircuitOp>().begin();
       if (bad == 4) c->removeAttr("rawAnnotations");
       if (bad == 5) c.setNameAttr(StringAttr::get(&context, "OtherTop"));
+      if (bad == 7 || bad == 8) {
+        OpBuilder builder(&context);
+        auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+        SmallVector<Attribute> retained(raw.begin(), raw.end());
+        retained.push_back(builder.getDictionaryAttr({
+            builder.getNamedAttr("class", builder.getStringAttr(goldengate::AnnotationClasses::OutputFile)),
+            builder.getNamedAttr("fileSuffix", builder.getStringAttr(bad == 7 ? ".const.vh" : ".const.h")),
+            builder.getNamedAttr("body", builder.getStringAttr("existing\n"))}));
+        c->setAttr("rawAnnotations", builder.getArrayAttr(retained));
+      }
       before = dump(*negative);
       require(failed(goldengate::prepareMetasimInterfaceHeader(c, bad == 6 ? "" : "FireSim", error)) &&
               dump(*negative) == before, "invalid input changed IR");
@@ -94,7 +123,7 @@ int main(int argc, char **argv) {
                            "AXI4Config{16, 64, 512}", "FPGATopQSFPConfig{256, 0}"})
         require(StringRef(result).contains(expected), "recorded U250 boundary configuration");
       require(succeeded(goldengate::emitOutputFiles(c, argv[2], "FireSim-generated", error)), error);
-      llvm::outs() << "Recorded CIRCT U250 boundary: metasim .const.h emitted with original FireSim target name\n";
+      llvm::outs() << "Recorded CIRCT U250 boundary: metasim .const.h and .const.vh emitted with original FireSim target name\n";
     }
     return 0;
   } catch (const std::exception &error) { llvm::errs() << error.what() << '\n'; return 1; }

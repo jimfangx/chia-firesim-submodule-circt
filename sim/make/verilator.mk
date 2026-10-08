@@ -13,7 +13,7 @@ verilator_debug = $(GENERATED_DIR)/V$(DESIGN)-debug
 $(verilator) $(verilator_debug): export CXXFLAGS := $(CXXFLAGS) $(common_cxx_flags) $(VERILATOR_CXXOPTS) -D RTLSIM
 $(verilator) $(verilator_debug): export LDFLAGS := $(LDFLAGS) $(common_ld_flags) -Wl,-rpath='$$$$ORIGIN'
 
-verilator_driver_deps := $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h) $(simulator_verilog)
+verilator_driver_deps := $(header) $(verilog_header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h) $(simulator_verilog)
 
 define make_verilator
         $(MAKE) -C $(simif_dir) $(VERILATOR_MAKEFLAGS) $(1) \

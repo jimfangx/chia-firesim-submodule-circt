@@ -133,8 +133,9 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
     if (!cls) return reject("malformed retained header annotation");
     if (cls.getValue() == AnnotationClasses::OutputFile) {
       auto suffix = dict.getAs<StringAttr>("fileSuffix");
-      if (suffix && suffix.getValue() == ".const.h")
-        return reject("driver header output already exists");
+      if (suffix && (suffix.getValue() == ".const.h" ||
+                     suffix.getValue() == ".const.vh"))
+        return reject("metasim header output already exists");
     }
   }
   std::string body;
@@ -153,8 +154,41 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
       << "\n};\n#undef GET_METASIM_INTERFACE_CONFIG\n"
          "#endif // GET_METASIM_INTERFACE_CONFIG\n";
   out.flush();
+  // top.sv consumes these same interface widths as Verilog macros. Derive
+  // both headers from the validated ports so a fresh metasim build does not
+  // depend on collateral left behind by an earlier Scala compiler run.
+  std::string guard = "__";
+  for (unsigned char ch : targetName.bytes())
+    guard += ch >= 'a' && ch <= 'z' ? char(ch - 'a' + 'A') :
+             (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') ?
+             char(ch) : '_';
+  guard += "_H";
+  std::string verilogBody;
+  llvm::raw_string_ostream verilog(verilogBody);
+  verilog << "// Golden Gate-generated Verilog Header\n"
+             "// Interface widths for MIDAS-level simulation.\n"
+          << "`ifndef " << guard << "\n`define " << guard
+          << "\n\n// Simulation Constants\n";
+  auto printVerilogAXI = [&](StringRef prefix, AXIConfig config) {
+    verilog << "`define " << prefix << "_ID_BITS " << config.id << '\n'
+            << "`define " << prefix << "_ADDR_BITS " << config.addr << '\n'
+            << "`define " << prefix << "_DATA_BITS " << config.data << '\n';
+  };
+  printVerilogAXI("CTRL", ctrl);
+  printVerilogAXI("CPU_MANAGED_AXI4", cpu);
+  verilog << "`define CPU_MANAGED_AXI4_PRESENT 1\n"
+          << "`define QSFP_DATA_BITS " << qsfpWidth << '\n';
+  for (unsigned channel = 0; channel < memories; ++channel)
+    verilog << "`define MEM_HAS_CHANNEL" << channel << " 1\n";
+  printVerilogAXI("MEM", memory);
+  verilog << "`endif // " << guard << '\n';
+  verilog.flush();
   OpBuilder builder(circuit.getContext());
   SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  annotations.push_back(builder.getDictionaryAttr({
+      builder.getNamedAttr("class", builder.getStringAttr(AnnotationClasses::OutputFile)),
+      builder.getNamedAttr("fileSuffix", builder.getStringAttr(".const.vh")),
+      builder.getNamedAttr("body", builder.getStringAttr(verilogBody))}));
   annotations.push_back(builder.getDictionaryAttr({
       builder.getNamedAttr("class", builder.getStringAttr(AnnotationClasses::OutputFile)),
       builder.getNamedAttr("fileSuffix", builder.getStringAttr(".const.h")),
