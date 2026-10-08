@@ -923,7 +923,7 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
   struct ClockOutput {
     unsigned modelPort;
     unsigned topPort;
-    StrictConnectOp connection;
+    Operation *connection;
     circt::hw::InnerSymAttr symbol;
   };
   SmallVector<ClockOutput> clocks;
@@ -934,9 +934,21 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
       continue;
     auto name = model.getPortName(modelPort);
     std::optional<unsigned> topPort;
-    for (unsigned i = 0; i < top.getNumPorts(); ++i)
-      if (top.getPortName(i) == name)
-        topPort = i;
+    // ChannelExcision gives promoted clock aliases their instance prefix and
+    // source suffix. Resolve their identity from SSA rather than port spelling.
+    for (OpOperand &use : instance.getResult(modelPort).getUses()) {
+      auto strict = dyn_cast<StrictConnectOp>(use.getOwner());
+      auto ordinary = dyn_cast<ConnectOp>(use.getOwner());
+      Value source = strict ? strict.getSrc() : ordinary ? ordinary.getSrc() : Value();
+      Value destination = strict ? strict.getDest() : ordinary ? ordinary.getDest() : Value();
+      auto dest = dyn_cast_or_null<BlockArgument>(destination);
+      if (source != instance.getResult(modelPort) ||
+          !dest || dest.getOwner() != top.getBodyBlock() || topPort) {
+        error = "FAME output clock has nontrivial top wiring: " + name.str();
+        return failure();
+      }
+      topPort = dest.getArgNumber();
+    }
     if (!topPort || !topPorts.insert(*topPort).second ||
         top.getPortDirection(*topPort) != Direction::Out ||
         top.getPorts()[*topPort].type != model.getPorts()[modelPort].type ||
@@ -964,15 +976,17 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
         }
     Value topClock = top.getBodyBlock()->getArgument(*topPort);
     Value instanceClock = instance.getResult(modelPort);
-    StrictConnectOp connection;
+    Operation *connection = nullptr;
     for (OpOperand &use : instanceClock.getUses()) {
-      auto connect = dyn_cast<StrictConnectOp>(use.getOwner());
-      if (!connect || connect.getSrc() != instanceClock ||
-          connect.getDest() != topClock || connection) {
+      auto strict = dyn_cast<StrictConnectOp>(use.getOwner());
+      auto ordinary = dyn_cast<ConnectOp>(use.getOwner());
+      Value source = strict ? strict.getSrc() : ordinary ? ordinary.getSrc() : Value();
+      Value destination = strict ? strict.getDest() : ordinary ? ordinary.getDest() : Value();
+      if (source != instanceClock || destination != topClock || connection) {
         error = "FAME output clock has nontrivial top wiring: " + name.str();
         return failure();
       }
-      connection = connect;
+      connection = use.getOwner();
     }
     if (!connection || !topClock.hasOneUse()) {
       error = "FAME output clock is not exclusively wired to its top port: " +
@@ -1026,7 +1040,7 @@ LogicalResult goldengate::internalizeFAMEOutputClocks(
       wire.setInnerSymAttr(clock.symbol);
     model.getBodyBlock()->getArgument(clock.modelPort)
         .replaceAllUsesWith(wire.getResult());
-    clock.connection.erase();
+    clock.connection->erase();
     eraseModel.set(clock.modelPort);
     eraseTop.set(clock.topPort);
     eraseInstance.set(clock.modelPort);

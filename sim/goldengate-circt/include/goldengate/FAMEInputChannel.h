@@ -97,7 +97,9 @@ mlir::LogicalResult removeFAMEVirtualClockPort(
 // Clock outputs used to identify channel domains are no longer simulator
 // ports after FAME. Keep their model-side connects by turning each into a wire.
 // Require one model instance and exclusively connected, unannotated clock
-// outputs. Transfer model ground-port inner symbols to same-name Clock wires,
+// outputs. Resolve wrapper aliases by their direct strict/ordinary SSA connect;
+// promoted wrapper port names need not match model port names. Transfer model
+// ground-port inner symbols to same-name Clock wires,
 // preserving names/visibility and InnerRefs. Wrapper symbols and instance-port
 // annotations need a deletion policy and are rejected before mutation. Preserve
 // unrelated ports and instance metadata; refresh hierarchy and symbol analyses.

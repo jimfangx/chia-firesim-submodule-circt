@@ -205,6 +205,33 @@ foreach(instance Top_m0_p0_ram Top_m0_p1_ram Top_m1_p0_ram Top_m1_p1_ram)
 endforeach()
 message(STATUS "Passed native single/shared SRAM FAME state and per-instance payload bindings")
 
+# Transform both ends of the closed four-instance graph and put actual native
+# queues between parent and SRAM channels. Internal data channels must not be
+# exposed as bridge inputs; only the Boolean clock packet crosses the wrapper.
+execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
+  --annotation-file "${FIXTURES}/SRAMModelChannels.json"
+  --output-dir "${OUTPUT}/transport" --rewrite-sram-transport
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM parent transport failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/transport/post-sram-transport.fir" transport_fir)
+string(REGEX MATCHALL "inst PipeChannel_[^\n]* of GGFAMEPipe" queues "${transport_fir}")
+list(LENGTH queues queue_count)
+string(REGEX MATCHALL "reg [^\n]*_fired_[0-9]+ : UInt<1>" transport_fired "${transport_fir}")
+list(LENGTH transport_fired transport_fired_count)
+string(FIND "${transport_fir}" "circuit GGFAMEPipeWrapper :" active_wrapper)
+string(FIND "${transport_fir}" "bits : UInt<1>[1]" boolean_clock)
+string(FIND "${transport_fir}" "clock_sink.bits" raw_clock_token)
+string(FIND "${transport_fir}" "m0_p0_ram_r_data_fired_0 <= mux(targetCycleFinishing, not(asUInt(clock_sink.bits))" parent_input_rule)
+string(FIND "${transport_fir}" "m0_p0_ram_r_addr_fired_0 <= mux(targetCycleFinishing, not(clock_enabled)" parent_output_rule)
+if(NOT queue_count EQUAL 52 OR NOT transport_fired_count EQUAL 65 OR
+   active_wrapper LESS 0 OR boolean_clock LESS 0 OR raw_clock_token LESS 0 OR
+   parent_input_rule LESS 0 OR parent_output_rule LESS 0)
+  message(FATAL_ERROR "SRAM transport lacks complete native hardware: queues=${queue_count}, fired=${transport_fired_count}")
+endif()
+message(STATUS "Passed native 52-pipe parent/SRAM transport and raw/buffered clock FSM rules")
+
 # Unknown metadata referring to a replaced data port needs its own transfer
 # policy. Reject it instead of recursively changing arbitrary annotation text.
 file(READ "${FIXTURES}/SRAMModelChannels.json" data_seed)

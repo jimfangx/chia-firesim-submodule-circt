@@ -5,6 +5,9 @@
 #include "goldengate/ExtractModel.h"
 #include "goldengate/FAMEDefaults.h"
 #include "goldengate/FAMEHostControl.h"
+#include "goldengate/FAMEClockEnable.h"
+#include "goldengate/FAMEClockChannel.h"
+#include "goldengate/FAMEPipeChannel.h"
 #include "goldengate/FAMEInputChannel.h"
 #include "goldengate/FAMEOutputChannel.h"
 #include "goldengate/FAMEFiredState.h"
@@ -251,14 +254,23 @@ namespace {
 // Stable names and types survive the insert/erase APIs; indices and instance
 // operations do not. Never reuse a binding after a channel has been rewritten.
 struct SRAMDataPort {
-  std::string model, instance, oldPort, local, global, topPort;
+  std::string model, instance, oldPort, local, global, topPort, clock;
   Direction direction;
   BundleType type;
 };
 
 LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
-                                  std::string &error) {
+                                  std::string &error, bool withTransport = false) {
   using namespace goldengate;
+  if (withTransport) {
+    // Promotion can leave repeated parent writes. Resolve last-connect order
+    // before following clock aliases, as the SFC LowForm preparation does.
+    PassManager normalization(circuit.getContext(), CircuitOp::getOperationName());
+    normalization.addNestedPass<FModuleOp>(createExpandWhensPass());
+    if (failed(normalization.run(circuit))) {
+      error = "SRAM transport last-connect normalization failed"; return failure();
+    }
+  }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto hierarchy = analyzeTopHierarchy(circuit, error);
   auto dependencies = analyzeSRAMModelDependencies(circuit, error);
@@ -317,6 +329,49 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     if (!bound) return failure();
     bindings.append(bound->begin(), bound->end());
   }
+  // Capture the parent hub's clock and data-domain identities while ports are
+  // scalar. The SRAM-only boundary keeps its historical virtual-clock scope.
+  FModuleOp hub;
+  std::string hubInstance, clockLocal;
+  SmallVector<FAMEHubClockDomain> domains;
+  SmallVector<FAMEChannelClockDomain> assignments;
+  std::optional<FAMETopChannelPort> clockPort;
+  if (withTransport) {
+    for (const auto &channel : channels) {
+      if (channel.kind != ChannelKind::TargetClock && channel.kind != ChannelKind::Pipe) {
+        error = "SRAM transport requires scalar pipe data channels";
+        return failure();
+      }
+      if (channel.kind != ChannelKind::TargetClock) continue;
+      if (hub) { error = "SRAM transport requires one clock hub"; return failure(); }
+      auto bound = bindChannelToModels(channel, *hierarchy, groups, error);
+      if (!bound) return failure();
+      if (bound->size() != 1) {
+        error = "SRAM transport clock channel must bind exactly one parent hub";
+        return failure();
+      }
+      auto boundModule = bound->front().portGroup->module;
+      hub = dyn_cast<FModuleOp>(boundModule.getOperation());
+      if (!hub || llvm::is_contained(models, hub)) {
+        error = "SRAM transport requires a separate parent clock hub"; return failure();
+      }
+      hubInstance = bound->front().instance.getName().str();
+      clockLocal = bound->front().portGroup->name;
+      auto analyzed = analyzeFAMEHubClockDomains(channel, *hierarchy, bound->front(), error);
+      if (!analyzed) return failure();
+      domains = *analyzed;
+      auto clockAssignments = analyzeFAMEChannelClockDomains(circuit, hub, domains, error);
+      if (!clockAssignments) return failure();
+      assignments = *clockAssignments;
+    }
+    if (!hub) { error = "SRAM transport has no parent clock hub"; return failure(); }
+    unsigned uses = 0;
+    circuit.walk([&](InstanceOp instance) {
+      if (instance.getModuleName() == hub.getName()) ++uses;
+    });
+    if (uses != 1) { error = "SRAM transport requires one promoted parent hub instance"; return failure(); }
+    models.push_back(hub);
+  }
   SmallVector<FModuleLike> selected(models.begin(), models.end());
   auto plan = analyzeFAMEPorts(*hierarchy, bindings, channels, selected, error);
   if (!plan) return failure();
@@ -330,14 +385,28 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
       auto binding = *port.binding;
       auto group = *binding.portGroup;
       auto model = cast<FModuleOp>(group.module.getOperation());
-      if (group.ports.size() != 1 || group.clockPort || binding.instancePorts.size() != 1 ||
+      if (model == hub && llvm::all_of(group.ports, [&](unsigned i) {
+            return isa<ClockType>(model.getPortType(i));
+          })) {
+        if (clockPort) { error = "SRAM transport has multiple clock groups"; return failure(); }
+        clockPort = port;
+        continue;
+      }
+      if (group.ports.size() != 1 || (group.clockPort && model != hub) || binding.instancePorts.size() != 1 ||
           !isa<UIntType, SIntType>(model.getPortType(group.ports[0]))) {
-        error = "SRAM FAME currently requires scalar integer virtual-clock data channels";
+        error = "SRAM FAME requires scalar integer data channels; SRAM groups must use virtual clocks";
         return failure();
       }
       auto oldPort = model.getPortName(group.ports[0]).str();
+      std::string clock;
+      if (model == hub) {
+        for (const auto &assignment : assignments)
+          if (assignment.globalName == binding.globalName && assignment.localName == group.name &&
+              assignment.direction == group.direction) clock = assignment.modelClockName;
+        if (clock.empty()) { error = "SRAM parent data channel lacks a clock domain"; return failure(); }
+      }
       ports.push_back({model.getName().str(), binding.instance.getName().str(), oldPort,
-                       group.name, binding.globalName, port.portName, group.direction, port.type});
+                       group.name, binding.globalName, port.portName, clock, group.direction, port.type});
       renames[target(model, oldPort)] = target(model, group.name +
           (group.direction == Direction::In ? "_sink" : "_source")) + ".bits";
       for (const auto &connection : hierarchy->connections)
@@ -348,6 +417,7 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     }
   // Every data port must belong to exactly one local channel. The clock-only
   // substep validates the absence of explicit SRAM clock-channel associations.
+  SmallVector<std::string> unusedHubOutputs;
   for (auto model : models) {
     auto selection = analyzeFAMEDataSelection(circuit, model, error);
     if (!selection) return failure();
@@ -359,6 +429,14 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
         error = "SRAM FAME has duplicate instance data channel bindings";
         return failure();
       }
+    if (model == hub) {
+      for (auto p : model.getPorts())
+        if (!isa<ClockType>(p.type) && p.direction == Direction::Out &&
+            !selectedPorts[hubInstance].count(p.getName().str())) {
+          unusedHubOutputs.push_back(p.getName().str());
+          --dataPorts;
+        }
+    }
     for (auto instance : hierarchy->top.getOps<InstanceOp>()) {
       if (instance.getModuleName() != model.getName()) continue;
       if (selectedPorts[instance.getName().str()].size() == dataPorts) continue;
@@ -391,6 +469,29 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
       error = "SRAM FAME data target has unsupported retained annotation metadata";
       return failure();
     }
+  }
+  // Clock rewriting transfers clock endpoint annotations itself. Do not later
+  // replay the scalar snapshot and undo those schema-aware transfers.
+  SmallVector<FAMEHubClockControl> controls;
+  if (withTransport) {
+    if (!clockPort || failed(addFAMEHostControl(circuit, hub, error))) return failure();
+    auto current = analyzeTopHierarchy(circuit, error);
+    if (!current) return failure();
+    InstanceOp instance;
+    for (auto i : current->top.getOps<InstanceOp>()) if (i.getName() == hubInstance) instance = i;
+    ModelPortGroup clockGroup = *clockPort->binding->portGroup;
+    ModelChannelBinding clockBinding = *clockPort->binding;
+    for (auto &index : clockGroup.ports) index += 2;
+    for (auto &index : clockBinding.instancePorts) index += 2;
+    for (auto &domain : domains) domain.modelPort += 2;
+    clockBinding.instance = instance;
+    clockBinding.portGroup = &clockGroup;
+    FAMETopChannelPort liveClock{&clockBinding, clockPort->portName, clockPort->type};
+    if (failed(rewriteFAMEHubClockChannel(*current, liveClock, domains, false, error))) return failure();
+    auto clockControls = constructFAMEHubClockControls(circuit, hub, clockLocal, domains, error);
+    if (!clockControls) return failure();
+    controls = *clockControls;
+    raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   }
   if (failed(rewriteSRAMVirtualClocks(circuit, rewritten, error))) return failure();
   std::set<std::pair<std::string, std::string>> rewrittenChannels;
@@ -467,7 +568,12 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
       if (!localChannels.insert(port.local).second) continue;
       bool input = port.direction == Direction::In;
       (input ? inputs : outputs).push_back(port.local);
-      fired.push_back({port.local, input, one, false});
+      Value enable = one;
+      if (model == hub) {
+        for (const auto &control : controls) if (control.modelClockName == port.clock)
+          enable = input ? control.inputEnable : control.outputEnable;
+      }
+      fired.push_back({port.local, input, enable, model == hub});
     }
     for (const auto &dependency : *dependencies)
       if (dependency.module == model) rules.append(dependency.outputs.begin(), dependency.outputs.end());
@@ -475,19 +581,34 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
         failed(rewriteFAMEFiredStates(model, fired, error)) ||
         failed(rewriteFAMEInputReadies(model, inputs, error)) ||
         failed(rewriteFAMEOutputValids(model, rules, error)) ||
-        failed(rewriteFAMEFinishing(model, inputs, outputs, "", error)) ||
-        failed(groupFAMEChannelPorts(hierarchy->top, model, instance, "", error))) return failure();
+        failed(rewriteFAMEFinishing(model, inputs, outputs, model == hub ? clockLocal : "", error)))
+      return failure();
+    if (model == hub) {
+      if (failed(internalizeFAMEOutputClocks(hierarchy->top, hub, hubInstance, error))) return failure();
+      SmallVector<StringRef> unused;
+      for (const auto &name : unusedHubOutputs) unused.push_back(name);
+      if (failed(internalizeFAMEUnusedOutputs(circuit, hub, unused, error))) return failure();
+    }
+    if (failed(groupFAMEChannelPorts(hierarchy->top, model, instance,
+                                    model == hub ? clockLocal + "_sink" : "", error))) return failure();
+  }
+  if (withTransport) {
+    if (failed(removeFAMEStaleTopClocks(hierarchy->top, error)) ||
+        failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
+        failed(addFAMEPipeWrapper(circuit, error)) ||
+        failed(addFAMEClockChannel(circuit, error)) ||
+        failed(activateFAMEPipeWrapper(circuit, error))) return failure();
   }
   return success();
 }
 } // namespace
 
-LogicalResult goldengate::rewriteSRAMFAME(CircuitOp circuit, unsigned &rewritten,
-                                         std::string &error) {
+static LogicalResult rewriteSRAMBoundary(CircuitOp circuit, unsigned &rewritten,
+                                         std::string &error, bool transport) {
   rewritten = 0;
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   unsigned count = 0;
-  if (failed(rewriteSRAMFAMEImpl(*staged, count, error))) return failure();
+  if (failed(rewriteSRAMFAMEImpl(*staged, count, error, transport))) return failure();
   if (failed(verify(*staged))) {
     error = "SRAM FAME produced invalid FIRRTL IR";
     return failure();
@@ -496,4 +617,14 @@ LogicalResult goldengate::rewriteSRAMFAME(CircuitOp circuit, unsigned &rewritten
   circuit.getBody().takeBody(staged->getBody());
   rewritten = count;
   return success();
+}
+
+LogicalResult goldengate::rewriteSRAMFAME(CircuitOp circuit, unsigned &rewritten,
+                                         std::string &error) {
+  return rewriteSRAMBoundary(circuit, rewritten, error, false);
+}
+
+LogicalResult goldengate::rewriteSRAMPipeTransport(CircuitOp circuit, unsigned &rewritten,
+                                                  std::string &error) {
+  return rewriteSRAMBoundary(circuit, rewritten, error, true);
 }

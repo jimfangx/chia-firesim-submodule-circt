@@ -38,4 +38,11 @@ mlir::LogicalResult rewriteSRAMVirtualClocks(
 // so unsupported instances/metadata leave the original circuit unchanged.
 mlir::LogicalResult rewriteSRAMFAME(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
+// Construct the parent clock hub and directly promoted SRAM FAME models, then
+// join scalar PipeChannel endpoints with host-clocked queues. Requires one hub,
+// scalar integer data groups and complete model coverage; no ready-valid pairs.
+// Preserves retained inner endpoint/clock identities through wrapper activation.
+// Commits only a verified clone. Optional timing-model replacement is separate.
+mlir::LogicalResult rewriteSRAMPipeTransport(
+    circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
 }

@@ -313,11 +313,77 @@ java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
   midas.passes.fame.SRAMFAMEOracle "$evidence"
 ```
 
+## Parent/SRAM pipe transport (iteration 50)
+
+The opt-in `--rewrite-sram-transport` boundary now constructs both the parent
+clock hub's FAME hardware and the promoted SRAM definitions' virtual-clock
+hardware, then joins their data endpoints with the native host-clocked pipe
+queues and activates the Boolean-clock wrapper. The four-instance probe has
+52 internal queues, one SRAM definition and one clock hub. All data channels
+stay inside the wrapper; only host controls and the clock packet are external.
+The parent input fired states use the raw clock token and reset fired; its
+output states use the buffered token and reset unfired. SRAM channels retain
+their virtual-clock reset/unfired behavior. The rewrite commits a verified
+clone and requires complete scalar integer pipe coverage of the parent.
+
+Clock analysis required last-connect normalization after promotion. The
+comparison also exposed promoted wrapper clock aliases whose names differ
+from their model ports. Clock-output removal now resolves their direct SSA
+connections, including ordinary connects emitted by `ExpandWhens`, instead
+of assuming equal names. Eight identity/alias/LowerTypes cases pass, and
+19 unsafe plans reject without mutation.
+
+`SRAMPipeTransportOracle.scala` runs the unchanged full SFC `FAMETransform`
+and production `SimWrapper` on the independently prepared four-instance input.
+The native candidate is only parsed. Its parent/SRAM ABIs, all 67 register
+reset/transition rules and 72 ready/valid/finishing/gate equations match after
+expanding temporary nodes and canonicalizing Boolean association/constants.
+Every queue's payload, valid, ready and host-control connection is checked.
+The complete 52-pair endpoint multiset matches both SFC's annotations and
+the actual production SimWrapper wiring. Existing pipe-channel behavioral
+tests cover the reused queue implementation.
+
+The golden comparison uses the unchanged
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`.
+Fresh preparation still matches all 100 Rocket and 197 fanout annotation
+records. The extracted Rocket register file still matches SFC's ten Decoupled
+ABIs, memory/payload/gate wiring, 160 fired transitions, 2,048 output-valid
+cases, 16,384 finishing cases and annotation renames. Its isolated parent
+omits non-SRAM channels, so it is not a complete parent transport oracle:
+SFC full-parent FAME cannot transform that partial graph, and the native
+transport boundary rejects incomplete data coverage. This probe is kept at
+the SRAM-only comparison boundary.
+
+All nine focused CTests pass. After rebuilding the shared clock-coupling test
+against the changed helper, its four modes and the SRAM boundary pass again.
+The direct default compiler through PrintBridge host binding passes with empty
+stderr. FireSim manager verification remains harness-owned.
+
+Artifacts are in the mutable U250 generated directory's
+`iteration50-sram-transport/`: fresh preparation and SRAM FAME candidates,
+`fanout-transport/post-sram-transport.fir` and its annotation sidecar,
+`oracle/fanout.transport-fame.sfc.fir/json`,
+`oracle/fanout.transport-wrapper.sfc.fir`, and comparison/test logs.
+After compiling the Scala oracle alongside the existing preparation oracles:
+
+```sh
+"$native_compiler" "$evidence/oracle/fanout.channels-input.fir" \
+  --annotation-file "$evidence/oracle/fanout.channels-input.json" \
+  --output-dir "$evidence/fanout-transport" --rewrite-sram-transport
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMPipeTransportOracle "$evidence"
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMPipeTransportCompare "$evidence"
+```
+
 ## Remaining scope
 
 Shared SRAM definitions now have native FAME data/clock hardware with distinct
-instance bindings. Optional memory selection is still absent from the default
-FireSim build; inter-model transport and abstract RAM timing-model replacement
-remain pending. The next step is to construct the both-ended pipe transport
-between a promoted SRAM and its parent model, then compare that executable
-connection against SFC's channel implementation.
+instance bindings and native transport for complete scalar parent graphs.
+Optional memory selection is still absent from the default FireSim build;
+abstract RAM timing-model replacement and SRAM generated-clock collateral
+integration remain pending. Legacy retained domain-clock annotations have the
+same erased top-clock references as SFC after FAME; later consumers must use
+captured domain identity rather than resolve those as surviving ports. The
+next step is to supply the isolated golden Rocket parent's surrounding input
+and output channels, then compare its complete SRAM transport boundary.

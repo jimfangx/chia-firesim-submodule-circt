@@ -37,7 +37,7 @@ void annotate(OpBuilder &b, Operation *op, unsigned count, unsigned port) {
   op->setAttr("portAnnotations", b.getArrayAttr(annotations));
 }
 void runOutputs(MLIRContext &context, bool symbols, bool emptyBody,
-                unsigned rejection) {
+                unsigned rejection, bool promotedAliases = false) {
   auto root = parseSourceString<ModuleOp>(R"mlir(
 module { firrtl.circuit "Top" {
   firrtl.module @Top(in %hostClock: !firrtl.clock, out %clockA: !firrtl.clock,
@@ -52,6 +52,12 @@ module { firrtl.circuit "Top" {
   auto modules = circuit.getOps<FModuleOp>();
   auto top = *modules.begin();
   auto model = *std::next(modules.begin());
+  if (promotedAliases) {
+    SmallVector<Attribute> names(top.getPortNamesAttr().begin(), top.getPortNamesAttr().end());
+    names[1] = StringAttr::get(&context, "model_clockA_source");
+    names[3] = StringAttr::get(&context, "model_clockB_source");
+    top.setPortNamesAttr(ArrayAttr::get(&context, names));
+  }
   OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
   auto instance = b.create<InstanceOp>(top.getLoc(), model, "model");
   auto instanceSymbol = symbol(b, "instance_id", "private");
@@ -60,8 +66,12 @@ module { firrtl.circuit "Top" {
   for (unsigned i = 0; i < top.getNumPorts(); ++i) {
     auto t = top.getBodyBlock()->getArgument(i);
     auto m = instance.getResult(i);
-    b.create<StrictConnectOp>(top.getLoc(), i == 0 || i == 2 ? m : t,
-                             i == 0 || i == 2 ? t : m);
+    if (promotedAliases)
+      b.create<ConnectOp>(top.getLoc(), i == 0 || i == 2 ? m : t,
+                          i == 0 || i == 2 ? t : m);
+    else
+      b.create<StrictConnectOp>(top.getLoc(), i == 0 || i == 2 ? m : t,
+                                i == 0 || i == 2 ? t : m);
   }
   b.setInsertionPointToEnd(model.getBodyBlock());
   NodeOp clockConsumer;
@@ -220,12 +230,13 @@ int main() {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     for (bool symbols : {false, true})
-      for (bool empty : {false, true}) runOutputs(context, symbols, empty, 0);
+      for (bool empty : {false, true})
+        for (bool aliases : {false, true}) runOutputs(context, symbols, empty, 0, aliases);
     for (unsigned rejection = 1; rejection <= 8; ++rejection)
-      runOutputs(context, true, false, rejection);
+      for (bool aliases : {false, true}) runOutputs(context, true, false, rejection, aliases);
     for (unsigned rejection = 0; rejection <= 3; ++rejection) runInput(context, rejection);
-    llvm::outs() << "4 clock-output identity/LowerTypes cases and input-clock deletion passed; "
-                    "11 unsafe plans rejected without mutation\n";
+    llvm::outs() << "8 clock-output identity/alias/LowerTypes cases and input-clock deletion passed; "
+                    "19 unsafe plans rejected without mutation\n";
     return 0;
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';
