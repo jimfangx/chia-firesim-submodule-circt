@@ -13,6 +13,7 @@
 #include "goldengate/LabelSRAMModels.h"
 #include "goldengate/SRAMModelChannels.h"
 #include "goldengate/RAMModelAdapter.h"
+#include "goldengate/AsyncRAMModel.h"
 #include "goldengate/AnnotationEmission.h"
 #include "goldengate/MetasimInterfaceHeader.h"
 #include "goldengate/SimulationMasterHeader.h"
@@ -198,6 +199,7 @@ static mlir::LogicalResult emitAutoILAAnalysis(CircuitOp circuit,
 }
 
 int main(int argc, char **argv) {
+  bool emitAsyncRAM = argc == 8 && llvm::StringRef(argv[6]) == "--emit-async-ram";
   bool wrapRAMModel = argc == 9 && llvm::StringRef(argv[6]) == "--wrap-ram-model";
   bool rewriteOutputValids =
       argc == 8 &&
@@ -338,7 +340,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !wrapRAMModel && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
+       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !wrapRAMModel && !emitAsyncRAM && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -357,7 +359,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --rewrite-sram-clocks | --rewrite-sram-fame | --rewrite-sram-parent-fame | --rewrite-sram-transport | --wrap-ram-model wrapper implementation | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
+                    "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --rewrite-sram-clocks | --rewrite-sram-fame | --rewrite-sram-parent-fame | --rewrite-sram-transport | --wrap-ram-model wrapper implementation | --emit-async-ram module | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -4751,6 +4753,29 @@ int main(int argc, char **argv) {
   for (const auto &[name, count] : externalClasses)
     if (classes[name] < count)
       return fail("CIRCT lost input annotations of class " + name);
+
+  if (emitAsyncRAM) {
+    FModuleOp selected;
+    for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == argv[7]) selected = m;
+    std::string error;
+    goldengate::RAMModelParameters parameters;
+    if (failed(goldengate::emitAsyncRAMModel(selected, parameters, error)))
+      return fail("Async RAM model: " + error);
+    if (failed(mlir::verify(*module))) return fail("Async RAM boundary is invalid");
+    llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
+    llvm::sys::path::append(firPath, "post-async-ram.fir");
+    llvm::sys::path::append(annotationPath, "post-async-ram-all.json");
+    std::error_code ec;
+    llvm::raw_fd_ostream out(firPath, ec);
+    if (ec || failed(exportFIRFile(*module, out, 16384, FIRVersion(1, 2, 0))))
+      return fail("cannot export async RAM FIRRTL");
+    if (failed(goldengate::emitAllAnnotations(circuit, annotationPath, error)))
+      return fail("cannot export async RAM annotations: " + error);
+    llvm::outs() << "Emitted native async RAM " << argv[7] << ": " << parameters.reads
+                 << " reads, " << parameters.writes << " writes, " << parameters.addressWidth
+                 << " address bits, " << parameters.dataWidth << " data bits\n";
+    return 0;
+  }
 
   if (wrapRAMModel) {
     FModuleOp wrapper, implementation;

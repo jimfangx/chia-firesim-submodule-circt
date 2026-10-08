@@ -605,17 +605,91 @@ the analogous aggregate artifacts, `compare.stdout`, and `ctest.log`.
 The supplied iteration 53 replacertl and Verilator workload results pass;
 manager verification of this new boundary remains harness-owned.
 
+## Native async RAM timing model (iteration 55)
+
+`--emit-async-ram module` replaces a selected host module body with typed
+CIRCT FIRRTL operations implementing `AsyncMemChiselModel`. It consumes only
+its `clock`, `reset`, and aggregate `RegfileModelIO` port ABI. The implementation
+emits priority read arbitration, a sampled memory-data register, per-reader
+response buffers and four-state controllers, reset-token capture, ordered
+write completion, and target-reset/host-reset write suppression. Host reset
+flushes protocol state while retaining memory and data buffers. Read-command
+`en` is intentionally unused, matching the Scala oracle.
+
+Emission preserves module/port metadata and all retained annotation records.
+It rejects malformed types/directions, empty command vectors, unknown widths,
+and references into the replaced body (including hierarchical targets) before
+mutation. The body is built and verified on a temporary module before transfer.
+`AsyncRAMModelTest.cpp` covers repeatable replacement, local/hierarchical port
+identity preservation, and ten atomic rejection boundaries.
+
+`AsyncRAMModelOracle.scala` selects the independently generated production SFC
+`RamModel` from iteration 54's `golden-rocket.expected.fir` and
+`aggregate.expected.fir`. The Rocket reference derives from the immutable
+compiler artifact:
+
+```
+/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir
+```
+
+The selected original memory is `Rocket.rf`, `UInt<64>[31]`, with two reads and
+one write. Production `EmitAndWrapRAMModels` uses its five address bits to emit
+a depth-32 host RAM. A fresh 3-read/3-write, depth-16, 23-bit production Chisel
+model adds a wider arbitration probe. Candidates receive empty module bodies
+with only the oracle ABI; no SFC transform supplies or rewrites native hardware.
+
+The comparator evaluates each exported FIRRTL operation and requires matching
+ABI, memory configuration, register identities, outputs (including invalid
+response bits), every register next value, async read address and enabled
+writes. Each shape passes 10,000 arbitrary-state transitions followed by
+10,000 stateful cycles with memory updates, randomized stalls, host resets and
+target-reset tokens: 60,000 transitions total. SFC `validif` write fields are
+compared only when the corresponding write is enabled. Unsupported operations
+are rejected by the evaluator. The combined Rocket candidate starts from the
+native iteration-54 wrapper; its 29 wrapper equations and all 1,249 annotation
+records remain unchanged while its host body matches the checked native model.
+
+Mutable evidence is under `iteration55-async-ram/` in the U250 generated
+directory: `*.expected.fir`, `*-native/post-async-ram.fir`, `comparison.log`,
+`golden-rocket-combined/`, `combined-comparison.log` and `ctest.log`.
+The native compiler and unit test build; 41 focused SRAM/FAME CTests pass.
+The three standalone native host modules also lower through CIRCT `firtool`
+to SystemVerilog. For reingestion, the test removes only CIRCT's `public`
+module keyword, which the pinned exporter emits even with a FIRRTL 1.2 header;
+the parser rejects that syntax/version pair. This is a compiler-boundary test; manager validation remains
+harness-owned.
+
+After sourcing the FireSim environment, compile `AsyncRAMModelOracle.scala`
+with the pinned Scala 2.13 compiler and Midas runtime classpath, then:
+
+```sh
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMModelOracle \
+  "$evidence" "$iteration54_evidence"
+for name in golden-rocket aggregate multiport; do
+  "$native_compiler" "$evidence/$name.input.fir" \
+    --annotation-file "$evidence/$name.input.json" \
+    --output-dir "$evidence/$name-native" --emit-async-ram RamModel
+done
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMModelCompare "$evidence"
+"$native_compiler" "$evidence/combined.input.fir" \
+  --annotation-file "$evidence/combined.input.json" \
+  --output-dir "$evidence/golden-rocket-combined" --emit-async-ram RamModel
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMModelCombinedCompare \
+  "$iteration54_evidence" "$evidence"
+```
+
 ## Remaining scope
 
 Shared SRAM definitions now have native FAME data/clock hardware with distinct
-instance bindings and native transport for complete scalar parent graphs.
-Optional memory selection is still absent from the default FireSim build;
-native async RAM timing-model emission and SRAM generated-clock collateral
-integration remain pending. The new adapter requires a supplied elaborated
-implementation and is not yet selected by the default FireSim compiler flow.
-Legacy retained domain-clock annotations have the
-same erased top-clock references as SFC after FAME; later consumers must use
-captured domain identity rather than resolve those as surviving ports. The
-next step is to emit native async read arbitration and response buffering on a
-selected memory, compare the timing transitions against SFC, then integrate optional
-memory selection and generated-clock collateral into the default compiler.
+instance bindings, native transport for complete scalar parent graphs, a
+native command/response adapter, and native async host timing-model hardware.
+Optional memory selection is still absent from the default FireSim build.
+The adapter currently requires a supplied host module declaration; selecting
+the optional path must create that ABI and invoke native body emission instead
+of elaborating the Scala timing model. SRAM generated-clock collateral also
+needs integration. Legacy retained domain-clock annotations have the same
+erased top-clock references as SFC after FAME; later consumers must use captured
+domain identity rather than resolve those as surviving ports. The next smallest
+step is native host-module creation from the adapter's resolved parameters,
+followed by the selected-memory end-to-end boundary and generated-clock
+collateral comparison before enabling optional selection in the default flow.
