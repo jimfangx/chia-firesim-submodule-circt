@@ -616,6 +616,46 @@ void remoteModelClock(MLIRContext &context) {
             "invalid remote clock binding accepted or mutated IR");
   }
 }
+// Shared FAME host controls are fanout edges, not ambiguous target channels.
+void sharedHostControls(MLIRContext &context) {
+  for (unsigned rejection = 0; rejection < 3; ++rejection) {
+    auto root = parseSourceString<ModuleOp>(R"mlir(module {
+      firrtl.circuit "Top" {
+        firrtl.module @Top(in %hostClock: !firrtl.clock,
+            in %hostReset: !firrtl.uint<1>, in %data: !firrtl.uint<1>) {}
+        firrtl.module private @Model(in %hostClock: !firrtl.clock,
+            in %hostReset: !firrtl.uint<1>, in %data: !firrtl.uint<1>) {}
+      }
+    })mlir", &context);
+    require(bool(root), "host control fanout fixture parse failed");
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    auto it = circuit.getOps<FModuleOp>().begin();
+    auto top = *it++, model = *it;
+    OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
+    for (unsigned i = 0; i < 2; ++i) {
+      auto instance = b.create<InstanceOp>(top.getLoc(), model, i ? "right" : "left");
+      b.create<StrictConnectOp>(top.getLoc(), instance.getResult(0),
+                                top.getBodyBlock()->getArgument(0));
+      // A mismatched first edge must also prevent subsequent fanout.
+      b.create<StrictConnectOp>(top.getLoc(),
+          instance.getResult(rejection == 2 && i == 0 ? 2 : 1),
+          top.getBodyBlock()->getArgument(1));
+      if (rejection == 1)
+        b.create<StrictConnectOp>(top.getLoc(), instance.getResult(2),
+                                  top.getBodyBlock()->getArgument(2));
+    }
+    require(succeeded(verify(*root)), "host control fanout fixture invalid");
+    auto before = dump(*root);
+    std::string error;
+    auto hierarchy = goldengate::analyzeTopHierarchy(circuit, error);
+    require(dump(*root) == before, "host fanout analysis mutated IR");
+    if (rejection)
+      require(!hierarchy && !error.empty(), "ambiguous target/control fanout accepted");
+    else
+      require(hierarchy && hierarchy->connections.size() == 4,
+              "shared host controls lost an instance edge: " + error);
+  }
+}
 } // namespace
 int main(int argc, char **argv) {
   try {
@@ -653,6 +693,7 @@ int main(int argc, char **argv) {
       multiportAliases(context, rejection);
     newlySynthesizedPrintBundle(context);
     remoteModelClock(context);
+    sharedHostControls(context);
     llvm::outs() << "Annotation-selected Print/forward/reverse outputs, payload order, "
                     "dependencies, scalar/multiport and mixed-kind shared producers, all data inputs and model isolation passed; 12 unsafe selections "
                     "rejected without mutation; scalar physical aliases collapsed and four unsafe rewrites rejected atomically\n";

@@ -33,6 +33,9 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
   std::set<unsigned> boundPorts;
   llvm::SmallVector<const ModelPortGroup *> outputGroups;
   llvm::SmallVector<llvm::SmallVector<unsigned>> outputOrders;
+  llvm::SmallVector<const ModelPortGroup *> inputGroups;
+  llvm::SmallVector<llvm::SmallVector<unsigned>> inputOrders;
+  llvm::SmallVector<llvm::SmallVector<InstanceOp>> inputInstances;
   for (auto attr : annotations) {
     Annotation annotation(attr);
     if (!annotation.isClass(AnnotationClasses::ChannelConnection))
@@ -53,6 +56,33 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
       auto boundModule = binding.portGroup->module;
       if (boundModule.getOperation() != model.getOperation())
         continue;
+      if (binding.portGroup->direction == Direction::In) {
+        llvm::SmallVector<unsigned> orderedPorts;
+        for (const auto &sink : channel->sinks)
+          for (const auto &connection : hierarchy->connections)
+            if (sink.port && sink.module == hierarchy->top &&
+                connection.topPort == *sink.port &&
+                connection.instance == binding.instance)
+              orderedPorts.push_back(connection.instancePort);
+        auto previous = llvm::find(inputGroups, binding.portGroup);
+        if (previous != inputGroups.end()) {
+          unsigned index = previous - inputGroups.begin();
+          if (orderedPorts != inputOrders[index] ||
+              selection.inputs[index].fieldCount != channel->sinks.size() ||
+              llvm::is_contained(inputInstances[index], binding.instance)) {
+            error = "shared FAME input changes payload order or repeats an instance: " +
+                    channel->name;
+            return std::nullopt;
+          }
+          // SFC builds the local channel once per definition. Distinct
+          // promoted instances retain separate global input connections.
+          inputInstances[index].push_back(binding.instance);
+          continue;
+        }
+        inputGroups.push_back(binding.portGroup);
+        inputOrders.push_back(std::move(orderedPorts));
+        inputInstances.push_back({binding.instance});
+      }
       if (binding.portGroup->direction == Direction::Out) {
         // InferModelPorts has already deduplicated (clock, ordered ports).
         // Binding matches port sets, so check order again before sharing a

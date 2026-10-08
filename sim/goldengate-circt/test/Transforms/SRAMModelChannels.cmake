@@ -153,7 +153,7 @@ if(NOT seeded_count EQUAL count)
   message(FATAL_ERROR "Existing annotations were duplicated: ${count} -> ${seeded_count}")
 endif()
 
-# Data-port rewriting currently supports one promoted instance per definition.
+# Exercise a single instance as well as all four shared-definition instances.
 # Derive a single-instance probe without changing the recorded fanout fixture.
 file(READ "${FIXTURES}/SRAMModelChannels.fir" single)
 string(REGEX REPLACE "    inst p1 of Parent\n" "" single "${single}")
@@ -187,10 +187,23 @@ execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
   --annotation-file "${FIXTURES}/SRAMModelChannels.json"
   --output-dir "${OUTPUT}/repeated-fame" --rewrite-sram-fame
   RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
-if(status EQUAL 0 OR NOT stderr MATCHES "require one promoted instance per definition")
-  message(FATAL_ERROR "Repeated SRAM data rewrite was not rejected: ${stdout}\n${stderr}")
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Shared SRAM data rewrite failed: ${stdout}\n${stderr}")
 endif()
-message(STATUS "Passed native single-instance SRAM FAME state, payload targets and repeated-instance rejection")
+file(READ "${OUTPUT}/repeated-fame/post-sram-fame.fir" repeated_fir)
+string(REGEX MATCHALL "reg [^\n]*_fired_[0-9]+ : UInt<1>" repeated_fired "${repeated_fir}")
+list(LENGTH repeated_fired repeated_fired_count)
+if(NOT repeated_fired_count EQUAL 13)
+  message(FATAL_ERROR "Shared SRAM definition duplicated channel state: ${repeated_fired_count}")
+endif()
+foreach(instance Top_m0_p0_ram Top_m0_p1_ram Top_m1_p0_ram Top_m1_p1_ram)
+  string(FIND "${repeated_fir}" "${instance}.r_addr_sink <= ${instance}_r_addr_sink" input_binding)
+  string(FIND "${repeated_fir}" "${instance}_r_data_source <= ${instance}.r_data_source" output_binding)
+  if(input_binding LESS 0 OR output_binding LESS 0)
+    message(FATAL_ERROR "Shared SRAM instance ${instance} has stale channel bindings")
+  endif()
+endforeach()
+message(STATUS "Passed native single/shared SRAM FAME state and per-instance payload bindings")
 
 # Unknown metadata referring to a replaced data port needs its own transfer
 # policy. Reject it instead of recursively changing arbitrary annotation text.

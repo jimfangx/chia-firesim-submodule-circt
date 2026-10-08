@@ -215,12 +215,16 @@ LogicalResult rewriteMultiportInputChannel(
 
 LogicalResult goldengate::rewriteFAMEInputChannel(
     const TopHierarchy &hierarchy, const FAMETopChannelPort &channel,
-    std::string &error) {
+    std::string &error, bool rewriteModel) {
   const auto &binding = *channel.binding;
   auto top = hierarchy.top;
   auto modelModule = binding.portGroup->module;
   auto model = dyn_cast<FModuleOp>(modelModule.getOperation());
   auto instance = binding.instance;
+  if (binding.instancePorts.size() > 1 && !rewriteModel) {
+    error = "additional FAME instance rewrite requires a scalar channel";
+    return failure();
+  }
   if (binding.instancePorts.size() > 1)
     return rewriteMultiportInputChannel(hierarchy, channel, error);
   if (!model || binding.portGroup->direction != Direction::In ||
@@ -230,7 +234,7 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
     return failure();
   }
   unsigned modelPort = binding.instancePorts.front();
-  auto payloadType = dyn_cast<FIRRTLBaseType>(model.getPorts()[modelPort].type);
+  auto payloadType = dyn_cast<FIRRTLBaseType>(instance.getResult(modelPort).getType());
   if (!payloadType || isa<BundleType, FVectorType>(payloadType) ||
       !isa<BundleType>(channel.type) ||
       channel.type.getElements().size() != 3 ||
@@ -239,11 +243,18 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
     return failure();
   }
   std::string modelName = binding.portGroup->name + "_sink";
-  for (const auto &port : model.getPorts())
-    if (port.getName() == modelName) {
-      error = "FAME model channel port already exists: " + modelName;
-      return failure();
-    }
+  if ((!rewriteModel && (model.getPortName(modelPort) != modelName ||
+                         model.getPortType(modelPort) != channel.type)) ||
+      (rewriteModel && model.getPortType(modelPort) != payloadType)) {
+    error = "FAME scalar definition does not match the instance rewrite stage";
+    return failure();
+  }
+  if (rewriteModel)
+    for (const auto &port : model.getPorts())
+      if (port.getName() == modelName) {
+        error = "FAME model channel port already exists: " + modelName;
+        return failure();
+      }
   if (hasPortAnnotations(model, modelPort)) {
     error = "FAME input port has annotations requiring a field transfer";
     return failure();
@@ -274,8 +285,8 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
   if (failed(collectFAMEWrapperPayloadMetadata(
           top, *topPort, channel.type, {}, wrapperAnnotations,
           wrapperSymbols, error)) ||
-      failed(collectFAMEPayloadSymbols(
-          model, modelPort, channel.type, {}, modelSymbols, error)))
+      (rewriteModel && failed(collectFAMEPayloadSymbols(
+          model, modelPort, channel.type, {}, modelSymbols, error))))
     return failure();
   Value oldTop = top.getBodyBlock()->getArgument(*topPort);
   Value oldInstance = instance.getResult(modelPort);
@@ -321,16 +332,18 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
   }
   // The insertion position is in the original port list, as in the host
   // control rewrite. The old scalar moves one slot right and is then erased.
-  model.insertPorts({{modelPort, modelInfo}});
-  Value oldModel = model.getBodyBlock()->getArgument(modelPort + 1);
-  OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
-  Value bits = body.create<SubfieldOp>(model.getLoc(),
-                                       model.getBodyBlock()->getArgument(modelPort),
-                                       "bits");
-  oldModel.replaceAllUsesWith(bits);
-  llvm::BitVector eraseModel(model.getNumPorts());
-  eraseModel.set(modelPort + 1);
-  model.erasePorts(eraseModel);
+  if (rewriteModel) {
+    model.insertPorts({{modelPort, modelInfo}});
+    Value oldModel = model.getBodyBlock()->getArgument(modelPort + 1);
+    OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
+    Value bits = body.create<SubfieldOp>(model.getLoc(),
+                                         model.getBodyBlock()->getArgument(modelPort),
+                                         "bits");
+    oldModel.replaceAllUsesWith(bits);
+    llvm::BitVector eraseModel(model.getNumPorts());
+    eraseModel.set(modelPort + 1);
+    model.erasePorts(eraseModel);
+  }
 
   top.insertPorts({{*topPort, topInfo}});
   Value newTop = top.getBodyBlock()->getArgument(*topPort);
@@ -1175,12 +1188,21 @@ LogicalResult goldengate::groupFAMEChannelPorts(
     error = "FAME model instance has incompatible ports";
     return failure();
   }
-  for (unsigned i = 0; i < model.getNumPorts(); ++i)
-    if (instance.getPortNameStr(i) != model.getPortName(i) ||
-        instance.getResult(i).getType() != model.getPorts()[i].type) {
-      error = "FAME model instance port differs from its module";
+  SmallVector<InstanceOp> instances;
+  for (auto candidate : top.getOps<InstanceOp>()) {
+    if (candidate.getModuleName() != model.getName()) continue;
+    if (candidate.getNumResults() != model.getNumPorts()) {
+      error = "FAME model instance has incompatible ports";
       return failure();
     }
+    for (unsigned i = 0; i < model.getNumPorts(); ++i)
+      if (candidate.getPortNameStr(i) != model.getPortName(i) ||
+          candidate.getResult(i).getType() != model.getPortType(i)) {
+        error = "FAME model instance port differs from its module";
+        return failure();
+      }
+    instances.push_back(candidate);
+  }
 
   auto planOrder = [&](FModuleOp module, bool modelPorts,
                        SmallVectorImpl<unsigned> &order) -> LogicalResult {
@@ -1241,16 +1263,18 @@ LogicalResult goldengate::groupFAMEChannelPorts(
   if (modelChanged) {
     unsigned oldSize = model.getNumPorts();
     auto added = reorderModule(model, modelOrder);
-    InstanceOp expanded = instance.cloneAndInsertPorts(added);
-    for (unsigned newIndex = 0; newIndex < oldSize; ++newIndex)
-      instance.getResult(modelOrder[newIndex])
-          .replaceAllUsesWith(expanded.getResult(newIndex));
-    instance.erase();
-    llvm::BitVector oldIndices(expanded.getNumResults());
-    oldIndices.set(oldSize, expanded.getNumResults());
-    OpBuilder builder(expanded);
-    expanded.erasePorts(builder, oldIndices);
-    expanded.erase();
+    for (auto instance : instances) {
+      InstanceOp expanded = instance.cloneAndInsertPorts(added);
+      for (unsigned newIndex = 0; newIndex < oldSize; ++newIndex)
+        instance.getResult(modelOrder[newIndex])
+            .replaceAllUsesWith(expanded.getResult(newIndex));
+      instance.erase();
+      llvm::BitVector oldIndices(expanded.getNumResults());
+      oldIndices.set(oldSize, expanded.getNumResults());
+      OpBuilder builder(expanded);
+      expanded.erasePorts(builder, oldIndices);
+      expanded.erase();
+    }
   }
   bool topChanged = false;
   for (unsigned i = 0; i < topOrder.size(); ++i)

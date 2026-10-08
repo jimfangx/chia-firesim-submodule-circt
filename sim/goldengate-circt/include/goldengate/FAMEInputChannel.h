@@ -11,10 +11,14 @@ namespace goldengate {
 // move to payload field IDs; symbol names/visibility and InnerRefs stay unchanged.
 // Model annotations must already be consumed; identities add no protection.
 // Unsupported attached metadata is rejected before the channel is changed.
+// For additional instances of an already rewritten scalar definition, set
+// rewriteModel=false. The definition must have the exact channel ABI at the
+// same index; only the instance and its wrapper ports are then changed.
 // Callers must refresh port analyses and inner symbol tables after rewriting.
 mlir::LogicalResult rewriteFAMEInputChannel(const TopHierarchy &hierarchy,
                                              const FAMETopChannelPort &channel,
-                                             std::string &error);
+                                             std::string &error,
+                                              bool rewriteModel = true);
 
 // Channelize all ordered hub Clock inputs and explicitly transfer retained
 // ChannelConnection sinks/ChannelPorts ports to scalar bits or bundle leaves.
@@ -133,6 +137,7 @@ mlir::LogicalResult removeFAMEStaleTopClocks(
 // Place host controls and the model clock sink before data sinks, followed by
 // data sources, as in the SFC FAME model interface. Keep each group's order.
 // An empty modelClockSink selects the non-hub virtual-clock interface.
+// Reorder the shared definition and every direct instance in top together.
 mlir::LogicalResult groupFAMEChannelPorts(
     circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
     llvm::StringRef instanceName, llvm::StringRef modelClockSink,

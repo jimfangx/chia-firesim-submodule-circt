@@ -22,6 +22,7 @@
 #include "mlir/Pass/PassManager.h"
 #include <functional>
 #include <map>
+#include <set>
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -290,8 +291,8 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
       ++uses;
       promoted &= instance->getParentOfType<FModuleOp>() == hierarchy->top;
     });
-    if (uses != 1 || !promoted) {
-      error = "SRAM FAME data channels require one promoted instance per definition: " +
+    if (!uses || !promoted) {
+      error = "SRAM FAME data channels require directly promoted instances: " +
               model.getName().str();
       return failure();
     }
@@ -350,10 +351,17 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   for (auto model : models) {
     auto selection = analyzeFAMEDataSelection(circuit, model, error);
     if (!selection) return failure();
-    unsigned dataPorts = 0, selectedPorts = 0;
+    unsigned dataPorts = 0;
     for (auto port : model.getPorts()) dataPorts += !isa<ClockType>(port.type);
-    for (const auto &port : ports) selectedPorts += port.model == model.getName();
-    if (dataPorts != selectedPorts) {
+    std::map<std::string, std::set<std::string>> selectedPorts;
+    for (const auto &port : ports) if (port.model == model.getName())
+      if (!selectedPorts[port.instance].insert(port.oldPort).second) {
+        error = "SRAM FAME has duplicate instance data channel bindings";
+        return failure();
+      }
+    for (auto instance : hierarchy->top.getOps<InstanceOp>()) {
+      if (instance.getModuleName() != model.getName()) continue;
+      if (selectedPorts[instance.getName().str()].size() == dataPorts) continue;
       error = "SRAM FAME requires complete, distinct data channel coverage";
       return failure();
     }
@@ -385,7 +393,12 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     }
   }
   if (failed(rewriteSRAMVirtualClocks(circuit, rewritten, error))) return failure();
+  std::set<std::pair<std::string, std::string>> rewrittenChannels;
   for (const auto &port : ports) {
+    // Transform the definition once, then rewire every remaining instance at
+    // the same stable channel index. Each helper changes one instance operation;
+    // refresh hierarchy after every call rather than retaining erased handles.
+    bool rewriteModel = rewrittenChannels.insert({port.model, port.local}).second;
     auto current = analyzeTopHierarchy(circuit, error);
     if (!current) return failure();
     FModuleOp model;
@@ -397,7 +410,8 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
         instance = candidate;
     std::optional<unsigned> index;
     for (unsigned i = 0; i < model.getNumPorts(); ++i)
-      if (model.getPortName(i) == port.oldPort) index = i;
+      if (model.getPortName(i) == (rewriteModel ? port.oldPort : port.local +
+          (port.direction == Direction::In ? "_sink" : "_source"))) index = i;
     if (!instance || !index) {
       error = "SRAM FAME lost a scalar model binding during channelization";
       return failure();
@@ -406,8 +420,8 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     ModelChannelBinding binding{port.global, &group, instance, {*index}};
     FAMETopChannelPort channel{&binding, port.topPort, port.type};
     if (failed(port.direction == Direction::In
-                   ? rewriteFAMEInputChannel(*current, channel, error)
-                   : rewriteFAMEOutputChannel(*current, channel, error))) return failure();
+                   ? rewriteFAMEInputChannel(*current, channel, error, rewriteModel)
+                   : rewriteFAMEOutputChannel(*current, channel, error, rewriteModel))) return failure();
   }
   // SFC removes the transformed models' DontTouch annotations, then applies
   // hostDecouplingRenames to memory metadata, local groups and global endpoints.
@@ -447,11 +461,13 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     OpBuilder builder(model.getBodyBlock(), model.getBodyBlock()->begin());
     Value one = builder.create<ConstantOp>(model.getLoc(), UIntType::get(model.getContext(), 1), APInt(1, 1));
     std::string instance;
+    std::set<std::string> localChannels;
     for (const auto &port : ports) if (port.model == model.getName()) {
+      instance = port.instance;
+      if (!localChannels.insert(port.local).second) continue;
       bool input = port.direction == Direction::In;
       (input ? inputs : outputs).push_back(port.local);
       fired.push_back({port.local, input, one, false});
-      instance = port.instance;
     }
     for (const auto &dependency : *dependencies)
       if (dependency.module == model) rules.append(dependency.outputs.begin(), dependency.outputs.end());

@@ -31,7 +31,8 @@ mlir::LogicalResult rewriteSRAMVirtualClocks(
 
 // Channelize prepared scalar SRAM data ports, retarget their annotations to
 // Decoupled bits, and construct the virtual-clock FAME channel FSM. Requires
-// one promoted instance per SRAM definition. Other models stay at the prepared
+// directly promoted instances of each SRAM definition. Transforms local
+// channel hardware once and rewires every instance. Other models stay at the prepared
 // boundary; inter-model transport and SRAM timing-model replacement are later
 // steps. Rebuilds hierarchy between port rewrites. Commits a verified clone,
 // so unsupported instances/metadata leave the original circuit unchanged.

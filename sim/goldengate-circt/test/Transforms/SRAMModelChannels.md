@@ -259,11 +259,65 @@ All ten focused native tests pass. The direct default compiler boundary through
 PrintBridge host binding is also checked in this iteration. Manager validation
 remains harness-owned.
 
+## Shared SRAM FAME definitions (iteration 49)
+
+The data rewrite now transforms a shared SRAM definition once and rewires
+all its directly promoted instances. Scalar input/output helpers distinguish
+definition transformation from subsequent instance rewrites, validating the
+shared definition's channel name, type and stable port index. Final interface
+grouping reorders every instance with its definition. Hierarchy analysis retains
+shared host clock/reset edges only for matching control names, input directions
+and types; ordinary target-port fanout remains an error. The SRAM boundary still
+commits only a fully verified circuit clone.
+
+The four-instance test exposed a second single-instance assumption in data
+selection: repeated bindings of a local input group collided on the definition's
+port index. Selection now shares an input group across distinct instances after
+checking ordered payload identity. A second input channel claiming the same
+instance remains an error. Fired registers and ready/valid/finishing rules are
+constructed once per local channel; every instance retains its own global
+channel targets and top bindings.
+
+`SRAMFAMEOracle.scala` now checks both the fresh immutable-golden-derived Rocket
+register file and the four-instance read/write/readwrite fanout against the
+unchanged `FAMEModuleTransformer`. It compares each definition's memory and
+payload/gate wiring, every promoted instance's host/Decoupled bindings, and the
+SFC annotation rename multiset. Exhaustive equation comparisons cover:
+
+| Input | Instance bindings | Fired transitions | Output-valid cases | Finishing cases |
+| --- | ---: | ---: | ---: | ---: |
+| Golden Rocket register file | 1 | 160 | 2,048 | 16,384 |
+| Four-instance fanout | 4 | 208 | 16,384 | 131,072 |
+
+Both equation/annotation comparisons pass, and preparation still matches all
+100 Rocket and 197 fanout annotation records. All ten focused native tests pass,
+including rejection of competing input bindings, ordinary data fanout and
+mismatched host-control identities. The direct default compiler through
+PrintBridge host binding passes with empty stderr. Manager gates remain
+harness-owned.
+
+Artifacts are in the mutable U250 generated directory's
+`iteration49-sram-fame/`: the fresh golden-derived preparation oracle,
+`oracle/golden-rocket.fame.sfc.fir/json`,
+`oracle/fanout.fame.sfc.fir/json`, matching native `*-fame/post-sram-fame.fir`
+and annotation sidecars, and preparation/FAME comparison logs. The comparator
+requires preparation outputs for both inputs and FAME candidates for both:
+
+```sh
+for name in fanout golden-rocket; do
+  "$native_compiler" "$evidence/oracle/$name.channels-input.fir" \
+    --annotation-file "$evidence/oracle/$name.channels-input.json" \
+    --output-dir "$evidence/$name-fame" --rewrite-sram-fame
+done
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMFAMEOracle "$evidence"
+```
+
 ## Remaining scope
 
-The single-instance SRAM model now has native FAME data/clock hardware.
-Optional memory selection is still absent from the default FireSim build;
-inter-model transport and abstract RAM timing-model replacement remain pending.
-The next step is to generalize data-port rewriting to every promoted instance
-of a shared SRAM definition, preserving each instance's distinct global
-channel/clock targets while constructing the definition's local FSM once.
+Shared SRAM definitions now have native FAME data/clock hardware with distinct
+instance bindings. Optional memory selection is still absent from the default
+FireSim build; inter-model transport and abstract RAM timing-model replacement
+remain pending. The next step is to construct the both-ended pipe transport
+between a promoted SRAM and its parent model, then compare that executable
+connection against SFC's channel implementation.

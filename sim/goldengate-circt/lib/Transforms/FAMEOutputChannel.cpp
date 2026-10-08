@@ -307,13 +307,17 @@ std::optional<std::string> goldengate::getFAMEOutputAliasField(
 
 LogicalResult goldengate::rewriteFAMEOutputChannel(
     const TopHierarchy &hierarchy, const FAMETopChannelPort &channel,
-    std::string &error) {
+    std::string &error, bool rewriteModel) {
   const auto &binding = *channel.binding;
   auto top = hierarchy.top;
   auto modelModule = binding.portGroup->module;
   auto model = dyn_cast<FModuleOp>(modelModule.getOperation());
   auto instance = binding.instance;
   auto channelType = channel.type;
+  if (binding.instancePorts.size() > 1 && !rewriteModel) {
+    error = "additional FAME instance rewrite requires a scalar channel";
+    return failure();
+  }
   if (binding.instancePorts.size() > 1)
     return rewriteMultiportOutputChannel(hierarchy, channel, error);
   if (!model || binding.portGroup->direction != Direction::Out ||
@@ -323,7 +327,7 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
     return failure();
   }
   unsigned modelPort = binding.instancePorts.front();
-  auto payloadType = dyn_cast<FIRRTLBaseType>(model.getPorts()[modelPort].type);
+  auto payloadType = dyn_cast<FIRRTLBaseType>(instance.getResult(modelPort).getType());
   auto bitsIndex = channelType.getElementIndex("bits");
   auto readyIndex = channelType.getElementIndex("ready");
   auto validIndex = channelType.getElementIndex("valid");
@@ -338,11 +342,18 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
     return failure();
   }
   std::string modelName = binding.portGroup->name + "_source";
-  for (const auto &port : model.getPorts())
-    if (port.getName() == modelName) {
-      error = "FAME model source port already exists";
-      return failure();
-    }
+  if ((!rewriteModel && (model.getPortName(modelPort) != modelName ||
+                         model.getPortType(modelPort) != channel.type)) ||
+      (rewriteModel && model.getPortType(modelPort) != payloadType)) {
+    error = "FAME scalar definition does not match the instance rewrite stage";
+    return failure();
+  }
+  if (rewriteModel)
+    for (const auto &port : model.getPorts())
+      if (port.getName() == modelName) {
+        error = "FAME model source port already exists";
+        return failure();
+      }
 
   std::set<unsigned> topPorts;
   for (const auto &connection : hierarchy.connections)
@@ -428,7 +439,7 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
       error = "FAME output channel has a use outside its top aliases";
       return failure();
     }
-  if (failed(collectFAMEPayloadSymbols(
+  if (rewriteModel && failed(collectFAMEPayloadSymbols(
           model, modelPort, channel.type, {}, modelSymbols, error)))
     return failure();
   unsigned topInsert = *topPorts.begin();
@@ -451,15 +462,17 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
     });
     topInfo.sym = circt::hw::InnerSymAttr::get(context, wrapperSymbols);
   }
-  model.insertPorts({{modelPort, modelInfo}});
-  Value oldModel = model.getBodyBlock()->getArgument(modelPort + 1);
-  OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
-  Value bits = body.create<SubfieldOp>(model.getLoc(),
-      model.getBodyBlock()->getArgument(modelPort), "bits");
-  oldModel.replaceAllUsesWith(bits);
-  llvm::BitVector eraseModel(model.getNumPorts());
-  eraseModel.set(modelPort + 1);
-  model.erasePorts(eraseModel);
+  if (rewriteModel) {
+    model.insertPorts({{modelPort, modelInfo}});
+    Value oldModel = model.getBodyBlock()->getArgument(modelPort + 1);
+    OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
+    Value bits = body.create<SubfieldOp>(model.getLoc(),
+        model.getBodyBlock()->getArgument(modelPort), "bits");
+    oldModel.replaceAllUsesWith(bits);
+    llvm::BitVector eraseModel(model.getNumPorts());
+    eraseModel.set(modelPort + 1);
+    model.erasePorts(eraseModel);
+  }
 
   top.insertPorts({{topInsert, topInfo}});
   Value newTop = top.getBodyBlock()->getArgument(topInsert);

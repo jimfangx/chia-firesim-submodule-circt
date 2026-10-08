@@ -29,7 +29,7 @@ goldengate::analyzeTopHierarchy(CircuitOp circuit, std::string &error) {
   }
 
   TopHierarchy result{top, {}};
-  llvm::DenseMap<unsigned, unsigned> seenTopPorts;
+  llvm::DenseMap<unsigned, bool> seenTopPorts;
   top.walk([&](mlir::Operation *operation) {
     mlir::Value dest, src;
     if (auto connect = mlir::dyn_cast<StrictConnectOp>(operation)) {
@@ -63,11 +63,6 @@ goldengate::analyzeTopHierarchy(CircuitOp circuit, std::string &error) {
       return;
     auto topPort = topArg.getArgNumber();
     auto instancePort = instanceResult.getResultNumber();
-    if (seenTopPorts.count(topPort)) {
-      error = "top port has more than one direct instance connection: " +
-              top.getPortName(topPort).str();
-      return;
-    }
     auto child = children.lookup(instance.getOperation());
     auto childModule = child ? mlir::dyn_cast<FModuleLike>(
                                    child->getModule().getOperation()) : FModuleLike();
@@ -77,7 +72,24 @@ goldengate::analyzeTopHierarchy(CircuitOp circuit, std::string &error) {
               top.getPortName(topPort).str();
       return;
     }
-    seenTopPorts[topPort] = instancePort;
+    // FAME supplies common host controls to every transformed instance.
+    // Preserve all those edges while keeping scalar target-channel bindings
+    // unique. Require matching control identities, types and input direction.
+    auto name = top.getPortName(topPort);
+    bool hostControl =
+        ((name == "hostClock" && mlir::isa<ClockType>(topArg.getType())) ||
+         (name == "hostReset" && topArg.getType() == UIntType::get(circuit.getContext(), 1))) &&
+        top.getPortDirection(topPort) == Direction::In &&
+        childModule.getPortName(instancePort) == name &&
+        childModule.getPortDirection(instancePort) == Direction::In &&
+        childModule.getPortType(instancePort) == topArg.getType() &&
+        instanceResult.getType() == topArg.getType() && destResult;
+    if (seenTopPorts.count(topPort) &&
+        (!hostControl || !seenTopPorts.lookup(topPort))) {
+      error = "top port has more than one direct instance connection: " + name.str();
+      return;
+    }
+    seenTopPorts[topPort] = hostControl;
     result.connections.push_back({topPort, instance, instancePort});
   });
   if (!error.empty())

@@ -88,7 +88,8 @@ struct FAMEInputSelection {
   unsigned fieldCount;
 };
 
-// Snapshot every bound data channel in connection annotation order. The
+// Snapshot module-local data channels in connection annotation order, sharing
+// each input group across distinct instances of the same definition. The
 // explicit clock channel is excluded; names and payload counts remain valid
 // while subsequent port rewrites invalidate the original binding indices.
 // No annotations consumed/produced or IR mutation. Output dependencies use
