@@ -176,6 +176,15 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-extract-model-test
+    test/Transforms/ExtractModelTest.cpp lib/Transforms/ExtractModel.cpp)
+  target_compile_features(goldengate-extract-model-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-extract-model-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-extract-model-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-extract-model-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-extract-model COMMAND goldengate-extract-model-test)
   add_executable(goldengate-label-sram-models-test
     test/Transforms/LabelSRAMModelsTest.cpp lib/Transforms/LabelSRAMModels.cpp)
   target_compile_features(goldengate-label-sram-models-test PRIVATE cxx_std_17)

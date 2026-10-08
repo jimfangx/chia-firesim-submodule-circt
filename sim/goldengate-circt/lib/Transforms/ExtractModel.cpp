@@ -1,9 +1,11 @@
 // See LICENSE for license details.
 #include "goldengate/ExtractModel.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Support/InstanceGraph.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/StringRef.h"
+#include "llvm/ADT/DenseSet.h"
 #include <limits>
 #include <map>
 #include <set>
@@ -83,6 +85,7 @@ bool refersToInstance(Attribute attr, llvm::StringRef target) {
 }
 
 LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
+                         SmallVectorImpl<std::string> &peerTargets,
                          std::string &error) {
   auto parent = model.parent;
   auto child = model.child;
@@ -127,8 +130,8 @@ LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
   for (unsigned i = 0; i < child.getNumPorts(); ++i) {
     PortInfo childPort = child.getPorts()[i];
     auto baseType = dyn_cast<FIRRTLBaseType>(childPort.type);
-    if (!baseType || !baseType.isPassive() || isa<AnalogType>(baseType)) {
-      error = "model promotion requires passive, non-analog ports";
+    if (!baseType || baseType.containsAnalog()) {
+      error = "model promotion requires non-analog FIRRTL ports";
       return failure();
     }
     fields.emplace_back(childPort.name,
@@ -169,15 +172,21 @@ LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
     builder.setInsertionPointAfter(expanded);
     InstanceOp peer = builder.create<InstanceOp>(expanded.getLoc(), child,
                                                  peerName);
+    peerTargets.push_back("~" + circuit.getName().str() + "|" +
+                          grandparent.getName().str() + "/" + peerName +
+                          ":" + child.getName().str());
     builder.setInsertionPointAfter(peer);
     for (unsigned i = 0; i < child.getNumPorts(); ++i) {
       Value parentPort = builder.create<SubfieldOp>(
           peer.getLoc(), expanded.getResult(oldPortCount), child.getPortName(i));
       Value childPort = peer.getResult(i);
+      // Scala emits a PartialConnect of the two instance bundles. Expand
+      // matching aggregate leaves with CIRCT so each nested flip reverses
+      // the data flow, including SRAM read/readwrite data fields.
       if (child.getPortDirection(i) == Direction::In)
-        builder.create<ConnectOp>(peer.getLoc(), childPort, parentPort);
+        emitConnect(builder, peer.getLoc(), childPort, parentPort);
       else
-        builder.create<ConnectOp>(peer.getLoc(), parentPort, childPort);
+        emitConnect(builder, peer.getLoc(), parentPort, childPort);
     }
   }
   return success();
@@ -193,11 +202,12 @@ LogicalResult goldengate::extractModels(CircuitOp circuit, unsigned &promoted,
     return failure();
   }
   SmallVector<Attribute> remaining, models;
+  llvm::SmallDenseSet<Attribute> selected;
   for (Attribute attr : raw) {
     Annotation annotation(attr);
     if (!annotation.isClass(modelClass))
       remaining.push_back(attr);
-    else
+    else if (selected.insert(attr).second)
       models.push_back(attr);
   }
   while (!models.empty()) {
@@ -226,7 +236,7 @@ LogicalResult goldengate::extractModels(CircuitOp circuit, unsigned &promoted,
           queue.push_back({record->getTarget(), distance + 1});
       }
     }
-    unsigned choice = 0;
+    std::optional<unsigned> choice;
     unsigned bestDepth = std::numeric_limits<unsigned>::max();
     for (unsigned i = 0; i < models.size(); ++i) {
       Annotation annotation(models[i]);
@@ -237,6 +247,10 @@ LogicalResult goldengate::extractModels(CircuitOp circuit, unsigned &promoted,
       }
       llvm::StringRef local = target.getValue().split('|').second;
       std::string parent = local.split('/').first.str();
+      // Scala's moduleOrder excludes the circuit main. Already-top models
+      // are complete, but other branches still need promotion.
+      if (parent == circuit.getName())
+        continue;
       auto found = depth.find(parent);
       if (found == depth.end()) {
         error = "FAME model parent is unreachable: " + parent;
@@ -247,7 +261,9 @@ LogicalResult goldengate::extractModels(CircuitOp circuit, unsigned &promoted,
         choice = i;
       }
     }
-    Attribute attr = models[choice];
+    if (!choice)
+      break;
+    Attribute attr = models[*choice];
     Annotation annotation(attr);
     auto target = annotation.getMember<StringAttr>("target");
     if (!target) {
@@ -257,14 +273,22 @@ LogicalResult goldengate::extractModels(CircuitOp circuit, unsigned &promoted,
     auto model = resolveModel(circuit, target.getValue(), error);
     if (!model)
       return failure();
-    for (Attribute other : raw)
-      if (other != attr && refersToInstance(other, target.getValue())) {
+    for (Attribute other : remaining)
+      if (refersToInstance(other, target.getValue())) {
         error = "another annotation references the promoted model instance";
         return failure();
       }
-    if (failed(promoteOne(circuit, *model, error)))
+    SmallVector<std::string> peerTargets;
+    if (failed(promoteOne(circuit, *model, peerTargets, error)))
       return failure();
-    models.erase(models.begin() + choice);
+    models.erase(models.begin() + *choice);
+    // SFC's RenameMap fans the FAME annotation out to every peer instance.
+    // Keep those identities until each branch reaches the circuit main.
+    for (const auto &peerTarget : peerTargets) {
+      NamedAttrList members(cast<DictionaryAttr>(attr));
+      members.set("target", StringAttr::get(circuit.getContext(), peerTarget));
+      models.push_back(members.getDictionary(circuit.getContext()));
+    }
     ++promoted;
   }
   circuit->setAttr("rawAnnotations",

@@ -211,8 +211,10 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--apply-fame-defaults";
   bool promotePassthrough =
       argc == 7 && llvm::StringRef(argv[6]) == "--promote-passthrough";
-  bool extractModels =
-      argc == 7 && llvm::StringRef(argv[6]) == "--extract-models";
+  bool extractSRAMs =
+      argc == 7 && llvm::StringRef(argv[6]) == "--extract-sram-models";
+  bool extractModels = extractSRAMs ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--extract-models");
   bool wrapTop = argc == 7 && llvm::StringRef(argv[6]) == "--wrap-top";
   bool updateBridgeClocks =
       argc == 7 && llvm::StringRef(argv[6]) == "--update-bridge-clocks";
@@ -232,7 +234,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--promote-aggregate-bridges";
   bool resolveDontTouch =
       argc == 7 && llvm::StringRef(argv[6]) == "--resolve-dont-touch";
-  bool labelSRAMs = argc == 7 && llvm::StringRef(argv[6]) == "--label-sram-models";
+  bool labelSRAMs = extractSRAMs ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--label-sram-models");
   bool lowerTypes =
       argc == 7 && llvm::StringRef(argv[6]) == "--lower-types";
   bool analyzeAutoCounter =
@@ -341,7 +344,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--label-sram-models | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
+                    "--label-sram-models | --extract-sram-models | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -4207,6 +4210,32 @@ int main(int argc, char **argv) {
     return 0;
   }
 
+  auto extractModelBoundary = [&]() -> int {
+    std::string error;
+    unsigned promoted = 0;
+    if (mlir::failed(goldengate::extractModels(circuit, promoted, error)))
+      return fail("ExtractModel: " + error);
+    if (mlir::failed(mlir::verify(*module)))
+      return fail("ExtractModel produced invalid FIRRTL IR");
+    llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
+    llvm::sys::path::append(firPath, "post-extract-model.fir");
+    llvm::sys::path::append(annotationPath, "post-extract-model-all.json");
+    std::error_code writeError;
+    llvm::raw_fd_ostream firOut(firPath, writeError);
+    if (writeError)
+      return fail("cannot write extracted model FIRRTL: " +
+                  writeError.message());
+    if (mlir::failed(exportFIRFile(*module, firOut, std::nullopt,
+                                  exportFIRVersion)))
+      return fail("cannot export extracted model FIRRTL");
+    if (mlir::failed(goldengate::emitAllAnnotations(circuit, annotationPath,
+                                                    error)))
+      return fail("ExtractModel annotation emission: " + error);
+    llvm::outs() << "Promoted " << promoted << " model instances in "
+                 << firPath << '\n';
+    return 0;
+  };
+
   if (labelSRAMs) {
     std::string error;
     // This optional transform precedes LowerTypes in MidasTransforms. Resolve
@@ -4232,7 +4261,7 @@ int main(int argc, char **argv) {
     if (failed(goldengate::emitAllAnnotations(circuit, annotationPath, error)))
       return fail("cannot export SRAM wrapper annotations: " + error);
     llvm::outs() << "Extracted " << extracted << " CIRCT SRAM models in " << irPath << '\n';
-    return 0;
+    return extractSRAMs ? extractModelBoundary() : 0;
   }
 
   if (lowerTypes) {
@@ -4691,31 +4720,8 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  if (extractModels) {
-    std::string error;
-    unsigned promoted = 0;
-    if (mlir::failed(goldengate::extractModels(circuit, promoted, error)))
-      return fail("ExtractModel: " + error);
-    if (mlir::failed(mlir::verify(*module)))
-      return fail("ExtractModel produced invalid FIRRTL IR");
-    llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
-    llvm::sys::path::append(firPath, "post-extract-model.fir");
-    llvm::sys::path::append(annotationPath, "post-extract-model-all.json");
-    std::error_code writeError;
-    llvm::raw_fd_ostream firOut(firPath, writeError);
-    if (writeError)
-      return fail("cannot write extracted model FIRRTL: " +
-                  writeError.message());
-    if (mlir::failed(exportFIRFile(*module, firOut, std::nullopt,
-                                  exportFIRVersion)))
-      return fail("cannot export extracted model FIRRTL");
-    if (mlir::failed(goldengate::emitAllAnnotations(circuit, annotationPath,
-                                                    error)))
-      return fail("ExtractModel annotation emission: " + error);
-    llvm::outs() << "Promoted " << promoted << " model instances in "
-                 << firPath << '\n';
-    return 0;
-  }
+  if (extractModels)
+    return extractModelBoundary();
 
   if (promotePassthrough) {
     std::string error;

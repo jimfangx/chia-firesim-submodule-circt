@@ -54,11 +54,10 @@ inline: whole transformed RTL and retained annotation arrays are not declared
 equivalent. Only the selected memory's behavior and optional extraction boundary
 were compared.
 
-Remaining work includes SRAM promotion through ExtractModel and FAME, abstract
-RAM timing/host models, native handling of symbolic memory targets, and general
-port-order behavior beyond these probes. The next small step is to feed these
-wrappers through retained-target LowerTypes and ExtractModel, comparing model
-port and clock identities against SFC before enabling an end-to-end optional
-RAM pipeline. Iteration 40 manager compile and required Verilator regressions
-passed before this change; iteration 41 manager gates remain harness-owned.
-The SFC UART-bearing baseline and overall migration remain incomplete.
+Iteration 44 adds transitive SRAM promotion and checks retained-target
+LowerTypes identities; see [ExtractSRAMModels.md](ExtractSRAMModels.md) for
+the fresh Scala comparisons. Remaining work includes SRAM FAME control,
+abstract RAM timing/host models, native handling of symbolic memory targets,
+and general port-order behavior beyond these probes. The next small step is
+FAMEDefaults and InferModelPorts on the promoted SRAMs. The SFC UART-bearing
+baseline and overall migration remain incomplete.
