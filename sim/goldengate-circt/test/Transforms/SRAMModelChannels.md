@@ -823,6 +823,51 @@ java -Xmx8G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.SRAMTimingM
 java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMModelCompare "$evidence" --sram-timing
 ```
 
+## Ordered parent payloads through SRAM transport (iteration 58)
+
+The parent FAME rewrite now accepts ordered groups of ground UInt/SInt ports.
+It resolves each live port again after interface mutation and packs the group
+with the existing native channel operations. Retained top/model references
+move to individual `bits` fields using SFC `hostDecouplingRenames`' common-prefix
+rule. Scalar SRAM commands and shared SRAM definitions retain their previous
+ABI. The boundary still commits only a verified circuit clone.
+
+The first candidate reached queue construction but failed because its ordered
+field references were interpreted as several incomplete payloads.
+`FAMEPipeChannel.cpp` now accepts a complete, ordered list of immediate integer
+fields on the same Decoupled payload. One group creates one queue and transfers
+its entire bundle with one ready/valid handshake. Incomplete, duplicate,
+reordered and nonpayload field lists fail before queue creation. Whole-payload
+targets retain their existing aggregate/vector support.
+
+Fresh preparation again reads the exact immutable compiler artifact
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`.
+The independent SFC oracle groups five real Rocket interrupt inputs and two
+instruction-request outputs in reversed order in a mutable annotation copy.
+The grouped candidate matches both payload ABIs, all 1,234 annotation records,
+1,019 generated hub control equations, 29 RAM adapter equations, generated
+register contracts, and both XDC files. This is a grouped-channel probe derived
+from the recorded target, not a claim that its original configuration selects
+these groups or optional SRAM models. Ordinary target RTL equivalence remains
+outside this comparator.
+
+The original fanout and scalar Rocket comparisons still pass. Native RAM
+operations from those complete candidates match SFC over 40,000 transitions.
+The complete grouped Rocket hierarchy lowers through pinned CIRCT firtool to
+split SystemVerilog, removing only the public-module keyword in a mutable
+FIRRTL-1.2 lowering copy. Forty focused SRAM/RAM/FAME/pipe/XDC CTests pass.
+They include mixed signed/unsigned reversed payloads, one queue per group,
+ordered dependency targets with duplicate sources, unsupported leaf metadata
+rejection, and malformed queue-field lists. Manager gates remain harness-owned.
+
+Evidence is under the mutable U250 generated directory's
+`iteration58-sram-parent-payloads/`: fresh preparation inputs, independent
+`grouped-rocket.expected.fir/json`, corresponding native output and `rtl/`,
+`comparison.log`, `timing-comparison.log`, `ctest.log`, and lowering/build logs.
+Use the iteration-57 commands above with this directory; additionally invoke
+`--rewrite-sram-models` on `grouped-rocket.input.fir/json`. The updated oracle
+and comparator include that probe automatically.
+
 ## Remaining scope
 
 Shared SRAM definitions now have a combined native FAME, transport, timing-model
@@ -830,7 +875,7 @@ and generated-clock collateral boundary. Optional memory selection is still
 absent from the default FireSim build, and full selected-memory Rocket runtime
 verification remains pending. Legacy retained domain-clock annotations have
 the same erased top-clock references as SFC after FAME; later consumers must
-use captured domain identity. The next smallest step is optional selection
-through the FireSim compiler pipeline, preserving this combined boundary and
-letting the harness exercise its transformed RTL. Readwrite/wider memory shapes
-and FAME-5 remain separate incomplete work.
+use captured domain identity. The next smallest step is ready/valid parent
+channel transport, needed before optional selection through the full FireSim
+compiler pipeline can let the harness exercise selected-memory Rocket RTL.
+Readwrite/wider memory shapes and FAME-5 remain separate incomplete work.

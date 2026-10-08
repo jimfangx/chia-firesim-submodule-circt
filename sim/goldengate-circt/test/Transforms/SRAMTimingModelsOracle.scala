@@ -16,15 +16,29 @@ object SRAMTimingModelsOracle extends App {
   val directory = new java.io.File(args(0))
   def read(path: String) = AsyncRAMModelFiles.read(new java.io.File(directory, path))
   def write(path: String, body: String) = AsyncRAMModelFiles.write(new java.io.File(directory, path), body)
-  for (name <- Seq("fanout", "golden-rocket")) {
-    val text = read(s"oracle/$name.channels-input.fir")
+  for (name <- Seq("fanout", "golden-rocket", "grouped-rocket")) {
+    val sourceName = if (name == "grouped-rocket") "golden-rocket" else name
+    val text = read(s"oracle/$sourceName.channels-input.fir")
     // Keep the existing readwrite probe immutable; async RAM supports distinct
     // read and write commands. Four promoted uses still share one definition.
     val inputText = if (name == "fanout") text
       .replaceAll("(?m)^\\s*readwriter => rw\\n", "")
       .replaceAll("(?m)^\\s*ram\\.rw[^\\n]*\\n", "") else text
-    val input = new ResolveAndCheck().runTransform(CircuitState(Parser.parse(inputText), LowForm,
-      JsonProtocol.deserialize(read(s"oracle/$name.channels-input.json"))))
+    val originalAnnos = JsonProtocol.deserialize(read(s"oracle/$sourceName.channels-input.json"))
+    // Use actual Rocket leaves from the immutable input. Reverse their order
+    // so the oracle tests ordered multiport input and output payloads.
+    val annos = if (name != "grouped-rocket") originalAnnos else {
+      val external = originalAnnos.collect {
+        case c: FAMEChannelConnectionAnnotation if c.globalName.startsWith("external_io_interrupts_") ||
+          Set("external_io_imem_req_bits_pc", "external_io_imem_req_bits_speculative")(c.globalName) => c
+      }
+      val inputs = external.flatMap(_.sinks.toSeq.flatten).reverse
+      val outputs = external.flatMap(_.sources.toSeq.flatten).reverse
+      originalAnnos.filterNot(external.contains) ++ Seq(
+        FAMEChannelConnectionAnnotation.sink("io_interrupts", PipeChannel(0), external.head.clock, inputs),
+        FAMEChannelConnectionAnnotation.source("io_imem_req_bits", PipeChannel(0), external.head.clock, outputs))
+    }
+    val input = new ResolveAndCheck().runTransform(CircuitState(Parser.parse(inputText), LowForm, annos))
     val labeled = new LabelSRAMModels().runTransform(input)
     val promoted = new ExtractModel().runTransform(labeled)
     val lowered = new LowFirrtlCompiler().compile(promoted, Nil)
@@ -65,7 +79,7 @@ object SRAMTimingModelsCompare extends App {
     visit(s); result.toSeq
   }
   def multiset[A](values: Seq[A]) = values.groupMapReduce(identity)(_ => 1)(_ + _)
-  for ((name, memory, hub, count) <- Seq(("fanout", "ram", "Top", 4), ("golden-rocket", "rf", "Rocket", 1))) {
+  for ((name, memory, hub, count) <- Seq(("fanout", "ram", "Top", 4), ("golden-rocket", "rf", "Rocket", 1), ("grouped-rocket", "rf", "Rocket", 1))) {
     val native = circuit(s"$name-native/post-sram-models.fir")
     val expected = circuit(s"$name.expected.fir")
     def module(c: Circuit, n: String) = c.modules.find(_.name == n).get.asInstanceOf[Module]

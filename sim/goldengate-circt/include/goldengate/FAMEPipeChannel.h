@@ -27,8 +27,10 @@ mlir::LogicalResult addFAMEPipeChannel(circt::firrtl::CircuitOp circuit,
 // channel annotations
 // and create one module definition for each (payload type, latency) pair.
 // Requires: post-FAME Decoupled ports and retained PipeChannel annotations
-// naming complete bits fields with matching direction. Model loopbacks have
-// one source and one sink with identical payload types. Consumes/produces no
+// naming a complete bits target or its complete ordered immediate UInt/SInt
+// field list with matching direction. Either representation is one token.
+// Model loopbacks have one source payload and one sink payload of identical
+// type. Consumes/produces no
 // annotations. Validates every endpoint and symbol before adding definitions;
 // mutation/analysis/output contracts are otherwise the same as above.
 mlir::LogicalResult addFAMEBoundaryPipeChannels(

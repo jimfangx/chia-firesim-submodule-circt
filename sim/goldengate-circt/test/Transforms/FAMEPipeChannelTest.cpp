@@ -235,6 +235,59 @@ void checkTypedBoundary(MLIRContext &context, llvm::StringRef spelling) {
           "typed endpoint retarget mismatch");
 }
 
+void checkOrderedFieldEndpoints(MLIRContext &context) {
+  // FAME keeps one reference per original model port after packing the ports
+  // into an ordered token. That complete field list must create one queue.
+  for (unsigned scenario = 0; scenario < 5; ++scenario) {
+    auto root = typedFixture(context, "bundle<data: sint<8>, addr: uint<2>>");
+    auto circuit = circuitOf(*root);
+    OpBuilder builder(&context);
+    SmallVector<Attribute> endpoints{
+        builder.getStringAttr("~FAMETop|FAMETop>tokens.bits.data"),
+        builder.getStringAttr("~FAMETop|FAMETop>tokens.bits.addr")};
+    if (scenario == 1)
+      std::swap(endpoints[0], endpoints[1]);
+    else if (scenario == 2)
+      endpoints[1] = endpoints[0];
+    else if (scenario == 3)
+      endpoints.pop_back();
+    else if (scenario == 4)
+      endpoints[1] = builder.getStringAttr("~FAMETop|FAMETop>tokens.valid");
+    NamedAttrList annotation(pipeAnnotation(builder, "typed", "sources", "tokens", 1));
+    annotation.set("sources", builder.getArrayAttr(endpoints));
+    circuit->setAttr("rawAnnotations", builder.getArrayAttr({annotation.getDictionary(&context)}));
+    std::string error;
+    auto status = goldengate::addFAMEBoundaryPipeChannels(circuit, error);
+    if (scenario != 0) {
+      require(failed(status) && !error.empty(),
+              "partial, reordered or duplicate token fields must fail");
+      require(std::distance(circuit.getOps<FModuleOp>().begin(),
+                            circuit.getOps<FModuleOp>().end()) == 1,
+              "invalid field lists must fail before creating queues");
+      continue;
+    }
+    require(succeeded(status), error);
+    require(succeeded(goldengate::addFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(goldengate::activateFAMEPipeWrapper(circuit, error)), error);
+    require(succeeded(verify(*root)), "ordered token wrapper verification failed");
+    auto wrapper = moduleNamed(circuit, "GGFAMEPipeWrapper");
+    unsigned queues = 0;
+    for (auto instance : wrapper.getOps<InstanceOp>())
+      queues += instance.getName().starts_with("PipeChannel_");
+    require(queues == 1, "ordered token fields must share one queue");
+    auto retained = cast<DictionaryAttr>(
+        circuit->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<ArrayAttr>("sources");
+    for (auto [index, field] : llvm::enumerate(SmallVector<llvm::StringRef>{"data", "addr"})) {
+      std::string spelling = "~GGFAMEPipeWrapper|GGFAMEPipeWrapper>tokens.bits." + std::string(field);
+      require(cast<StringAttr>(retained[index]).getValue() == spelling,
+              "wrapper activation must preserve ordered field identities");
+      auto target = goldengate::resolveAnnotationTarget(circuit, spelling, error);
+      require(target && target->module == wrapper && target->port == 2,
+              "ordered token leaf must resolve on the active wrapper");
+    }
+  }
+}
+
 void checkRejectedTypes(MLIRContext &context) {
   for (llvm::StringRef spelling : {"uint", "sint", "clock", "analog<8>",
       "bundle<x flip: uint<8>>", "bundle<x: uint<8>, y: clock>",
@@ -408,6 +461,7 @@ int main(int argc, char **argv) {
     checkWrapper(context);
     checkRejectedQueueInterfaces(context);
     checkRejectedAnnotations(context);
+    checkOrderedFieldEndpoints(context);
     checkRejectedTypes(context);
     for (unsigned width : {0, 1, 3, 32, 40, 64})
       for (unsigned latency : {0, 1})

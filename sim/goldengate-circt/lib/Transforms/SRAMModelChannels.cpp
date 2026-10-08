@@ -259,7 +259,8 @@ namespace {
 // Stable names and types survive the insert/erase APIs; indices and instance
 // operations do not. Never reuse a binding after a channel has been rewritten.
 struct SRAMDataPort {
-  std::string model, instance, oldPort, local, global, topPort, clock;
+  std::string model, instance, local, global, topPort, clock;
+  SmallVector<std::string> oldPorts;
   Direction direction;
   BundleType type;
 };
@@ -460,7 +461,7 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   if (withParent) {
     for (const auto &channel : channels) {
       if (channel.kind != ChannelKind::TargetClock && channel.kind != ChannelKind::Pipe) {
-        error = "SRAM transport requires scalar pipe data channels";
+        error = "SRAM transport requires pipe data channels";
         return failure();
       }
       if (channel.kind != ChannelKind::TargetClock) continue;
@@ -530,12 +531,14 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
                 target(hierarchy->top, port.portName) + ".bits";
         continue;
       }
-      if (group.ports.size() != 1 || (group.clockPort && model != hub) || binding.instancePorts.size() != 1 ||
-          !isa<UIntType, SIntType>(model.getPortType(group.ports[0]))) {
-        error = "SRAM FAME requires scalar integer data channels; SRAM groups must use virtual clocks";
+      if ((model != hub && (group.ports.size() != 1 || group.clockPort)) ||
+          binding.instancePorts.size() != group.ports.size() ||
+          !llvm::all_of(group.ports, [&](unsigned index) {
+            return isa<UIntType, SIntType>(model.getPortType(index));
+          })) {
+        error = "SRAM FAME requires ground integer parent channels and scalar virtual-clock SRAM channels";
         return failure();
       }
-      auto oldPort = model.getPortName(group.ports[0]).str();
       std::string clock;
       if (model == hub) {
         for (const auto &assignment : assignments)
@@ -543,15 +546,33 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
               assignment.direction == group.direction) clock = assignment.modelClockName;
         if (clock.empty()) { error = "SRAM parent data channel lacks a clock domain"; return failure(); }
       }
-      ports.push_back({model.getName().str(), binding.instance.getName().str(), oldPort,
-                       group.name, binding.globalName, port.portName, clock, group.direction, port.type});
-      renames[target(model, oldPort)] = target(model, group.name +
-          (group.direction == Direction::In ? "_sink" : "_source")) + ".bits";
-      for (const auto &connection : hierarchy->connections)
-        if (connection.instance == binding.instance &&
-            connection.instancePort == group.ports[0])
-          renames[target(hierarchy->top, hierarchy->top.getPortName(connection.topPort))] =
-              target(hierarchy->top, port.portName) + ".bits";
+      SmallVector<std::string> oldPorts;
+      // SFC hostDecouplingRenames uses an ordered payload field for each
+      // member of a multiport channel, independently at the top and model.
+      auto suffix = [&](StringRef name, StringRef channel) {
+        if (group.ports.size() == 1) return std::string();
+        while (!name.empty() && !channel.empty() && name.front() == channel.front()) {
+          name = name.drop_front();
+          channel = channel.drop_front();
+        }
+        return "." + name.str();
+      };
+      for (unsigned index : group.ports) {
+        auto oldPort = model.getPortName(index);
+        oldPorts.push_back(oldPort.str());
+        renames[target(model, oldPort)] = target(model, group.name +
+            (group.direction == Direction::In ? "_sink" : "_source")) +
+            ".bits" + suffix(oldPort, group.name);
+        for (const auto &connection : hierarchy->connections)
+          if (connection.instance == binding.instance && connection.instancePort == index) {
+            auto oldTop = hierarchy->top.getPortName(connection.topPort);
+            renames[target(hierarchy->top, oldTop)] = target(hierarchy->top, port.portName) +
+                ".bits" + suffix(oldTop, binding.globalName);
+          }
+      }
+      ports.push_back({model.getName().str(), binding.instance.getName().str(),
+                       group.name, binding.globalName, port.portName, clock,
+                       std::move(oldPorts), group.direction, port.type});
     }
   // Every data port must belong to exactly one local channel. The clock-only
   // substep validates the absence of explicit SRAM clock-channel associations.
@@ -563,10 +584,11 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     for (auto port : model.getPorts()) dataPorts += !isa<ClockType>(port.type);
     std::map<std::string, std::set<std::string>> selectedPorts;
     for (const auto &port : ports) if (port.model == model.getName())
-      if (!selectedPorts[port.instance].insert(port.oldPort).second) {
-        error = "SRAM FAME has duplicate instance data channel bindings";
-        return failure();
-      }
+      for (const auto &oldPort : port.oldPorts)
+        if (!selectedPorts[port.instance].insert(oldPort).second) {
+          error = "SRAM FAME has duplicate instance data channel bindings";
+          return failure();
+        }
     if (model == hub) {
       for (auto p : model.getPorts())
         if (!isa<ClockType>(p.type) && p.direction == Direction::Out &&
@@ -669,16 +691,21 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     for (auto candidate : current->top.getOps<InstanceOp>())
       if (candidate.getName() == port.instance && candidate.getModuleName() == port.model)
         instance = candidate;
-    std::optional<unsigned> index;
-    for (unsigned i = 0; i < model.getNumPorts(); ++i)
-      if (model.getPortName(i) == (rewriteModel ? port.oldPort : port.local +
-          (port.direction == Direction::In ? "_sink" : "_source"))) index = i;
-    if (!instance || !index) {
-      error = "SRAM FAME lost a scalar model binding during channelization";
+    SmallVector<unsigned> indices;
+    for (const auto &oldPort : port.oldPorts) {
+      for (unsigned i = 0; i < model.getNumPorts(); ++i)
+        if (model.getPortName(i) == (rewriteModel ? oldPort : port.local +
+            (port.direction == Direction::In ? "_sink" : "_source"))) {
+          indices.push_back(i);
+          break;
+        }
+    }
+    if (!instance || indices.size() != port.oldPorts.size()) {
+      error = "SRAM FAME lost a model channel binding during channelization";
       return failure();
     }
-    ModelPortGroup group{port.local, model, port.direction, std::nullopt, {*index}};
-    ModelChannelBinding binding{port.global, &group, instance, {*index}};
+    ModelPortGroup group{port.local, model, port.direction, std::nullopt, indices};
+    ModelChannelBinding binding{port.global, &group, instance, indices};
     FAMETopChannelPort channel{&binding, port.topPort, port.type};
     if (failed(port.direction == Direction::In
                    ? rewriteFAMEInputChannel(*current, channel, error, rewriteModel)
@@ -797,8 +824,8 @@ LogicalResult goldengate::rewriteSRAMParentFAME(CircuitOp circuit, unsigned &rew
   return rewriteSRAMBoundary(circuit, rewritten, error, true, false);
 }
 
-/// Required input invariants: prepared ground scalar parent/SRAM channels,
-/// supported read/write payloads and one XDC circuit path mapping.
+/// Required input invariants: prepared ground integer parent channels and scalar
+/// SRAM channels, supported read/write payloads and one XDC circuit path mapping.
 /// Annotations consumed: XDC paths/snippets; memory/channel targets transfer
 /// through FAME and remain on the adapter ports. Annotations produced: XDC
 /// output files. IR mutations: FAME state, queues and async RAM implementations.

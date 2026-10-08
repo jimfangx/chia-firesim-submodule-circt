@@ -48,8 +48,10 @@ mlir::LogicalResult rewriteSRAMFAME(
 mlir::LogicalResult rewriteSRAMParentFAME(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
 // Construct the parent clock hub and directly promoted SRAM FAME models, then
-// join scalar PipeChannel endpoints with host-clocked queues. Requires one hub,
-// scalar integer data groups and complete model coverage; no ready-valid pairs.
+// join PipeChannel endpoints with host-clocked queues. Requires one hub,
+// ground integer parent groups, scalar SRAM groups and complete model coverage;
+// no ready-valid pairs. Multiport parent payloads retain SFC field order and
+// transfer each top/model target to its own Decoupled bits field.
 // Preserves retained inner endpoint/clock identities through wrapper activation.
 // Commits only a verified clone. Optional timing-model replacement is separate.
 mlir::LogicalResult rewriteSRAMPipeTransport(

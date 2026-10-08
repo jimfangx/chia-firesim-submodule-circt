@@ -465,3 +465,88 @@ if(status EQUAL 0 OR NOT stderr MATCHES "does not support readwrite ports" OR
    EXISTS "${OUTPUT}/unsupported-timing-port/post-sram-models.fir")
   message(FATAL_ERROR "Unsupported timing ABI was not rejected: ${stdout}\n${stderr}")
 endif()
+
+# Parent bridge channels may carry several ordered fields even when each SRAM
+# command remains scalar. Reverse order and mix signed/unsigned widths to catch
+# accidental sorting, scalar bits renames and incorrect pipe packing.
+string(REPLACE "    inst Top of Top" "    input request_addr : UInt<2>\n    input request_data : SInt<8>\n    output reply_addr : UInt<2>\n    output reply_data : SInt<8>\n    output external_clock : Clock\n    inst Top of Top\n    Top.request_addr <= request_addr\n    Top.request_data <= request_data\n    reply_addr <= Top.reply_addr\n    reply_data <= Top.reply_data\n    external_clock <= Top.external_clock" grouped_fir "${timing_input}")
+string(REPLACE "    inst m0 of Middle" "    input request_addr : UInt<2>\n    input request_data : SInt<8>\n    output reply_addr : UInt<2>\n    output reply_data : SInt<8>\n    output external_clock : Clock\n    external_clock <= clock\n    reply_addr <= xor(request_addr, UInt<2>(1))\n    reply_data <= asSInt(not(asUInt(request_data)))\n    inst m0 of Middle" grouped_fir "${grouped_fir}")
+set(grouped_annos "${timing_annos}")
+string(JSON grouped_count LENGTH "${grouped_annos}")
+foreach(direction request reply)
+  if(direction STREQUAL "request")
+    set(endpoint sinks)
+  else()
+    set(endpoint sources)
+  endif()
+  string(JSON grouped_annos SET "${grouped_annos}" ${grouped_count}
+    "{\"class\":\"midas.passes.fame.FAMEChannelConnectionAnnotation\",\"globalName\":\"${direction}\",\"channelInfo\":{\"class\":\"midas.passes.fame.PipeChannel\",\"latency\":0},\"clock\":\"~FAMETop|FAMETop>external_clock\",\"${endpoint}\":[\"~FAMETop|FAMETop>${direction}_data\",\"~FAMETop|FAMETop>${direction}_addr\"]}")
+  math(EXPR grouped_count "${grouped_count} + 1")
+endforeach()
+string(JSON grouped_annos SET "${grouped_annos}" ${grouped_count}
+  "{\"class\":\"firrtl.transforms.CombinationalPath\",\"sink\":\"~FAMETop|Top>reply_data\",\"sources\":[\"~FAMETop|Top>request_data\",\"~FAMETop|Top>request_data\"]}")
+file(WRITE "${OUTPUT}/grouped-parent.fir" "${grouped_fir}")
+file(WRITE "${OUTPUT}/grouped-parent.json" "${grouped_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/grouped-parent.fir"
+  --annotation-file "${OUTPUT}/grouped-parent.json"
+  --output-dir "${OUTPUT}/grouped-parent" --rewrite-sram-models
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Grouped parent SRAM transport failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/grouped-parent/post-sram-models.fir" grouped_output)
+foreach(direction request reply)
+  if(direction STREQUAL "request")
+    set(suffix sink)
+  else()
+    set(suffix source)
+  endif()
+  string(FIND "${grouped_output}" "${direction}_${suffix} : { flip ready : UInt<1>, valid : UInt<1>, bits : { _data : SInt<8>, _addr : UInt<2> } }" ordered_payload)
+  if(ordered_payload LESS 0)
+    message(FATAL_ERROR "Grouped parent ${direction} payload order/type differs")
+  endif()
+endforeach()
+string(REGEX MATCHALL "inst PipeChannel_[^\n]* of GGFAMEPipe" grouped_queues "${grouped_output}")
+list(LENGTH grouped_queues grouped_queue_count)
+string(REGEX MATCHALL "inst PipeChannel_[^\n]* of GGFAMEPipe" timing_queues "${timing_fir}")
+list(LENGTH timing_queues timing_queue_count)
+math(EXPR expected_grouped_queue_count "${timing_queue_count} + 2")
+if(NOT grouped_queue_count EQUAL expected_grouped_queue_count)
+  message(FATAL_ERROR "Expected one pipe per grouped token, got ${grouped_queue_count}")
+endif()
+file(READ "${OUTPUT}/grouped-parent/post-sram-models-all.json" grouped_metadata)
+string(JSON grouped_metadata_count LENGTH "${grouped_metadata}")
+math(EXPR grouped_metadata_last "${grouped_metadata_count} - 1")
+set(grouped_paths 0)
+foreach(index RANGE 0 ${grouped_metadata_last})
+  string(JSON class GET "${grouped_metadata}" ${index} class)
+  if(class STREQUAL "firrtl.transforms.CombinationalPath")
+    math(EXPR grouped_paths "${grouped_paths} + 1")
+    string(JSON sink GET "${grouped_metadata}" ${index} sink)
+    string(JSON first GET "${grouped_metadata}" ${index} sources 0)
+    string(JSON second GET "${grouped_metadata}" ${index} sources 1)
+    if(NOT sink STREQUAL "~GGFAMEPipeWrapper|Top>reply_source.bits._data" OR
+       NOT first STREQUAL "~GGFAMEPipeWrapper|Top>request_sink.bits._data" OR
+       NOT first STREQUAL second)
+      message(FATAL_ERROR "Grouped parent field identities/multiplicity differ")
+    endif()
+  endif()
+endforeach()
+if(NOT grouped_paths EQUAL 1)
+  message(FATAL_ERROR "Grouped parent lost or duplicated retained dependency metadata")
+endif()
+message(STATUS "Passed ordered mixed-width parent channels, token pipes and field metadata")
+
+# A target on any grouped leaf still needs a defined annotation transfer.
+math(EXPR grouped_count "${grouped_count} + 1")
+string(JSON grouped_annos SET "${grouped_annos}" ${grouped_count}
+  "{\"class\":\"example.UnsupportedPortAnnotation\",\"target\":\"~FAMETop|Top>request_addr\"}")
+file(WRITE "${OUTPUT}/grouped-unsupported.json" "${grouped_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/grouped-parent.fir"
+  --annotation-file "${OUTPUT}/grouped-unsupported.json"
+  --output-dir "${OUTPUT}/grouped-unsupported" --rewrite-sram-models
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "data target has unsupported retained annotation metadata" OR
+   EXISTS "${OUTPUT}/grouped-unsupported/post-sram-models.fir")
+  message(FATAL_ERROR "Unknown grouped leaf metadata was not rejected atomically: ${stdout}\n${stderr}")
+endif()

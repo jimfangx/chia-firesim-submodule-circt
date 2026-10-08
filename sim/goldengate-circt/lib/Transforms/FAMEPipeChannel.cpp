@@ -115,7 +115,7 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
     }
     auto resolvePort = [&](ArrayAttr endpoints, Direction direction,
                            unsigned &port, FIRRTLBaseType &payload) -> LogicalResult {
-      if (endpoints.size() != 1) {
+      if (endpoints.empty()) {
         error = "PipeChannel " + name.getValue().str() +
                 " requires one complete payload per endpoint";
         return failure();
@@ -141,13 +141,34 @@ LogicalResult findBoundaryPipes(CircuitOp circuit, FModuleOp &top,
           type.getElements()[*valid].isFlip || type.getElements()[*bits].isFlip ||
           type.getElements()[*ready].type != bit ||
           type.getElements()[*valid].type != bit ||
-          target->fieldID != type.getFieldID(*bits) ||
           top.getPortDirection(port) != direction) {
         error = "PipeChannel " + name.getValue().str() +
                 " requires a passive integer Decoupled payload target with matching direction";
         return failure();
       }
-      return success();
+      if (endpoints.size() == 1) {
+        if (target->fieldID == type.getFieldID(*bits)) return success();
+      } else if (auto bundle = dyn_cast<BundleType>(payload);
+                 bundle && bundle.getElements().size() == endpoints.size()) {
+        // SFC retains the ordered ground fields after hostDecouplingRenames.
+        // A complete field list denotes one token, not one pipe per leaf.
+        // Verify coverage and order against the actual payload type before
+        // using the containing port's complete handshake and payload.
+        bool complete = true;
+        for (auto [index, endpoint] : llvm::enumerate(endpoints)) {
+          auto spelling = dyn_cast<StringAttr>(endpoint);
+          auto leaf = spelling ? goldengate::resolveAnnotationTarget(
+                                      circuit, spelling.getValue(), error)
+                               : std::nullopt;
+          complete &= leaf && leaf->module == top && leaf->port == port &&
+              isa<UIntType, SIntType>(bundle.getElements()[index].type) &&
+              leaf->fieldID == type.getFieldID(*bits) + bundle.getFieldID(index);
+        }
+        if (complete) return success();
+      }
+      error = "PipeChannel " + name.getValue().str() +
+              " requires a complete ordered payload field sequence";
+      return failure();
     };
     unsigned sourcePort = 0, sinkPort = 0;
     FIRRTLBaseType sourceType, sinkType;
