@@ -110,7 +110,8 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   const std::string circuitName = circuit.getName().str();
   // DontTouch, host/global reset signal and FPGA debug targets may fan out.
   // Trigger/AutoCounter scalar members and channel endpoints (including nested
-  // ready/valid) follow SFC RTRenamer.exact. Keep endpoint indices so repeated
+  // ready/valid) and SRAM model port members follow SFC RTRenamer.exact.
+  // Keep endpoint indices so repeated
   // references and clock schedule order survive.
   // An empty fanout plan removes an empty aggregate annotation; no plan
   // preserves a member whose identity does not need transferring.
@@ -164,12 +165,20 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         info && Annotation(info).isClass(AnnotationClasses::DecoupledForwardChannel);
     const bool channelConnection = clockChannel || pipeChannel || reverseChannel || forwardChannel;
     const bool channelPorts = annotation.isClass(AnnotationClasses::ChannelPorts);
-    const bool exact = autoCounter || triggerSource || triggerSink || channelConnection || channelPorts;
+    const bool readPort = annotation.isClass(AnnotationClasses::ModelReadPort);
+    const bool writePort = annotation.isClass(AnnotationClasses::ModelWritePort);
+    const bool readWritePort = annotation.isClass(AnnotationClasses::ModelReadWritePort);
+    const bool memoryPort = readPort || writePort || readWritePort;
+    const bool exact = autoCounter || triggerSource || triggerSink ||
+                       channelConnection || channelPorts || memoryPort;
     const StringRef kind = clockChannel ? "TargetClockChannel" :
                            pipeChannel ? "PipeChannel" :
                            reverseChannel ? "DecoupledReverseChannel" :
                            forwardChannel ? "DecoupledForwardChannel" :
                            channelPorts ? "FAMEChannelPortsAnnotation" :
+                           readPort ? "ModelReadPort" :
+                           writePort ? "ModelWritePort" :
+                           readWritePort ? "ModelReadWritePort" :
                            autoCounter ? "AutoCounter" : "Trigger";
     if (!dontTouch && !hostSignal && !fpgaDebug && !globalReset && !exact)
       continue;
@@ -200,7 +209,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
       if (target && target->port) {
         auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
             target->module.getPortType(*target->port), *target->fieldID));
-        if (exact && !type.isGround()) {
+        if (exact && !memoryPort && !type.isGround()) {
           error = kind.str() + " " + member.str() +
                   " must select a ground value: " + spelling.getValue().str();
           return failure();
@@ -209,7 +218,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                              *target->fieldID, plan.targets);
       } else if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
                                                             resolutionError)) {
-        if (exact && !internal->type.isGround()) {
+        if (exact && !memoryPort && !internal->type.isGround()) {
           error = kind.str() + " " + member.str() +
                   " must select a ground value: " + spelling.getValue().str();
           return failure();
@@ -240,9 +249,37 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                 " selects a zero-width value: " + spelling.getValue().str();
         return failure();
       }
+      if (memoryPort && plan.targets.size() != 1) {
+        error = kind.str() + " " + member.str() +
+                " must select exactly one ground value: " + spelling.getValue().str();
+        return failure();
+      }
       replacements[index].push_back(std::move(plan));
       return success();
     };
+    if (memoryPort) {
+      // LabelSRAMModels emits these selectors on the wrapper's aggregate
+      // ports, before High/Middle -> Low lowering. Every member is required
+      // and independently exact. Singleton bundles/vectors select one leaf;
+      // data/mask aggregates must not fan out into multiple memory ports.
+      // Use native identities, including collisions.
+      const StringRef readMembers[]{"data", "addr", "en"};
+      const StringRef writeMembers[]{"data", "mask", "addr", "en"};
+      const StringRef readWriteMembers[]{"wmode", "rdata", "wdata", "wmask",
+                                        "addr", "en"};
+      ArrayRef<StringRef> members = readPort ? ArrayRef<StringRef>(readMembers)
+          : writePort ? ArrayRef<StringRef>(writeMembers)
+                      : ArrayRef<StringRef>(readWriteMembers);
+      for (auto member : members) {
+        auto spelling = annotation.getMember<StringAttr>(member);
+        if (!spelling) {
+          error = kind.str() + " " + member.str() + " is not a reference target";
+          return failure();
+        }
+        if (failed(planTarget(member, spelling))) return failure();
+      }
+      continue;
+    }
     if (channelPorts) {
       if (auto clock = annotation.getMember("clockPort")) {
         auto spelling = dyn_cast<StringAttr>(clock);

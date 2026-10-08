@@ -925,6 +925,135 @@ void debugTargets(MLIRContext &context, bool internal, bool legacy, StringRef ou
   }
 }
 // SFC RemoveZeroWidth drops fanout leaves and makes exact renames fail.
+void memoryPortTargets(MLIRContext &context) {
+  const char *fixture = R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %io: !firrtl.bundle<data: uint<8>, mask: uint<1>, addr: uint<2>, en: uint<1>, wmode: uint<1>, rdata: uint<8>, wdata: vector<uint<8>, 2>, wmask: uint<1>, zero: uint<0>>,
+                        in %io_data: !firrtl.uint<19>) {
+        %alias = firrtl.node %io : !firrtl.bundle<data: uint<8>, mask: uint<1>, addr: uint<2>, en: uint<1>, wmode: uint<1>, rdata: uint<8>, wdata: vector<uint<8>, 2>, wmask: uint<1>, zero: uint<0>>
+        %wire = firrtl.wire : !firrtl.bundle<data: uint<8>, mask: uint<1>, addr: uint<2>, en: uint<1>, wmode: uint<1>, rdata: uint<8>, wdata: vector<uint<8>, 2>, wmask: uint<1>, zero: uint<0>>
+        firrtl.strictconnect %wire, %io : !firrtl.bundle<data: uint<8>, mask: uint<1>, addr: uint<2>, en: uint<1>, wmode: uint<1>, rdata: uint<8>, wdata: vector<uint<8>, 2>, wmask: uint<1>, zero: uint<0>>
+      }
+    }
+  })mlir";
+  OpBuilder b(&context);
+  const StringRef classes[]{goldengate::AnnotationClasses::ModelReadPort,
+      goldengate::AnnotationClasses::ModelWritePort,
+      goldengate::AnnotationClasses::ModelReadWritePort};
+  const SmallVector<StringRef> members[]{
+      {"data", "addr", "en"}, {"data", "mask", "addr", "en"},
+      {"wmode", "rdata", "wdata", "wmask", "addr", "en"}};
+  auto annotations = [&](StringRef declaration) {
+    SmallVector<DictionaryAttr> result;
+    for (unsigned kind = 0; kind < 3; ++kind) {
+      NamedAttrList attrs;
+      attrs.set("class", b.getStringAttr(classes[kind]));
+      attrs.set("test.payload", b.getArrayAttr({b.getI32IntegerAttr(42)}));
+      for (auto member : members[kind])
+        attrs.set(member, b.getStringAttr("~Top|Top>" + declaration.str() +
+            "." + member.str() + (member == "wdata" ? "[1]" : "")));
+      result.push_back(attrs.getDictionary(&context));
+    }
+    return result;
+  };
+  std::string error;
+  for (StringRef declaration : {"io", "alias", "wire"}) {
+    auto root = parseSourceString<ModuleOp>(fixture, &context);
+    require(bool(root), "memory model selector fixture parse failed");
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    auto original = annotations(declaration);
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(SmallVector<Attribute>(original.begin(), original.end())));
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+    require(succeeded(verify(*root)), "memory model selector lowering produced invalid IR");
+    auto lowered = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    require(lowered.size() == 3, "memory port annotations fanned out or disappeared");
+    for (unsigned kind = 0; kind < 3; ++kind) {
+      Annotation result(lowered[kind]);
+      require(result.isClass(classes[kind]) &&
+              result.getMember<ArrayAttr>("test.payload") == Annotation(original[kind]).getMember<ArrayAttr>("test.payload"),
+              "memory annotation class/order/payload changed");
+      for (auto member : members[kind]) {
+        auto expected = "~Top|Top>" + declaration.str() + "_" + member.str() +
+            (member == "wdata" ? "_1" : "");
+        auto spelling = result.getMember<StringAttr>(member);
+        require(spelling && spelling.getValue() == expected,
+                "memory member identity: expected " + expected + ", got " +
+                (spelling ? spelling.getValue().str() : "<absent>"));
+        if (declaration == "io") {
+          auto target = goldengate::resolveAnnotationTarget(circuit, spelling.getValue(), error);
+          require(target && target->port && *target->fieldID == 0, "memory port member does not resolve to a ground port");
+          if (member == "data")
+            require(cast<UIntType>(target->module.getPortType(*target->port)).getWidth() == 8,
+                    "memory data target selected the colliding 19-bit port");
+        } else {
+          auto target = goldengate::resolveInternalFieldTarget(circuit, spelling.getValue(), error);
+          require(target && target->fieldID == 0 && target->type.isGround(),
+                  "internal memory member does not resolve to a ground declaration");
+        }
+      }
+    }
+    for (auto owner : circuit.getOps<FModuleLike>())
+      circt::hw::InnerSymbolTable::walkSymbols(owner, [&](StringAttr, circt::hw::InnerSymTarget) {
+        require(false, "memory member lowering leaked temporary symbols");
+      });
+    auto before = dump(*root);
+    require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)) && dump(*root) == before,
+            "memory annotation target transfer is not idempotent");
+  }
+  auto original = annotations("io");
+  // SFC exact renaming accepts an aggregate with one surviving leaf. The
+  // memory port classes describe payloads, so single-element vector selections
+  // must resolve to that leaf rather than rejecting their input syntax.
+  auto singleton = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(in %data: !firrtl.bundle<only: vector<uint<8>, 1>>,
+                        in %mask: !firrtl.bundle<only: uint<1>>,
+                        in %addr: !firrtl.uint<2>, in %en: !firrtl.uint<1>) {}
+    }
+  })mlir", &context);
+  auto sc = *singleton->getOps<CircuitOp>().begin();
+  NamedAttrList singletonAttrs;
+  singletonAttrs.set("class", b.getStringAttr(classes[1]));
+  for (StringRef member : {"data", "mask", "addr", "en"})
+    singletonAttrs.set(member, b.getStringAttr("~Top|Top>" + member.str()));
+  sc->setAttr("rawAnnotations", b.getArrayAttr({singletonAttrs.getDictionary(&context)}));
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*singleton, sc, error)) && succeeded(verify(*singleton)), error);
+  Annotation single(sc->getAttrOfType<ArrayAttr>("rawAnnotations")[0]);
+  require(single.getMember<StringAttr>("data").getValue() == "~Top|Top>data_only_0" &&
+          single.getMember<StringAttr>("mask").getValue() == "~Top|Top>mask_only",
+          "singleton memory data/mask aggregates did not follow their sole leaf");
+  for (unsigned kind = 0; kind < 3; ++kind)
+    for (auto member : members[kind])
+      for (unsigned bad = 0; bad < 5; ++bad) {
+        auto root = parseSourceString<ModuleOp>(fixture, &context);
+        auto circuit = *root->getOps<CircuitOp>().begin();
+        NamedAttrList invalid(original[kind]);
+        if (bad == 0) invalid.set(member, b.getStringAttr("~Top|Top>io"));
+        if (bad == 1) invalid.set(member, b.getStringAttr("~Top|Top>io.zero"));
+        if (bad == 2) invalid.set(member, b.getStringAttr("~Top|Top>io.absent"));
+        if (bad == 3) invalid.erase(member);
+        if (bad == 4) invalid.set(member, b.getI32IntegerAttr(3));
+        circuit->setAttr("rawAnnotations", b.getArrayAttr({original.front(), invalid.getDictionary(&context)}));
+        auto before = dump(*root); error.clear();
+        require(failed(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)) &&
+                !error.empty() && dump(*root) == before,
+                "invalid memory member accepted or mutated IR before rejection");
+      }
+  // Late debug-only lowering must preserve historical SRAM metadata without
+  // resolving ports that its earlier consumer may already have removed.
+  auto late = parseSourceString<ModuleOp>(fixture, &context);
+  auto lateCircuit = *late->getOps<CircuitOp>().begin();
+  SmallVector<Attribute> historical;
+  for (auto klass : classes)
+    historical.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(klass))}));
+  auto raw = b.getArrayAttr(historical);
+  lateCircuit->setAttr("rawAnnotations", raw);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*late, lateCircuit, error,
+              goldengate::RetainedTargetScope::FpgaDebugOnly)) &&
+          lateCircuit->getAttr("rawAnnotations") == raw && succeeded(verify(*late)),
+          "debug-only normalization validated or rewrote historical SRAM metadata");
+  llvm::outs() << "SRAM port annotations: 39 port/node/wire member identities, colliding names, vector elements, singleton aggregates, idempotence, symbol cleanup, 65 atomic rejections and late debug-only preservation passed\n";
+}
 void zeroWidthTargets(MLIRContext &context) {
   const char *fixture = R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
@@ -1053,6 +1182,7 @@ int main(int argc, char **argv) {
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
     run(context);
+    memoryPortTargets(context);
     zeroWidthTargets(context);
     for (bool internal : {false, true})
       for (bool legacy : {false, true}) {

@@ -21,6 +21,8 @@ enum class RetainedTargetScope { All, FpgaDebugOnly };
 // references in original order, including
 // DecoupledForwardChannel optional nested ready/valid references, and exact
 // FAMEChannelPortsAnnotation optional clockPort and ordered ports references.
+// SRAM ModelReadPort/ModelWritePort/ModelReadWritePort data, mask, address,
+// enable and mode members each transfer to exactly one ground identity.
 // Exact zero-width references reject, matching SFC RTRenamer after RemoveZeroWidth.
 // Fanout annotations omit zero-width leaves, including widths inferred as zero.
 // Mutates: resolves CHIRRTL, infers widths/resets, lowers aggregates, uniquifies

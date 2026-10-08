@@ -39,6 +39,12 @@ struct AnnotationClasses {
       "midas.targetutils.FirrtlFAMEModelAnnotation";
   static constexpr llvm::StringLiteral MemModel =
       "midas.targetutils.FirrtlMemModelAnnotation";
+  static constexpr llvm::StringLiteral ModelReadPort =
+      "midas.passes.fame.ModelReadPort";
+  static constexpr llvm::StringLiteral ModelWritePort =
+      "midas.passes.fame.ModelWritePort";
+  static constexpr llvm::StringLiteral ModelReadWritePort =
+      "midas.passes.fame.ModelReadWritePort";
   static constexpr llvm::StringLiteral DontTouch =
       "firrtl.transforms.DontTouchAnnotation";
   static constexpr llvm::StringLiteral AutoCounter =
