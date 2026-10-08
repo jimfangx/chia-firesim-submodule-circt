@@ -148,6 +148,13 @@ LogicalResult goldengate::inferModelPorts(CircuitOp circuit,
   auto *context = circuit.getContext();
   auto key = [&](llvm::StringRef text) { return StringAttr::get(context, text); };
   SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  llvm::DenseSet<Attribute> protectedTargets;
+  for (Attribute attr : raw) {
+    Annotation annotation(attr);
+    if (annotation.isClass(AnnotationClasses::DontTouch))
+      if (auto target = annotation.getMember<StringAttr>("target"))
+        protectedTargets.insert(target);
+  }
   for (const auto &group : groups) {
     auto model = group.module;
     std::string prefix = "~" + circuit.getName().str() + "|" +
@@ -168,6 +175,11 @@ LogicalResult goldengate::inferModelPorts(CircuitOp circuit,
     // port annotation. Keep the same target identities available to later
     // CIRCT transformations even though the FAME-only dump omits DontTouch.
     auto protect = [&](Attribute target) {
+      // Many data channels share one clock port. SFC runTransform retains a
+      // single DontTouch record for it, including protection already present
+      // at this boundary. Do the same without dropping other annotations.
+      if (!protectedTargets.insert(target).second)
+        return;
       NamedAttrList dontTouch;
       dontTouch.set("class", key(AnnotationClasses::DontTouch));
       dontTouch.set("target", target);

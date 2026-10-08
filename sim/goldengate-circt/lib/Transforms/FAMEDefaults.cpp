@@ -27,10 +27,14 @@ LogicalResult goldengate::addFAMEDefaults(CircuitOp circuit,
 
   // Scala's channel namespace is seeded by existing global channel names.
   std::set<std::string> channelNames;
+  std::set<std::string> labeledModules;
   SmallVector<Attribute> annotations(raw.begin(), raw.end());
   SmallVector<Attribute> loopbacks, modelLabels;
   for (Attribute attr : raw) {
     Annotation annotation(attr);
+    if (annotation.isClass(AnnotationClasses::FAMETransform))
+      if (auto target = annotation.getMember<StringAttr>("target"))
+        labeledModules.insert(target.getValue().str());
     if (!annotation.isClass(AnnotationClasses::ChannelConnection))
       continue;
     auto name = annotation.getMember<StringAttr>("globalName");
@@ -51,12 +55,18 @@ LogicalResult goldengate::addFAMEDefaults(CircuitOp circuit,
   // is needed to identify a direct inter-model connection.
   top.walk([&](Operation *op) {
     if (auto instance = dyn_cast<InstanceOp>(op)) {
+      // A module annotation applies to every instance of that module. SFC's
+      // runTransform removes identical annotations; retain that uniqueness
+      // explicitly for repeated promoted SRAM instances in the native stream.
+      std::string target = prefix + instance.getModuleName().str();
+      if (!labeledModules.insert(target).second)
+        return;
       modelLabels.push_back(DictionaryAttr::get(
           circuit.getContext(),
           {{StringAttr::get(circuit.getContext(), "class"),
             text(AnnotationClasses::FAMETransform)},
            {StringAttr::get(circuit.getContext(), "target"),
-            text(prefix + instance.getModuleName().str())}}));
+            text(target)}}));
       return;
     }
     auto addLoopback = [&](Value dest, Value source) {

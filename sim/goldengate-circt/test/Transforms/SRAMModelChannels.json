@@ -1,0 +1,34 @@
+[
+  {
+    "class":"midas.targetutils.FirrtlMemModelAnnotation",
+    "target":"~FAMETop|Parent>ram"
+  },
+  {
+    "class":"midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName":"targetClock",
+    "channelInfo":{
+      "class":"midas.passes.fame.TargetClockChannel",
+      "clockInfo":[
+        {
+          "name":"base",
+          "multiplier":1,
+          "divisor":1
+        }
+      ],
+      "perClockMFMR":[
+        1
+      ]
+    },
+    "sinks":[
+      "~FAMETop|FAMETop>clock"
+    ]
+  },
+  {
+    "class":"midas.passes.fame.FAMEHostClock",
+    "target":"~FAMETop|FAMETop>hostClock"
+  },
+  {
+    "class":"midas.passes.fame.FAMEHostReset",
+    "target":"~FAMETop|FAMETop>hostReset"
+  }
+]

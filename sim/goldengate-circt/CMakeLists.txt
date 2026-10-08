@@ -40,6 +40,7 @@ add_executable(goldengate-circt
   lib/Transforms/ExtractModel.cpp
   lib/Transforms/WrapTop.cpp
   lib/Transforms/LabelSRAMModels.cpp
+  lib/Transforms/SRAMModelChannels.cpp
   lib/Transforms/LowerTypes.cpp
   lib/Transforms/AutoCounterResetGate.cpp
   lib/Transforms/AutoCounterPrintfValues.cpp
@@ -175,6 +176,13 @@ target_link_libraries(goldengate-circt PRIVATE
   MLIRIR MLIRSupport LLVMSupport)
 
 include(CTest)
+if(BUILD_TESTING)
+  add_test(NAME goldengate-sram-model-channels COMMAND ${CMAKE_COMMAND}
+    -DCOMPILER=$<TARGET_FILE:goldengate-circt>
+    -DFIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms
+    -DOUTPUT=${CMAKE_CURRENT_BINARY_DIR}/sram-model-channels
+    -P ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/SRAMModelChannels.cmake)
+endif()
 if(BUILD_TESTING)
   add_executable(goldengate-extract-model-test
     test/Transforms/ExtractModelTest.cpp lib/Transforms/ExtractModel.cpp)

@@ -11,6 +11,7 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/LabelSRAMModels.h"
+#include "goldengate/SRAMModelChannels.h"
 #include "goldengate/AnnotationEmission.h"
 #include "goldengate/MetasimInterfaceHeader.h"
 #include "goldengate/SimulationMasterHeader.h"
@@ -213,6 +214,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--promote-passthrough";
   bool extractSRAMs =
       argc == 7 && llvm::StringRef(argv[6]) == "--extract-sram-models";
+  bool analyzeSRAMChannels =
+      argc == 7 && llvm::StringRef(argv[6]) == "--analyze-sram-channels";
   bool extractModels = extractSRAMs ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--extract-models");
   bool wrapTop = argc == 7 && llvm::StringRef(argv[6]) == "--wrap-top";
@@ -325,7 +328,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
+       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -344,7 +347,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--label-sram-models | --extract-sram-models | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
+                    "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -4235,6 +4238,31 @@ int main(int argc, char **argv) {
                  << firPath << '\n';
     return 0;
   };
+
+  if (analyzeSRAMChannels) {
+    std::string error;
+    unsigned wrapped = 0, promoted = 0;
+    if (failed(goldengate::prepareSRAMModelChannels(
+            *module, circuit, wrapped, promoted, error)))
+      return fail("SRAM model channels: " + error);
+    llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
+    llvm::sys::path::append(firPath, "post-sram-channels.fir");
+    llvm::sys::path::append(annotationPath, "post-sram-channels-all.json");
+    std::error_code ec;
+    llvm::raw_fd_ostream out(firPath, ec);
+    // Keep this semantic comparison boundary readable by the pinned SFC
+    // oracle. CIRCT handles version-specific statements during export; the
+    // old parser also requires connections on one line. Keep the margin below
+    // PrettyPrinter's 32767 sentinel so mandatory newlines still break.
+    if (ec || failed(exportFIRFile(*module, out, 16384,
+                                  FIRVersion(1, 2, 0))))
+      return fail("cannot export SRAM channel FIRRTL");
+    if (failed(goldengate::emitAllAnnotations(circuit, annotationPath, error)))
+      return fail("cannot export SRAM channel annotations: " + error);
+    llvm::outs() << "Prepared channels for " << wrapped << " SRAM wrappers after "
+                 << promoted << " promotions in " << firPath << '\n';
+    return 0;
+  }
 
   if (labelSRAMs) {
     std::string error;
