@@ -552,15 +552,70 @@ directory: `oracle/golden-rocket.channels.sfc.{fir,json}`,
 `fanout-comparison-final.log` and `ctest-final.log`. No candidate is compiled
 by SFC; the comparison parses and inspects native FIRRTL directly.
 
+## Native RAM command adapter (iteration 54)
+
+`RAMModelAdapter` ports the body replacement and command wiring from
+`EmitAndWrapRAMModels` through typed CIRCT operations. Its compiler boundary is
+`--wrap-ram-model wrapper implementation`, on an already FAME-transformed
+circuit containing an elaborated host RAM module. It resolves retained read
+and write annotations to scalar bits or one ground field below aggregate bits,
+checks uniform unsigned address/data widths and the complete `RegfileModelIO`
+interface, then replaces the selected wrapper body in a verified transaction.
+All wrapper ports, their order, and retained annotations survive unchanged.
+
+Read command valid combines address and enable valid; each input ready includes
+command ready and the other input valid. Write commands combine data, mask,
+address and enable with the same rendezvous rule. Response bits, valid and
+ready connect directly to the corresponding read output. Host clock/reset
+drive the implementation, and its target-reset channel receives constant
+valid one and bits zero, matching SFC. Distinct payload fields retain distinct
+annotation identities even when they share a channel. Duplicate annotations
+select hardware once while remaining in the emitted annotation list.
+
+`RAMModelAdapterOracle.scala` runs unchanged production FAME and
+`EmitAndWrapRAMModels` on the recorded independently prepared Rocket probe.
+That probe derives from the immutable
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`,
+selecting `Rocket.rf`. The candidate uses the previously compared native FAME
+wrapper. Both sides share the Chisel async timing-model constructor; only that
+constructor is normalized to remove legacy `validif` for CIRCT ingestion.
+The native adapter is never compiled or rewritten by SFC. The comparator
+inspects the selected module directly, excluding unrelated hub expressions
+that CIRCT can wrap beyond the pinned SFC parser's grammar. Command vector
+indices are identified by their bound address input because SFC's mutable
+annotation set does not specify their order.
+
+All 29 Rocket command/response/handshake/host/reset-token equations match the
+SFC wrapper, with two reads, one write, five address bits and 64 data bits.
+SFC's constructor therefore uses depth 32 even though the original memory has
+depth 31; this is oracle behavior, not an inferred native timing-model change.
+An aggregate probe with one read and two writes matches all 23 distinct
+equations and all retained annotations, including duplicate records.
+`RAMModelAdapterTest.cpp` verifies aggregate replacement and eight atomic
+rejections: implementation width mismatch, signed data, unresolved width,
+combined readwrite ports, non-bits targets, retained body targets, identical
+wrapper/implementation and channels shared between different commands.
+Combined readwrite ports are also rejected by the Scala oracle. Cross-command
+sharing requires an arbitration policy before it can be supported safely.
+
+The compiler and unit test build successfully; 37 focused SRAM/FAME CTests
+pass. Mutable evidence is under `iteration54-ram-adapter/` in the U250 generated
+directory: `golden-rocket.expected.fir`, `golden-rocket-native/post-ram-adapter.fir`,
+the analogous aggregate artifacts, `compare.stdout`, and `ctest.log`.
+The supplied iteration 53 replacertl and Verilator workload results pass;
+manager verification of this new boundary remains harness-owned.
+
 ## Remaining scope
 
 Shared SRAM definitions now have native FAME data/clock hardware with distinct
 instance bindings and native transport for complete scalar parent graphs.
 Optional memory selection is still absent from the default FireSim build;
-abstract RAM timing-model replacement and SRAM generated-clock collateral
-integration remain pending. Legacy retained domain-clock annotations have the
+native async RAM timing-model emission and SRAM generated-clock collateral
+integration remain pending. The new adapter requires a supplied elaborated
+implementation and is not yet selected by the default FireSim compiler flow.
+Legacy retained domain-clock annotations have the
 same erased top-clock references as SFC after FAME; later consumers must use
 captured domain identity rather than resolve those as surviving ports. The
-next step is to port abstract SRAM timing-model replacement on a selected
-memory, compare its model/channel boundary against SFC, then integrate optional
+next step is to emit native async read arbitration and response buffering on a
+selected memory, compare the timing transitions against SFC, then integrate optional
 memory selection and generated-clock collateral into the default compiler.

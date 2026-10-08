@@ -12,6 +12,7 @@
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/LabelSRAMModels.h"
 #include "goldengate/SRAMModelChannels.h"
+#include "goldengate/RAMModelAdapter.h"
 #include "goldengate/AnnotationEmission.h"
 #include "goldengate/MetasimInterfaceHeader.h"
 #include "goldengate/SimulationMasterHeader.h"
@@ -197,6 +198,7 @@ static mlir::LogicalResult emitAutoILAAnalysis(CircuitOp circuit,
 }
 
 int main(int argc, char **argv) {
+  bool wrapRAMModel = argc == 9 && llvm::StringRef(argv[6]) == "--wrap-ram-model";
   bool rewriteOutputValids =
       argc == 8 &&
       llvm::StringRef(argv[6]) == "--rewrite-fame-output-valid-from";
@@ -336,7 +338,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
+       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !wrapRAMModel && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -355,7 +357,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --rewrite-sram-clocks | --rewrite-sram-fame | --rewrite-sram-parent-fame | --rewrite-sram-transport | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
+                    "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --rewrite-sram-clocks | --rewrite-sram-fame | --rewrite-sram-parent-fame | --rewrite-sram-transport | --wrap-ram-model wrapper implementation | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -4749,6 +4751,33 @@ int main(int argc, char **argv) {
   for (const auto &[name, count] : externalClasses)
     if (classes[name] < count)
       return fail("CIRCT lost input annotations of class " + name);
+
+  if (wrapRAMModel) {
+    FModuleOp wrapper, implementation;
+    for (auto m : circuit.getOps<FModuleOp>()) {
+      if (m.getName() == argv[7]) wrapper = m;
+      if (m.getName() == argv[8]) implementation = m;
+    }
+    std::string error;
+    goldengate::RAMModelParameters parameters;
+    if (failed(goldengate::wrapRAMModel(circuit, wrapper, implementation, parameters, error)))
+      return fail("RAM model adapter: " + error);
+    if (failed(mlir::verify(*module))) return fail("RAM adapter boundary is invalid");
+    llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
+    llvm::sys::path::append(firPath, "post-ram-adapter.fir");
+    llvm::sys::path::append(annotationPath, "post-ram-adapter-all.json");
+    std::error_code ec;
+    llvm::raw_fd_ostream out(firPath, ec);
+    if (ec || failed(exportFIRFile(*module, out, 16384, FIRVersion(1, 2, 0))))
+      return fail("cannot export RAM adapter FIRRTL");
+    if (failed(goldengate::emitAllAnnotations(circuit, annotationPath, error)))
+      return fail("cannot export RAM adapter annotations: " + error);
+    llvm::outs() << "Wrapped " << argv[7] << " using " << argv[8] << ": "
+                 << parameters.reads << " reads, " << parameters.writes << " writes, "
+                 << parameters.addressWidth << " address bits, " << parameters.dataWidth
+                 << " data bits\n";
+    return 0;
+  }
 
   if (updateBridgeClocks) {
     std::string error;

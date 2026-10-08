@@ -41,6 +41,7 @@ add_executable(goldengate-circt
   lib/Transforms/WrapTop.cpp
   lib/Transforms/LabelSRAMModels.cpp
   lib/Transforms/SRAMModelChannels.cpp
+  lib/Transforms/RAMModelAdapter.cpp
   lib/Transforms/LowerTypes.cpp
   lib/Transforms/AutoCounterResetGate.cpp
   lib/Transforms/AutoCounterPrintfValues.cpp
@@ -177,6 +178,16 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-ram-model-adapter-test
+    test/Transforms/RAMModelAdapterTest.cpp lib/Transforms/RAMModelAdapter.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-ram-model-adapter-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-ram-model-adapter-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-ram-model-adapter-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-ram-model-adapter-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-ram-model-adapter COMMAND goldengate-ram-model-adapter-test)
   add_executable(goldengate-promote-passthrough-test
     test/Transforms/PromotePassthroughConnectionsTest.cpp
     lib/Transforms/PromotePassthroughConnections.cpp)
