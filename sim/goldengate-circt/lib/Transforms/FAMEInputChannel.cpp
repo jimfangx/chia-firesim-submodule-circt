@@ -244,11 +244,6 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
       error = "FAME model channel port already exists: " + modelName;
       return failure();
     }
-  for (const auto &port : top.getPorts())
-    if (port.getName() == channel.portName) {
-      error = "FAME top channel port already exists: " + channel.portName;
-      return failure();
-    }
   if (hasPortAnnotations(model, modelPort)) {
     error = "FAME input port has annotations requiring a field transfer";
     return failure();
@@ -269,6 +264,11 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
     error = "FAME input channel has no matching top port";
     return failure();
   }
+  for (unsigned i = 0; i < top.getNumPorts(); ++i)
+    if (top.getPortName(i) == channel.portName && i != *topPort) {
+      error = "FAME top channel port already exists: " + channel.portName;
+      return failure();
+    }
   llvm::SmallVector<Annotation> wrapperAnnotations;
   llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
   if (failed(collectFAMEWrapperPayloadMetadata(
@@ -1196,7 +1196,7 @@ LogicalResult goldengate::groupFAMEChannelPorts(
       return false;
     };
     if (!addNamedInput("hostClock") || !addNamedInput("hostReset") ||
-        (modelPorts && !addNamedInput(modelClockSink))) {
+        (modelPorts && !modelClockSink.empty() && !addNamedInput(modelClockSink))) {
       error = "FAME module is missing a host control or clock sink port";
       return failure();
     }

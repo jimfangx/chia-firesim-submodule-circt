@@ -343,11 +343,6 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
       error = "FAME model source port already exists";
       return failure();
     }
-  for (const auto &port : top.getPorts())
-    if (port.getName() == channel.portName) {
-      error = "FAME top source port already exists";
-      return failure();
-    }
 
   std::set<unsigned> topPorts;
   for (const auto &connection : hierarchy.connections)
@@ -358,6 +353,11 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
     error = "FAME output channel has no matching top port";
     return failure();
   }
+  for (unsigned i = 0; i < top.getNumPorts(); ++i)
+    if (top.getPortName(i) == channel.portName && !topPorts.count(i)) {
+      error = "FAME top source port already exists";
+      return failure();
+    }
   llvm::SmallVector<Annotation> wrapperAnnotations;
   llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
   llvm::SmallVector<Operation *> oldConnections;

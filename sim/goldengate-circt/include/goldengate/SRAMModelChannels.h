@@ -28,4 +28,13 @@ analyzeSRAMModelDependencies(circt::firrtl::CircuitOp circuit,
 // Requires one target clock and no model-local channel clock associations.
 mlir::LogicalResult rewriteSRAMVirtualClocks(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
+
+// Channelize prepared scalar SRAM data ports, retarget their annotations to
+// Decoupled bits, and construct the virtual-clock FAME channel FSM. Requires
+// one promoted instance per SRAM definition. Other models stay at the prepared
+// boundary; inter-model transport and SRAM timing-model replacement are later
+// steps. Rebuilds hierarchy between port rewrites. Commits a verified clone,
+// so unsupported instances/metadata leave the original circuit unchanged.
+mlir::LogicalResult rewriteSRAMFAME(
+    circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
 }

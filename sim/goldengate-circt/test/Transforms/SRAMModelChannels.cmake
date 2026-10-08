@@ -152,3 +152,57 @@ string(JSON seeded_count LENGTH "${seeded_output}")
 if(NOT seeded_count EQUAL count)
   message(FATAL_ERROR "Existing annotations were duplicated: ${count} -> ${seeded_count}")
 endif()
+
+# Data-port rewriting currently supports one promoted instance per definition.
+# Derive a single-instance probe without changing the recorded fanout fixture.
+file(READ "${FIXTURES}/SRAMModelChannels.fir" single)
+string(REGEX REPLACE "    inst p1 of Parent\n" "" single "${single}")
+string(REGEX REPLACE "    p1[^\n]*\n" "" single "${single}")
+string(REGEX REPLACE "    inst m1 of Middle\n" "" single "${single}")
+string(REGEX REPLACE "    m1[^\n]*\n" "" single "${single}")
+file(WRITE "${OUTPUT}/single.fir" "${single}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/single.fir"
+  --annotation-file "${FIXTURES}/SRAMModelChannels.json"
+  --output-dir "${OUTPUT}/single-fame" --rewrite-sram-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Single-instance SRAM FAME failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/single-fame/post-sram-fame.fir" fame_fir)
+string(REGEX MATCHALL "reg [^\n]*_fired_[0-9]+ : UInt<1>" fired_regs "${fame_fir}")
+list(LENGTH fired_regs fired_count)
+string(FIND "${fame_fir}" "targetCycleFinishing <= " finishing)
+string(FIND "${fame_fir}" "ram.r_addr_sink <= " top_input)
+string(FIND "${fame_fir}" "ram_r_data_source <= Top_m0_p0_ram.r_data_source" top_output)
+if(NOT fired_count EQUAL 13 OR finishing LESS 0 OR top_input LESS 0 OR top_output LESS 0)
+  message(FATAL_ERROR "SRAM FAME has incomplete state or top bindings: fired=${fired_count}, finishing=${finishing}, input=${top_input}, output=${top_output}")
+endif()
+file(READ "${OUTPUT}/single-fame/post-sram-fame-all.json" fame_annotations)
+string(FIND "${fame_annotations}" "~FAMETop|ram>r_addr_sink.bits" memory_addr)
+string(FIND "${fame_annotations}" "~FAMETop|FAMETop>Top_m0_p0_ram_r_data_source.bits" channel_source)
+if(memory_addr LESS 0 OR channel_source LESS 0)
+  message(FATAL_ERROR "SRAM memory/channel targets were not transferred to payload fields")
+endif()
+execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
+  --annotation-file "${FIXTURES}/SRAMModelChannels.json"
+  --output-dir "${OUTPUT}/repeated-fame" --rewrite-sram-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "require one promoted instance per definition")
+  message(FATAL_ERROR "Repeated SRAM data rewrite was not rejected: ${stdout}\n${stderr}")
+endif()
+message(STATUS "Passed native single-instance SRAM FAME state, payload targets and repeated-instance rejection")
+
+# Unknown metadata referring to a replaced data port needs its own transfer
+# policy. Reject it instead of recursively changing arbitrary annotation text.
+file(READ "${FIXTURES}/SRAMModelChannels.json" data_seed)
+string(JSON data_seed_count LENGTH "${data_seed}")
+string(JSON data_seed SET "${data_seed}" ${data_seed_count}
+  "{\"class\":\"example.UnsupportedPortAnnotation\",\"target\":\"~FAMETop|ram>r_addr\"}")
+file(WRITE "${OUTPUT}/protected-data.json" "${data_seed}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/single.fir"
+  --annotation-file "${OUTPUT}/protected-data.json"
+  --output-dir "${OUTPUT}/protected-data" --rewrite-sram-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "data target has unsupported retained annotation metadata")
+  message(FATAL_ERROR "Unknown SRAM data metadata was not rejected: ${stdout}\n${stderr}")
+endif()

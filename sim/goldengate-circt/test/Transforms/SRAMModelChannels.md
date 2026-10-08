@@ -195,11 +195,75 @@ ctest --test-dir "$native_build" --output-on-failure \
   -R 'goldengate-(sram-model-channels|fame-virtual-clock-port|fame-clock-gate|fame-clock-gate-identity|fame-output-selection|comb-dependency|fame-channel-clock-domains)$'
 ```
 
+## Native SRAM FAME data hardware (iteration 48)
+
+`--rewrite-sram-fame` prepares the same wrapped handoff, snapshots native
+combinational dependencies and scalar channel identities, then creates each
+SRAM's virtual clock, Decoupled data ports, fired registers, ready/valid rules,
+and driven `targetCycleFinishing` wire. It refreshes hierarchy and port bindings
+between channel rewrites. The model interface places host controls before
+inputs and outputs; no explicit clock-token sink is created. Every channel
+starts unfired and uses constant-one virtual enable, following SFC
+`genMetadata(None)`. Unknown metadata referring to replaced data ports and
+repeated SRAM instances are rejected. A verified circuit clone is committed
+only after the entire rewrite succeeds.
+
+The initial Rocket candidate exposed a real helper mismatch: ChannelExcision
+already named its scalar top ports as the eventual FAME channels. Scalar input
+and output helpers now allow reusing the replaced port's name, while preserving
+collision rejection for other ports. Model/top metadata transfer and final
+MLIR verification still run.
+
+`SRAMFAMEOracle.scala` builds the independent register-file hardware with
+unchanged `FAMEModuleTransformer`, using the fresh golden-derived prepared
+circuit above. It only parses the CIRCT candidate. It compares all ten channel
+ABIs, the SRAM memory specification, payload assignments and gated memory
+clocks, host/top channel connections, reset values and these equations:
+
+| Rule | Compared cases |
+| --- | ---: |
+| Ten fired next-state rules | 160 |
+| Eight input ready rules | 128 |
+| Two output valid rules, including all nondependent write-input valids | 2,048 |
+| Target-cycle completion over every input-valid/output-fired/ready/valid combination | 16,384 |
+
+The comparison passes. The native pre-FAME preparation again matches the SFC
+boundary structurally: 100 Rocket annotation records and 197 fanout records.
+For annotation transfer, the comparator applies SFC's own `Annotation.update`
+to that verified native preparation, using actual top/instance connections.
+This preserves the compilers' legal hub-instance spelling differences. The
+resulting annotation multiset matches the native output, including SRAM
+memory-port metadata and local/global channel targets at `.bits`; transformed
+SRAM DontTouch records are consumed as in SFC.
+
+Artifacts are under the mutable U250 generated directory's
+`iteration48-sram-fame/`: `oracle/golden-rocket.fame.sfc.fir/json`,
+`golden-rocket-fame/post-sram-fame.fir` and its annotation sidecar,
+`fame-comparison.log`, and fresh preparation comparisons. Compile
+`SRAMFAMEOracle.scala` alongside the existing preparation oracle files, then:
+
+```sh
+"$native_compiler" "$evidence/oracle/golden-rocket.channels-input.fir" \
+  --annotation-file "$evidence/oracle/golden-rocket.channels-input.json" \
+  --output-dir "$evidence/golden-rocket-fame" --rewrite-sram-fame
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMFAMEOracle "$evidence"
+```
+
+The comparator also reads `golden-rocket-candidate/post-sram-channels.fir` and
+`post-sram-channels-all.json` from the preparation reproduction above. CTest derives a single-instance read/write/readwrite probe from
+the existing fanout handoff and checks all thirteen fired registers, finishing,
+channel bindings and payload annotation targets. It retains the four-instance
+clock test and rejects repeated-instance data rewriting and unknown metadata.
+All ten focused native tests pass. The direct default compiler boundary through
+PrintBridge host binding is also checked in this iteration. Manager validation
+remains harness-owned.
+
 ## Remaining scope
 
-This establishes the optional SRAM channel graph. It does not yet connect
-optional memory selection to the default FireSim build, finish FAME data-channel
-hardware rewriting on these promoted models, or emit abstract RAM timing models.
-The next step is to channelize the single Rocket SRAM model's data ports and
-construct its fired/ready/valid/finishing rules from the verified dependency
-graph. Repeated model instances still need instance-aware data-port rewriting.
+The single-instance SRAM model now has native FAME data/clock hardware.
+Optional memory selection is still absent from the default FireSim build;
+inter-model transport and abstract RAM timing-model replacement remain pending.
+The next step is to generalize data-port rewriting to every promoted instance
+of a shared SRAM definition, preserving each instance's distinct global
+channel/clock targets while constructing the definition's local FSM once.

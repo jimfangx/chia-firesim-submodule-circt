@@ -132,6 +132,7 @@ mlir::LogicalResult removeFAMEStaleTopClocks(
 
 // Place host controls and the model clock sink before data sinks, followed by
 // data sources, as in the SFC FAME model interface. Keep each group's order.
+// An empty modelClockSink selects the non-hub virtual-clock interface.
 mlir::LogicalResult groupFAMEChannelPorts(
     circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
     llvm::StringRef instanceName, llvm::StringRef modelClockSink,

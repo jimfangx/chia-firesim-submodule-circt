@@ -6,6 +6,11 @@
 #include "goldengate/FAMEDefaults.h"
 #include "goldengate/FAMEHostControl.h"
 #include "goldengate/FAMEInputChannel.h"
+#include "goldengate/FAMEOutputChannel.h"
+#include "goldengate/FAMEFiredState.h"
+#include "goldengate/FAMEInputReady.h"
+#include "goldengate/FAMEOutputValid.h"
+#include "goldengate/FAMEFinishing.h"
 #include "goldengate/FindDefaultClocks.h"
 #include "goldengate/InferModelPorts.h"
 #include "goldengate/LabelSRAMModels.h"
@@ -13,8 +18,10 @@
 #include "goldengate/PromotePassthroughConnections.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/Pass/PassManager.h"
 #include <functional>
+#include <map>
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -236,5 +243,241 @@ LogicalResult goldengate::rewriteSRAMVirtualClocks(
       return failure();
     ++rewritten;
   }
+  return success();
+}
+
+namespace {
+// Stable names and types survive the insert/erase APIs; indices and instance
+// operations do not. Never reuse a binding after a channel has been rewritten.
+struct SRAMDataPort {
+  std::string model, instance, oldPort, local, global, topPort;
+  Direction direction;
+  BundleType type;
+};
+
+LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
+                                  std::string &error) {
+  using namespace goldengate;
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto hierarchy = analyzeTopHierarchy(circuit, error);
+  auto dependencies = analyzeSRAMModelDependencies(circuit, error);
+  if (!raw || !hierarchy || !dependencies) return failure();
+  SmallVector<FModuleOp> models;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (!anno.isClass(AnnotationClasses::ModelReadPort) &&
+        !anno.isClass(AnnotationClasses::ModelWritePort) &&
+        !anno.isClass(AnnotationClasses::ModelReadWritePort)) continue;
+    auto addr = anno.getMember<StringAttr>("addr");
+    auto target = addr ? resolveAnnotationTarget(circuit, addr.getValue(), error)
+                       : std::nullopt;
+    auto model = target ? dyn_cast<FModuleOp>(target->module.getOperation()) : FModuleOp();
+    if (!model || !target->port) {
+      error = "SRAM FAME requires prepared scalar memory-port targets";
+      return failure();
+    }
+    if (!llvm::is_contained(models, model)) models.push_back(model);
+  }
+  if (models.empty()) {
+    error = "SRAM FAME requires at least one prepared memory model";
+    return failure();
+  }
+  for (auto model : models) {
+    unsigned uses = 0;
+    bool promoted = true;
+    circuit.walk([&](InstanceOp instance) {
+      if (instance.getModuleName() != model.getName()) return;
+      ++uses;
+      promoted &= instance->getParentOfType<FModuleOp>() == hierarchy->top;
+    });
+    if (uses != 1 || !promoted) {
+      error = "SRAM FAME data channels require one promoted instance per definition: " +
+              model.getName().str();
+      return failure();
+    }
+  }
+  SmallVector<ModelPortGroup> groups;
+  SmallVector<GGChannelConnection, 0> channels;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (anno.isClass(AnnotationClasses::ChannelPorts)) {
+      auto group = analyzeModelPortGroup(circuit, anno, error);
+      if (!group) return failure();
+      groups.push_back(std::move(*group));
+    } else if (anno.isClass(AnnotationClasses::ChannelConnection)) {
+      auto channel = analyzeChannelConnection(circuit, anno, error);
+      if (!channel) return failure();
+      channels.push_back(std::move(*channel));
+    }
+  }
+  SmallVector<ModelChannelBinding> bindings;
+  for (const auto &channel : channels) {
+    auto bound = bindChannelToModels(channel, *hierarchy, groups, error);
+    if (!bound) return failure();
+    bindings.append(bound->begin(), bound->end());
+  }
+  SmallVector<FModuleLike> selected(models.begin(), models.end());
+  auto plan = analyzeFAMEPorts(*hierarchy, bindings, channels, selected, error);
+  if (!plan) return failure();
+  SmallVector<SRAMDataPort, 0> ports;
+  std::map<std::string, std::string> renames;
+  auto target = [&](FModuleOp module, StringRef port) {
+    return "~" + circuit.getName().str() + "|" + module.getName().str() + ">" + port.str();
+  };
+  for (const auto &list : {plan->sinks, plan->sources})
+    for (const auto &port : list) {
+      auto binding = *port.binding;
+      auto group = *binding.portGroup;
+      auto model = cast<FModuleOp>(group.module.getOperation());
+      if (group.ports.size() != 1 || group.clockPort || binding.instancePorts.size() != 1 ||
+          !isa<UIntType, SIntType>(model.getPortType(group.ports[0]))) {
+        error = "SRAM FAME currently requires scalar integer virtual-clock data channels";
+        return failure();
+      }
+      auto oldPort = model.getPortName(group.ports[0]).str();
+      ports.push_back({model.getName().str(), binding.instance.getName().str(), oldPort,
+                       group.name, binding.globalName, port.portName, group.direction, port.type});
+      renames[target(model, oldPort)] = target(model, group.name +
+          (group.direction == Direction::In ? "_sink" : "_source")) + ".bits";
+      for (const auto &connection : hierarchy->connections)
+        if (connection.instance == binding.instance &&
+            connection.instancePort == group.ports[0])
+          renames[target(hierarchy->top, hierarchy->top.getPortName(connection.topPort))] =
+              target(hierarchy->top, port.portName) + ".bits";
+    }
+  // Every data port must belong to exactly one local channel. The clock-only
+  // substep validates the absence of explicit SRAM clock-channel associations.
+  for (auto model : models) {
+    auto selection = analyzeFAMEDataSelection(circuit, model, error);
+    if (!selection) return failure();
+    unsigned dataPorts = 0, selectedPorts = 0;
+    for (auto port : model.getPorts()) dataPorts += !isa<ClockType>(port.type);
+    for (const auto &port : ports) selectedPorts += port.model == model.getName();
+    if (dataPorts != selectedPorts) {
+      error = "SRAM FAME requires complete, distinct data channel coverage";
+      return failure();
+    }
+  }
+  // Prepared annotations use canonical local targets. Only the SFC memory,
+  // channel and DontTouch schemas have a defined payload-transfer policy here.
+  // Unknown target-bearing metadata must not be silently rewritten as text.
+  std::function<bool(Attribute)> referencesData = [&](Attribute attr) {
+    if (auto spelling = dyn_cast<StringAttr>(attr))
+      return renames.count(spelling.getValue().str()) != 0;
+    if (auto array = dyn_cast<ArrayAttr>(attr))
+      return llvm::any_of(array, referencesData);
+    if (auto dictionary = dyn_cast<DictionaryAttr>(attr))
+      return llvm::any_of(dictionary, [&](NamedAttribute member) {
+        return referencesData(member.getValue());
+      });
+    return false;
+  };
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (referencesData(attr) && !anno.isClass(AnnotationClasses::DontTouch) &&
+        !anno.isClass(AnnotationClasses::ChannelPorts) &&
+        !anno.isClass(AnnotationClasses::ChannelConnection) &&
+        !anno.isClass(AnnotationClasses::ModelReadPort) &&
+        !anno.isClass(AnnotationClasses::ModelWritePort) &&
+        !anno.isClass(AnnotationClasses::ModelReadWritePort)) {
+      error = "SRAM FAME data target has unsupported retained annotation metadata";
+      return failure();
+    }
+  }
+  if (failed(rewriteSRAMVirtualClocks(circuit, rewritten, error))) return failure();
+  for (const auto &port : ports) {
+    auto current = analyzeTopHierarchy(circuit, error);
+    if (!current) return failure();
+    FModuleOp model;
+    for (auto candidate : circuit.getOps<FModuleOp>())
+      if (candidate.getName() == port.model) model = candidate;
+    InstanceOp instance;
+    for (auto candidate : current->top.getOps<InstanceOp>())
+      if (candidate.getName() == port.instance && candidate.getModuleName() == port.model)
+        instance = candidate;
+    std::optional<unsigned> index;
+    for (unsigned i = 0; i < model.getNumPorts(); ++i)
+      if (model.getPortName(i) == port.oldPort) index = i;
+    if (!instance || !index) {
+      error = "SRAM FAME lost a scalar model binding during channelization";
+      return failure();
+    }
+    ModelPortGroup group{port.local, model, port.direction, std::nullopt, {*index}};
+    ModelChannelBinding binding{port.global, &group, instance, {*index}};
+    FAMETopChannelPort channel{&binding, port.topPort, port.type};
+    if (failed(port.direction == Direction::In
+                   ? rewriteFAMEInputChannel(*current, channel, error)
+                   : rewriteFAMEOutputChannel(*current, channel, error))) return failure();
+  }
+  // SFC removes the transformed models' DontTouch annotations, then applies
+  // hostDecouplingRenames to memory metadata, local groups and global endpoints.
+  std::function<Attribute(Attribute)> rename = [&](Attribute attr) -> Attribute {
+    if (auto spelling = dyn_cast<StringAttr>(attr)) {
+      auto found = renames.find(spelling.getValue().str());
+      return found == renames.end() ? attr : StringAttr::get(circuit.getContext(), found->second);
+    }
+    if (auto array = dyn_cast<ArrayAttr>(attr)) {
+      SmallVector<Attribute> values;
+      for (auto value : array) values.push_back(rename(value));
+      return ArrayAttr::get(circuit.getContext(), values);
+    }
+    if (auto dictionary = dyn_cast<DictionaryAttr>(attr)) {
+      SmallVector<NamedAttribute> values;
+      for (auto member : dictionary)
+        values.emplace_back(member.getName(), rename(member.getValue()));
+      return DictionaryAttr::get(circuit.getContext(), values);
+    }
+    return attr;
+  };
+  SmallVector<Attribute> updated;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    auto spelling = anno.getMember<StringAttr>("target");
+    if (anno.isClass(AnnotationClasses::DontTouch) && spelling &&
+        llvm::any_of(models, [&](FModuleOp model) {
+          return spelling.getValue().starts_with(target(model, ""));
+        })) continue;
+    updated.push_back(rename(attr));
+  }
+  circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), updated));
+  for (auto model : models) {
+    SmallVector<std::string> inputs, outputs;
+    SmallVector<FAMEFiredChannel> fired;
+    SmallVector<LocalChannelDependency> rules;
+    OpBuilder builder(model.getBodyBlock(), model.getBodyBlock()->begin());
+    Value one = builder.create<ConstantOp>(model.getLoc(), UIntType::get(model.getContext(), 1), APInt(1, 1));
+    std::string instance;
+    for (const auto &port : ports) if (port.model == model.getName()) {
+      bool input = port.direction == Direction::In;
+      (input ? inputs : outputs).push_back(port.local);
+      fired.push_back({port.local, input, one, false});
+      instance = port.instance;
+    }
+    for (const auto &dependency : *dependencies)
+      if (dependency.module == model) rules.append(dependency.outputs.begin(), dependency.outputs.end());
+    if (failed(ensureFAMEFiredRegisters(model, fired, error)) ||
+        failed(rewriteFAMEFiredStates(model, fired, error)) ||
+        failed(rewriteFAMEInputReadies(model, inputs, error)) ||
+        failed(rewriteFAMEOutputValids(model, rules, error)) ||
+        failed(rewriteFAMEFinishing(model, inputs, outputs, "", error)) ||
+        failed(groupFAMEChannelPorts(hierarchy->top, model, instance, "", error))) return failure();
+  }
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::rewriteSRAMFAME(CircuitOp circuit, unsigned &rewritten,
+                                         std::string &error) {
+  rewritten = 0;
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  unsigned count = 0;
+  if (failed(rewriteSRAMFAMEImpl(*staged, count, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "SRAM FAME produced invalid FIRRTL IR";
+    return failure();
+  }
+  circuit->setAttrs((*staged)->getAttrs());
+  circuit.getBody().takeBody(staged->getBody());
+  rewritten = count;
   return success();
 }
