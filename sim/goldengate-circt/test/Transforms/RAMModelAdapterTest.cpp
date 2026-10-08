@@ -42,7 +42,7 @@ const char *fixture = R"fir(circuit Top :
     skip
 )fir";
 void run(MLIRContext &context) {
-  for (unsigned probe = 0; probe != 9; ++probe) {
+  for (unsigned probe = 0; probe != 20; ++probe) {
     std::string input(fixture);
     if (probe == 1) { // A valid but different elaborated implementation ABI.
       auto at = input.rfind("data : UInt<17>");
@@ -51,6 +51,19 @@ void run(MLIRContext &context) {
     if (probe == 2 || probe == 3) {
       auto at = input.find("bits : UInt<17>");
       input.replace(at, std::string("bits : UInt<17>").size(), probe == 2 ? "bits : SInt<17>" : "bits : UInt");
+    }
+    if (probe >= 9) {
+      input.erase(input.find("  module HostRAM :")); // Native creation needs no host ABI.
+      if (probe == 10 || probe == 11)
+        input += "  extmodule RamModel :\n    defname = ExistingExternalRAM\n";
+      if (probe == 11)
+        input += "  module RamModel_1 :\n    skip\n";
+      if (probe == 12) {
+        size_t at = 0;
+        while ((at = input.find("UInt<3>", at)) != std::string::npos) {
+          input.replace(at, 7, "UInt<63>"); at += 8;
+        }
+      }
     }
     llvm::SourceMgr source;
     source.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBufferCopy(input), llvm::SMLoc());
@@ -83,14 +96,33 @@ void run(MLIRContext &context) {
       annos.push_back(b.getDictionaryAttr({
         b.getNamedAttr("class", b.getStringAttr("test.RetainedBodyReference")),
         signal("target", "oldState")}));
+    if (probe == 13 || probe == 14 || probe == 15 || probe == 16) {
+      std::string target = probe == 13 ? "~Top|RAM>oldState" :
+          probe == 14 ? "~Top|Top/ram:RAM>read.bits.addr" :
+          probe == 15 ? "~Top|Top/ram:RAM>oldState" : "~Top|RAM/child:Child>port";
+      annos.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr("test.RetainedReference")),
+          b.getNamedAttr("target", b.getStringAttr(target))}));
+    }
     if (probe == 7) implementation = wrapper;
+    if (probe == 17)
+      wrapper.getBodyBlock()->front().setAttr("annotations", b.getArrayAttr({read}));
+    if (probe == 18)
+      wrapper.getBodyBlock()->front().setAttr("inner_sym", circt::hw::InnerSymAttr::get(b.getStringAttr("oldState")));
+    if (probe == 19) wrapper = {};
     auto raw = b.getArrayAttr(annos);
     circuit->setAttr("rawAnnotations", raw);
     auto before = dump(*root);
+    SmallVector<std::pair<Operation *, std::string>> unchanged;
+    for (auto &op : circuit.getBodyBlock()->getOperations())
+      if (&op != wrapper) unchanged.emplace_back(&op, dump(&op));
     goldengate::RAMModelParameters parameters;
     std::string error;
-    auto result = goldengate::wrapRAMModel(circuit, wrapper, implementation, parameters, error);
-    if (probe) {
+    auto result = probe < 9
+        ? goldengate::wrapRAMModel(circuit, wrapper, implementation, parameters, error)
+        : goldengate::materializeRAMModel(circuit, wrapper, implementation, parameters, error);
+    bool accepted = probe == 0 || probe == 9 || probe == 10 || probe == 11 || probe == 14;
+    if (!accepted) {
       require(failed(result) && !error.empty(), "unsupported RAM boundary accepted");
       require(dump(*root) == before && parameters.reads == 0, "RAM rejection mutated the circuit");
     } else {
@@ -98,6 +130,25 @@ void run(MLIRContext &context) {
       require(parameters.reads == 1 && parameters.writes == 1 &&
               parameters.addressWidth == 3 && parameters.dataWidth == 17,
               "RAM parameter resolution or duplicate annotation handling failed");
+      if (probe >= 9) {
+        require(implementation && implementation.getName() ==
+                (probe == 10 ? "RamModel_1" : probe == 11 ? "RamModel_2" : "RamModel"),
+                "RAM host module namespace allocation failed");
+        require(std::distance(implementation.getOps<MemOp>().begin(),
+                              implementation.getOps<MemOp>().end()) == 1,
+                "native RAM host storage was not emitted");
+        require((*wrapper.getOps<InstanceOp>().begin()).getModuleName() == implementation.getName(),
+                "wrapper does not instantiate the newly created host");
+        if (probe == 9) {
+          auto firstHost = dump(implementation);
+          FModuleOp second;
+          require(succeeded(goldengate::materializeRAMModel(circuit, wrapper, second, parameters, error)) &&
+                  second.getName() == "RamModel_1" && dump(implementation) == firstHost,
+                  "multiple materializations reused or changed another host's storage");
+        }
+      }
+      for (const auto &[op, text] : unchanged)
+        require(dump(op) == text, "RAM creation changed another module");
       require(circuit->getAttr("rawAnnotations") == raw, "RAM adapter changed annotations");
       require(succeeded(verify(*root)), "RAM adapter IR verification failed");
       auto instances = wrapper.getOps<InstanceOp>();
@@ -113,5 +164,5 @@ int main() {
   try { run(context); } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n'; return 1;
   }
-  llvm::outs() << "PASS aggregate RAM adapter, duplicate annotations and eight atomic rejection boundaries\n";
+  llvm::outs() << "PASS aggregate RAM adapter, native host creation, internal/external collisions, independent storage and fifteen atomic rejections\n";
 }

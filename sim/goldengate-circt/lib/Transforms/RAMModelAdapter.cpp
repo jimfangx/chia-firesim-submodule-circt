@@ -1,5 +1,13 @@
 // See LICENSE for license details.
+// Requires: selected post-FAME wrapper, local MemPortAnnotation channel targets,
+// known UInt payload widths, read and write commands, no replaced-body identities.
+// Consumes/produces annotations: none; preserves wrapper and port metadata.
+// Analyses: typed target resolution; invalidates wrapper body/instance analyses.
+// Mutates: wrapper body; materialization also appends a unique native host module.
+// Output: verified FIRRTL adapter and optionally native async host timing model.
+// Failed analysis/emission leaves the circuit unchanged.
 #include "goldengate/RAMModelAdapter.h"
+#include "goldengate/AsyncRAMModel.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
@@ -7,10 +15,14 @@
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringSet.h"
 #include <functional>
 
 using namespace mlir;
 using namespace circt::firrtl;
+using goldengate::RAMModelParameters;
+using goldengate::AnnotationClasses;
+using goldengate::resolveAnnotationTarget;
 
 namespace {
 struct Signal {
@@ -26,15 +38,16 @@ BundleType bundle(MLIRContext *context,
                   std::initializer_list<BundleType::BundleElement> fields) {
   return BundleType::get(context, ArrayRef<BundleType::BundleElement>(fields));
 }
-} // namespace
-
-LogicalResult goldengate::wrapRAMModel(
-    CircuitOp circuit, FModuleOp wrapper, FModuleOp implementation,
-    RAMModelParameters &parameters, std::string &error) {
-  parameters = {};
-  if (!wrapper || !implementation || wrapper == implementation ||
-      wrapper->getParentOp() != circuit || implementation->getParentOp() != circuit) {
-    error = "RAM adapter needs distinct internal modules in the same circuit";
+struct RAMModelPlan {
+  RAMModelParameters parameters;
+  SmallVector<MemoryPort, 2> memoryPorts;
+  unsigned clock, reset;
+  BundleType channels;
+};
+LogicalResult analyzeRAMModel(CircuitOp circuit, FModuleOp wrapper,
+                              RAMModelPlan &plan, std::string &error) {
+  if (!wrapper || wrapper->getParentOp() != circuit) {
+    error = "RAM adapter needs an internal wrapper in this circuit";
     return failure();
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
@@ -192,6 +205,70 @@ LogicalResult goldengate::wrapRAMModel(
       field("read_cmds", true, FVectorType::get(decoupled(readCmd), planned.reads)),
       field("read_resps", false, FVectorType::get(decoupled(data), planned.reads)),
       field("write_cmds", true, FVectorType::get(decoupled(writeCmd), planned.writes))});
+  bool bodyIdentities = false;
+  wrapper.walk([&](Operation *op) {
+    if (op == wrapper) return;
+    auto annotations = op->getAttrOfType<ArrayAttr>("annotations");
+    bodyIdentities |= op->hasAttr("inner_sym") || (annotations && !annotations.empty());
+  });
+  if (bodyIdentities) {
+    error = "RAM wrapper body has annotation identities requiring a rename policy";
+    return failure();
+  }
+  std::string prefix = "~" + circuit.getName().str() + "|";
+  std::function<bool(Attribute)> referencesBody = [&](Attribute attr) {
+    if (auto text = dyn_cast<StringAttr>(attr)) {
+      auto ref = text.getValue();
+      if (!ref.consume_front(prefix)) return false;
+      auto [scope, reference] = ref.split('>');
+      SmallVector<StringRef> path;
+      scope.split(path, '/');
+      for (auto [i, step] : llvm::enumerate(path)) {
+        auto name = i ? step.split(':').second : step;
+        if (name != wrapper.getName()) continue;
+        if (i + 1 != path.size()) return true; // Erased instance in this body.
+        if (reference.empty()) continue; // Module/instance identity survives.
+        std::string ignored;
+        auto target = resolveAnnotationTarget(circuit,
+            prefix + wrapper.getName().str() + ">" + reference.str(), ignored);
+        if (!target || !target->port) return true;
+      }
+      return false;
+    }
+    if (auto array = dyn_cast<ArrayAttr>(attr)) return llvm::any_of(array, referencesBody);
+    if (auto dictionary = dyn_cast<DictionaryAttr>(attr))
+      return llvm::any_of(dictionary, [&](NamedAttribute member) { return referencesBody(member.getValue()); });
+    return false;
+  };
+  if (referencesBody(raw)) {
+    error = "RAM wrapper body has retained targets requiring a rename policy";
+    return failure();
+  }
+  plan = {planned, std::move(memoryPorts), *clock, *reset, channels};
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::wrapRAMModel(
+    CircuitOp circuit, FModuleOp wrapper, FModuleOp implementation,
+    RAMModelParameters &parameters, std::string &error) {
+  parameters = {};
+  if (!implementation || wrapper == implementation ||
+      implementation->getParentOp() != circuit) {
+    error = "RAM adapter needs distinct internal modules in the same circuit";
+    return failure();
+  }
+  RAMModelPlan plan;
+  if (failed(analyzeRAMModel(circuit, wrapper, plan, error))) return failure();
+  auto *context = circuit.getContext();
+  OpBuilder b(context);
+  auto bit = UIntType::get(context, 1);
+  auto findPort = [](FModuleOp module, StringRef name) -> std::optional<unsigned> {
+    for (unsigned i = 0; i < module.getNumPorts(); ++i)
+      if (module.getPortName(i) == name) return i;
+    return std::nullopt;
+  };
+  auto channels = plan.channels;
   auto implClock = findPort(implementation, "clock"), implReset = findPort(implementation, "reset"),
        implChannels = findPort(implementation, "channels");
   auto implPorts = implementation.getPorts();
@@ -201,29 +278,6 @@ LogicalResult goldengate::wrapRAMModel(
       implPorts[*implReset].direction != Direction::In || implPorts[*implReset].type != bit ||
       implPorts[*implChannels].direction != Direction::Out || implPorts[*implChannels].type != channels) {
     error = "RAM implementation ABI differs from resolved memory parameters";
-    return failure();
-  }
-  bool innerSymbols = false;
-  wrapper.walk([&](Operation *op) { innerSymbols |= op->hasAttr("inner_sym"); });
-  if (innerSymbols) {
-    error = "RAM wrapper body has inner symbols requiring a rename policy";
-    return failure();
-  }
-  std::string prefix = "~" + circuit.getName().str() + "|" + wrapper.getName().str() + ">";
-  std::function<bool(Attribute)> referencesBody = [&](Attribute attr) {
-    if (auto text = dyn_cast<StringAttr>(attr)) {
-      if (!text.getValue().starts_with(prefix)) return false;
-      std::string ignored;
-      auto target = resolveAnnotationTarget(circuit, text.getValue(), ignored);
-      return !target || !target->port;
-    }
-    if (auto array = dyn_cast<ArrayAttr>(attr)) return llvm::any_of(array, referencesBody);
-    if (auto dictionary = dyn_cast<DictionaryAttr>(attr))
-      return llvm::any_of(dictionary, [&](NamedAttribute member) { return referencesBody(member.getValue()); });
-    return false;
-  };
-  if (referencesBody(raw)) {
-    error = "RAM wrapper body has retained targets requiring a rename policy";
     return failure();
   }
   // Build and verify a temporary body before committing. Existing instances,
@@ -258,13 +312,13 @@ LogicalResult goldengate::wrapRAMModel(
         first = b.create<AndPrimOp>(loc, first, valid(s));
     return first;
   };
-  connect(model.getResult(*implClock), block->getArgument(*clock));
-  connect(model.getResult(*implReset), block->getArgument(*reset));
+  connect(model.getResult(*implClock), block->getArgument(plan.clock));
+  connect(model.getResult(*implReset), block->getArgument(plan.reset));
   Value channel = model.getResult(*implChannels), resetChannel = sub(channel, "reset");
   connect(sub(resetChannel, "valid"), constant(true));
   connect(sub(resetChannel, "bits"), constant(false));
   unsigned readIndex = 0, writeIndex = 0;
-  for (const auto &port : memoryPorts) {
+  for (const auto &port : plan.memoryPorts) {
     auto index = port.read ? readIndex++ : writeIndex++;
     Value cmd = b.create<SubindexOp>(loc,
         sub(channel, port.read ? "read_cmds" : "write_cmds"), index);
@@ -292,6 +346,41 @@ LogicalResult goldengate::wrapRAMModel(
     return failure();
   }
   wrapper.getBody().takeBody(candidate->getBody());
-  parameters = planned;
+  parameters = plan.parameters;
+  return success();
+}
+
+LogicalResult goldengate::materializeRAMModel(
+    CircuitOp circuit, FModuleOp wrapper, FModuleOp &implementation,
+    RAMModelParameters &parameters, std::string &error) {
+  implementation = {};
+  parameters = {};
+  RAMModelPlan plan;
+  if (failed(analyzeRAMModel(circuit, wrapper, plan, error))) return failure();
+  // SFC allocates one RamModel per wrapper using the circuit namespace. Include
+  // external modules too; never reuse another wrapper's storage implementation.
+  llvm::StringSet<> names;
+  for (auto &op : circuit.getBodyBlock()->getOperations())
+    if (auto module = dyn_cast<FModuleLike>(&op)) names.insert(module.getModuleName());
+  std::string name = "RamModel";
+  for (unsigned suffix = 1; names.count(name); ++suffix)
+    name = "RamModel_" + std::to_string(suffix);
+  OpBuilder b(circuit.getContext());
+  auto loc = wrapper.getLoc();
+  SmallVector<PortInfo> ports{
+      {b.getStringAttr("clock"), ClockType::get(b.getContext()), Direction::In},
+      {b.getStringAttr("reset"), UIntType::get(b.getContext(), 1), Direction::In},
+      {b.getStringAttr("channels"), plan.channels, Direction::Out}};
+  b.setInsertionPointToEnd(circuit.getBodyBlock());
+  OwningOpRef<FModuleOp> host(b.create<FModuleOp>(
+      loc, b.getStringAttr(name), wrapper.getConventionAttr(), ports));
+  RAMModelParameters emitted;
+  // The temporary host is erased on either failure. wrapRAMModel commits only
+  // after its replacement body verifies, so failure cannot orphan a host or
+  // partially replace the selected wrapper.
+  if (failed(emitAsyncRAMModel(*host, emitted, error)) ||
+      failed(wrapRAMModel(circuit, wrapper, *host, parameters, error)))
+    return failure();
+  implementation = host.release();
   return success();
 }

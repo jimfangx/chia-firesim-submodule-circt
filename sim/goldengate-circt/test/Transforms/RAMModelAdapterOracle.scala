@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // SFC generates the reference wrapper and the shared Chisel timing module.
 // The candidate wrapper comes from native FAME and is never compiled by SFC.
+// --native-host omits every supplied host declaration/body for materialization.
 package midas.passes.fame
 
 import firrtl._
@@ -11,6 +12,7 @@ import scala.collection.mutable
 object RAMModelAdapterOracle extends App {
   val output = new java.io.File(args(0)); output.mkdirs()
   val previous = new java.io.File(args(1))
+  val nativeHost = args.lift(2).contains("--native-host")
   def read(file: java.io.File) = {
     val source = scala.io.Source.fromFile(file)
     try source.mkString finally source.close()
@@ -28,9 +30,10 @@ object RAMModelAdapterOracle extends App {
     val added = host.circuit.modules.filterNot(m => input.circuit.modules.exists(_.name == m.name))
     require(added.size == 1, "probe must select one RAM definition")
     write(s"$name.expected.fir", reference.circuit.serialize)
-    write(s"$name.input.fir", candidate.copy(modules = candidate.modules ++ added).serialize)
+    val supplied = if (nativeHost) Seq.empty else added
+    write(s"$name.input.fir", candidate.copy(modules = candidate.modules ++ supplied).serialize)
     write(s"$name.input.json", JsonProtocol.serialize(input.annotations))
-    println(s"Prepared $name native wrapper input with shared Chisel timing module ${added.head.name}")
+    println(s"Prepared $name native wrapper input; supplied host = ${!nativeHost}")
   }
   for ((name, module) <- Seq("golden-rocket" -> "rf")) {
     val prepared = CircuitState(Parser.parse(read(new java.io.File(previous, s"oracle/$name.channels.sfc.fir"))),
@@ -72,6 +75,7 @@ object RAMModelAdapterOracle extends App {
 
 object RAMModelAdapterCompare extends App {
   val directory = new java.io.File(args(0))
+  val boundary = if (args.lift(1).contains("--materialized")) "post-ram-model" else "post-ram-adapter"
   def read(path: String) = {
     val source = scala.io.Source.fromFile(new java.io.File(directory, path))
     try source.mkString finally source.close()
@@ -93,7 +97,7 @@ object RAMModelAdapterCompare extends App {
   }
   for ((name, module) <- Seq("golden-rocket" -> "rf", "aggregate" -> "Aggregate")) {
     val expected = selected(s"$name.expected.fir", module)
-    val native = selected(s"$name-native/post-ram-adapter.fir", module)
+    val native = selected(s"$name-native/$boundary.fir", module)
     def abi(m: Module) = m.ports.map(p => p.name -> (p.direction, p.tpe.serialize.replace(" ", ""))).toMap
     require(abi(expected) == abi(native), s"$name wrapper port ABI differs")
     require(selected(s"$name.input.fir", module).ports.map(p => p.copy(info = NoInfo)) ==
@@ -129,13 +133,24 @@ object RAMModelAdapterCompare extends App {
         s"$name wrapper retained target storage or FAME state")
       connects.map { case (lhs, rhs) => identity(lhs) -> canonical(rhs) }
     }
+    // Materialized timing priority is indexed. Require the same logical
+    // address-to-index binding in these combined probes, in addition to the
+    // adapter-only comparison that permits SFC's annotation-set permutations.
+    if (boundary == "post-ram-model") {
+      def priorities(m: Module) = statements(m.body).collect {
+        case Connect(_, lhs, rhs) if lhs.serialize.matches(
+            "model.channels.(read|write)_cmds\\[\\d+\\].bits.addr") =>
+          lhs.serialize -> rhs.serialize
+      }.toMap
+      require(priorities(native) == priorities(expected), s"$name combined command priority differs")
+    }
     val actual = equations(native); val reference = equations(expected)
     for ((key, value) <- reference)
       require(actual.get(key).contains(value), s"$name/$key: ${actual.get(key)} != $value")
     require(actual.keySet == reference.keySet, s"$name unexpected adapter connections")
     val inputAnnotations = JsonProtocol.deserialize(read(s"$name.input.json"))
-    val nativeAnnotations = JsonProtocol.deserialize(read(s"$name-native/post-ram-adapter-all.json"))
+    val nativeAnnotations = JsonProtocol.deserialize(read(s"$name-native/$boundary-all.json"))
     require(nativeAnnotations == inputAnnotations, s"$name retained annotations changed")
-    println(s"PASS $name: ${reference.size} command/response/ready/valid/host/reset-token equations, port ABI and all retained annotations")
+    println(s"PASS $name: ${reference.size} command/response/ready/valid/host/reset-token equations, port ABI and ${inputAnnotations.size} retained annotations")
   }
 }

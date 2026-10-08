@@ -52,6 +52,8 @@ object AsyncRAMModelOracle extends App {
 object AsyncRAMModelCompare extends App {
   import AsyncRAMModelFiles._
   val directory = new java.io.File(args(0))
+  val materialized = args.lift(1).contains("--materialized")
+  val boundary = if (materialized) "post-ram-model" else "post-async-ram"
   def statements(s: Statement): Seq[Statement] = {
     val out = mutable.ArrayBuffer[Statement]()
     def visit(v: Statement): Unit = { out += v; v.foreachStmt(visit) }
@@ -125,13 +127,16 @@ object AsyncRAMModelCompare extends App {
       (values, next, write, ref("data.read_data_async.addr").toInt)
     }
   }
-  for (name <- Seq("golden-rocket", "aggregate", "multiport")) {
+  for (name <- (if (materialized) Seq("golden-rocket", "aggregate") else
+      Seq("golden-rocket", "aggregate", "multiport"))) {
     val reference = new Machine(selected(new java.io.File(directory, s"$name.expected.fir")))
-    val native = new Machine(selected(new java.io.File(directory, s"$name-native/post-async-ram.fir")))
+    val native = new Machine(selected(new java.io.File(directory, s"$name-native/$boundary.fir")))
     require(reference.abi == native.abi && reference.regs == native.regs, s"$name ABI/registers differ")
     require(reference.memory.copy(info = NoInfo) == native.memory.copy(info = NoInfo), s"$name memory differs")
-    require(read(new java.io.File(directory, s"$name-native/post-async-ram-all.json")).trim == "[]",
-      "emitter changed annotations")
+    val actualAnnotations = JsonProtocol.deserialize(read(new java.io.File(directory,
+      s"$name-native/$boundary-all.json")))
+    val inputAnnotations = JsonProtocol.deserialize(read(new java.io.File(directory, s"$name.input.json")))
+    require(actualAnnotations == inputAnnotations, "emitter changed annotations")
     val random = new scala.util.Random(0x55L)
     def values(widths: Map[String, Int]) = widths.map { case (n, w) => n -> BigInt(w, random) }
     var state = values(reference.regs)

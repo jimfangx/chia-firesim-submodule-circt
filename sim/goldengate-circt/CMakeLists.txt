@@ -190,6 +190,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-async-ram-model COMMAND goldengate-async-ram-model-test)
   add_executable(goldengate-ram-model-adapter-test
     test/Transforms/RAMModelAdapterTest.cpp lib/Transforms/RAMModelAdapter.cpp
+    lib/Transforms/AsyncRAMModel.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-ram-model-adapter-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-ram-model-adapter-test PRIVATE -fno-rtti)

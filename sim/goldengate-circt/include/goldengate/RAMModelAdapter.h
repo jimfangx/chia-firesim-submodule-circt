@@ -21,4 +21,12 @@ mlir::LogicalResult wrapRAMModel(
     circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp wrapper,
     circt::firrtl::FModuleOp implementation, RAMModelParameters &parameters,
     std::string &error);
+// Complete selected-wrapper EmitAndWrapRAMModels boundary. Resolve the channel
+// ABI, allocate a unique RamModel, emit its native async timing operations, and
+// replace the wrapper body. No elaborated host declaration/body is required.
+// Returns the created implementation; all failures leave the circuit unchanged.
+mlir::LogicalResult materializeRAMModel(
+    circt::firrtl::CircuitOp circuit, circt::firrtl::FModuleOp wrapper,
+    circt::firrtl::FModuleOp &implementation, RAMModelParameters &parameters,
+    std::string &error);
 }

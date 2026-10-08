@@ -678,18 +678,86 @@ java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMMod
   "$iteration54_evidence" "$evidence"
 ```
 
+## Native RAM module materialization (iteration 56)
+
+`--materialize-ram-model wrapper` completes the selected post-FAME
+`EmitAndWrapRAMModels` boundary without any supplied host declaration or Chisel
+body. The shared adapter analysis resolves retained memory annotations to typed
+channel ports and derives address/data widths and distinct read/write commands.
+CIRCT creates the complete `clock`, `reset`, `RegfileModelIO` ABI, emits the
+native async timing model, and replaces the selected wrapper with the verified
+adapter. Host names use the circuit namespace, including external modules;
+each materialization owns separate storage. Annotation records, wrapper ports,
+module metadata and other module bodies are preserved.
+
+The host is owned temporarily until both body emissions succeed. Unsupported
+widths or wrapper-body identities fail without leaving a new host or replacing
+any wrapper operations. The adapter now also rejects attached body annotations
+and hierarchical targets through erased body instances, while preserving local
+and hierarchical references to surviving wrapper ports. The expanded C++ test
+passes host-free creation, internal/external name collisions, repeated creation
+with independent storage, unchanged other modules and fifteen atomic rejections.
+
+The fresh Scala oracle uses production `EmitAndWrapRAMModels` on the same
+Rocket register-file boundary derived from the immutable compiler artifact:
+
+```
+/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir
+```
+
+`Rocket.rf` is `UInt<64>[31]` with two reads and one write. Its resolved five-bit
+address interface produces a depth-32 host RAM in both compilers. The native
+candidate receives the native post-FAME wrapper and retained annotation stream,
+with no `RamModel` module in its input. Its 29 adapter equations match the fresh
+SFC boundary by bound address identity, its wrapper ABI is preserved, and all
+1,249 annotations match exactly. A duplicate-annotation aggregate case with
+one read and two writes likewise matches 23 equations and all six annotations.
+Both combined probes also match the indexed address-to-command bindings, so
+their host priority order agrees with SFC.
+The exported native host operations pass 20,000 differential transitions per
+shape against SFC, including arbitrary complete states, stateful memory updates,
+backpressure, host reset and target reset: 40,000 transitions total. Every
+output, register D, read address and enabled write matches. Both complete
+candidate hierarchies lower through CIRCT `firtool` to SystemVerilog, including
+native `RamModel`, wrapper instances and `data_32x64` / `data_8x17` storage.
+Reingestion removes only the pinned exporter's unsupported FIRRTL-1.2 `public`
+keyword, as described in iteration 55.
+
+The compiler and focused unit test build, and 41 SRAM/FAME CTests pass. Mutable
+evidence is in `iteration56-ram-materialization/` under the U250 generated
+source directory: host-free `*.input.fir/json`, fresh `*.expected.fir`,
+`*-native/post-ram-model.fir`, `post-ram-model-all.json`, `rtl/`,
+`adapter-comparison.log`, `timing-comparison.log`, `unit.log` and `ctest.log`.
+The supplied iteration-55 CIRCT replacertl and required Verilator regression
+gates pass; manager verification of this new optional boundary is harness-owned.
+
+After sourcing the FireSim environment and compiling both Scala oracle files:
+
+```sh
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.RAMModelAdapterOracle \
+  "$evidence" "$iteration53_evidence" --native-host
+"$native_compiler" "$evidence/golden-rocket.input.fir" \
+  --annotation-file "$evidence/golden-rocket.input.json" \
+  --output-dir "$evidence/golden-rocket-native" --materialize-ram-model rf
+"$native_compiler" "$evidence/aggregate.input.fir" \
+  --annotation-file "$evidence/aggregate.input.json" \
+  --output-dir "$evidence/aggregate-native" --materialize-ram-model Aggregate
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.RAMModelAdapterCompare \
+  "$evidence" --materialized
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" midas.passes.fame.AsyncRAMModelCompare \
+  "$evidence" --materialized
+```
+
 ## Remaining scope
 
 Shared SRAM definitions now have native FAME data/clock hardware with distinct
-instance bindings, native transport for complete scalar parent graphs, a
-native command/response adapter, and native async host timing-model hardware.
+instance bindings, native transport for complete scalar parent graphs, and
+native host-module creation, command/response adapters and async timing hardware.
 Optional memory selection is still absent from the default FireSim build.
-The adapter currently requires a supplied host module declaration; selecting
-the optional path must create that ABI and invoke native body emission instead
-of elaborating the Scala timing model. SRAM generated-clock collateral also
-needs integration. Legacy retained domain-clock annotations have the same
-erased top-clock references as SFC after FAME; later consumers must use captured
-domain identity rather than resolve those as surviving ports. The next smallest
-step is native host-module creation from the adapter's resolved parameters,
-followed by the selected-memory end-to-end boundary and generated-clock
-collateral comparison before enabling optional selection in the default flow.
+SRAM generated-clock collateral also needs integration. Legacy retained
+domain-clock annotations have the same erased top-clock references as SFC after
+FAME; later consumers must use captured domain identity rather than resolve
+those as surviving ports. The next smallest step is the selected-memory
+end-to-end boundary and generated-clock collateral comparison, followed by
+optional selection in the FireSim compiler pipeline. FAME-5 and wider memory
+shapes remain separate incomplete work.
