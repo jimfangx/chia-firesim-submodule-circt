@@ -38,7 +38,9 @@ void collectGroundTargets(FIRRTLBaseType type, FModuleLike module,
     for (unsigned i = 0; i < vector.getNumElements(); ++i)
       collectGroundTargets(vector.getElementType(), module, port, declaration,
                            fieldID + vector.getFieldID(i), targets);
-  } else {
+  } else if (type.getBitWidthOrSentinel() != 0) {
+    // SFC RemoveZeroWidth deletes these references before DestructTypes.
+    // Fanout annotations therefore expand only to surviving ground leaves.
     targets.push_back({module, port, declaration, fieldID, {}});
   }
 }
@@ -118,6 +120,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     SmallVector<GroundTarget> targets;
     bool channelInfo;
     bool legacyComponent = false;
+    bool exact = false;
   };
   SmallVector<SmallVector<TargetPlan>> replacements(raw.size());
   auto isHostSignal = [](Annotation annotation) {
@@ -174,6 +177,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
                           std::optional<unsigned> element = std::nullopt,
                           bool channelInfo = false) -> LogicalResult {
       TargetPlan plan{member, element, {}, channelInfo};
+      plan.exact = exact;
       // Debug annotations use SFC ComponentName, serialized as
       // circuit.module.component. Resolve that local identity through CIRCT
       // field IDs, then retain its original JSON representation on each leaf.
@@ -227,6 +231,14 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
           return failure();
         }
         return success();
+      }
+      // RTRenamer.exact requires one surviving reference. An explicitly
+      // zero-width endpoint has no rename after SFC RemoveZeroWidth. Reject it
+      // before attaching symbols or changing IR, just like an aggregate endpoint.
+      if (exact && plan.targets.empty()) {
+        error = kind.str() + " " + member.str() +
+                " selects a zero-width value: " + spelling.getValue().str();
+        return failure();
       }
       replacements[index].push_back(std::move(plan));
       return success();
@@ -391,6 +403,29 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
 
   uniquifyLoweredNames(circuit);
   circt::hw::InnerSymbolTableCollection tables;
+  // Width inference can also discover a zero-width leaf. Resolve its final
+  // CIRCT type through the same identity used for renaming, so it obeys the
+  // deletion rule even when the input width was not known during preflight.
+  for (auto &annotationPlan : replacements) {
+    for (auto &plan : annotationPlan) {
+      llvm::erase_if(plan.targets, [&](GroundTarget target) {
+        auto lowered = tables.getInnerSymbolTable(target.module).lookup(target.symbol);
+        if (!lowered || lowered.getField() != 0)
+          return false; // The identity diagnostic below handles this case.
+        auto type = lowered.isPort()
+            ? target.module.getPortType(lowered.getPort())
+            : cast<circt::hw::InnerSymbolOpInterface>(lowered.getOp())
+                  .getTargetResult().getType();
+        auto base = dyn_cast<FIRRTLBaseType>(type);
+        return base && base.getBitWidthOrSentinel() == 0;
+      });
+      if (plan.exact && plan.targets.empty()) {
+        error = "LowerTypes " + plan.member.str() +
+                " selects an inferred zero-width value";
+        return failure();
+      }
+    }
+  }
   SmallVector<Attribute> rewritten;
   rewritten.reserve(raw.size());
   // Scala LowForm coalesces identical SingleTargetAnnotation leaves, including

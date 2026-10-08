@@ -924,12 +924,136 @@ void debugTargets(MLIRContext &context, bool internal, bool legacy, StringRef ou
     require(!ec, "cannot write FPGA debug fixture: " + ec.message()); root->print(file);
   }
 }
+// SFC RemoveZeroWidth drops fanout leaves and makes exact renames fail.
+void zeroWidthTargets(MLIRContext &context) {
+  const char *fixture = R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top(in %clock: !firrtl.clock,
+                        in %io: !firrtl.bundle<pad: uint<0>, signed: sint<0>, valid: uint<1>>,
+                        in %empty: !firrtl.bundle<pad: uint<0>, signed: sint<0>>) {
+        %alias = firrtl.node %io : !firrtl.bundle<pad: uint<0>, signed: sint<0>, valid: uint<1>>
+        %wire = firrtl.wire : !firrtl.bundle<pad: uint<0>, signed: sint<0>, valid: uint<1>>
+        firrtl.strictconnect %wire, %io : !firrtl.bundle<pad: uint<0>, signed: sint<0>, valid: uint<1>>
+        %state = firrtl.reg %clock : !firrtl.clock, !firrtl.bundle<pad: uint<0>, signed: sint<0>, valid: uint<1>>
+        firrtl.strictconnect %state, %io : !firrtl.bundle<pad: uint<0>, signed: sint<0>, valid: uint<1>>
+        %pad = firrtl.subfield %io[pad] : !firrtl.bundle<pad: uint<0>, signed: sint<0>, valid: uint<1>>
+        %inferred = firrtl.wire : !firrtl.uint
+        firrtl.connect %inferred, %pad : !firrtl.uint, !firrtl.uint<0>
+      }
+    }
+  })mlir";
+  using A = goldengate::AnnotationClasses;
+  OpBuilder b(&context);
+  auto single = [&](StringRef klass, StringRef target) {
+    return b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(klass)),
+        b.getNamedAttr("target", b.getStringAttr("~Top|Top>" + target.str()))});
+  };
+  SmallVector<Attribute> fanout, expected;
+  for (StringRef klass : {A::DontTouch, A::HostReset, A::HostClockSource,
+                         A::GlobalResetSink, A::FpgaDebug}) {
+    for (StringRef name : {"io", "alias", "wire", "state"}) {
+      fanout.push_back(single(klass, name));
+      fanout.push_back(single(klass, name.str() + ".pad"));
+      fanout.push_back(single(klass, name.str() + ".signed"));
+      expected.push_back(single(klass, name.str() + "_valid"));
+    }
+    fanout.push_back(single(klass, "empty"));
+    fanout.push_back(single(klass, "inferred"));
+  }
+  auto root = parseSourceString<ModuleOp>(fixture, &context);
+  require(bool(root), "zero-width fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(fanout));
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)) && circuit->getAttr("rawAnnotations") == b.getArrayAttr(expected),
+          "zero-width fanout annotations differ from SFC deletion semantics");
+  auto before = dump(*root);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)) &&
+          dump(*root) == before, "zero-width fanout is not idempotent");
+  SmallVector<DictionaryAttr> exact;
+  auto ref = b.getStringAttr("~Top|Top>io.pad");
+  auto valid = b.getStringAttr("~Top|Top>io.valid");
+  for (StringRef member : {"ports", "clockPort"}) {
+    NamedAttrList attrs;
+    attrs.set("class", b.getStringAttr(A::ChannelPorts));
+    attrs.set("localName", b.getStringAttr("payload"));
+    attrs.set("ports", b.getArrayAttr({valid}));
+    attrs.set(member, member == "ports" ? Attribute(b.getArrayAttr({valid, ref})) : Attribute(ref));
+    exact.push_back(attrs.getDictionary(&context));
+  }
+  for (StringRef member : {"clock", "sources", "sinks", "readySink", "validSource", "readySource", "validSink"}) {
+    NamedAttrList info, attrs;
+    info.set("class", b.getStringAttr(A::DecoupledForwardChannel));
+    attrs.set("class", b.getStringAttr(A::ChannelConnection));
+    attrs.set("globalName", b.getStringAttr("payload"));
+    if (member == "clock") attrs.set(member, ref);
+    else if (member == "sources" || member == "sinks") attrs.set(member, b.getArrayAttr({valid, ref}));
+    else info.set(member, ref);
+    attrs.set("channelInfo", info.getDictionary(&context));
+    exact.push_back(attrs.getDictionary(&context));
+  }
+  for (StringRef klass : {A::AutoCounter, A::TriggerSource, A::TriggerSink})
+    for (StringRef member : {"target", "clock", "reset"}) {
+      if (klass == A::TriggerSink && member == "reset") continue;
+      NamedAttrList attrs(single(klass, "io.valid")); attrs.set(member, ref);
+      exact.push_back(attrs.getDictionary(&context));
+    }
+  for (auto bad : exact) {
+    for (StringRef target : {"io.pad", "alias.signed", "wire.pad", "state.signed"}) {
+      // Replace every occurrence of the invalid reference, including nested info.
+      NamedAttrList attrs(bad);
+      for (auto attr : bad) {
+        auto replacement = b.getStringAttr("~Top|Top>" + target.str());
+        if (attr.getValue() == ref) attrs.set(attr.getName(), replacement);
+        if (auto array = dyn_cast<ArrayAttr>(attr.getValue())) {
+          SmallVector<Attribute> values(array.begin(), array.end());
+          for (auto &value : values) if (value == ref) value = replacement;
+          attrs.set(attr.getName(), b.getArrayAttr(values));
+        }
+        if (auto dict = dyn_cast<DictionaryAttr>(attr.getValue())) {
+          NamedAttrList nested(dict);
+          for (auto field : dict) if (field.getValue() == ref) nested.set(field.getName(), replacement);
+          attrs.set(attr.getName(), nested.getDictionary(&context));
+        }
+      }
+      auto invalid = parseSourceString<ModuleOp>(fixture, &context);
+      auto owner = *invalid->getOps<CircuitOp>().begin();
+      owner->setAttr("rawAnnotations", b.getArrayAttr({fanout.front(), attrs.getDictionary(&context)}));
+      before = dump(*invalid); error.clear();
+      require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
+              error.find("zero-width") != std::string::npos && dump(*invalid) == before,
+              "explicit zero-width exact target did not reject atomically");
+    }
+  }
+  // An unknown input width must be checked after InferWidths, with raw
+  // annotations unpublished and every temporary identity cleaned on failure.
+  auto invalid = parseSourceString<ModuleOp>(fixture, &context);
+  auto owner = *invalid->getOps<CircuitOp>().begin();
+  NamedAttrList inferred(exact.front());
+  inferred.set("ports", b.getArrayAttr({valid, b.getStringAttr("~Top|Top>inferred")}));
+  auto raw = b.getArrayAttr({fanout.front(), inferred.getDictionary(&context)});
+  owner->setAttr("rawAnnotations", raw); error.clear();
+  require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid, owner, error)) &&
+          error.find("inferred zero-width") != std::string::npos &&
+          owner->getAttr("rawAnnotations") == raw && succeeded(verify(*invalid)),
+          "inferred zero-width exact target accepted or published annotations");
+  auto noTemporarySymbols = [](CircuitOp c) {
+    for (auto module : c.getOps<FModuleLike>())
+      circt::hw::InnerSymbolTable::walkSymbols(module, [&](StringAttr, circt::hw::InnerSymTarget) {
+        require(false, "zero-width lowering leaked temporary inner symbols");
+      });
+  };
+  noTemporarySymbols(circuit); noTemporarySymbols(owner);
+  llvm::outs() << "Zero-width fanout leaves deleted for five annotation classes; inferred zeros deleted; 68 exact endpoint cases reject atomically; inferred exact endpoint rejects without publishing annotations or leaking symbols\n";
+}
 } // namespace
 int main(int argc, char **argv) {
   MLIRContext context;
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
     run(context);
+    zeroWidthTargets(context);
     for (bool internal : {false, true})
       for (bool legacy : {false, true}) {
         std::string name = internal ? "internal" : "public";

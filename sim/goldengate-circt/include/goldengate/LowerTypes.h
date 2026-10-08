@@ -9,8 +9,8 @@ namespace goldengate {
 enum class RetainedTargetScope { All, FpgaDebugOnly };
 // Requires: imported FIRRTL with rawAnnotations and resolvable local selectors.
 // Consumes: DontTouch/host/global reset signal/FPGA debug references to empty
-// aggregates; temporary leaf identities and identical expanded signal/debug
-// annotations.
+// aggregates and zero-width leaves; temporary leaf identities and identical
+// expanded signal/debug annotations.
 // Produces: ground DontTouch/FAME host clock/reset and HostClockSource/Sink
 // targets; public/internal FPGA debug ComponentName leaves (preserving legacy
 // JSON spelling when supplied); public/internal GlobalResetCondition source
@@ -21,6 +21,8 @@ enum class RetainedTargetScope { All, FpgaDebugOnly };
 // references in original order, including
 // DecoupledForwardChannel optional nested ready/valid references, and exact
 // FAMEChannelPortsAnnotation optional clockPort and ordered ports references.
+// Exact zero-width references reject, matching SFC RTRenamer after RemoveZeroWidth.
+// Fanout annotations omit zero-width leaves, including widths inferred as zero.
 // Mutates: resolves CHIRRTL, infers widths/resets, lowers aggregates, uniquifies
 // declaration names, synchronizes instance ports, and transfers retained targets.
 // Requires analyses: FIRRTL subtype/field IDs and CIRCT inner symbol namespaces.
