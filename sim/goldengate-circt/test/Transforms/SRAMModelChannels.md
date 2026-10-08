@@ -868,6 +868,45 @@ Use the iteration-57 commands above with this directory; additionally invoke
 `--rewrite-sram-models` on `grouped-rocket.input.fir/json`. The updated oracle
 and comparator include that probe automatically.
 
+## Iteration 59: ready/valid parent transport
+
+The optional parent/SRAM boundary now constructs native ReadyValidChannel
+operations after the pipe wrapper and before clock normalization/activation.
+Forward target-valid and reverse target-ready remain distinct from the host
+token handshakes. Pair payload normalization and retained endpoint transfers
+use the same native implementation as the baseline FireSim compiler. Internal
+SRAM command/response channels retain their pipe transports. Unpaired boundary
+names fail on the staged circuit without publishing a partial timing model.
+
+Fresh SFC preparation reads the immutable compiler artifact
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`.
+Its Rocket inputs match the previously recorded preparation. A mutable
+annotation copy groups actual `io_dmem_req` leaves into an outgoing pair and
+`io_imem_resp` leaves into an incoming pair. The unchanged production SFC
+preparation, FAME, RAM replacement, SimWrapper and WriteXDCFile generate the
+independent reference; no Scala transform compiles native candidate hardware.
+
+The candidate matches 40 flattened SimWrapper port direction/type contracts,
+all 32 wrapper handshake/clock/reset bindings, 974 parent FAME control equations,
+generated FAME register contracts, all 1,175 retained annotation records, the
+29 RAM adapter equations and both XDC files. Wrapper payload identities are
+compared after undoing the separately verified SimWrapper payload nesting.
+SFC's hash-based read-port collection changes read-lane order for this probe;
+the comparator requires a bijection by address-channel identity and transfers
+the same permutation to both command and response equations. It does not
+discard either half of a lane or compare only unordered port widths.
+
+The complete Rocket candidate lowers through pinned CIRCT firtool to split
+SystemVerilog. Focused CTests cover mixed signed/unsigned pair payloads in both
+orientations, preserved internal pipe multiplicity, and atomic unpaired-name
+rejection, alongside the existing ready/valid queue behavior tests. Evidence
+is in the mutable U250 generated directory's `iteration59-sram-ready-valid/`:
+`oracle-fresh/`, `oracle/ready-valid-rocket.wrapper.sfc.fir`, independent
+`ready-valid-rocket.expected.fir/json`, corresponding `ready-valid-rocket-native/`
+including `rtl/`, `comparison-final.log`, `ctest-final.log` and build logs.
+The iteration-58 scalar/grouped and shared-memory comparisons still pass.
+FireSim manager verification remains owned by the harness.
+
 ## Remaining scope
 
 Shared SRAM definitions now have a combined native FAME, transport, timing-model
@@ -875,7 +914,8 @@ and generated-clock collateral boundary. Optional memory selection is still
 absent from the default FireSim build, and full selected-memory Rocket runtime
 verification remains pending. Legacy retained domain-clock annotations have
 the same erased top-clock references as SFC after FAME; later consumers must
-use captured domain identity. The next smallest step is ready/valid parent
-channel transport, needed before optional selection through the full FireSim
-compiler pipeline can let the harness exercise selected-memory Rocket RTL.
+use captured domain identity. The next smallest step is optional SRAM selection
+through the full FireSim compiler pipeline, followed by harness verification of
+selected-memory Rocket RTL. Ready/valid top passthroughs and inter-model
+ready/valid endpoints remain unsupported at this optional boundary.
 Readwrite/wider memory shapes and FAME-5 remain separate incomplete work.

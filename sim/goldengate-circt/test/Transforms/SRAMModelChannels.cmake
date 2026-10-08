@@ -537,6 +537,78 @@ if(NOT grouped_paths EQUAL 1)
 endif()
 message(STATUS "Passed ordered mixed-width parent channels, token pipes and field metadata")
 
+# Use the same selected SRAM hierarchy with forward target-valid and reverse
+# target-ready tokens in both bridge directions. The wrapper must replace each
+# pair with one ReadyValidChannel, keeping all internal SRAM command pipes.
+string(REPLACE "    input request_addr : UInt<2>"
+  "    input request_valid : UInt<1>\n    output request_ready : UInt<1>\n    output reply_valid : UInt<1>\n    input reply_ready : UInt<1>\n    input request_addr : UInt<2>" rv_fir "${grouped_fir}")
+string(REPLACE "    Top.request_addr <= request_addr"
+  "    Top.request_valid <= request_valid\n    request_ready <= Top.request_ready\n    reply_valid <= Top.reply_valid\n    Top.reply_ready <= reply_ready\n    Top.request_addr <= request_addr" rv_fir "${rv_fir}")
+string(REPLACE "    external_clock <= clock"
+  "    request_ready <= not(reply_ready)\n    reply_valid <= not(request_valid)\n    external_clock <= clock" rv_fir "${rv_fir}")
+set(rv_annos "${timing_annos}")
+string(JSON rv_count LENGTH "${rv_annos}")
+foreach(direction request reply)
+  if(direction STREQUAL "request")
+    set(endpoint sinks)
+    set(reverse_endpoint sources)
+    set(valid_field validSink)
+    set(ready_field readySource)
+  else()
+    set(endpoint sources)
+    set(reverse_endpoint sinks)
+    set(valid_field validSource)
+    set(ready_field readySink)
+  endif()
+  string(JSON rv_annos SET "${rv_annos}" ${rv_count}
+    "{\"class\":\"midas.passes.fame.FAMEChannelConnectionAnnotation\",\"globalName\":\"${direction}_fwd\",\"channelInfo\":{\"class\":\"midas.passes.fame.DecoupledForwardChannel\",\"${valid_field}\":\"~FAMETop|FAMETop>${direction}_valid\",\"${ready_field}\":\"~FAMETop|FAMETop>${direction}_ready\"},\"clock\":\"~FAMETop|FAMETop>external_clock\",\"${endpoint}\":[\"~FAMETop|FAMETop>${direction}_data\",\"~FAMETop|FAMETop>${direction}_addr\",\"~FAMETop|FAMETop>${direction}_valid\"]}")
+  math(EXPR rv_count "${rv_count} + 1")
+  string(JSON rv_annos SET "${rv_annos}" ${rv_count}
+    "{\"class\":\"midas.passes.fame.FAMEChannelConnectionAnnotation\",\"globalName\":\"${direction}_rev\",\"channelInfo\":{\"class\":\"midas.passes.fame.DecoupledReverseChannel$\"},\"clock\":\"~FAMETop|FAMETop>external_clock\",\"${reverse_endpoint}\":[\"~FAMETop|FAMETop>${direction}_ready\"]}")
+  math(EXPR rv_count "${rv_count} + 1")
+endforeach()
+file(WRITE "${OUTPUT}/ready-valid-parent.fir" "${rv_fir}")
+file(WRITE "${OUTPUT}/ready-valid-parent.json" "${rv_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/ready-valid-parent.fir"
+  --annotation-file "${OUTPUT}/ready-valid-parent.json"
+  --output-dir "${OUTPUT}/ready-valid-parent" --rewrite-sram-models
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Ready/valid parent SRAM transport failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/ready-valid-parent/post-sram-models.fir" rv_output)
+string(REGEX MATCHALL "inst ReadyValidChannel_[^\n]* of GGFAMEReadyValid10" rv_channels "${rv_output}")
+list(LENGTH rv_channels rv_channel_count)
+string(REGEX MATCHALL "inst PipeChannel_[^\n]* of GGFAMEPipe" rv_pipes "${rv_output}")
+list(LENGTH rv_pipes rv_pipe_count)
+if(NOT rv_channel_count EQUAL 2 OR NOT rv_pipe_count EQUAL timing_queue_count)
+  message(FATAL_ERROR "Ready/valid pair or SRAM pipe multiplicity differs: ${rv_channel_count}/${rv_pipe_count}")
+endif()
+foreach(direction request reply)
+  if(direction STREQUAL "request")
+    set(suffix sink)
+  else()
+    set(suffix source)
+  endif()
+  string(FIND "${rv_output}" "${direction}_fwd_${suffix} : { flip ready : UInt<1>, valid : UInt<1>, bits : { valid : UInt<1>, bits : { data : SInt<8>, addr : UInt<2> } } }" normalized_payload)
+  if(normalized_payload LESS 0)
+    message(FATAL_ERROR "Ready/valid wrapper lost target-valid or mixed signed payload")
+  endif()
+endforeach()
+# A reverse token with an unmatched pair name is not a valid handshake pair. The
+# complete clone must fail without publishing a partial timing-model circuit.
+string(REPLACE "\"globalName\" : \"reply_rev\"" "\"globalName\" : \"unpaired_rev\"" unpaired_annos "${rv_annos}")
+file(WRITE "${OUTPUT}/ready-valid-unpaired.json" "${unpaired_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/ready-valid-parent.fir"
+  --annotation-file "${OUTPUT}/ready-valid-unpaired.json"
+  --output-dir "${OUTPUT}/ready-valid-unpaired" --rewrite-sram-models
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "lacks a boundary handshake pair" OR
+   EXISTS "${OUTPUT}/ready-valid-unpaired/post-sram-models.fir")
+  message(FATAL_ERROR "Unpaired ready/valid transport published a partial SRAM candidate: ${stdout}\n${stderr}")
+endif()
+message(STATUS "Passed both parent ready/valid orientations and atomic unpaired rejection")
+
 # A target on any grouped leaf still needs a defined annotation transfer.
 math(EXPR grouped_count "${grouped_count} + 1")
 string(JSON grouped_annos SET "${grouped_annos}" ${grouped_count}

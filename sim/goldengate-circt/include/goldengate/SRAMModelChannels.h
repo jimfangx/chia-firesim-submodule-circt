@@ -48,15 +48,18 @@ mlir::LogicalResult rewriteSRAMFAME(
 mlir::LogicalResult rewriteSRAMParentFAME(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
 // Construct the parent clock hub and directly promoted SRAM FAME models, then
-// join PipeChannel endpoints with host-clocked queues. Requires one hub,
-// ground integer parent groups, scalar SRAM groups and complete model coverage;
-// no ready-valid pairs. Multiport parent payloads retain SFC field order and
+// join pipe endpoints and external ready/valid pairs with host-clocked queues.
+// Ready/valid transport follows native SimWrapper payload normalization and
+// keeps target-ready/target-valid separate from forward/reverse host tokens.
+// Requires one hub, ground integer parent groups, scalar SRAM groups, complete
+// model coverage and paired external ready/valid endpoints. Multiport parent
+// payloads retain SFC field order and
 // transfer each top/model target to its own Decoupled bits field.
 // Preserves retained inner endpoint/clock identities through wrapper activation.
 // Commits only a verified clone. Optional timing-model replacement is separate.
 mlir::LogicalResult rewriteSRAMPipeTransport(
     circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
-// Complete the optional prepared-memory boundary: parent/SRAM FAME, pipe
+// Complete the optional prepared-memory boundary: parent/SRAM FAME, channel
 // transport, native async RAM materialization and hierarchy-resolved XDC.
 // Requires the transport invariants, supported MemPortAnnotation ABIs, and
 // exactly one XDCPathToCircuitAnnotation. Commits a verified circuit clone;

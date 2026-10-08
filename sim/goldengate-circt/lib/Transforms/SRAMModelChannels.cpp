@@ -8,6 +8,7 @@
 #include "goldengate/FAMEClockEnable.h"
 #include "goldengate/FAMEClockChannel.h"
 #include "goldengate/FAMEPipeChannel.h"
+#include "goldengate/FAMEReadyValidChannel.h"
 #include "goldengate/FAMEInputChannel.h"
 #include "goldengate/FAMEOutputChannel.h"
 #include "goldengate/FAMEFiredState.h"
@@ -460,10 +461,6 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   std::optional<FAMETopChannelPort> clockPort;
   if (withParent) {
     for (const auto &channel : channels) {
-      if (channel.kind != ChannelKind::TargetClock && channel.kind != ChannelKind::Pipe) {
-        error = "SRAM transport requires pipe data channels";
-        return failure();
-      }
       if (channel.kind != ChannelKind::TargetClock) continue;
       if (hub) { error = "SRAM transport requires one clock hub"; return failure(); }
       auto bound = bindChannelToModels(channel, *hierarchy, groups, error);
@@ -782,9 +779,13 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   if (withParent) {
     rewriteSRAMTopPassthroughs(hierarchy->top, passthroughs);
     if (failed(removeFAMEStaleTopClocks(hierarchy->top, error))) return failure();
+    // SimWrapper keeps SRAM command pipes and ready/valid pairs as distinct
+    // transports. Normalize external pair payloads before wrapper activation
+    // transfers their retained targets and before any wrapper instantiation.
     if (withQueues && (failed(addRemainingFanoutAnnotations(circuit, error)) ||
         failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
         failed(addFAMEPipeWrapper(circuit, error)) ||
+        failed(addFAMEBoundaryReadyValidChannels(circuit, error)) ||
         failed(addFAMEClockChannel(circuit, error)) ||
         failed(activateFAMEPipeWrapper(circuit, error)))) return failure();
   }
