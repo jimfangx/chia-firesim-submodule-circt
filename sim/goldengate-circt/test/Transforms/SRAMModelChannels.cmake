@@ -58,6 +58,52 @@ if(NOT models EQUAL 2 OR NOT unique_models EQUAL models OR
 endif()
 message(STATUS "Passed SRAM fanout, four clock domains, and unique model/port annotations")
 
+# This boundary constructs hardware from the wrapped handoff itself; it does
+# not ingest an SFC FAME-transformed model. The shared definition is clocked
+# once, and all four promoted instances must receive host clock/reset ports.
+execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
+  --annotation-file "${FIXTURES}/SRAMModelChannels.json"
+  --output-dir "${OUTPUT}/virtual-clocks" --rewrite-sram-clocks
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM virtual clocks failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/virtual-clocks/post-sram-clocks.fir" clock_fir)
+string(REGEX MATCHALL "ram\\.hostClock <= hostClock" host_clocks "${clock_fir}")
+string(REGEX MATCHALL "ram\\.hostReset <= hostReset" host_resets "${clock_fir}")
+string(REGEX MATCHALL "ram\\.clk <=" stale_clocks "${clock_fir}")
+string(REGEX MATCHALL "\\.clk <= clk_buffer\\.O" memory_clocks "${clock_fir}")
+list(LENGTH host_clocks host_clock_count)
+list(LENGTH host_resets host_reset_count)
+list(LENGTH stale_clocks stale_clock_count)
+list(LENGTH memory_clocks memory_clock_count)
+string(FIND "${clock_fir}" "clk_enabled <= mux(targetCycleFinishing, UInt<1>(1), clk_enabled)" enable_next)
+if(NOT host_clock_count EQUAL 4 OR NOT host_reset_count EQUAL 4 OR
+   NOT stale_clock_count EQUAL 0 OR NOT memory_clock_count EQUAL 3 OR
+   enable_next LESS 0)
+  message(FATAL_ERROR "SRAM host/virtual clock wiring differs: clocks=${host_clock_count}, resets=${host_reset_count}, stale=${stale_clock_count}, memory=${memory_clock_count}, enable=${enable_next}")
+endif()
+file(READ "${OUTPUT}/virtual-clocks/post-sram-clocks-all.json" clock_annotations)
+if(NOT clock_annotations STREQUAL annotations)
+  message(FATAL_ERROR "Clock substep changed retained SRAM/data/channel annotations")
+endif()
+message(STATUS "Passed native SRAM virtual clock hardware on four promoted instances")
+
+# A clock target retained outside the local data groups has no deletion policy.
+# Do not silently remove that annotated clock while preserving a stale target.
+file(READ "${FIXTURES}/SRAMModelChannels.json" clock_seed)
+string(JSON clock_seed_count LENGTH "${clock_seed}")
+string(JSON clock_seed SET "${clock_seed}" ${clock_seed_count}
+  "{\"class\":\"firrtl.transforms.DontTouchAnnotation\",\"target\":\"~FAMETop|ram>clk\"}")
+file(WRITE "${OUTPUT}/protected-clock.json" "${clock_seed}")
+execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
+  --annotation-file "${OUTPUT}/protected-clock.json"
+  --output-dir "${OUTPUT}/protected-clock" --rewrite-sram-clocks
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "SRAM virtual clock has a retained annotation target")
+  message(FATAL_ERROR "Annotated SRAM clock was not rejected at the virtual-clock boundary: ${stdout}\n${stderr}")
+endif()
+
 # FAME operates on module definitions, so four RAM instances must have only
 # two local output dependency records. Read latency 1 breaks both data paths.
 file(READ "${OUTPUT}/post-sram-channel-dependencies.json" dependencies)

@@ -21,4 +21,11 @@ mlir::LogicalResult prepareSRAMModelChannels(
 std::optional<llvm::SmallVector<SRAMModelDependencies>>
 analyzeSRAMModelDependencies(circt::firrtl::CircuitOp circuit,
                              std::string &error);
+
+// Construct FAME's virtual clock hardware on the prepared SRAM definitions
+// and update every promoted instance. Data ports remain scalar, and the
+// finishing wire is reserved for the subsequent channel FSM rewrite.
+// Requires one target clock and no model-local channel clock associations.
+mlir::LogicalResult rewriteSRAMVirtualClocks(
+    circt::firrtl::CircuitOp circuit, unsigned &rewritten, std::string &error);
 }

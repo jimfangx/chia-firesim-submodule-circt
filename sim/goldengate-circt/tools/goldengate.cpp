@@ -216,6 +216,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--extract-sram-models";
   bool analyzeSRAMChannels =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-sram-channels";
+  bool rewriteSRAMClocks =
+      argc == 7 && llvm::StringRef(argv[6]) == "--rewrite-sram-clocks";
   bool extractModels = extractSRAMs ||
       (argc == 7 && llvm::StringRef(argv[6]) == "--extract-models");
   bool wrapTop = argc == 7 && llvm::StringRef(argv[6]) == "--wrap-top";
@@ -328,7 +330,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
+       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -347,7 +349,7 @@ int main(int argc, char **argv) {
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
-                    "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
+                    "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --rewrite-sram-clocks | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
                     "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
@@ -4239,7 +4241,7 @@ int main(int argc, char **argv) {
     return 0;
   };
 
-  if (analyzeSRAMChannels) {
+  if (analyzeSRAMChannels || rewriteSRAMClocks) {
     std::string error;
     unsigned wrapped = 0, promoted = 0;
     if (failed(goldengate::prepareSRAMModelChannels(
@@ -4264,9 +4266,17 @@ int main(int argc, char **argv) {
     llvm::raw_fd_ostream dependencyOut(dependencyPath, dependencyError);
     if (dependencyError) return fail("cannot write SRAM channel dependencies");
     dependencyOut << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(dependencies)));
+    unsigned clockModels = 0;
+    if (rewriteSRAMClocks &&
+        failed(goldengate::rewriteSRAMVirtualClocks(circuit, clockModels, error)))
+      return fail("SRAM virtual clocks: " + error);
+    if (failed(mlir::verify(*module)))
+      return fail("SRAM clock/channel boundary produced invalid FIRRTL IR");
     llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
-    llvm::sys::path::append(firPath, "post-sram-channels.fir");
-    llvm::sys::path::append(annotationPath, "post-sram-channels-all.json");
+    llvm::sys::path::append(firPath, rewriteSRAMClocks ? "post-sram-clocks.fir"
+                                                   : "post-sram-channels.fir");
+    llvm::sys::path::append(annotationPath, rewriteSRAMClocks ? "post-sram-clocks-all.json"
+                                                          : "post-sram-channels-all.json");
     std::error_code ec;
     llvm::raw_fd_ostream out(firPath, ec);
     // Keep this semantic comparison boundary readable by the pinned SFC
@@ -4280,6 +4290,9 @@ int main(int argc, char **argv) {
       return fail("cannot export SRAM channel annotations: " + error);
     llvm::outs() << "Prepared channels for " << wrapped << " SRAM wrappers after "
                  << promoted << " promotions in " << firPath << '\n';
+    if (rewriteSRAMClocks)
+      llvm::outs() << "Constructed virtual clock hardware for " << clockModels
+                   << " SRAM definitions and every promoted instance\n";
     return 0;
   }
 

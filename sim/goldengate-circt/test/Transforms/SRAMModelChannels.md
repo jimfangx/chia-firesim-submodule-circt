@@ -142,12 +142,64 @@ ctest --test-dir "$native_build" --output-on-failure \
   -R 'goldengate-(sram-model-channels|comb-dependency|fame-output-selection|fame-channel-clock-domains|extract-model|label-sram-models)$'
 ```
 
+## Virtual-clock hardware boundary (iteration 47)
+
+`--rewrite-sram-clocks` runs the native preparation/dependency boundary above,
+then constructs virtual-clock hardware on the SRAM definitions selected by
+their typed read/write/readwriter annotations. It adds host clock/reset to
+each definition and every promoted instance, creates a reset-zero enable
+register with `next = finishing ? 1 : enabled`, and connects the shared
+`AbstractClockGate` with `CE = enabled & finishing & ~hostReset`. Memory clocks
+use that gate's output. The original target-clock input and ancillary instance
+clock writes are removed. Scalar data ports and retained annotations stay
+unchanged. Models with explicit local clock channels/associations are rejected;
+retained annotations targeting the removed clock are also rejected.
+
+This is a partial FAME boundary: `targetCycleFinishing` is reserved for the
+subsequent data-channel/FSM rewrite and remains undriven here. This artifact
+is not a complete executable FAME model or a default-build SRAM implementation.
+
+`SRAMVirtualClocksOracle.scala` runs the unchanged `FAMEModuleTransformer` on
+the independent SFC-prepared models. It resolves reference types/kinds in the
+oracle first, as Midas does before clock substitution. The native candidate
+is only parsed. The comparison checks all eight enable/finishing/reset input
+combinations, register clock/reset/init, gate input, every reader/writer/
+readwriter clock, memory specification, scalar data ABI, and host clock/reset
+wiring on every promoted instance. Both the four-instance fanout model and
+the real Rocket `rf` model derived freshly from the immutable `.sfc.fir` above
+match. SFC emits no non-hub generated-clock XDC annotations. The native
+annotation output exactly matches its pre-clock preparation output.
+
+CTest additionally checks four host interfaces, removal of all ancillary
+SRAM instance clock writes, all three memory port clocks, constant-one
+virtual enable, unchanged annotations, and rejection of a protected clock.
+Seven focused tests pass. A direct native baseline through PrintBridge host
+binding passes; manager validation remains harness-owned.
+
+Artifacts are in the mutable U250 generated directory's
+`iteration47-sram-clocks/`: `oracle/golden-rocket.virtual-clock.sfc.fir/json`,
+`golden-rocket-clocks/post-sram-clocks.fir` and its annotation sidecar, fanout
+equivalents, `clock-comparison.log`, `ctest.log`, and baseline stdout/stderr.
+Compile `SRAMVirtualClocksOracle.scala` alongside the preparation oracle files
+above, then run:
+
+```sh
+for name in fanout golden-rocket; do
+  "$native_compiler" "$evidence/oracle/$name.channels-input.fir" \
+    --annotation-file "$evidence/oracle/$name.channels-input.json" \
+    --output-dir "$evidence/$name-clocks" --rewrite-sram-clocks
+done
+java -Xmx4G -cp "$oracle_classes:$midas_classpath" \
+  midas.passes.fame.SRAMVirtualClocksOracle "$evidence"
+ctest --test-dir "$native_build" --output-on-failure \
+  -R 'goldengate-(sram-model-channels|fame-virtual-clock-port|fame-clock-gate|fame-clock-gate-identity|fame-output-selection|comb-dependency|fame-channel-clock-domains)$'
+```
+
 ## Remaining scope
 
 This establishes the optional SRAM channel graph. It does not yet connect
-optional memory selection to the default FireSim build, perform FAME hardware
-rewriting on these promoted models, or emit the abstract RAM timing models.
-The next step is to construct the virtual clock and fired-state rules for one
-promoted SRAM model using this verified dependency graph. Repeated model
-instances still need instance-aware data-port rewriting; this boundary does
-not claim those hardware transformations or abstract RAM model emission.
+optional memory selection to the default FireSim build, finish FAME data-channel
+hardware rewriting on these promoted models, or emit abstract RAM timing models.
+The next step is to channelize the single Rocket SRAM model's data ports and
+construct its fired/ready/valid/finishing rules from the verified dependency
+graph. Repeated model instances still need instance-aware data-port rewriting.
