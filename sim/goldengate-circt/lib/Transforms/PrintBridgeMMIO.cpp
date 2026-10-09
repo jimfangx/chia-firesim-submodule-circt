@@ -22,6 +22,11 @@
 #include "goldengate/BlockDevWriteLatency.h"
 #include "goldengate/BlockDevReadLatency.h"
 #include "goldengate/BlockDevResponseScheduler.h"
+#include "goldengate/FASEDTokenEngine.h"
+#include "goldengate/FASEDHostOutstanding.h"
+#include "goldengate/FASEDIngressAWQueue.h"
+#include "goldengate/FASEDIngressWQueue.h"
+#include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
 #include "goldengate/TSIMMIOBank.h"
@@ -501,6 +506,73 @@ LogicalResult goldengate::mapPrintBridgeRocketBlockDev(CircuitOp circuit,
       failed(addBlockDevWriteLatency(*staged, error)) || failed(addBlockDevReadLatency(*staged, error)) ||
       failed(addBlockDevResponseScheduler(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print BlockDev produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires the completed expanded Print/BlockDev boundary and its live MMIO
+// allocation. Consumes FASED BridgeIO/channel endpoints via the native token
+// pass; produces completed host endpoints and explicit ingress/egress ports.
+// Mutates only new FIRRTL modules, raw annotation targets and circuit identity.
+// No cached analysis is preserved. Timing, host-memory and MMIO binding follow.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDIngress(CircuitOp circuit,
+                                                        std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGBlockDevResponseSchedulerWrapper")
+    return reject("Rocket Print FASED ingress requires the completed BlockDev boundary");
+  auto find = [](CircuitOp c, StringRef name) -> FModuleOp {
+    for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
+    return {};
+  };
+  auto bound = find(circuit, "GGPrintBridgeHostWrapper");
+  auto decoder = find(circuit, "GGControlAddressDecode");
+  auto hosts = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
+  auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
+  if (!hosts || hosts.empty() || !regions || regions.size() != hosts.size() + 11)
+    return reject("Rocket Print FASED ingress requires the expanded allocation");
+  SmallVector<FModuleOp> printHosts;
+  llvm::StringSet<> identities;
+  for (auto attr : hosts) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
+    auto symbol = row ? row.getAs<StringAttr>("hostModule") : StringAttr{};
+    auto host = symbol ? find(circuit, symbol.getValue()) : FModuleOp{};
+    if (!name || name.getValue() != "PrintBridgeModule_" + std::to_string(printHosts.size()) ||
+        !host || !identities.insert(host.getName()).second)
+      return reject("Rocket Print FASED ingress requires instantiated constructor order");
+    printHosts.push_back(host);
+  }
+  SmallVector<ControlMMIOWidget> widgets;
+  SmallVector<ControlMMIORegion> allocated;
+  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+    return failure();
+  if (allocated.size() != regions.size()) return reject("Rocket Print FASED ingress allocation count differs");
+  for (auto [i, region] : llvm::enumerate(allocated)) {
+    auto row = dyn_cast<DictionaryAttr>(regions[i]);
+    auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr{};
+    auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr{};
+    auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr{};
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    if (!name || name.getValue() != region.name || !start || !size || !slave ||
+        start.getValue().getBitWidth() > 64 || size.getValue().getBitWidth() > 64 ||
+        slave.getValue().getBitWidth() > 64 || start.getInt() != int64_t(region.start) ||
+        size.getInt() != int64_t(region.size) || slave.getInt() != int64_t(i))
+      return reject("Rocket Print FASED ingress region differs from the live register allocation");
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDTokenEngine(*staged, error)) ||
+      failed(addFASEDHostOutstanding(*staged, error)) ||
+      failed(addFASEDIngressAWQueue(*staged, error)) ||
+      failed(addFASEDIngressWQueue(*staged, error)) ||
+      failed(addFASEDIngressARQueue(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED ingress produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

@@ -842,6 +842,94 @@ void rocketBlockDev(Fixture &f, StringRef output, bool reverse, unsigned &reject
   }
 }
 
+void rocketFASEDIngress(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  llvm::StringSet<> channelNames, tokenPorts;
+  for (auto attr : raw) {
+    auto row = cast<DictionaryAttr>(attr); auto widget = row.getAs<StringAttr>("widgetClass");
+    if (widget && widget.getValue() == "midas.models.FASEDMemoryTimingModel")
+      for (auto field : row.getAs<DictionaryAttr>("channelMapping"))
+        channelNames.insert(cast<StringAttr>(field.getValue()).getValue());
+  }
+  for (auto attr : raw) {
+    auto row = cast<DictionaryAttr>(attr); auto name = row.getAs<StringAttr>("globalName");
+    if (!name || !channelNames.count(name.getValue())) continue;
+    auto endpoints = row.getAs<ArrayAttr>("sources");
+    if (!endpoints || endpoints.empty()) endpoints = row.getAs<ArrayAttr>("sinks");
+    for (auto target : endpoints) {
+      auto ref = cast<StringAttr>(target).getValue();
+      tokenPorts.insert(ref.drop_front(ref.find('>') + 1).split('.').first);
+    }
+  }
+  require(channelNames.size() == 11 && tokenPorts.size() == 11, "FASED input channel catalog differs");
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    FModuleOp collision;
+    if (bad < 3) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      const StringRef names[]{"GGFASEDTokenEngine", "GGFASEDHostOutstanding", "GGFASEDIngressARQueueWrapper"};
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(names[bad]), original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 3 || bad == 4) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end()); NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 3) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 5 || bad == 6) {
+      SmallVector<Attribute> rows;
+      for (auto attr : raw) {
+        auto row = cast<DictionaryAttr>(attr); auto widget = row.getAs<StringAttr>("widgetClass");
+        if (widget && widget.getValue() == "midas.models.FASEDMemoryTimingModel") {
+          if (bad == 5) continue;
+          NamedAttrList changed(row); changed.erase("widgetConstructorKey"); attr = changed.getDictionary(ctx);
+        }
+        rows.push_back(attr);
+      }
+      f.circuit->setAttr("rawAnnotations", b.getArrayAttr(rows));
+    }
+    if (bad == 7) f.circuit.setName("WrongTop");
+    auto state = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeRocketFASEDIngress(f.circuit, error)) &&
+        !error.empty() && dump(*f.root) == state, "invalid expanded FASED ingress composition mutated IR"); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions); f.circuit->setAttr("rawAnnotations", raw);
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDIngress(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDIngressARQueueWrapper" &&
+      decoder->getAttr("goldengate.controlRegions") == regions, "FASED ingress changed expanded allocation");
+  for (auto p : top.getPorts())
+    require(!tokenPorts.count(p.name.getValue()) &&
+        p.name.getValue() != "fased_ingress" && p.name.getValue() != "fased_readiness" &&
+        p.name.getValue() != "fased_ingress_w_enq" && p.name.getValue() != "fased_ingress_ar_enq",
+        "consumed FASED ingress boundary escapes");
+  const StringRef wrappers[]{"GGFASEDIngressAW", "GGFASEDIngressWQueueWrapper", "GGFASEDIngressARQueueWrapper"};
+  const StringRef queues[]{"GGFASEDIngressAWQueue10", "GGFASEDIngressWQueue16", "GGFASEDIngressARQueue4"};
+  for (unsigned i = 0; i < 3; ++i)
+    require(bool(child(named(f.circuit, wrappers[i]), named(f.circuit, queues[i]))), "FASED requires three independent ingress queues");
+  unsigned constructors = 0, channels = 0;
+  for (auto attr : f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto row = cast<DictionaryAttr>(attr); auto widget = row.getAs<StringAttr>("widgetClass");
+    constructors += widget && widget.getValue() == "midas.models.FASEDMemoryTimingModel";
+    auto name = row.getAs<StringAttr>("globalName");
+    if (name && channelNames.count(name.getValue())) {
+      ++channels; auto sources = row.getAs<ArrayAttr>("sources"), sinks = row.getAs<ArrayAttr>("sinks");
+      require(sources && !sources.empty() && sinks && !sinks.empty(), "FASED channel lacks completed host endpoints");
+    }
+  }
+  require(constructors == 1 && channels == 11, "FASED constructor or channel retention differs");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDIngress(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED ingress composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-ingress-reverse.mlir" : ".rocket-fased-ingress.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED ingress boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
                      unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
@@ -1058,13 +1146,14 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
     for (StringRef p : {"clockBridge_ctrl", "resetBridge_ctrl", "uartBridge_ctrl",
                        "peekPokeBridge_ctrl", "tracerv_ctrl"})
       b.create<ConnectOp>(f.circuit.getLoc(), instance.getResult(port(importedTop, p)), original.getArgument(port(original, p)));
-    // Forward actual Rocket TSI and BlockDev channels, including their nested
+    // Forward actual Rocket TSI, BlockDev and FASED channels, including their nested
     // forward descriptors and constructor metadata, to the active Print top.
     auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
     SmallVector<Attribute> annotations;
     for (auto attr : f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) annotations.push_back(attr);
     for (StringRef widgetClass : {"firechip.goldengateimplementations.TSIBridgeModule",
-                                 "firechip.goldengateimplementations.BlockDevBridgeModule"}) {
+                                 "firechip.goldengateimplementations.BlockDevBridgeModule",
+                                 "midas.models.FASEDMemoryTimingModel"}) {
       DictionaryAttr bridge;
       for (auto attr : raw) {
         auto row = cast<DictionaryAttr>(attr);
@@ -1107,7 +1196,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
         }
         annotations.push_back(retargetBridge(row));
       }
-      require(forwarded.size() == (widgetClass.ends_with("TSIBridgeModule") ? 5 : 9),
+      require(forwarded.size() == (widgetClass.ends_with("TSIBridgeModule") ? 5 : widgetClass.ends_with("BlockDevBridgeModule") ? 9 : 11),
           "actual Rocket bridge requires distinct live token ports");
     }
     f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
@@ -1390,6 +1479,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketMaster(f, output, reverse, rejected);
       rocketTSI(f, output, reverse, rejected);
       rocketBlockDev(f, output, reverse, rejected);
+      rocketFASEDIngress(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);

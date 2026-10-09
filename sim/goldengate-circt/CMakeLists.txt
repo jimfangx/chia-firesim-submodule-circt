@@ -401,6 +401,11 @@ if(BUILD_TESTING)
     lib/Transforms/BlockDevWriteLatency.cpp
     lib/Transforms/BlockDevReadLatency.cpp
     lib/Transforms/BlockDevResponseScheduler.cpp
+    lib/Transforms/FASEDTokenEngine.cpp
+    lib/Transforms/FASEDHostOutstanding.cpp
+    lib/Transforms/FASEDIngressAWQueue.cpp
+    lib/Transforms/FASEDIngressWQueue.cpp
+    lib/Transforms/FASEDIngressARQueue.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp

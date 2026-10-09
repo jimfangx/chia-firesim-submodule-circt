@@ -1878,3 +1878,54 @@ platform/driver or FPGA execution equivalence. FASED, LoadMem register-side
 assembly, the UART-bearing SFC runtime baseline and hardware validation remain
 pending. Next: forward actual Rocket FASED channels and attach its native MMIO
 and timing path at allocated slave 1 in the expanded Print platform.
+
+## Iteration 79: FASED token and ingress composition after Rocket/Print BlockDev
+
+`mapPrintBridgeRocketFASEDIngress` composes the native FASED token engine,
+host outstanding counters, AW ingress queue, W ingress queue and AR ingress
+queue after `GGBlockDevResponseSchedulerWrapper`. It validates the complete
+live thirteen-bank allocation and ordered Print host identities, stages all
+five passes on a cloned CIRCT circuit, verifies it, then commits only new
+modules, completed annotation endpoints and the new circuit identity.
+Existing bank operations and their registries remain in place. The FASED bank
+remains slave 1 at byte 128 with size 128; this step does not attach its MMIO.
+
+The expanded fixture forwards all eleven actual FASED channel ports and their
+constructor, clock and nested valid/ready descriptors from the native Rocket
+handoff. Channel checks derive identities from the actual constructor mapping
+rather than assuming a global-name prefix. Both endpoints are retained after
+host attachment; consumed target token ports and intermediate enqueue/readiness
+ports disappear from the active top. Three independent queue instances retain
+host-clock and qualified ingress-reset wiring. Host outstanding counters use
+host reset only, so target stalls/reset do not discard host transactions.
+
+`PrintRocketFASEDIngressCompare.py` compares emitted operations and SSA nets
+with the immutable U250 `design/FireSim-generated.sv` and the fresh native
+`post-fame-fased-ingress-ar.mlir`. It checks SFC's full target-fire versus
+exclude-ingress-ready predicate, qualified ingress/egress resets, host counter
+width/max/reset, queue depths, surviving payload fields and enqueue predicates
+excluding each queue's own ready signal. Native address queues retain 69 bits
+and the W queue 78 bits. The optimized SFC queues retain 64/73/64 bits because
+unused user/region (and W ID) fields are pruned; this is recorded explicitly.
+It also evaluates all 256 token/readiness/reset input combinations per order
+and checks actual wrapper clock/reset/enqueue/dequeue connections.
+
+Evidence is under mutable `iteration79-print-rocket-fased-ingress/`, including
+fresh CIRCT compilation of the immutable compiler oracle's `.sfc.fir` and
+`.anno.json`, focused FASED behavior tests and expanded binding outputs.
+The fixture passes both constructor orders and 156 atomic rejection cases,
+including eighteen new FASED ingress cases. All five focused FASED behavior
+tests, the basic Print binding test and all nine structured comparisons pass.
+Fresh native compilation has empty stderr. The decoder and TracerV queue inputs
+match iteration 78 by SHA-256. Manager compile/metasim/bitstream gates remain
+exclusively harness-owned.
+
+This is a partial FASED ingress boundary. Egress readiness, host transaction
+signals and raw queue dequeues remain external; ingress credits/order/issue,
+egress scheduling, timing, MMIO and host-memory binding follow. The reference
+disables Print, so the comparison establishes shared FASED semantics without
+claiming full Print-enabled CLI/driver or hardware equivalence. Next smallest
+step: compose native ingress credit/order/issue/deadlock passes through this
+expanded boundary, compare their accepted host issue behavior with SFC, then
+advance to egress/timing and slave-1 MMIO attachment. The UART-bearing SFC
+runtime baseline and overall migration remain incomplete.
