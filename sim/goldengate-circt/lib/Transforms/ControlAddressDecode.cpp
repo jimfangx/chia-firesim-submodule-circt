@@ -6,6 +6,7 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringMap.h"
 #include <set>
 #include <algorithm>
 #include <functional>
@@ -154,6 +155,82 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
        "GGLoadMemReadRequestWrapper", "GGLoadMemReadDataWrapper"})) ||
       failed(bank("CPUManagedStreamEngine_0", "GGCPUStreamMCRFile", {"GGCPUStreamCountBank"}))) return failure();
   widgets.assign(catalog.begin(), catalog.end()); return success();
+}
+
+LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
+    unsigned addressBits, ArrayRef<FModuleOp> printHosts,
+    SmallVectorImpl<ControlMMIOWidget> &widgets,
+    SmallVectorImpl<ControlMMIORegion> &regions, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  FModuleOp reader, counts, bound;
+  for (auto m : circuit.getOps<FModuleOp>()) {
+    if (m.getName() == "GGCPUStreamRead") reader = m;
+    if (m.getName() == "GGCPUStreamCountBank") counts = m;
+    if (m.getName() == "GGPrintBridgeHostWrapper") bound = m;
+  }
+  auto sources = reader ? reader->getAttrOfType<ArrayAttr>("goldengate.sourceStreams") : ArrayAttr{};
+  auto words = counts ? counts->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters") : ArrayAttr{};
+  if (!sources || !words || sources.size() != printHosts.size() + 1 || words.size() != sources.size())
+    return reject("Rocket MMIO allocation requires one count word per TracerV/Print DMA source");
+  if (!printHosts.empty()) {
+    auto bindings = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
+    if (!bindings || bindings.size() != printHosts.size())
+      return reject("Rocket MMIO allocation requires the bound Print constructor catalog");
+    llvm::StringMap<StringAttr> hostNames;
+    for (auto attr : bindings) {
+      auto row = dyn_cast<DictionaryAttr>(attr);
+      auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
+      auto host = row ? row.getAs<StringAttr>("hostModule") : StringAttr{};
+      if (!name || !host || !hostNames.try_emplace(name.getValue(), host).second)
+        return reject("Rocket MMIO allocation requires unique complete Print bindings");
+    }
+    for (auto [i, item] : llvm::enumerate(printHosts)) {
+      FModuleOp host = item;
+      std::string name = "PrintBridgeModule_" + std::to_string(i);
+      auto found = hostNames.find(name); InstanceOp instance;
+      for (auto child : bound.getOps<InstanceOp>()) if (child.getName() == name) instance = child;
+      if (!host || found == hostNames.end() || found->second != host.getName() ||
+          !instance || instance.getModuleName() != host.getName())
+        return reject("Rocket MMIO allocation Print order differs from instantiated constructor catalog");
+    }
+  }
+  // CPUManagedStreamEngine attaches count registers in stream registration
+  // order. Match metadata by index/name/offset, independently of row order.
+  // A well-typed stale bank must not allocate a smaller global region.
+  std::set<int64_t> indices;
+  llvm::StringMap<DictionaryAttr> registers;
+  for (auto attr : words) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    if (!name || !registers.try_emplace(name.getValue(), row).second)
+      return reject("Rocket MMIO count register names must be complete and unique");
+  }
+  for (auto attr : sources) {
+    auto source = dyn_cast<DictionaryAttr>(attr);
+    auto name = source ? source.getAs<StringAttr>("name") : StringAttr{};
+    auto index = source ? source.getAs<IntegerAttr>("index") : IntegerAttr{};
+    if (!index || index.getValue().getBitWidth() > 64 || index.getInt() < 0 ||
+        uint64_t(index.getInt()) >= sources.size() || !indices.insert(index.getInt()).second)
+      return reject("Rocket MMIO DMA indices must be unique and contiguous");
+    auto i = index.getInt();
+    std::string expected = i == 0 ? "TRACERVBRIDGEMODULE_0_to_cpu_stream" :
+        "PRINTBRIDGEMODULE_" + std::to_string(i - 1) + "_to_cpu_stream";
+    auto found = registers.find(expected + "_count");
+    auto word = found == registers.end() ? DictionaryAttr{} : found->second;
+    auto offset = word ? word.getAs<IntegerAttr>("offset") : IntegerAttr{};
+    auto read = word ? word.getAs<BoolAttr>("readable") : BoolAttr{};
+    auto write = word ? word.getAs<BoolAttr>("writeable") : BoolAttr{};
+    if (!name || name != expected || !offset || offset.getValue().getBitWidth() > 64 || offset.getInt() != i * 4 ||
+        !read || !read.getValue() || !write || write.getValue())
+      return reject("Rocket MMIO count register differs from ordered read-only DMA source");
+  }
+  SmallVector<ControlMMIOWidget> catalog;
+  SmallVector<ControlMMIORegion> allocated;
+  if (failed(deriveRocketControlMMIOCatalog(circuit, printHosts, catalog, error)) ||
+      failed(allocateControlMMIORegions(addressBits, catalog, allocated, error))) return failure();
+  widgets.assign(catalog.begin(), catalog.end());
+  regions.assign(allocated.begin(), allocated.end());
+  return success();
 }
 
 LogicalResult goldengate::allocateControlMMIORegions(unsigned addressBits,

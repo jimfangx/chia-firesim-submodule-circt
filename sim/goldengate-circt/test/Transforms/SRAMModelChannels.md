@@ -1587,3 +1587,48 @@ bank; it must not be confused with the expanded three-word transport. Next,
 carry this expanded count bank into the full Rocket MMIO catalog and dispatch,
 then derive full-platform Print driver addresses. Manager gates remain owned by
 the verification harness; the SFC UART-bearing workload baseline is still pending.
+
+### Iteration 73: expanded CPU occupancy bank in the complete Rocket MMIO map
+
+`allocateRocketControlMMIORegions` composes the materialized platform register
+catalog with the shared TracerV/Print DMA/count catalog before creating the
+decoder. The full baseline compiler now calls this native API. It requires
+one read-only occupancy word per DMA index, checks names and byte offsets
+independently of metadata row order, and verifies the supplied Print constructor
+order against the actually instantiated hosts. It derives typed MCR word counts
+and applies `Widget.scala`'s power-of-two sizing, decreasing-size sort and
+contiguous allocation. Failures leave the IR and both result lists unchanged.
+
+Evidence is under mutable `iteration73-print-rocket-mmio/`. The binding test
+imports the fresh native Rocket queue hierarchy and actual register banks into
+the two-domain queued Print fixture. Historical bank dependencies use a separate
+symbol namespace so their old CPU wrapper cannot alias the live expanded CPU
+wrapper. Both Print constructor orders produce thirteen regions: Print bases
+544/576 remain stable; the three-word CPU bank requires sixteen bytes and sorts
+at 624 before ResetPulse at 640. The old pre-binding one-word count catalog's
+CPU base 632 is therefore not the final expanded allocation. Metadata row
+permutations preserve the map. Forty atomic rejection cases cover queue identity,
+missing/duplicate DMA indices and occupancy words, bad register schema,
+insufficient address space, detached Print bindings and changed host order.
+Existing selected Print bindings, headers, requests/responses and generic
+decoder tests continue to pass, including 123462 interpreted address pairs.
+
+A fresh direct native `--compile-baseline` reads the immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` and `.anno.json`. It emits
+complete RTL/collateral with empty stderr. `PrintRocketMMIOCompare.py` compares
+the candidate decoder with the immutable U250 fixture's
+`design/FireSim-generated.sv`: all eleven baseline AW/AR ranges and widget slave
+bindings match. It then verifies both expanded native decoders and their actual
+three-word count banks. `PrintRocketStreamsCompare.py` retains the matching SFC
+TracerV handshake/storage/count geometry; its reader query now selects the
+active shared transport explicitly because the imported bank dependencies also
+contain isolated historical readers. `PrintPlatformCatalogCompare.py` continues
+to validate the earlier pre-binding allocation separately.
+
+The immutable reference disables Print. This expanded test establishes the
+actual-bank allocation and native decoder boundary; it does not attach every
+platform request/response port or provide a runnable Print-enabled platform.
+Next, bind the full thirteen-bank dispatcher to these allocated ports, then
+derive Print driver addresses from that bound map. Manager verification remains
+owned by the harness. The overall migration and SFC UART differential remain
+incomplete.

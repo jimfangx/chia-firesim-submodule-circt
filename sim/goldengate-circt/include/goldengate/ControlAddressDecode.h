@@ -49,6 +49,16 @@ mlir::LogicalResult deriveRocketControlMMIOCatalog(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> printHosts,
     llvm::SmallVectorImpl<ControlMMIOWidget> &widgets, std::string &error);
+// Allocate the complete materialized Rocket platform after CPU stream binding.
+// Require the instantiated Print constructor order and one ordered read-only
+// count word per TracerV/Print DMA source before
+// sorting widget regions. CPU bank growth can reorder the small-bank tail.
+// Leave IR and both result lists unchanged on failure.
+mlir::LogicalResult allocateRocketControlMMIORegions(
+    circt::firrtl::CircuitOp circuit, unsigned addressBits,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> printHosts,
+    llvm::SmallVectorImpl<ControlMMIOWidget> &widgets,
+    llvm::SmallVectorImpl<ControlMMIORegion> &regions, std::string &error);
 // Widget.memRegionSize / HasWidgets.addrMap: round the 32-bit control bank's
 // byte size up to a power of two (or use customSize), stable-sort by decreasing
 // size, then assign contiguous regions from zero. Input order is widget

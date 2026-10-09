@@ -43,6 +43,9 @@ assert not re.search(r'\bmodule\s+PrintBridgeModule(?:_\d+)?\s*\(', reference)
 
 
 def allocations(text):
+    # Historical bank dependencies may retain their own namespaced reader.
+    # Compare the active shared transport, not those isolated definitions.
+    text = re.search(r'firrtl.module @GGCPUStreamRead\(.*?(?=\n\s+firrtl.module|\Z)', text, re.S).group()
     rows = re.findall(r'\{bufferBaseAddress = (\d+) : i64, depth = (\d+) : i64, index = (\d+) : i64, name = "([^"]+)", port = "([^"]+)", widthBytes = (\d+) : i64\}', text)
     return [(name, int(index), int(base), int(depth), int(width)) for base, depth, index, name, port, width in rows]
 

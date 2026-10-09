@@ -12,14 +12,17 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/SymbolTable.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <algorithm>
 #include <random>
 #include <stdexcept>
+#include <functional>
 
 using namespace mlir;
 using namespace circt::firrtl;
@@ -526,7 +529,7 @@ void platformCatalog(MLIRContext &ctx, StringRef baseline, StringRef output) {
 // Attach Print hosts after the real Rocket TracerV queue boundary. The earlier
 // fixture contains post-FAME print tokens; its TracerV ports now forward the
 // complete native Rocket hierarchy rather than a stand-in queue.
-void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef output) {
+void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseline, StringRef output) {
   if (baseline.empty()) return;
   unsigned rejected = 0;
   for (bool reverse : {false, true}) {
@@ -611,6 +614,103 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef output) {
     SmallVector<goldengate::ControlMMIORegion> regions;
     require(succeeded(goldengate::allocateControlMMIORegions(25, {widget}, regions, error)) &&
         regions.size() == 1 && regions[0].size == 16, "three CPU occupancy words require a sixteen-byte region");
+    if (!controlBaseline.empty()) {
+      auto platform = parseSourceFile<ModuleOp>(controlBaseline, &ctx);
+      require(bool(platform), "cannot parse materialized Rocket control banks");
+      auto pc = *platform->getOps<CircuitOp>().begin();
+      // Import only the actual register banks/adapters and their dependencies.
+      // The existing expanded CPU bank remains connected to the live queues;
+      // importing a historical platform wrapper would duplicate that transport.
+      llvm::StringSet<> present;
+      for (auto m : f.circuit.getOps<FModuleLike>()) present.insert(m.getModuleName());
+      const StringRef bankNames[]{"GGSimulationMasterBank", "GGPeekPokeMCRFile", "GGPeekPokeMMIOBank",
+          "GGResetPulseBridgeMCRFile", "GGResetPulseBridge", "GGBlockDevMMIOBank",
+          "GGUARTMCRFile", "GGUARTMMIOBank", "GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
+          "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors",
+          "GGTracerVMCRFile", "GGTracerVTriggerConfig", "GGTSIMMIOBank", "GGClockBridgeMCRFile",
+          "GGSingleClockBridge", "GGLoadMemMCRFile", "GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataWrapper",
+          "GGLoadMemReadRequestWrapper", "GGLoadMemReadDataWrapper"};
+      auto importedName = [&](StringRef name) {
+        return llvm::is_contained(bankNames, name) ? name.str() : "CatalogRocket_" + name.str();
+      };
+      std::function<void(StringRef)> importBank = [&](StringRef name) {
+        auto symbol = importedName(name);
+        if (!present.insert(symbol).second) return;
+        FModuleLike found;
+        for (auto m : pc.getOps<FModuleLike>()) if (m.getModuleName() == name) found = m;
+        require(bool(found), "missing Rocket bank dependency " + name.str());
+        auto copy = found->clone(); SymbolTable::setSymbolName(copy, symbol);
+        f.circuit.getBodyBlock()->push_back(copy);
+        copy->walk([&](InstanceOp i) {
+          auto originalName = i.getModuleName().str(); importBank(originalName);
+          i.setModuleNameAttr(FlatSymbolRefAttr::get(&ctx, importedName(originalName)));
+        });
+      };
+      for (StringRef name : bankNames) importBank(name);
+      require(succeeded(verify(*f.root)), "expanded Rocket platform register banks invalid");
+      SmallVector<goldengate::ControlMMIOWidget> catalog;
+      before = dump(*f.root);
+      require(succeeded(goldengate::allocateRocketControlMMIORegions(f.circuit, 25, f.hosts,
+          catalog, regions, error)) && dump(*f.root) == before && catalog.size() == 13, error);
+      for (auto r : regions) {
+        if (r.name == "PrintBridgeModule_0") require(r.start == 544 && r.size == 32, "full first Print region differs");
+        if (r.name == "PrintBridgeModule_1") require(r.start == 576 && r.size == 32, "full second Print region differs");
+        if (r.name == "SimulationMaster_0") require(r.start == 608 && r.size == 16, "full master region differs");
+        if (r.name == "CPUManagedStreamEngine_0") require(r.start == 624 && r.size == 16, "expanded CPU region differs");
+        if (r.name == "ResetPulseBridgeModule_0") require(r.start == 640 && r.size == 8, "reset moves after expanded CPU bank");
+      }
+      auto preservedCatalog = catalog; auto preservedRegions = regions;
+      auto rejectAllocation = [&](unsigned bits = 25) {
+        auto state = dump(*f.root);
+        require(failed(goldengate::allocateRocketControlMMIORegions(f.circuit, bits, f.hosts, catalog, regions, error)) &&
+            !error.empty() && dump(*f.root) == state && catalog.size() == preservedCatalog.size() &&
+            regions.size() == preservedRegions.size(), "failed full allocation mutated IR/results");
+        for (auto [i, r] : llvm::enumerate(regions)) require(r.name == preservedRegions[i].name &&
+            r.start == preservedRegions[i].start && r.size == preservedRegions[i].size, "failure changed regions");
+        for (auto [i, w] : llvm::enumerate(catalog)) require(w.name == preservedCatalog[i].name &&
+            w.registerCount == preservedCatalog[i].registerCount, "failure changed widgets");
+        ++rejected;
+      };
+      auto reader = named(f.circuit, "GGCPUStreamRead"), bank = named(f.circuit, "GGCPUStreamCountBank");
+      for (bool source : {false, true}) {
+        auto attrName = source ? "goldengate.sourceStreams" : "goldengate.mmioRegisters";
+        auto savedRows = source ? allocations : words;
+        SmallVector<Attribute> rows(savedRows.begin(), savedRows.end());
+        rows.pop_back(); (source ? reader : bank)->setAttr(attrName, b.getArrayAttr(rows));
+        rejectAllocation(); (source ? reader : bank)->setAttr(attrName, savedRows);
+        for (StringRef key : source ? ArrayRef<StringRef>{"name", "index"} : ArrayRef<StringRef>{"name", "offset", "readable", "writeable"}) {
+          rows.assign(savedRows.begin(), savedRows.end()); NamedAttrList bad(cast<DictionaryAttr>(rows[1]));
+          bad.erase(key); rows[1] = bad.getDictionary(&ctx); (source ? reader : bank)->setAttr(attrName, b.getArrayAttr(rows));
+          rejectAllocation(); (source ? reader : bank)->setAttr(attrName, savedRows);
+        }
+        rows.assign(savedRows.begin(), savedRows.end()); std::swap(rows[1], rows[2]);
+        (source ? reader : bank)->setAttr(attrName, b.getArrayAttr(rows));
+        require(succeeded(goldengate::allocateRocketControlMMIORegions(f.circuit, 25, f.hosts,
+            catalog, regions, error)), "metadata row permutation changed full allocation");
+        (source ? reader : bank)->setAttr(attrName, savedRows);
+        rows.assign(savedRows.begin(), savedRows.end()); NamedAttrList duplicate(cast<DictionaryAttr>(rows[2]));
+        auto key = source ? "index" : "offset";
+        duplicate.set(key, cast<DictionaryAttr>(rows[1]).get(key)); rows[2] = duplicate.getDictionary(&ctx);
+        (source ? reader : bank)->setAttr(attrName, b.getArrayAttr(rows));
+        rejectAllocation(); (source ? reader : bank)->setAttr(attrName, savedRows);
+      }
+      rejectAllocation(1);
+      std::reverse(f.hosts.begin(), f.hosts.end()); rejectAllocation();
+      std::reverse(f.hosts.begin(), f.hosts.end());
+      auto bound = named(f.circuit, "GGPrintBridgeHostWrapper");
+      auto bindings = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+      bound->removeAttr("goldengate.printHostBindings"); rejectAllocation();
+      bound->setAttr("goldengate.printHostBindings", bindings);
+      auto decoded = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGControlErrorWrapper" {
+        firrtl.module @GGControlErrorWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>) {}
+      } })", &ctx);
+      auto dc = *decoded->getOps<CircuitOp>().begin(); dc->setAttr("rawAnnotations", b.getArrayAttr({}));
+      require(succeeded(goldengate::addControlAddressDecode(dc, 25, regions, error)) && succeeded(verify(*decoded)), error);
+      if (!output.empty()) {
+        std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-mmio-reverse.mlir" : ".rocket-mmio.mlir")).str(), ec);
+        require(!ec, "cannot write full Rocket/Print decoder"); decoded->print(file); file << '\n';
+      }
+    }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
       require(!ec, "cannot write Rocket/Print stream boundary"); f.root->print(file); file << '\n';
@@ -950,7 +1050,7 @@ int main(int argc, char **argv) {
     checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
     allocatedHeaders(ctx, argc > 1 ? argv[1] : "");
     platformCatalog(ctx, argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");
-    rocketStreams(ctx, argc > 3 ? argv[3] : "", argc > 1 ? argv[1] : "");
+    rocketStreams(ctx, argc > 3 ? argv[3] : "", argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");
     for (bool reverse : {false, true}) {
       Fixture f(ctx, true, reverse); std::string error, header;
       require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);

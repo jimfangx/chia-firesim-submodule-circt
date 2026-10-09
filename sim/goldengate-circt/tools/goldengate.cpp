@@ -2788,10 +2788,9 @@ int main(int argc, char **argv) {
       const llvm::StringRef fasedRegisterModules[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
           "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"};
       SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
-      if (failed(goldengate::deriveRocketControlMMIOCatalog(circuit, {}, controlWidgets, error)))
-        return fail("platform control register catalog: " + error);
       SmallVector<goldengate::ControlMMIORegion> controlRegions;
-      if (failed(goldengate::allocateControlMMIORegions(25, controlWidgets, controlRegions, error)))
+      if (failed(goldengate::allocateRocketControlMMIORegions(circuit, 25, {},
+              controlWidgets, controlRegions, error)))
         return fail("control address allocation: " + error);
       if (failed(goldengate::addControlAddressDecode(circuit, 25, controlRegions, error)))
         return fail("control address decoder: " + error);
