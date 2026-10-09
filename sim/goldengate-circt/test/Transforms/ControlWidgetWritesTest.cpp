@@ -100,7 +100,8 @@ void test(MLIRContext &ctx,unsigned layout) {
   std::vector<std::string> originalTargets;
   for(auto a:c->getAttrOfType<ArrayAttr>("rawAnnotations"))
     originalTargets.push_back(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue().str());
-  require(succeeded(goldengate::bindControlWidgetWrites(c,error)),error);
+  require(succeeded(layout ? goldengate::bindControlWidgetWrites(c,error) :
+                            goldengate::bindRocketControlWidgetWrites(c,error)),error);
   require(succeeded(verify(*root)),"widget write IR invalid");
   FModuleOp top;for(auto m:c.getOps<FModuleOp>())if(m.getName()==newTop)top=m;
   require(bool(top),"wrapper missing");
@@ -203,6 +204,12 @@ void test(MLIRContext &ctx,unsigned layout) {
   }
 }
 void explicitCatalogRejections(MLIRContext &ctx) {
+  {
+    auto root = fixture(ctx, 0, 1); auto c = *root->getOps<CircuitOp>().begin();
+    std::string error; auto before = dump(*root);
+    require(failed(goldengate::bindRocketControlWidgetWrites(c, error)) && !error.empty() &&
+        dump(*root) == before, "Rocket request binding accepted allocated but uninstantiated Print banks");
+  }
   for (unsigned bad = 0; bad < 6; ++bad) {
     auto root = fixture(ctx, 0, 1); auto c = *root->getOps<CircuitOp>().begin();
     SmallVector<goldengate::ControlWidgetPort> widgets{{"PrintBridgeModule_0", "print0_ctrl"},
@@ -222,6 +229,6 @@ void explicitCatalogRejections(MLIRContext &ctx) {
 int main() {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
   try{for(unsigned layout=0;layout<3;++layout)test(ctx,layout); explicitCatalogRejections(ctx);
-    llvm::outs()<<"Widget writes: 420 exact scalar bindings across baseline, two added Print banks, and reversed allocations; partial targets and 29 atomic rejections passed\n";
+    llvm::outs()<<"Widget writes: 420 exact scalar bindings across baseline, two added Print banks, and reversed allocations; partial targets and 30 atomic rejections passed\n";
     return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}
 }

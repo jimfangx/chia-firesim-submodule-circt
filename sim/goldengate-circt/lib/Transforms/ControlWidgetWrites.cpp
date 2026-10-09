@@ -39,6 +39,95 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
   return bindControlWidgetWrites(circuit, widgets, error);
 }
 
+LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
+                                                       std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  FModuleOp bound, top, decoder;
+  std::map<std::string, FModuleOp> modules;
+  for (auto m : circuit.getOps<FModuleOp>()) {
+    modules.emplace(m.getName().str(), m);
+    if (m.getName() == "GGPrintBridgeHostWrapper") bound = m;
+    if (m.getName() == circuit.getName()) top = m;
+    if (m.getName() == "GGControlAddressDecode") decoder = m;
+  }
+  auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
+  if (!top || !regions) return reject("Rocket request binding requires an active top and allocation");
+  std::set<std::string> allocatedPrints;
+  for (auto attr : regions) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    if (!name) return reject("Rocket request allocation lacks a widget identity");
+    if (name.getValue().starts_with("PrintBridgeModule_") &&
+        !allocatedPrints.insert(name.getValue().str()).second)
+      return reject("Rocket request allocation duplicates a Print bank");
+  }
+  SmallVector<ControlWidgetPort> widgets;
+  for (auto w : widgetPorts) widgets.push_back({w.widget, w.port});
+  if (bound) {
+    auto registry = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+    if (!registry || registry.empty() || registry.size() != allocatedPrints.size())
+      return reject("Rocket request binding requires every allocated Print host");
+    std::set<std::string> hosts, ports;
+    for (auto [slot, attr] : llvm::enumerate(registry)) {
+      auto row = dyn_cast<DictionaryAttr>(attr);
+      auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
+      auto port = row ? row.getAs<StringAttr>("controlPort") : StringAttr{};
+      auto hostName = row ? row.getAs<StringAttr>("hostModule") : StringAttr{};
+      auto expected = "PrintBridgeModule_" + std::to_string(slot);
+      if (!name || name.getValue() != expected || !allocatedPrints.erase(expected) ||
+          !port || port.getValue().empty() || !ports.insert(port.getValue().str()).second ||
+          !hostName || !hosts.insert(hostName.getValue().str()).second)
+        return reject("Rocket request binding requires unique constructor-ordered Print identities");
+      auto it = modules.find(hostName.getValue().str());
+      auto host = it == modules.end() ? FModuleOp{} : it->second;
+      unsigned instances = 0;
+      for (auto i : bound.getOps<InstanceOp>())
+        if (i.getName() == expected && host && i.getModuleName() == host.getName()) ++instances;
+      bool control = false;
+      if (host && host.getNumPorts() == 13 && host->hasAttr("goldengate.printHost"))
+        for (auto p : top.getPorts()) if (p.name == port.getValue())
+          control = p.direction == Direction::In && p.type == host.getPortType(11);
+      if (instances != 1 || !control)
+        return reject("Rocket request binding differs from the instantiated Print AXI bank");
+      // Equal AXI types do not identify a bank. Follow whole-bundle input
+      // forwarding through the active wrapper hierarchy to this constructor's
+      // actual host control operand; reject aliases, fanout and detached ports.
+      Value value;
+      for (unsigned p = 0; p < top.getNumPorts(); ++p)
+        if (top.getPortName(p) == port.getValue()) value = top.getArgument(p);
+      FModuleOp owner = top; bool reachesHost = false;
+      std::set<std::pair<Operation *, unsigned>> visited;
+      for (unsigned depth = 0; value && depth < 4096; ++depth) {
+        auto argument = dyn_cast<BlockArgument>(value);
+        if (!argument || !visited.emplace(owner.getOperation(), argument.getArgNumber()).second) break;
+        Value dest; unsigned drivers = 0;
+        for (auto &op : *owner.getBodyBlock()) {
+          if (auto connect = dyn_cast<ConnectOp>(op))
+            if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+          if (auto connect = dyn_cast<StrictConnectOp>(op))
+            if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+        }
+        auto result = dyn_cast_or_null<OpResult>(dest);
+        auto instance = result ? dyn_cast<InstanceOp>(result.getOwner()) : InstanceOp{};
+        if (drivers != 1 || !instance) break;
+        auto child = modules.find(instance.getModuleName().str());
+        if (child == modules.end() || result.getResultNumber() >= child->second.getNumPorts() ||
+            child->second.getPortDirection(result.getResultNumber()) != Direction::In) break;
+        if (owner == bound) {
+          reachesHost = instance.getName() == expected && instance.getModuleName() == host.getName() &&
+                        result.getResultNumber() == 11;
+          break;
+        }
+        owner = child->second; value = owner.getArgument(result.getResultNumber());
+      }
+      if (!reachesHost) return reject("Rocket request port does not reach its instantiated Print bank");
+      widgets.push_back({expected, port.getValue().str()});
+    }
+  }
+  if (!allocatedPrints.empty()) return reject("Rocket request allocation contains unbound Print banks");
+  return bindControlWidgetWrites(circuit, widgets, error);
+}
+
 LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
     ArrayRef<ControlWidgetPort> widgets, std::string &error) {
   constexpr llvm::StringLiteral wrapperName="GGControlWidgetWriteWrapper";

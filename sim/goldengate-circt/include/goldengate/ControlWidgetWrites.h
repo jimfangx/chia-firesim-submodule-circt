@@ -17,5 +17,11 @@ mlir::LogicalResult bindControlWidgetWrites(circt::firrtl::CircuitOp circuit,
 // Unimplemented slaves and response arbitration remain explicit boundaries.
 mlir::LogicalResult bindControlWidgetWrites(circt::firrtl::CircuitOp circuit,
                                            std::string &error);
+// Rocket request binding adds every instantiated Print bank to the seven
+// early MCR slaves. Require a complete constructor-ordered host registry and
+// decoded Print allocation; leave late-bound Master/FASED/TSI/BlockDev lanes
+// exposed. All identity/type validation precedes mutation.
+mlir::LogicalResult bindRocketControlWidgetWrites(circt::firrtl::CircuitOp circuit,
+                                                 std::string &error);
 }
 #endif

@@ -1632,3 +1632,48 @@ Next, bind the full thirteen-bank dispatcher to these allocated ports, then
 derive Print driver addresses from that bound map. Manager verification remains
 owned by the harness. The overall migration and SFC UART differential remain
 incomplete.
+
+### Iteration 74: Rocket request binding includes instantiated Print banks
+
+`bindRocketControlWidgetWrites` extends the production compiler's seven early
+MMIO request bindings with every instantiated Print constructor. It resolves
+the sorted slave indices by widget identity, requires the complete ordered
+Print host registry, and follows whole AXI bundle forwarding through the active
+wrapper hierarchy to the matching host's control operand. Equal AXI types alone
+do not identify a bank: swapped same-type Print ports, detached ports, fanout
+and cycles must fail before any IR or annotation mutation. The existing FIRRTL
+AW/W binding operations and subsequent AR dispatcher now consume this expanded
+catalog. Master, FASED, TSI and BlockDev still use their later binding steps.
+
+Evidence is under mutable `iteration74-print-rocket-requests/`. The native
+fixture preserves the five live Rocket bridge controls while binding two
+queued Print hosts and their shared TracerV/Print DMA/count engine. It imports
+the actual LoadMem AXI adapter with its register side exposed. Both Print
+constructor orders bind nine early request banks through the complete thirteen
+regions. Native checks verify all 180 AW/W scalar connections per order,
+including shared Nasti metadata and independent readiness, and the matching AR
+bank identities. Print slaves are 8/9; the expanded CPU bank is slave 11 at 624;
+ResetPulse moves to slave 12 at 640. Fifty-four atomic rejection cases cover
+the combined Rocket/Print stream, allocation and request contracts, including
+swapped same-type Print control ports. The generic widget test passes 420
+scalar bindings and 30 rejections; the AR interpreter passes 248056 independent
+backpressure/route cases across up to 63 regions, including thirteen regions.
+
+A fresh direct native compile reads the immutable compiler oracle's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` and `.anno.json`, emitting
+baseline RTL/collateral with empty stderr. `PrintRocketRequestsCompare.py`
+compares the candidate's seven baseline AW/W/AR bank identities with the
+immutable U250 fixture's `design/FireSim-generated.sv`: all match. It then
+checks both expanded native request catalogs against their actual allocation.
+The MMIO, stream and pre-binding catalog comparisons also retain their SFC
+matches. The final native register/queue input boundaries match those used by
+the fixture (recorded in `input-boundary-comparison.json`).
+
+The immutable SFC reference disables Print. This milestone establishes early
+request attachment to live Print/CPU/original bridge storage, with an explicit
+LoadMem register-side boundary and four later request/response banks exposed.
+The complete Print-enabled CLI path, full response assembly and full-platform
+Print driver addresses remain unfinished. Next, compose the later bank and
+response bindings with this thirteen-region native fixture, then carry the
+bound map into Print headers and the complete CLI path. Manager verification
+remains owned by the harness; the SFC UART-bearing differential is pending.

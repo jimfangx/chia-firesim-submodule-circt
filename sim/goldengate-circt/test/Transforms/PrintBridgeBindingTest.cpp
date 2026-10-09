@@ -7,6 +7,11 @@
 #include "goldengate/CPUStreamCountBank.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
+#include "goldengate/ControlErrorSlave.h"
+#include "goldengate/ControlWriteRoute.h"
+#include "goldengate/ControlWriteDispatch.h"
+#include "goldengate/ControlWidgetWrites.h"
+#include "goldengate/ControlReadDispatch.h"
 #include "goldengate/SimulationMasterControl.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
@@ -551,12 +556,22 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
     }
     auto original = named(f.circuit, "Top");
     auto importedTop = named(f.circuit, queueTop.getName());
+    // Preserve the five live Rocket bridge control endpoints while appending
+    // Print and expanding the CPU stream engine. They share the final router.
+    for (StringRef name : {"clockBridge_ctrl", "resetBridge_ctrl", "uartBridge_ctrl",
+                          "peekPokeBridge_ctrl", "tracerv_ctrl"}) {
+      auto p = importedTop.getPorts()[port(importedTop, name)];
+      original.insertPorts({{original.getNumPorts(), p}});
+    }
     b.setInsertionPointToStart(original.getBodyBlock());
     auto instance = b.create<InstanceOp>(f.circuit.getLoc(), importedTop, "rocket");
     for (StringRef p : {"hostClock", "hostReset"})
       b.create<ConnectOp>(f.circuit.getLoc(), instance.getResult(port(importedTop, p)), original.getArgument(port(original, p)));
     for (StringRef p : {"tracerv_stream", "tracerv_stream_count"})
       b.create<ConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, p)), instance.getResult(port(importedTop, p)));
+    for (StringRef p : {"clockBridge_ctrl", "resetBridge_ctrl", "uartBridge_ctrl",
+                       "peekPokeBridge_ctrl", "tracerv_ctrl"})
+      b.create<ConnectOp>(f.circuit.getLoc(), instance.getResult(port(importedTop, p)), original.getArgument(port(original, p)));
     if (reverse) std::reverse(f.hosts.begin(), f.hosts.end());
     require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)) && succeeded(verify(*f.root)), error);
     before = dump(*f.root);
@@ -709,6 +724,116 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       if (!output.empty()) {
         std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-mmio-reverse.mlir" : ".rocket-mmio.mlir")).str(), ec);
         require(!ec, "cannot write full Rocket/Print decoder"); decoded->print(file); file << '\n';
+      }
+      // Attach the actual LoadMem AXI adapter. Its MCR-side register fragments
+      // remain an explicit boundary here; the five original bridge controls,
+      // CPU occupancy bank and both Print banks already reach live storage.
+      auto inner = named(f.circuit, f.circuit.getName());
+      auto loadmem = named(f.circuit, "GGLoadMemMCRFile");
+      auto wrapperPorts = inner.getPorts();
+      unsigned ctrl = wrapperPorts.size();
+      wrapperPorts.push_back({b.getStringAttr("loadmem_ctrl"), loadmem.getPortType(2), Direction::In});
+      unsigned mcr = wrapperPorts.size();
+      wrapperPorts.push_back({b.getStringAttr("loadmem_mcr"), loadmem.getPortType(3), Direction::In});
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      auto platformTop = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr("GGRocketPrintControlWrapper"),
+          inner.getConventionAttr(), wrapperPorts);
+      b.setInsertionPointToStart(platformTop.getBodyBlock());
+      auto sim = b.create<InstanceOp>(f.circuit.getLoc(), inner, "sim");
+      for (auto [p, info] : llvm::enumerate(inner.getPorts()))
+        b.create<ConnectOp>(f.circuit.getLoc(), info.direction == Direction::In ? sim.getResult(p) : platformTop.getArgument(p),
+            info.direction == Direction::In ? platformTop.getArgument(p) : sim.getResult(p));
+      auto adapter = b.create<InstanceOp>(f.circuit.getLoc(), loadmem, "loadmem");
+      for (unsigned p = 0; p < 2; ++p)
+        b.create<ConnectOp>(f.circuit.getLoc(), adapter.getResult(p), platformTop.getArgument(p));
+      b.create<ConnectOp>(f.circuit.getLoc(), adapter.getResult(2), platformTop.getArgument(ctrl));
+      b.create<ConnectOp>(f.circuit.getLoc(), adapter.getResult(3), platformTop.getArgument(mcr));
+      auto oldPrefix = "~" + f.circuit.getName().str();
+      std::function<Attribute(Attribute)> retarget = [&](Attribute attr) -> Attribute {
+        if (auto s = dyn_cast<StringAttr>(attr)) {
+          auto value = s.getValue();
+          if (value == oldPrefix || value.starts_with(oldPrefix + "|"))
+            return b.getStringAttr("~GGRocketPrintControlWrapper" + value.drop_front(oldPrefix.size()).str());
+        }
+        if (auto rows = dyn_cast<ArrayAttr>(attr)) {
+          SmallVector<Attribute> result; for (auto row : rows) result.push_back(retarget(row));
+          return b.getArrayAttr(result);
+        }
+        if (auto row = dyn_cast<DictionaryAttr>(attr)) {
+          NamedAttrList result; for (auto field : row) result.set(field.getName(), retarget(field.getValue()));
+          return result.getDictionary(&ctx);
+        }
+        return attr;
+      };
+      f.circuit->setAttr("rawAnnotations", retarget(f.circuit->getAttr("rawAnnotations")));
+      f.circuit.setName("GGRocketPrintControlWrapper");
+      require(succeeded(goldengate::addControlErrorSlave(f.circuit, 25, 12, "GGRocketPrintControlWrapper", error)) &&
+          succeeded(goldengate::addControlAddressDecode(f.circuit, 25, regions, error)) &&
+          succeeded(goldengate::addControlWriteRoute(f.circuit, error)) &&
+          succeeded(goldengate::addControlWriteDispatch(f.circuit, error)), error);
+      for (unsigned bad = 0; bad < 7; ++bad) {
+        auto rows = SmallVector<Attribute>(bindings.begin(), bindings.end());
+        auto first = cast<DictionaryAttr>(rows[0]); NamedAttrList modified(first);
+        if (bad == 0) rows.pop_back();
+        if (bad == 1) std::reverse(rows.begin(), rows.end());
+        if (bad == 2) modified.erase("controlPort");
+        if (bad == 3) modified.set("hostModule", b.getStringAttr("GGCPUStreamCountBank"));
+        if (bad == 4) modified.set("controlPort", b.getStringAttr("cpuStream_ctrl"));
+        if (bad == 5) modified.set("widgetName", b.getStringAttr("PrintBridgeModule_2"));
+        if (bad == 6) {
+          modified.set("controlPort", cast<DictionaryAttr>(bindings[1]).get("controlPort"));
+          NamedAttrList second(cast<DictionaryAttr>(rows[1])); second.set("controlPort", first.get("controlPort"));
+          rows[1] = second.getDictionary(&ctx);
+        }
+        if (bad >= 2) rows[0] = modified.getDictionary(&ctx);
+        bound->setAttr("goldengate.printHostBindings", b.getArrayAttr(rows));
+        auto state = dump(*f.root);
+        require(failed(goldengate::bindRocketControlWidgetWrites(f.circuit, error)) && !error.empty() &&
+            dump(*f.root) == state, "invalid full-platform Print request binding mutated IR");
+        ++rejected; bound->setAttr("goldengate.printHostBindings", bindings);
+      }
+      require(succeeded(goldengate::bindRocketControlWidgetWrites(f.circuit, error)) &&
+          succeeded(goldengate::addControlReadDispatch(f.circuit, error)) && succeeded(verify(*f.root)), error);
+      auto writes = named(f.circuit, "GGControlWidgetWriteWrapper");
+      std::function<std::string(Value)> key = [&](Value value) -> std::string {
+        if (auto field = value.getDefiningOp<SubfieldOp>()) return key(field.getInput()) + "." + field.getFieldName().str();
+        if (auto i = value.getDefiningOp<InstanceOp>())
+          return "sim." + i.getPortNameStr(cast<OpResult>(value).getResultNumber()).str();
+        if (auto arg = dyn_cast<BlockArgument>(value)) return "top." + writes.getPortName(arg.getArgNumber()).str();
+        throw std::runtime_error("unexpected full-platform write binding value");
+      };
+      std::map<std::string, std::string> actual, expected;
+      for (auto connect : writes.getOps<StrictConnectOp>())
+        require(actual.emplace(key(connect.getDest()), key(connect.getSrc())).second, "duplicate full-platform request driver");
+      for (auto attr : writes->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings")) {
+        auto row = cast<DictionaryAttr>(attr); auto control = row.getAs<StringAttr>("port").getValue().str();
+        auto slave = row.getAs<IntegerAttr>("slave").getInt();
+        for (StringRef ch : {"aw", "w"}) {
+          auto prefix = "sim.ctrl_write_dispatch_slave_" + std::to_string(slave) + "_" + ch.str();
+          auto dest = "sim." + control + "." + ch.str();
+          expected[prefix + "_ready"] = dest + ".ready";
+          expected[dest + ".valid"] = prefix + "_valid";
+          const StringRef aw[]{"addr", "len", "size", "burst", "lock", "cache", "prot", "qos", "region", "id", "user"};
+          const StringRef w[]{"data", "last", "id", "strb", "user"};
+          for (auto field : ch == "aw" ? ArrayRef<StringRef>(aw) : ArrayRef<StringRef>(w)) {
+            bool dispatched = ch == "aw" ? field == "addr" || field == "len" || field == "id" : field == "data" || field == "last";
+            expected[dest + ".bits." + field.str()] = dispatched ? prefix + "_bits_" + field.str() :
+                "top.ctrl_write_dispatch_master_" + ch.str() + "_bits_" + field.str();
+          }
+        }
+      }
+      require(actual == expected && actual.size() == 180, "full-platform AW/W routing or shared metadata differs");
+      auto reads = named(f.circuit, f.circuit.getName())->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
+      require(reads && reads.size() == 9, "full Rocket/Print requests require nine early bank bindings");
+      for (auto attr : reads) {
+        auto row = cast<DictionaryAttr>(attr); auto name = row.getAs<StringAttr>("name").getValue();
+        auto region = llvm::find_if(regions, [&](auto r) { return r.name == name; });
+        require(region != regions.end() && row.getAs<IntegerAttr>("slave").getInt() == region - regions.begin(),
+            "Rocket/Print request bank differs from its allocated slave");
+      }
+      if (!output.empty()) {
+        std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-requests-reverse.mlir" : ".rocket-requests.mlir")).str(), ec);
+        require(!ec, "cannot write Rocket/Print request boundary"); f.root->print(file); file << '\n';
       }
     }
     if (!output.empty()) {

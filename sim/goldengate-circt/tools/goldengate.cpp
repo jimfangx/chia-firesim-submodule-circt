@@ -2837,7 +2837,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlDispatchAnnotations, error)))
         return fail("control dispatch annotations: " + error);
       llvm::outs() << "Dispatched CIRCT control AW/W requests and connected the error endpoint in " << controlDispatchPath << '\n';
-      if (failed(goldengate::bindControlWidgetWrites(circuit, error)))
+      if (failed(goldengate::bindRocketControlWidgetWrites(circuit, error)))
         return fail("control widget writes: " + error);
       if (failed(mlir::verify(*module)))
         return fail("control widget writes produced invalid FIRRTL IR");
@@ -2851,7 +2851,7 @@ int main(int argc, char **argv) {
       module->print(widgetWritesOut); widgetWritesOut << '\n'; widgetWritesOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, widgetWritesAnnotations, error)))
         return fail("control widget write annotations: " + error);
-      llvm::outs() << "Bound CIRCT control AW/W requests to seven implemented widgets in " << widgetWritesPath << '\n';
+      llvm::outs() << "Bound CIRCT control AW/W requests to Rocket and instantiated Print widgets in " << widgetWritesPath << '\n';
       if (failed(goldengate::addControlReadDispatch(circuit, error)))
         return fail("control read dispatch: " + error);
       if (failed(mlir::verify(*module)))
