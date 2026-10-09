@@ -21,7 +21,7 @@ def bindings(text):
         r'\{name = "([^"]+)", port = "([^"]+)", slave = (\d+) : i32\}', rows[0])]
 
 
-def wiring(text, name):
+def wiring(text, name, aggregate=False):
     body = re.search(r'^    firrtl.module @' + name + r'\(.*?^    }', text, re.M | re.S)
     assert body, f'missing native {name}'
     lines = body[0].splitlines()
@@ -42,7 +42,8 @@ def wiring(text, name):
         if match := re.search(r'(%\w+) = firrtl.and (%\w+), (%\w+)', line):
             dest, lhs, rhs = match.groups()
             values[dest] = frozenset(leaf(values[lhs]) | leaf(values[rhs]))
-        if match := re.search(r'firrtl.strictconnect (%\w+), (%\w+)', line):
+        connection = r'firrtl.(?:strictconnect|connect)' if aggregate else r'firrtl.strictconnect'
+        if match := re.search(connection + r' (%\w+), (%\w+)', line):
             dest, src = match.groups()
             assert values[dest] not in nets, f'duplicate {name} driver'
             nets[values[dest]] = values[src]

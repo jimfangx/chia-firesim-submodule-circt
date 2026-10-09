@@ -1731,3 +1731,49 @@ unfinished. Next, attach and bind the actual SimulationMaster bank at expanded
 slave 10, then compare its complete request/response/register path with SFC.
 Manager verification remains owned by the harness; the SFC UART-bearing
 baseline is pending and the overall migration remains incomplete.
+
+### Iteration 76: expanded Rocket/Print SimulationMaster attachment
+
+`mapPrintBridgeRocketSimulationMaster` composes the native Master.scala bank,
+three-word MCRFile adapter, and AW/W/AR/B/R binding after the expanded response
+tracker boundary. It uses the live thirteen-region allocation instead of the
+old eleven-bank indices. SimulationMaster moves from slave 8/base 544 to slave
+10/base 608; its three register addresses become 608, 612, and 616. The bank
+retains its five registers, host clock/reset, and Widget.scala's default
+ReadWrite permissions even for the genROReg/genWOReg-named helpers.
+
+The compiler validates the complete live allocation, instantiated Print
+constructor order, response catalog, and Master register identities/offsets/
+permissions before staging all three operations. A collision after attachment
+or adapter creation leaves the original circuit unchanged. Inspection of the
+first fixture failure corrected the catalog owner: it is retained on
+`GGControlReadArbiterWrapper`, not the later write-tracker wrapper.
+
+Evidence is under mutable `iteration76-print-rocket-master/`. The native
+Rocket/two-Print fixture passes both constructor orders and 94 atomic
+rejections (18 new Master cases). It checks all 32 scalar requests/responses,
+aggregate AR, host clock/reset, consumption of the Master boundary, copied
+port types/directions, unchanged decoder/register catalogs, and retained
+annotation payload/order. The SimulationMaster behavior and generic control
+binding tests also pass. A fresh final native `--compile-baseline` reads the
+immutable compiler fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`
+and `.anno.json`, emits baseline RTL/collateral with empty stderr, and produces
+bank/queue input artifacts identical to the fixture inputs by SHA-256.
+
+`PrintRocketMasterCompare.py` compares actual native SSA wiring with the
+immutable U250 fixture's `design/FireSim-generated.sv`: all 20 surviving SFC
+Master control pins, host clock/reset, five register widths/reset values, and
+three read-word identities match after normalizing the allocation shift. The
+complete native bank operations also match the fresh baseline bank. Both host
+orders pass; `rocket-master-comparison.json` records the exact artifacts and
+addresses. The response, request, MMIO, TracerV stream, and pre-binding catalog
+comparisons retain their SFC matches.
+
+The immutable SFC fixture disables Print. This does not establish full
+Print-enabled platform equivalence or complete driver assembly. TSI, BlockDev,
+and FASED request/response boundaries remain exposed, as does LoadMem's
+register side. Next, compose the native TSI queue/MMIO attachment at slave 3
+with this expanded boundary and compare its register/control path with SFC.
+The full Print-enabled CLI path and driver addresses remain pending. Manager
+verification remains owned by the harness; the SFC UART-bearing baseline and
+overall migration remain incomplete.

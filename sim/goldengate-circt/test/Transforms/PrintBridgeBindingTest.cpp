@@ -532,10 +532,128 @@ void platformCatalog(MLIRContext &ctx, StringRef baseline, StringRef output) {
                << rejected << " atomic rejections (pre-binding allocation only)\n";
 }
 
-// Attach Print hosts after the real Rocket TracerV queue boundary. The earlier
-// fixture contains post-FAME print tokens; its TracerV ports now forward the
-// complete native Rocket hierarchy rather than a stand-in queue.
-// Full Rocket response composition uses actual request banks imported below.
+// Attach the actual Master.scala bank after expanded Rocket/Print responses.
+// Allocation remains derived from the live imported banks and queued hosts.
+void rocketMaster(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto bank = named(f.circuit, "GGSimulationMasterBank");
+  auto registers = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  auto bound = named(f.circuit, "GGPrintBridgeHostWrapper");
+  auto hosts = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    SmallVector<Attribute> rows(regions.begin(), regions.end());
+    NamedAttrList master(cast<DictionaryAttr>(rows[10]));
+    if (bad == 0) master.set("start", b.getI64IntegerAttr(544));
+    if (bad == 1) master.set("slave", b.getI32IntegerAttr(8));
+    if (bad < 2) { rows[10] = master.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows)); }
+    if (bad == 2 || bad == 3) {
+      SmallVector<Attribute> words(registers.begin(), registers.end());
+      if (bad == 2) words.pop_back();
+      else { NamedAttrList word(cast<DictionaryAttr>(words[0])); word.set("writeable", b.getBoolAttr(false)); words[0] = word.getDictionary(ctx); }
+      bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(words));
+    }
+    FModuleOp collision;
+    if (bad == 4 || bad == 5) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(bad == 4 ?
+          "GGSimulationMasterMCRFile" : "GGSimulationMasterBoundWrapper"), original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    if (bad == 7) bound->setAttr("goldengate.printHostBindings", b.getArrayAttr({hosts[1], hosts[0]}));
+    auto state = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeRocketSimulationMaster(f.circuit, error)) &&
+        !error.empty() && dump(*f.root) == state, "invalid expanded master composition mutated IR");
+    ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    bank->setAttr("goldengate.mmioRegisters", registers);
+    bound->setAttr("goldengate.printHostBindings", hosts);
+    if (collision) collision.erase();
+    f.circuit.setName(original.getName());
+  }
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  std::function<Attribute(Attribute)> payload = [&](Attribute a) -> Attribute {
+    if (auto s = dyn_cast<StringAttr>(a)) if (s.getValue().starts_with("~")) return b.getStringAttr("<target>");
+    if (auto rows = dyn_cast<ArrayAttr>(a)) { SmallVector<Attribute> out; for (auto row : rows) out.push_back(payload(row)); return b.getArrayAttr(out); }
+    if (auto row = dyn_cast<DictionaryAttr>(a)) { NamedAttrList out; for (auto field : row) out.set(field.getName(), payload(field.getValue())); return out.getDictionary(ctx); }
+    return a;
+  };
+  require(succeeded(goldengate::mapPrintBridgeRocketSimulationMaster(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGSimulationMasterBoundWrapper" &&
+      top->getAttrOfType<IntegerAttr>("goldengate.simulationMasterSlave").getInt() == 10 &&
+      decoder->getAttr("goldengate.controlRegions") == regions &&
+      bank->getAttr("goldengate.mmioRegisters") == registers, "expanded master identity or allocation changed");
+  require(top.getNumPorts() + 22 == original.getNumPorts(), "expanded master consumed port count differs");
+  for (auto p : top.getPorts()) {
+    auto old = original.getPorts()[port(original, p.name.getValue())];
+    require(old.type == p.type && old.direction == p.direction, "master changed a copied port contract");
+  }
+  std::function<std::string(Value)> key = [&](Value value) -> std::string {
+    if (auto field = value.getDefiningOp<SubfieldOp>()) return key(field.getInput()) + "." + field.getFieldName().str();
+    if (auto inst = value.getDefiningOp<InstanceOp>())
+      return inst.getName().str() + "." + inst.getPortNameStr(cast<OpResult>(value).getResultNumber()).str();
+    if (auto arg = dyn_cast<BlockArgument>(value)) {
+      auto parent = cast<FModuleOp>(arg.getOwner()->getParentOp());
+      return "top." + parent.getPortName(arg.getArgNumber()).str();
+    }
+    throw std::runtime_error("unexpected expanded master value");
+  };
+  std::map<std::string, std::string> actual, expected;
+  for (auto connect : top.getOps<StrictConnectOp>())
+    require(actual.emplace(key(connect.getDest()), key(connect.getSrc())).second, "duplicate expanded master driver");
+  const std::string ctrl = "sim.simulationMaster_ctrl";
+  const StringRef aw[]{"addr", "len", "size", "burst", "lock", "cache", "prot", "qos", "region", "id", "user"};
+  const StringRef w[]{"data", "last", "id", "strb", "user"};
+  for (StringRef ch : {"aw", "w"}) {
+    auto prefix = "sim.ctrl_write_dispatch_slave_10_" + ch.str();
+    auto local = ctrl + "." + ch.str();
+    expected[prefix + "_ready"] = local + ".ready";
+    expected[local + ".valid"] = prefix + "_valid";
+    for (auto field : ch == "aw" ? ArrayRef<StringRef>(aw) : ArrayRef<StringRef>(w)) {
+      bool dispatched = ch == "aw" ? field == "addr" || field == "len" || field == "id" : field == "data" || field == "last";
+      expected[local + ".bits." + field.str()] = (dispatched ? prefix : "sim.ctrl_write_dispatch_master_" + ch.str()) + "_bits_" + field.str();
+    }
+  }
+  for (StringRef ch : {"r", "b"}) {
+    auto prefix = std::string(ch == "r" ? "sim.ctrl_read_arb_in_10" : "sim.ctrl_write_arb_in_10");
+    auto local = ctrl + "." + ch.str();
+    expected[local + ".ready"] = prefix + "_ready";
+    expected[prefix + "_valid"] = local + ".valid";
+    for (StringRef field : {"resp", "id", "user"}) expected[prefix + "_bits_" + field.str()] = local + ".bits." + field.str();
+    if (ch == "r") for (StringRef field : {"data", "last"}) expected[prefix + "_bits_" + field.str()] = local + ".bits." + field.str();
+  }
+  require(actual == expected && actual.size() == 32, "expanded master scalar requests/responses differ");
+  bool ar = false;
+  for (auto connect : top.getOps<ConnectOp>()) if (key(connect.getDest()) == ctrl + ".ar") {
+    require(!ar && key(connect.getSrc()) == "sim.ctrl_read_dispatch_slave_10_ar", "expanded master AR slot differs"); ar = true;
+  }
+  require(ar, "expanded master AR is absent");
+  for (auto p : top.getPorts()) {
+    auto name = p.name.getValue();
+    require(name != "simulationMaster_ctrl" && name != "simulationMaster_mcr" &&
+        !name.starts_with("ctrl_write_dispatch_slave_10_") && name != "ctrl_read_dispatch_slave_10_ar" &&
+        !name.starts_with("ctrl_read_arb_in_10_") && !name.starts_with("ctrl_write_arb_in_10_"),
+        "expanded master consumed port escapes");
+  }
+  // Host clock/reset connect to the actual bank, independently of Print token resets.
+  auto attached = named(f.circuit, "GGSimulationMasterWrapper");
+  std::map<std::string, std::string> clockReset;
+  for (auto connect : attached.getOps<StrictConnectOp>()) clockReset[key(connect.getDest())] = key(connect.getSrc());
+  require(clockReset["simulationMaster.clock"] == "top.hostClock" &&
+      clockReset["simulationMaster.reset"] == "top.hostReset", "expanded master host clock/reset differ");
+  require(payload(f.circuit->getAttr("rawAnnotations")) == payload(raw), "master changed annotation payloads/order");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketSimulationMaster(f.circuit, error)) &&
+      dump(*f.root) == state, "repeated expanded master composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-master-reverse.mlir" : ".rocket-master.mlir")).str(), ec);
+    require(!ec, "cannot write expanded master boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
                      unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
@@ -1016,6 +1134,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
         require(!ec, "cannot write Rocket/Print request boundary"); f.root->print(file); file << '\n';
       }
       rocketResponses(f, reads, output, reverse, rejected);
+      rocketMaster(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);

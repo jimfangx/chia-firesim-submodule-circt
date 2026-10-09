@@ -133,4 +133,10 @@ mlir::LogicalResult mapPrintBridgeControlResponses(
 // banks retain explicit request/response ports for subsequent attachment.
 mlir::LogicalResult mapPrintBridgeRocketControlResponses(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Attach the standalone Master.scala bank and consume its AW/W/AR/B/R at
+// the live expanded Rocket allocation. Input: GGControlWriteTrackerWrapper.
+// Revalidate all region identities/bounds before staging the bank, adapter,
+// and binding together. The remaining TSI/BlockDev/FASED ports stay exposed.
+mlir::LogicalResult mapPrintBridgeRocketSimulationMaster(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
