@@ -1353,3 +1353,53 @@ accepted-response and retirement behavior with the same immutable NastiRouter.
 The prior harness's printf-disabled Rocket regressions passed; this iteration
 runs only native compiler/unit comparisons and leaves manager verification to
 the harness. The complete migration success matrix remains open.
+
+### Iteration 68: selected Print control response composition
+
+`mapPrintBridgeControlResponses` consumes the selected Print/count banks' B/R
+interfaces through the native read tracker, burst-locking read arbiter,
+round-robin write arbiter and write tracker. It checks the complete Print/CPU
+binding catalog, stages all four passes on a clone, verifies the result and
+moves only new modules into the original circuit. A late failure preserves
+existing operations and annotation identities. The resulting boundary is
+`GGControlWriteTrackerWrapper`; master request/response fields and tracker
+match diagnostics remain explicit, while bank responses and tracker capacity
+inputs are connected internally.
+
+Use `--map-print-host-responses` after `--map-print-host-control` in the selected
+`--compile-baseline --stop-after-print-host-binding --map-print-host-cpu-streams`
+flow. Outputs are `post-print-control-responses.mlir`, `.sv` and `-all.json`.
+The mutable evidence directory is `iteration68-print-control-responses/` under
+the U250 generated-source tree. Its selected Rocket/SRAM compilation uses the
+immutable `firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/`
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` and iteration 67's selected
+rf/printf annotations. One Print bank and one CPU count bank yield three
+response sources including the error endpoint, with 64 slots and 12-bit tags
+in each outstanding-transaction tracker.
+
+`PrintControlResponsesCompare.py` compares emitted response retirement and ID
+wiring with the exact immutable U250 `design/FireSim-generated.sv` recorded
+above. Six Print/count/error R/B retirement predicates match: accepted final
+R beats retire reads, and accepted B responses retire writes. Normal SFC MCR
+responses are single-beat, so their optimized predicates specialize R.last to
+one; the error endpoint retains R.last in both outputs. The native general
+boundary preserves R.last for every bank. Actual emitted tracker enqueue,
+capacity, ID, route, arbiter and retirement connections pass. Both outputs
+retain 64 tag/free slots; SFC eliminates unused route-data storage, while the
+native boundary exposes route diagnostics. Annotation classes, non-target
+payloads and ordering are preserved. The previous request/count comparison
+also passes all eight normalized SFC router predicates.
+
+The Print binding test covers two ordered/reversed Print hosts and a preceding
+TracerV stream: all three banks plus error bind to response arbitration, and
+both trackers use four dequeue lanes with two-bit routes. Twelve new malformed
+response compositions, including an unbound decoded region and failure after
+both arbiters materialize, reject without changing the original IR. The focused native response tests
+exercise collision/reset/retirement, stalls, round-robin selection and burst
+locking across dynamic catalog sizes.
+
+Remaining: assemble one coherent MMIO master bundle for the selected banks,
+then integrate platform widget registration, address/driver collateral and
+Print runtime execution. The immutable U250 fixture has printf disabled, so
+this is a comparison of shared router semantics, not a complete Print-enabled
+platform differential. Harness-owned manager gates were not started here.

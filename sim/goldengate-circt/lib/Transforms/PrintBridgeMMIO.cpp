@@ -9,9 +9,14 @@
 #include "goldengate/ControlWriteDispatch.h"
 #include "goldengate/ControlWidgetWrites.h"
 #include "goldengate/ControlReadDispatch.h"
+#include "goldengate/ControlReadTracker.h"
+#include "goldengate/ControlReadArbiter.h"
+#include "goldengate/ControlWriteArbiter.h"
+#include "goldengate/ControlWriteTracker.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/StringMap.h"
 using namespace mlir;
 using namespace circt::firrtl;
 
@@ -84,6 +89,64 @@ LogicalResult goldengate::mapPrintBridgeControlDispatch(CircuitOp circuit,
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleLike>(&op))
       if (!originalNames.count(m.getModuleName())) op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+LogicalResult goldengate::mapPrintBridgeControlResponses(CircuitOp circuit,
+                                                        std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGControlReadDispatchWrapper")
+    return reject("Print control responses require the selected AR dispatch wrapper");
+  FModuleOp top, bound, decoder;
+  for (auto m : circuit.getOps<FModuleOp>()) {
+    if (m.getName() == circuit.getName()) top = m;
+    if (m.getName() == "GGPrintBridgeHostWrapper") bound = m;
+    if (m.getName() == "GGControlAddressDecode") decoder = m;
+  }
+  auto hosts = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
+  auto bindings = top ? top->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings") : ArrayAttr{};
+  auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
+  if (!hosts || hosts.empty() || !bindings || bindings.size() != hosts.size() + 1 ||
+      !regions || regions.size() != bindings.size())
+    return reject("Print control responses require every Print bank and the CPU count bank");
+  // The general response passes can expose unbound slaves. This selected
+  // composition must instead consume the complete implemented bank catalog.
+  llvm::StringMap<StringAttr> expected;
+  for (auto attr : hosts) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
+    auto port = row ? row.getAs<StringAttr>("controlPort") : StringAttr{};
+    if (!name || !port || name.getValue().empty() || port.getValue().empty() ||
+        !expected.try_emplace(name.getValue(), port).second)
+      return reject("Print control responses require unique complete Print identities");
+  }
+  if (!expected.try_emplace("CPUManagedStreamEngine_0",
+        StringAttr::get(circuit.getContext(), "cpuStream_ctrl")).second)
+    return reject("Print control responses collide with the CPU count bank");
+  for (auto attr : bindings) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    auto port = row ? row.getAs<StringAttr>("port") : StringAttr{};
+    auto it = name ? expected.find(name.getValue()) : expected.end();
+    if (it == expected.end() || port != it->second)
+      return reject("Print control response binding differs from the instantiated bank catalog");
+    expected.erase(it);
+  }
+  if (!expected.empty()) return reject("Print control response bank is unbound");
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addControlReadTracker(*staged, error)) ||
+      failed(addControlReadArbiter(*staged, error)) ||
+      failed(addControlWriteArbiter(*staged, error)) ||
+      failed(addControlWriteTracker(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Print control responses produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
   return success();

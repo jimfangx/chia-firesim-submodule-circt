@@ -118,4 +118,9 @@ mlir::LogicalResult mapPrintBridgeCPUStreams(
 // address collateral remain separate boundaries. Fixed U250 Nasti widths.
 mlir::LogicalResult mapPrintBridgeControlDispatch(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Consume every selected bank's B/R response through the native NastiRouter
+// arbiters and 64-slot ID trackers. Input: GGControlReadDispatchWrapper.
+// Stage all four passes; MMIO master bundle and driver assembly follow later.
+mlir::LogicalResult mapPrintBridgeControlResponses(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

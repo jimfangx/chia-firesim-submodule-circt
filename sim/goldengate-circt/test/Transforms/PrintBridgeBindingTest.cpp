@@ -329,6 +329,56 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   auto dispatched = dump(*f.root);
   require(failed(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)) &&
       dump(*f.root) == dispatched, "repeat Print MMIO dispatch must be atomic");
+  require(succeeded(goldengate::mapPrintBridgeControlResponses(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  require(f.circuit.getName() == "GGControlWriteTrackerWrapper", "Print response composition stopped before AW tracking");
+  for (auto p : named(f.circuit, f.circuit.getName()).getPorts()) {
+    auto name = p.name.getValue();
+    require(name != "print_0_ctrl" && name != "print_1_ctrl" && name != "cpuStream_ctrl" &&
+        name != "ctrl_read_dispatch_tracker_ready" && name != "ctrl_write_route_aw_tracker_ready" &&
+        !name.starts_with("ctrl_error_b_") && !name.starts_with("ctrl_error_r_"),
+        "selected bank response or tracker readiness escaped composition");
+  }
+  for (auto name : {"GGControlReadTracker", "GGControlWriteTracker"}) {
+    auto tracker = named(f.circuit, name);
+    require(tracker->getAttrOfType<IntegerAttr>("goldengate.trackerSlots").getInt() == 64 &&
+        tracker->getAttrOfType<IntegerAttr>("goldengate.trackerTagWidth").getInt() == 12 &&
+        tracker->getAttrOfType<IntegerAttr>("goldengate.trackerDequeuePorts").getInt() == 4 &&
+        tracker->getAttrOfType<IntegerAttr>("goldengate.trackerRouteWidth").getInt() == 2,
+        "Print response tracker differs from three banks plus error");
+  }
+  // Check all actual response nets, including the unmapped-address source.
+  for (auto channel : {"r", "b"}) {
+    bool read = StringRef(channel) == "r";
+    std::map<std::string, std::string> connections;
+    auto wrapper = named(f.circuit, read ? "GGControlReadArbiterWrapper" : "GGControlWriteArbiterWrapper");
+    for (auto connect : wrapper.getOps<StrictConnectOp>())
+      if (!isa<BlockArgument>(connect.getSrc()) && !isa<BlockArgument>(connect.getDest()) &&
+          !connect.getSrc().getDefiningOp<AndPrimOp>())
+        connections.emplace(key(connect.getDest()), key(connect.getSrc()));
+    std::string arb = read ? "readArbiter" : "writeArbiter";
+    for (unsigned i = 0; i < 4; ++i) {
+      auto prefix = arb + ".in_" + std::to_string(i) + "_";
+      auto bank = "sim." + std::string(i < 2 ? "print_" + std::to_string(i) + "_ctrl" : "cpuStream_ctrl") + "." + channel;
+      auto errorPrefix = "sim.ctrl_error_" + std::string(channel) + "_";
+      require(connections.at(i < 3 ? bank + ".ready" : errorPrefix + "ready") == prefix + "ready" &&
+          connections.at(prefix + "valid") == (i < 3 ? bank + ".valid" : errorPrefix + "valid"),
+          "Print response valid/readiness detached from arbiter");
+      for (auto field : {"resp", "id", "user"})
+        require(connections.at(prefix + "bits_" + field) ==
+            (i < 3 ? bank + ".bits." + field : errorPrefix + "bits_" + field), "response metadata detached");
+      if (read) for (auto field : {"data", "last"})
+        require(connections.at(prefix + "bits_" + field) ==
+            (i < 3 ? bank + ".bits." + field : errorPrefix + "bits_" + field), "read payload detached");
+    }
+  }
+  if (!output.empty() && !reverse) {
+    std::error_code ec; llvm::raw_fd_ostream out((output + ".responses.mlir").str(), ec);
+    require(!ec, "cannot write Print response composition fixture"); f.root->print(out);
+  }
+  auto responded = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeControlResponses(f.circuit, error)) && dump(*f.root) == responded,
+      "repeat Print response composition must be atomic");
   llvm::outs() << "PASS binding " << (reverse ? "reversed" : "ordered") << " " << evaluations << " handshake/data cases and three-stream CPU composition\n";
 }
 
@@ -405,6 +455,54 @@ void controlRejections(MLIRContext &ctx) {
   llvm::outs() << "PASS eleven atomic Print MMIO composition rejections including failures after adapter creation\n";
 }
 
+void responseRejections(MLIRContext &ctx) {
+  for (unsigned bad = 0; bad < 12; ++bad) {
+    Fixture f(ctx); std::string error; OpBuilder b(&ctx);
+    require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)) &&
+        succeeded(goldengate::mapPrintBridgeCPUStreams(f.circuit, {}, {}, error)) &&
+        succeeded(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)), error);
+    auto top = named(f.circuit, f.circuit.getName());
+    auto bindings = top->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
+    SmallVector<Attribute> rows(bindings.begin(), bindings.end());
+    NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+    if (bad == 0) named(f.circuit, "GGPrintBridgeHostWrapper")->removeAttr("goldengate.printHostBindings");
+    if (bad == 1) rows.pop_back();
+    if (bad == 2) rows[1] = rows[0];
+    if (bad == 3) row.set("port", b.getStringAttr("other"));
+    if (bad == 4) row.set("name", b.getStringAttr("absent"));
+    if (bad == 3 || bad == 4) rows[0] = row.getDictionary(&ctx);
+    top->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
+    if (bad == 5) named(f.circuit, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+    if (bad >= 6 && bad <= 9) {
+      const char *collision[] = {"GGControlReadTracker", "GGControlReadArbiter", "GGControlWriteArbiter", "GGControlWriteTracker"};
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(collision[bad - 6]),
+          ConventionAttr::get(&ctx, Convention::Internal), SmallVector<PortInfo>{});
+    }
+    if (bad == 10) {
+      // Read tracker and both arbiters have already succeeded in staging.
+      SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
+      for (auto &name : names) if (cast<StringAttr>(name).getValue() == "ctrl_write_route_aw_track_valid")
+        name = b.getStringAttr("absentAWAcceptance");
+      top.setPortNames(names);
+    }
+    if (bad == 11) {
+      auto decoder = named(f.circuit, "GGControlAddressDecode");
+      auto catalog = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+      SmallVector<Attribute> extra(catalog.begin(), catalog.end());
+      NamedAttrList unbound(cast<DictionaryAttr>(catalog[0]));
+      unbound.set("name", b.getStringAttr("unboundBank"));
+      unbound.set("slave", b.getI32IntegerAttr(catalog.size()));
+      extra.push_back(unbound.getDictionary(&ctx));
+      decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(extra));
+    }
+    auto before = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeControlResponses(f.circuit, error)) && !error.empty() &&
+        dump(*f.root) == before, "Print response failure mutated circuit " + std::to_string(bad));
+  }
+  llvm::outs() << "PASS twelve atomic Print response rejections including failure after both arbiters\n";
+}
+
 void rejections(MLIRContext &ctx) {
   constexpr unsigned cases = 22;
   for (unsigned bad = 0; bad < cases; ++bad) {
@@ -471,7 +569,7 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx);
+    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
     for (bool reverse : {false, true}) {
       Fixture f(ctx, true, reverse); std::string error, header;
       require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
