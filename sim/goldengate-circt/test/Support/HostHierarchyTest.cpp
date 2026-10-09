@@ -10,6 +10,7 @@
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/ADT/APSInt.h"
 #include <stdexcept>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -29,6 +30,17 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned depth) {
   for (unsigned i = 0; i <= depth; ++i) {
     text += "firrtl.module " + std::string(i ? "private " : "") + "@" + name(i) +
       "(in %clock: !firrtl.clock, in %in: !firrtl.uint<8>, out %out: !firrtl.uint<8>) {\n";
+    if (i == 0)
+      text += "%protocol = firrtl.wire : !firrtl.uint<1>\n"
+        "%disabled = firrtl.constant 0 : !firrtl.uint<1>\n"
+        "firrtl.connect %protocol, %disabled : !firrtl.uint<1>, !firrtl.uint<1>\n";
+    if (i == 2)
+      text += "%zero = firrtl.constant 0 : !firrtl.uint<8>\n"
+        "%predicate = firrtl.neq %in, %zero : (!firrtl.uint<8>, !firrtl.uint<8>) -> !firrtl.uint<1>\n"
+        "%enable = firrtl.constant 1 : !firrtl.uint<1>\n"
+        "firrtl.assert %clock, %predicate, %enable, \"anonymous protocol A\" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>\n"
+        "firrtl.assert %clock, %predicate, %enable, \"anonymous protocol B\" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1>\n"
+        "firrtl.assert %clock, %predicate, %enable, \"named protocol\" : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<1> {name = \"protocol\"}\n";
     auto child = i == depth ? "Target" : name(i + 1);
     text += "%child:3 = firrtl.instance " + std::string(i == depth ? "target" : "sim") +
       " @" + child + "(in clock: !firrtl.clock, in in: !firrtl.uint<8>, out out: !firrtl.uint<8>)\n"
@@ -69,6 +81,26 @@ int main(int argc, char **argv) {
       require(dump(target) == targetBefore, "target body changed");
       unsigned modules = 0; for (auto m : c.getOps<FModuleOp>()) ++modules;
       require(modules == 3, "host wrappers remain or target was flattened");
+      if (depth > 1) {
+        unsigned anonymous = 0, named = 0;
+        c.walk([&](AssertOp assertion) {
+          if (assertion.getMessage().starts_with("anonymous protocol")) {
+            require(assertion.getName().empty(),
+                    "inlined anonymous assertion acquired label: " +
+                        assertion.getName().str());
+            ++anonymous;
+          } else if (assertion.getMessage() == "named protocol") {
+            require(assertion.getName() == "protocol_0",
+                    "named assertion lost collision handling");
+            ++named;
+          }
+          require(assertion.getPredicate().getDefiningOp<NEQPrimOp>() &&
+                  assertion.getEnable().getDefiningOp<ConstantOp>().getValue() == 1 &&
+                  assertion.getClock().getType() == ClockType::get(&ctx),
+                  "assertion predicate, enable or clock changed");
+        });
+        require(anonymous == 2 && named == 1, "inlining lost protocol assertions");
+      }
       auto normalized = dump(*root);
       require(succeeded(goldengate::normalizeHostHierarchy(*root, "/tmp/host-hierarchy-test.sv", count, error)) && count == 0 && dump(*root) == normalized, "normalization is not idempotent");
       if (depth == 98) require(normalized.find("sim_sim_") == std::string::npos, "unbounded instance name prefix remains");
@@ -134,7 +166,7 @@ int main(int argc, char **argv) {
     auto invalid = fixture(ctx, 3); auto c = *invalid->getOps<CircuitOp>().begin();
     c->removeAttr("rawAnnotations"); auto before = dump(*invalid);
     require(failed(goldengate::normalizeHostHierarchy(*invalid, "/tmp/host-hierarchy-test.sv", count, error)) && dump(*invalid) == before, "rejection mutated source");
-    llvm::outs() << "Host hierarchy depth 1/3/98, target preservation, bounded names, XDC references, port/instance symbol identities, idempotence and atomic rejections passed\n";
+    llvm::outs() << "Host hierarchy depth 1/3/98, anonymous assertion controls/names, named assertion collisions, target preservation, bounded names, XDC references, port/instance symbol identities, idempotence and atomic rejections passed\n";
     if (argc == 4) {
       auto baseline = fixture(ctx, 98);
       require(succeeded(goldengate::emitSimulatorRTL(*baseline, "fixture", std::string(argv[3]) + "/baseline.sv", error)), error);

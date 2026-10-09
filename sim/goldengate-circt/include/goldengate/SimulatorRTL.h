@@ -9,6 +9,7 @@ namespace goldengate {
 // before XDC path resolution. Target/bridge/SRAM modules and boundaries owning
 // inner symbols or explicit XDC references stay hierarchical.
 // Native CIRCT inlining maintains connections, annotations and inner symbols.
+// Anonymous side effects remain unnamed; named declarations retain uniqueness.
 // The serialized archive remains historical; inline blackboxes are attached
 // before dead-module elimination and must not be replayed afterwards.
 // Failure leaves the source IR unchanged. Repeated calls are a no-op.

@@ -477,7 +477,14 @@ LogicalResult goldengate::normalizeHostHierarchy(ModuleOp source,
     for (auto *op : shorten) {
       StringRef base = op->getAttrOfType<StringAttr>("name").getValue();
       while (base.consume_front("sim_")) {}
-      op->setAttr("name", StringAttr::get(context, names.newName(base)));
+      // The inliner also prefixes empty names on anonymous side effects.
+      // Preserve anonymity: Namespace::newName("") invents `_0`, which the
+      // backend turns into `assert___0`. Verilator can decode that label's
+      // incomplete `__0` escape as a NUL in its VPI scope name and emit
+      // uncompilable C++.
+      // Nonempty declaration/verification names still need collision handling.
+      op->setAttr("name", StringAttr::get(
+          context, base.empty() ? base : names.newName(base)));
     }
   }
   circuit->setAttr("goldengate.hostHierarchyNormalized", UnitAttr::get(context));
