@@ -3,6 +3,7 @@
 #define GOLDENGATE_CPUSTREAMREAD_H
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "llvm/ADT/ArrayRef.h"
+#include "goldengate/CPUStreamCountBank.h"
 #include <string>
 namespace goldengate {
 // Explicit allocator order of buffered outgoing streams on the active top.
@@ -12,6 +13,14 @@ struct CPUStreamSourcePort {
   std::string portName;
   unsigned depth;
 };
+// Resolve the recorded Rocket outgoing queue through active wrapper connects.
+// Payload and count must reach the same 6144x512 TracerV queue instance. This
+// read-only preflight preserves both output lists on failure; Print streams
+// are appended in their host constructor order by mapPrintBridgeCPUStreams.
+mlir::LogicalResult deriveRocketCPUStreamPorts(
+    circt::firrtl::CircuitOp circuit,
+    llvm::SmallVectorImpl<CPUStreamSourcePort> &sources,
+    llvm::SmallVectorImpl<CPUStreamCountPort> &counts, std::string &error);
 // Consume Decoupled512 outputs into one AXI AR/R interface. Allocate equal
 // windows using ceilLog2(64 * max(depth)); every stream counter follows the
 // global R handshake, as in CPUManagedStreamEngine. No annotations consumed.

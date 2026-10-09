@@ -11,6 +11,14 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
+LogicalResult goldengate::mapPrintBridgeRocketCPUStreams(CircuitOp circuit,
+    std::string &error) {
+  SmallVector<CPUStreamSourcePort> sources;
+  SmallVector<CPUStreamCountPort> counts;
+  if (failed(deriveRocketCPUStreamPorts(circuit, sources, counts, error))) return failure();
+  return mapPrintBridgeCPUStreams(circuit, sources, counts, error);
+}
+
 LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
     ArrayRef<CPUStreamSourcePort> precedingSources,
     ArrayRef<CPUStreamCountPort> precedingCounts, std::string &error) {

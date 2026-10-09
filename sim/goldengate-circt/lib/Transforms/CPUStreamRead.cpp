@@ -18,6 +18,76 @@
 using namespace mlir;
 using namespace circt::firrtl;
 
+LogicalResult goldengate::deriveRocketCPUStreamPorts(CircuitOp circuit,
+    SmallVectorImpl<CPUStreamSourcePort> &sources,
+    SmallVectorImpl<CPUStreamCountPort> &counts, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  auto find = [&](StringRef name) -> FModuleOp {
+    for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == name) return m;
+    return {};
+  };
+  auto top = find(circuit.getName());
+  if (!top) return reject("Rocket CPU stream catalog requires an active top");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx);
+  auto bit = UIntType::get(ctx, 1), word = UIntType::get(ctx, 512);
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
+      {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, word}});
+  Value data, count;
+  for (auto [i, p] : llvm::enumerate(top.getPorts())) {
+    if (p.name == "tracerv_stream" && p.type == token && p.direction == Direction::Out) data = top.getArgument(i);
+    if (p.name == "tracerv_stream_count" && p.type == UIntType::get(ctx, 13) && p.direction == Direction::Out) count = top.getArgument(i);
+  }
+  if (!data || !count) return reject("Rocket CPU stream catalog needs buffered TracerV payload/count ports");
+  using Path = SmallVector<InstanceOp>;
+  struct Endpoint { FModuleOp queue; Path path; unsigned port = 0; };
+  auto trace = [&](Value value) -> Endpoint {
+    Path path; SmallVector<Value> seen;
+    while (value && seen.size() < 4096) {
+      if (llvm::is_contained(seen, value)) return {};
+      seen.push_back(value);
+      Value driver; unsigned drivers = 0;
+      for (auto &op : *value.getParentBlock()) {
+        if (auto c = dyn_cast<ConnectOp>(op)) if (c.getDest() == value) { driver = c.getSrc(); ++drivers; }
+        if (auto c = dyn_cast<StrictConnectOp>(op)) if (c.getDest() == value) { driver = c.getSrc(); ++drivers; }
+      }
+      if (drivers) { if (drivers != 1) return {}; value = driver; continue; }
+      auto inst = value.getDefiningOp<InstanceOp>();
+      auto module = inst ? find(inst.getModuleName()) : FModuleOp{};
+      if (!module) return {};
+      unsigned port = cast<OpResult>(value).getResultNumber();
+      if (module.getPortDirection(port) != Direction::Out) return {};
+      path.push_back(inst);
+      if (module.getName() == "GGTracerVStreamQueue6144") return {module, path, port};
+      value = module.getArgument(port);
+    }
+    return {};
+  };
+  auto payload = trace(data), occupancy = trace(count);
+  if (!payload.queue || !occupancy.queue || payload.path != occupancy.path ||
+      payload.port != 3 || occupancy.port != 4)
+    return reject("Rocket CPU payload/count must forward the same live TracerV queue instance");
+  auto queue = payload.queue;
+  auto info = queue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
+  auto name = info ? info.getAs<StringAttr>("name") : StringAttr{};
+  auto depth = info ? info.getAs<IntegerAttr>("depth") : IntegerAttr{};
+  auto width = info ? info.getAs<IntegerAttr>("widthBytes") : IntegerAttr{};
+  auto index = info ? info.getAs<IntegerAttr>("index") : IntegerAttr{};
+  if (!name || name.getValue() != "TRACERVBRIDGEMODULE_0_to_cpu_stream" ||
+      !depth || depth.getInt() != 6144 || !width || width.getInt() != 64 || !index || index.getInt() != 0 ||
+      queue.getNumPorts() != 5 || queue.getPortType(3) != token || queue.getPortType(4) != UIntType::get(ctx, 13))
+    return reject("Rocket CPU catalog queue identity or geometry differs");
+  unsigned memories = 0;
+  for (auto mem : queue.getOps<MemOp>()) {
+    ++memories;
+    if (mem.getDepth() != 6144 || mem.getDataType() != word)
+      return reject("Rocket CPU catalog queue storage differs from allocation");
+  }
+  if (memories != 1) return reject("Rocket CPU catalog requires one native queue memory");
+  sources.assign({{name.getValue().str(), "tracerv_stream", 6144}});
+  counts.assign({{name.getValue().str(), "tracerv_stream_count", 13}});
+  return success();
+}
+
 LogicalResult goldengate::addCPUStreamRead(CircuitOp circuit, std::string &error) {
   if (circuit.getName() != "GGTracerVStreamQueueWrapper") {
     error = "CPU stream read requires the TracerV queue wrapper";

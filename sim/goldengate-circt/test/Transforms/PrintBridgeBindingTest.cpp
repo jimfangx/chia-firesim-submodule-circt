@@ -5,6 +5,7 @@
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/CPUStreamCountBank.h"
+#include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/SimulationMasterControl.h"
 #include "circt/Dialect/HW/HWDialect.h"
@@ -522,6 +523,103 @@ void platformCatalog(MLIRContext &ctx, StringRef baseline, StringRef output) {
                << rejected << " atomic rejections (pre-binding allocation only)\n";
 }
 
+// Attach Print hosts after the real Rocket TracerV queue boundary. The earlier
+// fixture contains post-FAME print tokens; its TracerV ports now forward the
+// complete native Rocket hierarchy rather than a stand-in queue.
+void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef output) {
+  if (baseline.empty()) return;
+  unsigned rejected = 0;
+  for (bool reverse : {false, true}) {
+    auto rocket = parseSourceFile<ModuleOp>(baseline, &ctx);
+    require(bool(rocket), "cannot parse Rocket queue boundary");
+    auto c = *rocket->getOps<CircuitOp>().begin(); std::string error;
+    SmallVector<goldengate::CPUStreamSourcePort> sources;
+    SmallVector<goldengate::CPUStreamCountPort> counts;
+    auto before = dump(*rocket);
+    require(succeeded(goldengate::deriveRocketCPUStreamPorts(c, sources, counts, error)) &&
+        dump(*rocket) == before && sources.size() == 1 && counts.size() == 1, error);
+    auto queueTop = named(c, c.getName());
+    Fixture f(ctx); OpBuilder b(&ctx);
+    for (auto m : c.getOps<FModuleLike>()) {
+      bool exists = false;
+      for (auto prior : f.circuit.getOps<FModuleLike>()) exists |= prior.getName() == m.getName();
+      require(!exists, "unexpected Rocket/Print module collision");
+      f.circuit.getBodyBlock()->push_back(m->clone());
+    }
+    auto original = named(f.circuit, "Top");
+    auto importedTop = named(f.circuit, queueTop.getName());
+    b.setInsertionPointToStart(original.getBodyBlock());
+    auto instance = b.create<InstanceOp>(f.circuit.getLoc(), importedTop, "rocket");
+    for (StringRef p : {"hostClock", "hostReset"})
+      b.create<ConnectOp>(f.circuit.getLoc(), instance.getResult(port(importedTop, p)), original.getArgument(port(original, p)));
+    for (StringRef p : {"tracerv_stream", "tracerv_stream_count"})
+      b.create<ConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, p)), instance.getResult(port(importedTop, p)));
+    if (reverse) std::reverse(f.hosts.begin(), f.hosts.end());
+    require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)) && succeeded(verify(*f.root)), error);
+    before = dump(*f.root);
+    require(succeeded(goldengate::deriveRocketCPUStreamPorts(f.circuit, sources, counts, error)) &&
+        dump(*f.root) == before, "Rocket stream derivation mutated bound Print circuit");
+    auto reject = [&]() {
+      auto state = dump(*f.root);
+      require(failed(goldengate::mapPrintBridgeRocketCPUStreams(f.circuit, error)) && !error.empty() &&
+          dump(*f.root) == state, "invalid Rocket/Print attachment mutated circuit");
+      auto savedName = sources[0].streamName, savedCount = counts[0].streamName;
+      require(failed(goldengate::deriveRocketCPUStreamPorts(f.circuit, sources, counts, error)) &&
+          sources.size() == 1 && counts.size() == 1 && sources[0].streamName == savedName &&
+          counts[0].streamName == savedCount, "failed derivation changed caller catalog");
+      ++rejected;
+    };
+    auto queue = named(f.circuit, "GGTracerVStreamQueue6144");
+    auto info = queue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
+    for (StringRef key : {"name", "depth", "widthBytes", "index"}) {
+      NamedAttrList bad(info); bad.erase(key); queue->setAttr("goldengate.streamParameters", bad.getDictionary(&ctx));
+      reject(); queue->setAttr("goldengate.streamParameters", info);
+    }
+    auto inner = named(f.circuit, "Top");
+    ConnectOp countConnect;
+    for (auto connect : inner.getOps<ConnectOp>())
+      if (connect.getDest() == inner.getArgument(port(inner, "tracerv_stream_count"))) countConnect = connect;
+    require(bool(countConnect), "missing Rocket count forwarding");
+    auto saved = countConnect.getSrc(); b.setInsertionPoint(countConnect);
+    auto zero = b.create<ConstantOp>(f.circuit.getLoc(), UIntType::get(&ctx, 13), APInt(13, 0));
+    countConnect->setOperand(1, zero.getResult()); reject(); countConnect->setOperand(1, saved); zero.erase();
+    b.setInsertionPoint(countConnect);
+    auto duplicate = b.create<ConnectOp>(f.circuit.getLoc(), countConnect.getDest(), saved);
+    reject(); duplicate.erase();
+    // Two instances of one queue definition still represent distinct storage.
+    b.setInsertionPoint(countConnect);
+    auto otherRocket = b.create<InstanceOp>(f.circuit.getLoc(), importedTop, "otherRocket");
+    countConnect->setOperand(1, otherRocket.getResult(port(importedTop, "tracerv_stream_count")));
+    reject(); countConnect->setOperand(1, saved); otherRocket.erase();
+    require(succeeded(goldengate::mapPrintBridgeRocketCPUStreams(f.circuit, error)) && succeeded(verify(*f.root)), error);
+    auto allocations = named(f.circuit, "GGCPUStreamRead")->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+    auto words = named(f.circuit, "GGCPUStreamCountBank")->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+    require(allocations.size() == 3 && words.size() == 3, "Rocket/Print DMA/count catalog differs");
+    for (unsigned i = 0; i < 3; ++i) {
+      auto stream = cast<DictionaryAttr>(allocations[i]); auto reg = cast<DictionaryAttr>(words[i]);
+      std::string name = i == 0 ? "TRACERVBRIDGEMODULE_0_to_cpu_stream" :
+          "PRINTBRIDGEMODULE_" + std::to_string(i - 1) + "_to_cpu_stream";
+      require(stream.getAs<StringAttr>("name") == name && stream.getAs<IntegerAttr>("index").getInt() == i &&
+          stream.getAs<IntegerAttr>("bufferBaseAddress").getInt() == int64_t(i * 524288) &&
+          reg.getAs<StringAttr>("name") == name + "_count" && reg.getAs<IntegerAttr>("offset").getInt() == i * 4,
+          "Rocket/Print ordered DMA/count allocation differs");
+    }
+    require(succeeded(goldengate::mapCPUStreamControl(f.circuit, 25, 12, error)) && succeeded(verify(*f.root)), error);
+    goldengate::ControlMMIOWidget widget;
+    require(succeeded(goldengate::deriveControlMMIOWidget(f.circuit, "CPUManagedStreamEngine_0", "GGCPUStreamMCRFile",
+        {"GGCPUStreamCountBank"}, widget, error)) && widget.registerCount == 3, error);
+    SmallVector<goldengate::ControlMMIORegion> regions;
+    require(succeeded(goldengate::allocateControlMMIORegions(25, {widget}, regions, error)) &&
+        regions.size() == 1 && regions[0].size == 16, "three CPU occupancy words require a sixteen-byte region");
+    if (!output.empty()) {
+      std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
+      require(!ec, "cannot write Rocket/Print stream boundary"); f.root->print(file); file << '\n';
+    }
+  }
+  llvm::outs() << "PASS actual Rocket queue plus two Print hosts: three live DMA/count bindings, both constructor orders and "
+               << rejected << " atomic rejections\n";
+}
+
 void allocatedHeaders(MLIRContext &ctx, StringRef output) {
   for (bool reverse : {false, true}) {
     Fixture f(ctx); OpBuilder b(&ctx); std::string error, header;
@@ -852,6 +950,7 @@ int main(int argc, char **argv) {
     checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
     allocatedHeaders(ctx, argc > 1 ? argv[1] : "");
     platformCatalog(ctx, argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");
+    rocketStreams(ctx, argc > 3 ? argv[3] : "", argc > 1 ? argv[1] : "");
     for (bool reverse : {false, true}) {
       Fixture f(ctx, true, reverse); std::string error, header;
       require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);

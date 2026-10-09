@@ -1546,3 +1546,44 @@ Remaining: attach the selected queued Print hosts and their occupancy words to
 the complete platform CPU stream catalog, then bind their full-platform MMIO
 requests/responses and emit headers from the resulting actual allocation. No
 harness-owned manager gate was started. The overall migration is incomplete.
+### Iteration 72: Rocket queue identity and appended Print DMA/count words
+
+`deriveRocketCPUStreamPorts` resolves the active top's TracerV payload and
+occupancy ports through FIRRTL wrapper connects to the same queue instance.
+It validates the recorded stream identity, index zero, 6144x512 storage and
+13-bit occupancy. It leaves the circuit and both result lists unchanged on
+failure. The full `--compile-baseline` compiler now uses this derived pair for
+CPU read and count allocation, replacing separate implicit default lists.
+`mapPrintBridgeRocketCPUStreams` uses the same preflight and appends bound Print
+hosts in constructor order through the existing transactional native builders.
+
+Evidence is under mutable `iteration72-print-rocket-streams/`. The native
+binding test imports the actual candidate `post-fame-tracerv-stream-queue.mlir`
+hierarchy into the two-domain Print token fixture, forwards its queue outputs,
+then binds the Print hosts and materializes one shared CPU read/count transport.
+Both constructor orders preserve TracerV at index zero and append Print at
+indices one/two with DMA bases 524288/1048576. The live count words have offsets
+0/4/8; the native MCR adapter derives three words, requiring a 16-byte region.
+Fourteen rejection cases cover missing identity/geometry metadata, detached or
+multiply driven counts, and a count from another instance of the same queue
+definition. Existing binding, decoder, header and response tests still pass.
+The multi-stream transport interpreter passes 196241 SSA cases, including
+global R-handshake counter updates under backpressure and unselected streams.
+
+Fresh native compilation reads the immutable compiler oracle's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` and `.anno.json` and emits
+complete baseline RTL/collateral with empty stderr. `PrintRocketStreamsCompare.py`
+compares the candidate against the immutable U250 fixture's
+`design/FireSim-generated.sv`: all three CPU read handshake predicates, 19-bit
+DMA window selector, queue capacity/width and 13-bit count forwarding match.
+It also checks both expanded native allocation/count artifacts.
+`PrintPlatformCatalogCompare.py` again matches all eleven baseline AW/AR regions
+and slave bindings against that same golden artifact.
+
+The SFC fixture disables Print. The expanded stream test is an IR attachment
+boundary with explicit Print token inputs, not a runnable complete Print-enabled
+platform. The pre-binding catalog test still has its original one-word count
+bank; it must not be confused with the expanded three-word transport. Next,
+carry this expanded count bank into the full Rocket MMIO catalog and dispatch,
+then derive full-platform Print driver addresses. Manager gates remain owned by
+the verification harness; the SFC UART-bearing workload baseline is still pending.

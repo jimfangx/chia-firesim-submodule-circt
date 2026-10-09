@@ -2373,7 +2373,11 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerQueueAnnotations, error)))
         return fail("TracerV stream queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TracerV CPU stream in " << tracerQueuePath << '\n';
-      if (failed(goldengate::addCPUStreamRead(circuit, error)))
+      SmallVector<goldengate::CPUStreamSourcePort> rocketStreams;
+      SmallVector<goldengate::CPUStreamCountPort> rocketCounts;
+      if (failed(goldengate::deriveRocketCPUStreamPorts(circuit, rocketStreams, rocketCounts, error)))
+        return fail("Rocket CPU stream catalog: " + error);
+      if (failed(goldengate::addCPUStreamRead(circuit, rocketStreams, error)))
         return fail("CPU stream read transport: " + error);
       if (failed(mlir::verify(*module)))
         return fail("CPU stream read transport produced invalid FIRRTL IR");
@@ -2388,7 +2392,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuReadAnnotations, error)))
         return fail("CPU stream read transport annotations: " + error);
       llvm::outs() << "Mapped CIRCT CPU stream read transport in " << cpuReadPath << '\n';
-      if (failed(goldengate::addCPUStreamCountBank(circuit, error)))
+      if (failed(goldengate::addCPUStreamCountBank(circuit, rocketCounts, error)))
         return fail("CPU stream count bank: " + error);
       if (failed(mlir::verify(*module)))
         return fail("CPU stream count bank produced invalid FIRRTL IR");

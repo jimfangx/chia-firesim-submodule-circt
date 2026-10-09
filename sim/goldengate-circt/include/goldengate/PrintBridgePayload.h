@@ -112,6 +112,10 @@ mlir::LogicalResult mapPrintBridgeCPUStreams(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<CPUStreamSourcePort> precedingSources,
     llvm::ArrayRef<CPUStreamCountPort> precedingCounts, std::string &error);
+// Recorded Rocket platform: derive its live TracerV payload/count pair, then
+// append the bound Print hosts to the shared outgoing DMA and MCR allocation.
+mlir::LogicalResult mapPrintBridgeRocketCPUStreams(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 // Allocate implemented Print configuration banks and the live CPU count bank
 // through native MMIO AW/W/AR dispatch. Input: GGCPUStreamCountWrapper.
 // Stage and verify the whole composition; response arbitration and driver
