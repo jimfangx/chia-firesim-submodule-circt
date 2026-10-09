@@ -4,6 +4,7 @@
 #include "goldengate/ChannelExcision.h"
 #include "goldengate/ExtractModel.h"
 #include "goldengate/FAMEDefaults.h"
+#include "goldengate/FAMEAnnotations.h"
 #include "goldengate/FAMEHostControl.h"
 #include "goldengate/FAMEClockEnable.h"
 #include "goldengate/FAMEClockChannel.h"
@@ -602,7 +603,8 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
     }
   }
   // Prepared annotations use canonical local targets. Only the SFC memory,
-  // channel and DontTouch schemas have a defined payload-transfer policy here.
+  // channel, debug and DontTouch schemas have a defined payload-transfer policy
+  // here.
   // Unknown target-bearing metadata must not be silently rewritten as text.
   std::function<bool(Attribute)> referencesData = [&](Attribute attr) {
     if (auto spelling = dyn_cast<StringAttr>(attr))
@@ -615,8 +617,28 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
       });
     return false;
   };
+  std::map<std::string, std::string> debugRenames;
   for (auto attr : raw) {
     Annotation anno(attr);
+    if (anno.isClass(AnnotationClasses::InternalFpgaDebug)) {
+      auto spelling = anno.getMember<StringAttr>("target");
+      std::string local = spelling ? spelling.getValue().str() : std::string();
+      if (spelling && !spelling.getValue().starts_with("~")) {
+        auto circuitAndRest = spelling.getValue().split('.');
+        auto moduleAndRef = circuitAndRest.second.split('.');
+        if (circuitAndRest.first == circuit.getName())
+          local = "~" + circuitAndRest.first.str() + "|" +
+                  moduleAndRef.first.str() + ">" + moduleAndRef.second.str();
+      }
+      auto replacement = renames.find(local);
+      if (replacement != renames.end() || referencesData(attr)) {
+        if (cast<DictionaryAttr>(attr).size() != 2 || replacement == renames.end()) {
+          error = "SRAM FAME debug selection needs a single ground port target";
+          return failure();
+        }
+        debugRenames.insert(*replacement);
+      }
+    }
     if (anno.isClass(AnnotationClasses::CombinationalPath) && referencesData(attr)) {
       // CheckCombLoops emits an ordered source list and a sink, then SFC's
       // hostDecouplingRenames transfers those references to channel payloads.
@@ -639,6 +661,7 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
       }
     }
     if (referencesData(attr) && !anno.isClass(AnnotationClasses::DontTouch) &&
+        !anno.isClass(AnnotationClasses::InternalFpgaDebug) &&
         !anno.isClass(AnnotationClasses::CombinationalPath) &&
         !anno.isClass(AnnotationClasses::ChannelPorts) &&
         !anno.isClass(AnnotationClasses::ChannelConnection) &&
@@ -736,7 +759,11 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
         llvm::any_of(models, [&](FModuleOp model) {
           return spelling.getValue().starts_with(target(model, ""));
         })) continue;
-    updated.push_back(rename(attr));
+    // ComponentName debug selections retain their legacy spelling. Transfer
+    // only the schema's target after all payload ports exist, using the same
+    // validated helper as the single-hub FAME compiler path.
+    updated.push_back(anno.isClass(AnnotationClasses::InternalFpgaDebug)
+                          ? attr : rename(attr));
   }
   circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), updated));
   for (auto model : models) {
@@ -779,16 +806,20 @@ LogicalResult rewriteSRAMFAMEImpl(CircuitOp circuit, unsigned &rewritten,
   if (withParent) {
     rewriteSRAMTopPassthroughs(hierarchy->top, passthroughs);
     if (failed(removeFAMEStaleTopClocks(hierarchy->top, error))) return failure();
-    // SimWrapper keeps SRAM command pipes and ready/valid pairs as distinct
-    // transports. Normalize external pair payloads before wrapper activation
-    // transfers their retained targets and before any wrapper instantiation.
-    if (withQueues && (failed(addRemainingFanoutAnnotations(circuit, error)) ||
-        failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
-        failed(addFAMEPipeWrapper(circuit, error)) ||
-        failed(addFAMEBoundaryReadyValidChannels(circuit, error)) ||
-        failed(addFAMEClockChannel(circuit, error)) ||
-        failed(activateFAMEPipeWrapper(circuit, error)))) return failure();
   }
+  for (const auto &[oldTarget, payloadTarget] : debugRenames)
+    if (failed(transferFAMEPortDebugTargets(circuit, oldTarget, payloadTarget, error)))
+      return failure();
+  // SimWrapper keeps SRAM command pipes and ready/valid pairs as distinct
+  // transports. Normalize external pair payloads before wrapper activation
+  // transfers their retained targets and before any wrapper instantiation.
+  if (withParent && withQueues &&
+      (failed(addRemainingFanoutAnnotations(circuit, error)) ||
+       failed(addFAMEBoundaryPipeChannels(circuit, error)) ||
+       failed(addFAMEPipeWrapper(circuit, error)) ||
+       failed(addFAMEBoundaryReadyValidChannels(circuit, error)) ||
+       failed(addFAMEClockChannel(circuit, error)) ||
+       failed(activateFAMEPipeWrapper(circuit, error)))) return failure();
   return success();
 }
 } // namespace

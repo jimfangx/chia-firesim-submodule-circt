@@ -299,6 +299,50 @@ if(NOT parent_fired_count EQUAL 65 OR parent_fir MATCHES "circuit GGFAMEPipeWrap
 endif()
 message(STATUS "Passed native parent/SRAM FAME boundary before queue construction")
 
+# Debug selections use both ReferenceTarget and SFC ComponentName spelling.
+# Transfer only their target member, preserve duplicates and signed payloads,
+# and leave functional FAME hardware unchanged.
+file(READ "${FIXTURES}/SRAMModelChannels.json" debug_annos)
+string(JSON debug_count LENGTH "${debug_annos}")
+foreach(probe "~FAMETop|ram>r.addr" "FAMETop.ram.r.addr"
+              "~FAMETop|ram>r.data" "FAMETop.ram.r.data" "FAMETop.ram.r.addr")
+  string(JSON debug_annos SET "${debug_annos}" ${debug_count}
+    "{\"class\":\"midas.InternalFirrtlFpgaDebugAnnotation\",\"target\":\"${probe}\"}")
+  math(EXPR debug_count "${debug_count} + 1")
+endforeach()
+file(WRITE "${OUTPUT}/debug.json" "${debug_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/single.fir"
+  --annotation-file "${OUTPUT}/debug.json"
+  --output-dir "${OUTPUT}/debug" --rewrite-sram-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM debug transfer failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/debug/post-sram-fame.fir" debug_fir)
+if(NOT debug_fir STREQUAL fame_fir)
+  message(FATAL_ERROR "Debug selections changed SRAM FAME hardware")
+endif()
+file(READ "${OUTPUT}/debug/post-sram-fame-all.json" debug_output)
+foreach(probe "~FAMETop|ram>r_addr_sink.bits" "FAMETop.ram.r_addr_sink.bits"
+              "~FAMETop|ram>r_data_source.bits" "FAMETop.ram.r_data_source.bits")
+  string(FIND "${debug_output}" "\"${probe}\"" found)
+  if(found LESS 0)
+    message(FATAL_ERROR "SRAM debug payload target missing: ${probe}")
+  endif()
+endforeach()
+string(JSON debug_annos SET "${debug_annos}" ${debug_count}
+  "{\"class\":\"midas.InternalFirrtlFpgaDebugAnnotation\",\"target\":\"~FAMETop|ram>r.addr\",\"unrelated\":\"~FAMETop|ram>r.data\"}")
+file(WRITE "${OUTPUT}/invalid-debug.json" "${debug_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/single.fir"
+  --annotation-file "${OUTPUT}/invalid-debug.json"
+  --output-dir "${OUTPUT}/invalid-debug" --rewrite-sram-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(status EQUAL 0 OR NOT stderr MATCHES "debug selection needs a single ground port target" OR
+   EXISTS "${OUTPUT}/invalid-debug/post-sram-fame.fir")
+  message(FATAL_ERROR "Malformed debug metadata was not rejected atomically: ${stdout}\n${stderr}")
+endif()
+message(STATUS "Passed SRAM debug payload identity and strict metadata rejection")
+
 # Bridge passthroughs are promoted top connections, not model ports. Exercise
 # unsigned and signed payloads and retained source-list order/multiplicity.
 file(READ "${FIXTURES}/SRAMModelChannels.fir" passthrough_fir)
@@ -371,6 +415,28 @@ foreach(index RANGE 0 ${metadata_last})
 endforeach()
 if(NOT path_matches EQUAL 1)
   message(FATAL_ERROR "Top passthrough lost or duplicated CombinationalPath")
+endif()
+set(passthrough_debug "${passthrough_annos}")
+set(passthrough_debug_count ${passthrough_count})
+foreach(probe "~FAMETop|FAMETop>signed_in" "FAMETop.FAMETop.signed_out")
+  string(JSON passthrough_debug SET "${passthrough_debug}" ${passthrough_debug_count}
+    "{\"class\":\"midas.InternalFirrtlFpgaDebugAnnotation\",\"target\":\"${probe}\"}")
+  math(EXPR passthrough_debug_count "${passthrough_debug_count} + 1")
+endforeach()
+file(WRITE "${OUTPUT}/passthrough-debug.json" "${passthrough_debug}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/passthrough.fir"
+  --annotation-file "${OUTPUT}/passthrough-debug.json"
+  --output-dir "${OUTPUT}/passthrough-debug" --rewrite-sram-parent-fame
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Signed passthrough debug transfer failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/passthrough-debug/post-sram-parent-fame.fir" passthrough_debug_fir)
+file(READ "${OUTPUT}/passthrough-debug/post-sram-parent-fame-all.json" passthrough_debug_output)
+string(FIND "${passthrough_debug_output}" "~FAMETop|FAMETop>external_signed_in_sink.bits" input_probe)
+string(FIND "${passthrough_debug_output}" "FAMETop.FAMETop.external_signed_out_source.bits" output_probe)
+if(NOT passthrough_debug_fir STREQUAL passthrough_output OR input_probe LESS 0 OR output_probe LESS 0)
+  message(FATAL_ERROR "Signed passthrough debug changed hardware or lost payload identity")
 endif()
 string(JSON passthrough_annos SET "${passthrough_annos}" ${passthrough_count}
   "{\"class\":\"example.UnsupportedPortAnnotation\",\"target\":\"~FAMETop|FAMETop>loop_in\"}")

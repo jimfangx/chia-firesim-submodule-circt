@@ -974,6 +974,53 @@ supports a completion-monitoring diagnosis, not a target RTL failure. The
 harness gate remains failed, and no manager action or unrelated session was
 modified. Selected-memory runtime verification remains pending with the harness.
 
+## SRAM FAME debug target transfer (iteration 61)
+
+The native SRAM FAME boundary now transfers
+`midas.InternalFirrtlFpgaDebugAnnotation` selections from replaced scalar
+ports to their channel payload fields. It uses the same validated
+`transferFAMEPortDebugTargets` helper as the single-hub compiler path. Modern
+ReferenceTarget and legacy ComponentName spellings retain their respective
+formats. Only the schema's target member is transferred; extra members on an
+affected debug annotation are rejected before publishing the staged rewrite.
+Top passthrough selections are transferred after their payload ports exist
+and before queue construction changes the circuit identity.
+
+The unchanged SFC `FAMETransform.hostDecouplingRenames` is the reference.
+Before this fix, the legacy selections survived native compilation with names
+of erased ports; modern selections were rejected as unsupported metadata.
+The new `SRAMDebugTargetsOracle.scala` independently runs SFC preparation and
+FAME on mutable Rocket inputs. It first checks their port and memory contracts
+against the immutable compiler artifact:
+
+```
+/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir
+```
+
+Both the scalar and grouped Rocket cases match all six SFC probe identities,
+duplicate coalescing, and resolved integer payload types. Wrapper selections
+are compared through their actual instance connections, allowing different
+generated top port names. Native Rocket FAME hardware is unchanged from the
+pre-fix candidate. The SRAM channel CTest also checks modern/legacy memory
+port selectors through LowerTypes, signed top passthrough selections, unchanged
+hardware, and rejection of malformed debug metadata. All five related SRAM,
+FAME annotation, LowerTypes and AutoILA CTests pass.
+
+Evidence is in the mutable U250 generated directory's
+`iteration61-sram-debug/`: `build-tool.log`, `before-comparison.log`,
+`before-modern.log`, `comparison-golden.log`, `ctest-related.log`, and the
+independent expected FIRRTL/annotation outputs. Compile the new oracle against
+the MIDAS runtime classpath and invoke it with the evidence directory and the
+immutable `.sfc.fir` path as its two arguments. No Scala transform runs on
+the native candidate.
+
+The complete iteration-60 timeout logs show the bare target passed with
+checksum `0x4d81038d93425513`, exited with status zero, and emulated 35,330
+cycles in two seconds. Manager polling continued to report the unrelated
+SPEC17 `fsim0` session. Local UART and the simulator stderr tail are preserved
+in the evidence directory. The harness gate remains failed; no manager action
+or unrelated process was modified.
+
 ## Remaining scope
 
 Shared SRAM definitions now have a combined native FAME, transport, timing-model
@@ -982,8 +1029,11 @@ execute through full FireSim compiler assembly; the ordinary configuration
 selects no optional memories. Selected-memory Rocket runtime verification
 remains pending. Legacy retained domain-clock annotations have
 the same erased top-clock references as SFC after FAME; later consumers must
-use captured domain identity. The next smallest step is harness verification of
-the selected-memory Rocket candidate, then selected-memory debug host assembly.
+use captured domain identity. The next smallest compiler step is to exercise
+selected-memory AutoILA host assembly with these transferred probes, then
+remove its existing full-compiler guard once the emitted host wiring and
+collateral match SFC. Selected-memory runtime verification remains owned by
+the harness.
 Ready/valid top passthroughs and inter-model
 ready/valid endpoints remain unsupported at this optional boundary.
 Readwrite/wider memory shapes and FAME-5 remain separate incomplete work.
