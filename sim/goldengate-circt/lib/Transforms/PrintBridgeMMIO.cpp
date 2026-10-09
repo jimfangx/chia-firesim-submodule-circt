@@ -13,6 +13,15 @@
 #include "goldengate/ControlReadArbiter.h"
 #include "goldengate/ControlWriteArbiter.h"
 #include "goldengate/ControlWriteTracker.h"
+#include "goldengate/BlockDevTokenEngine.h"
+#include "goldengate/BlockDevRequestQueue.h"
+#include "goldengate/BlockDevDataQueue.h"
+#include "goldengate/BlockDevReadResponseQueue.h"
+#include "goldengate/BlockDevWriteAckQueue.h"
+#include "goldengate/BlockDevMMIOBank.h"
+#include "goldengate/BlockDevWriteLatency.h"
+#include "goldengate/BlockDevReadLatency.h"
+#include "goldengate/BlockDevResponseScheduler.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
 #include "goldengate/TSIMMIOBank.h"
@@ -405,6 +414,93 @@ LogicalResult goldengate::mapPrintBridgeRocketTSI(CircuitOp circuit,
       failed(mapTSIBridgeControl(*staged, 25, 12, error)) ||
       failed(bindTSIBridgeControl(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print TSI produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// BlockDevBridgeModule.scala binds nine FAME channels, four functional queues,
+// and target-cycle timing. Preserve the allocated bank while completing that path.
+// Allocate from the actual expanded bank catalog, then stage all operations so
+// a missing channel, malformed bank or late wrapper collision leaves IR intact.
+LogicalResult goldengate::mapPrintBridgeRocketBlockDev(CircuitOp circuit,
+                                                std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGTSIBridgeBoundWrapper")
+    return reject("Rocket Print BlockDev requires the completed TSI boundary");
+  auto find = [](CircuitOp c, StringRef name) -> FModuleOp {
+    for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
+    return {};
+  };
+  auto bound = find(circuit, "GGPrintBridgeHostWrapper");
+  auto decoder = find(circuit, "GGControlAddressDecode");
+  auto bank = find(circuit, "GGBlockDevMMIOBank");
+  auto hosts = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
+  auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
+  auto words = bank ? bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters") : ArrayAttr{};
+  if (!hosts || hosts.empty() || !regions || regions.size() != hosts.size() + 11 ||
+      !words || words.size() != 26)
+    return reject("Rocket Print BlockDev requires the expanded allocation and 26 BlockDev words");
+  const StringRef names[]{"read_latency", "write_latency", "bdev_nsectors", "bdev_max_req_len",
+      "bdev_req_valid", "bdev_req_write", "bdev_req_offset", "bdev_req_len", "bdev_req_tag", "bdev_req_ready",
+      "bdev_data_valid", "bdev_data_data_upper", "bdev_data_data_lower", "bdev_data_tag", "bdev_data_ready",
+      "bdev_rresp_data_upper", "bdev_rresp_data_lower", "bdev_rresp_tag", "bdev_rresp_valid", "bdev_rresp_ready",
+      "bdev_wack_tag", "bdev_wack_valid", "bdev_wack_ready", "bdev_reqs_pending", "bdev_wack_stalled", "bdev_rresp_stalled"};
+  for (auto [i, attr] : llvm::enumerate(words)) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto offset = row ? row.getAs<IntegerAttr>("offset") : IntegerAttr{};
+    auto read = row ? row.getAs<BoolAttr>("readable") : BoolAttr{};
+    auto write = row ? row.getAs<BoolAttr>("writeable") : BoolAttr{};
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    if (!name || name.getValue() != names[i] || !offset ||
+        offset.getValue().getBitWidth() > 64 || offset.getInt() != int64_t(4 * i) ||
+        !read || read.getValue() != (i != 2 && i != 3) || !write || !write.getValue())
+      return reject("Rocket Print BlockDev register identity, offset or permissions differ");
+  }
+  SmallVector<FModuleOp> printHosts;
+  llvm::StringSet<> identities;
+  for (auto attr : hosts) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
+    auto symbol = row ? row.getAs<StringAttr>("hostModule") : StringAttr{};
+    auto host = symbol ? find(circuit, symbol.getValue()) : FModuleOp{};
+    if (!name || name.getValue() != "PrintBridgeModule_" + std::to_string(printHosts.size()) ||
+        !host || !identities.insert(host.getName()).second)
+      return reject("Rocket Print BlockDev requires instantiated constructor order");
+    printHosts.push_back(host);
+  }
+  SmallVector<ControlMMIOWidget> widgets;
+  SmallVector<ControlMMIORegion> allocated;
+  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+    return failure();
+  if (allocated.size() != regions.size()) return reject("Rocket Print BlockDev allocation count differs");
+  for (auto [i, region] : llvm::enumerate(allocated)) {
+    auto row = dyn_cast<DictionaryAttr>(regions[i]);
+    auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr{};
+    auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr{};
+    auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr{};
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    if (!name || name.getValue() != region.name || !start || !size || !slave ||
+        start.getValue().getBitWidth() > 64 || size.getValue().getBitWidth() > 64 ||
+        slave.getValue().getBitWidth() > 64 || start.getInt() != int64_t(region.start) ||
+        size.getInt() != int64_t(region.size) || slave.getInt() != int64_t(i))
+      return reject("Rocket Print BlockDev region differs from the live register allocation");
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addBlockDevTokenEngine(*staged, error)) ||
+      failed(addBlockDevRequestQueue(*staged, error)) || failed(addBlockDevDataQueue(*staged, error)) ||
+      failed(addBlockDevReadResponseQueue(*staged, error)) || failed(addBlockDevWriteAckQueue(*staged, error)) ||
+      failed(attachBlockDevMMIOBank(*staged, find(*staged, "GGBlockDevMMIOBank"), error)) ||
+      failed(mapBlockDevBridgeControl(*staged, 25, 12, error)) || failed(bindBlockDevBridgeControl(*staged, error)) ||
+      failed(addBlockDevWriteLatency(*staged, error)) || failed(addBlockDevReadLatency(*staged, error)) ||
+      failed(addBlockDevResponseScheduler(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print BlockDev produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

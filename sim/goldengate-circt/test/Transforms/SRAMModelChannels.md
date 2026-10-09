@@ -1832,3 +1832,49 @@ BlockDev channels and compose its native timing/queue/MMIO path at slave 0
 through this expanded boundary, comparing its register/control path with SFC.
 Manager verification remains harness-owned. The SFC UART-bearing baseline,
 FPGA execution and overall compiler migration remain incomplete.
+
+## Iteration 78: expanded Rocket/Print BlockDev boundary
+
+`mapPrintBridgeRocketBlockDev` composes the existing native BlockDev token,
+request/data/read-response/write-ack queues, 26-word bank, allocated control
+adapter, latency pipes, and write-priority response scheduler after the live
+expanded Print/TSI boundary. It validates every bank word's identity, offset,
+and permissions and re-derives the whole thirteen-bank allocation before
+staging operations on a cloned CIRCT circuit. The actual allocated bank is
+attached without replacing its operation or registry. Missing channels,
+mismatched clocks, stale allocation, malformed metadata, and late adapter,
+binding or scheduler collisions reject without changing the input circuit.
+
+The fixture forwards the nine actual Rocket BlockDev ports, nested forward
+valid/ready descriptors and original constructor metadata, in addition to the
+five TSI channels. Both Print constructor orders retain all nine completed
+BlockDev channel annotations and one one-tracker constructor. All four queues
+have independent instances; their shared reset is the engine's qualified
+host-or-target reset. Timing uses the engine's target cycle counter and MMIO
+latencies. The control adapter consumes slave 0's AW/W/AR/B/R boundaries.
+The remaining latency/reset/tFire diagnostics are preserved as in the native
+pipeline rather than treated as external target channels.
+
+`PrintRocketBlockDevCompare.py` compares both emitted boundaries against the
+immutable U250 SFC `design/FireSim-generated.sv`: BlockDevBridgeModule's 26
+register identities and permissions (two geometry words are write-only), 31
+register/state widths, 24 read slots, four queue depths/payload widths
+(10/66, 32/65, 32/65, 4/1), qualified queue reset, and 20 surviving SFC control
+pins. The actual native bank, token engine, queue definitions, adapter, latency
+pipes and response scheduler must also match the fresh native Rocket candidate
+operations. Actual queue/MMIO/scheduler/latency SSA connections and slave 0's
+0--127 byte AW/AR region are checked, with no tail-bank allocation normalization
+needed for BlockDev.
+
+Evidence lives under the mutable generated-source directory's
+`iteration78-print-rocket-blockdev/`: fresh native compilation, expanded fixture,
+focused BlockDev token/queue/MMIO/control/timing tests, and structured comparisons.
+The fixture passes both constructor orders and 138 atomic rejection cases;
+all ten focused BlockDev tests and all eight Rocket/Print structured comparison
+scripts pass. FireSim manager gates for this checkpoint remain harness-owned.
+The immutable SFC fixtures are read-only. Its Rocket configuration disables
+Print: this establishes a shared BlockDev boundary, not complete Print-enabled
+platform/driver or FPGA execution equivalence. FASED, LoadMem register-side
+assembly, the UART-bearing SFC runtime baseline and hardware validation remain
+pending. Next: forward actual Rocket FASED channels and attach its native MMIO
+and timing path at allocated slave 1 in the expanded Print platform.

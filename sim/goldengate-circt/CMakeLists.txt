@@ -392,6 +392,15 @@ if(BUILD_TESTING)
     lib/Transforms/ControlReadArbiter.cpp
     lib/Transforms/ControlWriteArbiter.cpp
     lib/Transforms/ControlWriteTracker.cpp
+    lib/Transforms/BlockDevTokenEngine.cpp
+    lib/Transforms/BlockDevRequestQueue.cpp
+    lib/Transforms/BlockDevDataQueue.cpp
+    lib/Transforms/BlockDevReadResponseQueue.cpp
+    lib/Transforms/BlockDevWriteAckQueue.cpp
+    lib/Transforms/BlockDevMMIOBank.cpp
+    lib/Transforms/BlockDevWriteLatency.cpp
+    lib/Transforms/BlockDevReadLatency.cpp
+    lib/Transforms/BlockDevResponseScheduler.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp

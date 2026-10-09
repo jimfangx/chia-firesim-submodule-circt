@@ -738,6 +738,110 @@ void rocketTSI(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   }
 }
 
+void rocketBlockDev(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto bank = named(f.circuit, "GGBlockDevMMIOBank");
+  auto words = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  for (unsigned bad = 0; bad < 11; ++bad) {
+    if (bad < 2) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end()); NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+      row.set(bad == 0 ? "start" : "slave", b.getI64IntegerAttr(bad == 0 ? 128 : 10));
+      rows[0] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 2) {
+      SmallVector<Attribute> rows(words.begin(), words.end()); NamedAttrList row(cast<DictionaryAttr>(rows[25]));
+      row.set("writeable", b.getBoolAttr(false)); rows[25] = row.getDictionary(ctx);
+      bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+    }
+    if (bad == 7 || bad == 8) {
+      auto source = bad == 7 ? words : regions;
+      SmallVector<Attribute> rows(source.begin(), source.end()); NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+      row.erase("name"); rows[0] = row.getDictionary(ctx);
+      (bad == 7 ? bank : decoder)->setAttr(bad == 7 ? "goldengate.mmioRegisters" : "goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 3) {
+      SmallVector<Attribute> rows;
+      for (auto attr : raw) { auto row = cast<DictionaryAttr>(attr);
+        auto name = row.getAs<StringAttr>("globalName");
+        if (!name || name.getValue() != "ep_reset") rows.push_back(attr); }
+      f.circuit->setAttr("rawAnnotations", b.getArrayAttr(rows));
+    }
+    FModuleOp collision;
+    if (bad == 4 || bad == 5 || bad == 9) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(bad == 4 ?
+          "GGBlockDevMCRFile" : bad == 5 ? "GGBlockDevBridgeBoundWrapper" : "GGBlockDevResponseScheduler"), original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 10) {
+      SmallVector<Attribute> rows;
+      for (auto attr : raw) {
+        auto row = cast<DictionaryAttr>(attr); auto name = row.getAs<StringAttr>("globalName");
+        if (name && name.getValue() == "ep_reset") {
+          NamedAttrList changed(row); changed.set("clock", b.getStringAttr("~Wrong|Clock>clk"));
+          attr = changed.getDictionary(ctx);
+        }
+        rows.push_back(attr);
+      }
+      f.circuit->setAttr("rawAnnotations", b.getArrayAttr(rows));
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    auto state = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeRocketBlockDev(f.circuit, error)) &&
+        !error.empty() && dump(*f.root) == state, "invalid expanded BlockDev composition mutated IR"); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions); bank->setAttr("goldengate.mmioRegisters", words);
+    f.circuit->setAttr("rawAnnotations", raw); if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketBlockDev(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  auto bound = named(f.circuit, "GGBlockDevBridgeBoundWrapper");
+  require(top.getName() == "GGBlockDevResponseSchedulerWrapper" &&
+      bound->getAttrOfType<IntegerAttr>("goldengate.blockdevSlave").getInt() == 0 &&
+      decoder->getAttr("goldengate.controlRegions") == regions && bank->getAttr("goldengate.mmioRegisters") == words,
+      "expanded BlockDev identity or allocation differs");
+  require(bool(child(named(f.circuit, "GGBlockDevMMIOWrapper"), bank)), "BlockDev register bank is not attached");
+  const StringRef queueWrappers[]{"GGBlockDevRequestQueueWrapper", "GGBlockDevDataQueueWrapper",
+      "GGBlockDevReadResponseQueueWrapper", "GGBlockDevWriteAckQueueWrapper"};
+  const StringRef queues[]{"GGBlockDevRequestQueue10", "GGBlockDevDataQueue32",
+      "GGBlockDevDataQueue32", "GGBlockDevWriteAckQueue4"};
+  for (unsigned i = 0; i < 4; ++i)
+    require(bool(child(named(f.circuit, queueWrappers[i]), named(f.circuit, queues[i]))),
+        "BlockDev requires four independent functional queue instances");
+  for (auto p : top.getPorts()) {
+    auto name = p.name.getValue();
+    require(name != "blockdevBridge_ctrl" && name != "blockdevBridge_mcr" && name != "blockdev_control" &&
+        name != "blockdev_req_deq" && name != "blockdev_data_deq" && !name.starts_with("FireSim_ep_bdev_") &&
+        name != "blockdev_rresp_enq" && name != "blockdev_wack_enq" &&
+        name != "blockdev_timing" && name != "blockdev_write_latency_deq" && name != "blockdev_read_latency_deq" &&
+        name != "FireSim_ep_reset_source" && !name.starts_with("ctrl_write_dispatch_slave_0_") &&
+        name != "ctrl_read_dispatch_slave_0_ar" && !name.starts_with("ctrl_read_arb_in_0_") &&
+        !name.starts_with("ctrl_write_arb_in_0_"), "consumed BlockDev boundary escapes");
+  }
+  unsigned constructors = 0, channels = 0;
+  for (auto attr : f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto row = cast<DictionaryAttr>(attr);
+    auto widget = row.getAs<StringAttr>("widgetClass");
+    constructors += widget && widget.getValue() == "firechip.goldengateimplementations.BlockDevBridgeModule";
+    auto name = row.getAs<StringAttr>("globalName");
+    if (name && (name.getValue() == "ep_reset" || name.getValue().starts_with("ep_bdev_"))) {
+      ++channels;
+      auto sources = row.getAs<ArrayAttr>("sources"), sinks = row.getAs<ArrayAttr>("sinks");
+      require(sources && !sources.empty() && sinks && !sinks.empty(), "BlockDev channel lacks completed host endpoints");
+    }
+  }
+  require(constructors == 1 && channels == 9, "BlockDev constructor or completed channel retention differs");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketBlockDev(f.circuit, error)) && dump(*f.root) == state,
+      "repeated expanded BlockDev composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-blockdev-reverse.mlir" : ".rocket-blockdev.mlir")).str(), ec);
+    require(!ec, "cannot write expanded BlockDev boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
                      unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
@@ -954,54 +1058,58 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
     for (StringRef p : {"clockBridge_ctrl", "resetBridge_ctrl", "uartBridge_ctrl",
                        "peekPokeBridge_ctrl", "tracerv_ctrl"})
       b.create<ConnectOp>(f.circuit.getLoc(), instance.getResult(port(importedTop, p)), original.getArgument(port(original, p)));
-    // Forward the five actual Rocket TSI channels, including their nested
-    // forward valid/ready descriptors, to the Print fixture's active top.
+    // Forward actual Rocket TSI and BlockDev channels, including their nested
+    // forward descriptors and constructor metadata, to the active Print top.
     auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
-    DictionaryAttr tsiBridge;
-    for (auto attr : raw) {
-      auto row = cast<DictionaryAttr>(attr);
-      auto widget = row.getAs<StringAttr>("widgetClass");
-      if (widget && widget.getValue() == "firechip.goldengateimplementations.TSIBridgeModule") tsiBridge = row;
-    }
-    require(bool(tsiBridge), "actual Rocket TSI constructor is absent");
-    llvm::StringSet<> tsiNames, forwarded;
-    for (auto field : tsiBridge.getAs<DictionaryAttr>("channelMapping"))
-      tsiNames.insert(cast<StringAttr>(field.getValue()).getValue());
-    std::function<Attribute(Attribute)> retargetTSI = [&](Attribute attr) -> Attribute {
-      if (auto str = dyn_cast<StringAttr>(attr)) {
-        auto value = str.getValue();
-        std::string prefix = "~" + c.getName().str();
-        if (!value.consume_front(prefix)) return attr;
-        auto suffix = value.str();
-        std::string oldTop = "|" + importedTop.getName().str() + ">";
-        if (StringRef(suffix).starts_with(oldTop)) suffix.replace(0, oldTop.size(), "|Top>");
-        return b.getStringAttr("~Top" + suffix);
-      }
-      if (auto rows = dyn_cast<ArrayAttr>(attr)) { SmallVector<Attribute> out; for (auto row : rows) out.push_back(retargetTSI(row)); return b.getArrayAttr(out); }
-      if (auto row = dyn_cast<DictionaryAttr>(attr)) { NamedAttrList out; for (auto field : row) out.set(field.getName(), retargetTSI(field.getValue())); return out.getDictionary(&ctx); }
-      return attr;
-    };
     SmallVector<Attribute> annotations;
     for (auto attr : f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) annotations.push_back(attr);
-    annotations.push_back(retargetTSI(tsiBridge));
-    for (auto attr : raw) {
-      auto row = cast<DictionaryAttr>(attr); auto name = row.getAs<StringAttr>("globalName");
-      if (!name || !tsiNames.count(name.getValue())) continue;
-      auto endpoints = row.getAs<ArrayAttr>("sources");
-      if (!endpoints || endpoints.empty()) endpoints = row.getAs<ArrayAttr>("sinks");
-      require(endpoints && !endpoints.empty(), "actual TSI channel has no endpoint");
-      auto target = cast<StringAttr>(endpoints[0]).getValue();
-      auto ref = target.drop_front(target.find('>') + 1).split('.').first;
-      if (forwarded.insert(ref).second) {
-        auto index = port(importedTop, ref); auto p = importedTop.getPorts()[index];
-        original.insertPorts({{original.getNumPorts(), p}});
-        b.create<ConnectOp>(f.circuit.getLoc(),
-            p.direction == Direction::In ? instance.getResult(index) : original.getArgument(port(original, ref)),
-            p.direction == Direction::In ? original.getArgument(port(original, ref)) : instance.getResult(index));
+    for (StringRef widgetClass : {"firechip.goldengateimplementations.TSIBridgeModule",
+                                 "firechip.goldengateimplementations.BlockDevBridgeModule"}) {
+      DictionaryAttr bridge;
+      for (auto attr : raw) {
+        auto row = cast<DictionaryAttr>(attr);
+        auto widget = row.getAs<StringAttr>("widgetClass");
+        if (widget && widget.getValue() == widgetClass) bridge = row;
       }
-      annotations.push_back(retargetTSI(row));
+      require(bool(bridge), "actual Rocket bridge constructor is absent");
+      llvm::StringSet<> channelNames, forwarded;
+      for (auto field : bridge.getAs<DictionaryAttr>("channelMapping"))
+        channelNames.insert(cast<StringAttr>(field.getValue()).getValue());
+      std::function<Attribute(Attribute)> retargetBridge = [&](Attribute attr) -> Attribute {
+        if (auto str = dyn_cast<StringAttr>(attr)) {
+          auto value = str.getValue();
+          std::string prefix = "~" + c.getName().str();
+          if (!value.consume_front(prefix)) return attr;
+          auto suffix = value.str();
+          std::string oldTop = "|" + importedTop.getName().str() + ">";
+          if (StringRef(suffix).starts_with(oldTop)) suffix.replace(0, oldTop.size(), "|Top>");
+          return b.getStringAttr("~Top" + suffix);
+        }
+        if (auto rows = dyn_cast<ArrayAttr>(attr)) { SmallVector<Attribute> out; for (auto row : rows) out.push_back(retargetBridge(row)); return b.getArrayAttr(out); }
+        if (auto row = dyn_cast<DictionaryAttr>(attr)) { NamedAttrList out; for (auto field : row) out.set(field.getName(), retargetBridge(field.getValue())); return out.getDictionary(&ctx); }
+        return attr;
+      };
+      annotations.push_back(retargetBridge(bridge));
+      for (auto attr : raw) {
+        auto row = cast<DictionaryAttr>(attr); auto name = row.getAs<StringAttr>("globalName");
+        if (!name || !channelNames.count(name.getValue())) continue;
+        auto endpoints = row.getAs<ArrayAttr>("sources");
+        if (!endpoints || endpoints.empty()) endpoints = row.getAs<ArrayAttr>("sinks");
+        require(endpoints && !endpoints.empty(), "actual Rocket channel has no endpoint");
+        auto target = cast<StringAttr>(endpoints[0]).getValue();
+        auto ref = target.drop_front(target.find('>') + 1).split('.').first;
+        if (forwarded.insert(ref).second) {
+          auto index = port(importedTop, ref); auto p = importedTop.getPorts()[index];
+          original.insertPorts({{original.getNumPorts(), p}});
+          b.create<ConnectOp>(f.circuit.getLoc(),
+              p.direction == Direction::In ? instance.getResult(index) : original.getArgument(port(original, ref)),
+              p.direction == Direction::In ? original.getArgument(port(original, ref)) : instance.getResult(index));
+        }
+        annotations.push_back(retargetBridge(row));
+      }
+      require(forwarded.size() == (widgetClass.ends_with("TSIBridgeModule") ? 5 : 9),
+          "actual Rocket bridge requires distinct live token ports");
     }
-    require(forwarded.size() == 5, "TSI requires five distinct live token ports");
     f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
     if (reverse) std::reverse(f.hosts.begin(), f.hosts.end());
     require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)) && succeeded(verify(*f.root)), error);
@@ -1281,6 +1389,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketResponses(f, reads, output, reverse, rejected);
       rocketMaster(f, output, reverse, rejected);
       rocketTSI(f, output, reverse, rejected);
+      rocketBlockDev(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);

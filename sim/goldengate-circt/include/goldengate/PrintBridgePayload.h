@@ -144,4 +144,8 @@ mlir::LogicalResult mapPrintBridgeRocketSimulationMaster(
 // control slave after the expanded Print/SimulationMaster boundary. Atomic.
 mlir::LogicalResult mapPrintBridgeRocketTSI(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Compose all nine live Rocket BlockDev channels, four queues, timing, and
+// allocated MMIO slave after the expanded Print/TSI boundary. Atomic.
+mlir::LogicalResult mapPrintBridgeRocketBlockDev(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
