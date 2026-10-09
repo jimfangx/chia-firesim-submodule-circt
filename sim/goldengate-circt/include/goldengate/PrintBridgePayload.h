@@ -112,4 +112,10 @@ mlir::LogicalResult mapPrintBridgeCPUStreams(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<CPUStreamSourcePort> precedingSources,
     llvm::ArrayRef<CPUStreamCountPort> precedingCounts, std::string &error);
+// Allocate implemented Print configuration banks and the live CPU count bank
+// through native MMIO AW/W/AR dispatch. Input: GGCPUStreamCountWrapper.
+// Stage and verify the whole composition; response arbitration and driver
+// address collateral remain separate boundaries. Fixed U250 Nasti widths.
+mlir::LogicalResult mapPrintBridgeControlDispatch(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

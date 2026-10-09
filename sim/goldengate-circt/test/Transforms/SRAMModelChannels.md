@@ -1289,3 +1289,67 @@ the harness.
 Ready/valid top passthroughs and inter-model
 ready/valid endpoints remain unsupported at this optional boundary.
 Readwrite/wider memory shapes and FAME-5 remain separate incomplete work.
+
+## Iteration 67: selected Print banks enter native MMIO dispatch
+
+`mapPrintBridgeControlDispatch` composes the implemented Print six-word banks
+and CPU stream occupancy bank with native U250 control transport. It resolves
+Print identities through the bound host registry, checks the actual queued
+host instance and exposed control bundle, and derives each allocation from its
+implemented MCR registry. The CPU count adapter uses the allocated bank's word
+count. Widget.scala's decreasing-size allocation assigns the Print banks before
+the smaller count bank, retaining registration order for equal-sized banks.
+
+`bindControlWidgetWrites` now accepts an explicit implemented widget/port
+catalog. It resolves each slave by allocated widget identity and validates
+unique nonempty names/ports before mutation. The existing seven-widget entry
+point delegates to this API. The error endpoint accepts an explicit expected
+top while retaining its existing LoadMem entry point and clock/reset checks.
+The new composition stages the complete adapter, error endpoint, address
+decoder, queued write route, AW/W binding and AR dispatch on a clone and verifies
+it before moving only newly created modules into the original circuit.
+
+Use `--map-print-host-control` with `--compile-baseline
+--stop-after-print-host-binding --map-print-host-cpu-streams`. It emits
+`post-print-control-dispatch.mlir`, `.sv` and `-all.json`. This boundary consumes
+the bound banks' AW/W/AR request interfaces and exposes their B/R responses,
+transaction-tracker readiness and master request fields. It does not assemble
+a complete platform control bus or claim response/driver integration.
+
+Evidence is `iteration67-print-control-dispatch/` in the mutable U250 generated
+source tree. Its selected Rocket/SRAM candidate ingests the immutable oracle
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`
+with the iteration 66 rf/printf selections. The resulting one Print host has
+six words in a 32-byte region at zero, followed by one read-only count word in
+a four-byte region at 32. Existing raw annotation classes, payloads and order
+are preserved through the composed target transfers.
+
+`PrintControlDispatchCompare.py` compares the candidate's RTL with the immutable
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+Eight normalized `NastiRouter` AW/W/AR dispatch, tracker-enqueue and master-ready
+predicates match. Request payload forwarding also matches. The test follows
+actual instance nets from the native dispatchers to Print/count controls and
+from the live occupancy word to its AXI adapter. This SFC fixture has printf
+disabled: the comparison establishes shared router semantics and connections,
+not equivalence of a complete Print-enabled platform address map.
+`PrintCPUAllocationCompare.py` passes again for the unchanged CPU transport,
+queue/count connectivity and recorded 6144x512, 13-bit occupancy geometry.
+
+Seven focused CTests passed: Print binding, widget write binding, error slave,
+address decode, read dispatch, write route and write dispatch. After extending
+the connectivity assertions and explicit-catalog rejection coverage, the Print
+binding and widget-write tests passed again. The Print fixtures cover ordered
+and reversed two-host bindings plus a preceding TracerV stream: regions are
+32/32/16 bytes at 0/32/64, all three request banks bind to their allocated lanes,
+and both Print and count responses retain their flipped B/R contracts. Eleven
+new composition failures (including failures after adapter construction) and
+six malformed explicit binding catalogs preserve IR atomically.
+
+Remaining: response tracker/arbitration composition for the selected Print
+banks, full platform widget registration/address collateral and Print runtime
+integration. The next smallest step is to connect these banks' B/R interfaces
+to the native transaction trackers and response arbiters, then compare their
+accepted-response and retirement behavior with the same immutable NastiRouter.
+The prior harness's printf-disabled Rocket regressions passed; this iteration
+runs only native compiler/unit comparisons and leaves manager verification to
+the harness. The complete migration success matrix remains open.

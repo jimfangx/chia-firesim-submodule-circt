@@ -202,10 +202,26 @@ void test(MLIRContext &ctx,unsigned layout) {
     require(dump(*m)==before,"rejection mutated IR");
   }
 }
+void explicitCatalogRejections(MLIRContext &ctx) {
+  for (unsigned bad = 0; bad < 6; ++bad) {
+    auto root = fixture(ctx, 0, 1); auto c = *root->getOps<CircuitOp>().begin();
+    SmallVector<goldengate::ControlWidgetPort> widgets{{"PrintBridgeModule_0", "print0_ctrl"},
+                                                     {"PrintBridgeModule_1", "print1_ctrl"}};
+    if (bad == 0) widgets.clear();
+    if (bad == 1) widgets[1].widget = widgets[0].widget;
+    if (bad == 2) widgets[1].port = widgets[0].port;
+    if (bad == 3) widgets[1].widget.clear();
+    if (bad == 4) widgets[1].port.clear();
+    if (bad == 5) widgets[1].widget = "unallocated";
+    std::string error; auto before = dump(*root);
+    require(failed(goldengate::bindControlWidgetWrites(c, widgets, error)) && !error.empty() &&
+        dump(*root) == before, "explicit widget binding rejection must preserve IR");
+  }
+}
 }
 int main() {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try{for(unsigned layout=0;layout<3;++layout)test(ctx,layout);
-    llvm::outs()<<"Widget writes: 420 exact scalar bindings across baseline, two added Print banks, and reversed allocations; partial targets and 23 atomic rejections passed\n";
+  try{for(unsigned layout=0;layout<3;++layout)test(ctx,layout); explicitCatalogRejections(ctx);
+    llvm::outs()<<"Widget writes: 420 exact scalar bindings across baseline, two added Print banks, and reversed allocations; partial targets and 29 atomic rejections passed\n";
     return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}
 }

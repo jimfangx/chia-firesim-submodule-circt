@@ -4,6 +4,10 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
+// Same endpoint for an explicitly selected, typed native control top.
+mlir::LogicalResult addControlErrorSlave(circt::firrtl::CircuitOp circuit,
+    unsigned addressBits, unsigned idBits, llvm::StringRef expectedTop,
+    std::string &error);
 // Materialize the junctions.nasti.scala NastiErrorSlave needed by the control
 // router's unmapped-address branch. Read and write queues each have one entry;
 // reads produce len+1 DECERR beats and writes drain through W.last before B.

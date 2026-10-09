@@ -263,6 +263,72 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   require(succeeded(goldengate::allocateControlMMIORegions(25, widgets, regions, error)) &&
       regions.size() == 2 && regions[0].start == 0 && regions[1].start == 32 &&
       regions[0].size == 32 && regions[1].size == 32, "Print six-word banks must allocate 32-byte regions");
+  require(succeeded(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  require(f.circuit.getName() == "GGControlReadDispatchWrapper", "Print MMIO composition stopped before AR binding");
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto allocated = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto writeBindings = named(f.circuit, "GGControlWidgetWriteWrapper")->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
+  auto readBindings = named(f.circuit, "GGControlReadDispatchWrapper")->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
+  require(allocated.size() == 3 && writeBindings == readBindings && readBindings.size() == 3,
+      "Print and occupancy banks need matching request binding identities");
+  for (unsigned i = 0; i < 3; ++i) {
+    auto row = cast<DictionaryAttr>(allocated[i]), binding = cast<DictionaryAttr>(readBindings[i]);
+    std::string name = i < 2 ? names[i] : "CPUManagedStreamEngine_0";
+    std::string port = i < 2 ? "print_" + std::to_string(i) + "_ctrl" : "cpuStream_ctrl";
+    require(row.getAs<StringAttr>("name").getValue() == name &&
+        row.getAs<IntegerAttr>("start").getInt() == i * 32 &&
+        row.getAs<IntegerAttr>("size").getInt() == (i < 2 ? 32 : 16) &&
+        binding.getAs<StringAttr>("name").getValue() == name &&
+        binding.getAs<StringAttr>("port").getValue() == port &&
+        binding.getAs<IntegerAttr>("slave").getInt() == i,
+        "Print MMIO allocation or request wiring lost registration identity");
+    bool found = false;
+    for (auto p : named(f.circuit, f.circuit.getName()).getPorts()) if (p.name == port) {
+      auto type = cast<BundleType>(p.type); found = true;
+      require(type.getNumElements() == 2 && type.getElement("b") && type.getElement("r"),
+          "consumed Print MMIO request channel escaped the dispatcher");
+    }
+    require(found, "Print response boundary missing");
+  }
+  // Inspect actual operations, not just the catalog: each bank's AW/W
+  // scalars and flipped AR bundle must connect to its allocated dispatcher.
+  auto key = [&](Value value) -> std::string {
+    std::string suffix;
+    while (auto field = value.getDefiningOp<SubfieldOp>()) {
+      suffix = "." + field.getFieldName().str() + suffix; value = field.getInput();
+    }
+    auto inst = value.getDefiningOp<InstanceOp>();
+    require(bool(inst), "request binding is not an instance port");
+    return inst.getName().str() + "." + inst.getPortNameStr(cast<OpResult>(value).getResultNumber()).str() + suffix;
+  };
+  std::map<std::string, std::string> writeConnections, readConnections;
+  for (auto connect : named(f.circuit, "GGControlWidgetWriteWrapper").getOps<StrictConnectOp>()) {
+    // Metadata sources are top arguments; request valid/data use instance results.
+    if (!isa<BlockArgument>(connect.getSrc())) writeConnections.emplace(key(connect.getDest()), key(connect.getSrc()));
+  }
+  for (auto connect : named(f.circuit, "GGControlReadDispatchWrapper").getOps<ConnectOp>())
+    if (connect.getDest().getDefiningOp<SubfieldOp>() && connect.getSrc().getDefiningOp<InstanceOp>())
+      readConnections.emplace(key(connect.getDest()), key(connect.getSrc()));
+  for (unsigned i = 0; i < 3; ++i) {
+    std::string bank = "sim." + std::string(i < 2 ? "print_" + std::to_string(i) + "_ctrl" : "cpuStream_ctrl");
+    std::string slave = "sim.ctrl_write_dispatch_slave_" + std::to_string(i);
+    for (auto channel : {"aw", "w"}) {
+      require(writeConnections.at(bank + "." + channel + ".valid") == slave + "_" + channel + "_valid" &&
+          writeConnections.at(slave + "_" + channel + "_ready") == bank + "." + channel + ".ready",
+          "Print request valid/readiness detached from selected slave");
+    }
+    require(writeConnections.at(bank + ".aw.bits.addr") == slave + "_aw_bits_addr" &&
+        writeConnections.at(bank + ".w.bits.data") == slave + "_w_bits_data" &&
+        readConnections.at(bank + ".ar") == "controlReadDispatch.slave_" + std::to_string(i) + "_ar",
+        "Print request payload routed to the wrong allocated bank");
+  }
+  if (!output.empty() && !reverse) {
+    std::error_code ec; llvm::raw_fd_ostream out((output + ".control.mlir").str(), ec);
+    require(!ec, "cannot write Print MMIO composition fixture"); f.root->print(out);
+  }
+  auto dispatched = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)) &&
+      dump(*f.root) == dispatched, "repeat Print MMIO dispatch must be atomic");
   llvm::outs() << "PASS binding " << (reverse ? "reversed" : "ordered") << " " << evaluations << " handshake/data cases and three-stream CPU composition\n";
 }
 
@@ -297,6 +363,46 @@ void allocationRejections(MLIRContext &ctx) {
         "Print CPU allocation accepted or mutated malformed boundary " + std::to_string(bad));
   }
   llvm::outs() << "PASS eight atomic Print CPU allocation rejections including failure after read materialization\n";
+}
+
+void controlRejections(MLIRContext &ctx) {
+  for (unsigned bad = 0; bad < 11; ++bad) {
+    Fixture f(ctx); std::string error; OpBuilder b(&ctx);
+    require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
+    require(succeeded(goldengate::mapPrintBridgeCPUStreams(f.circuit, {}, {}, error)), error);
+    auto bound = named(f.circuit, "GGPrintBridgeHostWrapper");
+    auto registry = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+    SmallVector<Attribute> rows(registry.begin(), registry.end());
+    NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+    if (bad == 0) bound->removeAttr("goldengate.printHostBindings");
+    if (bad == 1) rows[1] = rows[0];
+    if (bad == 2) row.set("widgetName", b.getStringAttr("absent"));
+    if (bad == 3) row.set("controlPort", b.getStringAttr("other"));
+    if (bad == 4) row.erase("hostModule");
+    if (bad >= 2 && bad <= 4) rows[1] = row.getDictionary(&ctx);
+    if (bad >= 1 && bad <= 4) bound->setAttr("goldengate.printHostBindings", b.getArrayAttr(rows));
+    auto counts = named(f.circuit, "GGCPUStreamCountBank");
+    if (bad == 5) counts->removeAttr("goldengate.mmioRegisters"); // adapter already created in staging
+    if (bad == 6) {
+      auto regs = counts->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+      counts->setAttr("goldengate.mmioRegisters", b.getArrayAttr({regs[0]}));
+    }
+    if (bad == 7) f.circuit.setName("GGPrintBridgeHostWrapper");
+    if (bad == 8) f.circuit->removeAttr("rawAnnotations");
+    if (bad == 9) {
+      auto top = named(f.circuit, f.circuit.getName());
+      SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
+      names[0] = b.getStringAttr("notHostClock"); top.setPortNames(names);
+    }
+    if (bad == 10) {
+      auto info = f.hosts[1]->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+      named(f.circuit, info.getAs<StringAttr>("configModule").getValue())->removeAttr("goldengate.mmioRegisters");
+    }
+    auto before = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)) && !error.empty() &&
+        dump(*f.root) == before, "Print MMIO failure mutated circuit " + std::to_string(bad));
+  }
+  llvm::outs() << "PASS eleven atomic Print MMIO composition rejections including failures after adapter creation\n";
 }
 
 void rejections(MLIRContext &ctx) {
@@ -365,7 +471,7 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx);
+    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx);
     for (bool reverse : {false, true}) {
       Fixture f(ctx, true, reverse); std::string error, header;
       require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);

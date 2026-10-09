@@ -54,6 +54,7 @@ add_executable(goldengate-circt
   lib/Transforms/PrintBridgeConfig.cpp
   lib/Transforms/PrintBridgeStream.cpp
   lib/Transforms/PrintBridgeHost.cpp
+  lib/Transforms/PrintBridgeMMIO.cpp
   lib/Transforms/PrintBridgeBinding.cpp
   lib/Transforms/AutoILAWiring.cpp
   lib/Transforms/GlobalResetWiring.cpp
@@ -372,13 +373,19 @@ if(BUILD_TESTING)
     lib/Transforms/PrintBridgeStream.cpp
     lib/Transforms/PrintBridgeConfig.cpp
     lib/Transforms/PrintBridgeHost.cpp
+    lib/Transforms/PrintBridgeMMIO.cpp
     lib/Transforms/PrintBridgeBinding.cpp
     lib/Transforms/CPUStreamQueue.cpp
     lib/Transforms/CPUStreamRead.cpp
     lib/Transforms/CPUStreamCountBank.cpp
     lib/Transforms/ClockBridgeControl.cpp
     lib/Support/TargetUtils.cpp
-    lib/Transforms/ControlAddressDecode.cpp)
+    lib/Transforms/ControlAddressDecode.cpp
+    lib/Transforms/ControlErrorSlave.cpp
+    lib/Transforms/ControlWriteRoute.cpp
+    lib/Transforms/ControlWriteDispatch.cpp
+    lib/Transforms/ControlWidgetWrites.cpp
+    lib/Transforms/ControlReadDispatch.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-binding-test PRIVATE

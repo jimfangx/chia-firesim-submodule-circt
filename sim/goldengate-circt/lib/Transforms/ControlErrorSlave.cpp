@@ -14,13 +14,19 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addControlErrorSlave(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
+  return addControlErrorSlave(circuit, addressBits, idBits, "GGLoadMemControlWrapper", error);
+}
+
+LogicalResult goldengate::addControlErrorSlave(CircuitOp circuit,
+    unsigned addressBits, unsigned idBits, llvm::StringRef expectedTop,
+    std::string &error) {
   constexpr llvm::StringLiteral wrapperName = "GGControlErrorWrapper";
   constexpr llvm::StringLiteral helperName = "GGControlErrorSlave";
   auto reject = [&](llvm::StringRef message) { error = message.str(); return failure(); };
   if (!addressBits || addressBits > 64 || !idBits || idBits > 64)
     return reject("control error slave requires address and ID widths in 1..64");
-  if (circuit.getName() != "GGLoadMemControlWrapper")
-    return reject("control error slave requires the LoadMem control wrapper");
+  if (expectedTop.empty() || circuit.getName() != expectedTop)
+    return reject("control error slave requires the selected control wrapper");
   FModuleOp inner;
   for (auto module : circuit.getOps<FModuleLike>()) {
     if (module.getModuleName() == wrapperName || module.getModuleName() == helperName)

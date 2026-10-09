@@ -20,7 +20,7 @@ constexpr WidgetPort widgetPorts[]{
   {"ClockBridgeModule_0", "clockBridge_ctrl"},
   {"ResetPulseBridgeModule_0", "resetBridge_ctrl"},
   {"CPUManagedStreamEngine_0", "cpuStream_ctrl"}};
-struct Binding { const char *widget; const char *port; unsigned slave; };
+struct Binding { std::string widget; std::string port; unsigned slave; };
 struct Field { const char *name; unsigned width; };
 constexpr Field addressFields[]{
   {"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
@@ -34,6 +34,13 @@ bool dispatched(llvm::StringRef channel, llvm::StringRef field) {
 
 LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
                                                  std::string &error) {
+  SmallVector<ControlWidgetPort> widgets;
+  for (auto w : widgetPorts) widgets.push_back({w.widget, w.port});
+  return bindControlWidgetWrites(circuit, widgets, error);
+}
+
+LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
+    ArrayRef<ControlWidgetPort> widgets, std::string &error) {
   constexpr llvm::StringLiteral wrapperName="GGControlWidgetWriteWrapper";
   auto reject=[&](llvm::StringRef s){error=s.str();return failure();};
   if(circuit.getName()!="GGControlWriteDispatchWrapper")
@@ -62,7 +69,12 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
       return reject("widget write allocation needs unique names and ordered slave indices");
   }
   SmallVector<Binding> bindings;
-  for(auto widget:widgetPorts) {
+  std::set<std::string> widgetNames, portNames;
+  if (widgets.empty()) return reject("widget write bindings must not be empty");
+  for(auto widget:widgets) {
+    if (widget.widget.empty() || widget.port.empty() ||
+        !widgetNames.insert(widget.widget).second || !portNames.insert(widget.port).second)
+      return reject("widget writes require unique nonempty widget and port identities");
     auto found=allocated.find(widget.widget);
     if(found==allocated.end())return reject("widget write allocation is missing an implemented widget");
     bindings.push_back({widget.widget,widget.port,found->second});
