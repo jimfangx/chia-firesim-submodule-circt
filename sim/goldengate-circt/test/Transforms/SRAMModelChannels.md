@@ -1677,3 +1677,57 @@ Print driver addresses remain unfinished. Next, compose the later bank and
 response bindings with this thirteen-region native fixture, then carry the
 bound map into Print headers and the complete CLI path. Manager verification
 remains owned by the harness; the SFC UART-bearing differential is pending.
+
+### Iteration 75: Rocket/Print B/R response composition
+
+`mapPrintBridgeRocketControlResponses` composes the existing native FIRRTL
+read tracker, read arbiter, write arbiter and write tracker after the expanded
+Rocket request boundary. It consumes the seven early Rocket banks and both
+instantiated Print banks. The thirteen normal slaves plus the error source
+produce fourteen arbitration inputs and retirement ports; both trackers use
+64 slots, 12-bit response IDs and four-bit routes. The Scala oracle is
+`junctions/nasti.scala`'s `NastiRouter`: accepted final R beats retire AR
+transactions; accepted B responses retire AW transactions, using response IDs.
+
+Before creating any operations, the compiler re-derives the thirteen-region
+allocation from live register/DMA registries, requires identical AW/W and AR
+catalogs, and resolves each bank's actual AR SSA connection to its allocated
+slave. Matching stale metadata cannot silently exchange the two Print banks.
+All four response passes run on a staged circuit; a later collision preserves
+all original IR and annotations. The selected Print-only composition shares
+this implementation and retains its existing behavior.
+
+Evidence is under mutable `iteration75-print-rocket-responses/`. The native
+fixture imports the actual Rocket hierarchy, banks and two queued Print hosts,
+and composes both constructor orders. It verifies every connected B/R payload,
+ID, ready/valid pair, final-beat retirement predicate, error response and all
+four later-bank scalar boundaries. Raw annotation payloads and ordering are
+preserved. The combined stream/allocation/request/response test passes 76
+atomic rejections, including equal stale Print catalogs with swapped ports
+and a failure after both response arbiters have been staged.
+The shared arbiter interpreters pass 114833 read and 195366 write cases.
+Tracker interpreters pass 14616 read and 4989 write collision/retirement/reset
+cycles across up to 63 regions, including the expanded thirteen-region case.
+
+A fresh direct native `--compile-baseline` reads the immutable compiler
+fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` and `.anno.json`,
+and emits complete baseline RTL/collateral with empty stderr. Its register
+and TracerV queue input artifacts match the fixture's inputs and iteration 74
+(`input-boundary-comparison.json`). `PrintRocketResponsesCompare.py` reads
+actual FIRRTL SSA wiring in both response artifacts and compares the seven
+shared banks plus error with the immutable U250 fixture's
+`design/FireSim-generated.sv`: response identities, response IDs/data,
+ready/valid wiring and retirement predicates match. The SFC normal banks
+specialize R.last to one; the native test preserves the unspecialized
+ready-and-valid-and-last predicate. `rocket-responses-comparison.json` records
+the baseline/expanded slave mapping. The request, MMIO, TracerV stream and
+pre-binding catalog comparisons retain their SFC matches.
+
+The immutable SFC RTL disables Print, so it does not establish full
+Print-enabled equivalence. Master, FASED, TSI and BlockDev request/response
+ports remain exposed; LoadMem's register side also remains an explicit
+boundary. The full Print-enabled CLI path and platform driver addresses are
+unfinished. Next, attach and bind the actual SimulationMaster bank at expanded
+slave 10, then compare its complete request/response/register path with SFC.
+Manager verification remains owned by the harness; the SFC UART-bearing
+baseline is pending and the overall migration remains incomplete.

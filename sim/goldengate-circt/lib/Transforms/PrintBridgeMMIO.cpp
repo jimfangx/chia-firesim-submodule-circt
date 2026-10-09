@@ -94,8 +94,10 @@ LogicalResult goldengate::mapPrintBridgeControlDispatch(CircuitOp circuit,
   return success();
 }
 
-LogicalResult goldengate::mapPrintBridgeControlResponses(CircuitOp circuit,
-                                                        std::string &error) {
+namespace {
+using namespace goldengate;
+LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
+                                  std::string &error) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGControlReadDispatchWrapper")
     return reject("Print control responses require the selected AR dispatch wrapper");
@@ -108,12 +110,21 @@ LogicalResult goldengate::mapPrintBridgeControlResponses(CircuitOp circuit,
   auto hosts = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
   auto bindings = top ? top->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings") : ArrayAttr{};
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
-  if (!hosts || hosts.empty() || !bindings || bindings.size() != hosts.size() + 1 ||
-      !regions || regions.size() != bindings.size())
-    return reject("Print control responses require every Print bank and the CPU count bank");
-  // The general response passes can expose unbound slaves. This selected
-  // composition must instead consume the complete implemented bank catalog.
+  if (!hosts || hosts.empty() || !bindings || bindings.size() != hosts.size() + (rocket ? 7 : 1) ||
+      !regions || regions.size() != hosts.size() + (rocket ? 11 : 1))
+    return reject("Print control responses require the complete selected or Rocket bank catalog");
+  auto writes = [&]() -> ArrayAttr {
+    for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == "GGControlWidgetWriteWrapper")
+      return m->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
+    return {};
+  }();
+  if (writes != bindings)
+    return reject("Print control responses require identical AW/W and AR bank bindings");
+  // Selected composition consumes all banks. Rocket composition leaves only
+  // Master/FASED/TSI/BlockDev exposed, as in the native platform pipeline.
   llvm::StringMap<StringAttr> expected;
+  SmallVector<FModuleOp> printHosts;
+  llvm::StringSet<> hostNames;
   for (auto attr : hosts) {
     auto row = dyn_cast<DictionaryAttr>(attr);
     auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
@@ -121,10 +132,44 @@ LogicalResult goldengate::mapPrintBridgeControlResponses(CircuitOp circuit,
     if (!name || !port || name.getValue().empty() || port.getValue().empty() ||
         !expected.try_emplace(name.getValue(), port).second)
       return reject("Print control responses require unique complete Print identities");
+    if (rocket) {
+      auto hostName = row.getAs<StringAttr>("hostModule"); FModuleOp host;
+      if (hostName) for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == hostName) host = m;
+      if (!host || !hostNames.insert(host.getName()).second ||
+          name.getValue() != "PrintBridgeModule_" + std::to_string(printHosts.size()))
+        return reject("Rocket Print responses require instantiated constructor order");
+      printHosts.push_back(host);
+    }
   }
   if (!expected.try_emplace("CPUManagedStreamEngine_0",
         StringAttr::get(circuit.getContext(), "cpuStream_ctrl")).second)
     return reject("Print control responses collide with the CPU count bank");
+  if (rocket) {
+    const std::pair<const char *, const char *> early[]{
+        {"TracerVBridgeModule_0", "tracerv_ctrl"}, {"LoadMemWidget_0", "loadmem_ctrl"},
+        {"PeekPokeBridgeModule_0", "peekPokeBridge_ctrl"}, {"UARTBridgeModule_0", "uartBridge_ctrl"},
+        {"ClockBridgeModule_0", "clockBridge_ctrl"}, {"ResetPulseBridgeModule_0", "resetBridge_ctrl"}};
+    for (auto [name, port] : early)
+      if (!expected.try_emplace(name, StringAttr::get(circuit.getContext(), port)).second)
+        return reject("Rocket Print response bank identity collides");
+    SmallVector<goldengate::ControlMMIOWidget> widgets;
+    SmallVector<goldengate::ControlMMIORegion> allocated;
+    if (failed(goldengate::allocateRocketControlMMIORegions(circuit, 25, printHosts,
+            widgets, allocated, error))) return failure();
+    if (allocated.size() != regions.size()) return reject("Rocket response allocation count differs");
+    for (auto [i, region] : llvm::enumerate(allocated)) {
+      auto row = dyn_cast<DictionaryAttr>(regions[i]);
+      auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+      auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr{};
+      auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr{};
+      auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr{};
+      if (!name || name != region.name || !start || !size || !slave ||
+          start.getValue().getBitWidth() > 64 || size.getValue().getBitWidth() > 64 ||
+          slave.getValue().getBitWidth() > 64 || start.getInt() != int64_t(region.start) ||
+          size.getInt() != int64_t(region.size) || slave.getInt() != int64_t(i))
+        return reject("Rocket response region differs from the live register allocation");
+    }
+  }
   for (auto attr : bindings) {
     auto row = dyn_cast<DictionaryAttr>(attr);
     auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
@@ -135,6 +180,37 @@ LogicalResult goldengate::mapPrintBridgeControlResponses(CircuitOp circuit,
     expected.erase(it);
   }
   if (!expected.empty()) return reject("Print control response bank is unbound");
+  if (rocket) {
+    // Catalog equality is insufficient if both rows are stale. The response
+    // slave must be the same slave already connected to the bank's AR port.
+    auto path = [](Value value) -> std::string {
+      std::string suffix;
+      while (auto field = value.getDefiningOp<SubfieldOp>()) {
+        suffix = "." + field.getFieldName().str() + suffix; value = field.getInput();
+      }
+      if (auto inst = value.getDefiningOp<InstanceOp>())
+        return inst.getName().str() + "." + inst.getPortNameStr(cast<OpResult>(value).getResultNumber()).str() + suffix;
+      return {};
+    };
+    llvm::StringMap<std::string> ar;
+    for (auto connect : top.getOps<ConnectOp>()) {
+      auto dest = path(connect.getDest()), src = path(connect.getSrc());
+      if (!dest.empty() && !src.empty() && !ar.try_emplace(dest, src).second)
+        return reject("Rocket responses require uniquely driven AR request banks");
+    }
+    for (auto attr : bindings) {
+      auto row = cast<DictionaryAttr>(attr);
+      auto port = row.getAs<StringAttr>("port"); auto slave = row.getAs<IntegerAttr>("slave");
+      auto name = row.getAs<StringAttr>("name");
+      if (!slave || slave.getValue().getBitWidth() > 64 || slave.getInt() < 0 ||
+          uint64_t(slave.getInt()) >= regions.size() ||
+          cast<DictionaryAttr>(regions[slave.getInt()]).getAs<StringAttr>("name") != name)
+        return reject("Rocket response binding differs from its allocated slave identity");
+      auto found = ar.find("sim." + port.getValue().str() + ".ar");
+      if (found == ar.end() || found->second != "controlReadDispatch.slave_" + std::to_string(slave.getInt()) + "_ar")
+        return reject("Rocket response bank differs from its connected AR request slave");
+    }
+  }
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addControlReadTracker(*staged, error)) ||
       failed(addControlReadArbiter(*staged, error)) ||
@@ -150,4 +226,15 @@ LogicalResult goldengate::mapPrintBridgeControlResponses(CircuitOp circuit,
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
   return success();
+}
+} // namespace
+
+LogicalResult goldengate::mapPrintBridgeControlResponses(CircuitOp circuit,
+                                                        std::string &error) {
+  return mapControlResponses(circuit, false, error);
+}
+
+LogicalResult goldengate::mapPrintBridgeRocketControlResponses(CircuitOp circuit,
+                                                              std::string &error) {
+  return mapControlResponses(circuit, true, error);
 }

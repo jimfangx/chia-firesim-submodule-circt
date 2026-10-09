@@ -24,6 +24,7 @@
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+#include <set>
 #include <algorithm>
 #include <random>
 #include <stdexcept>
@@ -534,6 +535,185 @@ void platformCatalog(MLIRContext &ctx, StringRef baseline, StringRef output) {
 // Attach Print hosts after the real Rocket TracerV queue boundary. The earlier
 // fixture contains post-FAME print tokens; its TracerV ports now forward the
 // complete native Rocket hierarchy rather than a stand-in queue.
+// Full Rocket response composition uses actual request banks imported below.
+void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
+                     unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto top = named(f.circuit, f.circuit.getName());
+  auto bound = named(f.circuit, "GGPrintBridgeHostWrapper");
+  auto hosts = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto writes = named(f.circuit, "GGControlWidgetWriteWrapper");
+  auto bank = named(f.circuit, "GGCPUStreamCountBank");
+  auto words = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  for (unsigned bad = 0; bad < 10; ++bad) {
+    SmallVector<Attribute> rows(reads.begin(), reads.end());
+    if (bad == 0) rows.pop_back();
+    if (bad == 1 || bad == 2 || bad == 3) {
+      NamedAttrList row(cast<DictionaryAttr>(rows[7]));
+      if (bad == 1) row.set("port", cast<DictionaryAttr>(rows[8]).get("port"));
+      if (bad == 2) row.set("slave", b.getI32IntegerAttr(9));
+      if (bad == 3) row.set("name", b.getStringAttr("SimulationMaster_0"));
+      rows[7] = row.getDictionary(ctx);
+    }
+    top->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
+    // Mutate both request catalogs in the wrong-slave/later-bank cases so
+    // response preflight cannot succeed merely by comparing AW/W with AR.
+    if (bad == 2 || bad == 3) writes->setAttr("goldengate.controlWriteBindings", b.getArrayAttr(rows));
+    if (bad == 4) {
+      rows.assign(regions.begin(), regions.end()); NamedAttrList row(cast<DictionaryAttr>(rows[8]));
+      row.set("start", b.getI64IntegerAttr(548)); rows[8] = row.getDictionary(ctx);
+      decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 5) { rows.assign(words.begin(), words.end()); rows.pop_back(); bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows)); }
+    if (bad == 6) { rows.assign(hosts.begin(), hosts.end()); std::reverse(rows.begin(), rows.end()); bound->setAttr("goldengate.printHostBindings", b.getArrayAttr(rows)); }
+    if (bad == 7) bound->removeAttr("goldengate.printHostBindings");
+    FModuleOp collision;
+    if (bad == 8) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr("GGControlWriteTracker"),
+          ConventionAttr::get(ctx, Convention::Internal), SmallVector<PortInfo>{});
+    }
+    if (bad == 9) {
+      // Equal, well-typed stale request/host catalogs must not swap the two
+      // actual Print AR connections when the response arbiter is composed.
+      rows.assign(reads.begin(), reads.end());
+      for (unsigned i : {7U, 8U}) {
+        NamedAttrList row(cast<DictionaryAttr>(rows[i]));
+        row.set("port", cast<DictionaryAttr>(reads[i == 7 ? 8 : 7]).get("port"));
+        rows[i] = row.getDictionary(ctx);
+      }
+      top->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
+      writes->setAttr("goldengate.controlWriteBindings", b.getArrayAttr(rows));
+      rows.assign(hosts.begin(), hosts.end());
+      for (unsigned i : {0U, 1U}) {
+        NamedAttrList row(cast<DictionaryAttr>(rows[i]));
+        row.set("controlPort", cast<DictionaryAttr>(hosts[1 - i]).get("controlPort"));
+        rows[i] = row.getDictionary(ctx);
+      }
+      bound->setAttr("goldengate.printHostBindings", b.getArrayAttr(rows));
+    }
+    auto state = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeRocketControlResponses(f.circuit, error)) &&
+        !error.empty() && dump(*f.root) == state, "invalid Rocket response composition mutated IR " + std::to_string(bad));
+    ++rejected;
+    top->setAttr("goldengate.controlReadBindings", reads);
+    writes->setAttr("goldengate.controlWriteBindings", reads);
+    decoder->setAttr("goldengate.controlRegions", regions);
+    bank->setAttr("goldengate.mmioRegisters", words);
+    bound->setAttr("goldengate.printHostBindings", hosts);
+    if (collision) collision.erase();
+  }
+  // Preserve arbitrary annotation payloads/order while allowing target transfer.
+  std::function<Attribute(Attribute)> payload = [&](Attribute a) -> Attribute {
+    if (auto s = dyn_cast<StringAttr>(a)) if (s.getValue().starts_with("~")) return b.getStringAttr("<target>");
+    if (auto rows = dyn_cast<ArrayAttr>(a)) { SmallVector<Attribute> out; for (auto row : rows) out.push_back(payload(row)); return b.getArrayAttr(out); }
+    if (auto row = dyn_cast<DictionaryAttr>(a)) { NamedAttrList out; for (auto field : row) out.set(field.getName(), payload(field.getValue())); return out.getDictionary(ctx); }
+    return a;
+  };
+  auto annotations = payload(f.circuit->getAttr("rawAnnotations"));
+  require(succeeded(goldengate::mapPrintBridgeRocketControlResponses(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  require(f.circuit.getName() == "GGControlWriteTrackerWrapper" &&
+      payload(f.circuit->getAttr("rawAnnotations")) == annotations, "Rocket responses changed annotation payloads/order");
+  auto final = named(f.circuit, f.circuit.getName());
+  for (auto attr : reads) {
+    auto control = cast<DictionaryAttr>(attr).getAs<StringAttr>("port");
+    for (auto p : final.getPorts()) require(p.name != control, "connected Rocket response bank escaped composition");
+  }
+  for (StringRef name : {"GGControlReadTracker", "GGControlWriteTracker"}) {
+    auto tracker = named(f.circuit, name);
+    require(tracker->getAttrOfType<IntegerAttr>("goldengate.trackerSlots").getInt() == 64 &&
+        tracker->getAttrOfType<IntegerAttr>("goldengate.trackerTagWidth").getInt() == 12 &&
+        tracker->getAttrOfType<IntegerAttr>("goldengate.trackerDequeuePorts").getInt() == 14 &&
+        tracker->getAttrOfType<IntegerAttr>("goldengate.trackerRouteWidth").getInt() == 4,
+        "expanded Rocket trackers need thirteen slaves plus error");
+  }
+  auto key = [&](Value v) -> std::string {
+    std::string suffix;
+    while (auto field = v.getDefiningOp<SubfieldOp>()) { suffix = "." + field.getFieldName().str() + suffix; v = field.getInput(); }
+    if (auto inst = v.getDefiningOp<InstanceOp>()) return inst.getName().str() + "." + inst.getPortNameStr(cast<OpResult>(v).getResultNumber()).str() + suffix;
+    auto arg = cast<BlockArgument>(v); auto m = cast<FModuleOp>(arg.getOwner()->getParentOp());
+    return "top." + m.getPortName(arg.getArgNumber()).str() + suffix;
+  };
+  auto connections = [&](FModuleOp m) {
+    std::map<std::string, Value> result;
+    for (auto con : m.getOps<StrictConnectOp>()) require(result.emplace(key(con.getDest()), con.getSrc()).second, "duplicate response driver");
+    return result;
+  };
+  std::function<std::set<std::string>(Value)> terms = [&](Value v) {
+    if (auto op = v.getDefiningOp<AndPrimOp>()) {
+      auto left = terms(op.getLhs()), right = terms(op.getRhs()); left.insert(right.begin(), right.end()); return left;
+    }
+    return std::set<std::string>{key(v)};
+  };
+  auto rt = connections(named(f.circuit, "GGControlReadTrackerWrapper"));
+  auto wt = connections(final);
+  for (bool read : {true, false}) {
+    std::string channel = read ? "r" : "b", arb = read ? "readArbiter" : "writeArbiter";
+    auto m = named(f.circuit, read ? "GGControlReadArbiterWrapper" : "GGControlWriteArbiterWrapper");
+    auto nets = connections(m);
+    require(named(f.circuit, read ? "GGControlReadArbiter" : "GGControlWriteArbiter")
+        ->getAttrOfType<IntegerAttr>(read ? "goldengate.readArbiterSources" : "goldengate.writeArbiterSources").getInt() == 14,
+        "expanded Rocket arbiter source count differs");
+    for (auto attr : reads) {
+      auto row = cast<DictionaryAttr>(attr); auto portName = row.getAs<StringAttr>("port").getValue().str();
+      auto i = std::to_string(row.getAs<IntegerAttr>("slave").getInt());
+      auto ap = arb + ".in_" + i + "_", rp = "sim." + portName + "." + channel;
+      require(key(nets.at(rp + ".ready")) == ap + "ready" && key(nets.at(ap + "valid")) == rp + ".valid", "Rocket response handshake routed to wrong bank");
+      for (StringRef field : read ? ArrayRef<StringRef>{"resp", "data", "last", "id", "user"} : ArrayRef<StringRef>{"resp", "id", "user"})
+        require(key(nets.at(ap + "bits_" + field.str())) == rp + ".bits." + field.str(), "Rocket response payload/ID routed to wrong bank");
+      if (read) {
+        auto pred = terms(rt.at("controlReadTracker.deq_" + i + "_valid"));
+        require(pred == std::set<std::string>{"top." + portName + ".r.ready", rp + ".valid", rp + ".bits.last"} &&
+            key(rt.at("controlReadTracker.deq_" + i + "_tag")) == rp + ".bits.id", "Rocket R retirement is not accepted final beat with response ID");
+      }
+    }
+    // B retirement is wired for all thirteen normal sources, including four
+    // late attachment boundaries, and the error source at index thirteen.
+    for (unsigned i = 0; i < 14; ++i) if (!read) {
+      auto p = arb + ".in_" + std::to_string(i) + "_", q = "ctrl_write_tracker_deq_" + std::to_string(i) + "_";
+      require(terms(nets.at("top." + q + "valid")) == std::set<std::string>{p + "ready", p + "valid"} &&
+          key(nets.at("top." + q + "tag")) == p + "bits_id" &&
+          key(wt.at("controlWriteTracker.deq_" + std::to_string(i) + "_valid")) == "sim." + q + "valid" &&
+          key(wt.at("controlWriteTracker.deq_" + std::to_string(i) + "_tag")) == "sim." + q + "tag",
+          "Rocket B retirement detached from arbiter acceptance or response ID");
+    }
+    auto ep = arb + ".in_13_", rp = "sim.ctrl_error_" + channel + "_";
+    require(key(nets.at(rp + "ready")) == ep + "ready" && key(nets.at(ep + "valid")) == rp + "valid", "Rocket error handshake detached");
+    for (StringRef field : read ? ArrayRef<StringRef>{"resp", "data", "last", "id", "user"} : ArrayRef<StringRef>{"resp", "id", "user"})
+      require(key(nets.at(ep + "bits_" + field.str())) == rp + "bits_" + field.str(), "Rocket error response payload/ID detached");
+  }
+  std::set<unsigned> connected;
+  for (auto row : reads) connected.insert(cast<DictionaryAttr>(row).getAs<IntegerAttr>("slave").getInt());
+  SmallVector<unsigned> late;
+  for (unsigned i = 0; i < regions.size(); ++i) if (!connected.count(i)) late.push_back(i);
+  require(late.size() == 4, "Rocket response composition must expose exactly four later banks");
+  auto ra = connections(named(f.circuit, "GGControlReadArbiterWrapper"));
+  for (auto i : late) {
+    auto p = "readArbiter.in_" + std::to_string(i) + "_", q = "sim.ctrl_read_tracker_deq_" + std::to_string(i) + "_";
+    require(terms(ra.at(q + "valid")) == std::set<std::string>{p + "ready", p + "valid", p + "bits_last"} &&
+        key(ra.at(q + "tag")) == p + "bits_id", "late Rocket R retirement detached");
+    for (StringRef channel : {"read", "write"}) {
+      auto prefix = "ctrl_" + channel.str() + "_arb_in_" + std::to_string(i) + "_";
+      for (StringRef field : channel == "read" ? ArrayRef<StringRef>{"valid", "bits_resp", "bits_data", "bits_last", "bits_id", "bits_user"} : ArrayRef<StringRef>{"valid", "bits_resp", "bits_id", "bits_user"})
+        require(final.getPorts()[port(final, prefix + field.str())].direction == Direction::In, "late Rocket response boundary missing");
+      require(final.getPorts()[port(final, prefix + "ready")].direction == Direction::Out, "late Rocket response readiness missing");
+    }
+  }
+  require(terms(rt.at("controlReadTracker.deq_13_valid")) == std::set<std::string>{"top.ctrl_error_r_ready", "sim.ctrl_error_r_valid", "sim.ctrl_error_r_bits_last"} &&
+      key(rt.at("controlReadTracker.deq_13_tag")) == "sim.ctrl_error_r_bits_id", "Rocket error R retirement detached");
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-responses-reverse.mlir" : ".rocket-responses.mlir")).str(), ec);
+    require(!ec, "cannot write Rocket/Print response boundary"); f.root->print(file); file << '\n';
+  }
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketControlResponses(f.circuit, error)) && dump(*f.root) == state, "repeat Rocket responses mutated IR");
+  ++rejected;
+  llvm::outs() << "PASS Rocket/Print responses: ten connected R/B sources, four late boundaries, fourteen retirements and unchanged annotation payloads\n";
+}
+
 void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseline, StringRef output) {
   if (baseline.empty()) return;
   unsigned rejected = 0;
@@ -835,6 +1015,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
         std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-requests-reverse.mlir" : ".rocket-requests.mlir")).str(), ec);
         require(!ec, "cannot write Rocket/Print request boundary"); f.root->print(file); file << '\n';
       }
+      rocketResponses(f, reads, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);

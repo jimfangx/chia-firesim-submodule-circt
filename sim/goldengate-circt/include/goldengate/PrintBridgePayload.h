@@ -127,4 +127,10 @@ mlir::LogicalResult mapPrintBridgeControlDispatch(
 // Stage all four passes; MMIO master bundle and driver assembly follow later.
 mlir::LogicalResult mapPrintBridgeControlResponses(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Full Rocket allocation with instantiated Print hosts: consume the seven
+// early Rocket banks and all Print B/R responses. Re-derive region bounds
+// from live bank/DMA registries before composing; the four later Rocket
+// banks retain explicit request/response ports for subsequent attachment.
+mlir::LogicalResult mapPrintBridgeRocketControlResponses(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
