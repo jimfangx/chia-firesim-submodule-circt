@@ -457,6 +457,25 @@ if(status EQUAL 0 OR NOT stderr MATCHES "exactly one circuit path annotation" OR
 endif()
 message(STATUS "Passed native SRAM timing/transport/XDC boundary and late failure rejection")
 
+# Full simulator assembly needs the same hardware before a platform hierarchy
+# and XDC path exist. Keep generated-clock snippets and native gate identity
+# for the late constraint pass; do not prematurely serialize path-dependent XDC.
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/timing-models.fir"
+  --annotation-file "${FIXTURES}/SRAMModelChannels.json"
+  --output-dir "${OUTPUT}/deferred-xdc" --rewrite-sram-hardware
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM hardware with deferred XDC failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/deferred-xdc/post-sram-hardware.fir" deferred_fir)
+file(READ "${OUTPUT}/deferred-xdc/post-sram-hardware-all.json" deferred_annos)
+if(NOT deferred_fir STREQUAL timing_fir OR
+   deferred_annos MATCHES "midas.passes.XDCOutputAnnotation" OR
+   EXISTS "${OUTPUT}/deferred-xdc/post-sram-models.implementation.xdc")
+  message(FATAL_ERROR "Deferred XDC changed hardware or emitted premature constraints")
+endif()
+message(STATUS "Passed identical SRAM hardware before platform XDC path resolution")
+
 execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
   --annotation-file "${OUTPUT}/timing-models.json"
   --output-dir "${OUTPUT}/unsupported-timing-port" --rewrite-sram-models

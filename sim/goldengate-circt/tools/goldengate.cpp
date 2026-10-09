@@ -221,6 +221,8 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--extract-sram-models";
   bool analyzeSRAMChannels =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-sram-channels";
+  bool rewriteSRAMHardware =
+      argc == 7 && llvm::StringRef(argv[6]) == "--rewrite-sram-hardware";
   bool rewriteSRAMModels =
       argc == 7 && llvm::StringRef(argv[6]) == "--rewrite-sram-models";
   bool rewriteSRAMTransport =
@@ -343,7 +345,7 @@ int main(int argc, char **argv) {
        !labelMultiThreaded &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
-       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !rewriteSRAMModels && !wrapRAMModel && !emitAsyncRAM && !materializeRAM && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
+       !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !rewriteSRAMModels && !rewriteSRAMHardware && !wrapRAMModel && !emitAsyncRAM && !materializeRAM && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
        !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
@@ -356,7 +358,7 @@ int main(int argc, char **argv) {
                     "--rewrite-fame-output-channel channel | "
                     "--rewrite-fame-inputs-with-output all|channel[,channel...] | "
                     "--apply-fame-defaults | --promote-passthrough | "
-                    "--rewrite-sram-models | --extract-models | --wrap-top | --update-bridge-clocks | "
+                    "--rewrite-sram-models | --rewrite-sram-hardware | --extract-models | --wrap-top | --update-bridge-clocks | "
                     "--label-multithreaded-models=on|off | "
                     "--infer-default-clocks | "
                     "--excise-channels | --infer-model-ports | "
@@ -1011,6 +1013,14 @@ int main(int argc, char **argv) {
         return fail("cannot export wrapped annotations: " + error);
       llvm::outs() << "Wrapped CIRCT top in " << wrapIRPath << '\n';
 
+      // Retained FirrtlMemModel selections are executable compiler requests.
+      // Label before ExtractModel, then lower the newly introduced interfaces,
+      // following the optional target-transform ordering in MidasTransforms.
+      unsigned selectedSRAMs = 0;
+      if (failed(goldengate::labelSRAMModels(circuit, selectedSRAMs, error)))
+        return fail("LabelSRAMModels: " + error);
+      if (selectedSRAMs && (enableAutoILA || stopAfterPrintHostBinding))
+        return fail("selected SRAM simulator assembly with debug hosts is not supported yet");
       unsigned promotedModels = 0;
       if (mlir::failed(goldengate::extractModels(circuit, promotedModels,
                                                error)))
@@ -1035,13 +1045,12 @@ int main(int argc, char **argv) {
       llvm::outs() << "Promoted " << promotedModels << " CIRCT models in "
                    << modelIRPath << '\n';
 
-      // PrintSynthesis creates new aggregate ports after the first lowering.
-      // Scala lowers again after ExtractModel. Match that boundary so every
-      // printf leaf has a direct model/top connection for InferModelPorts;
-      // otherwise only the scalar reset gets FAME controls.
-      if (stopAfterPrintHostBinding &&
+      // SRAM labeling and PrintSynthesis introduce aggregate ports after the
+      // first lowering. Match Scala's post-ExtractModel lowering so each
+      // leaf has a direct model/top connection for InferModelPorts.
+      if ((stopAfterPrintHostBinding || selectedSRAMs) &&
           failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
-        return fail("post-ExtractModel Print LowerTypes: " + error);
+        return fail("post-ExtractModel LowerTypes: " + error);
 
       unsigned promotedConnections = 0;
       if (mlir::failed(goldengate::promotePassthroughConnections(
@@ -1154,6 +1163,24 @@ int main(int argc, char **argv) {
       llvm::outs() << "Inferred CIRCT model ports in "
                    << inferredPortsIRPath << '\n';
 
+      if (selectedSRAMs) {
+        unsigned materialized = 0;
+        if (failed(goldengate::rewriteSRAMTimingHardware(circuit, materialized, error)))
+          return fail("selected SRAM simulator hardware: " + error);
+        if (materialized != selectedSRAMs)
+          return fail("selected SRAM definitions were not all materialized");
+        llvm::SmallString<256> memoryIR(outputDir), memoryAnnos(outputDir);
+        llvm::sys::path::append(memoryIR, "post-sram-simulator-hardware.mlir");
+        llvm::sys::path::append(memoryAnnos, "post-sram-simulator-hardware-all.json");
+        std::error_code memoryEC;
+        llvm::raw_fd_ostream memoryOut(memoryIR, memoryEC);
+        if (memoryEC) return fail("cannot write selected SRAM simulator hardware: " + memoryEC.message());
+        module->print(memoryOut); memoryOut << '\n'; memoryOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, memoryAnnos, error)))
+          return fail("cannot write selected SRAM simulator annotations: " + error);
+        llvm::outs() << "Materialized " << materialized
+                     << " selected native SRAM definitions for FireSim host assembly\n";
+      } else {
       // Snapshot annotation-selected inputs, outputs and data dependencies
       // before channelization changes port identities. This baseline path
       // currently supports one model/clock hub.
@@ -1992,6 +2019,7 @@ int main(int argc, char **argv) {
         return fail("cannot write active FAME wrapper annotations: " + error);
       llvm::outs() << "Activated CIRCT FAME PipeChannel wrapper in "
                    << activeIRPath << '\n';
+      } // Selected SRAM and baseline FAME paths share all host/platform stages.
       if (failed(goldengate::addClockBridge(circuit, error)))
         return fail("rational ClockBridge mapping: " + error);
       if (failed(mlir::verify(*module)))
@@ -4254,7 +4282,7 @@ int main(int argc, char **argv) {
     return 0;
   };
 
-  if (analyzeSRAMChannels || rewriteSRAMClocks || rewriteSRAMFAME || rewriteSRAMTransport || rewriteSRAMParentFAME || rewriteSRAMModels) {
+  if (analyzeSRAMChannels || rewriteSRAMClocks || rewriteSRAMFAME || rewriteSRAMTransport || rewriteSRAMParentFAME || rewriteSRAMModels || rewriteSRAMHardware) {
     std::string error;
     unsigned wrapped = 0, promoted = 0;
     if (failed(goldengate::prepareSRAMModelChannels(
@@ -4280,6 +4308,9 @@ int main(int argc, char **argv) {
     if (dependencyError) return fail("cannot write SRAM channel dependencies");
     dependencyOut << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(dependencies)));
     unsigned clockModels = 0;
+    if (rewriteSRAMHardware &&
+        failed(goldengate::rewriteSRAMTimingHardware(circuit, clockModels, error)))
+      return fail("SRAM simulator hardware: " + error);
     if (rewriteSRAMModels &&
         failed(goldengate::rewriteSRAMTimingModels(circuit, clockModels, error)))
       return fail("SRAM timing models: " + error);
@@ -4298,9 +4329,9 @@ int main(int argc, char **argv) {
     if (failed(mlir::verify(*module)))
       return fail("SRAM clock/channel boundary produced invalid FIRRTL IR");
     llvm::SmallString<256> firPath(outputDir), annotationPath(outputDir);
-    llvm::sys::path::append(firPath, rewriteSRAMModels ? "post-sram-models.fir" : rewriteSRAMParentFAME ? "post-sram-parent-fame.fir" : rewriteSRAMTransport ? "post-sram-transport.fir" : rewriteSRAMFAME ? "post-sram-fame.fir" : rewriteSRAMClocks ? "post-sram-clocks.fir"
+    llvm::sys::path::append(firPath, rewriteSRAMHardware ? "post-sram-hardware.fir" : rewriteSRAMModels ? "post-sram-models.fir" : rewriteSRAMParentFAME ? "post-sram-parent-fame.fir" : rewriteSRAMTransport ? "post-sram-transport.fir" : rewriteSRAMFAME ? "post-sram-fame.fir" : rewriteSRAMClocks ? "post-sram-clocks.fir"
                                                    : "post-sram-channels.fir");
-    llvm::sys::path::append(annotationPath, rewriteSRAMModels ? "post-sram-models-all.json" : rewriteSRAMParentFAME ? "post-sram-parent-fame-all.json" : rewriteSRAMTransport ? "post-sram-transport-all.json" : rewriteSRAMFAME ? "post-sram-fame-all.json" : rewriteSRAMClocks ? "post-sram-clocks-all.json"
+    llvm::sys::path::append(annotationPath, rewriteSRAMHardware ? "post-sram-hardware-all.json" : rewriteSRAMModels ? "post-sram-models-all.json" : rewriteSRAMParentFAME ? "post-sram-parent-fame-all.json" : rewriteSRAMTransport ? "post-sram-transport-all.json" : rewriteSRAMFAME ? "post-sram-fame-all.json" : rewriteSRAMClocks ? "post-sram-clocks-all.json"
                                                           : "post-sram-channels-all.json");
     std::error_code ec;
     llvm::raw_fd_ostream out(firPath, ec);

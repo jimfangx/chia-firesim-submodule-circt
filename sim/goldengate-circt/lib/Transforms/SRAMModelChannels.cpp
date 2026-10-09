@@ -826,15 +826,17 @@ LogicalResult goldengate::rewriteSRAMParentFAME(CircuitOp circuit, unsigned &rew
 }
 
 /// Required input invariants: prepared ground integer parent channels and scalar
-/// SRAM channels, supported read/write payloads and one XDC circuit path mapping.
-/// Annotations consumed: XDC paths/snippets; memory/channel targets transfer
-/// through FAME and remain on the adapter ports. Annotations produced: XDC
-/// output files. IR mutations: FAME state, queues and async RAM implementations.
+/// SRAM channels and supported read/write payloads. Resolving XDC additionally
+/// requires one circuit path mapping; full host assembly defers that resolution.
+/// Memory/channel targets transfer through FAME onto adapter ports. XDC paths
+/// and snippets are consumed only when resolving output constraints.
+/// IR mutations: FAME state, queues and async RAM implementations.
 /// Analyses required: hierarchy, channel binding, dependencies and typed targets.
 /// Analyses preserved: none. Output invariants: verified executable memory
 /// transport; only surviving hub gates contribute generated-clock constraints.
-LogicalResult goldengate::rewriteSRAMTimingModels(
-    CircuitOp circuit, unsigned &rewritten, std::string &error) {
+static LogicalResult rewriteSRAMTimingModelsImpl(
+    CircuitOp circuit, unsigned &rewritten, std::string &error, bool emitXDC) {
+  using namespace goldengate;
   rewritten = 0;
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   auto raw = (*staged)->getAttrOfType<ArrayAttr>("rawAnnotations");
@@ -861,13 +863,14 @@ LogicalResult goldengate::rewriteSRAMTimingModels(
     FModuleOp wrapper, implementation;
     for (auto model : staged->getOps<FModuleOp>())
       if (model.getName() == name) wrapper = model;
-    RAMModelParameters parameters;
-    if (failed(materializeRAMModel(*staged, wrapper, implementation, parameters, error)))
+    goldengate::RAMModelParameters parameters;
+    if (failed(goldengate::materializeRAMModel(*staged, wrapper, implementation, parameters, error)))
       return failure();
   }
-  // Resolve constraints while native gate identity and the complete transport
-  // hierarchy still exist. FIRRTL text export cannot retain these attributes.
-  if (failed(prepareXDCOutput(*staged, error))) return failure();
+  // Standalone boundaries resolve constraints before text export loses native
+  // gate identity. Full compiler assembly retains that identity through host
+  // mapping and resolves constraints against the final platform hierarchy.
+  if (emitXDC && failed(goldengate::prepareXDCOutput(*staged, error))) return failure();
   if (failed(verify(*staged))) {
     error = "SRAM timing models produced invalid FIRRTL IR";
     return failure();
@@ -876,4 +879,14 @@ LogicalResult goldengate::rewriteSRAMTimingModels(
   circuit.getBody().takeBody(staged->getBody());
   rewritten = names.size();
   return success();
+}
+
+LogicalResult goldengate::rewriteSRAMTimingHardware(
+    CircuitOp circuit, unsigned &rewritten, std::string &error) {
+  return rewriteSRAMTimingModelsImpl(circuit, rewritten, error, false);
+}
+
+LogicalResult goldengate::rewriteSRAMTimingModels(
+    CircuitOp circuit, unsigned &rewritten, std::string &error) {
+  return rewriteSRAMTimingModelsImpl(circuit, rewritten, error, true);
 }

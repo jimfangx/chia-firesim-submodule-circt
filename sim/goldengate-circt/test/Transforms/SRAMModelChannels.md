@@ -907,15 +907,83 @@ including `rtl/`, `comparison-final.log`, `ctest-final.log` and build logs.
 The iteration-58 scalar/grouped and shared-memory comparisons still pass.
 FireSim manager verification remains owned by the harness.
 
+## Iteration 60: selected memories in full compiler assembly
+
+The normal `--compile-baseline` route now consumes retained
+`FirrtlMemModelAnnotation` requests after WrapTop, labels memories before
+ExtractModel, and lowers the new interfaces before channel preparation. Selected
+memories use the native parent/SRAM FAME, pipe and ready/valid transport, and RAM
+replacement. This route then enters the same bridge, host, platform, header and
+RTL stages as the unselected compiler. Debug-host combinations fail explicitly
+until their selected-memory assembly is supported.
+
+`rewriteSRAMTimingHardware` commits verified hardware while retaining native
+clock-gate identity and constraint snippets. It defers XDC resolution until the
+host hierarchy is finalized. The standalone `--rewrite-sram-models` route keeps
+its existing immediate-XDC contract. A focused `--rewrite-sram-hardware` probe
+accepts a missing circuit path and emits hardware identical to the constrained
+boundary, without generating premature XDC. Its FIRRTL text is a comparison
+artifact; only the live MLIR circuit preserves native gate attributes.
+
+The full selected candidate reads the exact immutable compiler fixture
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`
+and its `.anno.json`, adding only `~FireSim|Rocket>rf` memory selection in a
+mutable annotation copy. It emits simulator SystemVerilog with one native SRAM
+definition, the async RAM implementation and complete FireSim host assembly.
+An unselected compile from the original annotations also succeeds. Their
+`.const.h`, `.const.vh` and `.defines.vh` match.
+
+The independently regenerated Scala reference derived from that exact FIRRTL
+matches the full assembled SRAM adapter on 32 port contracts and 32 bindings
+and equations. `SRAMCompilerAssemblyOracle.scala` exports the SFC adapter with
+its RAM implementation represented by its independently generated port ABI;
+pinned firtool lowers that reference. `SRAMCompilerAssemblyCompare.py` compares
+port widths/directions, every live implementation binding and handshake
+equation, expanding aliases and canonicalizing Boolean conjunctions. The
+unused reset-ready output must remain unobserved. This comparison does not
+claim equivalence of ordinary target logic or RAM internal state.
+
+Both final XDC files match the immutable U250 build-tree artifacts
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.implementation.xdc`
+and `FireSim-generated.synthesis.xdc`, normalizing only SFC's
+`target/FireSim_` to native `target_FAMETop/FireSim`. Clock names, ratios and
+multicycle setup/hold values match; the replaced SRAM contributes no stale gate.
+The four scalar/shared/grouped/ready-valid Scala comparisons still match their
+annotation records, FAME control equations, adapter equations and XDC. Forty-two
+focused CTests pass after correcting the deferred-XDC test's initial assumption
+that native snippet attributes appear in exported annotation JSON.
+
+Evidence is in the mutable generated directory's `iteration60-sram-compiler/`:
+`selected-full/`, `unselected-full/`, `boundary/`, `comparison.log`,
+`assembly-comparison.log`, `collateral-comparison.log`, `ctest.log` and
+`ctest-fixed.log`. To reproduce the final adapter comparison, compile
+`SRAMCompilerAssemblyOracle.scala` against the existing MIDAS classpath, invoke
+it with `boundary/golden-rocket.expected.fir` and `sfc-adapter.fir`, lower that
+file with pinned firtool, then run:
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/SRAMCompilerAssemblyCompare.py \
+  "$evidence/sfc-adapter.sv" "$evidence/selected-full/FireSim-generated.sv"
+```
+
+The iteration-59 manager gate timed out despite the local target UART recording
+all 90,141 portable checks, signature `0x78194504c338c229`, and exit status zero.
+Complete supplied stdout/stderr and manager logs contain repeated screen-status
+polling; an unrelated SPEC `fsim0` screen session was still present. This
+supports a completion-monitoring diagnosis, not a target RTL failure. The
+harness gate remains failed, and no manager action or unrelated session was
+modified. Selected-memory runtime verification remains pending with the harness.
+
 ## Remaining scope
 
 Shared SRAM definitions now have a combined native FAME, transport, timing-model
-and generated-clock collateral boundary. Optional memory selection is still
-absent from the default FireSim build, and full selected-memory Rocket runtime
-verification remains pending. Legacy retained domain-clock annotations have
+and generated-clock collateral boundary. Explicit retained memory selections now
+execute through full FireSim compiler assembly; the ordinary configuration
+selects no optional memories. Selected-memory Rocket runtime verification
+remains pending. Legacy retained domain-clock annotations have
 the same erased top-clock references as SFC after FAME; later consumers must
-use captured domain identity. The next smallest step is optional SRAM selection
-through the full FireSim compiler pipeline, followed by harness verification of
-selected-memory Rocket RTL. Ready/valid top passthroughs and inter-model
+use captured domain identity. The next smallest step is harness verification of
+the selected-memory Rocket candidate, then selected-memory debug host assembly.
+Ready/valid top passthroughs and inter-model
 ready/valid endpoints remain unsupported at this optional boundary.
 Readwrite/wider memory shapes and FAME-5 remain separate incomplete work.
