@@ -386,7 +386,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding] "
+                    "[--stop-after-print-host-binding [--map-print-host-cpu-streams]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -395,6 +395,7 @@ int main(int argc, char **argv) {
   llvm::StringRef outputBase = "FireSim-generated";
   bool enableAutoILA = false;
   bool stopAfterPrintHostBinding = false;
+  bool mapPrintHostCPUStreams = false;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
     bool baseSeen = false, depthSeen = false, triggersSeen = false;
@@ -415,6 +416,11 @@ int main(int argc, char **argv) {
             materializePrintHosts = bindPrintHostConstructors = true;
         continue;
       }
+      if (option == "--map-print-host-cpu-streams") {
+        if (mapPrintHostCPUStreams) return fail("duplicate --map-print-host-cpu-streams");
+        mapPrintHostCPUStreams = true;
+        continue;
+      }
       if (i + 1 == argc) return fail("missing value for compiler option: " + option.str());
       llvm::StringRef value(argv[++i]);
       if (option == "--output-filename-base") {
@@ -433,6 +439,8 @@ int main(int argc, char **argv) {
       }
     }
   }
+  if (mapPrintHostCPUStreams && !stopAfterPrintHostBinding)
+    return fail("--map-print-host-cpu-streams requires --stop-after-print-host-binding");
   ilaOptions.outputBaseFilename = outputBase.str();
   if (auto error = llvm::sys::fs::create_directories(outputDir))
     return fail("cannot create output directory: " + error.message());
@@ -535,6 +543,23 @@ int main(int argc, char **argv) {
           return fail("PrintBridge binding RTL: " + error);
       }
       llvm::outs() << "Bound " << hosts.size() << " queued PrintBridge hosts to post-FAME tokens in " << boundIR << '\n';
+      if (mapPrintHostCPUStreams) {
+        // This boundary has materialized only Print hosts. Full platform
+        // assembly supplies earlier allocated streams (e.g. TracerV) explicitly.
+        if (failed(goldengate::mapPrintBridgeCPUStreams(circuit, {}, {}, error)))
+          return fail("PrintBridge CPU stream allocation: " + error);
+        llvm::SmallString<256> cpuIR(outputDir), cpuRTL(outputDir), cpuAnnos(outputDir);
+        llvm::sys::path::append(cpuIR, "post-print-cpu-streams.mlir");
+        llvm::sys::path::append(cpuRTL, "post-print-cpu-streams.sv");
+        llvm::sys::path::append(cpuAnnos, "post-print-cpu-streams-all.json");
+        llvm::raw_fd_ostream cpuOut(cpuIR, ec);
+        if (ec) return fail("cannot write Print CPU stream MLIR: " + ec.message());
+        module->print(cpuOut); cpuOut << '\n'; cpuOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, cpuAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, cpuRTL, error)))
+          return fail("PrintBridge CPU stream output: " + error);
+        llvm::outs() << "Mapped bound Print queues to native CPU AXI reads and count MCR in " << cpuIR << '\n';
+      }
       return 0;
     }
     if (failed(mlir::verify(*module)))

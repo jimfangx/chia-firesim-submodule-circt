@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/CPUStreamQueue.h"
+#include "goldengate/ControlAddressDecode.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
 #include <set>
@@ -9,6 +10,80 @@
 #include "llvm/Support/MathExtras.h"
 using namespace mlir;
 using namespace circt::firrtl;
+
+LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
+    ArrayRef<CPUStreamSourcePort> precedingSources,
+    ArrayRef<CPUStreamCountPort> precedingCounts, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (precedingSources.size() != precedingCounts.size())
+    return reject("Print CPU allocation requires one ordered count per preceding stream");
+  for (unsigned i = 0; i < precedingSources.size(); ++i)
+    if (precedingSources[i].streamName != precedingCounts[i].streamName)
+      return reject("Print CPU allocation preceding stream/count identities differ");
+  FModuleOp top;
+  auto find = [&](StringRef name) -> FModuleOp {
+    for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == name) return m;
+    return {};
+  };
+  top = find(circuit.getName());
+  auto bindings = top ? top->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
+  if (!bindings || bindings.empty())
+    return reject("Print CPU allocation requires the active bound Print host registry");
+  SmallVector<CPUStreamSourcePort> sources(precedingSources);
+  SmallVector<CPUStreamCountPort> counts(precedingCounts);
+  llvm::StringSet<> hostNames, widgetNames;
+  for (auto attr : bindings) {
+    auto binding = dyn_cast<DictionaryAttr>(attr);
+    auto string = [&](StringRef key) { return binding ? binding.getAs<StringAttr>(key) : StringAttr{}; };
+    auto hostName = string("hostModule"), widgetName = string("widgetName");
+    auto stream = string("streamPort"), count = string("countPort"), control = string("controlPort");
+    if (!hostName || !widgetName || !stream || !count || !control ||
+        widgetName.getValue().empty() || !hostNames.insert(hostName.getValue()).second ||
+        !widgetNames.insert(widgetName.getValue()).second)
+      return reject("Print CPU allocation requires unique complete host bindings");
+    auto host = find(hostName.getValue());
+    auto info = host ? host->getAttrOfType<DictionaryAttr>("goldengate.printHost") : DictionaryAttr{};
+    auto depth = info ? info.getAs<IntegerAttr>("queueDepth") : IntegerAttr{};
+    auto width = info ? info.getAs<IntegerAttr>("widthBytes") : IntegerAttr{};
+    auto countBits = info ? info.getAs<IntegerAttr>("countBits") : IntegerAttr{};
+    auto config = info ? info.getAs<StringAttr>("configModule") : StringAttr{};
+    auto mcr = info ? info.getAs<StringAttr>("mcrModule") : StringAttr{};
+    if (!host || host.getNumPorts() != 13 || !depth || depth.getInt() != 6144 || !width || width.getInt() != 64 ||
+        !countBits || countBits.getInt() != 13 || !config || !mcr)
+      return reject("Print CPU allocation requires the queued 6144x512 host geometry");
+    // Resolve the real host instance and control port, not a detached metadata
+    // row that could allocate a different bank from the one driving this queue.
+    InstanceOp instance;
+    for (auto i : top.getOps<InstanceOp>()) if (i.getName() == widgetName.getValue()) instance = i;
+    if (!instance || instance.getModuleName() != host.getName())
+      return reject("Print CPU allocation host instance differs from its binding");
+    bool foundControl = false;
+    for (auto p : top.getPorts()) if (p.name == control.getValue())
+      foundControl = p.direction == Direction::In && p.type == host.getPortType(11);
+    if (!foundControl) return reject("Print CPU allocation control port differs from the local AXI bank");
+    ControlMMIOWidget widget;
+    if (failed(deriveControlMMIOWidget(circuit, widgetName.getValue(), mcr.getValue(),
+          {config.getValue()}, widget, error))) return failure();
+    if (widget.registerCount != 6) return reject("Print CPU allocation requires six control words");
+    std::string streamName = widgetName.getValue().upper() + "_to_cpu_stream";
+    sources.push_back({streamName, stream.getValue().str(), 6144});
+    counts.push_back({streamName, count.getValue().str(), 13});
+  }
+  // The read builder may succeed before the count builder discovers a malformed
+  // boundary. Commit only the new wrappers and both target retargetings together.
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addCPUStreamRead(*staged, sources, error)) ||
+      failed(addCPUStreamCountBank(*staged, counts, error))) return failure();
+  if (failed(verify(*staged))) return reject("Print CPU allocation produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName())) op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
 
 // CPU stream allocation wraps local hosts without renaming existing targets.
 LogicalResult goldengate::materializePrintBridgeHostQueues(CircuitOp circuit,

@@ -125,6 +125,16 @@ LogicalResult materializeConfigs(CircuitOp circuit,
     }
     metadata.set("registers", b.getArrayAttr(registerMap));
     m->setAttr(streamForm ? "goldengate.printStreamConfig" : "goldengate.printConfig", metadata.getDictionary(ctx));
+    // Widget.numRegs and HasWidgets allocation use the same registry as other
+    // native banks. Keep the decoder's richer layout alongside this shared ABI.
+    SmallVector<Attribute> mmioRegisters;
+    for (unsigned word = 0; word < 6; ++word)
+      mmioRegisters.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("name", b.getStringAttr(registerNames[word])),
+          b.getNamedAttr("offset", b.getI64IntegerAttr(word * 4)),
+          b.getNamedAttr("readable", b.getBoolAttr(true)),
+          b.getNamedAttr("writeable", b.getBoolAttr(true))}));
+    m->setAttr("goldengate.mmioRegisters", b.getArrayAttr(mmioRegisters));
     b.setInsertionPointToStart(m.getBodyBlock());
     auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
     auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };

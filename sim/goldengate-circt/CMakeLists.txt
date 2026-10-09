@@ -352,6 +352,8 @@ if(BUILD_TESTING)
     lib/Transforms/PrintBridgeConfig.cpp
     lib/Transforms/PrintBridgeHost.cpp
     lib/Transforms/CPUStreamQueue.cpp
+    lib/Transforms/CPUStreamRead.cpp
+    lib/Transforms/CPUStreamCountBank.cpp
     lib/Transforms/ClockBridgeControl.cpp
     lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-print-host-test PRIVATE cxx_std_17)

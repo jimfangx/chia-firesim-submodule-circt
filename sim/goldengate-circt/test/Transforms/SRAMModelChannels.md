@@ -1217,6 +1217,63 @@ MMIO words and outgoing CPU stream in full platform assembly. Compatibility
 with an SFC decoder's hash-ordered record ABI remains a separate limitation;
 the native decoder must accompany its native RTL.
 
+## Iteration 66: bound Print queues enter native CPU transport
+
+`PrintBridgeConfig.cpp` now exposes the six implemented configuration words in
+the shared `goldengate.mmioRegisters` registry. The richer Print decoder layout
+is retained. `deriveControlMMIOWidget` validates this registry against the actual
+six-lane MCRFile type; `allocateControlMMIORegions` therefore allocates 32 bytes
+per Print bank, including equal-sized banks in caller registration order.
+
+`mapPrintBridgeCPUStreams` resolves the active top's bound Print host collection,
+its instantiated hosts and control ports. It derives stream names using
+`StreamToHostCPU`'s uppercase widget-name convention and takes queue geometry
+from each host. Explicit caller-supplied streams precede the Print collection;
+Print order comes from the binding registry. It connects the actual queued
+outputs to `addCPUStreamRead`'s native AXI AR/R transport and their live counts
+to `addCPUStreamCountBank`'s read-only MCR words. Both transformations are staged
+on a clone and committed together, preserving existing operation identities.
+
+The compiler option `--map-print-host-cpu-streams`, used with
+`--compile-baseline --stop-after-print-host-binding`, exercises this stage on
+the selected-memory path. It emits `post-print-cpu-streams.mlir`, `.sv` and
+`-all.json` after retaining the preceding binding/decoder artifacts. This stop
+boundary materializes only Print hosts; its stream zero is not a claim about
+the complete platform's bridge registration order.
+
+Evidence is in `iteration66-print-cpu-allocation/` under the mutable U250
+generated directory. The candidate and a fresh independent SFC reference use
+the immutable compiler oracle
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`
+with the recorded explicit rf/printf selections. `SRAMPrintBindingCompare.py`
+passes again for all 18 Print channels, constructors, clocks, queued joins,
+ordered native payload/decoder slices and the immutable queue geometry. Native
+versus SFC inter-group record order still differs and is reported separately.
+
+`PrintCPUAllocationCompare.py` compares the emitted transport with
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+The recorded configuration has no Print host. Its `CPUManagedStreamEngine`
+transports TracerV using the same stream ABI: after resolving internal aliases,
+AR ready, R valid and queue ready have identical handshake terms. The 19-bit
+window selection, nine-bit burst counter, 512-bit data/ID forwarding, and
+zero-extended 13-bit occupancy also match. The candidate's emitted queue and
+count instance connections are checked directly. Removing last-beat gating
+from AR ready and detaching the count input are both rejected; results are in
+`cpu-allocation-comparison.json` and `cpu-mutation-results.json`.
+
+Five focused CTests pass: Print config, host, binding, control address decode
+and multiple CPU reads. The binding test now derives two Print streams after
+TracerV through the production consumer, validates ordered count identities
+and 512KiB windows, and checks two six-word banks allocate 32-byte regions. Eight
+malformed allocation cases leave the circuit unchanged, including a bad count
+port discovered after read hardware has been staged. The compiler and the
+fresh selected SFC oracle pass. No manager verification step was run.
+
+Global control dispatch, CPU write/response assembly and final driver allocation
+remain pending for this optional boundary. The next smallest step is binding
+the validated Print bank(s) and CPU count bank into the platform's shared MMIO
+dispatch, with complete bridge registration order supplied explicitly.
+
 ## Remaining scope
 
 Shared SRAM definitions now have a combined native FAME, transport, timing-model

@@ -1,5 +1,7 @@
 // See LICENSE for license details.
 #pragma once
+#include "goldengate/CPUStreamRead.h"
+#include "goldengate/CPUStreamCountBank.h"
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include "llvm/ADT/SmallVector.h"
 #include <string>
@@ -100,4 +102,14 @@ mlir::LogicalResult materializePrintBridgeHostQueues(
 mlir::LogicalResult bindPrintBridgeHosts(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+// Consume bound Print queue outputs into native CPU AXI AR/R and read-only
+// occupancy MCR words. Caller-supplied streams precede Print hosts; Print order
+// comes from the binding registry, independently of module traversal. Validate
+// each Print's implemented six-word MCR bank before allocation. Stage both
+// transport and count binding so a failure leaves the entire circuit unchanged.
+// Global MMIO dispatch, CPU write transport and driver assembly follow later.
+mlir::LogicalResult mapPrintBridgeCPUStreams(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<CPUStreamSourcePort> precedingSources,
+    llvm::ArrayRef<CPUStreamCountPort> precedingCounts, std::string &error);
 } // namespace goldengate
