@@ -1403,3 +1403,50 @@ then integrate platform widget registration, address/driver collateral and
 Print runtime execution. The immutable U250 fixture has printf disabled, so
 this is a comparison of shared router semantics, not a complete Print-enabled
 platform differential. Harness-owned manager gates were not started here.
+
+### Iteration 69: selected Print control master assembly
+
+`bindControlMaster` now accepts an explicit completed assembly stage. The
+default full-platform entry still requires `GGFASEDBridgeBoundWrapper`; the
+selected Print path explicitly requires `GGControlWriteTrackerWrapper` after
+its complete Print/count request and response catalog has been bound. The pass
+validates every U250 request/response field before creating FIRRTL operations.
+It internalizes 32 scalar ports and the aggregate AR port, connects them to one
+five-channel `ctrl` bundle and preserves the inner module body. Copied ports,
+including host clock/reset and CPU AXI streams, retain their types and
+directions. Copied annotation targets transfer to the new master wrapper;
+internalized targets retain their inner module identity.
+
+`--map-print-host-master` requires `--map-print-host-responses` and emits
+`post-print-control-master.mlir`, `.sv` and `-all.json`. The mutable evidence
+directory is `iteration69-print-control-master/` under the U250 generated-source
+tree. The native candidate consumes the immutable compiler oracle's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` with the selected rf/printf
+annotations from iteration 68: one Print bank, one CPU count bank and error.
+
+`PrintControlMasterCompare.py` compares the emitted interface with `FPGATop`
+in the exact immutable U250 `design/FireSim-generated.sv` recorded above. All
+45 control pins match in width and direction, including 25-bit addresses,
+12-bit IDs, 32-bit data and all sidebands. All 45 actual master-to-router
+connections pass. The 214 copied flattened ports retain their interfaces;
+CIRCT folds the constant CPU R.resp output to the same `2'h0` in both the
+inner and outer emitted modules. Annotation classes, payloads, order and
+recursive target transfer match. `control-master-comparison.json` records
+these results and both exact artifact paths. The response comparison also
+passes all six retirement predicates and tracker/arbiter connections; the
+request comparison passes all eight SFC NastiRouter handshake predicates.
+
+The compiler and both focused tests built. `goldengate-print-binding` and
+`goldengate-control-master` pass, covering ordered/reversed two-Print-host
+catalogs with a preceding TracerV stream, complete scalar/aggregate wiring,
+copied CPU stream ports, unchanged inner IR, explicit-stage enforcement and
+26 atomic master rejection cases across both assembly stages. The CLI rejects
+the new flag without response composition before creating an output directory.
+
+Remaining: integrate selected Print widget registration and address/driver
+collateral into platform assembly, then exercise Print runtime execution.
+The next smallest step is to emit the selected Print/count register-address
+collateral from the same bound catalog used by MMIO dispatch. The immutable
+U250 fixture has printf disabled, so shared control ABI/router matches do not
+establish a Print-enabled platform differential. This iteration did not start
+any harness-owned manager gates; the overall migration remains incomplete.

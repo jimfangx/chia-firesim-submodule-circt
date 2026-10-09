@@ -5,6 +5,7 @@
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/CPUStreamCountBank.h"
 #include "goldengate/ControlAddressDecode.h"
+#include "goldengate/SimulationMasterControl.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -379,6 +380,51 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   auto responded = dump(*f.root);
   require(failed(goldengate::mapPrintBridgeControlResponses(f.circuit, error)) && dump(*f.root) == responded,
       "repeat Print response composition must be atomic");
+  auto inner = named(f.circuit, f.circuit.getName());
+  auto innerBefore = dump(inner);
+  // The default full-platform entry must not silently accept a selected host.
+  require(failed(goldengate::bindControlMaster(f.circuit, error)) && dump(*f.root) == responded,
+      "selected master needs an explicit assembly stage");
+  require(succeeded(goldengate::bindControlMaster(f.circuit, "GGControlWriteTrackerWrapper", error)) &&
+      succeeded(verify(*f.root)), error);
+  auto master = named(f.circuit, "GGControlMasterWrapper");
+  require(f.circuit.getName() == master.getName() && dump(inner) == innerBefore,
+      "master assembly changed selected host internals");
+  require(master.getNumPorts() + 32 == inner.getNumPorts(), "master scalar boundary count differs");
+  for (auto p : master.getPorts()) {
+    auto name = p.name.getValue();
+    require(name != "ctrl_write_route_aw_ready" && name != "ctrl_write_route_aw_valid" &&
+        name != "ctrl_write_route_w_ready" && name != "ctrl_write_route_w_valid" &&
+        name != "ctrl_write_route_w_last" && !name.starts_with("ctrl_write_dispatch_master_") &&
+        name != "ctrl_decode_aw_addr" && !name.starts_with("ctrl_read_dispatch_master_") &&
+        !name.starts_with("ctrl_read_arb_out_") && !name.starts_with("ctrl_write_arb_out_"),
+        "master request/response scalar remains exposed");
+  }
+  auto ctrl = cast<BundleType>(master.getPorts()[port(master, "ctrl")].type);
+  require(ctrl.getElements().size() == 5 && master.getPorts()[port(master, "ctrl")].direction == Direction::In,
+      "master is not one complete flipped Nasti interface");
+  unsigned cpuPorts = 0;
+  for (auto p : inner.getPorts()) if (p.name.getValue().starts_with("cpu_stream_")) {
+    auto copied = master.getPorts()[port(master, p.name.getValue())];
+    require(copied.type == p.type && copied.direction == p.direction,
+        "master binding changed CPU AXI stream interface");
+    ++cpuPorts;
+  }
+  require(cpuPorts != 0, "master binding lost CPU AXI stream ports");
+  unsigned strictConnections = 0, arConnections = 0;
+  for (auto connect : master.getOps<StrictConnectOp>()) { (void)connect; ++strictConnections; }
+  for (auto connect : master.getOps<ConnectOp>())
+    if (auto field = connect.getSrc().getDefiningOp<SubfieldOp>())
+      if (field.getInput() == master.getBodyBlock()->getArgument(port(master, "ctrl")) && field.getFieldName() == "ar")
+        ++arConnections;
+  require(strictConnections == 32 && arConnections == 1, "master lacks complete scalar/AR wiring");
+  if (!output.empty() && !reverse) {
+    std::error_code ec; llvm::raw_fd_ostream out((output + ".master.mlir").str(), ec);
+    require(!ec, "cannot write Print master composition fixture"); f.root->print(out);
+  }
+  auto mastered = dump(*f.root);
+  require(failed(goldengate::bindControlMaster(f.circuit, "GGControlWriteTrackerWrapper", error)) &&
+      dump(*f.root) == mastered, "repeat selected master assembly must be atomic");
   llvm::outs() << "PASS binding " << (reverse ? "reversed" : "ordered") << " " << evaluations << " handshake/data cases and three-stream CPU composition\n";
 }
 

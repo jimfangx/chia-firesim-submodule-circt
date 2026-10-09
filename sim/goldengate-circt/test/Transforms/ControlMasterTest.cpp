@@ -38,7 +38,7 @@ std::vector<Pin> pins(){
   }
   return p;
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0){
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0, llvm::StringRef inputName="GGFASEDBridgeBoundWrapper"){
   std::string s="module { firrtl.circuit \"GGFASEDBridgeBoundWrapper\" { firrtl.module @GGFASEDBridgeBoundWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %diagnostic: !firrtl.uint<4>";
   for(auto p:pins()) {
     if(bad==1&&p.name=="ctrl_write_route_w_last")continue;
@@ -51,13 +51,16 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0){
   s+=") {} } }";
   if(bad==9)s.replace(s.find("user: uint<1>>>"),std::string("user: uint<1>>>").size(),"user: uint<2>>>");
   if(bad==10)s.replace(s.find("in %ctrl_read_dispatch_master_ar"),2,"out");
+  const std::string originalName = "GGFASEDBridgeBoundWrapper";
+  for (size_t at = 0; (at = s.find(originalName, at)) != std::string::npos; at += inputName.size())
+    s.replace(at, originalName.size(), inputName.str());
   auto root=parseSourceString<ModuleOp>(s,&ctx);require(bool(root),"fixture parse failed");
   auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);SmallVector<Attribute> annos;
   for(auto n:{"diagnostic","ctrl_write_route_w_last","ctrl_read_dispatch_master_ar.bits.id"})
-    annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Target")),b.getNamedAttr("target",b.getStringAttr("~GGFASEDBridgeBoundWrapper|GGFASEDBridgeBoundWrapper>"+std::string(n)))}));
+    annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Target")),b.getNamedAttr("target",b.getStringAttr("~"+inputName.str()+"|"+inputName.str()+">"+std::string(n)))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(annos));
   if(bad==5)c->removeAttr("rawAnnotations");
-  auto m=top(c,"GGFASEDBridgeBoundWrapper");
+  auto m=top(c,inputName);
   if(bad==6){b.setInsertionPointToStart(m.getBodyBlock());b.create<InstanceOp>(c.getLoc(),m,"used");}
   if(bad==7)c.setName("Wrong");
   if(bad==8){b.setInsertionPointToEnd(c.getBodyBlock());b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGControlMasterWrapper"),m.getConventionAttr(),ArrayRef<PortInfo>{});}
@@ -67,9 +70,17 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0){
 int main(){
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
   try {
-    auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
-    auto inner=top(c,"GGFASEDBridgeBoundWrapper");std::string before;llvm::raw_string_ostream out(before);inner.print(out);
-    require(succeeded(goldengate::bindControlMaster(c,error)),error);
+    for (llvm::StringRef inputName : {"GGFASEDBridgeBoundWrapper", "GGControlWriteTrackerWrapper"}) {
+    auto root=fixture(ctx, 0, inputName);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+    auto inner=top(c,inputName);std::string before;llvm::raw_string_ostream out(before);inner.print(out);
+    auto unbound = dump(*root);
+    require(failed(goldengate::bindControlMaster(c, "UnexpectedStage", error)) && dump(*root) == unbound,
+            "unsupported assembly stage mutated IR");
+    require(failed(goldengate::bindControlMaster(c,
+            inputName == "GGFASEDBridgeBoundWrapper" ? "GGControlWriteTrackerWrapper" : "GGFASEDBridgeBoundWrapper", error)) &&
+            dump(*root) == unbound, "mismatched assembly stage mutated IR");
+    require(succeeded(inputName == "GGFASEDBridgeBoundWrapper" ? goldengate::bindControlMaster(c,error) :
+            goldengate::bindControlMaster(c,inputName,error)),error);
     require(succeeded(verify(*root)),"invalid bound IR");
     auto m=top(c,"GGControlMasterWrapper");require(m.getNumPorts()==4,"master scalar boundaries remain exposed");
     InstanceOp sim=*m.getOps<InstanceOp>().begin();
@@ -97,11 +108,12 @@ int main(){
     for(auto [i,a]:llvm::enumerate(as)) {
       auto target=cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue();
       require(target.starts_with("~GGControlMasterWrapper|"),"circuit target lost");
-      require(target.contains(i==0?"|GGControlMasterWrapper>":"|GGFASEDBridgeBoundWrapper>"),"internalized target escaped");
+      require(target.contains(i==0?"|GGControlMasterWrapper>":"|"+inputName.str()+">"),"internalized target escaped");
     }
     auto good=dump(*root);require(failed(goldengate::bindControlMaster(c,error))&&dump(*root)==good,"repeat mutated IR");
-    for(unsigned bad=1;bad<=10;++bad){auto r=fixture(ctx,bad);auto c=*r->getOps<CircuitOp>().begin();auto original=dump(*r);require(failed(goldengate::bindControlMaster(c,error)),"invalid boundary accepted");require(original==dump(*r),"rejection mutated IR");}
-    llvm::outs()<<"Control master: 32 scalar and aggregate AR connections, copied clocks, target transfer and 11 atomic rejections passed\n";
+    for(unsigned bad=1;bad<=10;++bad){auto r=fixture(ctx,bad,inputName);auto c=*r->getOps<CircuitOp>().begin();auto original=dump(*r);require(failed(goldengate::bindControlMaster(c,inputName,error)),"invalid boundary accepted");require(original==dump(*r),"rejection mutated IR");}
+    }
+    llvm::outs()<<"Control master: both assembly stages, 32 scalar and aggregate AR connections, copied clocks, target transfer and 26 atomic rejections passed\n";
     return 0;
   } catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}
 }

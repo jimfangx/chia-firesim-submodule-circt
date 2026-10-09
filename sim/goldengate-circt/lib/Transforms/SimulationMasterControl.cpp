@@ -237,8 +237,10 @@ LogicalResult goldengate::bindFASEDBridgeControl(CircuitOp circuit,
        "fasedBridge_ctrl", "FASEDMemoryTimingModel_0", "goldengate.fasedSlave"}, error);
 }
 
-// Requires: uninstantiated GGFASEDBridgeBoundWrapper and exact U250 master
-// request/response boundaries. Widget.scala connects the host master to the
+// Requires: an uninstantiated completed binding stage and exact U250 master
+// request/response boundaries. The default entry requires all platform widgets;
+// the explicit selected-host entry follows complete request/response binding.
+// Widget.scala connects the host master to the
 // recursive interconnect; the existing route/tracker helpers supply readiness.
 // Consumes: 32 scalar boundaries and the aggregate AR master boundary.
 // Mutates: creates one stateless wrapper with the full host-facing ctrl bundle.
@@ -247,10 +249,19 @@ LogicalResult goldengate::bindFASEDBridgeControl(CircuitOp circuit,
 // bridge metadata and response acceptance through the existing arbiters.
 LogicalResult goldengate::bindControlMaster(CircuitOp circuit,
                                           std::string &error) {
-  constexpr llvm::StringLiteral inputName="GGFASEDBridgeBoundWrapper";
+  return bindControlMaster(circuit, "GGFASEDBridgeBoundWrapper", error);
+}
+
+LogicalResult goldengate::bindControlMaster(CircuitOp circuit,
+                                          llvm::StringRef inputName,
+                                          std::string &error) {
   constexpr llvm::StringLiteral wrapperName="GGControlMasterWrapper";
   auto reject=[&](llvm::StringRef s){error=s.str();return failure();};
-  if(circuit.getName()!=inputName)return reject("control master requires all widget bindings");
+  if(inputName != "GGFASEDBridgeBoundWrapper" &&
+     inputName != "GGControlWriteTrackerWrapper")
+    return reject("control master requires a supported completed binding stage");
+  if(circuit.getName()!=inputName)
+    return reject("control master active top differs from the requested binding stage");
   FModuleOp inner;
   for(auto m:circuit.getOps<FModuleLike>()) {
     if(m.getModuleName()==wrapperName)return reject("control master wrapper exists");
