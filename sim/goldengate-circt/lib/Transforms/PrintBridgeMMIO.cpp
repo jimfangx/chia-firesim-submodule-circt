@@ -13,6 +13,9 @@
 #include "goldengate/ControlReadArbiter.h"
 #include "goldengate/ControlWriteArbiter.h"
 #include "goldengate/ControlWriteTracker.h"
+#include "goldengate/TSITokenEngine.h"
+#include "goldengate/TSIWordQueues.h"
+#include "goldengate/TSIMMIOBank.h"
 #include "goldengate/SimulationMaster.h"
 #include "goldengate/SimulationMasterControl.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -322,6 +325,86 @@ LogicalResult goldengate::mapPrintBridgeRocketSimulationMaster(CircuitOp circuit
       failed(mapSimulationMasterControl(*staged, 25, 12, error)) ||
       failed(bindSimulationMasterControl(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print master produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// TSIBridge.scala binds five FAME channel ports before attaching its two queues.
+// Allocate from the actual expanded bank catalog, then stage all operations so
+// a missing channel, malformed bank or late wrapper collision leaves IR intact.
+LogicalResult goldengate::mapPrintBridgeRocketTSI(CircuitOp circuit,
+                                                std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGSimulationMasterBoundWrapper")
+    return reject("Rocket Print TSI requires the completed SimulationMaster boundary");
+  auto find = [](CircuitOp c, StringRef name) -> FModuleOp {
+    for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
+    return {};
+  };
+  auto bound = find(circuit, "GGPrintBridgeHostWrapper");
+  auto decoder = find(circuit, "GGControlAddressDecode");
+  auto bank = find(circuit, "GGTSIMMIOBank");
+  auto hosts = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
+  auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
+  auto words = bank ? bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters") : ArrayAttr{};
+  if (!hosts || hosts.empty() || !regions || regions.size() != hosts.size() + 11 ||
+      !words || words.size() != 9)
+    return reject("Rocket Print TSI requires the expanded allocation and nine TSI words");
+  const StringRef names[]{"in_bits", "in_valid", "in_ready", "out_bits", "out_valid",
+                         "out_ready", "step_size", "done", "start"};
+  for (auto [i, attr] : llvm::enumerate(words)) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto offset = row ? row.getAs<IntegerAttr>("offset") : IntegerAttr{};
+    auto read = row ? row.getAs<BoolAttr>("readable") : BoolAttr{};
+    auto write = row ? row.getAs<BoolAttr>("writeable") : BoolAttr{};
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    if (!name || name.getValue() != names[i] || !offset ||
+        offset.getValue().getBitWidth() > 64 || offset.getInt() != int64_t(4 * i) ||
+        !read || !read.getValue() || !write || !write.getValue())
+      return reject("Rocket Print TSI register identity, offset or permissions differ");
+  }
+  SmallVector<FModuleOp> printHosts;
+  llvm::StringSet<> identities;
+  for (auto attr : hosts) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
+    auto symbol = row ? row.getAs<StringAttr>("hostModule") : StringAttr{};
+    auto host = symbol ? find(circuit, symbol.getValue()) : FModuleOp{};
+    if (!name || name.getValue() != "PrintBridgeModule_" + std::to_string(printHosts.size()) ||
+        !host || !identities.insert(host.getName()).second)
+      return reject("Rocket Print TSI requires instantiated constructor order");
+    printHosts.push_back(host);
+  }
+  SmallVector<ControlMMIOWidget> widgets;
+  SmallVector<ControlMMIORegion> allocated;
+  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+    return failure();
+  if (allocated.size() != regions.size()) return reject("Rocket Print TSI allocation count differs");
+  for (auto [i, region] : llvm::enumerate(allocated)) {
+    auto row = dyn_cast<DictionaryAttr>(regions[i]);
+    auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr{};
+    auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr{};
+    auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr{};
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    if (!name || name.getValue() != region.name || !start || !size || !slave ||
+        start.getValue().getBitWidth() > 64 || size.getValue().getBitWidth() > 64 ||
+        slave.getValue().getBitWidth() > 64 || start.getInt() != int64_t(region.start) ||
+        size.getInt() != int64_t(region.size) || slave.getInt() != int64_t(i))
+      return reject("Rocket Print TSI region differs from the live register allocation");
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addTSITokenEngine(*staged, error)) || failed(addTSIWordQueues(*staged, error)) ||
+      failed(attachTSIMMIOBank(*staged, find(*staged, "GGTSIMMIOBank"), error)) ||
+      failed(mapTSIBridgeControl(*staged, 25, 12, error)) ||
+      failed(bindTSIBridgeControl(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print TSI produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

@@ -1777,3 +1777,58 @@ with this expanded boundary and compare its register/control path with SFC.
 The full Print-enabled CLI path and driver addresses remain pending. Manager
 verification remains owned by the harness; the SFC UART-bearing baseline and
 overall migration remain incomplete.
+
+
+### Iteration 77: native TSI attachment after expanded Rocket/Print Master
+
+`mapPrintBridgeRocketTSI` composes the existing native TSI token scheduler,
+its two sixteen-word queues, attachment of the materialized nine-word MMIO
+bank, MCRFile adapter, and allocated control binding. Its input is the
+completed `GGSimulationMasterBoundWrapper`; its output is
+`GGTSIBridgeBoundWrapper`. TSI remains slave 3 at byte 320 with a 64-byte
+region in both constructor orders. Print does not shift this earlier bank.
+The compiler checks register identities/offsets/permissions and the complete
+live 13-bank allocation before staging the operations. Missing channel or
+bank identities and collisions at late adapter/binding stages reject without
+changing the caller's circuit. Only newly generated modules and the completed
+annotation targets are committed; existing Rocket/Print operations remain.
+
+The native fixture forwards the five actual TSI ports and their constructor,
+clock, channel payload and forward handshake descriptors from the ingested
+Rocket queue boundary. It connects them to the imported live Rocket instance.
+The first runs identified two fixture faults: absent StringAttr members must
+be checked before comparison, and the manually composed LoadMem wrapper
+must transfer copied top-port module identities along with circuit prefixes.
+The fixture now also requires retention of all five completed TSI channel
+annotations with both source and sink endpoints. TSI consumes the external
+ports while retaining the completed channel metadata.
+
+Evidence is under mutable `iteration77-print-rocket-tsi/`. The corrected native
+Rocket/two-Print fixture passes both host orders and 114 atomic rejections,
+including 20 new TSI cases. These cover stale region base/slot, invalid register
+permission, missing register/region names, missing reset channel, late adapter
+and binding symbol collisions, wrong active top and repeated attachment.
+The existing TSI token, word-queue and MMIO behavior tests all pass. The fresh
+native `--compile-baseline` reads the immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` and `.anno.json` and emits
+RTL/collateral with empty stderr. Its decoder and TracerV queue fixture inputs
+have the same SHA-256 values as iteration 76.
+
+`PrintRocketTSICompare.py` compares both expanded artifacts with the immutable
+U250 reference's `design/FireSim-generated.sv`. The nine read-word identities,
+ten scheduler/MMIO register widths, slave-3 region, host clock/reset and all
+20 surviving SFC control pins match. The complete native MMIO bank, scheduler,
+queue and MCRFile operations remain identical to the fresh baseline. Actual
+SSA nets contain 32 scalar control connections plus the aggregate AR channel,
+and connect the bank to both independent queues and scheduler. Results are
+recorded in `rocket-tsi-comparison.json`. The Master, response, request, MMIO,
+TracerV stream and pre-binding platform catalog comparisons also pass.
+
+The immutable SFC fixture disables Print: this establishes the shared TSI
+boundary, not full Print-enabled platform or driver equivalence. BlockDev and
+FASED controls and LoadMem's register-side attachment remain separate work;
+full Print-enabled CLI assembly remains pending. Next, forward the actual
+BlockDev channels and compose its native timing/queue/MMIO path at slave 0
+through this expanded boundary, comparing its register/control path with SFC.
+Manager verification remains harness-owned. The SFC UART-bearing baseline,
+FPGA execution and overall compiler migration remain incomplete.

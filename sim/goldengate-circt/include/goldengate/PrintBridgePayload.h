@@ -139,4 +139,9 @@ mlir::LogicalResult mapPrintBridgeRocketControlResponses(
 // and binding together. The remaining TSI/BlockDev/FASED ports stay exposed.
 mlir::LogicalResult mapPrintBridgeRocketSimulationMaster(
     circt::firrtl::CircuitOp circuit, std::string &error);
+
+// Compose the live Rocket TSI scheduler, word queues, MMIO bank and allocated
+// control slave after the expanded Print/SimulationMaster boundary. Atomic.
+mlir::LogicalResult mapPrintBridgeRocketTSI(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

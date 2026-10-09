@@ -392,6 +392,9 @@ if(BUILD_TESTING)
     lib/Transforms/ControlReadArbiter.cpp
     lib/Transforms/ControlWriteArbiter.cpp
     lib/Transforms/ControlWriteTracker.cpp
+    lib/Transforms/TSITokenEngine.cpp
+    lib/Transforms/TSIWordQueues.cpp
+    lib/Transforms/TSIMMIOBank.cpp
     lib/Transforms/SimulationMaster.cpp
     lib/Transforms/SimulationMasterControl.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
