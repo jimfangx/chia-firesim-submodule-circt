@@ -619,6 +619,14 @@ int main(int argc, char **argv) {
           return fail("PrintBridge control master: " + error);
         if (failed(mlir::verify(*module)))
           return fail("PrintBridge control master produced invalid FIRRTL IR");
+        std::string allocatedHeader;
+        if (failed(goldengate::preparePrintBridgeAllocatedHeader(circuit, hosts, allocatedHeader, error)))
+          return fail("PrintBridge allocated driver header: " + error);
+        llvm::SmallString<256> allocatedPath(outputDir);
+        llvm::sys::path::append(allocatedPath, "print-bridge-allocated.const.h");
+        llvm::raw_fd_ostream allocatedOut(allocatedPath, ec);
+        if (ec) return fail("cannot write Print allocated header: " + ec.message());
+        allocatedOut << allocatedHeader; allocatedOut.close();
         llvm::SmallString<256> masterIR(outputDir), masterRTL(outputDir), masterAnnos(outputDir);
         llvm::sys::path::append(masterIR, "post-print-control-master.mlir");
         llvm::sys::path::append(masterRTL, "post-print-control-master.sv");

@@ -1450,3 +1450,56 @@ collateral from the same bound catalog used by MMIO dispatch. The immutable
 U250 fixture has printf disabled, so shared control ABI/router matches do not
 establish a Print-enabled platform differential. This iteration did not start
 any harness-owned manager gates; the overall migration remains incomplete.
+
+## Iteration 70: allocated selected Print/count driver collateral
+
+The selected control-master boundary now emits
+`print-bridge-allocated.const.h`. Its six Print addresses, widget numbers,
+CPU stream indices, count addresses, DMA bases and queue capacities come from
+the materialized FIRRTL widget/transport catalog. The emitter checks the live
+instance hierarchy, six-word configuration ABI, register permissions,
+read/write bindings and decoder regions against native register allocation.
+It preserves the input IR and existing output annotations on success or failure.
+Standard `GET_INCLUDES`, `GET_SUBSTRUCT_CHECKS`, `GET_BRIDGE_CONSTRUCTOR` and
+`GET_MANAGED_STREAM_CONSTRUCTOR` guards support the existing FireSim driver.
+
+The shared CPU header analysis now follows scalar Print payload connections
+through hierarchy, as well as aggregate stream connects. Payload and occupancy
+must resolve to the same queue instance, including when queues share a module
+definition. An explicit selected-outgoing boundary validates the selected
+master before the CPU write engine has been assembled; it rejects an existing
+incoming engine or incoming/write ports. The default complete boundary still
+requires and checks the empty incoming AXI engine. This fragment is allocation
+collateral for the partial selected assembly, not a completed platform header.
+
+Evidence lives in `iteration70-print-allocated-header/` under the same mutable
+U250 generated-source tree. The compiler consumes the exact immutable compiler
+oracle `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` recorded above with
+selected Rocket rf/printf annotations. The emitted Print addresses are
+0, 4, 8, 12, 16 and 20; stream index/DMA base are zero and the count address is
+32. `PrintAllocatedHeaderCompare.py` compares that fragment against emitted
+`post-print-control-master.mlir` and the exact immutable U250
+`design/FireSim-generated.sv` recorded above. SFC's live read-only 32-bit count
+word, 6144-by-512-bit queue and 524288-byte DMA window match. Its absolute count
+address is 568, versus selected candidate address 32: the recorded full widget
+catalog differs from this selected Print/count catalog. That expected mismatch
+is retained in `allocated-header-comparison.json`. The fixture has printf
+disabled and no generated driver header; no Print runtime differential is claimed.
+
+The native compiler and focused tests build. Print binding covers both two-host
+orders, a real preceding TracerV queue (Print CPU indices 1 and 2 versus widget
+indices 0 and 1), register metadata permutation and 44 atomic allocated-header
+rejections, including constant/detached scalar payloads. The complete CPU header
+test passes its 65 atomic rejection cases. The selected fragment compiles as
+C++17 against the real FireSim driver headers under all four guards. Repeated
+structured comparisons also pass the three CPU handshake predicates, eight
+request predicates, six response retirement predicates, all 45 SFC control ABI
+pins and annotation target transfer.
+
+Remaining: register Print in the complete platform widget catalog and allocate
+its MMIO/count/driver addresses there, then assemble the complete CPU AXI
+boundary and exercise Print runtime execution. The next smallest step is to
+extend that platform catalog with the selected Print register descriptors;
+the observed 32-versus-568 count address difference makes catalog integration
+the next allocation boundary to compare. No harness-owned manager gate was
+started in this iteration. The overall migration remains incomplete.

@@ -2,6 +2,7 @@
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/CPUStreamCountBank.h"
 #include "goldengate/ControlAddressDecode.h"
@@ -428,6 +429,146 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   llvm::outs() << "PASS binding " << (reverse ? "reversed" : "ordered") << " " << evaluations << " handshake/data cases and three-stream CPU composition\n";
 }
 
+void allocatedHeaders(MLIRContext &ctx, StringRef output) {
+  for (bool reverse : {false, true}) {
+    Fixture f(ctx); OpBuilder b(&ctx); std::string error, header;
+    // The reversed case has a real preceding stream queue. This makes widget
+    // numbers and CPU allocation indices differ, as on a TracerV platform.
+    if (reverse) {
+      auto original = named(f.circuit, "Top");
+      auto queueName = f.hosts[0]->getAttrOfType<DictionaryAttr>("goldengate.printHost").getAs<StringAttr>("queueModule");
+      auto queue = named(f.circuit, queueName.getValue());
+      b.setInsertionPointToStart(original.getBodyBlock());
+      auto q = b.create<InstanceOp>(f.circuit.getLoc(), queue, "precedingTraceQueue");
+      for (unsigned p = 0; p < 2; ++p)
+        b.create<StrictConnectOp>(f.circuit.getLoc(), q.getResult(p), original.getArgument(p));
+      auto enq = q.getResult(2);
+      for (auto [name, bits] : {std::make_pair("valid", 1U), std::make_pair("bits", 512U)})
+        b.create<StrictConnectOp>(f.circuit.getLoc(), b.create<SubfieldOp>(f.circuit.getLoc(), enq, name),
+            b.create<ConstantOp>(f.circuit.getLoc(), UIntType::get(&ctx, bits), APInt(bits, 0)));
+      b.create<ConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, "tracerv_stream")), q.getResult(3));
+      b.create<StrictConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, "tracerv_stream_count")), q.getResult(4));
+    }
+    if (reverse) std::reverse(f.hosts.begin(), f.hosts.end());
+    require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
+    SmallVector<goldengate::CPUStreamSourcePort> earlier;
+    SmallVector<goldengate::CPUStreamCountPort> earlierCounts;
+    if (reverse) {
+      earlier.push_back({"TRACERVBRIDGEMODULE_0_to_cpu_stream", "tracerv_stream", 6144});
+      earlierCounts.push_back({"TRACERVBRIDGEMODULE_0_to_cpu_stream", "tracerv_stream_count", 13});
+    }
+    require(succeeded(goldengate::mapPrintBridgeCPUStreams(f.circuit, earlier, earlierCounts, error)), error);
+    require(succeeded(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)), error);
+    require(succeeded(goldengate::mapPrintBridgeControlResponses(f.circuit, error)), error);
+    auto before = dump(*f.root); header = "preserve";
+    require(failed(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, header, error)) &&
+        header == "preserve" && dump(*f.root) == before, "header accepted incomplete master assembly");
+    require(succeeded(goldengate::bindControlMaster(f.circuit, "GGControlWriteTrackerWrapper", error)), error);
+    before = dump(*f.root);
+    require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, header, error)) &&
+        dump(*f.root) == before, error);
+    // The default full-platform API must still reject this outgoing-only IR.
+    OwningOpRef<CircuitOp> complete(cast<CircuitOp>(f.circuit->clone()));
+    auto raw = complete->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> annotations(raw.begin(), raw.end());
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::OutputFile)),
+        b.getNamedAttr("fileSuffix", b.getStringAttr(".const.h")), b.getNamedAttr("body", b.getStringAttr("preserve"))}));
+    complete->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+    auto completeBefore = dump(*complete);
+    require(failed(goldengate::prepareCPUManagedStreamHeader(*complete, error)) && dump(*complete) == completeBefore,
+        "complete CPU header accepted an absent incoming engine");
+    for (unsigned slot = 0; slot < 2; ++slot) {
+      unsigned index = slot + reverse;
+      require(header.find("make_print_bridge_" + std::to_string(slot)) != std::string::npos &&
+          header.find("}, " + std::to_string(slot) + "U, args, " + std::to_string(index) + "U).release()") != std::string::npos,
+          "allocated constructor widget/stream index differs");
+      for (unsigned word = 0; word < 6; ++word)
+        require(header.find(std::to_string(32 * slot + 4 * word) + "ULL,") != std::string::npos,
+            "allocated Print register address differs");
+      require(header.find("PRINTBRIDGEMODULE_" + std::to_string(slot) +
+          "_to_cpu_stream\"), " + std::to_string(index * 524288) + "ULL, " +
+          std::to_string(64 + 4 * index) + "ULL, 6144U, 64U)") != std::string::npos,
+          "CPU count address/DMA parameters differ from Print allocation");
+    }
+    if (!output.empty()) {
+      std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".allocated-reverse.const.h" : ".allocated.const.h")).str(), ec);
+      require(!ec, "cannot write allocated Print header fixture"); file << header;
+    }
+    auto bound = named(f.circuit, "GGPrintBridgeHostWrapper");
+    auto configName = f.hosts[0]->getAttrOfType<DictionaryAttr>("goldengate.printHost").getAs<StringAttr>("configModule");
+    auto config = named(f.circuit, configName.getValue());
+    // Registry row order cannot change ABI member order or allocated addresses.
+    auto registers = config->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+    SmallVector<Attribute> reordered(registers.begin(), registers.end());
+    std::reverse(reordered.begin(), reordered.end());
+    config->setAttr("goldengate.mmioRegisters", b.getArrayAttr(reordered));
+    std::string permuted;
+    require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, permuted, error)) && permuted == header,
+        "register metadata row order changed allocated header");
+    config->setAttr("goldengate.mmioRegisters", registers);
+    // Scalar Print payload connections must resolve to the same storage
+    // instance as occupancy, not just to a queue with the same definition.
+    auto host = f.hosts[0]; ConnectOp payload;
+    for (auto c : host.getOps<ConnectOp>())
+      if (c.getDest() == host.getArgument(10)) payload = c;
+    require(bool(payload), "missing scalar Print payload connection");
+    Value savedPayload = payload.getSrc();
+    auto queueName = host->getAttrOfType<DictionaryAttr>("goldengate.printHost").getAs<StringAttr>("queueModule");
+    b.setInsertionPoint(payload);
+    auto otherQueue = b.create<InstanceOp>(host.getLoc(), named(f.circuit, queueName.getValue()), "unrelatedQueue");
+    auto otherBits = b.create<SubfieldOp>(host.getLoc(), otherQueue.getResult(3), "bits");
+    auto constant = b.create<ConstantOp>(host.getLoc(), UIntType::get(&ctx, 512), APInt(512, 0));
+    for (Value wrong : {Value(otherBits.getResult()), Value(constant.getResult())}) {
+      payload->setOperand(1, wrong); auto corrupt = dump(*f.root); std::string rejected = "preserve";
+      require(failed(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, rejected, error)) &&
+          rejected == "preserve" && dump(*f.root) == corrupt, "allocated header accepted detached scalar payload");
+    }
+    payload->setOperand(1, savedPayload); constant.erase(); otherBits.erase(); otherQueue.erase();
+    for (unsigned bad = 0; bad < 17; ++bad) {
+      FModuleOp module; StringRef key; StringRef field; Attribute value;
+      if (bad < 4) {
+        module = named(f.circuit, "GGControlAddressDecode"); key = "goldengate.controlRegions";
+        field = bad == 0 ? "start" : bad == 1 ? "size" : bad == 2 ? "slave" : "name";
+        value = bad == 3 ? Attribute(b.getStringAttr("wrong_widget")) : Attribute(b.getI64IntegerAttr(bad == 1 ? 16 : 4));
+      } else if (bad < 7) {
+        module = config; key = "goldengate.mmioRegisters";
+        field = bad == 4 ? "name" : bad == 5 ? "offset" : "writeable";
+        value = bad == 4 ? Attribute(b.getStringAttr("wrong_register")) : bad == 5 ? Attribute(b.getI64IntegerAttr(4)) : Attribute(b.getBoolAttr(false));
+      } else if (bad < 10) {
+        module = bound; key = "goldengate.printHostBindings";
+        field = bad == 7 ? "widgetName" : bad == 8 ? "controlPort" : "streamPort";
+        value = b.getStringAttr("wrong_identity");
+      } else if (bad < 15) {
+        module = named(f.circuit, "GGCPUStreamRead"); key = "goldengate.sourceStreams";
+        field = bad == 10 ? "name" : bad == 11 ? "port" : bad == 12 ? "index" : bad == 13 ? "depth" : "bufferBaseAddress";
+        value = bad < 12 ? Attribute(b.getStringAttr("wrong_stream")) : Attribute(b.getI64IntegerAttr(1));
+      } else {
+        module = named(f.circuit, bad == 15 ? "GGControlReadDispatchWrapper" : "GGCPUStreamCountBank");
+        key = bad == 15 ? "goldengate.controlReadBindings" : "goldengate.mmioRegisters";
+        field = bad == 15 ? "port" : "name"; value = b.getStringAttr("wrong_count");
+      }
+      auto original = module->getAttrOfType<ArrayAttr>(key);
+      SmallVector<Attribute> rows(original.begin(), original.end()); NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+      row.set(field, value); rows[0] = row.getDictionary(&ctx); module->setAttr(key, b.getArrayAttr(rows));
+      auto corrupt = dump(*f.root); std::string rejected = "preserve";
+      require(failed(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, rejected, error)) &&
+          !error.empty() && rejected == "preserve" && dump(*f.root) == corrupt,
+          "allocated header accepted corruption or changed IR/text: " + std::to_string(bad));
+      module->setAttr(key, original);
+    }
+    b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+    auto unexpected = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr("GGEmptyCPUStreamWrite"),
+        f.hosts[0].getConventionAttr(), ArrayRef<PortInfo>{});
+    auto unexpectedBefore = dump(*f.root); std::string rejected = "preserve";
+    require(failed(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, rejected, error)) &&
+        rejected == "preserve" && dump(*f.root) == unexpectedBefore,
+        "selected CPU header silently omitted an existing incoming engine");
+    unexpected.erase();
+  }
+  llvm::outs() << "PASS allocated Print/count headers in both host orders, preceding live queue, register permutation and 44 atomic rejections\n";
+}
+
 void allocationRejections(MLIRContext &ctx) {
   for (unsigned bad = 0; bad < 8; ++bad) {
     Fixture f(ctx); std::string error; OpBuilder b(&ctx);
@@ -616,6 +757,7 @@ int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
+    allocatedHeaders(ctx, argc > 1 ? argv[1] : "");
     for (bool reverse : {false, true}) {
       Fixture f(ctx, true, reverse); std::string error, header;
       require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);

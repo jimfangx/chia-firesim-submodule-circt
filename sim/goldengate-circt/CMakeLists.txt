@@ -367,6 +367,7 @@ if(BUILD_TESTING)
   add_executable(goldengate-print-binding-test
     test/Transforms/PrintBridgeBindingTest.cpp
     lib/Support/PrintBridgeHeader.cpp
+    lib/Support/CPUManagedStreamHeader.cpp
     lib/Transforms/PrintBridgePayload.cpp
     lib/Transforms/PrintBridgeTokenStage.cpp
     lib/Transforms/PrintBridgeControl.cpp

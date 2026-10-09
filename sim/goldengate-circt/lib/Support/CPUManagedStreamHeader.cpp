@@ -25,8 +25,11 @@
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::prepareCPUManagedStreamHeader(
-    CircuitOp circuit, std::string &error) {
+    CircuitOp circuit, std::string &error, CPUStreamHeaderBoundary boundary) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  bool selected = boundary == CPUStreamHeaderBoundary::SelectedOutgoing;
+  if (selected && circuit.getName() != "GGControlMasterWrapper")
+    return reject("selected outgoing CPU header requires the assembled selected control master");
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw) return reject("CPUManagedStreamEngine header needs retained annotations");
   DictionaryAttr output;
@@ -133,11 +136,25 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
   };
   auto transport = liveModule("GGCPUStreamRead");
   auto incoming = liveModule("GGEmptyCPUStreamWrite");
+  if (selected) {
+    if (llvm::any_of(circuit.getOps<FModuleLike>(), [](FModuleLike module) {
+          return module.getModuleName() == "GGEmptyCPUStreamWrite";
+        }))
+      return reject("selected outgoing CPU header cannot omit an existing incoming engine");
+    auto module = dyn_cast<FModuleOp>(top->getModule().getOperation());
+    if (!module) return reject("selected outgoing CPU header requires a FIRRTL top");
+    for (auto p : module.getPorts()) {
+      auto name = p.name.getValue();
+      if (name.contains("from_cpu_stream") || name.starts_with("cpu_stream_aw_") ||
+          name.starts_with("cpu_stream_w_") || name.starts_with("cpu_stream_b_"))
+        return reject("selected outgoing CPU header cannot omit incoming CPU stream ports");
+    }
+  }
   auto sources = transport ? transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams") : ArrayAttr();
   auto space = transport ? transport->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits") : IntegerAttr();
   auto sinks = incoming ? incoming->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount") : IntegerAttr();
-  if (!transport || !incoming || !sources || sources.empty() || sources.size() > INT32_MAX / 4 ||
-      !space || space.getInt() < 6 || space.getInt() > 30 || !sinks || sinks.getInt() != 0)
+  if (!transport || (!selected && !incoming) || !sources || sources.empty() || sources.size() > INT32_MAX / 4 ||
+      !space || space.getInt() < 6 || space.getInt() > 30 || (!selected && (!sinks || sinks.getInt() != 0)))
     return reject("CPU stream descriptors need ordered outgoing allocations and no incoming streams");
   unsigned n = sources.size(), mcrPort = n + 2, addressPort = n + 5;
   if (transport.getNumPorts() != n + 14 || bank.getNumPorts() != n + 3 ||
@@ -185,18 +202,38 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     find(top); return result;
   };
   struct Endpoint { FModuleOp queue; Path path; unsigned port = 0; bool namedPort = false; };
-  auto trace = [&](Value value, Path path, StringRef sourcePort = {}) -> Endpoint {
+  auto trace = [&](Value value, Path path, StringRef sourcePort = {}, StringRef member = {}) -> Endpoint {
     bool namedPort = sourcePort.empty();
     SmallVector<std::pair<Value, Path>> seen;
     while (value && seen.size() < 4096) {
       for (auto &old : seen) if (old.first == value && old.second == path) return {};
       seen.emplace_back(value, path);
       auto *block = value.getParentBlock(); Value driver; unsigned drivers = 0;
+      // Print hosts expose flattened valid/bits outputs. Follow the payload
+      // member through those scalar connects as well as whole-bundle connects.
+      if (!member.empty()) {
+        for (auto &op : *block) {
+          auto field = dyn_cast<SubfieldOp>(op);
+          if (!field || field.getInput() != value || field.getFieldName() != member) continue;
+          for (auto &connect : *block) {
+            if (auto c = dyn_cast<ConnectOp>(connect)) if (c.getDest() == field.getResult()) { driver = c.getSrc(); ++drivers; }
+            if (auto c = dyn_cast<StrictConnectOp>(connect)) if (c.getDest() == field.getResult()) { driver = c.getSrc(); ++drivers; }
+          }
+        }
+        if (drivers) {
+          if (drivers != 1) return {};
+          value = driver; member = {}; continue;
+        }
+      }
       for (auto &op : *block) {
         if (auto c = dyn_cast<ConnectOp>(op)) if (c.getDest() == value) { driver = c.getSrc(); ++drivers; }
         if (auto c = dyn_cast<StrictConnectOp>(op)) if (c.getDest() == value) { driver = c.getSrc(); ++drivers; }
       }
       if (drivers) { if (drivers != 1) return {}; value = driver; continue; }
+      if (auto field = value.getDefiningOp<SubfieldOp>()) {
+        if (!member.empty()) return {};
+        member = field.getFieldName(); value = field.getInput(); continue;
+      }
       if (auto a = dyn_cast<BlockArgument>(value)) {
         auto module = dyn_cast<FModuleOp>(a.getOwner()->getParentOp());
         if (!module || module.getPortDirection(a.getArgNumber()) != Direction::In || path.empty()) return {};
@@ -212,7 +249,10 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
       if (module.getPortDirection(port) != Direction::Out) return {};
       namedPort |= module.getPortName(port) == sourcePort;
       path.push_back(inst);
-      if (module.getNumPorts() == 5 && !module.getOps<MemOp>().empty()) return {module, path, port, namedPort};
+      if (module.getNumPorts() == 5 && !module.getOps<MemOp>().empty()) {
+        if (!sourcePort.empty() && member != "bits") return {};
+        return {module, path, port, namedPort};
+      }
       value = arg(module, port);
     }
     return {};
@@ -247,7 +287,7 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
         transport.getPortDirection(i + 2) != Direction::In || fieldType(transport.getPortType(i + 2), "bits") != uint(512))
       return reject("CPU stream identity, order, capacity or DMA base differs from native allocation");
     maxDepth = std::max(maxDepth, uint64_t(depth.getInt()));
-    auto data = trace(arg(transport, i + 2), transportPath, port.getValue());
+    auto data = trace(arg(transport, i + 2), transportPath, port.getValue(), "bits");
     auto count = trace(arg(bank, i + 2), bankPath);
     if (!data.queue || !count.queue || !data.namedPort || data.port != 3 || count.port != 4 || data.path != count.path)
       return reject("CPU stream count and read transport must forward the same live queue instance");
@@ -365,7 +405,7 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
       return reject("CPU queue has live instances outside the outgoing allocation");
   }
   // Empty incoming vectors are meaningful ABI state; check the actual transport.
-  for (StringRef port : {"aw_ready", "w_ready", "b_valid"}) {
+  if (!selected) for (StringRef port : {"aw_ready", "w_ready", "b_valid"}) {
     std::optional<unsigned> n;
     for (auto [i, p] : llvm::enumerate(incoming.getPorts())) if (p.name == port) n = i;
     if (!n || incoming.getPortType(*n) != uint(1) || incoming.getPortDirection(*n) != Direction::Out)

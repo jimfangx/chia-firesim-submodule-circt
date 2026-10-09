@@ -12,4 +12,12 @@ mlir::LogicalResult preparePrintBridgeDecoderHeader(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &header, std::string &error);
+// Emit the selected Print/count Widget.genConstructor boundary after native
+// MMIO master assembly. Resolve addresses and stream indices from the live
+// allocation, validate the complete collection, and preserve IR/text on error.
+// The fragment uses print-bridge-decoders.h and the standard GET_* guards.
+mlir::LogicalResult preparePrintBridgeAllocatedHeader(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &header, std::string &error);
 }
