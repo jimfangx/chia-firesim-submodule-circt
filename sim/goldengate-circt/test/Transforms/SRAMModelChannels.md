@@ -1096,6 +1096,78 @@ lacks its SFC UART-bearing differential baseline. These gates precede the new
 selected-memory AutoILA candidate; runtime verification of this combination
 remains pending with the harness.
 
+## Selected SRAM with queued Print host binding (iteration 64)
+
+The explicit `--compile-baseline --stop-after-print-host-binding` boundary now
+supports selected SRAM models. After native SRAM FAME, command/response queues
+and timing implementations activate `GGFAMEPipeWrapper`, the compiler runs the
+existing CIRCT Print payload, token, control, queued-host and constructor-binding
+passes on that active wrapper. Print payloads therefore come from its external
+queued Decoupled endpoints. The SRAM queues and implementation remain internal.
+The earlier selected-SRAM Print rejection has been removed.
+
+The candidate uses the immutable compiler handoff
+`/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`
+with a mutable annotation copy selecting `~FireSim|Rocket>rf`,
+`~FireSim|Rocket>printf_1`, and `~FireSim|UARTTx>printf`. A duplicate Rocket
+printf selection checks deduplication. `SRAMPrintBindingOracle.scala` runs the
+unchanged Scala PrintSynthesis, FAME and RAM-model passes independently on this
+same handoff, emitting pre-FAME and post-RAM FIRRTL/annotation references.
+Only the SFC reference's legacy `validif` expressions are removed for import by
+pinned firtool; Scala never transforms the candidate.
+
+`SRAMPrintBindingCompare.py` checks the fresh SFC reference against the emitted
+native annotations: one Print domain, 18 scalar latency-zero Pipe channels,
+formats, argument order within each record, field widths, channel mappings and
+rational clock metadata match. It follows emitted native RTL through the
+active transport wrapper and queued Print host: host valid requires all 18
+tokens, each leaf ready requires host ready and every other leaf valid, and each
+payload uses the corresponding queued endpoint. Host clock/reset and all 18
+pipe output bindings match these contracts.
+Deliberately substituted host clock, payload and leaf-ready equations are
+rejected by the RTL comparison.
+
+The native outgoing queue's 6144 x 512 memory and 13-bit occupancy count match
+`Queue_50` in the immutable U250 artifact
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+This comparison checks geometry, not complete queue transition equivalence.
+The earlier independently generated SFC adapter reference
+`iteration60-sram-compiler/sfc-adapter.sv` still matches all 32 Rocket.rf port
+contracts and 32 adapter bindings/equations in this candidate. The fresh full
+SFC RTL optimizes unused implementation inputs and permutes its two reader
+indices, so it is not used for that literal adapter ABI comparison.
+
+There is an observed Print record-order mismatch: SFC places UART before
+Rocket, while native synthesis places Rocket before UART. Record contents match
+by identity, but their packed offsets and ordered decoder collateral do not yet
+match. `comparison.json` explicitly reports `record_order_matches: false`.
+The next smallest Print change is to preserve SFC's record traversal order and
+compare ordered payload offsets and emitted decoder records.
+
+The SRAM channel CTest now carries three Print leaves through four RAM-model
+instances, activates their queues, binds a native queued Print host, and checks
+retargeted sources/sinks and decoder format. The SRAM, Print token-stage,
+control, host and binding CTests pass. The full selected Rocket candidate and
+independent Scala oracle also compile successfully. Evidence is in the mutable
+U250 generated directory's `iteration64-sram-print/`: `selected-print.json`,
+`candidate/`, `sfc-prepared.fir/json`, `sfc-post-ram.fir/json`, `oracle.log`,
+`comparison.log/json`, `adapter-comparison.log`, and `ctest-integration.log`.
+Reproduce the comparisons with:
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/SRAMPrintBindingCompare.py \
+  "$evidence" "$immutable_u250/design/FireSim-generated.sv"
+python3 sim/goldengate-circt/test/Transforms/SRAMCompilerAssemblyCompare.py \
+  "$prior_evidence/sfc-adapter.sv" "$evidence/candidate/post-print-host-binding.sv"
+```
+
+This is an explicit compiler stop boundary. Complete Print MMIO/stream platform
+assembly and runtime verification of the selected-SRAM/Print combination remain
+pending. The supplied iteration-63 manager gates passed the bare smoke,
+90,141-check portable suite and 90,805-check UART-bearing Rocket suite; they
+precede this optional candidate. The latter suite's SFC UART-bearing baseline
+is still pending. No manager verification step was started by the agent.
+
 ## Remaining scope
 
 Shared SRAM definitions now have a combined native FAME, transport, timing-model
@@ -1104,10 +1176,9 @@ execute through full FireSim compiler assembly; the ordinary configuration
 selects no optional memories. Selected-memory Rocket runtime verification
 remains pending. Legacy retained domain-clock annotations have
 the same erased top-clock references as SFC after FAME; later consumers must
-use captured domain identity. The next smallest compiler step is selected-memory
-Print host binding through the shared queued transport, comparing its emitted
-tokens and local host connections against SFC before removing the remaining
-Print guard. Selected-memory AutoILA runtime verification remains owned by
+use captured domain identity. Selected-memory Print hosts now bind through the shared queued transport at
+the explicit compiler stop boundary. Ordered Print records and complete Print
+MMIO/stream platform integration remain incomplete. Selected-memory AutoILA runtime verification remains owned by
 the harness.
 Ready/valid top passthroughs and inter-model
 ready/valid endpoints remain unsupported at this optional boundary.

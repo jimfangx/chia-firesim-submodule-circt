@@ -1019,11 +1019,6 @@ int main(int argc, char **argv) {
       unsigned selectedSRAMs = 0;
       if (failed(goldengate::labelSRAMModels(circuit, selectedSRAMs, error)))
         return fail("LabelSRAMModels: " + error);
-      // SRAM FAME transfers debug targets to payload fields before the shared
-      // host AutoILA phase lowers and routes them. Print host binding still
-      // depends on the single-model assembly below.
-      if (selectedSRAMs && stopAfterPrintHostBinding)
-        return fail("selected SRAM simulator assembly with Print hosts is not supported yet");
       unsigned promotedModels = 0;
       if (mlir::failed(goldengate::extractModels(circuit, promotedModels,
                                                error)))
@@ -1183,6 +1178,11 @@ int main(int argc, char **argv) {
           return fail("cannot write selected SRAM simulator annotations: " + error);
         llvm::outs() << "Materialized " << materialized
                      << " selected native SRAM definitions for FireSim host assembly\n";
+        // SRAM command/response queues are already internal to the active
+        // transport wrapper. External Print channels retain latency-zero
+        // Decoupled endpoints on that wrapper, which the constructor binder
+        // joins exactly as it joins the single-hub target's output tokens.
+        if (stopAfterPrintHostBinding) return emitPrintPayloadBoundary();
       } else {
       // Snapshot annotation-selected inputs, outputs and data dependencies
       // before channelization changes port identities. This baseline path

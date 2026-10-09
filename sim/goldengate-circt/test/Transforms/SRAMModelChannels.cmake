@@ -542,6 +542,55 @@ if(NOT deferred_fir STREQUAL timing_fir OR
 endif()
 message(STATUS "Passed identical SRAM hardware before platform XDC path resolution")
 
+# Print hosts bind to the external outputs of the already active SRAM pipe
+# wrapper. Keep all internal command/response queues and four RAM instances.
+string(REPLACE "    inst Top of Top" "    output print_reset : UInt<1>\n    output print_enable : UInt<1>\n    output print_data : UInt<8>\n    output external_clock : Clock\n    inst Top of Top\n    print_reset <= Top.print_reset\n    print_enable <= Top.print_enable\n    print_data <= Top.print_data\n    external_clock <= Top.external_clock" print_fir "${timing_input}")
+string(REPLACE "    inst m0 of Middle" "    output print_reset : UInt<1>\n    output print_enable : UInt<1>\n    output print_data : UInt<8>\n    output external_clock : Clock\n    print_reset <= UInt<1>(0)\n    print_enable <= UInt<1>(1)\n    print_data <= UInt<8>(42)\n    external_clock <= clock\n    inst m0 of Middle" print_fir "${print_fir}")
+file(READ "${FIXTURES}/SRAMModelChannels.json" print_annos)
+string(JSON print_count LENGTH "${print_annos}")
+foreach(leaf reset enable data)
+  string(JSON print_annos SET "${print_annos}" ${print_count}
+    "{\"class\":\"midas.passes.fame.FAMEChannelConnectionAnnotation\",\"globalName\":\"print_${leaf}\",\"channelInfo\":{\"class\":\"midas.passes.fame.PipeChannel\",\"latency\":0},\"clock\":\"~FAMETop|FAMETop>external_clock\",\"sources\":[\"~FAMETop|FAMETop>print_${leaf}\"]}")
+  math(EXPR print_count "${print_count} + 1")
+endforeach()
+string(JSON print_annos SET "${print_annos}" ${print_count}
+  "{\"class\":\"firesim.lib.bridgeutils.BridgeIOAnnotation\",\"target\":\"~FAMETop|FAMETop>synthesizedPrintf\",\"widgetClass\":\"midas.widgets.PrintBridgeModule\",\"clockInfo\":{\"name\":\"base\",\"multiplier\":1,\"divisor\":1},\"channelMapping\":{\"reset\":\"print_reset\",\"record_enable\":\"print_enable\",\"record_data\":\"print_data\"},\"widgetConstructorKey\":{\"class\":\"midas.widgets.PrintBridgeParameters\",\"resetPortName\":\"reset\",\"printPorts\":[{\"name\":\"record\",\"format\":\"value=%x\",\"ports\":[{\"enable\":\"UInt<1>\"},{\"data\":\"UInt<8>\"}]}]}}")
+file(WRITE "${OUTPUT}/print-parent.fir" "${print_fir}")
+file(WRITE "${OUTPUT}/print-parent.json" "${print_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/print-parent.fir"
+  --annotation-file "${OUTPUT}/print-parent.json"
+  --output-dir "${OUTPUT}/print-parent" --rewrite-sram-hardware
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Selected SRAM Print transports failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/print-parent/post-sram-hardware.fir" print_hardware)
+string(REPLACE "public module " "module " print_hardware "${print_hardware}")
+file(WRITE "${OUTPUT}/print-import.fir" "${print_hardware}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/print-import.fir"
+  --annotation-file "${OUTPUT}/print-parent/post-sram-hardware-all.json"
+  --output-dir "${OUTPUT}/print-bound" --bind-print-host-constructors
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Selected SRAM queued Print host binding failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/print-bound/post-print-host-binding.fir" print_bound)
+file(READ "${OUTPUT}/print-bound/post-print-host-binding-all.json" print_bound_annos)
+file(READ "${OUTPUT}/print-bound/print-bridge-decoders.h" print_header)
+string(REGEX MATCHALL "inst [^\n]* of ram" print_rams "${print_bound}")
+list(LENGTH print_rams print_ram_count)
+if(NOT print_ram_count EQUAL 4 OR
+   NOT print_bound MATCHES "inst sim of GGFAMEPipeWrapper" OR
+   NOT print_bound MATCHES "connect PrintBridgeModule_0.hostClock, hostClock" OR
+   NOT print_bound MATCHES "connect PrintBridgeModule_0.hostReset, hostReset" OR
+   NOT print_bound MATCHES "connect PrintBridgeModule_0.hBits.record.data,[ \n]+sim.Top_print_data_source.bits" OR
+   NOT print_bound_annos MATCHES "~GGPrintBridgeHostWrapper\\|GGFAMEPipeWrapper>Top_print_data_source.bits" OR
+   NOT print_bound_annos MATCHES "~GGPrintBridgeHostWrapper\\|GGPrintBridgeHostQueued>hBits.record.data" OR
+   NOT print_header MATCHES "value=%x")
+  message(FATAL_ERROR "Selected SRAM Print host lost RAM, queued endpoint or decoder identity")
+endif()
+message(STATUS "Passed Print host binding after selected SRAM queue activation")
+
 # Debug probes on the retained parent must survive SRAM replacement and route
 # from all four instances to an ILA sampling the host clock. The replaced RAM
 # implementation is not a source of target probes.
