@@ -1019,8 +1019,11 @@ int main(int argc, char **argv) {
       unsigned selectedSRAMs = 0;
       if (failed(goldengate::labelSRAMModels(circuit, selectedSRAMs, error)))
         return fail("LabelSRAMModels: " + error);
-      if (selectedSRAMs && (enableAutoILA || stopAfterPrintHostBinding))
-        return fail("selected SRAM simulator assembly with debug hosts is not supported yet");
+      // SRAM FAME transfers debug targets to payload fields before the shared
+      // host AutoILA phase lowers and routes them. Print host binding still
+      // depends on the single-model assembly below.
+      if (selectedSRAMs && stopAfterPrintHostBinding)
+        return fail("selected SRAM simulator assembly with Print hosts is not supported yet");
       unsigned promotedModels = 0;
       if (mlir::failed(goldengate::extractModels(circuit, promotedModels,
                                                error)))

@@ -1021,6 +1021,81 @@ SPEC17 `fsim0` session. Local UART and the simulator stderr tail are preserved
 in the evidence directory. The harness gate remains failed; no manager action
 or unrelated process was modified.
 
+## Selected SRAM AutoILA compiler assembly (iteration 62)
+
+The full compiler now permits `--enable-autoila` with retained memory model
+selections. It executes the native SRAM hardware path and the shared host
+AutoILA phase, including debug target lowering, hierarchy routing, wrapper/IP
+generation, host-clock wiring, driver header capture, hierarchy normalization
+and final RTL/XDC emission. The previous unconditional rejection prevented
+this supported composition. The selected-memory Print-host guard remains;
+its binding path still depends on the single-model assembly.
+
+The complete local compile starts from this immutable compiler artifact:
+
+```
+/scratch/jfx/fsim-circt/sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir
+```
+
+Only the mutable annotation input adds `~FireSim|Rocket>rf` and three public
+debug selections: legacy `FireSim.Rocket.reset`, modern
+`~FireSim|Rocket>io.imem.req.bits.pc`, and modern
+`~FireSim|Rocket>io.imem.resp.bits.data`. The register file has 31 physical
+64-bit entries, two readers and one writer. Rocket remains inside the FireSim
+FAME model in this configuration; these local probe ports retain their
+identities. They are not the channelized Rocket-model ports of the separate
+iteration-61 comparison. Probes on rewritten model interfaces continue to use
+the validated payload-target transfer from that iteration.
+
+`SRAMAutoILAOracle.scala` independently lowers the immutable target with SFC,
+selects the same three Rocket ports, and runs the unchanged SFC AutoILA phase.
+The target handoff predates host assembly, so the oracle adds only a top-level
+host clock input/source for that host phase. No Scala pass transforms the
+native candidate. All three source identities, ordering and widths (1, 40,
+32 bits) match, as do all ILA IP settings, with depth 2048 and four comparators.
+This is a source/AutoILA-phase comparison; it does not claim complete SFC
+selected-memory simulator equivalence.
+
+`SRAMAutoILACompare.py` follows the emitted RTL assignments and instance
+bindings through the normalized hierarchy. All three wrapper inputs reach
+their selected Rocket port values, and the sampling clock reaches the F1Shim
+host clock. The wrapper retains its `SYNTHESIS` guard. Deliberately substituted
+reset data, reset in place of the host clock, and a narrowed probe are rejected.
+The independently generated SFC adapter reference from iteration 60 also
+matches all 32 adapter port contracts and 32 bindings/equations in this full
+candidate. The three driver/interface headers and both XDC files are unchanged
+from the selected-memory compile without AutoILA.
+
+Both final XDC files also match the immutable U250 reference under
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/`
+after mapping the SFC `/target/FireSim_/` hierarchy to native
+`/target_FAMETop/FireSim/`. No other constraint normalization is applied.
+
+The SRAM channel CTest now carries three retained parent selections through
+four SRAM-model instances and checks twelve ordered ILA routes, source widths,
+host-clock binding, private annotation cleanup and IP probe count. Its
+standalone ILA import includes the live debug/host-clock annotations rather
+than the historical pre-FAME channel clock archive. All eight related SRAM,
+FAME annotation, retained-target lowering, AutoILA, host hierarchy, header and
+XDC CTests pass.
+
+Evidence is in the mutable U250 generated directory's
+`iteration62-sram-autoila/`: `selected-debug.json`, `selected-full.stdout.log`,
+`selected-full.stderr.log`, `oracle-comparison.log`,
+`rtl-routes-comparison.log`, `rtl-mutations.log`, `adapter-comparison.log`,
+`header-xdc-comparison.log`, `golden-xdc-comparison.log`, and
+`ctest-related.log`. Compile the Scala oracle against the MIDAS runtime
+classpath, then invoke it with the evidence directory and the immutable
+`.sfc.fir` path. Run the RTL comparator with `selected-full/`. Finished large
+MLIR snapshots are compressed; model, SRAM and normalized hierarchy
+boundaries remain directly readable. No manager verification step was started.
+
+The supplied iteration-61 harness gates passed: bare smoke, the 90,141-check
+portable suite and the 90,805-check UART-bearing Rocket suite. The latter still
+lacks its SFC UART-bearing differential baseline. These gates precede the new
+selected-memory AutoILA candidate; runtime verification of this combination
+remains pending with the harness.
+
 ## Remaining scope
 
 Shared SRAM definitions now have a combined native FAME, transport, timing-model
@@ -1029,10 +1104,10 @@ execute through full FireSim compiler assembly; the ordinary configuration
 selects no optional memories. Selected-memory Rocket runtime verification
 remains pending. Legacy retained domain-clock annotations have
 the same erased top-clock references as SFC after FAME; later consumers must
-use captured domain identity. The next smallest compiler step is to exercise
-selected-memory AutoILA host assembly with these transferred probes, then
-remove its existing full-compiler guard once the emitted host wiring and
-collateral match SFC. Selected-memory runtime verification remains owned by
+use captured domain identity. The next smallest compiler step is selected-memory
+Print host binding through the shared queued transport, comparing its emitted
+tokens and local host connections against SFC before removing the remaining
+Print guard. Selected-memory AutoILA runtime verification remains owned by
 the harness.
 Ready/valid top passthroughs and inter-model
 ready/valid endpoints remain unsupported at this optional boundary.

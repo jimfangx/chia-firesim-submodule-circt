@@ -542,6 +542,92 @@ if(NOT deferred_fir STREQUAL timing_fir OR
 endif()
 message(STATUS "Passed identical SRAM hardware before platform XDC path resolution")
 
+# Debug probes on the retained parent must survive SRAM replacement and route
+# from all four instances to an ILA sampling the host clock. The replaced RAM
+# implementation is not a source of target probes.
+file(READ "${FIXTURES}/SRAMModelChannels.json" ila_annos)
+string(JSON ila_count LENGTH "${ila_annos}")
+foreach(port addr data out)
+  string(JSON ila_annos SET "${ila_annos}" ${ila_count}
+    "{\"class\":\"midas.InternalFirrtlFpgaDebugAnnotation\",\"target\":\"~FAMETop|Parent>${port}\"}")
+  math(EXPR ila_count "${ila_count} + 1")
+endforeach()
+file(WRITE "${OUTPUT}/ila.json" "${ila_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/timing-models.fir"
+  --annotation-file "${OUTPUT}/ila.json"
+  --output-dir "${OUTPUT}/ila-hardware" --rewrite-sram-hardware
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "SRAM hardware lost parent probes: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/ila-hardware/post-sram-hardware.fir" ila_fir)
+if(NOT ila_fir STREQUAL deferred_fir)
+  message(FATAL_ERROR "Parent debug selections changed SRAM replacement hardware")
+endif()
+# The legacy text exporter spells native visibility as `public module` while
+# emitting a 1.2 header. Visibility is implicit in the legacy import format.
+string(REPLACE "public module " "module " ila_import "${ila_fir}")
+file(WRITE "${OUTPUT}/ila-import.fir" "${ila_import}")
+file(READ "${OUTPUT}/ila-hardware/post-sram-hardware-all.json" ila_annos)
+string(JSON ila_count LENGTH "${ila_annos}")
+# The standalone ILA import needs its live selections, not the historical
+# pre-FAME channel clock archive. Full assembly retains that archive and uses
+# FpgaDebugOnly LowerTypes before ILA, as checked by the Rocket oracle.
+set(ila_host_annos "[]")
+set(ila_host_count 0)
+math(EXPR ila_last "${ila_count} - 1")
+foreach(index RANGE 0 ${ila_last})
+  string(JSON ila_class GET "${ila_annos}" ${index} class)
+  if(ila_class STREQUAL "midas.InternalFirrtlFpgaDebugAnnotation")
+    string(JSON ila_annotation GET "${ila_annos}" ${index})
+    string(JSON ila_host_annos SET "${ila_host_annos}" ${ila_host_count} "${ila_annotation}")
+    math(EXPR ila_host_count "${ila_host_count} + 1")
+  endif()
+endforeach()
+string(JSON ila_host_annos SET "${ila_host_annos}" ${ila_host_count}
+  "{\"class\":\"midas.passes.HostClockSource\",\"target\":\"~GGFAMEPipeWrapper|GGFAMEPipeWrapper>hostClock\"}")
+file(WRITE "${OUTPUT}/ila-host.json" "${ila_host_annos}")
+execute_process(COMMAND "${COMPILER}" "${OUTPUT}/ila-import.fir"
+  --annotation-file "${OUTPUT}/ila-host.json"
+  --output-dir "${OUTPUT}/ila-host" --wire-ila-wrapper
+  RESULT_VARIABLE status OUTPUT_VARIABLE stdout ERROR_VARIABLE stderr)
+if(NOT status EQUAL 0)
+  message(FATAL_ERROR "Selected SRAM parent AutoILA routing failed: ${stdout}\n${stderr}")
+endif()
+file(READ "${OUTPUT}/ila-host/autoila-routes.json" ila_routes)
+string(JSON ila_count LENGTH "${ila_routes}")
+if(NOT ila_count EQUAL 12)
+  message(FATAL_ERROR "Selected SRAM parent probe multiplicity differs: ${ila_count}")
+endif()
+foreach(index RANGE 0 11)
+  string(JSON ila_index GET "${ila_routes}" ${index} index)
+  string(JSON ila_width GET "${ila_routes}" ${index} width)
+  string(JSON ila_target GET "${ila_routes}" ${index} target)
+  math(EXPR position "${index} % 3")
+  if(position EQUAL 0)
+    set(ila_port addr)
+    set(expected_width 2)
+  elseif(position EQUAL 1)
+    set(ila_port data)
+    set(expected_width 8)
+  else()
+    set(ila_port out)
+    set(expected_width 8)
+  endif()
+  if(NOT ila_index EQUAL index OR NOT ila_width EQUAL expected_width OR
+     NOT ila_target STREQUAL "GGFAMEPipeWrapper.Parent.${ila_port}")
+    message(FATAL_ERROR "Selected SRAM parent ILA route changed identity/order/width: ${ila_target}/${ila_width}")
+  endif()
+endforeach()
+file(READ "${OUTPUT}/ila-host/post-autoila-wrapper.mlir" ila_wired)
+file(READ "${OUTPUT}/ila-host/post-autoila-wrapper-all.json" ila_output)
+if(ila_output MATCHES "midas.InternalFirrtlFpgaDebugAnnotation" OR
+   NOT ila_output MATCHES "CONFIG.C_NUM_OF_PROBES \\{12\\}" OR
+   NOT ila_wired MATCHES "firrtl.(matchingconnect|strictconnect) %ila_wrapper_inst_clock, %hostClock")
+  message(FATAL_ERROR "Selected SRAM parent ILA cleanup, IP count or host clock binding differs")
+endif()
+message(STATUS "Passed selected SRAM parent ILA routing on four instances and host clock binding")
+
 execute_process(COMMAND "${COMPILER}" "${FIXTURES}/SRAMModelChannels.fir"
   --annotation-file "${OUTPUT}/timing-models.json"
   --output-dir "${OUTPUT}/unsupported-timing-port" --rewrite-sram-models
