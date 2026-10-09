@@ -1141,8 +1141,8 @@ There is an observed Print record-order mismatch: SFC places UART before
 Rocket, while native synthesis places Rocket before UART. Record contents match
 by identity, but their packed offsets and ordered decoder collateral do not yet
 match. `comparison.json` explicitly reports `record_order_matches: false`.
-The next smallest Print change is to preserve SFC's record traversal order and
-compare ordered payload offsets and emitted decoder records.
+The next investigation is SFC's record traversal order and the corresponding
+ordered payload offsets and emitted decoder records (see iteration 65 below).
 
 The SRAM channel CTest now carries three Print leaves through four RAM-model
 instances, activates their queues, binds a native queued Print host, and checks
@@ -1167,6 +1167,55 @@ pending. The supplied iteration-63 manager gates passed the bare smoke,
 90,141-check portable suite and 90,805-check UART-bearing Rocket suite; they
 precede this optional candidate. The latter suite's SFC UART-bearing baseline
 is still pending. No manager verification step was started by the agent.
+
+## Iteration 65: Print source groups and ordered decoder checks
+
+`BridgeTopWiring.scala` groups TopWiring mappings by their pathless source before
+expanding absolute instances. Its immutable map determines the order *between*
+source groups; PrintSynthesis then preserves that sequence within each clock
+domain. Reversing the Rocket/UART vector would fit one fixture without porting
+this grouping behavior.
+
+`PrintWiring.cpp` now groups completed output annotations by their native stub
+identity. Source groups follow module/statement order; absolute instances within
+each group retain hierarchy traversal order. The constructor, channel sequence,
+payload operations and decoder all consume that grouped sequence. Data routing,
+port identities and clock resolution still use CIRCT operations.
+
+The shared-module native test has one top printf and two Leaf printfs, each
+replicated through `left/l`, `right/l` and `direct`. Previously its output sequence
+interleaved message/empty per instance. It now keeps all three message replicas
+together and all three empty replicas together, including in the emitted bridge
+constructor. `PrintSourceGroupingOracle.scala` independently executes the SFC
+BridgeTopWiring pass on the corresponding hierarchy: seven outputs, contiguous
+source groups, and the same three-instance order within each group. Inter-group
+hash ordering differs and is not claimed to match.
+
+A fresh selected-SRAM/Print native candidate and independent SFC reference use
+the same immutable `.sfc.fir` and explicit selections recorded above. Evidence
+is in `iteration65-print-source-groups/` in the mutable U250 generated directory:
+`candidate/`, `selected-print.json`, `sfc-post-ram.fir/json`,
+`sfc-shared-print-groups.json`, native/SFC stdout/stderr, `comparison.json`, and
+`mutation-results.json`. The 18 channels, constructor fields, formats, clocks,
+queued joins and payload routes match by identity. Queue_50 geometry still
+matches the immutable U250 `design/FireSim-generated.sv` named above.
+
+`SRAMPrintBindingCompare.py` now checks the emitted RTL concatenation and the
+ordered decoder records rather than inferring correctness from an unordered
+constructor comparison. Native Rocket/UART offsets are 1/372 with record widths
+371/17; SFC UART/Rocket offsets are 1/18. Native argument slices and decoder
+offsets match one another and the SFC record contents; raw inter-group byte
+layout remains different (`record_order_matches: false`). Deliberately swapped
+UART argument slices and a decoder offset of 371 instead of 372 are rejected.
+
+Five focused CTests pass: SRAM channels, Print wiring, payload, queued host and
+binding. The native compiler and both independent Scala reference programs
+also pass. Supplied iteration-64 manager and Rocket regression gates passed;
+these precede this optional candidate. No manager verification step was run.
+The next smallest integration step is allocating the bound Print host's six
+MMIO words and outgoing CPU stream in full platform assembly. Compatibility
+with an SFC decoder's hash-ordered record ABI remains a separate limitation;
+the native decoder must accompany its native RTL.
 
 ## Remaining scope
 

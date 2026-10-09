@@ -3,8 +3,9 @@
 """Compare selected SRAM/Print metadata and inspect the emitted queued joins.
 
 Arguments: evidence directory from SRAMPrintBindingOracle, immutable U250 RTL.
-Record order is reported separately: matching fields does not imply matching
-packed record offsets or ordered decoder collateral.
+Record order between Scala hash-map source groups is reported separately.
+Check native ordered RTL packing and decoder offsets against the reference
+records by identity; never count an unordered record match as a layout check.
 """
 import json
 import re
@@ -42,6 +43,21 @@ rk, nk = rb["widgetConstructorKey"], nb["widgetConstructorKey"]
 assert rk["resetPortName"] == nk["resetPortName"]
 records = lambda key: {p["name"]: p for p in key["printPorts"]}
 assert records(rk) == records(nk), "Print formats, argument order or types differ"
+
+
+def layout(key):
+    offset, result = 1, []  # PrintBridgeModule.reservedBits
+    for record in key["printPorts"]:
+        widths = [int(re.fullmatch(r"[US]Int<(\d+)>", next(iter(field.values())))[1])
+                  for field in record["ports"]]
+        assert widths[0] == 1 and next(iter(record["ports"][0])) == "enable"
+        result.append({"name": record["name"], "offset": offset,
+                       "width": sum(widths), "argument_widths": widths[1:]})
+        offset += sum(widths)
+    return result
+
+
+reference_layout, native_layout = layout(rk), layout(nk)
 fields = {nk["resetPortName"]: nk["resetPortName"]}
 for record in nk["printPorts"]:
     for port in record["ports"]:
@@ -100,6 +116,25 @@ for global_ in globals_:
     for field in ("ready", "valid", "bits"):
         assert pipe["io_out_" + field] == f"FireSim_{global_}_source_{field}"
 
+# Check the actual concat emitted from FIRRTL operations, rather than trusting
+# payload metadata. First record/first field occupy the least significant bits
+# above validity; reset is excluded. The independent SFC constructor supplies
+# formats and widths even when its hash-map record ordering differs.
+_, payload = module(rtl, "GGPrintBridgePayload")
+packing = re.findall(r"\bassign\s+data\s*=\s*\{(.*?)\};", payload, re.S)
+assert len(packing) == 1, "expected one direct Print payload concat"
+used_bits = 1 + sum(record["width"] for record in native_layout)
+ordered_fields = ["hBits_" + record["name"] + "_" + next(iter(field))
+                  for record in nk["printPorts"] for field in record["ports"]]
+packed_terms = [term.strip() for term in packing[0].split(",")]
+assert packed_terms == [f"{512 - used_bits}'h0", *reversed(ordered_fields), "_GEN"], "RTL record/argument bit ordering differs"
+decoder = (candidate / "print-bridge-decoders.h").read_text()
+decoded = re.findall(r'\{(\d+)U,\s*("(?:\\.|[^"\\])*"),\s*std::vector<unsigned>\{([^}]*)\}\}', decoder)
+expected_decoder = [(str(entry["offset"]), records(rk)[entry["name"]]["format"], entry["argument_widths"])
+                    for entry in native_layout]
+assert [(offset, json.loads(format_), [int(n) for n in re.findall(r"(\d+)U", widths)])
+        for offset, format_, widths in decoded] == expected_decoder, "ordered decoder offsets/formats/widths differ from RTL packing"
+
 golden = Path(sys.argv[2]).read_text()
 golden_header, golden_queue = module(golden, "Queue_50")
 native_header, _ = module(rtl, "GGPrintBridgeCPUQueue6144")
@@ -115,9 +150,12 @@ report = {
     "golden_rtl": str(Path(sys.argv[2])),
     "reference_record_order": [p["name"] for p in rk["printPorts"]],
     "candidate_record_order": [p["name"] for p in nk["printPorts"]],
+    "reference_layout": reference_layout, "candidate_layout": native_layout,
+    "ordered_rtl_packing_and_decoder_match": True,
 }
 report["record_order_matches"] = report["reference_record_order"] == report["candidate_record_order"]
 (evidence / "comparison.json").write_text(json.dumps(report, indent=2) + "\n")
 print("PASS 18 selected-SRAM Print channels: constructor fields, clocks, queued joins and payload routes")
 print("PASS immutable U250 Queue_50 geometry: 6144 x 512, 13-bit count")
+print("PASS ordered native RTL packing and decoder offsets against SFC record identities")
 print("Print record-order match:", report["record_order_matches"])

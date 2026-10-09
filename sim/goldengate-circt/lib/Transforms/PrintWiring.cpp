@@ -273,11 +273,11 @@ static LogicalResult synthesizePrintChannelsImpl(
       formats.emplace(stub.target, std::move(*format));
     }
   }
-  // Map ordering matches Scala's sortBy(sinkClockPort.ref); record ordering
-  // within each domain follows the completed native annotation sequence.
-  // Scala BridgeTopWiring emits records through a hash-map iteration, so its
-  // constructor order can differ. Host packing and driver offsets must use
-  // this same printPorts order when the PrintBridge host implementation lands.
+  // Domain ordering matches Scala's sortBy(sinkClockPort.ref). Completed
+  // wiring groups replicas of each pathless source before domain grouping,
+  // as BridgeTopWiring.localToAbsSource does. Source groups follow native
+  // module/statement order; Scala's hash-map order between groups may differ.
+  // Payload packing and decoder offsets both consume this printPorts sequence.
   struct Domain {
     SmallVector<Attribute> channels, printPorts;
     std::string resetName;
@@ -531,7 +531,17 @@ LogicalResult goldengate::completePrintClockWiring(
   // Do not use a dotted path or stale textual target to decide connectivity.
   std::string topPrefix = "~" + circuit.getName().str() + "|" + top.getName().str();
   SmallVector<Attribute> annotations;
-  for (auto &source : sources) {
+  // BridgeTopWiring groups TopWiring mappings by local source, then expands
+  // that source's absolute instances. A hierarchy walk interleaves distinct
+  // printf records when a module has multiple prints and multiple instances.
+  // Group using the native source identity, retaining instance traversal
+  // within each group. Module/statement order makes inter-group order stable
+  // without importing Scala's implementation-specific hash-map iteration.
+  SmallVector<SmallVector<unsigned>> sourceGroups(stubs.size());
+  for (auto [i, source] : llvm::enumerate(sources))
+    sourceGroups[routes[source.routeIndex].stubIndex].push_back(i);
+  for (auto &group : sourceGroups) for (auto i : group) {
+    auto &source = sources[i];
     auto &route = routes[source.routeIndex];
     auto stub = stubs[route.stubIndex];
     std::string absolute = topPrefix;

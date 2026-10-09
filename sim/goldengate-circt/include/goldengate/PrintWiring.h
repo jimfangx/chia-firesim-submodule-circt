@@ -30,6 +30,8 @@ mlir::LogicalResult analyzePrintClockSources(
     llvm::SmallVectorImpl<PrintClockSource> &sources, std::string &error);
 // Finish BridgeTopWiring: resolve clocks, append one output Clock per native
 // top input, and replace pending input annotations with five-field outputs.
+// Group outputs by local source in module/statement order, retaining absolute
+// instance traversal within each group. Scala hashes the inter-group order.
 // All clocks and annotation contracts are checked before any mutation.
 mlir::LogicalResult completePrintClockWiring(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,

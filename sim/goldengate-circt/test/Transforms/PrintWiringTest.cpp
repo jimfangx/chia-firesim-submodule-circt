@@ -268,7 +268,11 @@ void run(MLIRContext &context, bool complete = false) {
       "shared clock loopback deduplication, namespace or native driver mismatch");
   auto completed=c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(completed.size()==10,"output annotations lost preserved SynthPrintf records");
-  for(auto [i,route]:llvm::enumerate(routes)) {
+  // TopWiring's hierarchy walk interleaves message/empty within each Leaf.
+  // BridgeTopWiring groups all replicas of one local printf before the next.
+  const unsigned groupedRoutes[] = {0, 1, 3, 5, 2, 4, 6};
+  for(auto [i,routeIndex]:llvm::enumerate(groupedRoutes)) {
+    auto &route=routes[routeIndex];
     Annotation anno(completed[i]);
     require(anno.isClass(goldengate::AnnotationClasses::BridgeTopWiringOutput) &&
         anno.getMember<StringAttr>("pathlessSource").getValue()==stubs[route.stubIndex].target &&
@@ -374,10 +378,11 @@ void run(MLIRContext &context, bool complete = false) {
     require(ports && ports.size()==routes.size(),"printf bridge lost exported print instances");
     for (auto [i,attr] : llvm::enumerate(ports)) {
       auto port=cast<DictionaryAttr>(attr);
-      auto nativeType=cast<BundleType>(routes[i].topPort.getType());
+      auto &route=routes[groupedRoutes[i]];
+      auto nativeType=cast<BundleType>(route.topPort.getType());
       auto fields=port.getAs<ArrayAttr>("ports");
       require(!port.get("class") &&
-          port.getAs<StringAttr>("name").getValue()==top.getPortName(cast<BlockArgument>(routes[i].topPort).getArgNumber()) &&
+          port.getAs<StringAttr>("name").getValue()==top.getPortName(cast<BlockArgument>(route.topPort).getArgNumber()) &&
           port.getAs<StringAttr>("format").getValue()==
               "%d %d %x\\n\\t\\r\\b\\f\\\"\\\\ caf\\u00E9 \\uD83D\\uDE00\\u0001\x7f" &&
           fields.size()==nativeType.getElements().size(),
