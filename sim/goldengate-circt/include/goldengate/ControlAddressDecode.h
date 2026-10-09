@@ -39,6 +39,16 @@ mlir::LogicalResult deriveControlMMIOWidget(circt::firrtl::CircuitOp circuit,
     llvm::StringRef widgetName, llvm::StringRef mcrModule,
     llvm::ArrayRef<llvm::StringRef> registerModules, ControlMMIOWidget &widget,
     std::string &error, circt::firrtl::Direction mcrDirection = circt::firrtl::Direction::In);
+// Rocket platform registration order from FPGATop.scala: SimulationMaster,
+// original bridges, synthesized Print bridges, LoadMem, then CPU streams.
+// Derive every size from implemented FIRRTL register banks. Print hosts are
+// supplied in constructor order; their queued metadata identifies each bank.
+// This pre-binding catalog does not imply CPU stream or control attachment.
+// Leave the result and IR unchanged on failure; names borrow MLIR attributes.
+mlir::LogicalResult deriveRocketControlMMIOCatalog(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> printHosts,
+    llvm::SmallVectorImpl<ControlMMIOWidget> &widgets, std::string &error);
 // Widget.memRegionSize / HasWidgets.addrMap: round the 32-bit control bank's
 // byte size up to a power of two (or use customSize), stable-sort by decreasing
 // size, then assign contiguous regions from zero. Input order is widget

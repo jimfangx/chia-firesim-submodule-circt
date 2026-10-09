@@ -2784,52 +2784,8 @@ int main(int argc, char **argv) {
       const llvm::StringRef fasedRegisterModules[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
           "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"};
       SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
-      auto appendBank = [&](StringRef name, StringRef mcr,
-                            ArrayRef<StringRef> registers) {
-        goldengate::ControlMMIOWidget widget;
-        if (failed(goldengate::deriveControlMMIOWidget(
-                circuit, name, mcr, registers, widget, error))) return failure();
-        controlWidgets.push_back(widget);
-        return success();
-      };
-      goldengate::ControlMMIOWidget masterWidget;
-      if (failed(goldengate::deriveControlMMIOWidget(circuit, "SimulationMaster_0",
-              simulationMasterBank.getName(), {simulationMasterBank.getName()},
-              masterWidget, error, Direction::Out)))
-        return fail("SimulationMaster register registry: " + error);
-      controlWidgets.push_back(masterWidget);
-      if (failed(appendBank("PeekPokeBridgeModule_0", "GGPeekPokeMCRFile",
-                           {"GGPeekPokeMMIOBank"})) ||
-          failed(appendBank("ResetPulseBridgeModule_0", "GGResetPulseBridgeMCRFile",
-                           {"GGResetPulseBridge"})))
-        return fail("control bank registry: " + error);
-      goldengate::ControlMMIOWidget blockDevWidget;
-      if (failed(goldengate::deriveControlMMIOWidget(circuit, "BlockDevBridgeModule_0",
-              blockDevMMIOBank.getName(), {blockDevMMIOBank.getName()}, blockDevWidget,
-              error, Direction::Out)))
-        return fail("BlockDev MMIO register registry: " + error);
-      controlWidgets.push_back(blockDevWidget);
-      if (failed(appendBank("UARTBridgeModule_0", "GGUARTMCRFile", {"GGUARTMMIOBank"})))
-        return fail("control bank registry: " + error);
-      goldengate::ControlMMIOWidget fasedWidget;
-      if (failed(goldengate::deriveControlMMIORegistry(circuit, "FASEDMemoryTimingModel_0",
-              fasedRegisterModules, fasedWidget, error)))
-        return fail("FASED fragment register registry: " + error);
-      controlWidgets.push_back(fasedWidget);
-      if (failed(appendBank("TracerVBridgeModule_0", "GGTracerVMCRFile", {"GGTracerVTriggerConfig"})))
-        return fail("control bank registry: " + error);
-      goldengate::ControlMMIOWidget tsiWidget;
-      if (failed(goldengate::deriveControlMMIOWidget(circuit, "TSIBridgeModule_0",
-              tsiMMIOBank.getName(), {tsiMMIOBank.getName()}, tsiWidget, error, Direction::Out)))
-        return fail("TSI MMIO register registry: " + error);
-      controlWidgets.push_back(tsiWidget);
-      if (failed(appendBank("ClockBridgeModule_0", "GGClockBridgeMCRFile", {"GGSingleClockBridge"})) ||
-          failed(appendBank("LoadMemWidget_0", "GGLoadMemMCRFile",
-                           {"GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataWrapper",
-                            "GGLoadMemReadRequestWrapper", "GGLoadMemReadDataWrapper"})) ||
-          failed(appendBank("CPUManagedStreamEngine_0", "GGCPUStreamMCRFile",
-                           {"GGCPUStreamCountBank"})))
-        return fail("control bank registry: " + error);
+      if (failed(goldengate::deriveRocketControlMMIOCatalog(circuit, {}, controlWidgets, error)))
+        return fail("platform control register catalog: " + error);
       SmallVector<goldengate::ControlMMIORegion> controlRegions;
       if (failed(goldengate::allocateControlMMIORegions(25, controlWidgets, controlRegions, error)))
         return fail("control address allocation: " + error);
@@ -2989,7 +2945,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::deriveControlMMIOWidget(circuit, "SimulationMaster_0",
               "GGSimulationMasterMCRFile", {simulationMasterBank.getName()}, mappedMaster, error)))
         return fail("SimulationMaster adapter register registry: " + error);
-      if (mappedMaster.registerCount != masterWidget.registerCount)
+      auto masterWidget = llvm::find_if(controlWidgets, [](const auto &widget) {
+        return widget.name == "SimulationMaster_0";
+      });
+      if (masterWidget == controlWidgets.end() || mappedMaster.registerCount != masterWidget->registerCount)
         return fail("SimulationMaster adapter word count differs from its allocated register bank");
       if (failed(mlir::verify(*module)))
         return fail("SimulationMaster MCRFile produced invalid FIRRTL IR");
@@ -3062,7 +3021,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::deriveControlMMIOWidget(circuit, "TSIBridgeModule_0",
               "GGTSIMCRFile", {tsiMMIOBank.getName()}, mappedTSI, error)))
         return fail("TSI adapter register registry: " + error);
-      if (mappedTSI.registerCount != tsiWidget.registerCount)
+      auto tsiWidget = llvm::find_if(controlWidgets, [](const auto &widget) {
+        return widget.name == "TSIBridgeModule_0";
+      });
+      if (tsiWidget == controlWidgets.end() || mappedTSI.registerCount != tsiWidget->registerCount)
         return fail("TSI adapter word count differs from its allocated register bank");
       if (failed(mlir::verify(*module))) return fail("TSI MCRFile control produced invalid FIRRTL IR");
       llvm::SmallString<256> tsiControlPath(outputDir), tsiControlAnnotations(outputDir);
@@ -3172,7 +3134,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::deriveControlMMIOWidget(circuit, "BlockDevBridgeModule_0",
               "GGBlockDevMCRFile", {blockDevMMIOBank.getName()}, mappedBlockDev, error)))
         return fail("BlockDev adapter register registry: " + error);
-      if (mappedBlockDev.registerCount != blockDevWidget.registerCount)
+      auto blockDevWidget = llvm::find_if(controlWidgets, [](const auto &widget) {
+        return widget.name == "BlockDevBridgeModule_0";
+      });
+      if (blockDevWidget == controlWidgets.end() || mappedBlockDev.registerCount != blockDevWidget->registerCount)
         return fail("BlockDev adapter word count differs from its allocated register bank");
       if (failed(mlir::verify(*module))) return fail("BlockDev control transport produced invalid FIRRTL IR");
       llvm::SmallString<256> blockDevControlPath(outputDir), blockDevControlAnnotations(outputDir);

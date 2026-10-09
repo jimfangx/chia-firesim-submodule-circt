@@ -1503,3 +1503,46 @@ extend that platform catalog with the selected Print register descriptors;
 the observed 32-versus-568 count address difference makes catalog integration
 the next allocation boundary to compare. No harness-owned manager gate was
 started in this iteration. The overall migration remains incomplete.
+
+### Iteration 71 — native Rocket catalog registration for Print banks
+
+`deriveRocketControlMMIOCatalog` now provides the production Rocket allocator's
+registration list. It derives every bank size from materialized FIRRTL MCR
+ports/register registries, including the six sparse FASED fragments. The
+baseline compiler uses this function and compares its later SimulationMaster,
+TSI and BlockDev adapters against the named allocated descriptors. Supplied
+queued Print hosts enter after the original bridges (including Clock), before
+LoadMem and CPU streams. This follows FPGATop.scala's bridge registration and
+PrintSynthesis.scala's appended BridgeIO annotations. Host constructor order,
+not module traversal, controls equal-sized Print bank order. Duplicate, foreign,
+aliased, incomplete or omitted materialized queued hosts fail atomically.
+
+Evidence is in `iteration71-print-platform-catalog/` under the mutable U250
+generated-source tree recorded above. A fresh native baseline compiler run
+consumes the immutable compiler oracle
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` and its `.anno.json`.
+`PrintBridgeBindingTest` derives the catalog from actual Rocket bank modules,
+imports two native queued Print hosts, then creates verified native decoder
+operations for both host orders. The 11-bank baseline remains unchanged. With
+two Print banks, their regions are 544/576 (32 bytes each), and the small-bank
+tail shifts by 64 bytes: master 608, reset 624, count 632. The count bank at this
+pre-binding fixture still contains only TracerV's word. Adding Print occupancy
+words later changes its size and may change its sorted position; 632 is not a
+completed Print-enabled platform driver address.
+
+`PrintPlatformCatalogCompare.py` compares both native fixture decoders and the
+fresh compiler's `post-fame-control-address-decode.mlir` with the exact immutable
+U250 `design/FireSim-generated.sv` recorded above. All 11 baseline AW/AR regions
+and FPGATop slave bindings match SFC. The expanded catalog's two additional
+32-byte regions and shifted tail match the SFC allocator semantics; the fixture
+has Print disabled, so no Print-enabled SFC/runtime parity is claimed. Results
+are retained in `platform-catalog-comparison.json`. Native Print binding/header
+checks pass, including 20 new atomic catalog rejections. The control decoder
+suite passes 123462 address pairs and its registry/allocation rejection cases.
+The fresh baseline compiler completes native simulator RTL and collateral
+emission with empty stderr, including `.const.h`, `.const.vh` and XDC.
+
+Remaining: attach the selected queued Print hosts and their occupancy words to
+the complete platform CPU stream catalog, then bind their full-platform MMIO
+requests/responses and emit headers from the resulting actual allocation. No
+harness-owned manager gate was started. The overall migration is incomplete.

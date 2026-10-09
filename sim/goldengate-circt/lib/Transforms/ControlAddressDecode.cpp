@@ -94,6 +94,68 @@ LogicalResult goldengate::deriveControlMMIOWidget(CircuitOp circuit,
   return success();
 }
 
+LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
+    ArrayRef<FModuleOp> printHosts, SmallVectorImpl<ControlMMIOWidget> &widgets,
+    std::string &error) {
+  SmallVector<ControlMMIOWidget> catalog;
+  auto bank = [&](StringRef name, StringRef mcr, ArrayRef<StringRef> registers,
+                  Direction direction = Direction::In) {
+    ControlMMIOWidget descriptor;
+    if (failed(deriveControlMMIOWidget(circuit, name, mcr, registers,
+                                     descriptor, error, direction))) return failure();
+    catalog.push_back(descriptor); return success();
+  };
+  if (failed(bank("SimulationMaster_0", "GGSimulationMasterBank",
+                  {"GGSimulationMasterBank"}, Direction::Out)) ||
+      failed(bank("PeekPokeBridgeModule_0", "GGPeekPokeMCRFile", {"GGPeekPokeMMIOBank"})) ||
+      failed(bank("ResetPulseBridgeModule_0", "GGResetPulseBridgeMCRFile", {"GGResetPulseBridge"})) ||
+      failed(bank("BlockDevBridgeModule_0", "GGBlockDevMMIOBank", {"GGBlockDevMMIOBank"}, Direction::Out)) ||
+      failed(bank("UARTBridgeModule_0", "GGUARTMCRFile", {"GGUARTMMIOBank"}))) return failure();
+  // FASED's adapter is assembled later; its six sparse fragments collectively
+  // define the complete bank at this allocation boundary.
+  ControlMMIOWidget fased;
+  if (failed(deriveControlMMIORegistry(circuit, "FASEDMemoryTimingModel_0",
+      {"GGFASEDLatencyRegisters", "GGFASEDRequestLimits", "GGFASEDHistograms",
+       "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"},
+      fased, error))) return failure();
+  catalog.push_back(fased);
+  if (failed(bank("TracerVBridgeModule_0", "GGTracerVMCRFile", {"GGTracerVTriggerConfig"})) ||
+      failed(bank("TSIBridgeModule_0", "GGTSIMMIOBank", {"GGTSIMMIOBank"}, Direction::Out)) ||
+      failed(bank("ClockBridgeModule_0", "GGClockBridgeMCRFile", {"GGSingleClockBridge"}))) return failure();
+  // PrintSynthesis.scala appends BridgeIO annotations to the original bridges.
+  // Equal-sized Print/Clock banks must retain this registration order after
+  // HasWidgets sorts by size; module traversal order is irrelevant.
+  OpBuilder b(circuit.getContext()); llvm::StringSet<> seen, configs, mcrs;
+  for (auto [slot, item] : llvm::enumerate(printHosts)) {
+    FModuleOp host = item;
+    auto info = host ? host->getAttrOfType<DictionaryAttr>("goldengate.printHost") : DictionaryAttr{};
+    auto config = info ? info.getAs<StringAttr>("configModule") : StringAttr{};
+    auto mcr = info ? info.getAs<StringAttr>("mcrModule") : StringAttr{};
+    auto queue = info ? info.getAs<StringAttr>("queueModule") : StringAttr{};
+    if (!host || host->getParentOp() != circuit || host.getNumPorts() != 13 ||
+        !config || !mcr || !queue || !seen.insert(host.getName()).second ||
+        !configs.insert(config.getValue()).second || !mcrs.insert(mcr.getValue()).second) {
+      error = "Rocket control catalog requires unique queued Print hosts from this circuit"; return failure();
+    }
+    auto name = b.getStringAttr("PrintBridgeModule_" + std::to_string(slot));
+    if (failed(bank(name.getValue(), mcr.getValue(), {config.getValue()}))) return failure();
+    if (catalog.back().registerCount != 6) {
+      error = "Rocket control catalog requires six implemented Print configuration words"; return failure();
+    }
+  }
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    auto info = module->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+    if (info && info.getAs<StringAttr>("queueModule") && !seen.count(module.getName())) {
+      error = "Rocket control catalog would omit a materialized queued Print host"; return failure();
+    }
+  }
+  if (failed(bank("LoadMemWidget_0", "GGLoadMemMCRFile",
+      {"GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataWrapper",
+       "GGLoadMemReadRequestWrapper", "GGLoadMemReadDataWrapper"})) ||
+      failed(bank("CPUManagedStreamEngine_0", "GGCPUStreamMCRFile", {"GGCPUStreamCountBank"}))) return failure();
+  widgets.assign(catalog.begin(), catalog.end()); return success();
+}
+
 LogicalResult goldengate::allocateControlMMIORegions(unsigned addressBits,
     ArrayRef<ControlMMIOWidget> widgets,
     SmallVectorImpl<ControlMMIORegion> &regions, std::string &error) {

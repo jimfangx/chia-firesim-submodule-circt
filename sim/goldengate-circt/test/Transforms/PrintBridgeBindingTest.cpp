@@ -429,6 +429,99 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   llvm::outs() << "PASS binding " << (reverse ? "reversed" : "ordered") << " " << evaluations << " handshake/data cases and three-stream CPU composition\n";
 }
 
+// Exercise the production catalog against actual materialized Rocket banks.
+// This is a pre-binding allocation boundary: it does not attach Print to the
+// complete platform's CPU transport or claim a runnable Print platform.
+void platformCatalog(MLIRContext &ctx, StringRef baseline, StringRef output) {
+  if (baseline.empty()) return;
+  auto root = parseSourceFile<ModuleOp>(baseline, &ctx);
+  require(bool(root), "cannot parse materialized Rocket baseline");
+  auto circuit = *root->getOps<CircuitOp>().begin(); std::string error; OpBuilder b(&ctx);
+  SmallVector<goldengate::ControlMMIOWidget> catalog;
+  SmallVector<goldengate::ControlMMIORegion> regions;
+  auto before = dump(*root);
+  require(succeeded(goldengate::deriveRocketControlMMIOCatalog(circuit, {}, catalog, error)) &&
+      succeeded(goldengate::allocateControlMMIORegions(25, catalog, regions, error)) && dump(*root) == before, error);
+  auto original = named(circuit, "GGControlAddressDecode")->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  require(regions.size() == 11 && original.size() == 11, "Rocket platform widget count differs");
+  for (auto [i, r] : llvm::enumerate(regions)) {
+    auto row = cast<DictionaryAttr>(original[i]);
+    require(row.getAs<StringAttr>("name") == r.name && row.getAs<IntegerAttr>("start").getInt() == int64_t(r.start) &&
+        row.getAs<IntegerAttr>("size").getInt() == int64_t(r.size), "catalog changed baseline decoder allocation");
+  }
+  auto emitDecoder = [&](StringRef suffix) {
+    auto decoded = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGControlErrorWrapper" {
+      firrtl.module @GGControlErrorWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>) {}
+    } })", &ctx);
+    auto c = *decoded->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+    c->setAttr("rawAnnotations", b.getArrayAttr({}));
+    require(succeeded(goldengate::addControlAddressDecode(c, 25, regions, error)) && succeeded(verify(*decoded)), error);
+    if (!output.empty()) {
+      std::error_code ec; llvm::raw_fd_ostream file((output + suffix).str(), ec);
+      require(!ec, "cannot write platform Print allocation"); decoded->print(file); file << '\n';
+    }
+  };
+  emitDecoder(".platform-baseline.mlir");
+  // Import the real two-domain native Print banks, independently of module
+  // traversal order. The shared queue definition may already be in Rocket.
+  Fixture prints(ctx); SmallVector<FModuleOp> hosts;
+  for (auto m : prints.circuit.getOps<FModuleOp>()) {
+    if (m.getName() == "Top") continue;
+    bool exists = false;
+    for (auto prior : circuit.getOps<FModuleOp>()) exists |= prior.getName() == m.getName();
+    if (!exists) circuit.getBodyBlock()->push_back(m->clone());
+  }
+  for (auto h : prints.hosts) hosts.push_back(named(circuit, h.getName()));
+  require(succeeded(verify(*root)), "imported Print banks invalid");
+  unsigned rejected = 0;
+  for (bool reverse : {false, true}) {
+    if (reverse) std::reverse(hosts.begin(), hosts.end());
+    before = dump(*root);
+    require(succeeded(goldengate::deriveRocketControlMMIOCatalog(circuit, hosts, catalog, error)) &&
+        succeeded(goldengate::allocateControlMMIORegions(25, catalog, regions, error)) && dump(*root) == before, error);
+    require(catalog.size() == 13 && catalog[9].name == "PrintBridgeModule_0" &&
+        catalog[10].name == "PrintBridgeModule_1" && catalog[11].name == "LoadMemWidget_0", "Print registration order differs");
+    for (auto r : regions) {
+      if (r.name == "PrintBridgeModule_0") require(r.start == 544 && r.size == 32, "first platform Print region differs");
+      if (r.name == "PrintBridgeModule_1") require(r.start == 576 && r.size == 32, "second platform Print region differs");
+      if (r.name == "CPUManagedStreamEngine_0") require(r.start == 632 && r.size == 4, "platform count region differs");
+    }
+    emitDecoder(reverse ? ".platform-reverse.mlir" : ".platform.mlir");
+    // Batch errors preserve both the caller's result and materialized IR.
+    auto preserved = catalog;
+    auto checkReject = [&](ArrayRef<FModuleOp> bad) {
+      auto state = dump(*root);
+      require(failed(goldengate::deriveRocketControlMMIOCatalog(circuit, bad, catalog, error)) &&
+          dump(*root) == state && catalog.size() == preserved.size(), "catalog failure mutated IR or result");
+      for (auto [i, w] : llvm::enumerate(catalog)) require(w.name == preserved[i].name &&
+          w.registerCount == preserved[i].registerCount, "catalog failure changed descriptor");
+      ++rejected;
+    };
+    checkReject({hosts[0], hosts[0]}); checkReject({prints.hosts[0]});
+    checkReject({}); checkReject({hosts[0]});
+    auto info = hosts[1]->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+    for (StringRef key : {"configModule", "mcrModule", "queueModule"}) {
+      NamedAttrList corrupt(info); corrupt.erase(key);
+      hosts[1]->setAttr("goldengate.printHost", corrupt.getDictionary(&ctx));
+      checkReject(hosts); hosts[1]->setAttr("goldengate.printHost", info);
+    }
+    for (StringRef key : {"configModule", "mcrModule"}) {
+      NamedAttrList corrupt(info);
+      corrupt.set(key, hosts[0]->getAttrOfType<DictionaryAttr>("goldengate.printHost").getAs<StringAttr>(key));
+      hosts[1]->setAttr("goldengate.printHost", corrupt.getDictionary(&ctx));
+      checkReject(hosts); hosts[1]->setAttr("goldengate.printHost", info);
+    }
+    auto config = named(circuit, info.getAs<StringAttr>("configModule").getValue());
+    auto registers = config->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+    SmallVector<Attribute> rows(registers.begin(), registers.end());
+    NamedAttrList badWord(cast<DictionaryAttr>(rows.back())); badWord.set("offset", b.getI64IntegerAttr(0));
+    rows.back() = badWord.getDictionary(&ctx); config->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+    checkReject(hosts); config->setAttr("goldengate.mmioRegisters", registers);
+  }
+  llvm::outs() << "PASS production Rocket catalog: 11 baseline banks, two Print banks at 544/576, count at 632, both orders and "
+               << rejected << " atomic rejections (pre-binding allocation only)\n";
+}
+
 void allocatedHeaders(MLIRContext &ctx, StringRef output) {
   for (bool reverse : {false, true}) {
     Fixture f(ctx); OpBuilder b(&ctx); std::string error, header;
@@ -758,6 +851,7 @@ int main(int argc, char **argv) {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
     allocatedHeaders(ctx, argc > 1 ? argv[1] : "");
+    platformCatalog(ctx, argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");
     for (bool reverse : {false, true}) {
       Fixture f(ctx, true, reverse); std::string error, header;
       require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
