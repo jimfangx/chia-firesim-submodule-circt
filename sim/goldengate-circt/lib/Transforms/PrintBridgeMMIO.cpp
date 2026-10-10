@@ -37,6 +37,7 @@
 #include "goldengate/FASEDTimingCycle.h"
 #include "goldengate/FASEDReadLatency.h"
 #include "goldengate/FASEDWriteLatency.h"
+#include "goldengate/FASEDTimingAWQueue.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -837,6 +838,27 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDWriteLatency(CircuitOp circui
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addFASEDWriteLatency(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED write latency produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Keep accepted AW IDs ordered until the model pairs each write.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDTimingAWQueue(CircuitOp circuit,
+                                                             std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDWriteLatencyWrapper")
+    return reject("Rocket Print FASED timing AW queue requires the completed write-latency boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDTimingAWQueue(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED timing AW queue produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

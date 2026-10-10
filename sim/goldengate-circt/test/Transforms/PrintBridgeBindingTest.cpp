@@ -1534,6 +1534,87 @@ void rocketFASEDWriteLatency(Fixture &f, StringRef output, bool reverse, unsigne
   }
 }
 
+void rocketFASEDTimingAWQueue(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto raw = f.circuit->getAttr("rawAnnotations");
+  SmallVector<FModuleOp> existing;
+  for (auto m : f.circuit.getOps<FModuleOp>()) existing.push_back(m);
+  auto bank = named(f.circuit, "GGFASEDLatencyRegisters");
+  auto bankState = dump(bank.getOperation());
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    FModuleOp collision;
+    if (bad < 2) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(
+          bad == 0 ? "GGFASEDTimingAWQueue10" : "GGFASEDTimingAWQueueWrapper"),
+          original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 2 || bad == 3) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 2) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 4 || bad == 5) {
+      NamedAttrList key(constructor);
+      auto name = "axi4Widths";
+      NamedAttrList profile(cast<DictionaryAttr>(key.get(name)));
+      profile.set(bad == 4 ? "idBits" : "dataBits", b.getI64IntegerAttr(bad == 4 ? 5 : 32));
+      key.set(name, profile.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    if (bad == 7) f.circuit->removeAttr("rawAnnotations");
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDTimingAWQueue(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED timing AW queue rejection " + std::to_string(bad) +
+        (succeeded(result) ? " accepted invalid input" : " changed IR or omitted diagnostic: " + error)); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDTimingAWQueue(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDTimingAWQueueWrapper" &&
+      decoder->getAttr("goldengate.controlRegions") == regions && dump(bank.getOperation()) == bankState,
+      "FASED timing AW queue changed bank or expanded allocation");
+  for (auto m : existing) require(named(f.circuit, m.getName()) == m,
+      "FASED timing AW queue replaced an existing module operation");
+  for (auto p : original.getPorts()) {
+    if (p.name.getValue() == "fased_write_completion") continue;
+    auto index = port(top, p.name.getValue());
+    require(top.getPorts()[index].type == p.type &&
+        top.getPorts()[index].direction == p.direction,
+        "FASED timing AW queue changed a retained response boundary");
+  }
+  require(top.getNumPorts() == original.getNumPorts() + 1,
+      "FASED timing AW queue must exchange completion metadata for pairing/capacity ports");
+  auto paired = port(top, "fased_write_pair_complete");
+  auto capacity = port(top, "fased_timing_aw_queue_ready");
+  auto bit = UIntType::get(ctx, 1, false);
+  require(top.getPorts()[paired].direction == Direction::In &&
+      top.getPorts()[paired].type == bit &&
+      top.getPorts()[capacity].direction == Direction::Out && top.getPorts()[capacity].type == bit,
+      "FASED timing AW queue pairing/capacity boundary differs");
+  require(bool(child(top, named(f.circuit, "GGFASEDTimingAWQueue10"))),
+      "FASED timing AW queue helper is uninstantiated");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDTimingAWQueue(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED timing AW queue composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-timing-aw-queue-reverse.mlir" : ".rocket-fased-timing-aw-queue.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED timing AW queue boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
                      unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
@@ -2092,6 +2173,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDTimingCycle(f, output, reverse, rejected);
       rocketFASEDReadLatency(f, output, reverse, rejected);
       rocketFASEDWriteLatency(f, output, reverse, rejected);
+      rocketFASEDTimingAWQueue(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -2429,6 +2511,16 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    // Replay expanded write-latency boundaries to isolate accepted AW ordering.
+    if (argc == 4 && StringRef(argv[1]).starts_with("--fased-timing-aw-queue-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED write-latency boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin();
+      unsigned rejected = 0;
+      rocketFASEDTimingAWQueue(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded FASED timing AW queue boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     // Replay both expanded read-latency boundaries to isolate write deadlines.
     if (argc == 4 && StringRef(argv[1]).starts_with("--fased-write-latency-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);

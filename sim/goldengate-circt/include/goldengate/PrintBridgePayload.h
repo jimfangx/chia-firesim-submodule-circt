@@ -194,4 +194,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDReadLatency(
 // Split AW/W completion pairing and latency register attachment follow.
 mlir::LogicalResult mapPrintBridgeRocketFASEDWriteLatency(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Bind accepted AW IDs through the ten-entry timing queue to write completion.
+// Atomic; retain expanded Print banks. AW/W pairing remains an explicit pulse.
+mlir::LogicalResult mapPrintBridgeRocketFASEDTimingAWQueue(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
