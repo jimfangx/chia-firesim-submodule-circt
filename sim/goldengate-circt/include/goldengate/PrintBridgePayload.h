@@ -250,4 +250,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDHistograms(
 /// transfer copied/indexed targets and retain whole-fragment references inside.
 mlir::LogicalResult mapPrintBridgeRocketFASEDMMIOBank(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach and bind the native FASED MCRFile using the live expanded allocation.
+/// Stage both wrappers atomically; preserve existing banks and Print interfaces.
+mlir::LogicalResult mapPrintBridgeRocketFASEDControl(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

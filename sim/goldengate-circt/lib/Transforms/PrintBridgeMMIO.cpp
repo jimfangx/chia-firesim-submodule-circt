@@ -1216,3 +1216,64 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDMMIOBank(CircuitOp circuit,
   circuit.setName(staged->getName());
   return success();
 }
+
+// Requires: unused completed FASED MMIO top, retained annotations and the live
+// expanded Rocket/Print allocation. Consumes the decoded MCR boundary and the
+// catalog-selected AW/W/AR and B/R slave ports; no annotation classes consumed.
+// Produces: native MCRFile transaction state and resolved fasedSlave metadata.
+// Mutates: append the transport and two wrappers after staged verification.
+// Analyses required: register registry and Rocket allocation; hierarchy invalid.
+// Preserves: existing operation/port/argument identities, Print controls/streams,
+// all bank state and constructor/channel metadata. Copied targets transfer;
+// consumed slave references stay inner, unexpected decoded references reject.
+// Output: 21-word local decode, independently captured AW/W, held B/R flags/IDs,
+// live read data, zero legacy strobe and retirement through arbiter readiness.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDControl(CircuitOp circuit,
+                                                          std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDMMIOWrapper")
+    return reject("Rocket Print FASED control requires the completed MMIO bank");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(mapFASEDBridgeControl(*staged, 25, 12, error))) return failure();
+  const StringRef fragments[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
+      "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister",
+      "GGFASEDResponseErrors"};
+  ControlMMIOWidget widget;
+  if (failed(deriveControlMMIOWidget(*staged, "FASEDMemoryTimingModel_0",
+          "GGFASEDMCRFile", fragments, widget, error))) return failure();
+  // The adapter and allocator must describe the same actual bank, including
+  // names and permissions, rather than merely agreeing on the rounded size.
+  SmallVector<DictionaryAttr> registered(widget.registerCount), assembled(widget.registerCount);
+  for (auto m : staged->getOps<FModuleOp>()) {
+    bool fragment = llvm::is_contained(fragments, m.getName());
+    if (!fragment && m.getName() != "GGFASEDMMIOWrapper") continue;
+    auto rows = m->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+    for (auto attr : rows) {
+      auto row = cast<DictionaryAttr>(attr);
+      unsigned word = row.getAs<IntegerAttr>("offset").getValue().getZExtValue() / 4;
+      if (word >= widget.registerCount)
+        return reject("Rocket Print FASED assembled registry exceeds the allocated bank");
+      (fragment ? registered : assembled)[word] = row;
+    }
+  }
+  for (auto [word, row] : llvm::enumerate(registered)) {
+    if (!row || !assembled[word])
+      return reject("Rocket Print FASED assembled registry is incomplete");
+    for (auto key : {"name", "readable", "writeable"})
+      if (row.get(key) != assembled[word].get(key))
+        return reject("Rocket Print FASED assembled registry differs from its allocated fragments");
+  }
+  if (failed(bindFASEDBridgeControl(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("Rocket Print FASED control produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}

@@ -3210,3 +3210,72 @@ bind it to the allocated control slave. Host-memory attachment, Print-enabled
 production CLI/driver integration, general FAME1/FAME5, multi-clock support and
 the UART-bearing SFC runtime baseline remain incomplete. This increment does
 not complete the port.
+
+### Iteration 100: expanded Print/Rocket FASED control transport
+
+`mapPrintBridgeRocketFASEDControl` attaches the shared native MCRFile to the
+completed expanded MMIO bank and binds its five Nasti channels to the slave
+selected by the live control catalog. It validates the Rocket/Print allocation
+and compares assembled register names and permissions, by byte offset, with
+the six allocated bank fragments. Both attachment and slave binding run on a
+clone; only verified new modules and the transferred annotation archive are
+committed. A late missing slave, wrapper collision or stale assembled registry
+therefore leaves the original circuit unchanged. Existing modules, port and
+argument identities, bank state, Print interfaces and constructors survive.
+
+The native `GGFASEDMCRFile` implements `Lib.scala:311-384`: independently
+captured AW/W, captured address indices and IDs, one write commit, held B/R
+transaction flags, live selected read data, zero legacy write strobe, and
+reset-masked single-beat assertions. `Widget.scala:167-172,338-339` supplies
+the decoded-bank attachment and allocated-slave binding oracle. MidasTransforms
+and FAMETransform were also inspected; this composition follows the existing
+native model/channel and clock analyses rather than moving FAME logic into a
+text adapter.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration100-print-rocket-fased-control/`. Replay and comparison commands:
+
+```text
+goldengate-print-binding-test --fased-control-boundary INPUT_MMIO OUTPUT_PREFIX
+goldengate-print-binding-test --fased-control-boundary-reverse INPUT_MMIO_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketFASEDControlCompare.py EVIDENCE SFC_SV ITERATION99_EVIDENCE
+```
+
+The exact immutable artifact selected for comparison is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `MCRFile_5`, `FASEDMemoryTimingModel`,
+`NastiRouter` and `FPGATop`. SFC omits Print hosts, so the local transport and
+FASED platform control pins are its oracle; expanded allocation and Print
+preservation are checked against native IR. The comparator also checks the
+shared MCRFile body against fresh native ingestion of the immutable compiler
+fixture's `.sfc.fir` and `.anno.json`, at
+`candidate/post-fame-fased-control.mlir` and `candidate/post-fame-fased-bound.mlir`.
+
+The structured comparison passes in both constructor orders: nine transaction
+registers, four reset flags, capture/retirement priority, all 21 write predicates
+and selected read words, the 128-byte FASED region at slave 1, all five control
+channels and 20 surviving SFC platform pins match. Each order preserves all 256
+prior module bodies and the exact annotation transfer; 170 attachment and 177
+binding connections match, including 33 control routes and 23 consumed ports.
+The expanded MCRFile body equals the freshly ingested baseline body. SFC
+optimizes unused write-strobe capture away; the native zero strobe follows the
+inspected Scala oracle rather than an emitted SFC strobe pin.
+
+Both expanded replays pass fifteen atomic rejection cases each, including late
+binding failures and stale names/permissions in an otherwise correctly sized
+bank. The three focused Print-binding, simulation-master-control and FASED
+control CTests pass (140.45 seconds). The shared MCRFile test checks 96,000
+cycles across 1-, 21-, 32- and 33-word banks, reordered AW/W, stalled B/R,
+host reset, every local index and burst assertions, plus 27 malformed-boundary
+and repeat-map rejections. Fresh native compilation emits simulator RTL.
+Replay, compiler, comparison and CTest stderr are empty. Build logs report
+Ninja log recovery; no compiler error occurs. Manager verification remains
+owned by the harness; iteration 99 supplied passing CIRCT replacertl and
+Verilator workload results, with the UART-bearing SFC baseline still pending.
+
+Next smallest step: bind the host control master to the expanded fabric, then
+attach FASED host memory. Print-enabled production CLI/driver integration,
+general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
+baseline remain incomplete. This increment does not complete the port.
