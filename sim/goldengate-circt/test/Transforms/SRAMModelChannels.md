@@ -2813,3 +2813,64 @@ to the expanded boundary. Remaining timing policy, MCR/control fanout,
 host-memory attachment, Print-enabled production CLI/driver integration,
 general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
 baseline remain incomplete. This increment does not complete the port.
+
+
+## Iteration 94: expanded Print/Rocket FASED latency-register attachment
+
+`mapPrintBridgeRocketFASEDLatencyRegisters` attaches the already allocated
+`GGFASEDLatencyRegisters` after request limits. It validates expanded Rocket/
+Print control allocation, stages native attachment and verifies FIRRTL before
+moving only the new wrapper into the original circuit. Existing module and
+port identities survive. The annotation archive is retargeted explicitly;
+consumed latency-input targets remain on the inner module. The two full-width
+latency inputs are replaced by a decoded two-word MCR output.
+
+The Scala oracle is `LatencyPipeMMRegIO` in
+`models/dram/LatencyBandwidthPipe.scala:19`, `Widget.attachIO/genAndAttachReg`
+and `MCRIO.bindReg` in `widgets/Lib.scala:281`. Both 32-bit registers reset to
+30 on host reset; decoded write-valid updates them independently of strobes
+or target advancement. Readback and timing-model outputs retain all 32 bits.
+`MidasTransforms.scala` pass ordering and `FAMETransform.scala` readiness,
+validity and target-clock contracts were inspected and remain unchanged.
+
+The exact immutable comparison artifact is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, module `FASEDMemoryTimingModel`, specifically
+`writeLatency`/`readLatency`, MCR words 0/1 and full-width model connections.
+The fixture has no Print host; Print-specific assertions establish native
+preservation rather than an SFC Print-enabled differential comparison.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration94-print-rocket-fased-latency-registers/`. Replay and compare using:
+
+```text
+goldengate-print-binding-test --fased-latency-registers-boundary INPUT_REQUEST_LIMITS_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-latency-registers-boundary-reverse INPUT_REVERSE_REQUEST_LIMITS_MLIR OUTPUT_PREFIX
+PrintRocketFASEDLatencyRegistersCompare.py EVIDENCE GOLDEN_SV ITERATION93_EVIDENCE
+```
+
+Both constructor orders pass 52,768 transitions each: 32,768 exhaustive edge
+cases and 20,000 continuous randomized cycles. Each covers 52,967 writes,
+3,235 zero-strobe writes, 17,071 writes during reset, 44,775 writes carrying
+upper bits and 26,461 writes during target stalls. All 250 prior module
+bodies remain byte-identical and native identities/ports remain intact.
+All 169 wrapper ports, 173 connections and the complete retargeted annotation
+archive match. The reused bank and FASED wiring also match fresh native
+SFC ingestion's `post-fame-fased-latency-registers.mlir`.
+
+Native build, both expanded replays (nine atomic rejections each), and focused
+Print-binding/latency-register CTests pass (7.44 seconds). The standalone
+latency-register test covers 32,768 cycles, split/combined mapping equivalence,
+early allocation and 34 atomic rejection cases. Fresh native compilation of
+the immutable `.sfc.fir`/`.anno.json` reaches simulator RTL emission. Compiler,
+replay, CTest and comparison stderr are empty; the initial build reports Ninja
+log-recovery warnings. Manager verification remains harness-owned.
+
+Next smallest step: attach the already allocated `FASEDFunctionalModelRegister`
+bank, replacing the ingress relaxation input with its reset-zero, bit-zero
+setting at global MMIO word 18. Decoded MCR fanout, remaining FASED banks,
+host-memory attachment, Print-enabled production CLI/driver integration,
+general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
+baseline remain incomplete. This increment does not complete the port.

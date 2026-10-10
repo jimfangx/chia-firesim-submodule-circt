@@ -220,4 +220,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDReadAdmission(
 /// Attach the allocated request-limit bank after read/write admission.
 mlir::LogicalResult mapPrintBridgeRocketFASEDRequestLimits(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach the allocated latency bank after request limits. Requires the Rocket
+/// allocation and raw annotation archive; consumes the two latency inputs, adds
+/// one MCR output and wrapper, retargets copied ports, and preserves prior modules.
+mlir::LogicalResult mapPrintBridgeRocketFASEDLatencyRegisters(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

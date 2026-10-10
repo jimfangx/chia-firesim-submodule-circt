@@ -24,6 +24,7 @@
 #include "goldengate/BlockDevResponseScheduler.h"
 #include "goldengate/FASEDTokenEngine.h"
 #include "goldengate/FASEDRequestLimits.h"
+#include "goldengate/FASEDLatencyRegisters.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1003,6 +1004,38 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDRequestLimits(CircuitOp circu
   if (!bank) return reject("Rocket Print FASED request limits require the allocated request-limit bank");
   if (failed(attachFASEDRequestLimits(*staged, bank, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED request limits produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires: completed request-limit boundary, valid expanded Rocket/Print MMIO
+// allocation, retained annotations and a free, allocated latency bank.
+// Annotations consumed/produced: none; explicitly retarget the retained archive.
+// Mutates: append a wrapper consuming latency inputs and exporting decoded MCR.
+// Analyses required: Rocket control allocation; no cached analysis is used.
+// Preserves: prior module/port identities, bank definitions and constructor keys.
+// Output: host-clock/reset bank drives full-width read/write timing latencies;
+// failed attachment is atomic and retained ports keep their type/direction/order.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDLatencyRegisters(CircuitOp circuit,
+                                                               std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDRequestLimitsWrapper")
+    return reject("Rocket Print FASED latency registers require the completed request-limit boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDLatencyRegisters") bank = m;
+  if (!bank) return reject("Rocket Print FASED latency registers require the allocated latency-register bank");
+  if (failed(attachFASEDLatencyRegisters(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED latency registers produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

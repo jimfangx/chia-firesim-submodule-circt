@@ -423,6 +423,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDWriteAdmission.cpp
     lib/Transforms/FASEDReadAdmission.cpp
     lib/Transforms/FASEDRequestLimits.cpp
+    lib/Transforms/FASEDLatencyRegisters.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp
