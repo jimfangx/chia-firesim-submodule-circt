@@ -1929,3 +1929,51 @@ step: compose native ingress credit/order/issue/deadlock passes through this
 expanded boundary, compare their accepted host issue behavior with SFC, then
 advance to egress/timing and slave-1 MMIO attachment. The UART-bearing SFC
 runtime baseline and overall migration remain incomplete.
+
+
+## Iteration 80: FASED host issue and deadlock after expanded Rocket/Print ingress
+
+`mapPrintBridgeRocketFASEDIssue` composes native ingress credits, transaction
+order, host issue and deadlock passes after the expanded ingress boundary.
+It checks the ordered Print host catalog and complete live thirteen-bank MMIO
+allocation before staging the batch on a cloned CIRCT circuit. Commit preserves
+existing ingress module operation identities while transferring the assertion
+context ports and bodies. The six FASED register fragments and control decoder
+remain intact. Helper collisions, stale allocation, unsupported credit profile,
+wrong circuit identity and repeated application reject without changing IR.
+
+The issue wrapper consumes the raw AW/W/AR dequeues, transaction-order dequeue
+and host outstanding transaction inputs. It exposes host request and response
+bundles. Credits retain independent saturating AW/W counters and ordered-mode
+complete-write detection. The two ten-entry order queues preserve read-before-
+write ordering on simultaneous enqueue. Host issue implements relaxed credit
+gates and conservative read/write ordering; AW acceptance takes priority over
+last-W acceptance when updating the write-data state. Deadlock assertions
+observe raw enqueue valid/ready under qualified ingress reset, with their policy
+context threaded through the existing AW/W/AR ingress hierarchy.
+
+`PrintRocketFASEDIssueCompare.py` uses the immutable U250 build reference's
+`design/FireSim-generated.sv`, specifically `IngressModule` and `DualQueue`.
+It checks the oracle's credit, issue and assertion equations, evaluates native
+SSA for 3,872 credit, 32,768 issue and 512 deadlock combinations per Print order,
+and checks actual helper clock/reset/handshake connections. Helper definitions
+must match the fresh native `post-fame-fased-ingress-deadlock.mlir`. Constructor
+and channel identities, all six FASED register fragments and the decoder must
+survive composition. The fixture's `--fased-issue-boundary` mode can replay a
+saved expanded ingress artifact to isolate the batch and its nine rejections.
+
+Evidence is in mutable `iteration80-print-rocket-fased-issue/`. Fresh native
+compilation of the immutable compiler `.sfc.fir` and `.anno.json` succeeds with
+empty stderr. The focused Print binding and four FASED ingress tests pass. The
+expanded fixture passes both constructor orders and 174 atomic rejection cases,
+including eighteen new issue/deadlock cases; isolated replay passes nine cases
+and emits exactly the same first-order IR as full assembly. All ten structured
+Rocket/Print comparisons pass, including the credit/issue/deadlock cases and
+actual SSA wiring in both constructor orders. This is still a
+partial FASED boundary: host response bundles, egress readiness, timing policy
+and MMIO attachment remain external. The recorded SFC configuration disables
+Print; shared FASED comparisons do not establish a complete Print-enabled
+production CLI or driver flow. Manager verification remains harness-owned.
+Next: compose the native read buffer/read scheduler and write egress/response
+releaser through this expanded boundary, then timing and slave-1 MMIO. The
+UART-bearing SFC runtime baseline and overall compiler migration remain pending.

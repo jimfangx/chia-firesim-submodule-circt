@@ -930,6 +930,80 @@ void rocketFASEDIngress(Fixture &f, StringRef output, bool reverse, unsigned &re
   }
 }
 
+void rocketFASEDIssue(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto bank = named(f.circuit, "GGFASEDLatencyRegisters");
+  auto bankState = dump(bank.getOperation());
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttr("goldengate.bridgeConstructor");
+  const StringRef updated[]{"GGFASEDIngressARQueueWrapper", "GGFASEDIngressWQueueWrapper",
+      "GGFASEDIngressAWWrapper", "GGFASEDIngressAW"};
+  SmallVector<FModuleOp> previous;
+  for (auto name : updated) previous.push_back(named(f.circuit, name));
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    FModuleOp collision;
+    if (bad < 4) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      const StringRef names[]{"GGFASEDIngressCredits", "GGFASEDIngressOrder20",
+          "GGFASEDIngressIssue", "GGFASEDIngressDeadlock"};
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(names[bad]),
+          original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 4 || bad == 5) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 4) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 6) {
+      NamedAttrList key(cast<DictionaryAttr>(constructor));
+      NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+      edge.set("maxFlight", b.getI64IntegerAttr(9)); key.set("axi4Edge", edge.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 7) f.circuit.setName("WrongTop");
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDIssue(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED issue rejection " + std::to_string(bad) +
+        (succeeded(result) ? " accepted invalid input" : " changed IR or omitted diagnostic: " + error)); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDIssue(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDIngressIssueWrapper" &&
+      decoder->getAttr("goldengate.controlRegions") == regions &&
+      named(f.circuit, "GGFASEDLatencyRegisters") == bank && dump(bank.getOperation()) == bankState,
+      "FASED issue changed live bank or expanded allocation");
+  require(bool(port(top, "fased_host_requests")) && bool(port(top, "fased_host_responses")),
+      "FASED issue lacks host request/response boundary");
+  for (auto p : top.getPorts())
+    require(p.name != "fased_ingress_aw_deq" && p.name != "fased_ingress_w_deq" &&
+        p.name != "fased_ingress_ar_deq" && p.name != "fased_host_transactions" &&
+        p.name != "fased_ingress_order", "consumed FASED issue port escapes");
+  for (auto [i, name] : llvm::enumerate(updated)) {
+    auto m = named(f.circuit, name);
+    require(m == previous[i] && bool(port(m, "fased_ingress_deadlock_context")),
+        "FASED deadlock context did not update existing ingress module identity");
+  }
+  auto gates = named(f.circuit, "GGFASEDIngressAW");
+  require(bool(child(gates, named(f.circuit, "GGFASEDIngressDeadlock"))),
+      "FASED enqueue gates lack native deadlock checks");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDIssue(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED issue composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-issue-reverse.mlir" : ".rocket-fased-issue.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED issue boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
                      unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
@@ -1480,6 +1554,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketTSI(f, output, reverse, rejected);
       rocketBlockDev(f, output, reverse, rejected);
       rocketFASEDIngress(f, output, reverse, rejected);
+      rocketFASEDIssue(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -1817,6 +1892,15 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    // Reuse a recorded expanded ingress boundary to isolate this staged batch.
+    if (argc == 4 && StringRef(argv[1]) == "--fased-issue-boundary") {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED ingress boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin();
+      unsigned rejected = 0; rocketFASEDIssue(f, argv[3], false, rejected);
+      llvm::outs() << "PASS expanded FASED issue boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
     allocatedHeaders(ctx, argc > 1 ? argv[1] : "");
     platformCatalog(ctx, argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");

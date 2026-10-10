@@ -153,4 +153,9 @@ mlir::LogicalResult mapPrintBridgeRocketBlockDev(
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.
 mlir::LogicalResult mapPrintBridgeRocketFASEDIngress(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Consume the raw FASED dequeue/transaction boundaries into native credit,
+// ordered issue and qualified deadlock checks. Input: completed expanded ingress.
+// Atomic; retain existing MMIO identities and expose host request/response AXI.
+mlir::LogicalResult mapPrintBridgeRocketFASEDIssue(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
