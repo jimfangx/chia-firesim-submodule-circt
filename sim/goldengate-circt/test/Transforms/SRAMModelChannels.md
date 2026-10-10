@@ -2667,3 +2667,81 @@ host-memory attachment and Print-enabled production CLI/driver integration
 remain incomplete. General FAME1/FAME5, multi-clock support and the
 UART-bearing SFC runtime baseline remain outstanding. Manager verification
 stays with the harness; this is not overall port completion.
+
+
+### Expanded Print/Rocket pending-read admission (iteration 92)
+
+`mapPrintBridgeRocketFASEDReadAdmission` composes native
+`bindFASEDReadAdmission` after write admission. FIRRTL operations observe
+`R.ready && R.valid && R.last` at the response releaser, append that observation
+through eight existing modules, and feed the pending-read counter. Accepted AR
+increments the counter; accepted final R decrements it. AR readiness is
+`!full`, independent of target fire and reset. Counter state and reset advance
+only on target fire. Simultaneous increment/decrement holds, empty retirement
+saturates, and lowering the runtime maximum does not clamp existing state.
+AW/W admission remains connected through the preceding wrapper.
+
+The composer validates expanded control allocation and the recorded 35/64/4-bit
+constructor profile, applies the native mutation to a clone, verifies FIRRTL,
+then applies it to the original circuit while preserving module identities.
+Existing port indices/types/directions remain intact in the eight observed
+modules. The outer wrapper retains all 169 prior ports, changing only the AR
+ready flip, and appends the four-bit read maximum and pending-read observation.
+Print banks, FASED banks and control allocation remain unchanged. Collision,
+shared response hierarchy, malformed allocation, stale widths, wrong top,
+missing annotation archive and repetition reject without mutation.
+
+Executable Scala references inspected: `models/dram/TimingModel.scala:104–106`
+and `225–231`, `widgets/Lib.scala:71–86`, `passes/MidasTransforms.scala` pass
+ordering and `passes/fame/FAMETransform.scala` channel/target-clock contract.
+The exact immutable RTL compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `LatencyPipe`, `AXI4Releaser`,
+`SatUpDownCounter_1` and `FASEDMemoryTimingModel`. The LatencyPipe instance
+named `SatUpDownCounter` uses module `SatUpDownCounter_1` with a four-bit
+runtime maximum; the separate two-bit module named `SatUpDownCounter` is not
+this pending-read oracle. The fixture contains no Print host: results cover
+shared FASED semantics and preservation of the expanded native Print boundary.
+
+Evidence resides under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration92-print-rocket-fased-read-admission/`. Native replay modes:
+
+```text
+goldengate-print-binding-test --fased-read-admission-boundary INPUT_WRITE_ADMISSION_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-read-admission-boundary-reverse INPUT_REVERSE_WRITE_ADMISSION_MLIR OUTPUT_PREFIX
+```
+
+`PrintRocketFASEDReadAdmissionCompare.py EVIDENCE GOLDEN_SV ITERATION91_EVIDENCE`
+pins SFC admission, final-R retirement, saturated counter arithmetic and gated
+clock equations. It interprets actual native counter SSA, checks all eight
+observation connections and every prior driver, retains the complete annotation
+archive with expected retargeting, and compares the counter/helper wiring with
+fresh native SFC ingestion's `post-fame-fased-read-admission.mlir`.
+
+Result: both constructor orders pass 46,384 transitions each (16,384 exhaustive
+four-bit state/maximum/reset/fire/AR-valid/R-ready/R-valid/R-last cases plus
+30,000 continuous randomized transitions). Each includes 9,997 accepted ARs,
+5,815 accepted final Rs, 5,929 accepted nonfinal Rs, 13,061 blocked ARs,
+49 empty retirements, 682 simultaneous increment/decrement cases,
+23,239 states above the runtime maximum, 2,904 zero-maximum cases and 4,200
+stalled resets. All 247 prior module identities remain intact; 239 unrelated
+module definitions remain byte-identical. The eight observation hops retain
+all existing drivers: 1,415 prior/observation connections and 181 outer wrapper
+connections match. The complete retargeted annotation archive matches.
+
+Native build, both expanded replays with nine atomic rejections each and
+focused Print-binding/read-admission CTests pass (5.82 seconds). The standalone
+read-admission test covers 27 atomic rejection cases. Fresh native compilation
+of immutable `.sfc.fir`/`.anno.json` inputs reaches simulator RTL emission.
+Compiler, replay, CTest and comparison stderr are empty; build stderr contains
+two Ninja log-recovery warnings and compilation/linking completes successfully.
+Manager verification was not launched by this implementation turn.
+
+Next smallest step: compose native `FASEDRequestLimits` into this expanded
+boundary to replace the explicit runtime read/write maximum inputs with the
+allocated host-clock MMIO bank, then attach latency registers. Remaining timing
+policy, host-memory attachment, Print-enabled production CLI/driver integration,
+general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
+baseline remain incomplete. This increment does not complete the port.

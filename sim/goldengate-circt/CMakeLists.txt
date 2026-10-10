@@ -421,6 +421,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDWriteRetirement.cpp
     lib/Transforms/FASEDIngressDeadlock.cpp
     lib/Transforms/FASEDWriteAdmission.cpp
+    lib/Transforms/FASEDReadAdmission.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp

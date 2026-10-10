@@ -1800,6 +1800,120 @@ void rocketFASEDWriteRetirement(Fixture &f, StringRef output, bool reverse, unsi
   }
 }
 
+void rocketFASEDReadAdmission(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto raw = f.circuit->getAttr("rawAnnotations");
+  SmallVector<FModuleOp> existing;
+  SmallVector<SmallVector<PortInfo>> priorPorts;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+  }
+  const StringRef observed[]{"GGFASEDWriteAdmissionWrapper", "GGFASEDWriteRetirementWrapper", "GGFASEDWritePairingWrapper", "GGFASEDTimingAWQueueWrapper",
+      "GGFASEDWriteLatencyWrapper", "GGFASEDReadLatencyWrapper",
+      "GGFASEDTimingCycleWrapper", "GGFASEDResponseReleaserWrapper"};
+  auto bank = named(f.circuit, "GGFASEDLatencyRegisters");
+  auto bankState = dump(bank.getOperation());
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    FModuleOp collision; InstanceOp extra;
+    if (bad == 0) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(
+          "GGFASEDReadAdmissionWrapper"), original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 1) {
+      b.setInsertionPointToEnd(original.getBodyBlock());
+      extra = b.create<InstanceOp>(f.circuit.getLoc(),
+          named(f.circuit, "GGFASEDTimingAWQueueWrapper"), "duplicate");
+    }
+    if (bad == 2 || bad == 3) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 2) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 4 || bad == 5) {
+      NamedAttrList key(constructor);
+      auto name = "axi4Widths";
+      NamedAttrList profile(cast<DictionaryAttr>(key.get(name)));
+      profile.set(bad == 4 ? "idBits" : "dataBits", b.getI64IntegerAttr(bad == 4 ? 5 : 32));
+      key.set(name, profile.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    if (bad == 7) f.circuit->removeAttr("rawAnnotations");
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDReadAdmission(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED read admission rejection " + std::to_string(bad) +
+        (succeeded(result) ? " accepted invalid input" : " changed IR or omitted diagnostic: " + error)); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    if (extra) extra.erase();
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDReadAdmission(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDReadAdmissionWrapper" &&
+      decoder->getAttr("goldengate.controlRegions") == regions && dump(bank.getOperation()) == bankState,
+      "FASED read admission changed bank or expanded allocation");
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m,
+        "FASED read admission replaced an existing module operation");
+    bool appended = llvm::is_contained(observed, m.getName());
+    require(m.getNumPorts() == priorPorts[j].size() + unsigned(appended),
+        "FASED read admission changed an unrelated module's ports");
+    for (auto [i, p] : llvm::enumerate(priorPorts[j]))
+      require(m.getPortName(i) == p.name && m.getPortType(i) == p.type &&
+          m.getPortDirection(i) == p.direction,
+          "FASED read admission changed an existing port index/type/direction");
+    if (appended) require(m.getPortName(m.getNumPorts()-1) == "fased_accepted_r_last_fire" &&
+        m.getPortType(m.getNumPorts()-1) == UIntType::get(ctx, 1, false) &&
+        m.getPortDirection(m.getNumPorts()-1) == Direction::Out,
+        "FASED read admission observation differs");
+  }
+  auto oldPorts = priorPorts[llvm::find(existing, original) - existing.begin()];
+  for (auto [i, p] : llvm::enumerate(oldPorts)) {
+    auto type = p.type;
+    if (p.name.getValue() == "fased_timing_requests") {
+      auto requests = cast<BundleType>(type); auto fields = requests.getElements();
+      SmallVector<BundleType::BundleElement> rewritten(fields.begin(), fields.end());
+      for (auto &ch : rewritten) if (ch.name.getValue() == "ar") {
+        auto bundle = cast<BundleType>(ch.type); auto leaves = bundle.getElements();
+        SmallVector<BundleType::BundleElement> changed(leaves.begin(), leaves.end());
+        for (auto &leaf : changed) if (leaf.name.getValue() == "ready") leaf.isFlip = false;
+        ch.type = BundleType::get(ctx, changed);
+      }
+      type = BundleType::get(ctx, rewritten);
+    }
+    require(top.getPortName(i) == p.name && top.getPortType(i) == type &&
+        top.getPortDirection(i) == p.direction,
+        "FASED read admission must change only AR ready and retain every prior port index/type/direction");
+  }
+  require(top.getNumPorts() == oldPorts.size() + 2 &&
+      top.getPortName(oldPorts.size()) == "fased_read_max_reqs" &&
+      top.getPortType(oldPorts.size()) == UIntType::get(ctx, 4, false) &&
+      top.getPortDirection(oldPorts.size()) == Direction::In &&
+      top.getPortName(oldPorts.size()+1) == "fased_pending_reads" &&
+      top.getPortDirection(oldPorts.size()+1) == Direction::Out,
+      "FASED read admission maximum/count boundary differs");
+  auto sim = child(top, original);
+  require(bool(sim), "FASED read admission wrapper is uninstantiated");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDReadAdmission(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED read admission composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-read-admission-reverse.mlir" : ".rocket-fased-read-admission.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED read admission boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDWriteAdmission(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -2462,6 +2576,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDWritePairing(f, output, reverse, rejected);
       rocketFASEDWriteRetirement(f, output, reverse, rejected);
       rocketFASEDWriteAdmission(f, output, reverse, rejected);
+      rocketFASEDReadAdmission(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -2799,6 +2914,16 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    // Replay expanded write admission to isolate final-R retirement and AR admission.
+    if (argc == 4 && StringRef(argv[1]).starts_with("--fased-read-admission-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED write-admission boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin();
+      unsigned rejected = 0;
+      rocketFASEDReadAdmission(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded FASED read admission boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     // Replay the expanded retirement boundary to isolate pending-full admission.
     if (argc == 4 && StringRef(argv[1]).starts_with("--fased-write-admission-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);

@@ -212,4 +212,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDWriteRetirement(
 // preserve expanded banks and AR readiness. Runtime maximum remains external.
 mlir::LogicalResult mapPrintBridgeRocketFASEDWriteAdmission(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Close AR pending-full admission and accepted final-R retirement. Atomic;
+// retain existing modules and expanded banks. Runtime maximum remains external.
+mlir::LogicalResult mapPrintBridgeRocketFASEDReadAdmission(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

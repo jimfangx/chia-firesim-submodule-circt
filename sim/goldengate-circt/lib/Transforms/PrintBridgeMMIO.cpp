@@ -41,6 +41,7 @@
 #include "goldengate/FASEDWritePairing.h"
 #include "goldengate/FASEDWriteRetirement.h"
 #include "goldengate/FASEDWriteAdmission.h"
+#include "goldengate/FASEDReadAdmission.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -953,4 +954,31 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDWriteAdmission(CircuitOp circ
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
   return success();
+}
+
+// Observe accepted final R through the existing hierarchy and close AR ready.
+// Verify the full mutation on a clone, then preserve original module identities.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDReadAdmission(CircuitOp circuit,
+                                                                std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDWriteAdmissionWrapper")
+    return reject("Rocket Print FASED read admission requires the completed write-admission boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  FModuleOp engine;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDTokenEngine") engine = m;
+  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr{};
+  auto widths = key ? key.getAs<DictionaryAttr>("axi4Widths") : DictionaryAttr{};
+  auto has = [&](StringRef name, int value) {
+    auto attr = widths ? widths.getAs<IntegerAttr>(name) : IntegerAttr{};
+    return attr && attr.getValue().getBitWidth() <= 64 && attr.getInt() == value;
+  };
+  if (!has("addrBits", 35) || !has("dataBits", 64) || !has("idBits", 4))
+    return reject("Rocket Print FASED read admission requires the recorded 35/64/4-bit profile");
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(bindFASEDReadAdmission(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED read admission produced invalid FIRRTL IR");
+  // bindFASEDReadAdmission checks every rejection condition before mutation.
+  // The unchanged original has just passed those checks and IR verification.
+  return bindFASEDReadAdmission(circuit, error);
 }
