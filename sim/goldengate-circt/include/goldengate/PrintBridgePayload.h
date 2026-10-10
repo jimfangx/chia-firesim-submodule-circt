@@ -174,4 +174,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDReadScheduler(
 // Atomic; timing-model write requests/responses remain explicit boundaries.
 mlir::LogicalResult mapPrintBridgeRocketFASEDWriteEgress(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Close timing response and egress request boundaries with AXI4Releaser's
+// one-entry replacement queues. Atomic; preserve expanded Print MMIO banks.
+// Timing completion metadata and AW/W/AR readiness remain external.
+mlir::LogicalResult mapPrintBridgeRocketFASEDResponseReleaser(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

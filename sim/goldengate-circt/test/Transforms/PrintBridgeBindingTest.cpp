@@ -1219,6 +1219,80 @@ void rocketFASEDWriteEgress(Fixture &f, StringRef output, bool reverse, unsigned
   }
 }
 
+void rocketFASEDResponseReleaser(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto raw = f.circuit->getAttr("rawAnnotations");
+  SmallVector<FModuleOp> existing;
+  for (auto m : f.circuit.getOps<FModuleOp>()) existing.push_back(m);
+  auto bank = named(f.circuit, "GGFASEDLatencyRegisters");
+  auto bankState = dump(bank.getOperation());
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    FModuleOp collision;
+    if (bad < 2) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(
+          bad == 0 ? "GGFASEDResponseReleaser" : "GGFASEDResponseReleaserWrapper"),
+          original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 2 || bad == 3) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 2) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 4 || bad == 5) {
+      NamedAttrList key(constructor);
+      auto name = "axi4Widths";
+      NamedAttrList profile(cast<DictionaryAttr>(key.get(name)));
+      profile.set(bad == 4 ? "idBits" : "dataBits", b.getI64IntegerAttr(bad == 4 ? 5 : 32));
+      key.set(name, profile.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    if (bad == 7) f.circuit->removeAttr("rawAnnotations");
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDResponseReleaser(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED response releaser rejection " + std::to_string(bad) +
+        (succeeded(result) ? " accepted invalid input" : " changed IR or omitted diagnostic: " + error)); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDResponseReleaser(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDResponseReleaserWrapper" &&
+      decoder->getAttr("goldengate.controlRegions") == regions && dump(bank.getOperation()) == bankState,
+      "FASED response releaser changed bank or expanded allocation");
+  for (auto m : existing) require(named(f.circuit, m.getName()) == m,
+      "FASED response releaser replaced an existing module operation");
+  require(llvm::none_of(top.getPorts(), [](auto p) {
+        return p.name == "fased_timing" || p.name == "fased_read_egress_req" ||
+            p.name == "fased_read_egress_resp" || p.name == "fased_write_egress_req" ||
+            p.name == "fased_write_egress_resp";
+      }) && bool(port(top, "fased_host_requests")) &&
+      bool(port(top, "fased_host_read_response")) && bool(port(top, "fased_host_write_response")) &&
+      bool(port(top, "fased_timing_requests")) && bool(port(top, "fased_next_read")) &&
+      bool(port(top, "fased_next_write")),
+      "FASED response releaser did not close timing/egress or preserve host transactions");
+  require(bool(child(top, named(f.circuit, "GGFASEDResponseReleaser"))),
+      "FASED response releaser helper is uninstantiated");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDResponseReleaser(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED response releaser composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-response-releaser-reverse.mlir" : ".rocket-fased-response-releaser.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED response releaser boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
                      unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
@@ -1773,6 +1847,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDReadBuffer(f, output, reverse, rejected);
       rocketFASEDReadScheduler(f, output, reverse, rejected);
       rocketFASEDWriteEgress(f, output, reverse, rejected);
+      rocketFASEDResponseReleaser(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -2110,6 +2185,16 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    // Replay expanded write egress boundaries to isolate response retirement.
+    if (argc == 4 && StringRef(argv[1]).starts_with("--fased-response-releaser-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED write egress boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin();
+      unsigned rejected = 0;
+      rocketFASEDResponseReleaser(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded FASED response releaser boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     // Replay both expanded read scheduler orders to isolate write acknowledgments.
     if (argc == 4 && StringRef(argv[1]).starts_with("--fased-write-egress-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);

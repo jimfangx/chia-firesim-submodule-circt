@@ -2147,3 +2147,64 @@ Next smallest step: compose native `FASEDResponseReleaser` to consume both
 egress request/response boundaries and compare accepted-last-beat retirement
 and same-cycle replacement with SFC AXI4Releaser. Manager gates remain owned
 by the verification harness; this does not establish overall port completion.
+
+### Expanded Print/Rocket FASED response release (iteration 84)
+
+`mapPrintBridgeRocketFASEDResponseReleaser` closes the expanded write-egress
+boundary with native `addFASEDResponseReleaser`. It validates the live Print
+registry and MMIO allocation, stages the transform on a clone and verifies
+CIRCT FIRRTL before publishing its helper, wrapper and retargeted annotations.
+All earlier module operations, Print banks and FASED latency registers remain
+intact. The wrapper consumes timing R/B and both egress request/response
+boundaries; host AXI and timing AW/W/AR remain connected. Completion metadata
+enters through `fased_next_read` and `fased_next_write`.
+
+AXI4Releaser uses two one-entry pipe queues for response occupancy. Empty
+queues do not bypass newly accepted metadata into valid. Reads retire only
+on an accepted last beat; writes retire on response acceptance. Retirement and
+replacement in the same cycle leave occupancy set. Egress requests report
+combinational completion acceptance, including during a token stall. Response
+payloads and ready forward directly even when invalid. Occupancy and reset
+advance only on targetFire, matching the SFC timing model's gated clock.
+
+The complete expanded fixture calls this composition in both Print constructor
+orders. Replay saved iteration-83 boundaries with
+`--fased-response-releaser-boundary` and
+`--fased-response-releaser-boundary-reverse`. Each replay checks nine atomic
+rejections: helper/wrapper collisions, stale/malformed allocation, unsupported
+ID/data widths, wrong top, missing annotation archive and repeated composition.
+
+`PrintRocketFASEDResponseReleaserCompare.py` compares immutable U250
+`design/FireSim-generated.sv` modules `AXI4Releaser`, its two pipe queues,
+`LatencyPipe` and `FASEDMemoryTimingModel`. It pins SFC queue equations and
+sequential priority, read-last retirement, response forwarding and gated clock
+wiring, then interprets actual native SSA in both expanded constructor orders.
+It checks 131,072 flag/read-ID/write-ID combinations per order, all earlier
+module definitions, the complete retargeted annotation archive and 23 wrapper
+connections. The helper must match fresh native compilation's
+`post-fame-fased-response-releaser.mlir` from immutable `.sfc.fir`/`.anno.json`.
+The shared SSA evaluator now supports the emitted FIRRTL XOR operation.
+
+Evidence is in mutable `iteration84-print-rocket-fased-response-releaser/`.
+Both expanded replays, the structured comparison and focused CTests pass.
+All 233 preceding modules and the full annotation archive are retained in each
+order. Coverage per order includes 2,048 read replacements, 16,384 non-last
+beats, 24,576 blocked read requests, 24,576 occupied stalled resets, 37,376
+combinational acceptances without fire and 32,768 empty-queue pushes without
+flow-through. Fresh native ingestion, host assembly and RTL emission pass;
+compiler, replay and comparison stderr logs are empty.
+Run the focused Print binding and response-releaser CTests, both expanded
+boundary replays, then the comparison with the immutable SV path and the
+iteration-83 evidence directory. The native response-releaser unit test
+interprets 18,192 transitions, including 10,000 continuous state steps,
+64 wrapper mapping cases, seven target transfers and 22 atomic rejections.
+
+The expanded Print-enabled assembly remains partial and is exercised through
+the compiler library and boundary fixture. Timing policy, slave-1 MMIO,
+host-memory attachment and Print-enabled production CLI/driver integration
+remain to compose. The golden reference disables Print and the UART-bearing
+SFC runtime baseline remains pending. Next smallest step: compose native
+`FASEDTimingCycle` and compare target-qualified reset/advance, 64-bit cycle
+wrap and runtime-latency release offsets against SFC LatencyPipe. Manager gates
+remain owned by the verification harness; overall port completion is not
+established.

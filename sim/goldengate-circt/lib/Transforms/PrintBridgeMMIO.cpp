@@ -33,6 +33,7 @@
 #include "goldengate/FASEDReadBuffer.h"
 #include "goldengate/FASEDReadScheduler.h"
 #include "goldengate/FASEDWriteEgress.h"
+#include "goldengate/FASEDResponseReleaser.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -742,6 +743,30 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDWriteEgress(CircuitOp circuit
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addFASEDWriteEgress(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED write egress produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Compose AXI4Releaser's response occupancy on the expanded Print/Rocket circuit.
+// Read retirement requires an accepted last beat; simultaneous replacement keeps
+// occupancy set. State/reset are qualified by targetFire, acceptance is not.
+// Publish verified additions atomically while preserving existing operations.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDResponseReleaser(CircuitOp circuit,
+                                                              std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDWriteEgressWrapper")
+    return reject("Rocket Print FASED response releaser requires the completed write egress boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDResponseReleaser(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED response releaser produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

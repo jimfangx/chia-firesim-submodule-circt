@@ -412,6 +412,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDReadBuffer.cpp
     lib/Transforms/FASEDReadScheduler.cpp
     lib/Transforms/FASEDWriteEgress.cpp
+    lib/Transforms/FASEDResponseReleaser.cpp
     lib/Transforms/FASEDIngressDeadlock.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
