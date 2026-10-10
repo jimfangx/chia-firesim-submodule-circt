@@ -254,4 +254,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDMMIOBank(
 /// Stage both wrappers atomically; preserve existing banks and Print interfaces.
 mlir::LogicalResult mapPrintBridgeRocketFASEDControl(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Close the completed expanded Rocket/Print control fabric with the native
+/// five-channel host master. Atomic; validate live allocation and slave closure,
+/// preserve prior IR identities and transfer copied annotation targets.
+mlir::LogicalResult mapPrintBridgeRocketControlMaster(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

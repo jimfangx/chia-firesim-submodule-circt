@@ -3279,3 +3279,66 @@ Next smallest step: bind the host control master to the expanded fabric, then
 attach FASED host memory. Print-enabled production CLI/driver integration,
 general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
 baseline remain incomplete. This increment does not complete the port.
+
+### Iteration 101: expanded Print/Rocket host control master
+
+`mapPrintBridgeRocketControlMaster` closes the completed expanded FASED control
+binding with the native five-channel host `ctrl` bundle. It first checks the
+live Rocket/Print allocation and rejects remaining exported widget controls,
+request dispatcher slaves or response arbiter inputs. The shared
+`bindControlMaster` then consumes 32 scalar master boundaries and aggregate AR
+on a clone. Only the verified new wrapper and transferred annotation archive
+are committed, preserving every prior operation, port and argument identity.
+No new state is introduced: AW/W readiness and B/R response acceptance still
+come from the existing route and tracker-backed arbiters.
+
+The executable oracle is `Widget.scala:315-340`: size-sorted widgets bind to
+interconnect slaves, then `ctrlInterconnect.io.masters(0) <> master` connects
+the host. MidasTransforms and FAMETransform were also inspected; existing FAME
+clock/token and bridge metadata survive this downstream composition.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration101-print-rocket-control-master/`. Replays consume iteration 100's
+actual `binding.mlir.rocket-fased-control[-reverse].mlir` boundaries:
+
+```text
+goldengate-print-binding-test --rocket-control-master-boundary INPUT OUTPUT_PREFIX
+goldengate-print-binding-test --rocket-control-master-boundary-reverse INPUT_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketControlMasterCompare.py \
+  --before INPUT --after OUTPUT --before INPUT_REVERSE --after OUTPUT_REVERSE \
+  --sfc SFC_SV --baseline ITERATION100/candidate/post-fame-control-master.mlir \
+  --report-json EVIDENCE/rocket-control-master-comparison.json
+```
+
+The exact immutable SFC artifact is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, module `FPGATop` and its `ctrlInterconnect`
+instance. Compare the complete 45-leaf host control ABI and all 24 surviving
+SFC master pins; unused metadata is optimized away and B/R user bits are zero.
+The expanded native master routes are also compared with iteration 100's
+native ingestion of the immutable compiler fixture. Print is disabled in SFC;
+its shared host ABI is an oracle for this boundary, not Print runtime parity.
+
+Both constructor-order comparisons pass: 259 unchanged prior module bodies,
+111 copied ports, 21 retained Print modules and both allocated Print regions
+(slaves 8 and 9, starts 544 and 576). The new wrapper consumes 33 ports through
+32 scalar bindings and aggregate AR, with all 144 actual connections checked.
+The full retained archive and four added copied/internalized/circuit identity
+probes transfer exactly. Shared native baseline master routes also match.
+
+Native compiler/test builds pass. Print-binding and control-master CTests pass
+in 5.58 seconds; both expanded replays pass 14 atomic rejection cases each,
+including wrapper collision, used top, stale allocation, missing boundaries,
+remaining slave controls and repeat mapping. Replay, comparison and CTest
+stderr are empty. Build stderr only reports Ninja log recovery, with no compiler
+errors. No manager verification steps were started by the implementation agent.
+
+Next smallest step: attach FASED host memory to this expanded control-master
+boundary. Print-enabled production CLI/driver integration, general FAME1/FAME5,
+multi-clock support and the UART-bearing SFC runtime baseline remain incomplete.
+This increment does not complete the port. FireSim manager verification remains
+owned by the harness; supplied iteration 100 results pass CIRCT replacertl and
+both Verilator suites (90,141 portable and 90,805 Rocket checks).

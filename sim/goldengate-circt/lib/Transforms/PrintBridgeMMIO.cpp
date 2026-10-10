@@ -1277,3 +1277,45 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDControl(CircuitOp circuit,
   circuit.setName(staged->getName());
   return success();
 }
+
+// Requires: unused completed FASED control top, retained annotations, live
+// Rocket/Print allocation and no exported widget/slave control boundaries.
+// Consumes: scalar AW/W and B/R master ports and aggregate AR; no annotation
+// classes consumed or produced. Copied targets transfer, consumed targets stay
+// inner. Mutates: append one stateless FIRRTL wrapper after staged verification.
+// Analyses required: live MMIO registry/allocation; hierarchy analysis invalid.
+// Preserves: prior operations, ports, arguments, clock/reset, constructor/channel
+// metadata and all request/response tracker state. Output: complete host ctrl
+// bundle with independent AW/W readiness and B/R acceptance through arbiters.
+LogicalResult goldengate::mapPrintBridgeRocketControlMaster(CircuitOp circuit,
+                                                          std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDBridgeBoundWrapper")
+    return reject("Rocket Print control master requires the completed FASED control binding");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  for (auto m : circuit.getOps<FModuleOp>()) {
+    if (m.getName() != circuit.getName()) continue;
+    for (auto p : m.getPorts()) {
+      auto name = p.name.getValue();
+      if (name.ends_with("_ctrl") ||
+          name.starts_with("ctrl_write_dispatch_slave_") ||
+          name.starts_with("ctrl_read_dispatch_slave_") ||
+          name.starts_with("ctrl_write_arb_in_") ||
+          name.starts_with("ctrl_read_arb_in_"))
+        return reject("Rocket Print control master has an unbound widget control slave");
+    }
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(bindControlMaster(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("Rocket Print control master produced invalid FIRRTL IR");
+  // Commit only the new wrapper: replacing the cloned circuit would invalidate
+  // every previously resolved module, port and argument used by later mapping.
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGControlMasterWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
