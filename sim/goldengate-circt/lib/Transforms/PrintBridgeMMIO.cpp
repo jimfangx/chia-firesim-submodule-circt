@@ -23,6 +23,7 @@
 #include "goldengate/BlockDevReadLatency.h"
 #include "goldengate/BlockDevResponseScheduler.h"
 #include "goldengate/FASEDTokenEngine.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -981,4 +982,34 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDReadAdmission(CircuitOp circu
   // bindFASEDReadAdmission checks every rejection condition before mutation.
   // The unchanged original has just passed those checks and IR verification.
   return bindFASEDReadAdmission(circuit, error);
+}
+
+// Requires the expanded Print allocation and completed read/write admission.
+// Consumes/produces no annotations; explicitly retargets the retained archive.
+// Adds only a wrapper, using the allocated bank's existing module identity.
+// Preserves model/channel identities, constructor keys, banks and allocation.
+// Output: host-reset MMIO words drive the four-bit admission maxima; decoded
+// MCR words 2/3 remain exposed for subsequent control-fanout composition.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDRequestLimits(CircuitOp circuit,
+                                                               std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDReadAdmissionWrapper")
+    return reject("Rocket Print FASED request limits require the completed read-admission boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDRequestLimits") bank = m;
+  if (!bank) return reject("Rocket Print FASED request limits require the allocated request-limit bank");
+  if (failed(attachFASEDRequestLimits(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED request limits produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
 }

@@ -1800,6 +1800,83 @@ void rocketFASEDWriteRetirement(Fixture &f, StringRef output, bool reverse, unsi
   }
 }
 
+void rocketFASEDRequestLimits(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto bank = named(f.circuit, "GGFASEDRequestLimits");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto raw = f.circuit->getAttr("rawAnnotations");
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<PortInfo>> priorPorts;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+  }
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    FModuleOp collision; InstanceOp extra;
+    if (bad == 0) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(
+          "GGFASEDRequestLimitsWrapper"), original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 1 || bad == 2) {
+      b.setInsertionPointToEnd(original.getBodyBlock());
+      extra = b.create<InstanceOp>(f.circuit.getLoc(), bad == 1 ? original : bank, "duplicate");
+    }
+    if (bad == 3 || bad == 4) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 3) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 5) {
+      NamedAttrList key(constructor);
+      NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+      edge.set("maxFlight", b.getI64IntegerAttr(9)); key.set("axi4Edge", edge.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    if (bad == 7) f.circuit->removeAttr("rawAnnotations");
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDRequestLimits(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED request-limit rejection " + std::to_string(bad) + " changed IR or accepted invalid input: " + error); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    if (extra) extra.erase();
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDRequestLimits(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDRequestLimitsWrapper", "FASED request-limit top differs");
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == priorPorts[j].size(),
+        "FASED request-limit composition changed an existing module identity/port count");
+    for (auto [i, p] : llvm::enumerate(priorPorts[j]))
+      require(m.getPortName(i) == p.name && m.getPortType(i) == p.type &&
+          m.getPortDirection(i) == p.direction, "FASED request-limit composition changed an existing port");
+  }
+  unsigned copied = 0;
+  for (auto p : original.getPorts()) {
+    if (p.name == "fased_write_max_reqs" || p.name == "fased_read_max_reqs") continue;
+    require(top.getPortName(copied) == p.name && top.getPortType(copied) == p.type &&
+        top.getPortDirection(copied) == p.direction, "FASED request-limit composition changed a retained port"); ++copied;
+  }
+  require(top.getNumPorts() == copied + 1 && top.getPortName(copied) == "fased_request_limits_mcr" &&
+      top.getPortType(copied) == bank.getPortType(3) && top.getPortDirection(copied) == Direction::Out &&
+      bool(child(top, bank)) && bool(child(top, original)), "FASED request-limit bank attachment differs");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDRequestLimits(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED request-limit composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-request-limits-reverse.mlir" : ".rocket-fased-request-limits.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED request-limit boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDReadAdmission(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -2577,6 +2654,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDWriteRetirement(f, output, reverse, rejected);
       rocketFASEDWriteAdmission(f, output, reverse, rejected);
       rocketFASEDReadAdmission(f, output, reverse, rejected);
+      rocketFASEDRequestLimits(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -2914,6 +2992,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--fased-request-limits-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED read-admission boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketFASEDRequestLimits(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded FASED request-limit boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     // Replay expanded write admission to isolate final-R retirement and AR admission.
     if (argc == 4 && StringRef(argv[1]).starts_with("--fased-read-admission-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);

@@ -216,4 +216,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDWriteAdmission(
 // retain existing modules and expanded banks. Runtime maximum remains external.
 mlir::LogicalResult mapPrintBridgeRocketFASEDReadAdmission(
     circt::firrtl::CircuitOp circuit, std::string &error);
+
+/// Attach the allocated request-limit bank after read/write admission.
+mlir::LogicalResult mapPrintBridgeRocketFASEDRequestLimits(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

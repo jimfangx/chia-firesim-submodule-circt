@@ -2745,3 +2745,71 @@ allocated host-clock MMIO bank, then attach latency registers. Remaining timing
 policy, host-memory attachment, Print-enabled production CLI/driver integration,
 general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
 baseline remain incomplete. This increment does not complete the port.
+
+## Iteration 93: expanded Print/Rocket FASED request-limit bank attachment
+
+`mapPrintBridgeRocketFASEDRequestLimits` closes both runtime admission maximum
+inputs using the already allocated `GGFASEDRequestLimits` bank. It validates
+the expanded Print allocation, stages native `attachFASEDRequestLimits` on a
+clone and verifies FIRRTL before moving only the new wrapper into the original
+circuit. Existing modules, ports, bank bodies, constructor metadata and control
+regions retain their identities. The retained annotation archive is explicitly
+retargeted; targets of consumed maximum inputs remain on the inner module.
+The decoded two-word MCR fragment stays external for subsequent control fanout.
+
+The bank uses host clock and host reset, resets both 32-bit registers to 10,
+accepts decoded write-valid independently of target fire and byte strobes,
+returns full-width readback, and drives only bits 3:0 into read/write admission.
+This preserves `SplitTransactionMMRegIO.maxReqRegisters` in
+`models/dram/TimingModel.scala:204`, `Widget.attachIO/genAndAttachReg` and
+`MCRIO.bindReg` in `widgets/Lib.scala`. `MidasTransforms.scala` ordering and
+`FAMETransform.scala` input-ready/output-valid and target-clock contracts were
+also inspected; this does not alter FAME advancement.
+
+The exact immutable oracle compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, module `FASEDMemoryTimingModel`. Its two 32-bit
+registers, reset/write priority, low-four-bit model connections and full-width
+MCR readback at words 2/3 establish the semantic comparison. The SFC fixture
+has no Print host, so Print-specific claims cover native preservation only.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration93-print-rocket-fased-request-limits/`. Replay the preceding expanded
+boundary in each constructor order with:
+
+```text
+goldengate-print-binding-test --fased-request-limits-boundary INPUT_READ_ADMISSION_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-request-limits-boundary-reverse INPUT_REVERSE_READ_ADMISSION_MLIR OUTPUT_PREFIX
+PrintRocketFASEDRequestLimitsCompare.py EVIDENCE GOLDEN_SV ITERATION92_EVIDENCE
+```
+
+The comparison interprets actual bank SSA (including vector subindices), pins
+SFC equations and register updates, compares every new wrapper connection and
+all existing module definitions, and checks complete annotation retargeting.
+It also matches the bank and FASED bindings against fresh native ingestion's
+`post-fame-fased-request-limits.mlir`.
+
+Result: both constructor orders pass 52,768 transitions each (32,768 exhaustive
+edge-value/reset/fire/write-mask/strobe cases and 20,000 continuous randomized
+cycles). Each includes 52,679 writes, 3,378 zero-strobe writes, 17,062 writes
+concurrent with reset, 36,295 writes carrying upper bits and 26,333 writes
+during target stalls. All 249 prior module definitions remain byte-identical
+and their native operation identities/ports remain intact. All 174 new wrapper
+connections and 170 ports match; the complete retargeted annotation archive
+matches. The reused bank and FASED bindings match fresh native SFC ingestion.
+
+Native build, both expanded replays with nine atomic rejections each, and both
+focused Print-binding/request-limit CTests pass (7.07 seconds). The standalone
+request-limit test covers 32,768 cycles and 33 atomic rejection cases across
+materialization/attachment and combined mapping. Fresh native compilation of
+the immutable `.sfc.fir`/`.anno.json` handoff reaches simulator RTL emission.
+Compiler, replay, CTest and comparison stderr are empty; successful builds
+report Ninja log-recovery warnings. Manager verification remains harness-owned.
+
+Next smallest step: attach the already allocated `FASEDLatencyRegisters` bank
+to the expanded boundary. Remaining timing policy, MCR/control fanout,
+host-memory attachment, Print-enabled production CLI/driver integration,
+general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
+baseline remain incomplete. This increment does not complete the port.

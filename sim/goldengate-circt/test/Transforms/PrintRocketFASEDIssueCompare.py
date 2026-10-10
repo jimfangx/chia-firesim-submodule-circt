@@ -27,6 +27,8 @@ def expressions(text, name):
                 values[v] = ('leaf', v[1:])
         if m := re.search(r'(%\w+) = firrtl.regreset ', line):
             values[m[1]] = ('leaf', m[1][1:])
+        if m := re.search(r'(%\w+) = firrtl.subindex (%\w+)\[(\d+)\]', line):
+            values[m[1]] = ('leaf', values[m[2]][1] + '[' + m[3] + ']')
         if m := re.search(r'(%\w+) = firrtl.subfield (%\w+)\[(\w+)\]', line):
             values[m[1]] = ('leaf', values[m[2]][1] + '.' + m[3])
         if m := re.search(r'(%\w+) = firrtl.(and|or|xor|lt|gt|leq|geq|eq|add|sub) (%\w+), (%\w+)', line):
