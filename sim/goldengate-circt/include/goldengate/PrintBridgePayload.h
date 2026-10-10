@@ -235,4 +235,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDFunctionalModelRegister(
 /// the archive, and preserve prior modules and expanded Rocket/Print allocation.
 mlir::LogicalResult mapPrintBridgeRocketFASEDResponseErrors(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach allocated statistics after response errors, exposing accepted target R
+/// beats through the unique response hierarchy. Atomic; retain module identities
+/// and all original port arguments, retarget the archive, export four MCR words.
+mlir::LogicalResult mapPrintBridgeRocketFASEDStatistics(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

@@ -3011,3 +3011,74 @@ Decoded MCR fanout, remaining FASED banks, host-memory attachment, Print-enabled
 production CLI/driver integration, general FAME1/FAME5, multi-clock support
 and the UART-bearing SFC runtime baseline remain incomplete. This increment
 does not complete the port.
+
+## Iteration 97: expanded Print/Rocket FASED statistics
+
+`mapPrintBridgeRocketFASEDStatistics` attaches the allocated statistics bank
+at the completed response-error boundary. After validating Rocket/Print control
+allocation, it stages native attachment and verifies FIRRTL on a clone. Native
+attachment mutates thirteen existing modules and twelve `sim` instances to
+carry `fased_accepted_r_fire` from the target response releaser. Moving only the
+new wrapper would discard those mutations; instead the composer repeats the
+fully preflighted native attachment on the original circuit. Native attachment
+has no rejection paths after mutation starts. All existing module identities
+and original port arguments, types, directions and order survive. The new
+observation is consumed internally; the wrapper copies 170 original ports and
+exports the four-word MCR fragment. The retained annotation archive is
+explicitly retargeted. Hierarchy analyses must be recomputed afterward.
+
+The executable oracle is `models/dram/TimingModel.scala:151-167`,
+`FASEDMemoryTimingModel.scala:357-376` and `widgets/Lib.scala:281-298`.
+AW/AR count transactions and W/R count every accepted beat, including non-final
+R beats. The four UInt<32> counters wrap; targetFire qualifies increments and
+model reset. Host reset suppresses read-only assertions independently and does
+not reset these target-clocked counters. Global MCR words 14-17, bytes 56-68,
+read the counters; read-valid and write-ready are constant one. Every write
+asserts outside host reset, irrespective of strobe. The pipeline order in
+`MidasTransforms.scala` and the ready/valid and clock contracts in
+`FAMETransform.scala` were inspected.
+
+The exact immutable comparison artifact is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `LatencyPipe` and
+`FASEDMemoryTimingModel`. Counter widths, handshake guards, increment/reset
+priority, model clock/reset bindings, readback and read-only assertions match.
+The fixture lacks a Print host; Print checks prove native preservation rather
+than SFC Print parity. The reused bank and event/observation wiring also match
+fresh ingestion of the immutable compiler fixture's `.sfc.fir` and `.anno.json`
+at `candidate/post-fame-fased-statistics.mlir`.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration97-print-rocket-fased-statistics/`. Replay and compare:
+
+```text
+goldengate-print-binding-test --fased-statistics-boundary INPUT_RESPONSE_ERRORS OUTPUT_PREFIX
+goldengate-print-binding-test --fased-statistics-boundary-reverse INPUT_RESPONSE_ERRORS_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketFASEDStatisticsCompare.py EVIDENCE SFC_SV ITERATION96_EVIDENCE
+```
+
+Both constructor orders pass 36,384 transitions: 16,384 exhaustive handshake,
+reset, target-fire, last-bit and counter-edge cases plus 20,000 randomized
+cycles. Each includes 1,350 wraps, 1,728 accepted non-final R beats, 9,160 blocked
+R beats, 4,391 stalled model resets, 13,840 host-only resets, 32,253 read-only
+write violations and 40,481 reset-suppressed writes. All 253 module identities
+and original arguments survive; 240 module bodies remain byte-identical. Each
+of the thirteen expanded response wrappers preserves its original drivers,
+adds exactly one observation port/driver and matches the native baseline.
+All 170 copied ports, 179 wrapper connections and archive retargeting match.
+Each expanded replay passes twelve atomic rejection cases, including duplicate
+response hierarchy uses, a missing hierarchy module and observation collision.
+
+Native build, both replays and focused Print-binding/statistics CTests pass
+(9.11 seconds). The statistics unit test covers 32,768 cycles and 59 atomic
+rejection cases. Fresh native compilation reaches simulator RTL emission.
+Compiler, replay, CTest and comparison stderr are empty; the build reports two
+Ninja log-recovery warnings. FireSim manager verification remains harness-owned.
+
+Next smallest step: attach the allocated `FASEDHistograms` bank to this
+statistics boundary using the exposed pending read/AW counts. Global MCR fanout,
+host-memory attachment, Print-enabled production CLI/driver integration, general
+FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime baseline remain
+incomplete. This increment does not complete the port.

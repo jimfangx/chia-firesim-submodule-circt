@@ -426,6 +426,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDLatencyRegisters.cpp
     lib/Transforms/FASEDFunctionalModelRegister.cpp
     lib/Transforms/FASEDResponseErrors.cpp
+    lib/Transforms/FASEDStatistics.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp

@@ -27,6 +27,7 @@
 #include "goldengate/FASEDLatencyRegisters.h"
 #include "goldengate/FASEDFunctionalModelRegister.h"
 #include "goldengate/FASEDResponseErrors.h"
+#include "goldengate/FASEDStatistics.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1112,4 +1113,37 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDResponseErrors(CircuitOp circ
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
   return success();
+}
+
+// Requires: completed response-error boundary, expanded Rocket/Print allocation,
+// retained archive, free allocated statistics bank and unique response hierarchy.
+// Annotations consumed/produced: none; native attachment retargets the archive.
+// Mutates: append accepted-R observation to 13 modules and 12 sim instances;
+// attach four read-only counters and export their MCR fragment in a new wrapper.
+// Analyses required: native FASED response/request boundaries and MMIO allocation.
+// Preserves: existing module identities, original port arguments/types/order,
+// constructor keys and banks. Hierarchy analyses must be recomputed afterward.
+// Output: AW/AR transactions and all W/R beats count only on targetFire; model
+// reset is gated by targetFire. Validate and verify on a clone before changing
+// existing modules. Native attachment preflights every failure before mutation;
+// replaying that verified attachment preserves identities in the live circuit.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDStatistics(CircuitOp circuit,
+                                                            std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDResponseErrorsWrapper")
+    return reject("Rocket Print FASED statistics require the completed response-error boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  FModuleOp bank;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDStatistics") bank = m;
+  if (!bank) return reject("Rocket Print FASED statistics require the allocated statistics bank");
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp stagedBank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == bank.getName()) stagedBank = m;
+  if (failed(attachFASEDStatistics(*staged, stagedBank, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED statistics produced invalid FIRRTL IR");
+  // Moving only the new wrapper would discard the staged R-observation wiring.
+  // Repeat the fully preflighted mutation to retain original module/port handles.
+  return attachFASEDStatistics(circuit, bank, error);
 }
