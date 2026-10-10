@@ -415,6 +415,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDResponseReleaser.cpp
     lib/Transforms/FASEDTimingCycle.cpp
     lib/Transforms/FASEDReadLatency.cpp
+    lib/Transforms/FASEDWriteLatency.cpp
     lib/Transforms/FASEDIngressDeadlock.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp

@@ -2314,3 +2314,65 @@ through CIRCT RTL emission pass; compiler/replay/comparison stderr is empty.
 This increment closes the expanded read-completion deadline boundary. Write
 latency composition and attachment of the existing latency MMIO bank remain
 subsequent steps; general FAME1/FAME5 and multi-clock support remain incomplete.
+
+### Expanded Print/Rocket FASED write latency (iteration 87)
+
+`mapPrintBridgeRocketFASEDWriteLatency` composes `GGFASEDWriteLatency10` and
+`GGFASEDWriteLatencyWrapper` after the expanded `GGFASEDReadLatencyWrapper`.
+The native FIRRTL memory holds ten 64-bit write deadlines and four-bit IDs.
+It consumes `fased_write_release_cycle` and `fased_next_write`, takes the
+completion pulse/oldest AW ID through `fased_write_completion`, exposes
+capacity through `fased_write_latency_ready`, and sends due response metadata
+to the existing releaser. Capacity is diagnostic; it does not gate the
+completion pulse. All remaining ports retain their types and directions.
+The original module operations, Print banks, FASED allocation and latency
+register bank survive the atomic composition. Malformed allocation, unsupported
+constructor widths, missing archive, wrong top, collisions and repeat
+composition fail without changing the circuit.
+
+The semantic oracle is Scala `models/dram/LatencyBandwidthPipe.scala:61–74`,
+with `Queue_15`, `LatencyPipe` and `FASEDMemoryTimingModel` in the immutable
+U250 fixture's `design/FireSim-generated.sv`. The queue flows through when
+empty and its unsigned deadline is due. A full queue cannot accept a
+replacement on the same edge that dequeues its head. Pointer/reset and RAM
+writes advance only on target fire. Enabled reset clears queue state without
+clearing RAM or suppressing a simultaneous RAM write. The queue diagnoses
+overflow on an enabled, non-reset edge. SFC enqueues `newWReq` with the oldest
+AW queue ID; generating that completion pulse and ID remains a later stage.
+
+Evidence lives under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration87-print-rocket-fased-write-latency/`. Native replay modes are:
+
+```text
+goldengate-print-binding-test --fased-write-latency-boundary INPUT_READ_LATENCY_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-write-latency-boundary-reverse INPUT_REVERSE_READ_LATENCY_MLIR OUTPUT_PREFIX
+```
+
+`PrintRocketFASEDWriteLatencyCompare.py EVIDENCE GOLDEN_SV ITERATION86_EVIDENCE`
+pins the SFC queue/deadline/gated-clock equations and interprets actual native
+SSA, including memory writes and assertion enable/predicate. It checks all ten
+dequeue pointers, eleven occupancy levels, reset/fire/valid/ready combinations,
+unsigned deadline boundaries and 30,000 continuous randomized transitions.
+Per constructor order, 47,600 transitions, 174 wrapper connections, all 239
+preceding module definitions and the complete retargeted annotation archive
+pass. Coverage includes 203 flow-throughs, 1,646 full-queue pops, 18,822 stalls,
+4,503 stalled resets, 1,990 reset writes, 1,172 pointer wraps, 8,958 overflow
+assertion cases and 6,516 equal deadlines. The helper exactly matches fresh
+native compilation's `post-fame-fased-write-latency.mlir` from immutable SFC
+`.sfc.fir`/`.anno.json`; the fixture contains no Print host.
+
+The native build, both expanded replays with nine atomic rejection cases each,
+focused Print binding/write-latency CTests and fresh SFC handoff compilation
+through CIRCT RTL emission pass. The standalone write-latency CTest interprets
+30,093 transitions, 16 wrapper mappings, five target transfers and 21 atomic
+rejections. Compiler, replay and final comparison stderr logs are empty.
+
+This closes the expanded write deadline queue boundary. Next smallest step:
+compose native `FASEDTimingAWQueue` to derive the oldest AW ID, comparing its
+ten-entry flow-through queue and completion binding with SFC `Queue_14` and
+`LatencyPipe`; AW/W pairing counters follow that stage. Latency MMIO attachment,
+remaining timing policy, host-memory attachment and Print-enabled production
+CLI/driver integration remain incomplete. General FAME1/FAME5 and multi-clock
+support and the UART-bearing SFC runtime baseline remain outstanding. Manager
+verification stays owned by the harness; this is not overall port completion.
