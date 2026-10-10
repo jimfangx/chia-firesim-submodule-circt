@@ -240,4 +240,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDResponseErrors(
 /// and all original port arguments, retarget the archive, export four MCR words.
 mlir::LogicalResult mapPrintBridgeRocketFASEDStatistics(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach allocated occupancy histograms after statistics. Atomic; observe
+/// pre-edge pending reads/AW, preserve prior module/port/argument identities,
+/// transfer the archive and expose ten read-only MCR words, including zero bins.
+mlir::LogicalResult mapPrintBridgeRocketFASEDHistograms(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

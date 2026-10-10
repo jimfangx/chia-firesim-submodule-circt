@@ -2108,6 +2108,87 @@ void rocketFASEDResponseErrors(Fixture &f, StringRef output, bool reverse, unsig
   }
 }
 
+void rocketFASEDHistograms(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto bank = named(f.circuit, "GGFASEDHistograms");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto raw = f.circuit->getAttr("rawAnnotations");
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<PortInfo>> priorPorts;
+  SmallVector<SmallVector<Value>> priorArguments;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+    priorArguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+  }
+  for (unsigned bad = 0; bad < 9; ++bad) {
+    FModuleOp collision; InstanceOp extra;
+    if (bad == 0) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(
+          "GGFASEDHistogramsWrapper"), original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 1 || bad == 2) {
+      b.setInsertionPointToEnd(original.getBodyBlock());
+      extra = b.create<InstanceOp>(f.circuit.getLoc(), bad == 1 ? original : bank, "duplicate");
+    }
+    if (bad == 3 || bad == 4) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 3) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 5) {
+      NamedAttrList key(constructor);
+      NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+      edge.set("maxFlight", b.getI64IntegerAttr(9)); key.set("axi4Edge", edge.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    if (bad == 7) f.circuit->removeAttr("rawAnnotations");
+    if (bad == 8) bank.setName("MissingHistogramBank");
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDHistograms(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED histogram rejection " + std::to_string(bad) + " changed IR or accepted invalid input: " + error); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    bank.setName("GGFASEDHistograms");
+    if (extra) extra.erase();
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDHistograms(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDHistogramsWrapper", "FASED histogram top differs");
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == priorPorts[j].size(),
+        "FASED histogram composition changed an existing module identity/port count");
+    for (auto [i, p] : llvm::enumerate(priorPorts[j]))
+      require(m.getPortName(i) == p.name && m.getPortType(i) == p.type &&
+          m.getPortDirection(i) == p.direction && m.getArguments()[i] == priorArguments[j][i],
+          "FASED histogram composition changed an existing port or argument identity");
+  }
+  unsigned copied = 0;
+  for (auto p : original.getPorts()) {
+    require(top.getPortName(copied) == p.name && top.getPortType(copied) == p.type &&
+        top.getPortDirection(copied) == p.direction, "FASED histogram composition changed a retained port"); ++copied;
+  }
+  require(top.getNumPorts() == copied + 1 && top.getPortName(copied) == "fased_histograms_mcr" &&
+      top.getPortType(copied) == bank.getPortType(6) && top.getPortDirection(copied) == Direction::Out &&
+      bool(child(top, bank)) && bool(child(top, original)), "FASED histogram bank attachment differs");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDHistograms(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED histogram composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-histograms-reverse.mlir" : ".rocket-fased-histograms.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED histogram boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDStatistics(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -2997,6 +3078,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDFunctionalModelRegister(f, output, reverse, rejected);
       rocketFASEDResponseErrors(f, output, reverse, rejected);
       rocketFASEDStatistics(f, output, reverse, rejected);
+      rocketFASEDHistograms(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -3334,6 +3416,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--fased-histograms-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED statistics boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketFASEDHistograms(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded FASED histogram boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--fased-statistics-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded FASED response-error boundary");

@@ -28,6 +28,7 @@
 #include "goldengate/FASEDFunctionalModelRegister.h"
 #include "goldengate/FASEDResponseErrors.h"
 #include "goldengate/FASEDStatistics.h"
+#include "goldengate/FASEDHistograms.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1146,4 +1147,40 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDStatistics(CircuitOp circuit,
   // Moving only the new wrapper would discard the staged R-observation wiring.
   // Repeat the fully preflighted mutation to retain original module/port handles.
   return attachFASEDStatistics(circuit, bank, error);
+}
+
+// Requires: completed statistics boundary, expanded Rocket/Print allocation,
+// retained archive, unused allocated histogram bank and exact pending counts.
+// Annotations consumed/produced: none; explicitly transfer copied top targets
+// and retarget the retained archive using the native attachment contract.
+// Mutates: append a wrapper sampling pending reads and AW before the target edge
+// and exporting ten read-only MCR words. Existing modules/banks are unchanged.
+// Analyses required: Rocket control allocation and native histogram boundary.
+// Preserves: prior module/port/argument identities, constructors and drivers;
+// hierarchy analyses must be recomputed after wrapper attachment.
+// Output: first bound 0,2,4,8 increments on targetFire; fifth bins remain zero.
+// Model reset requires targetFire; host reset only masks read-only assertions.
+// Stage and verify before committing, so rejection leaves live IR unchanged.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDHistograms(CircuitOp circuit,
+                                                            std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDStatisticsWrapper")
+    return reject("Rocket Print FASED histograms require the completed statistics boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDHistograms") bank = m;
+  if (!bank) return reject("Rocket Print FASED histograms require the allocated histogram bank");
+  if (failed(attachFASEDHistograms(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED histograms produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
 }

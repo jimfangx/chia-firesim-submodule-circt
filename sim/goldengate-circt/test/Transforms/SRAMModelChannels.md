@@ -3082,3 +3082,70 @@ statistics boundary using the exposed pending read/AW counts. Global MCR fanout,
 host-memory attachment, Print-enabled production CLI/driver integration, general
 FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime baseline remain
 incomplete. This increment does not complete the port.
+
+### Iteration 98: expanded Print/Rocket occupancy histograms
+
+`mapPrintBridgeRocketFASEDHistograms` attaches the allocated native histogram
+bank after the expanded statistics boundary. It requires the recorded Rocket
+allocation, ten-flight constructor, retained annotation archive, unused bank
+and exact clock/reset/fire and pending-count observation types. It stages the
+native attachment and verifies the clone before moving only the new wrapper
+into the live circuit. No existing module changes; prior module, port and
+argument identities survive. Copied top targets explicitly transfer in the
+archive. Hierarchy analyses must be recomputed after attachment.
+
+The wrapper samples pre-edge `fased_pending_reads.value` and
+`fased_pending_writes.awValue`, not pending W or either full flag. The oracle
+`models/dram/TimingModel.scala:169-192` increments only the first matching bound
+in 0, 2, 4, 8. Scala's `bins.zip(maximums)` leaves each fifth bin zero; preserve
+that executable behavior even for counts above eight. Eight UInt<32> counters
+wrap and reset synchronously only when model reset and targetFire coincide.
+Host reset suppresses all ten read-only assertions and does not reset counters.
+The ten MCR lanes retain global words 4-13, bytes 16-52; read-valid and
+write-ready are one and writes assert independently of strobe. Clock/reset
+qualification follows `FASEDMemoryTimingModel.scala:357-376`; MMIO permissions
+follow `widgets/Lib.scala:281-298`. The existing `MidasTransforms.scala` pass
+order and `FAMETransform.scala` clock/ready-valid semantics were inspected.
+
+The exact immutable comparison artifact is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `LatencyPipe`, `FASEDMemoryTimingModel`
+and `MCRFile_5`. Counter widths, first-fit increment guards, reset priority,
+targetFire clock-gate enable, readback, constant fifth lanes and all ten
+read-only assertions match. The fixture has no Print host; Print checks prove
+native preservation rather than SFC Print parity. The allocated bank and seven
+observation/control connections also match fresh ingestion of the immutable
+compiler fixture's `.sfc.fir` and `.anno.json` at
+`candidate/post-fame-fased-histograms.mlir`.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration98-print-rocket-fased-histograms/`. Replay and compare:
+
+```text
+goldengate-print-binding-test --fased-histograms-boundary INPUT_STATISTICS OUTPUT_PREFIX
+goldengate-print-binding-test --fased-histograms-boundary-reverse INPUT_STATISTICS_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketFASEDHistogramsCompare.py EVIDENCE SFC_SV ITERATION97_EVIDENCE
+```
+
+Both constructor orders pass 28,192 transitions: 8,192 exhaustive occupancy,
+reset, target-fire and counter-edge cases plus 20,000 randomized cycles. Each
+includes 1,169 wraps, 9,467 above-last-bound samples, 2,388 stalled model resets,
+11,713 host-only resets, 68,329 read-only write violations and 72,526
+reset-suppressed writes. All 254 prior module bodies remain byte-identical;
+all 171 copied ports, 178 wrapper connections and archive retargeting match.
+Each replay passes ten atomic rejection cases, including missing/used bank,
+used top, malformed allocation, constructor mismatch and repeat attachment.
+
+Native build, both replays and focused Print-binding/histogram CTests pass
+(16.05 seconds). The histogram unit test covers 32,768 cycles and 50 atomic
+rejections. Fresh native compilation reaches simulator RTL emission. Compiler,
+replay, CTest and completed comparison stderr are empty; the build reports two
+Ninja log-recovery warnings. FireSim manager verification remains harness-owned.
+
+Next smallest step: assemble these six exported FASED fragments into the native
+21-word MMIO bank, then attach its MCRFile to the expanded control fabric.
+Host-memory attachment, Print-enabled production CLI/driver integration,
+general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
+baseline remain incomplete. This increment does not complete the port.
