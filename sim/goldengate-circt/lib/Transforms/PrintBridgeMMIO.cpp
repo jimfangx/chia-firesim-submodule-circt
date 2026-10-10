@@ -32,6 +32,7 @@
 #include "goldengate/FASEDIngressDeadlock.h"
 #include "goldengate/FASEDReadBuffer.h"
 #include "goldengate/FASEDReadScheduler.h"
+#include "goldengate/FASEDWriteEgress.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -717,6 +718,30 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDReadScheduler(CircuitOp circu
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addFASEDReadScheduler(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED read scheduler produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Compose WriteEgress acknowledgment state on the expanded Print/Rocket boundary.
+// Host B responses always accept; retry samples old per-ID acknowledgment
+// counters even without token fire, and same-ID enqueue/retirement cancel.
+// Publish new verified modules together, retaining existing module operations.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDWriteEgress(CircuitOp circuit,
+                                                              std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDReadSchedulerWrapper")
+    return reject("Rocket Print FASED write egress requires the completed read scheduler boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDWriteEgress(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED write egress produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

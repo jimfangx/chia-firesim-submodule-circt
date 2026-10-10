@@ -169,4 +169,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDReadBuffer(
 // Atomic; request/response payload and write egress await timing-model lowering.
 mlir::LogicalResult mapPrintBridgeRocketFASEDReadScheduler(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Consume flat host B responses and write readiness through native WriteEgress
+// acknowledgment state, retaining expanded Print banks and read scheduling.
+// Atomic; timing-model write requests/responses remain explicit boundaries.
+mlir::LogicalResult mapPrintBridgeRocketFASEDWriteEgress(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

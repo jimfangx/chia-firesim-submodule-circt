@@ -2085,3 +2085,65 @@ has Print disabled and the UART-bearing SFC runtime baseline remains pending.
 Next smallest step: compose native write egress against SFC WriteEgress,
 then connect read/write release to the timing model. Manager gates remain
 owned by the verification harness; overall port completion is not established.
+
+### Expanded Print/Rocket FASED write acknowledgment scheduling (iteration 83)
+
+`mapPrintBridgeRocketFASEDWriteEgress` consumes the expanded read-scheduler
+boundary. It revalidates the live Print registry and allocated MMIO regions,
+stages native `addFASEDWriteEgress` on a clone, verifies the resulting CIRCT
+FIRRTL IR, then publishes only the new helper/wrapper and retargeted circuit
+annotations. All preceding module operations remain intact. The wrapper
+consumes flat host B response acceptance and write readiness, connects its
+response hValid to token readiness, and preserves read scheduling and host R.
+Write request/response ports await timing-model response release.
+
+The recorded idReuse=1 profile has sixteen one-bit wrapping acknowledgment
+counters. Host B always accepts and retains only its ID. `haveAck` samples old
+counter state on a request start or retry, including retries without target
+fire. Retry selects the stored ID even when a new request starts simultaneously.
+Same-ID enqueue and retirement cancel; distinct IDs update independently.
+A new request wins over retirement. Qualified egress reset clears valid,
+haveAck and counters; the unreset request ID still captures during reset/start.
+
+The complete expanded fixture calls this stage in both Print constructor
+orders. Saved iteration-82 read-scheduler boundaries can also be replayed with
+`--fased-write-egress-boundary` and
+`--fased-write-egress-boundary-reverse`. Each replay checks nine atomic
+rejections: helper/wrapper collisions, stale/malformed allocation, unsupported
+profile, wrong top, missing annotation archive and repeated composition.
+
+`PrintRocketFASEDWriteEgressCompare.py` uses immutable U250
+`design/FireSim-generated.sv` modules `WriteEgress` and `FASEDMemoryTimingModel`.
+It pins the SFC equations, all counter selectors and updates, sequential
+priority and host wiring, then interprets actual native SSA for 65,536
+flag/ID/counter-mask cases per constructor order. Complementary masks exercise
+both values of every counter. The comparison checks qualified wrapper wiring,
+all preceding module definitions and the complete retargeted annotation
+archive. The helper must match fresh native compilation's
+`post-fame-fased-write-egress.mlir` from immutable `.sfc.fir`/`.anno.json`.
+
+Evidence is in mutable `iteration83-print-rocket-fased-write-egress/`.
+Both expanded replays and the structured SFC comparison pass with empty stderr.
+The comparison retains all 231 preceding modules and the complete annotation
+archive in each order, checking thirteen actual wrapper connections. Each order
+covers 128 same-ID cancellations, 8,192 host-only retries, 2,048 simultaneous
+starts/retirements, 16,320 counter wraps, 896 old-counter samples on concurrent
+enqueue and 8,192 reset/start coincidences. Fresh native compiler ingestion,
+baseline host assembly and RTL emission pass with empty stderr. Both focused
+CTest targets pass.
+
+Run the focused Print binding and write-egress CTests, replay both expanded
+boundaries, and run the comparison with the immutable SV path and the
+iteration-82 evidence directory. The existing native write-egress unit test
+also interprets 42,768 transitions, including 10,000 continuous state steps,
+64 wrapper mapping cases, five annotation transfers and 21 atomic rejections.
+
+The expanded Print-enabled assembly remains partial and is exercised through
+the compiler library and boundary fixture. Timing-model response release,
+timing policy, slave-1 MMIO, host-memory attachment and Print-enabled
+production CLI/driver integration remain to compose. The golden reference
+has Print disabled and the UART-bearing SFC runtime baseline remains pending.
+Next smallest step: compose native `FASEDResponseReleaser` to consume both
+egress request/response boundaries and compare accepted-last-beat retirement
+and same-cycle replacement with SFC AXI4Releaser. Manager gates remain owned
+by the verification harness; this does not establish overall port completion.
