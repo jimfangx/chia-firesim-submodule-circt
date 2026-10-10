@@ -2874,3 +2874,67 @@ setting at global MMIO word 18. Decoded MCR fanout, remaining FASED banks,
 host-memory attachment, Print-enabled production CLI/driver integration,
 general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
 baseline remain incomplete. This increment does not complete the port.
+
+## Iteration 95: expanded Print/Rocket FASED functional-model register
+
+`mapPrintBridgeRocketFASEDFunctionalModelRegister` attaches the already
+allocated `GGFASEDFunctionalModelRegister` after latency registers. It
+validates the expanded Rocket/Print control allocation, stages native
+attachment and verifies FIRRTL before moving only the new wrapper into the
+original circuit. Existing module/port identities and the bank definition
+survive. The annotation archive is retargeted explicitly; the consumed
+relaxation-input target remains on the inner module. The one-bit ingress
+relaxation input is replaced by a decoded one-word MCR output.
+
+The Scala oracle is `FuncModelProgrammableRegs` in
+`models/dram/FASEDMemoryTimingModel.scala:208`, `Widget.attachIO/genAndAttachReg`
+and `MCRIO.bindReg` in `widgets/Lib.scala:281`. The 32-bit MMIO register resets
+to zero on host reset and updates on decoded write-valid, independently of
+strobes and target advancement. Readback retains all 32 bits; only bit zero
+drives ingress relaxation. `MidasTransforms.scala` ordering and
+`FAMETransform.scala` readiness/validity/target-clock contracts were inspected.
+
+The exact immutable comparison artifact is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, module `FASEDMemoryTimingModel`, specifically
+`relaxFunctionalModel`, MCR word 18 (byte offset 72), reset/write priority,
+full-width readback and bit-zero ingress connection. The fixture has no Print
+host; Print-specific checks establish native preservation rather than an
+SFC Print-enabled differential comparison.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration95-print-rocket-fased-functional-model-register/`. Replay and compare:
+
+```text
+goldengate-print-binding-test --fased-functional-model-register-boundary INPUT_LATENCY_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-functional-model-register-boundary-reverse INPUT_REVERSE_LATENCY_MLIR OUTPUT_PREFIX
+PrintRocketFASEDFunctionalModelRegisterCompare.py EVIDENCE GOLDEN_SV ITERATION94_EVIDENCE
+```
+
+Both constructor orders pass 28,192 transitions each: 8,192 exhaustive edge
+cases and 20,000 continuous randomized cycles. Each covers 13,986 writes,
+924 zero-strobe writes, 2,380 writes during reset, 12,962 writes carrying
+upper bits, 6,971 writes during target stalls and 12,317 observations where
+upper bits are set but relaxation stays off. All 251 prior module bodies
+remain byte-identical and native identities/ports remain intact. All 169
+wrapper ports, 172 connections and the complete retargeted annotation archive
+match. The reused bank and FASED wiring also match fresh native SFC ingestion's
+`post-fame-fased-functional-model-register.mlir`.
+
+Native build, both expanded replays (nine atomic rejections each), and focused
+Print-binding/functional-model-register CTests pass (6.55 seconds). The
+standalone functional-model register test covers 32,768 cycles,
+split/combined mapping equivalence, early allocation and 33 atomic rejection
+cases. Fresh native compilation of the immutable `.sfc.fir`/`.anno.json`
+reaches simulator RTL emission. Compiler, replay, CTest and comparison stderr
+are empty; the build reports a Ninja log-recovery warning. Manager verification
+remains harness-owned.
+
+Next smallest step: attach the allocated `FASEDResponseErrors` bank and close
+its response-handshake observations in the expanded boundary. Decoded MCR
+fanout, remaining FASED banks, host-memory attachment, Print-enabled production
+CLI/driver integration, general FAME1/FAME5, multi-clock support and the
+UART-bearing SFC runtime baseline remain incomplete. This increment does not
+complete the port.

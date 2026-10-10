@@ -25,6 +25,7 @@
 #include "goldengate/FASEDTokenEngine.h"
 #include "goldengate/FASEDRequestLimits.h"
 #include "goldengate/FASEDLatencyRegisters.h"
+#include "goldengate/FASEDFunctionalModelRegister.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1036,6 +1037,38 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDLatencyRegisters(CircuitOp ci
   if (!bank) return reject("Rocket Print FASED latency registers require the allocated latency-register bank");
   if (failed(attachFASEDLatencyRegisters(*staged, bank, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED latency registers produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires: completed latency-register boundary, valid expanded Rocket/Print MMIO
+// allocation, retained annotations and a free, allocated functional-model bank.
+// Annotations consumed/produced: none; explicitly retarget the retained archive.
+// Mutates: append a wrapper consuming ingress relaxation and exporting decoded MCR.
+// Analyses required: Rocket control allocation; no cached analysis is used.
+// Preserves: prior module/port identities, bank definitions and constructor keys.
+// Output: host-clock/reset bank drives full-width MMIO readback and bit-zero ingress relaxation;
+// failed attachment is atomic and retained ports keep their type/direction/order.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDFunctionalModelRegister(CircuitOp circuit,
+                                                               std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDLatencyRegistersWrapper")
+    return reject("Rocket Print FASED functional-model register requires the completed latency-register boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDFunctionalModelRegister") bank = m;
+  if (!bank) return reject("Rocket Print FASED functional-model register requires the allocated functional-model register bank");
+  if (failed(attachFASEDFunctionalModelRegister(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED functional-model register produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

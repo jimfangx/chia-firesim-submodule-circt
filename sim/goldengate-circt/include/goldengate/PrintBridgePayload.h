@@ -225,4 +225,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDRequestLimits(
 /// one MCR output and wrapper, retargets copied ports, and preserves prior modules.
 mlir::LogicalResult mapPrintBridgeRocketFASEDLatencyRegisters(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach the allocated functional-model register after latency registers.
+/// Atomic; consume ingress relaxation, retarget copied ports and the archive,
+/// and preserve prior modules and the expanded Rocket/Print allocation.
+mlir::LogicalResult mapPrintBridgeRocketFASEDFunctionalModelRegister(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
