@@ -35,6 +35,7 @@
 #include "goldengate/FASEDWriteEgress.h"
 #include "goldengate/FASEDResponseReleaser.h"
 #include "goldengate/FASEDTimingCycle.h"
+#include "goldengate/FASEDReadLatency.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -791,6 +792,28 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDTimingCycle(CircuitOp circuit
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addFASEDTimingCycle(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED timing cycle produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// LatencyPipe accepts AR independently of capacity and diagnoses overflow.
+// Queue state/RAM writes use targetFire; reset clears pointers, not memory.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDReadLatency(CircuitOp circuit,
+                                                             std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDTimingCycleWrapper")
+    return reject("Rocket Print FASED read latency requires the completed model-cycle boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDReadLatency(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED read latency produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

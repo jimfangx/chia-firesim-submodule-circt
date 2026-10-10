@@ -22,12 +22,17 @@ def expressions(text, name):
     for line in lines[1:]:
         if m := re.search(r'(%\w+) = firrtl.constant (\d+)', line):
             values[m[1]] = ('const', int(m[2]))
+        if ' = firrtl.mem ' in line:
+            for v in re.findall(r'%\w+', line.split(' = ', 1)[0]):
+                values[v] = ('leaf', v[1:])
         if m := re.search(r'(%\w+) = firrtl.regreset ', line):
             values[m[1]] = ('leaf', m[1][1:])
         if m := re.search(r'(%\w+) = firrtl.subfield (%\w+)\[(\w+)\]', line):
             values[m[1]] = ('leaf', values[m[2]][1] + '.' + m[3])
-        if m := re.search(r'(%\w+) = firrtl.(and|or|xor|lt|geq|eq|add|sub) (%\w+), (%\w+)', line):
+        if m := re.search(r'(%\w+) = firrtl.(and|or|xor|lt|leq|geq|eq|add|sub) (%\w+), (%\w+)', line):
             values[m[1]] = (m[2], values[m[3]], values[m[4]])
+        if m := re.search(r'(%\w+) = firrtl.cat (%\w+), (%\w+) : \(!firrtl.uint<\d+>, !firrtl.uint<(\d+)>\)', line):
+            values[m[1]] = ('cat', values[m[2]], values[m[3]], int(m[4]))
         if m := re.search(r'(%\w+) = firrtl.pad (%\w+), (\d+)', line):
             values[m[1]] = values[m[2]]  # UInt padding is zero extension.
         if m := re.search(r'(%\w+) = firrtl.not (%\w+)', line):
@@ -57,7 +62,9 @@ def evaluate(tree, inputs, nets):
     if op == 'and': return a and b
     if op == 'or': return a or b
     if op == 'xor': return a ^ b
+    if op == 'cat': return (a << tree[3]) | b
     if op == 'lt': return a < b
+    if op == 'leq': return a <= b
     if op == 'geq': return a >= b
     if op == 'eq': return a == b
     if op == 'add': return a + b

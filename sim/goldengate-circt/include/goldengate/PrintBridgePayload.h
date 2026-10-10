@@ -184,4 +184,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDResponseReleaser(
 // Latency register attachment and completion queues remain subsequent stages.
 mlir::LogicalResult mapPrintBridgeRocketFASEDTimingCycle(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Consume read completion metadata through the ten-entry flow-through latency
+// queue. Atomic; preserve expanded Print banks and model-cycle boundaries.
+// Write completion and latency register attachment remain subsequent stages.
+mlir::LogicalResult mapPrintBridgeRocketFASEDReadLatency(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

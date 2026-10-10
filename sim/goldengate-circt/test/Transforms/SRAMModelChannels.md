@@ -2264,3 +2264,53 @@ the ten-entry completion queue, empty flow-through, unsigned deadline test,
 target-qualified reset/state and AR acceptance with SFC LatencyPipe/Queue_16.
 Manager gates remain owned by the verification harness; this does not establish
 overall port completion.
+
+### Expanded Print/Rocket FASED read latency (iteration 86)
+
+`mapPrintBridgeRocketFASEDReadLatency` composes `GGFASEDReadLatency10` and
+`GGFASEDReadLatencyWrapper` after the expanded `GGFASEDTimingCycleWrapper`.
+The native FIRRTL memory holds ten read deadlines and ID/length metadata.
+It consumes `fased_read_release_cycle` and `fased_next_read`, connects accepted
+AR requests to the queue, and connects released metadata to the existing
+response releaser. All remaining ports retain their types and directions.
+The original module operations, Print banks, and FASED allocation survive the
+atomic composition. Invalid allocation, constructor widths, archive, top name,
+module collisions, and repeat composition fail without changing the circuit.
+
+The semantic oracle is Scala `models/dram/LatencyBandwidthPipe.scala:77–88`,
+with `Queue_16`, `LatencyPipe`, and `FASEDMemoryTimingModel` in the immutable
+U250 fixture's `design/FireSim-generated.sv`. The queue flows through when
+empty and its unsigned 64-bit deadline is due. A full queue cannot accept a
+replacement on the same edge that pops its head. AR acceptance remains
+independent of queue capacity; the existing overflow assertion diagnoses a
+missing upstream limit. Pointer/reset and RAM writes advance only on target
+fire. Enabled reset clears the pointers/full bit but does not clear RAM or
+suppress a simultaneous RAM write. The native memory preserves Scala's
+8-bit length field, which the SFC reference optimizes out of its read queue.
+
+Evidence lives under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration86-print-rocket-fased-read-latency/`. Native replay modes are:
+
+```text
+goldengate-print-binding-test --fased-read-latency-boundary INPUT_TIMING_CYCLE_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-read-latency-boundary-reverse INPUT_REVERSE_TIMING_CYCLE_MLIR OUTPUT_PREFIX
+```
+
+`PrintRocketFASEDReadLatencyCompare.py EVIDENCE GOLDEN_SV ITERATION85_EVIDENCE`
+pins the SFC queue/deadline/gated-clock equations, checks actual CIRCT SSA and
+memory geometry, and verifies complete prior module and annotation retention.
+Both constructor orders cover all ten dequeue pointers, all eleven occupancy
+levels, reset/fire/valid/ready combinations, and unsigned deadline boundaries,
+plus 30,000 continuous randomized transitions per order: 47,600 transitions,
+176 wrapper connections, all 237 existing modules, and the complete annotation
+archive pass per order. Both expanded replays reject nine malformed/repeated
+compositions atomically. The standalone `goldengate-fased-read-latency` CTest
+separately interprets 30,093 native FIRRTL memory/register transitions, including
+63 reset writes, 1,399 full-queue pops, 99 stalled resets, and 860 pointer wraps.
+The native build, both relevant CTests, and fresh immutable SFC handoff compile
+through CIRCT RTL emission pass; compiler/replay/comparison stderr is empty.
+
+This increment closes the expanded read-completion deadline boundary. Write
+latency composition and attachment of the existing latency MMIO bank remain
+subsequent steps; general FAME1/FAME5 and multi-clock support remain incomplete.
