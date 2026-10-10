@@ -203,4 +203,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDTimingAWQueue(
 // explicit inputs until timing admission and latency MMIO attachment.
 mlir::LogicalResult mapPrintBridgeRocketFASEDWritePairing(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Close target B retirement feedback through the response-releaser hierarchy.
+// Atomic; append internal observation ports while retaining existing modules,
+// expanded Print banks and allocation. Runtime maximum MMIO attachment follows.
+mlir::LogicalResult mapPrintBridgeRocketFASEDWriteRetirement(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

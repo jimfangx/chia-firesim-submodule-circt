@@ -2507,3 +2507,86 @@ attachment and Print-enabled production CLI/driver integration remain
 incomplete. General FAME1/FAME5, multi-clock support and the UART-bearing SFC
 runtime baseline remain outstanding. Manager verification stays owned by the
 harness; this is not overall port completion.
+
+### Expanded Print/Rocket target B retirement (iteration 90)
+
+`mapPrintBridgeRocketFASEDWriteRetirement` composes the existing native
+`bindFASEDWriteRetirement` after the expanded Print/Rocket AW/W pairing
+boundary. Both pending write counters now retire on the response releaser's
+accepted target B handshake. This is `b.ready && b.valid`, independent of
+reset and `targetFire`; counter state/reset still advance only on targetFire.
+Host B acknowledgements and egress request acceptance are distinct events.
+
+The composer verifies the expanded allocation and recorded 35/64/4-bit
+constructor profile, applies the native retirement pass to a cloned circuit,
+and verifies FIRRTL before applying the same pass to the unchanged original.
+The native pass has no rejection after mutation begins. This retains existing
+module operations and all prior port indices/types/directions while appending
+one internal observation output to each of six response wrappers. Five `sim`
+instances are rebuilt with the appended result and their existing metadata
+and users retained. The new outer wrapper consumes the external retirement
+input and closes feedback from the observed handshake. Print banks, stream
+bindings, the FASED latency bank and expanded MMIO allocation remain intact.
+
+The first expanded replay exposed a stale constructor-profile case: the
+native retirement pass validated the exact B port shape but accepted changed
+constructor widths. The composer now rejects stale width metadata before
+staging. Wrapper collisions, non-unique response instances, malformed
+allocation, incompatible widths, wrong top, absent annotation archive and
+repetition are atomic rejection cases.
+
+The executable oracle is `models/dram/TimingModel.scala:108–114,130` and
+`models/dram/Util.scala:347–354`, with the target-clock contract in
+`passes/fame/FAMETransform.scala` and `widgets/Lib.scala` counter semantics.
+The exact immutable RTL compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `LatencyPipe`, `AXI4Releaser`,
+`SatUpDownCounter_1` and `FASEDMemoryTimingModel`. The fixture contains no
+Print host; the comparison covers shared retirement/counter semantics and
+preservation of the expanded native Print boundary.
+
+Evidence lives under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration90-print-rocket-fased-write-retirement/`. Native replay modes are:
+
+```text
+goldengate-print-binding-test --fased-write-retirement-boundary INPUT_PAIRING_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-write-retirement-boundary-reverse INPUT_REVERSE_PAIRING_MLIR OUTPUT_PREFIX
+```
+
+`PrintRocketFASEDWriteRetirementCompare.py EVIDENCE GOLDEN_SV ITERATION89_EVIDENCE`
+pins SFC target B retirement, response release, counter arithmetic and gated
+clock equations. It checks all six native observation hops and the closed
+feedback, interprets the pending counter's FIRRTL SSA across all four-bit
+AW/W states and maximum values with reset/fire/AW/W/B-ready/B-valid flags,
+and checks continuous randomized state transitions. It compares every prior
+wrapper driver, unchanged module definitions, the complete retargeted
+annotation archive and fresh native SFC-ingestion retirement output.
+
+Result: both constructor orders pass 292,144 counter transitions each
+(262,144 exhaustive cases plus 30,000 randomized transitions), including
+73,046 accepted B observations, 35,208 observations during target stalls,
+73,177 valid/backpressure cases, 72,952 ready-without-valid cases, 1,261 empty
+retirements, 16,030 simultaneous increment/decrement cases, 65,758
+qualified resets and 65,657 stalled resets. All 245 existing module identities
+remain; 239 module definitions are unchanged. All 1,060 prior/observation
+drivers across the six wrappers, 170 outer-wrapper connections and the
+complete retargeted annotation archive pass. The pairing helper and observed
+retirement wiring match fresh native compilation's
+`post-fame-fased-write-retirement.mlir` from the immutable compiler fixture's
+`.sfc.fir` and `.anno.json`.
+
+Native build, both expanded replays with nine atomic rejections each, focused
+Print binding/write-retirement CTests and fresh SFC handoff compilation
+through CIRCT RTL emission pass. The standalone retirement CTest checks six
+observation hops, retained users/metadata/targets and 20 atomic rejections.
+Final compiler, replay and comparison stderr logs are empty.
+
+Next smallest step: compose native `FASEDWriteAdmission` into this expanded
+boundary and compare pending-full admission with SFC. Runtime maximum and
+latency MMIO attachment, remaining timing policy, host-memory attachment and
+Print-enabled production CLI/driver integration remain incomplete. General
+FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime baseline
+remain outstanding. Manager verification stays with the harness; this is
+not overall port completion.

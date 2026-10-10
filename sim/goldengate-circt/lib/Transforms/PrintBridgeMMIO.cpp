@@ -39,6 +39,7 @@
 #include "goldengate/FASEDWriteLatency.h"
 #include "goldengate/FASEDTimingAWQueue.h"
 #include "goldengate/FASEDWritePairing.h"
+#include "goldengate/FASEDWriteRetirement.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -890,4 +891,32 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDWritePairing(CircuitOp circui
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
   return success();
+}
+
+// Retire both pending counters on the target-visible B handshake. This stage
+// appends observation ports to existing modules, so validate the complete
+// mutation on a clone before applying it in place to preserve module identities.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDWriteRetirement(CircuitOp circuit,
+                                                                std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDWritePairingWrapper")
+    return reject("Rocket Print FASED write retirement requires the completed write-pairing boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  FModuleOp engine;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDTokenEngine") engine = m;
+  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr{};
+  auto widths = key ? key.getAs<DictionaryAttr>("axi4Widths") : DictionaryAttr{};
+  auto has = [&](StringRef name, int value) {
+    auto attr = widths ? widths.getAs<IntegerAttr>(name) : IntegerAttr{};
+    return attr && attr.getValue().getBitWidth() <= 64 && attr.getInt() == value;
+  };
+  if (!has("addrBits", 35) || !has("dataBits", 64) || !has("idBits", 4))
+    return reject("Rocket Print FASED write retirement requires the recorded 35/64/4-bit profile");
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(bindFASEDWriteRetirement(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED write retirement produced invalid FIRRTL IR");
+  // bindFASEDWriteRetirement checks every rejection condition before mutation.
+  // The unchanged original has just passed those checks and IR verification.
+  return bindFASEDWriteRetirement(circuit, error);
 }
