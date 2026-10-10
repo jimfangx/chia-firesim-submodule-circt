@@ -29,7 +29,7 @@ def expressions(text, name):
             values[m[1]] = ('leaf', m[1][1:])
         if m := re.search(r'(%\w+) = firrtl.subfield (%\w+)\[(\w+)\]', line):
             values[m[1]] = ('leaf', values[m[2]][1] + '.' + m[3])
-        if m := re.search(r'(%\w+) = firrtl.(and|or|xor|lt|leq|geq|eq|add|sub) (%\w+), (%\w+)', line):
+        if m := re.search(r'(%\w+) = firrtl.(and|or|xor|lt|gt|leq|geq|eq|add|sub) (%\w+), (%\w+)', line):
             values[m[1]] = (m[2], values[m[3]], values[m[4]])
         if m := re.search(r'(%\w+) = firrtl.cat (%\w+), (%\w+) : \(!firrtl.uint<\d+>, !firrtl.uint<(\d+)>\)', line):
             values[m[1]] = ('cat', values[m[2]], values[m[3]], int(m[4]))
@@ -64,6 +64,7 @@ def evaluate(tree, inputs, nets):
     if op == 'xor': return a ^ b
     if op == 'cat': return (a << tree[3]) | b
     if op == 'lt': return a < b
+    if op == 'gt': return a > b
     if op == 'leq': return a <= b
     if op == 'geq': return a >= b
     if op == 'eq': return a == b

@@ -2441,3 +2441,69 @@ remaining timing policy, host-memory attachment and Print-enabled production
 CLI/driver integration remain incomplete. General FAME1/FAME5, multi-clock
 support and the UART-bearing SFC runtime baseline remain outstanding. Manager
 verification stays owned by the harness; this is not overall port completion.
+
+### Expanded Print/Rocket FASED AW/W pairing (iteration 89)
+
+`mapPrintBridgeRocketFASEDWritePairing` composes `GGFASEDWritePairing` and
+`GGFASEDWritePairingWrapper` after the expanded timing AW queue boundary.
+Accepted timing-model AW handshakes and accepted final W beats increment
+separate four-bit saturating pending counters. Target B handshakes retire
+both counters. The no-LLC `newWReq` expression consumes the prior external
+`fased_write_pair_complete` port and drives the existing oldest-AW-ID queue
+and write-latency completion path. Counter state and reset advance only on
+target fire; the combinational completion expression remains ungated, as in
+SFC. Runtime maximum reductions retain pending state rather than clamping it.
+
+B retirement and maximum remain explicit `fased_target_b_fire` and
+`fased_write_max_reqs` inputs. `fased_pending_writes` exposes both values and
+full flags. All other ports, original module operations, expanded Print banks,
+FASED control allocation and latency register bank remain intact. Composition
+stages a clone and verifies FIRRTL before transferring new modules and
+retargeting the annotation archive. Collisions, malformed allocation,
+unsupported widths, missing archive, wrong top and repetition reject atomically.
+
+The executable oracle is Scala `models/dram/TimingModel.scala:108–114,227–254`
+and `widgets/Lib.scala:71–86`. The exact immutable RTL compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `SatUpDownCounter_1`, `LatencyPipe`
+and `FASEDMemoryTimingModel`. Both pending counters instantiate the same
+four-bit SFC counter module. The fixture contains no Print host.
+
+Evidence lives under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration89-print-rocket-fased-write-pairing/`. Native replay modes are:
+
+```text
+goldengate-print-binding-test --fased-write-pairing-boundary INPUT_TIMING_AW_QUEUE_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-write-pairing-boundary-reverse INPUT_REVERSE_TIMING_AW_QUEUE_MLIR OUTPUT_PREFIX
+```
+
+`PrintRocketFASEDWritePairingCompare.py EVIDENCE GOLDEN_SV ITERATION88_EVIDENCE`
+pins the SFC counter, pairing and gated-clock equations, then interprets native
+FIRRTL SSA. Per constructor order, all 16 AW states, 16 W states, 16 runtime
+maximum values and 32 reset/fire/handshake combinations plus 30,000 continuous
+randomized transitions pass: 161,072 transitions total. Coverage includes
+18,123 AW-ahead pairings, 17,916 W-ahead pairings, 40,263 simultaneous pairings,
+8,748 saturation cases, 3,343 empty retirements, 19,807 simultaneous increment
+and decrement cases, 88,310 states above a reduced maximum, 75,440 stalls,
+32,885 stalled resets and 32,982 target-qualified resets.
+
+Both orders retain all 243 preceding module definitions, all 176 wrapper
+connections match, and the complete retargeted annotation archive passes.
+The helper exactly matches fresh native compilation's
+`post-fame-fased-write-pairing.mlir` from the immutable compiler fixture's
+`.sfc.fir` and `.anno.json`. Native build, both expanded replays with nine
+atomic rejections each, focused Print binding/write-pairing CTests and fresh
+SFC handoff compilation through CIRCT RTL emission pass. The standalone
+pairing CTest checks 151,072 transitions, 256 wrapper mappings, five target
+transfers and 23 atomic rejections. Compiler, replay and comparison stderr
+logs are empty.
+
+Next smallest step: compose native `FASEDWriteRetirement` into this expanded
+boundary and compare its B-channel ready/valid attachment with SFC. Request
+admission, latency MMIO attachment, remaining timing policy, host-memory
+attachment and Print-enabled production CLI/driver integration remain
+incomplete. General FAME1/FAME5, multi-clock support and the UART-bearing SFC
+runtime baseline remain outstanding. Manager verification stays owned by the
+harness; this is not overall port completion.

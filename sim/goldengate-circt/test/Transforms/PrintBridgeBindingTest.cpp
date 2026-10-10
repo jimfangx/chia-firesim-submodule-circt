@@ -1615,6 +1615,93 @@ void rocketFASEDTimingAWQueue(Fixture &f, StringRef output, bool reverse, unsign
   }
 }
 
+void rocketFASEDWritePairing(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto raw = f.circuit->getAttr("rawAnnotations");
+  SmallVector<FModuleOp> existing;
+  for (auto m : f.circuit.getOps<FModuleOp>()) existing.push_back(m);
+  auto bank = named(f.circuit, "GGFASEDLatencyRegisters");
+  auto bankState = dump(bank.getOperation());
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    FModuleOp collision;
+    if (bad < 2) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(
+          bad == 0 ? "GGFASEDWritePairing" : "GGFASEDWritePairingWrapper"),
+          original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 2 || bad == 3) {
+      SmallVector<Attribute> rows(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));
+      if (bad == 2) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      rows[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+    }
+    if (bad == 4 || bad == 5) {
+      NamedAttrList key(constructor);
+      auto name = "axi4Widths";
+      NamedAttrList profile(cast<DictionaryAttr>(key.get(name)));
+      profile.set(bad == 4 ? "idBits" : "dataBits", b.getI64IntegerAttr(bad == 4 ? 5 : 32));
+      key.set(name, profile.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 6) f.circuit.setName("WrongTop");
+    if (bad == 7) f.circuit->removeAttr("rawAnnotations");
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDWritePairing(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED write pairing rejection " + std::to_string(bad) +
+        (succeeded(result) ? " accepted invalid input" : " changed IR or omitted diagnostic: " + error)); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDWritePairing(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDWritePairingWrapper" &&
+      decoder->getAttr("goldengate.controlRegions") == regions && dump(bank.getOperation()) == bankState,
+      "FASED write pairing changed bank or expanded allocation");
+  for (auto m : existing) require(named(f.circuit, m.getName()) == m,
+      "FASED write pairing replaced an existing module operation");
+  for (auto p : original.getPorts()) {
+    if (p.name.getValue() == "fased_write_pair_complete") continue;
+    auto index = port(top, p.name.getValue());
+    require(top.getPorts()[index].type == p.type &&
+        top.getPorts()[index].direction == p.direction,
+        "FASED write pairing changed a retained response boundary");
+  }
+  require(top.getNumPorts() == original.getNumPorts() + 2,
+      "FASED write pairing must exchange the pairing pulse for retirement/maximum/count ports");
+  auto retirement = port(top, "fased_target_b_fire");
+  auto maximum = port(top, "fased_write_max_reqs");
+  auto counts = port(top, "fased_pending_writes");
+  auto bit = UIntType::get(ctx, 1, false);
+  auto word = UIntType::get(ctx, 4, false);
+  auto pending = BundleType::get(ctx, {{b.getStringAttr("awValue"), false, word},
+      {b.getStringAttr("wValue"), false, word}, {b.getStringAttr("awFull"), false, bit},
+      {b.getStringAttr("wFull"), false, bit}});
+  require(top.getPorts()[retirement].direction == Direction::In &&
+      top.getPorts()[retirement].type == bit &&
+      top.getPorts()[maximum].direction == Direction::In && top.getPorts()[maximum].type == word &&
+      top.getPorts()[counts].direction == Direction::Out && top.getPorts()[counts].type == pending,
+      "FASED write pairing retirement/maximum/count boundary differs");
+  require(bool(child(top, named(f.circuit, "GGFASEDWritePairing"))),
+      "FASED write pairing helper is uninstantiated");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDWritePairing(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED write pairing composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-write-pairing-reverse.mlir" : ".rocket-fased-write-pairing.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED write pairing boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse,
                      unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
@@ -2174,6 +2261,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDReadLatency(f, output, reverse, rejected);
       rocketFASEDWriteLatency(f, output, reverse, rejected);
       rocketFASEDTimingAWQueue(f, output, reverse, rejected);
+      rocketFASEDWritePairing(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -2511,6 +2599,16 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    // Replay expanded AW ordering boundaries to isolate AW/W completion pairing.
+    if (argc == 4 && StringRef(argv[1]).starts_with("--fased-write-pairing-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED timing AW queue boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin();
+      unsigned rejected = 0;
+      rocketFASEDWritePairing(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded FASED write pairing boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     // Replay expanded write-latency boundaries to isolate accepted AW ordering.
     if (argc == 4 && StringRef(argv[1]).starts_with("--fased-timing-aw-queue-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);

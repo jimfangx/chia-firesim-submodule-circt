@@ -198,4 +198,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDWriteLatency(
 // Atomic; retain expanded Print banks. AW/W pairing remains an explicit pulse.
 mlir::LogicalResult mapPrintBridgeRocketFASEDTimingAWQueue(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Pair accepted AW and final W handshakes using target-qualified saturating
+// counters. Atomic; retain expanded Print banks. B retirement and maximum stay
+// explicit inputs until timing admission and latency MMIO attachment.
+mlir::LogicalResult mapPrintBridgeRocketFASEDWritePairing(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
