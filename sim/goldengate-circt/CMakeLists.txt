@@ -409,6 +409,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDIngressCredits.cpp
     lib/Transforms/FASEDIngressOrder.cpp
     lib/Transforms/FASEDIngressIssue.cpp
+    lib/Transforms/FASEDReadBuffer.cpp
     lib/Transforms/FASEDIngressDeadlock.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp

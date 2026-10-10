@@ -1977,3 +1977,53 @@ production CLI or driver flow. Manager verification remains harness-owned.
 Next: compose the native read buffer/read scheduler and write egress/response
 releaser through this expanded boundary, then timing and slave-1 MMIO. The
 UART-bearing SFC runtime baseline and overall compiler migration remain pending.
+
+## Iteration 81: per-ID read buffering after expanded Rocket/Print host issue
+
+`mapPrintBridgeRocketFASEDReadBuffer` composes the native read buffer after
+`GGFASEDIngressIssueWrapper`. It shares the issue stage's live Rocket/Print
+allocation validation, stages on a cloned circuit, verifies the result, and
+commits only the new helper/wrapper plus retargeted circuit annotations.
+Existing module operations retain their identities. It consumes the flat host
+response bundle into explicit read payload and write handshake ports, exposes
+the raw read dequeue and address, and drives the buffer with hostClock and the
+qualified egress reset. Host R ready remains unconditional in this non-ROB
+profile; internal queue fullness still gates RAM writes. Reset clears pointer,
+full and dequeue-valid state, leaving the packed RAM and delayed read ID unreset.
+
+The expanded fixture invokes this stage after host issue in both constructor
+orders. Saved iteration-80 issue boundaries can also be replayed independently
+with `--fased-read-buffer-boundary` and
+`--fased-read-buffer-boundary-reverse`. Each replay checks nine atomic
+rejections: helper/wrapper collisions, stale or incomplete allocation, unsupported
+ID-reuse/data width, wrong active top, missing annotations and repeated use.
+Earlier module identities, the live FASED bank and MMIO allocation must survive.
+
+`PrintRocketFASEDReadBufferCompare.py` compares the immutable U250 reference
+`design/FireSim-generated.sv` (`ReadEgress` and `MultiQueue`) with the emitted
+expanded read-buffer boundary. It resolves SFC's lowered vector selectors,
+checks current versus delayed dequeue ID, synchronous read/prefetch equations,
+16-by-8 queue geometry, data/last storage, all 49 reset registers and the unreset
+read ID. Native storage is one packed 128-by-65 memory; SFC uses separate data
+and last memories. Fourteen actual wrapper connections, all 227 prior module
+definitions and the complete annotation archive must match in both Print
+orders. The queue definition must also match fresh native compilation's
+`post-fame-fased-read-buffer.mlir` from the immutable `.sfc.fir`/`.anno.json`.
+
+Evidence is in mutable `iteration81-print-rocket-fased-read-buffer/`. Both
+expanded replays and the structured SFC comparison pass with empty stderr.
+The allocator refactor's issue replay passes nine rejection cases and emits
+unchanged iteration-80 issue IR. Fresh native compiler ingestion and baseline
+assembly pass with empty stderr. Focused Print binding and read-buffer tests
+pass, including 40,000 native buffer state/edge samples and 18 lower-level
+atomic rejection cases.
+
+This remains a partial expanded FASED assembly, exercised through the compiler
+library and boundary fixture. Print-enabled production CLI/driver integration,
+request scheduling, write egress, response release, timing policy, slave-1 MMIO
+and host-memory attachment remain incomplete. The SFC reference disables Print;
+these shared semantics do not establish full Print-enabled runtime equivalence.
+Next smallest step: compose the native read scheduler to consume the raw buffer
+address/dequeue, compare its request/response predicates with SFC ReadEgress,
+then compose write egress and response release. Manager gates remain
+harness-owned; the UART-bearing SFC runtime baseline and overall port are pending.

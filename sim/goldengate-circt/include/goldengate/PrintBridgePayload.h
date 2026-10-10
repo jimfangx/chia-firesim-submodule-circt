@@ -158,4 +158,10 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDIngress(
 // Atomic; retain existing MMIO identities and expose host request/response AXI.
 mlir::LogicalResult mapPrintBridgeRocketFASEDIssue(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Buffer host R responses at the expanded Print/FASED issue boundary using
+// ReadEgress's non-ROB per-ID queues. Atomic; qualified egress reset clears
+// pointer/valid state, while RAM and delayed read ID remain unreset. The read
+// address/dequeue and write response boundaries await subsequent schedulers.
+mlir::LogicalResult mapPrintBridgeRocketFASEDReadBuffer(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
