@@ -3149,3 +3149,64 @@ Next smallest step: assemble these six exported FASED fragments into the native
 Host-memory attachment, Print-enabled production CLI/driver integration,
 general FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime
 baseline remain incomplete. This increment does not complete the port.
+
+### Iteration 99: expanded Print/Rocket FASED MMIO assembly
+
+`mapPrintBridgeRocketFASEDMMIOBank` composes the native `addFASEDMMIOBank`
+after histograms. It validates the expanded Rocket/Print control allocation,
+six exact typed fragments, retained annotation archive and ten-flight
+constructor, stages assembly on a clone, and verifies before moving the new
+wrapper into the live circuit. Existing modules, ports, argument identities,
+bank state and constructors remain unchanged. Hierarchy analyses must be
+recomputed. Copied top targets and indexed fragment targets explicitly transfer;
+whole-fragment references remain on the retained histogram wrapper.
+
+The new top consumes six fragment ports and exposes one `fasedBridge_mcr`
+bundle. Twenty-one read/write lanes follow the registry byte offsets, independently
+of local row order. Six four-bit write strobes fan out to the banks. Read-ready
+flows opposite read-valid/bits; write-ready flows opposite write-valid/bits.
+The map retains byte offsets 0-80, five writable words (0-3 and 18), sixteen
+read-only words, and both constant-zero histogram lanes (8 and 13). No state is
+duplicated. This implements `FASEDMemoryTimingModel.scala:584-589`,
+`Widget.scala:70-101,167-172` and `Lib.scala:200-236,281-298` through CIRCT
+FIRRTL operations; the Midas pipeline and FAME clock/handshake oracle were
+also inspected.
+
+The exact immutable artifact compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `FASEDMemoryTimingModel` and `MCRFile_5`.
+All 21 word identities, readback, writable/read-only guards, zero lanes and
+four-byte address stride match. All 48 fragment routes and the ordered registry
+also match fresh compilation of the immutable compiler fixture's `.sfc.fir`
+and `.anno.json` at `candidate/post-fame-fased-mmio.mlir`. The SFC fixture lacks
+Print hosts; expanded checks establish native Print preservation, not SFC Print
+runtime parity.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration99-print-rocket-fased-mmio/`. Replay and compare:
+
+```text
+goldengate-print-binding-test --fased-mmio-boundary INPUT_HISTOGRAMS OUTPUT_PREFIX
+goldengate-print-binding-test --fased-mmio-boundary-reverse INPUT_HISTOGRAMS_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketFASEDMMIOBankCompare.py EVIDENCE SFC_SV ITERATION98_EVIDENCE
+```
+
+Both constructor orders preserve all 255 prior module bodies, 166 copied ports
+and the explicitly retargeted archive; all 214 wrapper connections match.
+Each expanded replay passes twelve atomic rejection cases: wrapper collision,
+used top, malformed allocation, constructor mismatch, wrong top, missing archive,
+missing bank/fragment, duplicate offset, wrong permissions and repeat assembly.
+The focused Print-binding and MMIO-bank CTests pass (5.84 seconds). The native
+bank test independently checks three lane orders, 59 annotation targets per
+order and 93 atomic rejections. Fresh native compilation reaches simulator RTL
+emission. Replay, CTest, compiler and comparison stderr are empty; the build
+reports two Ninja log-recovery warnings. FireSim manager gates remain owned by
+the verification harness.
+
+Next smallest step: attach the native FASED MCRFile to this expanded bank and
+bind it to the allocated control slave. Host-memory attachment, Print-enabled
+production CLI/driver integration, general FAME1/FAME5, multi-clock support and
+the UART-bearing SFC runtime baseline remain incomplete. This increment does
+not complete the port.

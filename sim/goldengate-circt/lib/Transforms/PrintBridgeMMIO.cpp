@@ -29,6 +29,7 @@
 #include "goldengate/FASEDResponseErrors.h"
 #include "goldengate/FASEDStatistics.h"
 #include "goldengate/FASEDHistograms.h"
+#include "goldengate/FASEDMMIOBank.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1174,6 +1175,37 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDHistograms(CircuitOp circuit,
   if (!bank) return reject("Rocket Print FASED histograms require the allocated histogram bank");
   if (failed(attachFASEDHistograms(*staged, bank, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED histograms produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires: completed histogram boundary, expanded Rocket/Print allocation,
+// retained archive and six typed MCR fragments with the recorded register maps.
+// Annotations consumed/produced: none. Copied top targets and indexed fragment
+// lanes transfer; whole-fragment references remain on the retained inner module.
+// Mutates: append one wrapper joining 21 read/write lanes and six strobe routes;
+// remove the six fragment ports from the new top, without duplicating state.
+// Analyses required: Rocket allocation and native fragment registry/type checks.
+// Preserves: existing modules, port/argument identities, constructors and banks.
+// Hierarchy analyses must be recomputed after attachment.
+// Output: ordered byte offsets 0..80; ready flows opposite valid/bits. Stage and
+// verify before committing so even a failed IR verifier leaves live IR intact.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDMMIOBank(CircuitOp circuit,
+                                                         std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDHistogramsWrapper")
+    return reject("Rocket Print FASED MMIO bank requires the completed histogram boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDMMIOBank(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED MMIO bank produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

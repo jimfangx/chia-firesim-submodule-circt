@@ -2108,6 +2108,106 @@ void rocketFASEDResponseErrors(Fixture &f, StringRef output, bool reverse, unsig
   }
 }
 
+void rocketFASEDMMIOBank(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto bank = named(f.circuit, "GGFASEDHistograms");
+  auto rows = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto raw = f.circuit->getAttr("rawAnnotations");
+  auto portNames = llvm::to_vector(original.getPortNames());
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<PortInfo>> priorPorts;
+  SmallVector<SmallVector<Value>> priorArguments;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+    priorArguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+  }
+  for (unsigned bad = 0; bad < 11; ++bad) {
+    FModuleOp collision; InstanceOp extra;
+    if (bad == 0) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(
+          "GGFASEDMMIOWrapper"), original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 1) {
+      b.setInsertionPointToEnd(original.getBodyBlock());
+      extra = b.create<InstanceOp>(f.circuit.getLoc(), original, "duplicate");
+    }
+    if (bad == 2 || bad == 3) {
+      SmallVector<Attribute> changed(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(changed[1]));
+      if (bad == 2) row.set("start", b.getI64IntegerAttr(256)); else row.erase("name");
+      changed[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(changed));
+    }
+    if (bad == 4) {
+      NamedAttrList key(constructor);
+      NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+      edge.set("maxFlight", b.getI64IntegerAttr(9)); key.set("axi4Edge", edge.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(ctx));
+    }
+    if (bad == 5) f.circuit.setName("WrongTop");
+    if (bad == 6) f.circuit->removeAttr("rawAnnotations");
+    if (bad == 7) bank.setName("MissingHistogramBank");
+    if (bad == 8) {
+      auto names = portNames; names[port(original, "fased_histograms_mcr")] = b.getStringAttr("missingFragment");
+      original.setPortNames(names);
+    }
+    if (bad == 9 || bad == 10) {
+      SmallVector<Attribute> changed(rows.begin(), rows.end());
+      NamedAttrList row(cast<DictionaryAttr>(changed[0]));
+      if (bad == 9) row.set("offset", b.getI32IntegerAttr(20)); else row.set("writeable", b.getBoolAttr(true));
+      changed[0] = row.getDictionary(ctx); bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(changed));
+    }
+    auto state = dump(*f.root);
+    auto result = goldengate::mapPrintBridgeRocketFASEDMMIOBank(f.circuit, error);
+    require(failed(result) && !error.empty() && dump(*f.root) == state,
+        "expanded FASED MMIO rejection " + std::to_string(bad) + " changed IR or accepted invalid input: " + error); ++rejected;
+    decoder->setAttr("goldengate.controlRegions", regions);
+    engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw); bank.setName("GGFASEDHistograms");
+    bank->setAttr("goldengate.mmioRegisters", rows); original.setPortNames(portNames);
+    if (extra) extra.erase();
+    if (collision) collision.erase(); f.circuit.setName(original.getName());
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDMMIOBank(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, f.circuit.getName());
+  require(top.getName() == "GGFASEDMMIOWrapper", "FASED MMIO top differs");
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == priorPorts[j].size(),
+        "FASED MMIO composition changed an existing module identity/port count");
+    for (auto [i, p] : llvm::enumerate(priorPorts[j]))
+      require(m.getPortName(i) == p.name && m.getPortType(i) == p.type &&
+          m.getPortDirection(i) == p.direction && m.getArguments()[i] == priorArguments[j][i],
+          "FASED MMIO composition changed an existing port or argument identity");
+  }
+  const StringRef fragments[]{"fased_latency_mcr", "fased_request_limits_mcr", "fased_histograms_mcr",
+      "fased_statistics_mcr", "fased_functional_model_mcr", "fased_response_errors_mcr"};
+  unsigned copied = 0;
+  for (auto p : original.getPorts()) {
+    if (llvm::is_contained(fragments, p.name.getValue())) continue;
+    require(top.getPortName(copied) == p.name && top.getPortType(copied) == p.type &&
+        top.getPortDirection(copied) == p.direction, "FASED MMIO composition changed a retained port"); ++copied;
+  }
+  require(original.getNumPorts() == copied + 6 && top.getNumPorts() == copied + 1 &&
+      top.getPortName(copied) == "fasedBridge_mcr" && top.getPortDirection(copied) == Direction::Out &&
+      bool(child(top, original)), "FASED MMIO fragment consumption differs");
+  auto mcr = cast<BundleType>(top.getPortType(copied));
+  require(cast<FVectorType>(mcr.getElement("read")->type).getNumElements() == 21 &&
+      cast<FVectorType>(mcr.getElement("write")->type).getNumElements() == 21,
+      "FASED MMIO aggregate lane count differs");
+  auto state = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDMMIOBank(f.circuit, error)) && dump(*f.root) == state,
+      "repeated FASED MMIO composition mutated IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-fased-mmio-reverse.mlir" : ".rocket-fased-mmio.mlir")).str(), ec);
+    require(!ec, "cannot write expanded FASED MMIO boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDHistograms(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -3079,6 +3179,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDResponseErrors(f, output, reverse, rejected);
       rocketFASEDStatistics(f, output, reverse, rejected);
       rocketFASEDHistograms(f, output, reverse, rejected);
+      rocketFASEDMMIOBank(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -3416,6 +3517,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--fased-mmio-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded FASED histogram boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketFASEDMMIOBank(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded FASED MMIO boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--fased-histograms-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded FASED statistics boundary");

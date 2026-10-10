@@ -245,4 +245,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDStatistics(
 /// transfer the archive and expose ten read-only MCR words, including zero bins.
 mlir::LogicalResult mapPrintBridgeRocketFASEDHistograms(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Assemble the six exported fragments after histograms into the 21-word FASED
+/// bank. Atomic; preserve expanded allocation and prior module/port identities,
+/// transfer copied/indexed targets and retain whole-fragment references inside.
+mlir::LogicalResult mapPrintBridgeRocketFASEDMMIOBank(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

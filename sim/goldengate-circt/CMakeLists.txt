@@ -428,6 +428,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDResponseErrors.cpp
     lib/Transforms/FASEDStatistics.cpp
     lib/Transforms/FASEDHistograms.cpp
+    lib/Transforms/FASEDMMIOBank.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp
