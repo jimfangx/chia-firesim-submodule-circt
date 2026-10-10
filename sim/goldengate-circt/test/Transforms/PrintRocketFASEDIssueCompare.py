@@ -28,6 +28,8 @@ def expressions(text, name):
             values[m[1]] = ('leaf', values[m[2]][1] + '.' + m[3])
         if m := re.search(r'(%\w+) = firrtl.(and|or|xor|lt|geq|eq|add|sub) (%\w+), (%\w+)', line):
             values[m[1]] = (m[2], values[m[3]], values[m[4]])
+        if m := re.search(r'(%\w+) = firrtl.pad (%\w+), (\d+)', line):
+            values[m[1]] = values[m[2]]  # UInt padding is zero extension.
         if m := re.search(r'(%\w+) = firrtl.not (%\w+)', line):
             values[m[1]] = ('not', values[m[2]])
         if m := re.search(r'(%\w+) = firrtl.mux\((%\w+), (%\w+), (%\w+)\)', line):

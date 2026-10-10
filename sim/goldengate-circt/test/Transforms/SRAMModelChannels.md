@@ -2208,3 +2208,59 @@ SFC runtime baseline remains pending. Next smallest step: compose native
 wrap and runtime-latency release offsets against SFC LatencyPipe. Manager gates
 remain owned by the verification harness; overall port completion is not
 established.
+
+### Expanded Print/Rocket FASED timing cycle (iteration 85)
+
+`mapPrintBridgeRocketFASEDTimingCycle` composes native `addFASEDTimingCycle`
+after the expanded response releaser. It validates the live Print registry and
+MMIO allocation, verifies a staged CIRCT FIRRTL circuit, then publishes only
+the new helper/wrapper and retargeted annotation archive. Earlier module
+operations, response boundaries, Print banks and latency registers remain
+intact. The wrapper adds the 64-bit model cycle, two 32-bit runtime latency
+inputs and two 64-bit release-cycle outputs.
+
+TimingModel.scala increments its model cycle on the gated model clock.
+The native register advances only on targetFire; model reset is sampled on
+the same enabled edge, so a reset during a token stall retains the cycle.
+LatencyBandwidthPipe.scala computes releaseCycle as zero-extended runtime
+latency plus the current cycle, less the one-cycle AXI4Releaser delay.
+Both counter and deadlines wrap modulo 2^64, including latency-zero underflow.
+
+The expanded fixture calls the composition in both Print constructor orders.
+Replay saved iteration-84 response boundaries with
+`--fased-timing-cycle-boundary` and
+`--fased-timing-cycle-boundary-reverse`. Each checks nine atomic rejections:
+helper/wrapper collisions, stale/malformed allocation, unsupported ID/data
+widths, wrong top, missing annotation archive and repeated composition.
+Every retained port keeps its type and direction; all five added ports have
+the expected types and directions.
+
+`PrintRocketFASEDTimingCycleCompare.py` pins the immutable U250
+`design/FireSim-generated.sv` equations in `LatencyPipe` and gated model
+clock/reset wiring in `FASEDMemoryTimingModel`, then interprets emitted native
+SSA. Per constructor order it checks 22,048 transitions: boundary values,
+10,000 random states and 10,000 continuous state steps. It retains all 235
+preceding module definitions and the complete retargeted annotation archive,
+checks all 172 wrapper connections, and requires the helper to match fresh
+native compilation's `post-fame-fased-timing-cycle.mlir` from immutable SFC
+`.sfc.fir`/`.anno.json`. The shared SSA evaluator supports unsigned FIRRTL pad.
+
+Evidence is in mutable `iteration85-print-rocket-fased-timing-cycle/`.
+Both expanded replays, the structured comparison and focused Print binding
+and timing-cycle CTests pass. Per order, coverage includes 10,941 stalls,
+5,569 stalled resets, 5,549 enabled resets, 64 counter wraps, 64 deadline
+underflows and 710 deadline overflows. The native timing-cycle unit test
+passes 21,152 transitions, 16 wrapper mappings, three target transfers and
+19 atomic rejections. Fresh native ingestion, host assembly and RTL emission
+pass; compiler, replay and comparison stderr logs are empty.
+
+The expanded Print-enabled assembly remains partial and is exercised through
+the compiler library and boundary fixture. Runtime latency register attachment,
+completion queues, remaining timing policy, host-memory attachment and
+Print-enabled production CLI/driver integration remain to compose. The golden
+reference disables Print; the UART-bearing SFC runtime baseline remains
+pending. Next smallest step: compose native `FASEDReadLatency` and compare
+the ten-entry completion queue, empty flow-through, unsigned deadline test,
+target-qualified reset/state and AR acceptance with SFC LatencyPipe/Queue_16.
+Manager gates remain owned by the verification harness; this does not establish
+overall port completion.

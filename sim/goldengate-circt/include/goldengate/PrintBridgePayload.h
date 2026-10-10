@@ -179,4 +179,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDWriteEgress(
 // Timing completion metadata and AW/W/AR readiness remain external.
 mlir::LogicalResult mapPrintBridgeRocketFASEDResponseReleaser(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Add target-qualified 64-bit model cycle and runtime-latency release offsets.
+// Atomic; preserve expanded Print MMIO banks and all response boundaries.
+// Latency register attachment and completion queues remain subsequent stages.
+mlir::LogicalResult mapPrintBridgeRocketFASEDTimingCycle(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

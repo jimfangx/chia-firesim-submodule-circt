@@ -34,6 +34,7 @@
 #include "goldengate/FASEDReadScheduler.h"
 #include "goldengate/FASEDWriteEgress.h"
 #include "goldengate/FASEDResponseReleaser.h"
+#include "goldengate/FASEDTimingCycle.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -767,6 +768,29 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDResponseReleaser(CircuitOp ci
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addFASEDResponseReleaser(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED response releaser produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// TimingModel's model clock advances/reset only when targetFire enables the gate.
+// LatencyPipe deadlines use zero-extended UInt32 latencies, less one target cycle.
+// Retain earlier module operations and publish verified additions atomically.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDTimingCycle(CircuitOp circuit,
+                                                              std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDResponseReleaserWrapper")
+    return reject("Rocket Print FASED timing cycle requires the completed response releaser boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDTimingCycle(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED timing cycle produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
