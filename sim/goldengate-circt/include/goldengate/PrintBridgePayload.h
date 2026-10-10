@@ -230,4 +230,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDLatencyRegisters(
 /// and preserve prior modules and the expanded Rocket/Print allocation.
 mlir::LogicalResult mapPrintBridgeRocketFASEDFunctionalModelRegister(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach the allocated read-only response-error bank after the functional-model
+/// register. Atomic; observe accepted host responses, retarget copied ports and
+/// the archive, and preserve prior modules and expanded Rocket/Print allocation.
+mlir::LogicalResult mapPrintBridgeRocketFASEDResponseErrors(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

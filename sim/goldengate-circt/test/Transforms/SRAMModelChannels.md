@@ -2938,3 +2938,76 @@ fanout, remaining FASED banks, host-memory attachment, Print-enabled production
 CLI/driver integration, general FAME1/FAME5, multi-clock support and the
 UART-bearing SFC runtime baseline remain incomplete. This increment does not
 complete the port.
+
+## Iteration 96: expanded Print/Rocket FASED response errors
+
+`mapPrintBridgeRocketFASEDResponseErrors` attaches the already allocated
+`GGFASEDResponseErrors` after the functional-model register. It validates
+Rocket/Print allocation, stages native attachment, verifies FIRRTL, and moves
+only the new wrapper into the original circuit. Existing module and port
+identities, constructor keys and allocated banks survive. The retained
+annotation archive is explicitly retargeted to the new circuit/copied ports.
+The wrapper observes host R/B valid and response codes at its inputs and
+ready at the inner simulator outputs, preserving accepted-handshake semantics.
+
+The oracle is `models/dram/FASEDMemoryTimingModel.scala:580-587` and
+`widgets/Lib.scala:281-298`. Host reset takes priority over response capture.
+Accepted nonzero responses update two UInt<2> registers; successful or
+blocked responses leave them unchanged. Preserve the executable SFC behavior:
+B errors capture the current R response code, including zero. Both registers
+are read-only, zero-extended to UInt<32> at global MCR words 19/20 (bytes
+76/80). Read-valid and write-ready are constant one; writes assert outside
+host reset. State updates are independent of target advancement.
+`MidasTransforms.scala` ordering and `FAMETransform.scala` ready/valid and
+clock contracts were inspected.
+
+The exact immutable comparison artifact is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, module `FASEDMemoryTimingModel`, specifically
+`rrespError`, `brespError`, capture/reset priority, MCR readback and read-only
+assertions. Its optimized capture guards contain response-valid with no ready
+term; arbitrary ready stalls are checked against Scala's explicit `.fire`
+contract and the native FIRRTL operations. The fixture lacks a Print host;
+Print-specific checks prove native preservation rather than SFC Print parity.
+
+Evidence is under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration96-print-rocket-fased-response-errors/`. Replay and compare:
+
+```text
+goldengate-print-binding-test --fased-response-errors-boundary INPUT_FUNCTIONAL_REGISTER_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-response-errors-boundary-reverse INPUT_REVERSE_FUNCTIONAL_REGISTER_MLIR OUTPUT_PREFIX
+PrintRocketFASEDResponseErrorsCompare.py EVIDENCE GOLDEN_SV ITERATION95_EVIDENCE
+```
+
+Both constructor orders pass 85,536 transitions each: 65,536 exhaustive cases
+and 20,000 continuous randomized cycles. Each covers 9,746 accepted R errors,
+9,754 accepted B errors, 17,726 blocked errors, 7,333 B errors capturing a
+different R code (2,427 capturing zero), 11,359 errors coinciding with reset,
+8,813 captures during target stalls, 52,173 forbidden writes and 33,436 writes
+with assertions suppressed by reset. All 252 prior module bodies remain
+byte-identical, and their native identities/ports survive. All 170 wrapper
+ports, 178 connections and the complete annotation archive match. The reused
+bank and its observation wiring match fresh native ingestion's
+`post-fame-fased-response-errors.mlir`. The shared SSA comparison evaluator
+now supports `firrtl.neq` for the bank's error guards.
+
+Native build, both expanded replays (nine atomic rejections each) and focused
+Print-binding/response-error CTests pass (7.92 seconds). The standalone bank
+test covers 32,768 cycles, host handshake wiring, targets and 18 atomic
+rejections. Fresh native compilation of the immutable `.sfc.fir` and
+`.anno.json` reaches simulator RTL emission. Successful compiler, replay,
+CTest and comparison stderr are empty; build stderr contains two Ninja log
+recovery warnings. An early comparison attempt lacked the still-running
+compiler's boundary; its log is retained and the rerun after emission passes.
+Manager verification remains harness-owned.
+
+Next smallest step: expose accepted target R beats through the expanded
+response hierarchy for the allocated `FASEDStatistics` bank. Its native
+attachment intentionally adds an observation port through 13 prior wrappers;
+port/instance updates must be committed atomically alongside the new wrapper.
+Decoded MCR fanout, remaining FASED banks, host-memory attachment, Print-enabled
+production CLI/driver integration, general FAME1/FAME5, multi-clock support
+and the UART-bearing SFC runtime baseline remain incomplete. This increment
+does not complete the port.

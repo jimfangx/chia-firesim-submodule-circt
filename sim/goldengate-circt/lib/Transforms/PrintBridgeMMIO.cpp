@@ -26,6 +26,7 @@
 #include "goldengate/FASEDRequestLimits.h"
 #include "goldengate/FASEDLatencyRegisters.h"
 #include "goldengate/FASEDFunctionalModelRegister.h"
+#include "goldengate/FASEDResponseErrors.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1069,6 +1070,39 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDFunctionalModelRegister(Circu
   if (!bank) return reject("Rocket Print FASED functional-model register requires the allocated functional-model register bank");
   if (failed(attachFASEDFunctionalModelRegister(*staged, bank, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED functional-model register produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires: completed functional-model register boundary, valid expanded Rocket/
+// Print MMIO allocation, retained annotations and a free allocated error bank.
+// Annotations consumed/produced: none; explicitly retarget the retained archive.
+// Mutates: append a wrapper observing accepted host R/B responses and exporting MCR.
+// Analyses required: Rocket control allocation; no cached analysis is used.
+// Preserves: prior module/port identities, bank definitions and constructor keys.
+// Output: host-reset UInt<2> error state is read-only and zero-extended to UInt<32>;
+// accepted B errors capture R resp, as in SFC. Failed attachment is atomic and
+// copied ports retain their type/direction/order; response ready comes from sim.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDResponseErrors(CircuitOp circuit,
+                                                               std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDFunctionalModelRegisterWrapper")
+    return reject("Rocket Print FASED response errors require the completed functional-model register boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDResponseErrors") bank = m;
+  if (!bank) return reject("Rocket Print FASED response errors require the allocated response-error bank");
+  if (failed(attachFASEDResponseErrors(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED response errors produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
