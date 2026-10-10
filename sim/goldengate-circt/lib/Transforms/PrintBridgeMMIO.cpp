@@ -31,6 +31,7 @@
 #include "goldengate/FASEDIngressIssue.h"
 #include "goldengate/FASEDIngressDeadlock.h"
 #include "goldengate/FASEDReadBuffer.h"
+#include "goldengate/FASEDReadScheduler.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -692,6 +693,30 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDReadBuffer(CircuitOp circuit,
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addFASEDReadBuffer(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print FASED read buffer produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Compose ReadEgress request state on the expanded Print/Rocket read buffer.
+// The qualified token fire drives request capture and beat retirement; egress
+// reset clears only active validity, and a new request wins over retirement.
+// Publish new verified modules together, retaining existing module operations.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDReadScheduler(CircuitOp circuit,
+                                                                std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDReadBufferWrapper")
+    return reject("Rocket Print FASED read scheduler requires the completed read buffer boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDReadScheduler(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED read scheduler produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
   for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))

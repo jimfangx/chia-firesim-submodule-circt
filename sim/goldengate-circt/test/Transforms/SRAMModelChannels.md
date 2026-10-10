@@ -2027,3 +2027,61 @@ Next smallest step: compose the native read scheduler to consume the raw buffer
 address/dequeue, compare its request/response predicates with SFC ReadEgress,
 then compose write egress and response release. Manager gates remain
 harness-owned; the UART-bearing SFC runtime baseline and overall port are pending.
+
+
+### Expanded Print/Rocket FASED read request scheduling (iteration 82)
+
+`mapPrintBridgeRocketFASEDReadScheduler` consumes the completed expanded read
+buffer boundary. It revalidates the live Print registry and all allocated MMIO
+regions before staging native `addFASEDReadScheduler` on a clone. After MLIR
+verification, it publishes only the new helper/wrapper and retargeted circuit
+annotations. All preceding module operations and definitions remain intact.
+The wrapper consumes read address/dequeue and aggregate egress readiness,
+connects read readiness to the scheduler's response hValid, and leaves explicit
+read request/response and write readiness ports for subsequent timing lowering.
+
+This implements the recorded no-ROB ReadEgress scheduling branch through CIRCT
+FIRRTL operations: request capture and beat retirement use qualified target
+fire, a new request wins over an accepted final beat, and only request-valid
+state resets. The request ID captures even when reset and start coincide.
+Dequeue-ready and retirement deliberately do not include buffer-valid; legal
+cycles depend on token readiness. Response data/last and the stored response
+ID are forwarded, while a newly arriving request selects the prefetch address.
+The scheduler uses hostClock and the token engine's qualified egress reset.
+
+The complete expanded fixture invokes this stage in both Print constructor
+orders. Saved iteration-81 read-buffer boundaries can also be replayed using
+`--fased-read-scheduler-boundary` and
+`--fased-read-scheduler-boundary-reverse`. Each replay checks nine atomic
+rejections covering collisions, malformed allocation, unsupported profile,
+wrong top, missing annotation archive and repeated composition.
+
+`PrintRocketFASEDReadSchedulerCompare.py` compares immutable U250
+`design/FireSim-generated.sv` modules `ReadEgress` and `FASEDMemoryTimingModel`
+with the emitted expanded scheduler. It pins SFC combinational equations,
+reset/capture/retirement priority and host connections, then interprets actual
+native SSA for all 32,768 flag and AXI ID combinations in each constructor
+order. It also checks the qualified wrapper wiring, every prior module
+and the entire annotation archive after the expected target rename. The
+scheduler definition must match fresh native compilation's
+`post-fame-fased-read-scheduler.mlir` from the immutable `.sfc.fir`/`.anno.json`.
+
+Evidence is in mutable `iteration82-print-rocket-fased-read-scheduler/`.
+Both expanded replays and the structured SFC comparison pass with empty stderr.
+The comparison preserves all 229 preceding modules and the complete annotation
+archive in each order, including nine qualified wrapper connections. It covers
+1,024 simultaneous starts/retirements, 4,096 reset/start coincidences and 1,024
+retirements without buffer-valid per order. Fresh native compiler ingestion and
+baseline assembly pass with empty stderr.
+Focused Print binding and read-scheduler CTests pass, including 32,768 native
+scheduler edge cases, 32 wrapper mapping cases, eight annotation transfers,
+and 20 lower-level atomic rejections.
+
+The expanded Print-enabled assembly remains partial and is exercised through
+the compiler library and boundary fixture. Write egress, response release,
+timing policy, slave-1 MMIO and host-memory attachment remain to compose, as
+well as Print-enabled production CLI/driver integration. The golden reference
+has Print disabled and the UART-bearing SFC runtime baseline remains pending.
+Next smallest step: compose native write egress against SFC WriteEgress,
+then connect read/write release to the timing model. Manager gates remain
+owned by the verification harness; overall port completion is not established.

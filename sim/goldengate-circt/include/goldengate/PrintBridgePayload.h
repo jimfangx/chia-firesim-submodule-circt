@@ -164,4 +164,9 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDIssue(
 // address/dequeue and write response boundaries await subsequent schedulers.
 mlir::LogicalResult mapPrintBridgeRocketFASEDReadBuffer(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Consume the read-buffer address/dequeue boundary through ReadEgress request
+// state and token readiness, preserving the expanded Print MMIO allocation.
+// Atomic; request/response payload and write egress await timing-model lowering.
+mlir::LogicalResult mapPrintBridgeRocketFASEDReadScheduler(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
