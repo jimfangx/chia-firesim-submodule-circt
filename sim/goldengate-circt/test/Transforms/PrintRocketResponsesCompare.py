@@ -42,6 +42,9 @@ def wiring(text, name, aggregate=False):
         if match := re.search(r'(%\w+) = firrtl.and (%\w+), (%\w+)', line):
             dest, lhs, rhs = match.groups()
             values[dest] = frozenset(leaf(values[lhs]) | leaf(values[rhs]))
+        if match := re.search(r'(%\w+) = firrtl.not (%\w+)', line):
+            dest, src = match.groups()
+            values[dest] = ('not', values[src])
         connection = r'firrtl.(?:strictconnect|connect)' if aggregate else r'firrtl.strictconnect'
         if match := re.search(connection + r' (%\w+), (%\w+)', line):
             dest, src = match.groups()

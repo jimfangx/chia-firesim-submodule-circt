@@ -2590,3 +2590,80 @@ Print-enabled production CLI/driver integration remain incomplete. General
 FAME1/FAME5, multi-clock support and the UART-bearing SFC runtime baseline
 remain outstanding. Manager verification stays with the harness; this is
 not overall port completion.
+
+### Expanded Print/Rocket pending-full write admission (iteration 91)
+
+`mapPrintBridgeRocketFASEDWriteAdmission` composes native
+`bindFASEDWriteAdmission` after target B retirement. FIRRTL `NotPrimOp`s
+close AW/W reverse readiness with the respective pending-full observations.
+Both readiness values remain observable outputs; only their bundle flips
+change. Valid and payload are forwarded without masking, and AR retains its
+reverse readiness. Admission is combinational and independent of reset and
+`targetFire`; accepted AW and final W handshakes increment the existing
+pending counters, whose state and reset remain target-qualified.
+
+The composer checks expanded allocation and the recorded 35/64/4-bit
+constructor profile, stages the native pass on a clone, and verifies FIRRTL.
+It transfers only the new wrapper and retargeted annotation archive into the
+original circuit. All existing module operations, ports, users, Print banks,
+latency bank and allocation retain their identities. Collision, instantiated
+top, malformed allocation, stale widths, wrong top, absent annotation archive
+and repetition reject atomically.
+
+The executable oracle is `models/dram/TimingModel.scala:108–114,225–260`,
+`widgets/Lib.scala` counter semantics and the target-clock contract in
+`passes/fame/FAMETransform.scala`. The exact immutable RTL compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `LatencyPipe`, `SatUpDownCounter_1`
+and `FASEDMemoryTimingModel`. The fixture contains no Print host; this
+comparison covers shared admission/counter semantics and the expanded native
+Print boundary's preservation.
+
+Evidence lives under `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration91-print-rocket-fased-write-admission/`. Native replay modes are:
+
+```text
+goldengate-print-binding-test --fased-write-admission-boundary INPUT_RETIREMENT_MLIR OUTPUT_PREFIX
+goldengate-print-binding-test --fased-write-admission-boundary-reverse INPUT_REVERSE_RETIREMENT_MLIR OUTPUT_PREFIX
+```
+
+`PrintRocketFASEDWriteAdmissionCompare.py EVIDENCE GOLDEN_SV ITERATION90_EVIDENCE`
+pins SFC admission, counter increments/retirement, runtime maximum, saturated
+counter arithmetic and gated clock equations. It reads actual FIRRTL wrapper
+wiring and interprets the pending-counter helper over all four-bit AW/W states
+and maximum values, all reset/fire/valid/last/B-ready/B-valid combinations and
+continuous randomized transitions. It compares every prior module definition,
+all wrapper connections, the complete retargeted annotation archive and fresh
+native SFC-ingestion admission output. Native tests check exact port types,
+including preserved AR flip and payload types, and retained module identities.
+
+Result: both constructor orders pass 554,288 transitions each (524,288
+exhaustive cases plus 30,000 randomized transitions), including 34,631
+zero-maximum cases, 131,828 accepted AW requests, 67,774 accepted final W
+beats, 145,297 blocked AW requests, 141,823 blocked W beats, 108,745
+handshakes during target stalls, 22,716 simultaneous increment/retirement
+cases and 131,173 stalled resets. All 246 existing module identities and
+module definitions remain unchanged. All 169 outer port identities/types
+(with exactly two ready-flip changes), 177 wrapper connections and the
+complete retargeted annotation archive pass. The pending-counter helper and
+admission wiring match fresh native compilation's
+`post-fame-fased-write-admission.mlir` from the immutable compiler fixture's
+`.sfc.fir` and `.anno.json`.
+
+Native build, both expanded replays with nine atomic rejections each, focused
+Print binding/write-admission CTests and fresh SFC handoff compilation through
+CIRCT RTL emission pass. The standalone admission CTest checks combinational
+full inversion, unmasked valid/payload, AR passthrough, target retargeting and
+16 atomic rejections. Compiler, replay, CTest and comparison stderr logs are
+empty. Build stderr contains two Ninja log-recovery warnings; compilation
+and linking completed successfully.
+
+Next smallest step: compose native `FASEDReadAdmission` into this expanded
+boundary and compare pending reads, final-R retirement and AR readiness with
+SFC. Runtime maximum and latency MMIO attachment, remaining timing policy,
+host-memory attachment and Print-enabled production CLI/driver integration
+remain incomplete. General FAME1/FAME5, multi-clock support and the
+UART-bearing SFC runtime baseline remain outstanding. Manager verification
+stays with the harness; this is not overall port completion.

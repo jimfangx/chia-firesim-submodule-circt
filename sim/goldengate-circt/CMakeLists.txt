@@ -420,6 +420,7 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDWritePairing.cpp
     lib/Transforms/FASEDWriteRetirement.cpp
     lib/Transforms/FASEDIngressDeadlock.cpp
+    lib/Transforms/FASEDWriteAdmission.cpp
     lib/Transforms/TSITokenEngine.cpp
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp

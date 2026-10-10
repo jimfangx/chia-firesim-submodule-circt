@@ -40,6 +40,7 @@
 #include "goldengate/FASEDTimingAWQueue.h"
 #include "goldengate/FASEDWritePairing.h"
 #include "goldengate/FASEDWriteRetirement.h"
+#include "goldengate/FASEDWriteAdmission.h"
 #include "goldengate/FASEDIngressARQueue.h"
 #include "goldengate/TSITokenEngine.h"
 #include "goldengate/TSIWordQueues.h"
@@ -919,4 +920,37 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDWriteRetirement(CircuitOp cir
   // bindFASEDWriteRetirement checks every rejection condition before mutation.
   // The unchanged original has just passed those checks and IR verification.
   return bindFASEDWriteRetirement(circuit, error);
+}
+
+// Admission adds only a wrapper; move that verified addition from staging so
+// every pre-existing module operation and its users retain their identities.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDWriteAdmission(CircuitOp circuit,
+                                                               std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDWriteRetirementWrapper")
+    return reject("Rocket Print FASED write admission requires the completed retirement boundary");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  FModuleOp engine;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDTokenEngine") engine = m;
+  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr{};
+  auto widths = key ? key.getAs<DictionaryAttr>("axi4Widths") : DictionaryAttr{};
+  auto has = [&](StringRef name, int value) {
+    auto attr = widths ? widths.getAs<IntegerAttr>(name) : IntegerAttr{};
+    return attr && attr.getValue().getBitWidth() <= 64 && attr.getInt() == value;
+  };
+  if (!has("addrBits", 35) || !has("dataBits", 64) || !has("idBits", 4))
+    return reject("Rocket Print FASED write admission requires the recorded 35/64/4-bit profile");
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(bindFASEDWriteAdmission(*staged, error))) return failure();
+  if (failed(verify(*staged))) return reject("Rocket Print FASED write admission produced invalid FIRRTL IR");
+  llvm::StringSet<> originalNames;
+  for (auto m : circuit.getOps<FModuleLike>()) originalNames.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op))
+      if (!originalNames.count(m.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
 }

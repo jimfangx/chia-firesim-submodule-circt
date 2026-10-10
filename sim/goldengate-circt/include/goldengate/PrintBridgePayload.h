@@ -208,4 +208,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDWritePairing(
 // expanded Print banks and allocation. Runtime maximum MMIO attachment follows.
 mlir::LogicalResult mapPrintBridgeRocketFASEDWriteRetirement(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Close AW/W reverse readiness with the pending-full observations. Atomic;
+// preserve expanded banks and AR readiness. Runtime maximum remains external.
+mlir::LogicalResult mapPrintBridgeRocketFASEDWriteAdmission(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
