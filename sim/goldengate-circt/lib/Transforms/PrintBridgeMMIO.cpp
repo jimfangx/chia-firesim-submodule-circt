@@ -1947,3 +1947,28 @@ LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(
   circuit.setName(staged->getName());
   return success();
 }
+
+// AR uses the AW queue helper's payload shape, with its own instance state.
+// The read engine keeps the queue head until its final R handshake.
+LogicalResult goldengate::mapPrintBridgeRocketCPUStreamReadBuffer(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  if (circuit.getName() != "GGPrintCPUStreamWriteBufferWrapper") {
+    error = "Print CPU AR buffer requires the expanded CPU AW/W buffer boundary";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamReadBuffer(*staged, "GGPrintCPUStreamWriteBufferWrapper",
+                                      "GGPrintCPUStreamReadBufferWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "Print CPU AR buffer produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGPrintCPUStreamReadBufferWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}

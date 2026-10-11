@@ -4265,3 +4265,61 @@ Next: attach the shared native AR queue to this expanded CPU boundary, then
 R and B queues and the platform aggregate. Production Print integration,
 enabled Print runtime equivalence, and the UART-bearing SFC runtime baseline
 remain pending. No manager verification steps were started in this iteration.
+
+
+### Iteration 115: shared CPU AR queue on the expanded Print boundary
+
+`attachCPUStreamReadBuffer` now implements both the original CPU transport
+boundary and the expanded Print boundary. The native production entry point
+still uses its existing names. `mapPrintBridgeRocketCPUStreamReadBuffer`
+validates the Print/FASED allocation, stages the shared builder, verifies the
+result and publishes only `GGPrintCPUStreamReadBufferWrapper`. Its independent
+`arQueue` instance reuses `GGCPUStreamAWQueue2`, as SFC's AW and AR instances
+reuse Queue_51. No previous module, operation, SSA argument, port annotation
+or inner symbol is replaced.
+
+The Scala oracle is `FPGATop.scala`'s default `AXI4Buffer()` attachment in the
+post-FAME `SimulationMapping` neighborhood of `MidasTransforms.scala`.
+Exact immutable golden compared:
+
+```text
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+`PrintRocketCPUStreamReadBufferCompare.py` checks Queue_51's four payload
+fields (id16/addr64/len8/size3), depth-two memories, non-flowing/non-pipelined
+occupancy, reset control flushing and accepted reset-edge RAM writes. It
+checks all 14 AR attachment routes in AXI4Buffer_2 and the golden engine's
+`grant & R_ready & stream_valid & lastReadBeat` AR dequeue condition, with
+R id taken from the retained AR. The queue body matches the shared native
+baseline `iteration81-print-rocket-fased-read-buffer/candidate/post-fame-cpu-stream-platform.mlir`.
+
+Both constructor orders preserve all 292 prior module bodies and all 21 Print
+modules, produce 293 modules, retain 122 public ports and have 130 wrapper
+routes. Six consumed AR targets stay on the inner boundary; 116 copied ports,
+including host clock/reset, AW/W/B, R and mem_0, move to the new boundary.
+The nested mixed-target probe and complete retained annotation archive pass
+comparison. Each replay passes 15 atomic rejection cases, covering collisions,
+missing archive/allocation/helper, wrong active boundary, malformed clock/AR
+ports, unsupported AR fields, already-instantiated tops, invalid queue
+attributes/interface/memory latency and repeated application.
+
+`CPUStreamReadBufferTest.cpp` accepts the actual generated boundary and
+interprets its queue operations against an independent deque. Each order
+passes 21,450 cycles, including two pending requests held through eight
+non-final/stalled response beats each, full-queue pressure, pointer wrap,
+randomized enqueue/dequeue, full/empty no-bypass, simultaneous transfers,
+reset flush and accepted reset-edge RAM writes. Across both orders this is
+42,900 checked cycles. Focused CTests for Print binding, CPU AW/W buffering,
+CPU AR buffering and the single/multistream CPU read engines pass; the
+production compiler builds.
+Artifacts, stdout/stderr and comparison JSON are under:
+
+```text
+sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration115-print-rocket-cpu-ar-buffer/
+```
+
+Next: attach the native R response queue to this expanded boundary, then B
+and the platform aggregate. Production Print integration, enabled Print
+runtime equivalence, and the UART-bearing SFC runtime baseline remain pending.
+No manager verification steps were started in this iteration.

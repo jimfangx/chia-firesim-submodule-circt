@@ -4,6 +4,13 @@
 // the same native helper with independent state, retaining the AR until the
 // inner CPUManagedStreamEngine accepts its final read beat. R/B buffering and
 // the FPGA shell remain subsequent stages. All validation precedes mutation.
+// Requires: uninstantiated AW/W top, exact U250 AR ports, retained annotation
+// archive and native depth-two AW/AR helper. No annotations are consumed or
+// produced; copied top targets transfer, consumed AR targets stay on the inner
+// module, and circuit prefixes change recursively. Mutates: adds one wrapper
+// with sim + independent arQueue instances. Existing modules, ports, symbols,
+// operation identities and helper storage semantics are preserved. Output:
+// identical public ports, queued AR and direct passthrough of all other ports.
 #include "goldengate/TracerVTokenEngine.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -12,9 +19,14 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addCPUStreamReadBuffer(CircuitOp circuit,
                                                std::string &error) {
-  constexpr llvm::StringLiteral wrapperName = "GGCPUStreamReadBufferWrapper";
+  return attachCPUStreamReadBuffer(circuit, "GGCPUStreamWriteBufferWrapper",
+                                   "GGCPUStreamReadBufferWrapper", error);
+}
+
+LogicalResult goldengate::attachCPUStreamReadBuffer(CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGCPUStreamWriteBufferWrapper")
+  if (circuit.getName() != inputBoundary)
     return reject("CPU AR buffer requires the active CPU AW/W buffer wrapper");
   FModuleOp inner, queue;
   for (auto m : circuit.getOps<FModuleLike>()) {

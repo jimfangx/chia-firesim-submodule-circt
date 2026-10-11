@@ -117,15 +117,13 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
   require(succeeded(goldengate::addCPUStreamWriteBuffer(c, error)), error);
   return root;
 }
-void behavior(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  require(succeeded(goldengate::addCPUStreamReadBuffer(c, error)), error);
-  require(succeeded(verify(*root)), "queue IR verification failed");
+void behavior(CircuitOp c) {
   std::mt19937_64 random(165);
   for (auto name : {"GGCPUStreamAWQueue2"}) {
     Interpreter sim(named(c, name)); std::deque<std::map<std::string, uint64_t>> expected;
-    unsigned pushes = 0, pops = 0, fullBlocked = 0, emptyBlocked = 0, resetWrites = 0, simultaneous = 0;
+    unsigned cycles = 0, pushes = 0, pops = 0, fullBlocked = 0, emptyBlocked = 0, resetWrites = 0, simultaneous = 0;
     auto cycle = [&](bool reset, bool valid, bool ready) {
+      ++cycles;
       sim.memo.clear(); sim.memo[sim.key(sim.arg(1))] = reset;
       sim.memo[sim.key(sim.arg(2)) + ".valid"] = valid; sim.memo[sim.key(sim.arg(3)) + ".ready"] = ready;
       std::map<std::string, uint64_t> data;
@@ -150,9 +148,19 @@ void behavior(MLIRContext &context) {
     // Fill while the read engine is stalled on a burst. Its AR payload must
     // remain visible until dequeue, even when later requests fill the queue.
     for (unsigned i = 0; i < 100; ++i) { cycle(true, true, false); cycle(false, true, false); cycle(false, true, false); cycle(false, true, false); }
+    // Model the engine's final-beat-only dequeue: two pending AR requests,
+    // eight stalled/non-final R beats per request, then one last-beat fire.
+    // Full queue pressure must not replace either head's id/address/len/size.
+    for (unsigned burst = 0; burst < 50; ++burst) {
+      cycle(true, false, false); cycle(false, true, false); cycle(false, true, false);
+      for (unsigned request = 0; request < 2; ++request) {
+        for (unsigned beat = 0; beat < 8; ++beat) cycle(false, true, false);
+        cycle(false, false, true);
+      }
+    }
     for (unsigned i = 0; i < 20000; ++i) cycle((random()%23)==0, random()&1, random()&1);
     require(pushes > 1000 && pops > 1000 && fullBlocked > 100 && emptyBlocked > 100 && resetWrites > 100 && simultaneous > 100, "insufficient queue corner coverage");
-    llvm::outs() << name << ": 20400 cycles, pushes " << pushes << ", pops " << pops << ", reset writes " << resetWrites << ", full/empty blocked " << fullBlocked << "/" << emptyBlocked << "\n";
+    llvm::outs() << name << ": " << cycles << " cycles, pushes " << pushes << ", pops " << pops << ", reset writes " << resetWrites << ", full/empty blocked " << fullBlocked << "/" << emptyBlocked << "\n";
   }
 }
 void mapping(MLIRContext &context) {
@@ -230,7 +238,19 @@ void rejection(MLIRContext &context) {
   }
 }
 }
-int main() {
-  try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>(); behavior(context); mapping(context); rejection(context); return 0; }
-  catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+int main(int argc, char **argv) {
+  try {
+    MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 2) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &context);
+      require(bool(root) && succeeded(verify(*root)), "cannot parse/verify actual AR buffer boundary");
+      auto c = *root->getOps<CircuitOp>().begin();
+      require(c.getName() == "GGPrintCPUStreamReadBufferWrapper", "wrong expanded AR boundary");
+      behavior(c); return 0;
+    }
+    require(argc == 1, "usage: goldengate-cpu-stream-read-buffer-test [expanded-boundary.mlir]");
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+    require(succeeded(goldengate::addCPUStreamReadBuffer(c, error)) && succeeded(verify(*root)), error);
+    behavior(c); mapping(context); rejection(context); return 0;
+  } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
