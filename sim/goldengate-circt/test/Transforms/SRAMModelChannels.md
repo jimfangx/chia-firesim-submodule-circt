@@ -4649,3 +4649,60 @@ unchanged input direction, and comparison assumptions required the MLIR
 newline escape and externally declared child interface. Corrected replays
 and comparisons above pass. No manager verification gate was started by this
 iteration; the supplied prior gate passes do not validate enabled Print.
+
+
+### Expanded Rocket Print driver allocation (iteration 121)
+
+`preparePrintBridgeAllocatedHeader` now accepts the expanded Rocket F1Shim
+boundary as well as the selected control master. It calls the shared Rocket
+allocator over the actual original bridge, Print, LoadMem and CPU count
+registries. This preserves FPGATop's registration order and stable region sort;
+a Print-only allocation at this boundary would give incorrect driver addresses.
+Every active decoder region must equal the derived complete map. Print/count
+bindings, six-word configuration permissions, queued host identities and native
+stream indices are validated before any constructor text is published.
+
+The CPU header emitter now discovers the empty incoming writer by its contract
+attribute and unique live InstanceGraph path. Imported catalog symbols retain a
+prefix; their spelling does not determine whether the writer exists. Additional
+live writer definitions or multiple live paths are rejected, including an extra
+writer instantiated twice alongside the unique allocated writer. The existing
+SSA checks still require count and data to resolve to the same live storage,
+32-bit read-only count words, the actual DMA selector/dequeue handshake, queue
+capacity and inactive incoming handshakes. No compiler IR, annotations or
+existing collateral are changed by the Print fragment API, including rejection.
+
+Reproduce with `goldengate-print-binding-test --rocket-allocated-header INPUT
+OUTPUT_PREFIX`, using both iteration-120 `binding.mlir.rocket-f1-shim*.mlir`
+outputs. The test emits `.const.h` and `.decoders.h` fragments, rejects nine
+invalid boundaries atomically per order, and checks binding traversal order
+independence. Allocation text agrees between orders. Decoder clock ratios
+follow the respective instantiated host order (the reversed fixture intentionally
+exchanges the two bridge clocks). Compile each pair under the standard GET_*
+guards against the actual `widget_registry_t`, synthesized Print and CPU stream
+headers. `PrintRocketAllocatedHeaderCompare.py INPUT HEADER GOLDEN REPORT`
+compares the resulting addresses/descriptors with active CIRCT allocation and
+the immutable SFC RTL. Production compiler and focused test builds succeed;
+`goldengate-print-binding` and `goldengate-cpu-managed-stream-header` pass (2/2),
+including 66 CPU header rejection cases. Both constructor sets compile with
+`-std=c++17 -Wall -Wextra -Werror -fsyntax-only`.
+
+Exact read-only golden artifact:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+Eight native bank regions remain identical. The shared CPU transport ABI matches:
+6144 512-bit beats, 524288-byte DMA windows, padded 32-bit read-only counts and
+empty incoming writer behavior. The fixture disables Print; candidate Print
+bases are 544 and 576, CPU count addresses are 624/628/632, versus the oracle's
+single TracerV count at 568. This expected catalog difference is recorded rather
+than reported as absolute-address parity.
+
+Evidence is in the U250 generated-source directory's
+`iteration121-print-rocket-header/`: replay stdout/stderr for both orders,
+constructor/decoder fragments, `compare.json`, C++ compilation logs and
+`ctest.log`. Earlier local build/test-fixture mistakes and comparison assumptions
+were corrected before the passing results; no immutable fixture was modified.
+No FireSim manager verification gate was started. This is an expanded
+Print/count fragment, not the complete enabled-Print production driver header.
+Next: compose it with native Rocket constructors and interface/collateral output,
+then connect the expanded path to production enabled-Print ingestion. Enabled
+Print runtime and the SFC UART-bearing workload differential remain pending.

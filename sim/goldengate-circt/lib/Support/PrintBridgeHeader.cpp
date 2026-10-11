@@ -157,11 +157,19 @@ LogicalResult goldengate::preparePrintBridgeDecoderHeader(CircuitOp circuit,
   return success();
 }
 
+// Oracle: Widget.genConstructor, FPGATop widget registration and CPU stream
+// descriptors. Requires a completed selected master or expanded Rocket F1Shim,
+// live queued hosts, matching control identities and the materialized registry.
+// Reads retained bridge constructors/clocks; consumes/produces no annotations.
+// InstanceGraph and SSA forwarding validate queue storage/count/DMA identity.
+// Preserves all IR and analyses; publish the Print/count text only after the
+// complete batch succeeds. Other Rocket bridge constructors remain separate.
 LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
     ArrayRef<FModuleOp> hosts, std::string &header, std::string &error) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGControlMasterWrapper" || hosts.empty())
-    return reject("allocated Print header requires the selected control master and queued hosts");
+  bool rocket = circuit.getName() == "F1Shim";
+  if ((!rocket && circuit.getName() != "GGControlMasterWrapper") || hosts.empty())
+    return reject("allocated Print header requires the selected control master or Rocket F1Shim and queued hosts");
   std::string decoderText;
   if (failed(preparePrintBridgeDecoderHeader(circuit, hosts, decoderText, error))) return failure();
   circt::firrtl::InstanceGraph graph(circuit);
@@ -194,7 +202,8 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
   auto actual = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
   auto sources = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
   if (!catalog || catalog.size() != hosts.size() || !readBindings || readBindings != writeBindings ||
-      readBindings.size() != hosts.size() + 1 || !actual || actual.size() != readBindings.size() || !sources)
+      !actual || !sources || (rocket ? actual.size() != hosts.size() + 11 :
+          (readBindings.size() != hosts.size() + 1 || actual.size() != readBindings.size())))
     return reject("allocated Print header requires a complete matching Print/count catalog");
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<StringAttr> controlPorts;
@@ -247,7 +256,15 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
           {"GGCPUStreamCountBank"}, counts, error))) return reject("allocated Print header requires the live CPU count bank");
   widgets.push_back(counts); controlPorts.push_back(StringAttr::get(circuit.getContext(), "cpuStream_ctrl"));
   SmallVector<ControlMMIORegion> regions;
-  if (failed(allocateControlMMIORegions(25, widgets, regions, error))) return failure();
+  if (rocket) {
+    // FPGATop registers Print after the original bridges and before LoadMem
+    // and CPU streams. Their banks participate in the same stable size sort;
+    // deriving a Print-only map would silently emit wrong driver addresses.
+    SmallVector<ControlMMIOWidget> complete;
+    if (failed(allocateRocketControlMMIORegions(circuit, 25, hosts, complete, regions, error))) return failure();
+  } else if (failed(allocateControlMMIORegions(25, widgets, regions, error))) return failure();
+  if (regions.size() != actual.size())
+    return reject("allocated Print header region count differs from materialized allocation");
   for (auto [i, region] : llvm::enumerate(regions)) {
     auto row = dyn_cast<DictionaryAttr>(actual[i]);
     if (!row || row.getAs<StringAttr>("name") != region.name ||
@@ -257,6 +274,10 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
       return reject("allocated Print header MMIO regions differ from materialized register allocation");
     unsigned matches = 0;
     auto widget = llvm::find_if(widgets, [&](const auto &w) { return w.name == region.name; });
+    // Native Rocket bridges are attached at later wrappers. Only the Print
+    // and count constructor bindings belong to this fragment, but validate
+    // every region against the complete materialized register registry above.
+    if (widget == widgets.end()) continue;
     for (auto attr : readBindings) {
       auto binding = dyn_cast<DictionaryAttr>(attr);
       if (!binding || binding.getAs<StringAttr>("name") != region.name) continue;
@@ -280,10 +301,12 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
   raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::OutputFile)),
       b.getNamedAttr("fileSuffix", b.getStringAttr(".const.h")), b.getNamedAttr("body", b.getStringAttr(""))}));
   staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(raw));
-  if (failed(prepareCPUManagedStreamHeader(*staged, error, CPUStreamHeaderBoundary::SelectedOutgoing))) return failure();
+  if (failed(prepareCPUManagedStreamHeader(*staged, error, rocket ?
+          CPUStreamHeaderBoundary::Complete : CPUStreamHeaderBoundary::SelectedOutgoing))) return failure();
   auto cpu = cast<DictionaryAttr>(staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back()).getAs<StringAttr>("body");
   std::string result; llvm::raw_string_ostream out(result);
-  out << "// Selected Print/count allocation; include under the standard Golden Gate GET_* guards.\n"
+  out << (rocket ? "// Rocket Print/count allocation" : "// Selected Print/count allocation")
+      << "; include under the standard Golden Gate GET_* guards.\n"
          "#ifdef GET_INCLUDES\n#include <cstddef>\n#include <cstdint>\n#include \"print-bridge-decoders.h\"\n#endif // GET_INCLUDES\n"
          "#ifdef GET_SUBSTRUCT_CHECKS\n";
   for (auto [i, field] : llvm::enumerate(fields))

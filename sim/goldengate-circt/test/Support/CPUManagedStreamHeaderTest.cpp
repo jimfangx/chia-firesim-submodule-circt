@@ -126,6 +126,16 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
   if (bad == 29) c->setAttr("rawAnnotations",b.getArrayAttr({other}));
   if (bad == 30) c->setAttr("rawAnnotations",b.getArrayAttr({other,output,output}));
   if (bad == 31) c->removeAttr("rawAnnotations");
+  if (bad == 32) {
+    // A uniquely instantiated writer must not hide another tagged definition
+    // with two live instances. All writer paths participate in the contract.
+    b.setInsertionPointToEnd(c.getBodyBlock());
+    auto extra = cast<FModuleOp>(b.clone(*empty));
+    extra->setAttr("sym_name", b.getStringAttr("ImportedEmptyCPUStreamWrite"));
+    b.setInsertionPointToStart(top.getBodyBlock());
+    b.create<InstanceOp>(c.getLoc(), extra, "extraWriterA");
+    b.create<InstanceOp>(c.getLoc(), extra, "extraWriterB");
+  }
   return root;
 }
 const std::string printName = "print\"stream\\clock\n\t";
@@ -282,7 +292,7 @@ int main(int argc, char **argv) {
     require(StringRef(body).contains("GET_MANAGED_STREAM_CONSTRUCTOR") && !StringRef(body).contains("_struct"),"constructor guard/substruct differs");
     std::string before = dump(*root), error;
     require(failed(goldengate::prepareCPUManagedStreamHeader(c,error)) && dump(*root) == before,"duplicate constructor mutated IR");
-    for (unsigned bad = 1; bad <= 31; ++bad) {
+    for (unsigned bad = 1; bad <= 32; ++bad) {
       auto negative = fixture(ctx,bad); auto nc = *negative->getOps<CircuitOp>().begin(); before = dump(*negative);
       require(failed(goldengate::prepareCPUManagedStreamHeader(nc,error)) && !error.empty() && dump(*negative) == before,
           "invalid boundary accepted or mutated: " + std::to_string(bad));
@@ -310,7 +320,7 @@ int main(int argc, char **argv) {
     auto sharedBad = multiFixture(ctx,true,22); auto sc = *sharedBad->getOps<CircuitOp>().begin(); auto sharedBefore = dump(*sharedBad);
     require(failed(goldengate::prepareCPUManagedStreamHeader(sc,error)) && dump(*sharedBad) == sharedBefore,
         "extra shared queue instance escaped allocation validation");
-    llvm::outs() << "CPU managed stream header: single/ordered multi-stream descriptors, distinct/shared queue definitions, escaped names; 65 atomic rejections passed\n";
+    llvm::outs() << "CPU managed stream header: single/ordered multi-stream descriptors, distinct/shared queue definitions, escaped names; 66 atomic rejections passed\n";
     if (argc == 3) {
       auto boundary = parseSourceFile<ModuleOp>(argv[1],&ctx); require(bool(boundary),"boundary parse");
       auto bc = *boundary->getOps<CircuitOp>().begin();

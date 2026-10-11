@@ -135,10 +135,21 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     return field ? field->type : Type();
   };
   auto transport = liveModule("GGCPUStreamRead");
-  auto incoming = liveModule("GGEmptyCPUStreamWrite");
+  FModuleOp incoming;
+  // Catalog imports retain their own symbol prefix. Identify the writer by
+  // its typed contract and unique live path, never by a particular spelling.
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    if (!module->hasAttr("goldengate.fromHostCPUStreamCount")) continue;
+    auto *node = graph.lookup(module.getNameAttr());
+    unsigned paths = node ? countPaths(node, 2) : 0;
+    if (!paths) continue;
+    if (paths != 1 || incoming) return reject("CPU stream header requires one live incoming engine");
+    incoming = module;
+  }
   if (selected) {
     if (llvm::any_of(circuit.getOps<FModuleLike>(), [](FModuleLike module) {
-          return module.getModuleName() == "GGEmptyCPUStreamWrite";
+          return module.getModuleName() == "GGEmptyCPUStreamWrite" ||
+              module->hasAttr("goldengate.fromHostCPUStreamCount");
         }))
       return reject("selected outgoing CPU header cannot omit an existing incoming engine");
     auto module = dyn_cast<FModuleOp>(top->getModule().getOperation());

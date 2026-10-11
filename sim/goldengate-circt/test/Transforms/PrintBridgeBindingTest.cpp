@@ -2293,6 +2293,96 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
 }
 
 
+void rocketAllocatedHeader(Fixture &f, StringRef output) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error, header, decoders;
+  auto collect = [&](CircuitOp circuit) {
+    SmallVector<FModuleOp> hosts;
+    for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+      hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+    return hosts;
+  };
+  auto hosts = collect(f.circuit); auto before = dump(*f.root);
+  require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, hosts, header, error)) &&
+      succeeded(goldengate::preparePrintBridgeDecoderHeader(f.circuit, hosts, decoders, error)) &&
+      dump(*f.root) == before, error);
+  require(hosts.size() == 2, "Rocket header fixture requires two Print hosts");
+  for (unsigned slot = 0; slot < 2; ++slot) {
+    require(header.find("}, " + std::to_string(slot) + "U, args, " + std::to_string(slot + 1) + "U).release()") != std::string::npos,
+        "Rocket Print constructor stream index");
+    for (unsigned word = 0; word < 6; ++word)
+      require(header.find(std::to_string(544 + slot * 32 + word * 4) + "ULL,") != std::string::npos,
+          "Rocket Print constructor address");
+  }
+  for (unsigned slot = 0; slot < 3; ++slot)
+    require(header.find("\"), " + std::to_string(slot * 524288) + "ULL, " +
+        std::to_string(624 + 4 * slot) + "ULL, 6144U, 64U)") != std::string::npos,
+        "Rocket CPU constructor allocation");
+  // Reject stale register allocation, control identity, stream geometry and
+  // actual queue/empty-writer wiring. Each failed batch preserves text and IR.
+  for (unsigned bad = 0; bad < 9; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); auto hs = collect(c);
+    if (bad == 0) c.setName("FPGATop");
+    else if (bad == 1) {
+      auto decoder = named(c, "GGControlAddressDecode");
+      auto rows = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+      SmallVector<Attribute> values(rows.begin(), rows.end()); NamedAttrList row(cast<DictionaryAttr>(values[8]));
+      row.set("start", b.getI64IntegerAttr(548)); values[8] = row.getDictionary(ctx);
+      decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(values));
+    } else if (bad == 2) {
+      auto config = named(c, hs[0]->getAttrOfType<DictionaryAttr>("goldengate.printHost").getAs<StringAttr>("configModule").getValue());
+      config->removeAttr("goldengate.mmioRegisters");
+    } else if (bad == 3 || bad == 4) {
+      auto writes = named(c, "GGControlWidgetWriteWrapper");
+      auto rows = writes->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
+      SmallVector<Attribute> values(rows.begin(), rows.end());
+      if (bad == 3) values.pop_back(); else values.push_back(values.back());
+      writes->setAttr("goldengate.controlWriteBindings", b.getArrayAttr(values));
+      named(c, "GGControlReadDispatchWrapper")->setAttr("goldengate.controlReadBindings", b.getArrayAttr(values));
+    } else if (bad == 5) {
+      auto reader = named(c, "GGCPUStreamRead");
+      auto rows = reader->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+      SmallVector<Attribute> values(rows.begin(), rows.end()); NamedAttrList row(cast<DictionaryAttr>(values[1]));
+      row.set("bufferBaseAddress", b.getI64IntegerAttr(0)); values[1] = row.getDictionary(ctx);
+      reader->setAttr("goldengate.sourceStreams", b.getArrayAttr(values));
+    } else if (bad == 6) {
+      auto bank = named(c, "GGCPUStreamCountBank"); b.setInsertionPointToStart(bank.getBodyBlock());
+      auto zero = b.create<ConstantOp>(c.getLoc(), cast<UIntType>(bank.getPortType(3)), APInt(13, 0));
+      for (auto pad : bank.getOps<PadPrimOp>()) if (pad.getInput() == bank.getArgument(3)) pad->setOperand(0, zero);
+    } else {
+      FModuleOp writer;
+      for (auto m : c.getOps<FModuleOp>()) if (m->hasAttr("goldengate.fromHostCPUStreamCount")) writer = m;
+      require(bool(writer), "missing catalog writer");
+      if (bad == 7) writer->setAttr("goldengate.fromHostCPUStreamCount", b.getI32IntegerAttr(1));
+      else {
+        b.setInsertionPointToStart(writer.getBodyBlock());
+        auto one = b.create<ConstantOp>(c.getLoc(), UIntType::get(ctx, 1), APInt(1, 1));
+        for (auto conn : writer.getOps<StrictConnectOp>())
+          if (conn.getDest() == writer.getArgument(port(writer, "aw_ready"))) conn->setOperand(1, one);
+      }
+    }
+    auto saved = dump(*test); std::string rejected = "preserve";
+    require(failed(goldengate::preparePrintBridgeAllocatedHeader(c, hs, rejected, error)) &&
+        !error.empty() && rejected == "preserve" && dump(*test) == saved,
+        "Rocket header rejection " + std::to_string(bad) + ": " + error);
+  }
+  // Registry/binding traversal order cannot change constructor order or ABI.
+  for (auto [module, key] : {
+      std::pair<FModuleOp, StringRef>{named(f.circuit, "GGControlReadDispatchWrapper"), "goldengate.controlReadBindings"},
+      {named(f.circuit, "GGControlWidgetWriteWrapper"), "goldengate.controlWriteBindings"}}) {
+    auto rows = module->getAttrOfType<ArrayAttr>(key); SmallVector<Attribute> values(rows.begin(), rows.end());
+    std::reverse(values.begin(), values.end()); module->setAttr(key, b.getArrayAttr(values));
+  }
+  std::string reordered;
+  require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, hosts, reordered, error)) && reordered == header,
+      "Rocket binding order changed header: " + error);
+  for (auto [suffix, text] : {std::pair<StringRef, StringRef>{".const.h", header}, {".decoders.h", decoders}}) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + suffix).str(), ec);
+    require(!ec, "cannot write Rocket Print header"); file << text;
+  }
+  llvm::outs() << "PASS expanded Rocket Print/count header, nine atomic rejections and binding-order independence\n";
+}
+
 // This replay starts from a synthetic enabled-Print handoff plus actual Rocket
 // components. Seed the FAME identities explicitly in the TEST; the compiler
 // requires them and must not fabricate them from the host input port names.
@@ -5518,6 +5608,11 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]) == "--rocket-allocated-header") {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded Rocket F1Shim boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); rocketAllocatedHeader(f, argv[3]); return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-f1-shim-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded Print FPGATop boundary");
