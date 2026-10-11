@@ -3558,3 +3558,75 @@ translation and compare the five AXI channel queues with the immutable SFC
 boundary. Print-enabled production CLI/driver integration, general FAME1/FAME5,
 multiclock support and the UART-bearing SFC runtime baseline remain incomplete.
 No FireSim manager verification gates were started here. The port is incomplete.
+
+## Iteration 105: expanded Rocket/Print host memory buffering
+
+`mapPrintBridgeRocketFASEDHostMemoryBuffer` composes the shared native AXI
+buffer after address translation on the expanded Rocket/Print master. The
+Scala oracle is `MidasTransforms`/`FAMETransform`, followed by
+`SimulationMapping`/`FPGATop`'s `AXI4Buffer` between translation and the host
+crossbar. All five channels have independent depth-two, no-flow/no-pipe queues;
+AW and AR share a definition but retain separate state. Payload widths are
+63 bits for addresses, 73 for W, 6 for B and 71 for R. Host reset flushes
+pointer/full state, leaves RAM unreset and permits accepted RAM writes on a
+reset edge. Reads are asynchronous and writes are synchronous.
+
+The composition validates the live Rocket/Print allocation and the complete
+transformation on a clone before moving only the five new definitions into
+the live circuit. It replaces the one translated-master connection and binds
+the buffer to the existing host clock/reset sources. The active top, all 265
+prior module operations, their ports/block arguments, constructor metadata
+and annotation archive retain identity. No annotations are consumed or
+produced; callers must rebuild hierarchy analysis after insertion. Colliding
+symbols, unsupported constructor widths/constraints, missing archive/bindings,
+stale allocation, instantiated tops, missing deinterleaver and repeated mapping
+fail before live mutation.
+
+Mutable evidence is under the U250 generated-source tree at
+`iteration105-print-rocket-fased-host-memory-buffer/`. Replay iteration 104's
+saved deinterleaver boundaries with:
+
+```
+goldengate-print-binding-test --rocket-fased-host-memory-buffer-boundary INPUT OUTPUT_PREFIX
+goldengate-print-binding-test --rocket-fased-host-memory-buffer-boundary-reverse INPUT_REVERSE OUTPUT_PREFIX
+goldengate-fased-host-memory-buffer-test --expanded-boundary OUTPUT
+goldengate-fased-host-memory-buffer-test --expanded-boundary OUTPUT_REVERSE
+python3 test/Transforms/PrintRocketFASEDHostMemoryBufferCompare.py \
+  --before INPUT --after OUTPUT --before INPUT_REVERSE --after OUTPUT_REVERSE \
+  --sfc SFC_SV --baseline ITERATION81/candidate/post-fame-fased-host-memory-buffer.mlir \
+  --report-json EVIDENCE/rocket-fased-host-memory-buffer-comparison.json
+```
+
+The exact immutable artifact compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `AXI4Buffer_1` and
+`Queue_29`/`Queue_23`/`Queue_31`/`Queue_33`. Both orders match its 75 surviving
+ports, five queue instances, 54 payload routes, host clock/reset bindings,
+depth-two memory geometry, pointer/full equations and reset-independent RAM
+writes. SFC removes `auto_in_b_ready` and `Queue_31.io_deq_ready` because the
+B consumer is always ready; native retains B stalls. The actual native helper
+and four queue definitions also match iteration 81's ingestion of the
+immutable compiler fixture. The fixture disables Print, so this establishes
+the local host-memory contract, not enabled-Print runtime parity.
+
+Both expanded replays pass 23 atomic rejections, preserve all 264 prior module
+bodies outside the changed top, all 110 top ports, 21 Print modules and the
+archive, and check all 119 wrapper and 84 helper connections. Each actual
+composed circuit passes 256 exhaustive queue-state samples and 6,000
+five-channel hierarchical SSA edges against independent FIFO models: 17,380
+accepted enqueues, 17,147 dequeues, 8,350 stalls, 6,765 full samples, 9,487
+simultaneous enqueue/dequeue samples and 44 resets. Exhaustive samples cover
+48 reset writes, 64 full states and 32 RAM collisions. Compiler/test builds
+and Print-binding/shared-buffer CTests pass (12.38 seconds). Replay, behavior,
+comparison and CTest stderr are empty; the build reports only Ninja log
+recovery warnings. Supplied iteration 104 harness feedback passes CIRCT
+replacertl and required Verilator workloads; these prior gates do not verify
+the new Print composition.
+
+Next smallest step: compose the shared native LoadMem/FASED host-memory write
+arbiter onto this expanded buffered boundary and compare AW reservations,
+source IDs and accepted WLAST retirement with SFC `AXI4Xbar`/`Queue_21`.
+Print-enabled production CLI/driver integration, general FAME1/FAME5,
+multiclock support and the UART-bearing SFC runtime baseline remain incomplete.
+No FireSim manager verification gates were started here. The port is incomplete.

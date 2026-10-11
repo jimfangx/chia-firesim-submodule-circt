@@ -223,6 +223,16 @@ void behavior(CircuitOp circuit) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    if (argc == 3 && StringRef(argv[1]) == "--expanded-boundary") {
+      auto root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "invalid expanded buffer boundary");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDAddressTranslationWrapper" &&
+          top(circuit, "GGFASEDHostMemoryBuffer"), "missing expanded buffer helper");
+      queueEdges(circuit); behavior(circuit);
+      llvm::outs() << "PASS actual expanded host memory buffer SSA queues and helper\n";
+      return 0;
+    }
     auto setup=[&](){auto r=fixture(ctx);auto c=*r->getOps<CircuitOp>().begin();
       require(succeeded(goldengate::addFASEDAddressTranslation(c,error)),error);
       require(succeeded(goldengate::addFASEDReadDeinterleaver(c,error)),error);return r;};

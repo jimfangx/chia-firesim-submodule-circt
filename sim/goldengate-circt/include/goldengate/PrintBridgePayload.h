@@ -273,4 +273,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDAddressTranslation(
 /// sixteen eight-beat queues. Atomic; preserve existing IR identities/targets.
 mlir::LogicalResult mapPrintBridgeRocketFASEDReadDeinterleaver(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Buffer all five translated AXI channels with independent depth-two queues.
+/// Atomic; preserve the expanded Print/Rocket module, port and target identities.
+mlir::LogicalResult mapPrintBridgeRocketFASEDHostMemoryBuffer(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

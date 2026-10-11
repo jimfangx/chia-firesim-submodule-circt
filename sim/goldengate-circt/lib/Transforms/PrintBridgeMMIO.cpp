@@ -33,6 +33,7 @@
 #include "goldengate/FASEDHostMemory.h"
 #include "goldengate/FASEDAddressTranslation.h"
 #include "goldengate/FASEDReadDeinterleaver.h"
+#include "goldengate/FASEDHostMemoryBuffer.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1423,6 +1424,46 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDReadDeinterleaver(
         b.create<StrictConnectOp>(loc, deinterleaver.getResult(i), c.getSrc());
   b.create<ConnectOp>(loc, deinterleaver.getResult(2), boundary.getSrc());
   b.create<ConnectOp>(loc, translation.getResult(2), deinterleaver.getResult(3));
+  boundary.erase();
+  return success();
+}
+
+LogicalResult goldengate::mapPrintBridgeRocketFASEDHostMemoryBuffer(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDHostMemoryBuffer(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "Rocket Print host memory buffer produced invalid FIRRTL IR";
+    return failure();
+  }
+  FModuleOp top, helper;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == circuit.getName()) top = m;
+  InstanceOp translation;
+  for (auto i : top.getOps<InstanceOp>())
+    if (i.getName() == "translation") translation = i;
+  ConnectOp boundary;
+  for (auto c : top.getOps<ConnectOp>())
+    if (c.getSrc() == translation.getResult(3)) boundary = c;
+  // Validate the entire composition on a clone before moving only new
+  // definitions. Keep all existing operations and target identities live.
+  const StringRef definitions[]{"GGFASEDHostMemoryBuffer", "GGFASEDMemoryAddressQueue2",
+      "GGFASEDMemoryWriteQueue2", "GGFASEDMemoryAckQueue2", "GGFASEDMemoryReadQueue2"};
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (llvm::is_contained(definitions, m.getName())) {
+        if (m.getName() == definitions[0]) helper = m;
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+      }
+  OpBuilder b(boundary); auto loc = boundary.getLoc();
+  auto buffer = b.create<InstanceOp>(loc, helper, "memory_buffer");
+  for (auto c : llvm::make_early_inc_range(top.getOps<StrictConnectOp>()))
+    for (unsigned i = 0; i < 2; ++i)
+      if (c.getDest() == translation.getResult(i))
+        b.create<StrictConnectOp>(loc, buffer.getResult(i), c.getSrc());
+  b.create<ConnectOp>(loc, buffer.getResult(2), boundary.getSrc());
+  b.create<ConnectOp>(loc, boundary.getDest(), buffer.getResult(3));
   boundary.erase();
   return success();
 }
