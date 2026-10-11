@@ -47,8 +47,9 @@ std::string path(FModuleOp m,Value v) {
   auto i=v.getDefiningOp<InstanceOp>();require(bool(i),"unknown wrapper root");
   return i.getName().str()+"."+i.getPortName(cast<OpResult>(v).getResultNumber()).str();
 }
-void bindings(CircuitOp c) {
-  auto m=top(c,"GGCPUStreamPlatformWrapper"),old=top(c,"GGHostMemoryPlatformWrapper");
+void bindings(CircuitOp c, StringRef wrapper = "GGCPUStreamPlatformWrapper",
+              StringRef boundary = "GGHostMemoryPlatformWrapper") {
+  auto m=top(c,wrapper),old=top(c,boundary);
   std::map<std::string,std::string> got;
   for(auto conn:m.getOps<ConnectOp>())require(got.emplace(path(m,conn.getDest()),path(m,conn.getSrc())).second,"duplicate connection");
   for(auto conn:m.getOps<StrictConnectOp>())require(got.emplace(path(m,conn.getDest()),path(m,conn.getSrc())).second,"duplicate leaf connection");
@@ -140,7 +141,17 @@ int main(int argc,char **argv) {
     require(succeeded(goldengate::assembleCPUStreamPort(cc,error))&&succeeded(verify(*catalog)),"catalog writer/strict forwarding rejected");bindings(cc);behavior(cc);
     auto s=dump(*root);require(failed(goldengate::assembleCPUStreamPort(c,error)),"repeat accepted");require(s==dump(*root),"repeat mutated IR");
     llvm::outs()<<"15 atomic rejections; old bodies, aggregate bindings and copied/consumed targets preserved\n";
-    if(argc>=2){std::error_code ec;llvm::raw_fd_ostream os(argv[1],ec);require(!ec,"cannot write helper");os<<"module { firrtl.circuit \"GGCPUStreamPortAdapter\" {\n";top(c,"GGCPUStreamPortAdapter")->print(os);os<<"\n} }\n";}
+    if(argc>=2 && StringRef(argv[1])!="--print-platform"){std::error_code ec;llvm::raw_fd_ostream os(argv[1],ec);require(!ec,"cannot write helper");os<<"module { firrtl.circuit \"GGCPUStreamPortAdapter\" {\n";top(c,"GGCPUStreamPortAdapter")->print(os);os<<"\n} }\n";}
+    if(argc==4 && StringRef(argv[1])=="--print-platform") {
+      for (int i=2;i<4;++i) {
+        auto real=parseSourceFile<ModuleOp>(argv[i],&ctx);require(bool(real),"Print platform parse");
+        auto rc=*real->getOps<CircuitOp>().begin();
+        require(succeeded(verify(*real)),"Print platform invalid");
+        bindings(rc,"GGPrintCPUStreamPlatformWrapper","GGPrintCPUStreamWriteResponseBufferWrapper");behavior(rc);
+        llvm::outs()<<"PASS expanded Print platform identity wiring for every CPU payload bit: "<<argv[i]<<"\n";
+      }
+      return 0;
+    }
     if(argc>=3) {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"real parse");auto rc=*real->getOps<CircuitOp>().begin();auto n=rc->getAttrOfType<ArrayAttr>("rawAnnotations").size();
       require(succeeded(goldengate::assembleCPUStreamPort(rc,error)),error);require(succeeded(verify(*real)),"real invalid");bindings(rc);

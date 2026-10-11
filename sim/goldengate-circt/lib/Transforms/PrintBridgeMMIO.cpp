@@ -8,6 +8,7 @@
 #include "goldengate/HostMemoryReadResponses.h"
 #include "goldengate/HostMemoryOutputBuffer.h"
 #include "goldengate/HostMemoryPort.h"
+#include "goldengate/CPUStreamPort.h"
 #include "goldengate/EmptyCPUStreamWrite.h"
 #include "goldengate/TracerVTokenEngine.h"
 #include "goldengate/ClockBridgeControl.h"
@@ -2027,6 +2028,34 @@ LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteResponseBuffer(
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGPrintCPUStreamWriteResponseBufferWrapper" ||
           m.getName() == "GGCPUStreamBQueue2")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Required input: expanded Print B-buffer boundary, live Rocket allocation,
+// retained annotations and the exact buffered outgoing-only U250 CPU scalars.
+// No annotations consumed/produced. Copied targets transfer to the new wrapper;
+// CPU scalar targets stay on the retained inner module. Publish only the shared
+// combinational adapter and verified wrapper. Preserve all existing IR identities;
+// rebuild hierarchy analyses after wrapping. Reject unsupported shapes atomically.
+LogicalResult goldengate::mapPrintBridgeRocketCPUStreamPort(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  if (circuit.getName() != "GGPrintCPUStreamWriteResponseBufferWrapper") {
+    error = "Print CPU platform requires the expanded CPU B buffer boundary";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamPort(*staged, "GGPrintCPUStreamWriteResponseBufferWrapper",
+                                "GGPrintCPUStreamPlatformWrapper", error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "Print CPU platform produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGPrintCPUStreamPlatformWrapper" || m.getName() == "GGCPUStreamPortAdapter")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

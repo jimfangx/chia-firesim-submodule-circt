@@ -4434,3 +4434,59 @@ remain pending, as does the UART-bearing SFC runtime baseline. Iteration 116
 harness feedback reports passing CIRCT replacertl and required Verilator
 Rocket suites; it does not validate this enabled Print boundary. Manager
 verification remains owned by the harness; none was started here.
+
+### Iteration 118: expanded Rocket Print CPU platform AXI slave
+
+`mapPrintBridgeRocketCPUStreamPort` assembles the buffered 25 CPU scalars in
+`GGPrintCPUStreamWriteResponseBufferWrapper` into the 64/512/16 AXI slave in
+`GGPrintCPUStreamPlatformWrapper`. It validates live Print allocation, stages
+`attachCPUStreamPort` on a clone, verifies the result, and publishes only the
+new wrapper and shared `GGCPUStreamPortAdapter`. All prior module, port, SSA
+and operation identities remain intact. Copied targets transfer recursively;
+CPU scalar targets remain on the retained inner module.
+
+The shared preflight supports the original memory platform boundary and the
+expanded Print B boundary. It compares actual SSA roots and FIRRTL field IDs,
+counts ordinary and strict drivers together, and requires unique forwarding.
+The four buffered B leaves resolve to the retained queue's dequeue bundle;
+the other CPU scalars resolve to the retained simulator child. No engine,
+queue, state, protocol gating or target-clock behavior is changed.
+
+The Scala oracle is `FPGATop.scala`'s flipped CPU AXI bundle and direct node
+connection, following its `AXI4Buffer()` and the `SimulationMapping` boundary
+in `MidasTransforms.scala`. Host clock/reset conventions follow
+`FAMETransform.scala`. Exact immutable golden compared:
+
+```text
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+`PrintRocketCPUStreamPortCompare.py` checks FPGATop's complete 37-leaf CPU
+slave ABI, all 25 buffered identity routes, and the 12 unused metadata/data
+inputs in the zero-sink profile. It checks all 123 native wrapper connections,
+97 copied ports, the 25 consumed scalars, the 98 resulting public ports and
+the complete recursive annotation archive. All 297 prior module bodies and
+all 21 Print modules remain; the candidate contains 299 modules. The adapter
+body also matches the shared native baseline
+`iteration81-print-rocket-fased-read-buffer/candidate/post-fame-cpu-stream-platform.mlir`.
+
+The production compiler and both focused test binaries build. Print binding
+and CPU stream port CTests pass (2/2, 5.49 seconds). Both actual Rocket Print
+orders pass 17 atomic rejection checks, the structured golden comparison,
+and identity checks for every connected CPU payload bit. The original native
+Rocket replay also passes with 89 ports and 1,676 retained annotations. All
+replay, behavior and comparison stderr logs are empty. Evidence is retained
+under:
+
+```text
+sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration118-print-rocket-cpu-platform/
+```
+
+Next: compose the expanded CPU/control/memory boundary into the native
+`FPGATop` shell, then continue through platform specialization and collateral.
+Production enabled-Print integration and runtime parity remain pending, as
+does the SFC UART-bearing runtime baseline. Supplied iteration-117 harness
+feedback passes CIRCT replacertl and required Verilator suites; these gates
+do not validate the expanded enabled-Print boundary. No manager verification
+step was started here. Shared recovery, clock-control and harness edits remain
+outside this checkpoint.

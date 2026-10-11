@@ -325,4 +325,8 @@ mlir::LogicalResult mapPrintBridgeRocketCPUStreamResponseBuffer(
 /// Atomic; retain existing identities and consumed B targets.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamWriteResponseBuffer(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Expose buffered CPU streams as the platform's 64/512/16 AXI slave.
+/// Atomic; preserve existing IR and CPU scalar targets, transfer copied ports.
+mlir::LogicalResult mapPrintBridgeRocketCPUStreamPort(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

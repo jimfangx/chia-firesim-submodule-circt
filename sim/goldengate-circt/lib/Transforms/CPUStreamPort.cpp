@@ -1,23 +1,35 @@
 // See LICENSE for license details.
 // Oracle: FPGATop.cpuManagedAXI4NodeTuple and cpu_managed_axi4 IO <> node.out.
-// Required boundary: uninstantiated GGHostMemoryPlatformWrapper with all 25
-// recorded U250 CPU stream scalars forwarded uniquely to its retained child.
+// Required boundary: selected uninstantiated platform or expanded Print B
+// wrapper. All 25 CPU scalars forward uniquely to the retained child or B queue.
 // Required engines: buffered outgoing CPU streams, zero incoming streams.
 // Mutation: aggregate 64/512/16 AXI4 slave plus combinational leaf adapter.
 // Unused AW/AR metadata and W data/last inputs have no users in this profile.
 // No state, buffering, ID adaptation, or protocol gating is added here.
 // Annotations: none consumed/produced. Copied targets transfer; CPU scalar
 // identities stay on the retained inner module. Existing bodies are preserved.
+// Analyses required: none. Rebuild hierarchy analyses after wrapping.
+// Output: exact slave ABI and unchanged buffered CPU semantics; no new state.
 #include "goldengate/CPUStreamPort.h"
 #include "mlir/IR/Builders.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include <functional>
 #include <map>
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::assembleCPUStreamPort(CircuitOp circuit,
                                                std::string &error) {
-  constexpr StringLiteral oldName="GGHostMemoryPlatformWrapper";
-  constexpr StringLiteral newName="GGCPUStreamPlatformWrapper";
+  return attachCPUStreamPort(circuit, "GGHostMemoryPlatformWrapper",
+                             "GGCPUStreamPlatformWrapper", error);
+}
+
+LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
+    StringRef oldName, StringRef newName, std::string &error) {
+  bool print = oldName == "GGPrintCPUStreamWriteResponseBufferWrapper";
+  if (oldName != "GGHostMemoryPlatformWrapper" && !print) {
+    error = "CPU stream platform adapter requires a supported selected boundary";
+    return failure();
+  }
   constexpr StringLiteral helperName="GGCPUStreamPortAdapter";
   auto reject=[&](StringRef s){error=s.str();return failure();};
   FModuleOp inner,read,write;
@@ -69,27 +81,56 @@ LogicalResult goldengate::assembleCPUStreamPort(CircuitOp circuit,
   if(cp.type!=ClockType::get(ctx)||cp.direction!=Direction::In||rp.type!=uint(1)||rp.direction!=Direction::In)
     return reject("CPU stream platform adapter requires host clock/reset inputs");
   bool used=false;circuit.walk([&](InstanceOp i){used|=i.getModuleName()==oldName;});
-  InstanceOp sim,memory;unsigned instances=0;
+  InstanceOp sim,companion;unsigned instances=0;
   for(auto i:inner.getOps<InstanceOp>()) {
-    ++instances;if(i.getName()=="sim"&&i.getModuleName()=="GGHostMemoryReadResponseWrapper")sim=i;
-    if(i.getName()=="memory_port"&&i.getModuleName()=="GGHostMemoryPortAdapter")memory=i;
+    ++instances;
+    if(i.getName()=="sim" && i.getModuleName()==(print ?
+        "GGPrintCPUStreamResponseBufferWrapper" : "GGHostMemoryReadResponseWrapper")) sim=i;
+    if(i.getName()==(print ? "bQueue" : "memory_port") &&
+        i.getModuleName()==(print ? "GGCPUStreamBQueue2" : "GGHostMemoryPortAdapter")) companion=i;
   }
-  if(used||instances!=2||!sim||!memory)return reject("CPU stream platform adapter requires the unique memory platform wrapper");
-  auto childPort=[&](StringRef n)->Value {
-    for(auto [i,p]:llvm::enumerate(sim.getPortNames()))if(cast<StringAttr>(p).getValue()==n)return sim.getResult(i);
+  if(used||instances!=2||!sim||!companion)
+    return reject("CPU stream platform adapter requires the unique selected wrapper and retained companion");
+  auto arg=[&](FModuleOp m,unsigned i){return m.getBodyBlock()->getArgument(i);};
+  auto childPort=[](InstanceOp i,StringRef n)->Value {
+    for(auto [j,p]:llvm::enumerate(i.getPortNames()))
+      if(cast<StringAttr>(p).getValue()==n)return i.getResult(j);
     return {};
   };
-  auto arg=[&](FModuleOp m,unsigned i){return m.getBodyBlock()->getArgument(i);};
+  // Compare SSA roots plus FIRRTL field IDs, so repeated subfield operations
+  // cannot conceal a duplicate driver. The Print boundary buffers B here;
+  // all other scalars forward directly to the retained sim child.
   for(auto leaf:leaves) {
-    auto n="cpu_stream_"+leaf.name.str();Value a=arg(inner,consumed.at(n)),v=childPort(n);
-    if(!v||v.getType()!=a.getType()||!a.hasOneUse())return reject("CPU stream scalar requires one exact child forwarding connection");
-    auto d=leaf.direction==Direction::In?v:a,s=leaf.direction==Direction::In?a:v;
+    auto n="cpu_stream_"+leaf.name.str();Value a=arg(inner,consumed.at(n));
+    if(!a.hasOneUse())return reject("CPU stream scalar requires one exact forwarding connection");
+    Value peerRoot=childPort(sim,n);unsigned fieldID=0;
+    if(print && leaf.name.starts_with("b_")) {
+      peerRoot=childPort(companion,"deq");
+      if(!peerRoot)return reject("CPU stream platform requires the retained B dequeue bundle");
+      Type type=peerRoot.getType();
+      auto select=[&](StringRef field)->bool {
+        auto bundle=dyn_cast<BundleType>(type);if(!bundle)return false;
+        auto index=bundle.getElementIndex(field);if(!index)return false;
+        fieldID+=bundle.getFieldID(*index);type=bundle.getElementType(*index);return true;
+      };
+      auto rest=leaf.name.drop_front(2);
+      if(rest.starts_with("bits_")) {
+        if(!select("bits")||!select(rest.drop_front(5)))
+          return reject("CPU stream platform requires the exact B payload fields");
+      } else if(!select(rest))return reject("CPU stream platform requires B ready/valid");
+      if(type!=a.getType())return reject("CPU stream platform requires matching B leaf widths");
+    } else if(!peerRoot || peerRoot.getType()!=a.getType())
+      return reject("CPU stream platform requires matching retained child ports");
+    auto peer=circt::FieldRef(peerRoot,fieldID),outer=getFieldRefFromValue(a);
+    auto d=leaf.direction==Direction::In?peer:outer;
+    auto s=leaf.direction==Direction::In?outer:peer;
     unsigned drivers=0,matches=0;
     for(auto &op:inner.getBodyBlock()->getOperations())
-      if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==d) {
-        ++drivers;matches+=op.getOperand(1)==s;
+      if(isa<ConnectOp,StrictConnectOp>(op)&&getFieldRefFromValue(op.getOperand(0))==d) {
+        ++drivers;matches+=getFieldRefFromValue(op.getOperand(1))==s && op.getOperand(0).getType()==a.getType() &&
+            op.getOperand(1).getType()==a.getType();
       }
-    if(drivers!=1||matches!=1)return reject("CPU stream scalar requires a unique direct child binding");
+    if(drivers!=1||matches!=1)return reject("CPU stream scalar requires a unique direct child or buffered B binding");
   }
   // All rejection paths precede mutation. Generate ordinary FIRRTL operations.
   auto token=[&](ArrayRef<std::pair<StringRef,unsigned>> fs){
