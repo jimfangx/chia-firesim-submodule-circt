@@ -127,6 +127,12 @@ void writeStub(CircuitOp c,StringRef name) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    if(argc==4&&StringRef(argv[1])=="--emit-collateral") {
+      auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"collateral boundary parse");
+      auto c=*real->getOps<CircuitOp>().begin();
+      require(c.getName()=="F1Shim"&&succeeded(verify(c)),"collateral requires verified F1Shim boundary");
+      emitCollateral(c,argv[3]);return 0;
+    }
     auto make=[&](){auto r=fixture(ctx);auto c=*r->getOps<CircuitOp>().begin();require(succeeded(goldengate::assembleFPGATopShell(c,error)),error);return r;};
     auto root=make();auto c=*root->getOps<CircuitOp>().begin();applyShim(c);
     for(unsigned mode=0;mode<11;++mode) {

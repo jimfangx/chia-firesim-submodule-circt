@@ -333,4 +333,8 @@ mlir::LogicalResult mapPrintBridgeRocketCPUStreamPort(
 /// Requires FAME host identities; preserve all old IR and private targets.
 mlir::LogicalResult mapPrintBridgeRocketFPGATopShell(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Specialize the expanded Print shell for the one-channel U250 platform.
+/// Preserve old IR; add host request ID counters and DDR/XDC annotations.
+mlir::LogicalResult mapPrintBridgeRocketF1Shim(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

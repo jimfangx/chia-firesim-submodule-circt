@@ -4565,3 +4565,87 @@ UART-bearing runtime baseline still pending. Those gates do not validate this
 expanded Print path. No FireSim manager verification step was started here.
 Shared recovery, clock-control, harness and outer-plan changes are excluded
 from this checkpoint.
+
+### Expanded Print Rocket F1Shim specialization (iteration 120)
+
+`mapPrintBridgeRocketF1Shim` composes the expanded Print FPGATop boundary
+through the shared CIRCT U250 specialization. Before cloning, it requires one
+expanded Print CPU platform instance and exactly five identity connections,
+with matching names, types and directions. Missing, repeated, competing or
+misdirected connections are rejected. The shared specializer requires the
+exact one-channel U250 AXI contracts and a unique retained HostClockSource;
+existing DDR defines/XDC paths and unsupported platform shapes are rejected.
+After verification, only the new F1Shim module and circuit/archive identity
+are published. Existing modules, ports, SSA arguments and operations survive.
+Hierarchy analyses must be rebuilt after the new outer module is published.
+
+The semantic oracle is `platform/F1Shim.scala`, including the two synchronous
+host-reset 12-bit request ID counters that advance on independent control AW
+and AR handshakes, the AXI4/Nasti PCIS conversion, inactive QSFP lanes, and DDR
+channel defines. `PlatformShim.scala` supplies the U250 XDC paths. This stays
+outside FAME target-cycle state and follows the platform boundary described
+in `MidasTransforms.scala`; the FAME host convention comes from
+`FAMETransform.scala`. The mapper consumes no annotations, recursively
+retargets circuit identity while retaining local targets, and produces one DDR
+OutputFile and one XDCPathToCircuitAnnotation.
+
+Reproduce using `goldengate-print-binding-test --rocket-f1-shim-boundary[-reverse]
+INPUT OUTPUT_PREFIX` with the iteration-119 expanded shell outputs. Compare
+both orders using `PrintRocketF1ShimCompare.py --before INPUT --after OUTPUT
+--baseline NATIVE_F1SHIM --sfc GOLDEN --stub STUB --report-json REPORT`.
+Lower the actual new module with pinned `firtool --format=mlir STUB -o RTL`,
+then compare again with `--rtl RTL`. The stub preserves the actual F1Shim and
+an external FPGATop declaration; it is boundary evidence, not a full simulator.
+`goldengate-f1-shim-test --emit-collateral OUTPUT STUB` emits collateral from
+the verified expanded candidate and checks five invalid file sets leave the
+output bytes untouched. Pass the resulting `.defines.vh` as `--defines`.
+
+The comparison checks every retained module and the complete recursive raw
+annotation archive, the shared F1Shim body, all external leaf names/widths/
+directions and every combinational platform route against SFC. An interpreter
+executes the candidate's actual register-driver CIRCT DAG over 30,000 host
+cycles, independently stalling AW/AR, forcing counter wraps and synchronous
+resets, and varying ignored incoming request IDs. The SFC always blocks and
+expressions establish the reference transition. Four injected counter faults
+(reset value, increment, rollover width and handshake qualification) must be
+caught by the differential schedule.
+
+The replay inherits the explicitly seeded FAME host identities from iteration
+119. Neither mapper fabricates identities. The immutable SFC fixture has Print
+disabled; its platform ABI and shared behavior are useful oracles, but matching
+them does not establish enabled-Print production ingestion or runtime parity.
+Next: compose expanded Print driver/collateral emission, then connect the
+validated expanded path to production ingestion and its enabled-feature gate.
+
+Iteration-120 validation passed: production compiler and both focused test
+executables build; `goldengate-print-binding-test` and `goldengate-f1-shim-test`
+CTest entries pass (2/2). Both real expanded Rocket replays retain all 300
+prior module bodies, including 21 Print modules, preserve port/SSA/operation
+identities, and pass 18 atomic rejection cases per order. The complete raw
+archive transfer and the unique retained HostClockSource match. Pinned firtool
+lowers the actual new F1Shim boundary successfully. The comparison matches
+143 external leaf interfaces and 129 canonical combinational routes; the
+counter DAG matches 30,000 host cycles, two wraps per counter, 31,508 independent
+stall events and three reset cycles. All four counter mutants are rejected.
+Candidate OutputFile emission matches the full DDR header; five invalid
+collateral requests preserve existing output bytes and IR. U250 XDC paths
+remain `firesim_top` before and after linking.
+
+Exact immutable SFC artifacts compared (read only):
+
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`
+  — F1Shim interfaces, combinational routes and synchronous counter transitions
+  match the candidate's corresponding platform output.
+- The same directory's `FireSim-generated.defines.vh` — exact emitted-byte
+  match for all DDR channel defines and comments.
+
+Evidence is under the U250 generated-source directory's
+`iteration120-print-rocket-f1-shim/`: `ctest-final.log`,
+`replay-retry[-reverse].stdout.log`, `f1-shim.stub.mlir`, `f1-shim.sv`,
+`FireSim-generated.defines.vh`, `f1-shim-all.json`, `collateral.stdout.log`,
+`compare-retry.stdout.log`, and `compare.json`. Earlier failed local attempts
+are retained separately: one test direction mutation initially selected the
+unchanged input direction, and comparison assumptions required the MLIR
+newline escape and externally declared child interface. Corrected replays
+and comparisons above pass. No manager verification gate was started by this
+iteration; the supplied prior gate passes do not validate enabled Print.

@@ -10,6 +10,7 @@
 #include "goldengate/HostMemoryPort.h"
 #include "goldengate/CPUStreamPort.h"
 #include "goldengate/FPGATopShell.h"
+#include "goldengate/F1Shim.h"
 #include "goldengate/EmptyCPUStreamWrite.h"
 #include "goldengate/TracerVTokenEngine.h"
 #include "goldengate/ClockBridgeControl.h"
@@ -2081,6 +2082,70 @@ LogicalResult goldengate::mapPrintBridgeRocketFPGATopShell(
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "FPGATop")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Required input invariants: validated live Rocket Print allocation; the
+// expanded five-port FPGATop shell forwards each public interface once to its
+// unique Print CPU platform child; retained HostClockSource and raw archive.
+// Annotations consumed: none. Produced: DDR OutputFile and U250 XDCPaths.
+// Transfer circuit identity recursively; keep local targets on retained modules.
+// IR mutations: publish only the verified shared F1Shim, circuit/archive rename.
+// Analyses required: Print allocation. Preserved: existing modules, ports, SSA
+// values and operations. Rebuild hierarchy analyses after adding the platform.
+// Output invariants: exact U250 interfaces, two host-reset modulo-4096 control
+// request ID counters, inactive QSFP lanes, one memory channel. Clone staging
+// makes all unsupported boundary and verification failures atomic.
+LogicalResult goldengate::mapPrintBridgeRocketF1Shim(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  FModuleOp shell, platform;
+  for (auto m : circuit.getOps<FModuleOp>()) {
+    if (m.getName() == "FPGATop") shell = m;
+    if (m.getName() == "GGPrintCPUStreamPlatformWrapper") platform = m;
+  }
+  auto reject = [&]() {
+    error = "Print F1Shim requires the expanded five-port FPGATop identity shell";
+    return failure();
+  };
+  if (circuit.getName() != "FPGATop" || !shell || !platform || shell.getNumPorts() != 5 ||
+      llvm::range_size(shell.getOps<InstanceOp>()) != 1) return reject();
+  auto child = *shell.getOps<InstanceOp>().begin();
+  if (child.getModuleName() != platform.getName()) return reject();
+  SmallVector<std::pair<Value, Value>> expected;
+  for (auto [i, p] : llvm::enumerate(shell.getPorts())) {
+    StringRef name = p.name.getValue();
+    StringRef innerName = name == "clock" ? "hostClock" : name == "reset" ? "hostReset" : name;
+    std::optional<unsigned> index;
+    for (auto [j, q] : llvm::enumerate(platform.getPorts()))
+      if (q.name.getValue() == innerName && q.type == p.type && q.direction == p.direction) index = j;
+    if (!index || *index >= child.getNumResults()) return reject();
+    Value arg = shell.getArguments()[i], peer = child.getResult(*index);
+    expected.emplace_back(p.direction == Direction::In ? peer : arg,
+                          p.direction == Direction::In ? arg : peer);
+  }
+  for (auto &op : shell.getBodyBlock()->getOperations()) {
+    if (&op == child.getOperation()) continue;
+    Value dest, src;
+    if (auto c = dyn_cast<ConnectOp>(op)) {dest = c.getDest(); src = c.getSrc();}
+    else if (auto c = dyn_cast<StrictConnectOp>(op)) {dest = c.getDest(); src = c.getSrc();}
+    else return reject();
+    auto route = llvm::find(expected, std::make_pair(dest, src));
+    if (route == expected.end()) return reject();
+    expected.erase(route);
+  }
+  if (!expected.empty()) return reject();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(assembleF1Shim(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "Print F1Shim produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "F1Shim")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

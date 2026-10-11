@@ -2296,6 +2296,102 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
 // This replay starts from a synthetic enabled-Print handoff plus actual Rocket
 // components. Seed the FAME identities explicitly in the TEST; the compiler
 // requires them and must not fabricate them from the host input port names.
+void rocketF1Shim(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto body = [](FModuleOp m) {
+    std::string text; llvm::raw_string_ostream out(text);
+    m->print(out, OpPrintingFlags().useLocalScope()); return text;
+  };
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  SmallVector<SmallVector<PortInfo>> priorPorts; SmallVector<Operation *> operations;
+  std::map<std::string, std::string> bodies;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts()); bodies[m.getName().str()] = body(m);
+    arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+    for (auto &op : m.getBodyBlock()->getOperations()) operations.push_back(&op);
+  }
+  auto originalArchive = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  for (unsigned bad = 0; bad < 17; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); auto shell = named(c, "FPGATop");
+    auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> as(raw.begin(), raw.end());
+    unsigned source = 0;
+    for (auto [i, a] : llvm::enumerate(as))
+      if (cast<DictionaryAttr>(a).getAs<StringAttr>("class").getValue() == goldengate::AnnotationClasses::HostClockSource) source = i;
+    if (bad == 0) c.setName("WrongTop");
+    else if (bad == 1) c->removeAttr("rawAnnotations");
+    else if (bad == 2) named(c, "GGPrintBridgeHostWrapper")->removeAttr("goldengate.printHostBindings");
+    else if (bad == 3) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(), b.getStringAttr("F1Shim"), shell.getConventionAttr(), ArrayRef<PortInfo>{});
+    } else if (bad == 4) {
+      b.setInsertionPointToEnd(named(c, "GGPrintCPUStreamPlatformWrapper").getBodyBlock());
+      b.create<InstanceOp>(c.getLoc(), shell, "alreadyUsed");
+    } else if (bad == 5) {as.erase(as.begin()+source); c->setAttr("rawAnnotations", b.getArrayAttr(as));}
+    else if (bad == 6) {as.push_back(as[source]); c->setAttr("rawAnnotations", b.getArrayAttr(as));}
+    else if (bad == 7) {
+      NamedAttrList a(cast<DictionaryAttr>(as[source])); a.set("target", b.getStringAttr("~FPGATop|Other>clock"));
+      as[source] = a.getDictionary(ctx); c->setAttr("rawAnnotations", b.getArrayAttr(as));
+    } else if (bad == 8 || bad == 9) {
+      as.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(bad == 8 ?
+          goldengate::AnnotationClasses::OutputFile : goldengate::AnnotationClasses::XDCPaths)),
+          b.getNamedAttr("fileSuffix", b.getStringAttr(".defines.vh"))}));
+      c->setAttr("rawAnnotations", b.getArrayAttr(as));
+    } else if (bad == 10) {
+      auto inst = *shell.getOps<InstanceOp>().begin(); inst.setModuleNameAttr(FlatSymbolRefAttr::get(ctx, "Other"));
+    } else if (bad == 11) {auto conn = *shell.getOps<ConnectOp>().begin(); conn.erase();}
+    else if (bad == 12) {
+      auto conn = *shell.getOps<ConnectOp>().begin(); b.setInsertionPoint(conn); b.clone(*conn);
+    } else if (bad == 13) {
+      auto conn = *shell.getOps<ConnectOp>().begin(); conn->setOperand(1, shell.getArguments()[1]);
+    } else if (bad == 14) {
+      SmallVector<bool> dirs(shell.getPortDirections().begin(), shell.getPortDirections().end());
+      dirs[port(shell, "ctrl")] = true; shell.setPortDirections(dirs);
+    } else if (bad == 15) {as.push_back(b.getStringAttr("malformed")); c->setAttr("rawAnnotations", b.getArrayAttr(as));}
+    else {
+      SmallVector<Attribute> names(shell.getPortNames().begin(), shell.getPortNames().end());
+      names[port(shell, "ctrl")] = b.getStringAttr("renamedCtrl"); shell.setPortNames(names);
+    }
+    auto before = dump(*test);
+    require(failed(goldengate::mapPrintBridgeRocketF1Shim(c, error)) && !error.empty() && dump(*test) == before,
+        "Print F1Shim rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketF1Shim(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && body(m) == bodies.at(m.getName().str()), "Print F1Shim changed prior module body/identity");
+    for (auto [p, arg] : llvm::enumerate(arguments[j])) {
+      auto info = m.getPorts()[p], old = priorPorts[j][p];
+      require(m.getArguments()[p] == arg && info.name == old.name && info.type == old.type && info.direction == old.direction &&
+          info.annotations == old.annotations && info.sym == old.sym, "Print F1Shim changed prior metadata or SSA argument");
+    }
+  }
+  SmallVector<Operation *> live;
+  for (auto m : existing) for (auto &op : m.getBodyBlock()->getOperations()) live.push_back(&op);
+  require(live == operations, "Print F1Shim replaced prior operations");
+  auto shim = named(f.circuit, "F1Shim"); child(shim, named(f.circuit, "FPGATop"));
+  require(f.circuit.getName() == "F1Shim" && shim.getNumPorts() == 8 && llvm::range_size(shim.getOps<InstanceOp>()) == 1 &&
+      llvm::range_size(shim.getOps<RegResetOp>()) == 2 && shim.getOps<RegOp>().empty() && shim.getOps<MemOp>().empty(), "Print F1Shim geometry");
+  for (auto reg : shim.getOps<RegResetOp>())
+    require(cast<UIntType>(reg.getResult().getType()).getWidth() == 12 && reg.getClockVal() == shim.getArguments()[0] &&
+        reg.getResetSignal() == shim.getArguments()[1] && reg.getResetValue().getDefiningOp<ConstantOp>().getValue().isZero(),
+        "Print F1Shim request counter contract");
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(raw.size() == originalArchive.size()+2, "Print F1Shim annotation count");
+  auto source = llvm::find_if(raw, [](Attribute a) {
+    return cast<DictionaryAttr>(a).getAs<StringAttr>("class").getValue() == goldengate::AnnotationClasses::HostClockSource;
+  });
+  require(source != raw.end() && cast<DictionaryAttr>(*source).getAs<StringAttr>("target").getValue() == "~F1Shim|FPGATop>clock",
+      "Print F1Shim retained host clock source");
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketF1Shim(f.circuit, error)) && dump(*f.root) == before,
+      "repeated Print F1Shim changed IR"); ++rejected;
+  if (!output.empty()) {
+    auto suffix = reverse ? ".rocket-f1-shim-reverse.mlir" : ".rocket-f1-shim.mlir";
+    std::error_code ec; llvm::raw_fd_ostream file((output + suffix).str(), ec);
+    require(!ec, "cannot write Print F1Shim boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFPGATopShell(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, "GGPrintCPUStreamPlatformWrapper");
@@ -5422,6 +5518,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-f1-shim-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded Print FPGATop boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketF1Shim(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded Print F1Shim boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fpga-top-shell-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded CPU platform boundary");

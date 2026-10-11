@@ -446,7 +446,8 @@ if(BUILD_TESTING)
     lib/Transforms/CPUStreamReadBuffer.cpp
     lib/Transforms/CPUStreamResponseBuffer.cpp
     lib/Transforms/CPUStreamWriteResponseBuffer.cpp
-    lib/Transforms/CPUStreamPort.cpp lib/Transforms/FPGATopShell.cpp)
+    lib/Transforms/CPUStreamPort.cpp lib/Transforms/FPGATopShell.cpp
+    lib/Transforms/F1Shim.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-binding-test PRIVATE
