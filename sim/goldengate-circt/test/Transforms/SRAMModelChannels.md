@@ -4378,3 +4378,59 @@ Next: attach native B response buffering to this expanded boundary, then the
 platform aggregate. Production Print integration, enabled Print runtime
 parity, and the UART-bearing SFC runtime baseline remain pending. Manager
 verification remains owned by the harness; none was started here.
+
+### Iteration 117: expanded Rocket Print CPU B response buffer
+
+`mapPrintBridgeRocketCPUStreamWriteResponseBuffer` extends the verified
+`GGPrintCPUStreamResponseBufferWrapper` boundary with
+`GGPrintCPUStreamWriteResponseBufferWrapper` and `GGCPUStreamBQueue2`.
+`attachCPUStreamWriteResponseBuffer` shares the native FIRRTL queue builder
+with the production zero-Print path. The mapper validates live Print
+allocation, builds and verifies a clone, then publishes only the two new
+modules and the circuit/annotation rename. Existing module, port, SSA and
+operation identities remain intact; rejected inputs leave the circuit intact.
+
+`PrintRocketCPUStreamWriteResponseBufferCompare.py` compares both annotation
+orders against these modules in the exact immutable golden artifact:
+
+```text
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+The comparison passes for `Queue_53`, `AXI4Buffer_2` and
+`CPUManagedStreamEngine`: id16/resp2 RAM payloads, depth two, asynchronous
+reads, reset of dequeue control, and all seven specialized B routes. SFC
+specializes enqueue valid to zero for Rocket's empty sink list, removing
+enqueue/full state and disabling RAM writes. It retains RAM payload reads
+while invalid; the live engine AW ID and constant Okay response must not
+bypass these reads. The native helper retains generic queue state until
+standard CIRCT lowering. Its body matches the shared native baseline
+`iteration81-print-rocket-fased-read-buffer/candidate/post-fame-cpu-stream-platform.mlir`.
+
+Each order produces 297 modules while retaining all 295 previous module
+bodies and all 21 Print modules. All 122 public ports remain: 118 copied and
+four consumed B ports. All 128 wrapper routes and the complete recursively
+retargeted annotation archive match. Each order passes 11 atomic rejection
+checks, covering helper collisions, absent archive/allocation, wrong top,
+malformed clock/B interface, unsupported fields, instantiated top, wrong ID
+width and repeated application.
+
+The C++ interpreter exercises the actual emitted `GGCPUStreamBQueue2` in each
+order against an independent deque for 20,400 active-traffic cycles, including
+full/empty no-bypass, pointer wrap, stalls, simultaneous transfers, reset flush
+and accepted reset-edge RAM writes. An additional 1,024 zero-sink cycles per
+order check permanently empty occupancy, disabled writes and retained invalid
+RAM reads. Both orders pass. Print binding, CPU R and CPU B CTests pass (3/3),
+and the production compiler builds. Complete local stdout/stderr and the
+structured comparison report are retained under:
+
+```text
+sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration117-print-rocket-cpu-b-buffer/
+```
+
+Next: assemble the expanded buffered CPU scalars into the native platform AXI
+aggregate. Production Print integration and enabled Print runtime parity
+remain pending, as does the UART-bearing SFC runtime baseline. Iteration 116
+harness feedback reports passing CIRCT replacertl and required Verilator
+Rocket suites; it does not validate this enabled Print boundary. Manager
+verification remains owned by the harness; none was started here.

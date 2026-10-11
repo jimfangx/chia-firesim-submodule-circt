@@ -3,7 +3,7 @@
 // Preserve id16/resp2 RAM reads as in U250 Queue_53, including invalid payloads.
 // Rocket's empty CPU sink list drives enqueue valid zero and response Okay;
 // do not replace the queue's uninitialized payload with that live engine value.
-// Required input invariants: exact uninstantiated R wrapper, U250 B interface,
+// Required input invariants: selected uninstantiated R boundary, U250 B interface,
 // host Clock/UInt<1> reset, retained rawAnnotations, and fresh helper names.
 // Annotations consumed/produced: none removed or added. Retarget retained
 // circuit identities and copied top ports; B references remain engine-facing.
@@ -21,10 +21,15 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addCPUStreamWriteResponseBuffer(CircuitOp circuit,
                                                         std::string &error) {
-  constexpr llvm::StringLiteral wrapperName = "GGCPUStreamWriteResponseBufferWrapper";
+  return attachCPUStreamWriteResponseBuffer(circuit, "GGCPUStreamResponseBufferWrapper",
+      "GGCPUStreamWriteResponseBufferWrapper", error);
+}
+
+LogicalResult goldengate::attachCPUStreamWriteResponseBuffer(CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGCPUStreamResponseBufferWrapper")
-    return reject("CPU B buffer requires the active CPU R buffer wrapper");
+  if (circuit.getName() != inputBoundary)
+    return reject("CPU B buffer requires the selected active CPU R buffer boundary");
   constexpr llvm::StringLiteral queueName = "GGCPUStreamBQueue2";
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {

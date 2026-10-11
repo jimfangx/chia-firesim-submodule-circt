@@ -1998,3 +1998,37 @@ LogicalResult goldengate::mapPrintBridgeRocketCPUStreamResponseBuffer(
   circuit.setName(staged->getName());
   return success();
 }
+
+// B buffering preserves response storage even for Rocket's zero-sink engine.
+// Required input invariants: expanded CPU R boundary, validated Rocket Print
+// allocation, retained raw annotations, exact U250 B ports and host clock/reset.
+// Annotations consumed/produced: none; recursively transfer copied top targets
+// and retain consumed B targets on the unchanged inner module.
+// IR mutations: publish the verified B queue/wrapper and circuit/archive rename.
+// Analyses required: live Print allocation. Preserved: all existing modules,
+// ports, SSA values and operations. Rebuild hierarchy analyses after wrapping.
+// Output invariants: same public ports, independent no-flow/no-pipe B storage.
+// Clone staging ensures rejection leaves the input circuit untouched.
+LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteResponseBuffer(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  if (circuit.getName() != "GGPrintCPUStreamResponseBufferWrapper") {
+    error = "Print CPU B buffer requires the expanded CPU R buffer boundary";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamWriteResponseBuffer(*staged, "GGPrintCPUStreamResponseBufferWrapper",
+                                      "GGPrintCPUStreamWriteResponseBufferWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "Print CPU B buffer produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGPrintCPUStreamWriteResponseBufferWrapper" ||
+          m.getName() == "GGCPUStreamBQueue2")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}

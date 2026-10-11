@@ -444,7 +444,8 @@ if(BUILD_TESTING)
     lib/Transforms/HostMemoryOutputBuffer.cpp lib/Transforms/HostMemoryPort.cpp
     lib/Transforms/EmptyCPUStreamWrite.cpp lib/Transforms/CPUStreamWriteBuffer.cpp
     lib/Transforms/CPUStreamReadBuffer.cpp
-    lib/Transforms/CPUStreamResponseBuffer.cpp)
+    lib/Transforms/CPUStreamResponseBuffer.cpp
+    lib/Transforms/CPUStreamWriteResponseBuffer.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-binding-test PRIVATE

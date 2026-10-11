@@ -49,5 +49,9 @@ mlir::LogicalResult attachCPUStreamResponseBuffer(circt::firrtl::CircuitOp circu
 // Buffer U250 CPU AXI B responses, preserving the empty sink queue boundary.
 mlir::LogicalResult addCPUStreamWriteResponseBuffer(circt::firrtl::CircuitOp circuit,
                                                   std::string &error);
+// Attach the shared native B queue to an expanded boundary, retaining consumed
+// B targets and transferring copied targets to the new outer wrapper.
+mlir::LogicalResult attachCPUStreamWriteResponseBuffer(circt::firrtl::CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error);
 }
 #endif

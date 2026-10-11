@@ -321,4 +321,8 @@ mlir::LogicalResult mapPrintBridgeRocketCPUStreamReadBuffer(
 /// Atomic; retain existing identities and consumed R targets.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamResponseBuffer(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach a depth-two B queue to the expanded CPU R boundary.
+/// Atomic; retain existing identities and consumed B targets.
+mlir::LogicalResult mapPrintBridgeRocketCPUStreamWriteResponseBuffer(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

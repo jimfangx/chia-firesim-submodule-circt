@@ -110,10 +110,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         b.getNamedAttr("target", b.getStringAttr("~GGCPUStreamResponseBufferWrapper|GGCPUStreamResponseBufferWrapper>" + std::string(n)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
-void behavior(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  require(succeeded(goldengate::addCPUStreamWriteResponseBuffer(c, error)), error);
-  require(succeeded(verify(*root)), "B queue IR verification failed");
+void behavior(CircuitOp c) {
   Interpreter sim(named(c, "GGCPUStreamBQueue2"));
   require(sim.widths == std::map<std::string, unsigned>{{"id", 16}, {"resp", 2}}, "wrong B payload geometry");
   std::deque<std::map<std::string, APInt>> expected;
@@ -145,6 +142,21 @@ void behavior(MLIRContext &context) {
   for (unsigned i = 0; i < 100; ++i) { cycle(true, true, false); cycle(false, true, false); cycle(false, true, false); cycle(false, true, false); }
   for (unsigned i = 0; i < 20000; ++i) cycle(random()%23 == 0, random()&1, random()&1);
   require(pushes > 1000 && pops > 1000 && blocked > 100 && emptyBlocked > 100 && resetWrites > 100 && simultaneous > 100, "insufficient B queue coverage");
+  // SFC Queue_53 specializes the zero-sink engine's enqueue valid to zero.
+  // Reset flushes occupancy, but neither clears RAM nor bypasses it with the
+  // engine's live AW ID / constant Okay response while dequeue is invalid.
+  cycle(true, false, false);
+  auto retained = sim.memory;
+  for (unsigned i = 0; i < 1024; ++i) {
+    cycle(i % 31 == 0, false, random() & 1);
+    require(sim.memory == retained, "zero-sink B queue wrote or reset RAM");
+    require(sim.drive(sim.arg(2), "ready") == APInt(64, 1) &&
+        sim.drive(sim.arg(3), "valid").isZero(), "zero-sink B occupancy differs from SFC");
+    for (auto item : sim.widths)
+      require(sim.drive(sim.arg(3), "bits." + item.first) == retained[item.first][0],
+          "invalid zero-sink B payload bypassed RAM");
+  }
+  llvm::outs() << "B zero-sink specialization: 1024 cycles, retained invalid RAM reads passed\n";
   llvm::outs() << "B queue: 20400 cycles, pushes " << pushes << ", pops " << pops << ", reset writes " << resetWrites << ", full/empty blocked " << blocked << "/" << emptyBlocked << "\n";
 }
 void mapping(MLIRContext &context) {
@@ -208,7 +220,20 @@ void rejection(MLIRContext &context) {
   }
 }
 }
-int main() {
-  try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>(); behavior(context); mapping(context); rejection(context); return 0; }
-  catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+int main(int argc, char **argv) {
+  try {
+    MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 2) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &context);
+      require(bool(root) && succeeded(verify(*root)), "cannot parse verified Print CPU B boundary");
+      auto c = *root->getOps<CircuitOp>().begin();
+      require(c.getName() == "GGPrintCPUStreamWriteResponseBufferWrapper", "wrong Print CPU B boundary");
+      behavior(c); return 0;
+    }
+    require(argc == 1, "expected an optional Print CPU B boundary path");
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+    require(succeeded(goldengate::addCPUStreamWriteResponseBuffer(c, error)), error);
+    require(succeeded(verify(*root)), "B queue IR verification failed");
+    behavior(c); mapping(context); rejection(context); return 0;
+  } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
