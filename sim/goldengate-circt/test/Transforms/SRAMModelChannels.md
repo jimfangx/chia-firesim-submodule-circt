@@ -3342,3 +3342,73 @@ multi-clock support and the UART-bearing SFC runtime baseline remain incomplete.
 This increment does not complete the port. FireSim manager verification remains
 owned by the harness; supplied iteration 100 results pass CIRCT replacertl and
 both Verilator suites (90,141 portable and 90,805 Rocket checks).
+
+## Iteration 102: expanded Print/Rocket FASED host memory
+
+`mapPrintBridgeRocketFASEDHostMemory` consumes the completed expanded
+`GGControlMasterWrapper` split host request/read-response/write-response ports
+through the shared native `bindFASEDHostMemory`. It validates the live Print
+allocation, stages and verifies the assembly on a clone, then commits only the
+new `GGFASEDHostMemoryWrapper` and transferred archive. Existing operation,
+port and argument identities survive; the host control bundle and all model,
+bridge, ingress, egress and error-capture state remain unchanged. Three split
+ports become one five-channel AXI master before host address translation.
+
+The executable oracle is `FASEDMemoryTimingModel.scala:298-325` and
+`junctions/nasti.scala:565-617`, `AXI4NastiAssigner.toAXI4Slave`. AW/W/AR fields
+come from ingress, responses return to egress, and unused response users are
+`DontCare` (`firrtl.invalidvalue`). NASTI request user/region and W ID fields
+have no corresponding AXI leaves. Mapped leaf and copied targets transfer to
+the new top; whole split-bundle and discarded metadata targets remain on the
+inner control-master module. MidasTransforms and FAMETransform were inspected;
+this downstream composition preserves their prior clock/token semantics.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration102-print-rocket-fased-host-memory/`. Replays consume iteration 101's
+`binding.mlir.rocket-control-master[-reverse].mlir`:
+
+```text
+goldengate-print-binding-test --rocket-fased-host-memory-boundary INPUT OUTPUT_PREFIX
+goldengate-print-binding-test --rocket-fased-host-memory-boundary-reverse INPUT_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketFASEDHostMemoryCompare.py \
+  --before INPUT --after OUTPUT --before INPUT_REVERSE --after OUTPUT_REVERSE \
+  --sfc SFC_SV --baseline ITERATION100/candidate/post-fame-fased-host-memory.mlir \
+  --report-json EVIDENCE/rocket-fased-host-memory-comparison.json
+```
+
+The exact immutable artifact is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, module `FASEDMemoryTimingModel`, local
+`auto_to_host_dram_out` AXI boundary. Its 35 surviving ports and associated
+ingress/egress/error nets provide the 35/64/4-bit pre-translation contract.
+SFC removes two response-ready leaves. The candidate retains all 37 AXI leaves
+and two DontCare response-user sinks. The final platform memory address ABI
+is a later boundary; SFC disables Print, so this is not Print runtime parity.
+
+Both constructor-order comparisons pass: all 35 surviving SFC leaf widths,
+directions and ingress/egress/error connections match. All 39 native memory
+routes (37 AXI leaves and two invalid user sinks) also match iteration 100's
+native ingestion of the immutable compiler fixture. The new wrapper preserves
+260 prior module bodies, copies 109 ports, and has 110 final ports with 148
+checked connections. All 21 Print modules, both Print regions (slaves 8 and 9,
+starts 544 and 576), the complete annotation archive and eight added target
+probes survive exactly. C++ checks also preserve prior argument identities.
+
+Native compiler/test builds pass. Print-binding and FASED-host-memory CTests
+pass in 5.56 seconds; both expanded replays pass 15 atomic rejection cases
+each, covering collision, instantiated top, stale allocation, missing split
+ports/archive/engine/constructor, all three unsupported width fields, existing
+assembled port and repeat mapping. Replay, comparison and CTest stderr are
+empty. Build stderr contains only Ninja log recovery warnings. Supplied
+iteration 101 harness results pass CIRCT replacertl, bare Verilator smoke and
+both required suites (90,141 portable and 90,805 Rocket checks); these are
+prior gate results, not Print-enabled validation of this increment.
+
+Next smallest step: compose the native FASED address translation onto this
+expanded memory master. Print-enabled production CLI/driver integration,
+general FAME1/FAME5, multiclock support and the UART-bearing SFC runtime
+baseline remain incomplete. No manager verification steps are started by the
+implementation agent; the harness owns replacertl, Verilator and U250 gates.

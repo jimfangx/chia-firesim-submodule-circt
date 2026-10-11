@@ -433,7 +433,8 @@ if(BUILD_TESTING)
     lib/Transforms/TSIWordQueues.cpp
     lib/Transforms/TSIMMIOBank.cpp
     lib/Transforms/SimulationMaster.cpp
-    lib/Transforms/SimulationMasterControl.cpp)
+    lib/Transforms/SimulationMasterControl.cpp
+    lib/Transforms/FASEDHostMemory.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-binding-test PRIVATE

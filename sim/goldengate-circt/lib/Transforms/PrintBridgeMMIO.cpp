@@ -30,6 +30,7 @@
 #include "goldengate/FASEDStatistics.h"
 #include "goldengate/FASEDHistograms.h"
 #include "goldengate/FASEDMMIOBank.h"
+#include "goldengate/FASEDHostMemory.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1314,6 +1315,35 @@ LogicalResult goldengate::mapPrintBridgeRocketControlMaster(CircuitOp circuit,
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGControlMasterWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires: unused completed control master, live Rocket/Print allocation,
+// retained constructor/annotation archive and exact 35/64/4 NASTI boundaries.
+// Consumes: split host request/read-response/write-response ports. No annotation
+// classes consumed or produced; mapped leaf and copied targets transfer, whole
+// split-bundle and discarded metadata targets remain on the inner module.
+// Mutates: append one stateless FIRRTL wrapper after staged verification.
+// Analyses required: live MMIO allocation; hierarchy analysis invalidated.
+// Preserves: all existing operation/port/argument identities, state, control,
+// clock/reset and channel/constructor metadata. Output: five-channel host AXI
+// memory master before address translation, buffering and LoadMem arbitration.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDHostMemory(CircuitOp circuit,
+                                                           std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGControlMasterWrapper")
+    return reject("Rocket Print host memory requires the completed control master");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(bindFASEDHostMemory(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("Rocket Print host memory produced invalid FIRRTL IR");
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGFASEDHostMemoryWrapper")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

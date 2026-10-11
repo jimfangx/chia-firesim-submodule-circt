@@ -2292,6 +2292,117 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+void rocketFASEDHostMemory(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto names = llvm::to_vector(original.getPortNames());
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+  }
+  for (unsigned bad = 0; bad < 14; ++bad) {
+    FModuleOp collision; InstanceOp extra;
+    if (bad == 0) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr("GGFASEDHostMemoryWrapper"),
+          original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 1) {
+      b.setInsertionPointToEnd(original.getBodyBlock());
+      extra = b.create<InstanceOp>(f.circuit.getLoc(), original, "duplicate");
+    }
+    if (bad == 2) {
+      SmallVector<Attribute> changed(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(changed[1])); row.set("start", b.getI64IntegerAttr(256));
+      changed[1] = row.getDictionary(ctx);
+      decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(changed));
+    }
+    if (bad == 3) f.circuit.setName("WrongTop");
+    if (bad == 4) f.circuit->removeAttr("rawAnnotations");
+    if (bad >= 5 && bad <= 7) {
+      const StringRef missing[]{"fased_host_requests", "fased_host_read_response", "fased_host_write_response"};
+      auto changed = names; changed[port(original, missing[bad - 5])] = b.getStringAttr("missingBoundary");
+      original.setPortNames(changed);
+    }
+    if (bad >= 8 && bad <= 10) {
+      const StringRef fields[]{"addrBits", "dataBits", "idBits"};
+      NamedAttrList widths(constructor.getAs<DictionaryAttr>("axi4Widths"));
+      widths.set(fields[bad - 8], b.getI64IntegerAttr(1));
+      NamedAttrList changed(constructor); changed.set("axi4Widths", widths.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", changed.getDictionary(ctx));
+    }
+    if (bad == 11) {
+      auto changed = names; changed[port(original, "other")] = b.getStringAttr("fased_host_mem");
+      original.setPortNames(changed);
+    }
+    if (bad == 12) engine->removeAttr("goldengate.bridgeConstructor");
+    if (bad == 13) engine.setName("MissingEngine");
+    auto before = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeRocketFASEDHostMemory(f.circuit, error)) &&
+        !error.empty() && dump(*f.root) == before,
+        "expanded host memory rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+    original.setPortNames(names); decoder->setAttr("goldengate.controlRegions", regions);
+    engine.setName("GGFASEDTokenEngine"); engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    if (collision) collision.erase(); if (extra) extra.erase(); f.circuit.setName(original.getName());
+  }
+  SmallVector<Attribute> annotated(raw.begin(), raw.end());
+  const StringRef probes[]{"ctrl.aw.bits.addr", "fased_host_requests.aw.bits.addr",
+      "fased_host_read_response.bits.data", "fased_host_write_response.ready",
+      "fased_host_requests.w.bits.id", "fased_host_requests.aw.bits.user", "fased_host_requests", ""};
+  for (auto probe : probes) {
+    std::string target = "~GGControlMasterWrapper";
+    if (!probe.empty()) target += "|GGControlMasterWrapper>" + probe.str();
+    annotated.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.HostMemoryBoundary")),
+        b.getNamedAttr("target", b.getStringAttr(target))}));
+  }
+  f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annotated));
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDHostMemory(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, "GGFASEDHostMemoryWrapper");
+  require(f.circuit.getName() == top.getName() && bool(child(top, original)),
+      "expanded host memory hierarchy differs");
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == arguments[j].size(),
+        "expanded host memory changed an existing module identity");
+    for (auto [i, arg] : llvm::enumerate(arguments[j]))
+      require(m.getArguments()[i] == arg, "expanded host memory changed a port argument identity");
+  }
+  require(original.getNumPorts() == top.getNumPorts() + 2 &&
+      top.getPortName(top.getNumPorts() - 1) == "fased_host_mem" &&
+      top.getPortDirection(top.getNumPorts() - 1) == Direction::Out &&
+      cast<BundleType>(top.getPortType(top.getNumPorts() - 1)).getNumElements() == 5 &&
+      top.getPortType(port(top, "ctrl")) == original.getPortType(port(original, "ctrl")),
+      "expanded host memory split consumption or control preservation differs");
+  auto transferred = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  const StringRef expected[]{"GGFASEDHostMemoryWrapper>ctrl.aw.bits.addr",
+      "GGFASEDHostMemoryWrapper>fased_host_mem.aw.bits.addr",
+      "GGFASEDHostMemoryWrapper>fased_host_mem.r.bits.data",
+      "GGFASEDHostMemoryWrapper>fased_host_mem.b.ready",
+      "GGControlMasterWrapper>fased_host_requests.w.bits.id",
+      "GGControlMasterWrapper>fased_host_requests.aw.bits.user",
+      "GGControlMasterWrapper>fased_host_requests", ""};
+  for (auto [i, suffix] : llvm::enumerate(expected)) {
+    std::string target = "~GGFASEDHostMemoryWrapper";
+    if (!suffix.empty()) target += "|" + suffix.str();
+    require(cast<DictionaryAttr>(transferred[raw.size() + i]).getAs<StringAttr>("target").getValue() == target,
+        "expanded host memory target transfer differs");
+  }
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDHostMemory(f.circuit, error)) &&
+      dump(*f.root) == before, "repeated expanded host memory changed IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output +
+        (reverse ? ".rocket-fased-host-memory-reverse.mlir" : ".rocket-fased-host-memory.mlir")).str(), ec);
+    require(!ec, "cannot write expanded host memory boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDMMIOBank(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -3366,6 +3477,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDMMIOBank(f, output, reverse, rejected);
       rocketFASEDControl(f, output, reverse, rejected);
       rocketControlMaster(f, output, reverse, rejected);
+      rocketFASEDHostMemory(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -3703,6 +3815,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fased-host-memory-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded control master boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketFASEDHostMemory(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded host memory boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-control-master-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded FASED control binding boundary");
