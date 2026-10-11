@@ -3706,3 +3706,77 @@ assertion; explicit archive preflight fixes it and the final replays cover
 that case without mutation. Supplied iteration 105 harness feedback passes
 CIRCT replacertl and required Verilator workloads; those earlier gates do
 not verify this new Print-enabled composition. The overall port is incomplete.
+
+### Expanded Print/Rocket host AW/W arbitration (iteration 107)
+
+`mapPrintBridgeRocketHostMemoryWriteArbiter` now composes the native host write
+arbiter and its depth-two flow source queue onto iteration 106's LoadMem
+attachment. The shared compiler transform accepts either the original buffered
+translation top or the expanded Print LoadMem top. For Print it validates the
+two-instance attachment, all sixteen direct LoadMem pins, MCR binding, both
+host clock/reset routes and the retained four-instance buffered master before
+constructing new operations. A staged clone is verified before moving only
+three new definitions into the live circuit. Existing module, port and SSA
+argument identities remain unchanged; hierarchy and target analyses need
+rebuilding after installation.
+
+The new `GGHostMemoryWriteWrapper` retains 116 ports and adds the remaining
+FASED B/AR/R bundle and shared AW/W bundle, giving 118 ports and two instances.
+All eight LoadMem AW/W pins and FASED AW/W connect to the shared arbiter.
+LoadMem uses ID 16, full-byte strobes, size 3 and INCR burst; FASED retains
+IDs 0..15, payload and strobes. The source queue reserves the AW winner before
+AW acceptance, holds the reservation through stalls, and retires it only on
+an accepted selected WLAST. Queue flow, non-pipelined full behavior and RAM
+writes during reset remain in the existing native implementation.
+
+Copied public targets and remaining B/AR/R targets move to the new top;
+consumed AW/W targets remain on the inner LoadMem wrapper. Whole remaining
+channel targets (for example `fased_host_mem.ar`) now transfer alongside their
+leaves. Annotation circuit identities are recursively updated without
+consuming annotation classes. The nested-target test covers copied, consumed,
+remaining-leaf and whole-channel references.
+
+Replay both saved LoadMem boundaries using:
+
+```
+goldengate-print-binding-test --rocket-host-memory-write-arbiter-boundary INPUT OUTPUT_PREFIX
+goldengate-print-binding-test --rocket-host-memory-write-arbiter-boundary-reverse INPUT_REVERSE OUTPUT_PREFIX
+goldengate-host-memory-write-arbiter-test --expanded-boundary OUTPUT
+python3 test/Transforms/PrintRocketHostMemoryWriteArbiterCompare.py \
+  --before INPUT --after OUTPUT --before INPUT_REVERSE --after OUTPUT_REVERSE \
+  --sfc SFC_SV --baseline ITERATION81/candidate/post-fame-host-memory-write-arbiter.mlir \
+  --report-json EVIDENCE/rocket-host-memory-write-arbiter-comparison.json
+```
+
+Evidence is under the U250 generated-source tree at
+`iteration107-print-rocket-host-memory-write-arbiter/`. The immutable golden is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `AXI4Xbar` and `Queue_21`. The structured
+comparison anchors the interpreter oracle to 46 crossbar equations and twelve
+queue equations, plus the shared 34-bit-address/64-bit-data/five-bit-ID ABI,
+queue depth, reset state and reset-independent RAM writes. It checks every
+outer-wrapper route, unchanged prior module bodies, identical shared native
+helper bodies, all 21 Print modules and nested archive target transfer.
+
+Next smallest step: adapt the native host B response router to the retained
+Print LoadMem wrapper, preserving ID-16 LoadMem and IDs-0..15 FASED selection,
+then compare response valid/ready/ID behavior with the same SFC `AXI4Xbar`.
+AR/R composition, Print-enabled production CLI/driver integration and runtime
+parity, general FAME1/FAME5, multiclock support and the SFC UART baseline remain
+incomplete. Supplied iteration 106 harness feedback passes CIRCT replacertl
+and required Verilator workloads; it does not exercise this new Print-enabled
+composition. No manager verification gate was started in this iteration.
+
+Validation: compiler, Print binding and host write-arbiter executables build.
+Focused CTests pass in 11.89 seconds (Print binding 5.46, arbiter 6.43).
+Both expanded annotation orders pass 22 atomic rejections, full FIRRTL
+verification and the structured golden comparison. Each actual candidate's
+arbiter SSA passes 216,018 leaf checks across 12,001 edges, plus 256 exhaustive
+source-queue cases. Trace coverage includes full queues, AW stalls, early
+reservations, empty bypass, simultaneous enqueue/dequeue and 52 reset edges;
+forty exhaustive cases check RAM writes during reset. Successful replay,
+semantic and comparison stderr files are empty. A C++ test operand-setter
+compile error was corrected before the final successful build; its failed
+build log is retained. Existing shared-worktree changes remain outside this
+checkpoint. The overall port remains incomplete.

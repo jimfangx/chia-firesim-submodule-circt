@@ -281,4 +281,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDHostMemoryBuffer(
 /// Atomic; retain existing modules and transfer copied top port targets.
 mlir::LogicalResult mapPrintBridgeRocketLoadMemEngine(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Arbitrate expanded LoadMem/FASED AW and reserve W source until accepted WLAST.
+/// Atomic; retain prior IR and consumed targets, transfer copied public targets.
+mlir::LogicalResult mapPrintBridgeRocketHostMemoryWriteArbiter(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

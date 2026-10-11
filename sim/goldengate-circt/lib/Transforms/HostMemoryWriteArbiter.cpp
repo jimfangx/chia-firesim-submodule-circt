@@ -15,18 +15,25 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addHostMemoryWriteArbiter(CircuitOp circuit,
                                                    std::string &error) {
-  constexpr StringLiteral oldName="GGFASEDAddressTranslationWrapper";
+  const StringRef oldName=circuit.getName();
+  const bool printBoundary=oldName=="GGPrintLoadMemWrapper";
+  if(!printBoundary&&oldName!="GGFASEDAddressTranslationWrapper") {
+    error="host memory write arbiter requires the buffered translation or Print LoadMem top";
+    return failure();
+  }
   constexpr StringLiteral newName="GGHostMemoryWriteWrapper";
   constexpr StringLiteral helperName="GGHostMemoryWriteArbiter";
   constexpr StringLiteral queueName="GGHostMemoryWriteSourceQueue2";
   auto reject=[&](StringRef s){error=s.str();return failure();};
-  FModuleOp inner,engine,buffer;
+  FModuleOp inner,engine,buffer,bufferOwner,loadmemEngine;
   unsigned engines=0;
   for(auto m:circuit.getOps<FModuleLike>()) {
     auto n=m.getModuleName();
     if(n==newName||n==helperName||n==queueName)return reject("host memory write arbiter already exists");
     auto f=dyn_cast<FModuleOp>(m.getOperation());if(!f)continue;
     if(n==oldName)inner=f;
+    if(n=="GGFASEDAddressTranslationWrapper")bufferOwner=f;
+    if(n=="GGPrintLoadMemEngine")loadmemEngine=f;
     if(n=="GGFASEDHostMemoryBuffer")buffer=f;
     if(auto key=f->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"))
       if(key.getAs<DictionaryAttr>("axi4Edge")){engine=f;++engines;}
@@ -86,16 +93,64 @@ LogicalResult goldengate::addHostMemoryWriteArbiter(CircuitOp circuit,
     consumed.insert(n);
   }
   bool used=false;circuit.walk([&](InstanceOp i){used|=i.getModuleName()==oldName;});
-  InstanceOp buf;unsigned count=0;
-  for(auto i:inner.getOps<InstanceOp>()){++count;if(i.getName()=="memory_buffer"&&i.getModuleName()==buffer.getName())buf=i;}
-  ConnectOp boundary;for(auto c:inner.getOps<ConnectOp>())
-    if(buf&&buf.getNumResults()==4&&c.getDest()==inner.getBodyBlock()->getArgument(*mem)&&c.getSrc()==buf.getResult(3))boundary=c;
-  unsigned clockBindings=0,resetBindings=0;
-  if(buf && buf.getNumResults()==4)for(auto conn:inner.getOps<StrictConnectOp>()) {
-    clockBindings+=conn.getDest()==buf.getResult(0)&&conn.getSrc()==inner.getBodyBlock()->getArgument(*clock);
-    resetBindings+=conn.getDest()==buf.getResult(1)&&conn.getSrc()==inner.getBodyBlock()->getArgument(*reset);
+  // Print's LoadMem attachment forwards the buffered master through one
+  // additional wrapper. Validate that chain and every exposed engine pin;
+  // accepting names alone would silently arbitrate an unbound LoadMem source.
+  if(!bufferOwner)return reject("host memory write arbiter needs the retained buffered top");
+  auto findPort=[](FModuleOp m,StringRef n)->std::optional<unsigned>{
+    for(auto [i,p]:llvm::enumerate(m.getPorts()))if(p.name.getValue()==n)return i;
+    return std::nullopt;
+  };
+  auto ownerMem=findPort(bufferOwner,"fased_host_mem");
+  auto ownerClock=findPort(bufferOwner,"hostClock"),ownerReset=findPort(bufferOwner,"hostReset");
+  if(!ownerMem||!ownerClock||!ownerReset || bufferOwner.getPortType(*ownerMem)!=master ||
+     bufferOwner.getPortType(*ownerClock)!=ClockType::get(ctx)||bufferOwner.getPortType(*ownerReset)!=uint(1))
+    return reject("host memory write arbiter needs the exact retained memory/clock/reset interface");
+  if(printBoundary) {
+    InstanceOp sim,loadmem;unsigned count=0;
+    for(auto i:inner.getOps<InstanceOp>()) {
+      ++count;
+      if(i.getName()=="sim"&&i.getModuleName()==bufferOwner.getName())sim=i;
+      if(loadmemEngine&&i.getName()=="loadmem"&&i.getModuleName()==loadmemEngine.getName())loadmem=i;
+    }
+    if(count!=2||!sim||!loadmem||inner.getNumPorts()!=125||loadmemEngine.getNumPorts()!=19||
+       sim.getNumResults()!=bufferOwner.getNumPorts()||loadmem.getNumResults()!=19)
+      return reject("host memory write arbiter requires the two-instance Print LoadMem attachment");
+    auto connected=[&](Value dest,Value src,bool strict){unsigned matches=0;
+      for(auto &op:inner.getBodyBlock()->getOperations())
+        if((strict&&isa<StrictConnectOp>(op))||(!strict&&isa<ConnectOp>(op)))
+          matches+=op.getOperand(0)==dest&&op.getOperand(1)==src;
+      return matches==1&&dest.hasOneUse();
+    };
+    if(!connected(inner.getArgument(*mem),sim.getResult(*ownerMem),false)||
+       !connected(sim.getResult(*ownerClock),inner.getArgument(*clock),false)||
+       !connected(sim.getResult(*ownerReset),inner.getArgument(*reset),false)||
+       !connected(loadmem.getResult(0),inner.getArgument(*clock),true)||
+       !connected(loadmem.getResult(1),inner.getArgument(*reset),true))
+      return reject("host memory write arbiter needs direct buffered master and host clock/reset forwarding");
+    auto mcr=findPort(bufferOwner,"loadmem_mcr");
+    if(!mcr||loadmemEngine.getPortName(0)!="clock"||loadmemEngine.getPortName(1)!="reset"||
+       loadmemEngine.getPortName(2)!="mcr"||loadmemEngine.getPortDirection(2)!=Direction::Out||
+       loadmemEngine.getPortType(2)!=bufferOwner.getPortType(*mcr)||
+       !connected(sim.getResult(*mcr),loadmem.getResult(2),false))
+      return reject("host memory write arbiter needs the direct LoadMem MCR binding");
+    for(auto [p,info]:llvm::enumerate(loadmemEngine.getPorts()))if(p>=3) {
+      auto index=port(info.name.getValue(),info.type,info.direction);
+      if(!index||!connected(info.direction==Direction::In?loadmem.getResult(p):inner.getArgument(*index),
+                            info.direction==Direction::In?inner.getArgument(*index):loadmem.getResult(p),true))
+        return reject("host memory write arbiter needs every direct LoadMem engine pin");
+    }
   }
-  if(used||count!=4||!buf||buf.getNumResults()!=4||!boundary||!inner.getBodyBlock()->getArgument(*mem).hasOneUse()||clockBindings!=1||resetBindings!=1)
+  InstanceOp buf;unsigned count=0;
+  for(auto i:bufferOwner.getOps<InstanceOp>()){++count;if(i.getName()=="memory_buffer"&&i.getModuleName()==buffer.getName())buf=i;}
+  ConnectOp boundary;for(auto c:bufferOwner.getOps<ConnectOp>())
+    if(buf&&buf.getNumResults()==4&&c.getDest()==bufferOwner.getArgument(*ownerMem)&&c.getSrc()==buf.getResult(3))boundary=c;
+  unsigned clockBindings=0,resetBindings=0;
+  if(buf && buf.getNumResults()==4)for(auto conn:bufferOwner.getOps<StrictConnectOp>()) {
+    clockBindings+=conn.getDest()==buf.getResult(0)&&conn.getSrc()==bufferOwner.getArgument(*ownerClock);
+    resetBindings+=conn.getDest()==buf.getResult(1)&&conn.getSrc()==bufferOwner.getArgument(*ownerReset);
+  }
+  if(used||count!=4||!buf||buf.getNumResults()!=4||!boundary||!bufferOwner.getArgument(*ownerMem).hasOneUse()||clockBindings!=1||resetBindings!=1)
     return reject("host memory write arbiter requires the unique buffered master of an uninstantiated four-instance top");
 
   // All contract checks precede mutations. Inner modules and state are retained.
@@ -225,7 +280,11 @@ LogicalResult goldengate::addHostMemoryWriteArbiter(CircuitOp circuit,
       std::string suffix="|"+v.str();StringRef ref(suffix);
       if(ref.consume_front(mp)) {
         auto root=ref.take_front(ref.find_first_of(".[")).str();
-        bool remaining=ref.starts_with("fased_host_mem.b.")||ref.starts_with("fased_host_mem.ar.")||ref.starts_with("fased_host_mem.r.");
+        auto channel=ref;bool remaining=false;
+        if(channel.consume_front("fased_host_mem.")) {
+          auto name=channel.take_front(channel.find_first_of(".["));
+          remaining=name=="b"||name=="ar"||name=="r";
+        }
         if(copied.count(root)||remaining)suffix.replace(0,mp.size(),"|"+newName.str()+">");
       }
       return b.getStringAttr(np+suffix);

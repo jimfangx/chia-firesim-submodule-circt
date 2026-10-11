@@ -221,6 +221,14 @@ void rejected(MLIRContext &ctx,unsigned mode) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
+    if(argc==3&&StringRef(argv[1])=="--expanded-boundary") {
+      auto handoff=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(handoff),"cannot parse expanded write boundary");
+      auto real=*handoff->getOps<CircuitOp>().begin();require(succeeded(verify(*handoff)),"expanded write boundary verifier");
+      require(real.getName()=="GGHostMemoryWriteWrapper","expanded write boundary top");
+      exhaustiveQueue(real);trace(real);
+      llvm::outs()<<"PASS actual expanded Print host write arbiter SSA and source queue\n";
+      return 0;
+    }
     auto before=dump(top(c,"GGFASEDAddressTranslationWrapper"));std::string error;
     require(succeeded(goldengate::addHostMemoryWriteArbiter(c,error)),error);require(succeeded(verify(*root)),"IR verifier");
     require(before==dump(top(c,"GGFASEDAddressTranslationWrapper")),"inner module changed");

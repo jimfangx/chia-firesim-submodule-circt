@@ -2,6 +2,7 @@
 // Compose Widget.scala's size-sorted control allocation and io.ctrl binding
 // for the implemented Print hosts and their live CPU stream count bank.
 #include "goldengate/PrintBridgePayload.h"
+#include "goldengate/HostMemoryWriteArbiter.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/ControlErrorSlave.h"
@@ -1709,5 +1710,33 @@ LogicalResult goldengate::mapPrintBridgeRocketLoadMemEngine(
   auto raw = retarget(circuit->getAttr("rawAnnotations"));
   for (auto m : {engine, wrapper}) m->moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", raw); circuit.setName(newName);
+  return success();
+}
+
+// Requires the verified LoadMem attachment and live expanded control allocation.
+// AW/W scalar targets stay on the retained inner top; copied ports and the
+// remaining FASED channels move to the new top. No annotation classes consumed.
+// Stage the source reservation queue, arbiter and wrapper atomically. Preserve
+// all existing operations/ports/SSA arguments; rebuild hierarchy/target analyses.
+LogicalResult goldengate::mapPrintBridgeRocketHostMemoryWriteArbiter(
+    CircuitOp circuit, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGPrintLoadMemWrapper")
+    return reject("Rocket Print host write arbitration requires the LoadMem attachment");
+  if (!circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    return reject("Rocket Print host write arbitration requires the annotation archive");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addHostMemoryWriteArbiter(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("Rocket Print host write arbitration produced invalid FIRRTL IR");
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGHostMemoryWriteWrapper" ||
+          m.getName() == "GGHostMemoryWriteArbiter" ||
+          m.getName() == "GGHostMemoryWriteSourceQueue2")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
   return success();
 }
