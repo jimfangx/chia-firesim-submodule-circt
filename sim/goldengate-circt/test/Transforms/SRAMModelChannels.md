@@ -4068,3 +4068,69 @@ checks and the five AXI4Buffer instance mappings. All 280 prior non-top bodies,
 and the recursive archive match in both orders. FIRRTL verification passes;
 all six replay/semantic/comparison/CTest stderr logs are empty. Overall port
 completion is not claimed.
+
+### Expanded Print host memory platform port (iteration 112)
+
+`mapPrintBridgeRocketHostMemoryPort` composes the native
+`specializeHostMemoryPort` after the five-channel host output buffer.
+The Scala oracle is `MidasTransforms`'s post-SRAM `SimulationMapping` /
+`HostSpecialization` boundary and `FPGATop.scala`'s `mem IO <> memAXI4Nodes`
+connection. The new `GGHostMemoryPlatformWrapper` exposes a 34-bit address,
+64-bit data, 16-bit ID `mem_0` interface. Its combinational
+`GGHostMemoryPortAdapter` uses FIRRTL `pad` for AW/AR request IDs and `bits`
+for B/R response IDs; other payload/handshake leaves pass through. Conversion
+does not depend on valid or ready and introduces no state.
+
+The Print entry point validates the live expanded allocation, stages the shared
+native pass, verifies FIRRTL and transfers only the two new module definitions.
+All 286 prior bodies, live operations, arguments and port metadata remain
+intact. The top has 109 ports (108 copied plus `mem_0`), two instances and 110
+connections. Recursive copied-port targets transfer to the new wrapper;
+consumed `host_mem` references retain their original module/port identity under
+the new circuit name. All 21 Print modules retain their prior bodies.
+
+The native preflight now counts both ordinary and strict clock/reset connections
+and requires exactly one driver per buffer input. This accepts either unique
+connect form and rejects duplicate or conflicting drivers across both forms.
+
+Exact immutable golden:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintRocketHostMemoryPortCompare.py` compares FPGATop's complete 37-leaf
+`mem_0` ABI and every leaf equation, including the two five-to-sixteen-bit
+zero extensions and the two sixteen-to-five-bit truncations. It checks the
+candidate's copied ports, 110 routes, prior module bodies and recursive targets
+in both constructor orders. The helper also matches the native baseline
+`iteration81-print-rocket-fased-read-buffer/candidate/
+post-fame-host-memory-platform.mlir` exactly.
+
+After sourcing the project environment, replay both iteration-111 expanded Print
+output-buffer boundaries with `goldengate-print-binding-test
+--rocket-host-memory-port-boundary INPUT OUTPUT_PREFIX` and its `-reverse`
+variant. Each exercises 25 malformed inputs plus repeated attachment: helper
+collisions, missing archive/allocation, wrong constructor/ports, extra uses or
+instances, and missing/duplicate/conflicting clock/reset/output connections.
+`goldengate-host-memory-port-test --expanded-boundary OUTPUT` interprets the
+emitted adapter SSA across all 65,536 response IDs, all 32 request IDs and
+all four valid/ready combinations, with randomized non-ID payloads. Each order
+has 262,144 cases and 9,699,328 leaf checks. The native CTest also covers all
+ordinary/strict clock/reset combinations. Mutable evidence is under
+`iteration112-print-rocket-host-memory-port/` in the generated tree.
+
+Next smallest step: compose `assembleCPUStreamPort` on this expanded boundary,
+resolving its native-only `GGEmptyCPUStreamWrite` assumption against the
+preserved `CatalogRocket_GGEmptyCPUStreamWrite` and the live TracerV/Print stream
+bindings, then compare the platform stream ABI and routes against SFC.
+Production Print CLI/driver/runtime parity, general FAME1/FAME5, multiclock and
+the SFC UART-bearing baseline remain incomplete. Supplied iteration-111
+harness feedback passes CIRCT replacertl and required Verilator workloads;
+those gates do not establish runtime parity for this expanded Print change.
+No manager verification step was started. Shared clock-control, recovery and
+harness changes remain outside this checkpoint.
+
+Validation: the compiler and all three focused test executables build. The
+Print binding, native memory-port and output-buffer CTests pass in 59.25 seconds.
+Both expanded replays pass all 26 atomic rejections and FIRRTL verification.
+Each emitted adapter passes all 262,144 cases / 9,699,328 leaf checks. The
+structured SFC ABI/equation, native-helper, prior-body, copied-port, route and
+recursive-target comparisons pass in both orders. All five replay, behavior
+and comparison stderr logs are empty. Overall port completion is not claimed.

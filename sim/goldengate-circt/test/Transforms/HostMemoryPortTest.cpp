@@ -133,6 +133,27 @@ void bindings(CircuitOp c) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    if(argc==3&&StringRef(argv[1])=="--expanded-boundary") {
+      auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"expanded parse failed");
+      require(succeeded(verify(*real)),"expanded boundary invalid");
+      auto rc=*real->getOps<CircuitOp>().begin();bindings(rc);behavior(rc);
+      llvm::outs()<<"PASS expanded Print/Rocket host memory platform port\n";return 0;
+    }
+    for(unsigned forms=1;forms<4;++forms) {
+      auto mixed=fixture(ctx);auto mc=*mixed->getOps<CircuitOp>().begin();
+      auto m=top(mc,"GGHostMemoryReadResponseWrapper");OpBuilder b(&ctx);
+      for(auto &op:llvm::make_early_inc_range(m.getBodyBlock()->getOperations())) {
+        auto conn=dyn_cast<StrictConnectOp>(&op);if(!conn)continue;
+        auto source=dyn_cast<BlockArgument>(conn.getSrc());
+        if(source&&source.getOwner()==m.getBodyBlock()&&source.getArgNumber()<2&&
+            (forms&(1u<<source.getArgNumber()))) {
+          b.setInsertionPoint(&op);b.create<ConnectOp>(mc.getLoc(),conn.getDest(),conn.getSrc());op.erase();
+        }
+      }
+      require(succeeded(goldengate::specializeHostMemoryPort(mc,error)),error);
+      require(succeeded(verify(*mixed)),"mixed connect forms invalid");bindings(mc);
+    }
+    llvm::outs()<<"PASS unique ordinary/strict clock and reset combinations\n";
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
     std::map<std::string,std::string> before;for(auto m:c.getOps<FModuleOp>())before[m.getName().str()]=dump(m);
     require(succeeded(goldengate::specializeHostMemoryPort(c,error)),error);require(succeeded(verify(*root)),"invalid platform IR");

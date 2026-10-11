@@ -79,15 +79,19 @@ LogicalResult goldengate::specializeHostMemoryPort(CircuitOp circuit,
     if(i.getName()=="host_memory_buffer"&&i.getModuleName()==bufferModule.getName())buffer=i;
   }
   auto arg=[&](FModuleOp m,unsigned i){return m.getBodyBlock()->getArgument(i);};
-  unsigned out=0,cb=0,rb=0;
+  unsigned out=0,cb=0,rb=0,clockDrivers=0,resetDrivers=0;
   if(buffer&&buffer.getNumResults()==4) {
     for(auto c:inner.getOps<ConnectOp>())out+=c.getDest()==arg(inner,*mem)&&c.getSrc()==buffer.getResult(3);
-    for(auto c:inner.getOps<StrictConnectOp>()) {
-      cb+=c.getDest()==buffer.getResult(0)&&c.getSrc()==arg(inner,*clock);
-      rb+=c.getDest()==buffer.getResult(1)&&c.getSrc()==arg(inner,*reset);
+    for(auto &op:inner.getBodyBlock()->getOperations()) {
+      if(!isa<ConnectOp,StrictConnectOp>(op))continue;
+      auto dest=op.getOperand(0),src=op.getOperand(1);
+      clockDrivers+=dest==buffer.getResult(0);
+      resetDrivers+=dest==buffer.getResult(1);
+      cb+=dest==buffer.getResult(0)&&src==arg(inner,*clock);
+      rb+=dest==buffer.getResult(1)&&src==arg(inner,*reset);
     }
   }
-  if(used||instances!=3||!sim||!router||!buffer||out!=1||cb!=1||rb!=1||!arg(inner,*mem).hasOneUse()||!buffer.getResult(3).hasOneUse())
+  if(used||instances!=3||!sim||!router||!buffer||out!=1||cb!=1||rb!=1||clockDrivers!=1||resetDrivers!=1||!arg(inner,*mem).hasOneUse()||!buffer.getResult(3).hasOneUse())
     return reject("host memory platform adapter requires unique buffered output and host clock/reset bindings");
   // Validation precedes mutation. Keep every original module body intact.
   auto field=[&](Value v,StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};

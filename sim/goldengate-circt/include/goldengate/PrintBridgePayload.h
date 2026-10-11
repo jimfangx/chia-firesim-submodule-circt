@@ -301,4 +301,8 @@ mlir::LogicalResult mapPrintBridgeRocketHostMemoryReadResponses(
 /// Atomic; retain prior modules, top ports, SSA values and archived targets.
 mlir::LogicalResult mapPrintBridgeRocketHostMemoryOutputBuffer(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Expose the buffered host master as the platform's 34/64/16 mem_0 port.
+/// Atomic; preserve prior IR and consumed targets, transfer copied ports.
+mlir::LogicalResult mapPrintBridgeRocketHostMemoryPort(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

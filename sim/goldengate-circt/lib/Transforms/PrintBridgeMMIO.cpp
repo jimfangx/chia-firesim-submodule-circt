@@ -7,6 +7,7 @@
 #include "goldengate/HostMemoryReadArbiter.h"
 #include "goldengate/HostMemoryReadResponses.h"
 #include "goldengate/HostMemoryOutputBuffer.h"
+#include "goldengate/HostMemoryPort.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/ControlErrorSlave.h"
@@ -1863,5 +1864,28 @@ LogicalResult goldengate::mapPrintBridgeRocketHostMemoryOutputBuffer(
   b.create<StrictConnectOp>(loc, buffer.getResult(1), reset);
   b.create<ConnectOp>(loc, host, buffer.getResult(3));
   for (auto field : channels) field->setOperand(0, buffer.getResult(2));
+  return success();
+}
+
+// FPGATop.scala's mem IO <> memAXI4Nodes converts the internal five-bit IDs
+// to the platform's sixteen-bit IDs. Stage the shared pass on the complete
+// expanded Print circuit; commit only verified additions and target transfers.
+// Every prior module, operation and SSA argument retains its live identity.
+LogicalResult goldengate::mapPrintBridgeRocketHostMemoryPort(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(specializeHostMemoryPort(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "Rocket Print host memory platform port produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGHostMemoryPlatformWrapper" ||
+          m.getName() == "GGHostMemoryPortAdapter")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
   return success();
 }
