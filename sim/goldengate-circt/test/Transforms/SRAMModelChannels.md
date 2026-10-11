@@ -4134,3 +4134,72 @@ Each emitted adapter passes all 262,144 cases / 9,699,328 leaf checks. The
 structured SFC ABI/equation, native-helper, prior-body, copied-port, route and
 recursive-target comparisons pass in both orders. All five replay, behavior
 and comparison stderr logs are empty. Overall port completion is not claimed.
+
+### Expanded Print empty CPU write attachment (iteration 113)
+
+Replaying `assembleCPUStreamPort` against both iteration-112 Print boundaries
+rejected the candidate because the live top has only twelve AR/R scalar fields;
+the 25-field buffered CPU interface is not yet present. The archived empty
+writer and CPU queues are definitions, not live expanded connections. This
+observed mismatch selects the smaller engine-facing empty-write attachment.
+The rejected aggregate attempts remain in the mutable iteration-113 evidence.
+
+`mapPrintBridgeRocketEmptyCPUStreamWrite` now stages the shared native
+`attachEmptyCPUStreamWrite` on the validated expanded allocation. It connects
+the preserved `CatalogRocket_GGEmptyCPUStreamWrite` to host clock/reset and
+adds eleven typed AW/W/B scalar fields in `GGPrintCPUStreamWriteWrapper`.
+The wrapper has 120 ports, two instances and 122 connections. All 288 prior
+module bodies, operation objects, SSA arguments and port metadata remain
+unchanged, including all 21 Print modules. Recursive copied-port targets move
+to the new top; annotation classes and counts remain intact. Every rejection
+precedes mutation; the Print entry point verifies staged FIRRTL before transfer.
+
+The Scala oracle is `CPUManagedStreamEngine.scala`'s empty `sinkParams`, default
+write handshakes/response and its AW-size/W-strobe assertions, together with
+`FPGATop.scala`'s CPU-managed AXI buffer boundary. `MidasTransforms.scala` places
+host specialization after FAME and simulation mapping; `FAMETransform.scala`
+provides the host clock/reset context. This attachment reuses the native
+FIRRTL engine operations: AW/W ready, B valid and B response are zero, B ID
+tracks the live AW ID even when B is invalid, and the clocked size-6/all-strobe
+assertions are disabled during host reset. External queue behavior remains a
+separate step: the full SFC platform interface can buffer writes before stalling.
+
+Exact immutable golden:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintRocketEmptyCPUStreamWriteCompare.py` matches `CPUManagedStreamEngine`'s
+live-ID equation and both reset-gated assertion predicates, `AXI4Buffer_2`'s
+zero AW dequeue ready, the eliminated W dequeue-ready port in `Queue_52`, and
+`Queue_53`'s disabled B enqueue/default response. It separately checks every
+wrapper route/port, all prior bodies and recursive targets in both constructor
+orders. The reused helper matches the native iteration-81
+`candidate/post-fame-cpu-stream-platform.mlir` exactly.
+
+Native CPU port assembly also identifies the writer through its zero-sink
+stream contract and requires exactly one matching ordinary or strict forwarding
+driver. Tests cover a catalog-renamed writer, strict forwarding, duplicate
+contracts and duplicate/conflicting drivers without changing rejected IR.
+
+Validation: the compiler and three focused test executables build; Print
+binding, CPU stream port and empty CPU stream write CTests pass (6.62 seconds).
+Both `--rocket-empty-cpu-stream-write-boundary` replays pass 13 atomic rejection
+checks and FIRRTL verification. Each emitted helper passes 73,984 interpreted
+operation cases, covering all 65,536 live AW IDs, eight sizes, reset/valid/ready
+combinations and all 64 missing-strobe lanes. The updated native CPU port pass
+also replays the real Rocket boundary: 89 ports and 1,676 retained annotations. The structured SFC comparison
+passes in both orders: 288 unchanged bodies, 120 ports, 122 routes and recursive
+target transfer. Replay, behavior and comparison stderr logs are empty.
+Evidence is under `iteration113-print-rocket-cpu-stream-port/` in the generated
+tree; `empty-write-comparison.json` records the golden and both candidates.
+
+Supplied iteration-112 harness results pass CIRCT replacertl and all required
+Verilator workloads. The complete buildbitstream stdout/stderr and manager log
+were inspected: Vivado 2023.2.2 fails before synthesis because
+`bd_lib/2023.2.2/create_aurora_exdes.tcl` is absent. No manager gate or direct SSH
+was started. Shared platform, clock-control and harness changes are preserved.
+
+Next smallest step: compose the native depth-two AW/W CPU queues on this
+expanded empty-write boundary, including AW address/length, and compare their
+stall/reset behavior with SFC before composing AR/R/B queues and the aggregate
+CPU platform port. Production Print CLI/driver/runtime parity, general
+FAME1/FAME5, multiclock and the SFC UART-bearing baseline remain incomplete.
+Overall port completion is not claimed.

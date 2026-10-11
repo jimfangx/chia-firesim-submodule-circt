@@ -305,4 +305,8 @@ mlir::LogicalResult mapPrintBridgeRocketHostMemoryOutputBuffer(
 /// Atomic; preserve prior IR and consumed targets, transfer copied ports.
 mlir::LogicalResult mapPrintBridgeRocketHostMemoryPort(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach zero-sink CPU AW/W/B defaults and reset-gated protocol assertions.
+/// Atomic; preserve prior IR and transfer copied top targets.
+mlir::LogicalResult mapPrintBridgeRocketEmptyCPUStreamWrite(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

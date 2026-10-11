@@ -8,6 +8,7 @@
 #include "goldengate/HostMemoryReadResponses.h"
 #include "goldengate/HostMemoryOutputBuffer.h"
 #include "goldengate/HostMemoryPort.h"
+#include "goldengate/EmptyCPUStreamWrite.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/ControlErrorSlave.h"
@@ -1884,6 +1885,36 @@ LogicalResult goldengate::mapPrintBridgeRocketHostMemoryPort(
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGHostMemoryPlatformWrapper" ||
           m.getName() == "GGHostMemoryPortAdapter")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// CPUManagedStreamEngine's empty sinkParams still require AW/W protocol
+// assertions and live AW-ID forwarding while B is invalid. Attach the retained
+// native catalog helper to the expanded boundary; preserve existing identities.
+LogicalResult goldengate::mapPrintBridgeRocketEmptyCPUStreamWrite(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  if (circuit.getName() != "GGHostMemoryPlatformWrapper") {
+    error = "Print empty CPU write requires the host memory platform boundary";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp helper;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m->hasAttr("goldengate.fromHostCPUStreamCount")) {
+      if (helper) { error = "Print empty CPU write requires one writer contract"; return failure(); }
+      helper = m;
+    }
+  if (failed(attachEmptyCPUStreamWrite(*staged, helper, "GGPrintCPUStreamWriteWrapper", error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "Print empty CPU write produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGPrintCPUStreamWriteWrapper")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

@@ -8,6 +8,7 @@
 // Copies the existing boundary and retargets its ports, adding a stateless
 // write boundary with the two host-clock, reset-gated protocol assertions.
 #include "goldengate/TracerVTokenEngine.h"
+#include "goldengate/EmptyCPUStreamWrite.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
@@ -82,6 +83,94 @@ LogicalResult goldengate::addEmptyCPUStreamWrite(CircuitOp circuit,
   assertValid(3, 5, constant(3, 6), "CPUManagedStreamEngine requires 64-byte write beats");
   assertValid(7, 8, constant(64, ~uint64_t(0)), "CPUManagedStreamEngine requires all write strobes");
 
+  SmallVector<PortInfo> ports(inner.getPorts()); unsigned firstAXI = ports.size();
+  for (auto p : ArrayRef<PortInfo>(helperPorts).drop_front(2)) {
+    p.name = b.getStringAttr("cpu_stream_" + p.name.getValue().str()); ports.push_back(p);
+  }
+  b.setInsertionPointToEnd(circuit.getBodyBlock());
+  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
+  b.setInsertionPointToStart(wrapper.getBodyBlock());
+  auto sim = b.create<InstanceOp>(loc, inner, "sim");
+  auto transport = b.create<InstanceOp>(loc, helper, "cpuStreamWrite");
+  SmallVector<unsigned> copied;
+  for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
+    copied.push_back(i); Value external = wrapper.getBodyBlock()->getArgument(i);
+    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
+        p.direction == Direction::In ? external : sim.getResult(i));
+  }
+  connect(transport.getResult(0), wrapper.getBodyBlock()->getArgument(*clock));
+  connect(transport.getResult(1), wrapper.getBodyBlock()->getArgument(*reset));
+  for (unsigned i = 2; i < helperPorts.size(); ++i) {
+    Value external = wrapper.getBodyBlock()->getArgument(firstAXI + i - 2);
+    if (helperPorts[i].direction == Direction::In) connect(transport.getResult(i), external);
+    else connect(external, transport.getResult(i));
+  }
+  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
+  std::string modulePrefix = "|" + inner.getName().str() + ">";
+  std::function<Attribute(Attribute)> retarget = [&](Attribute attr) -> Attribute {
+    if (auto s = dyn_cast<StringAttr>(attr)) {
+      auto value = s.getValue(); if (value == oldPrefix) return b.getStringAttr(newPrefix);
+      if (!value.consume_front(oldPrefix + "|")) return attr;
+      std::string suffix = "|" + value.str(); llvm::StringRef ref(suffix);
+      if (ref.consume_front(modulePrefix)) {
+        auto name = ref.take_front(ref.find_first_of(".["));
+        for (auto i : copied) if (name == inner.getPortName(i)) {
+          suffix.replace(0, modulePrefix.size(), "|" + wrapperName.str() + ">"); break;
+        }
+      }
+      return b.getStringAttr(newPrefix + suffix);
+    }
+    if (auto a = dyn_cast<ArrayAttr>(attr)) {
+      SmallVector<Attribute> values; for (auto v : a) values.push_back(retarget(v)); return b.getArrayAttr(values);
+    }
+    if (auto d = dyn_cast<DictionaryAttr>(attr)) {
+      NamedAttrList values; for (auto v : d) values.set(v.getName(), retarget(v.getValue())); return values.getDictionary(context);
+    }
+    return attr;
+  };
+  SmallVector<Attribute> annotations; for (auto a : raw) annotations.push_back(retarget(a));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations)); circuit.setName(wrapperName);
+  return success();
+}
+
+
+// Shared attachment for an expanded top and its preserved native catalog.
+LogicalResult goldengate::attachEmptyCPUStreamWrite(CircuitOp circuit,
+    FModuleOp helper, StringRef wrapperName, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned w) { return UIntType::get(context, w, false); };
+  FModuleOp inner;
+  for (auto m : circuit.getOps<FModuleLike>()) {
+    if (m.getModuleName() == wrapperName) return reject("empty CPU write wrapper already exists");
+    if (m.getModuleName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
+  }
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto count = helper ? helper->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount") : IntegerAttr{};
+  if (!inner || !raw || !helper || helper->getParentOp() != circuit || !count || count.getInt() != 0 || helper.getNumPorts() != 13)
+    return reject("empty CPU write requires an active top, annotations and a zero-sink engine");
+  auto helperPorts = helper.getPorts();
+  const StringRef names[]{"clock","reset","aw_ready","aw_valid","aw_bits_id","aw_bits_size",
+      "w_ready","w_valid","w_bits_strb","b_valid","b_bits_id","b_bits_resp","b_ready"};
+  const unsigned widths[]{0,1,1,1,16,3,1,1,64,1,16,2,1};
+  for (auto [i,p] : llvm::enumerate(helperPorts)) {
+    auto direction = llvm::is_contained(ArrayRef<unsigned>({2,6,9,10,11}), unsigned(i)) ? Direction::Out : Direction::In;
+    if (p.name != names[i] || p.type != (i == 0 ? Type(ClockType::get(context)) : Type(uint(widths[i]))) || p.direction != direction)
+      return reject("empty CPU write engine interface differs from the U250 contract");
+  }
+  std::optional<unsigned> clock, reset, readID;
+  for (auto [i,p] : llvm::enumerate(inner.getPorts())) {
+    auto n = p.name.getValue();
+    if (n.starts_with("cpu_stream_aw_") || n.starts_with("cpu_stream_w_") || n.starts_with("cpu_stream_b_") || n.contains("from_cpu_stream"))
+      return reject("empty CPU write boundary or incoming streams already exist");
+    if (n == "hostClock" && p.type == ClockType::get(context) && p.direction == Direction::In) clock = i;
+    if (n == "hostReset" && p.type == uint(1) && p.direction == Direction::In) reset = i;
+    if (n == "cpu_stream_r_bits_id" && p.type == uint(16) && p.direction == Direction::Out) readID = i;
+  }
+  if (!clock || !reset || !readID) return reject("empty CPU write requires the U250 read boundary and host clock/reset");
+  bool used = false; circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
+  if (used) return reject("empty CPU write requires an uninstantiated top");
+  auto connect = [&](Value d, Value source) { b.create<StrictConnectOp>(loc, d, source); };
   SmallVector<PortInfo> ports(inner.getPorts()); unsigned firstAXI = ports.size();
   for (auto p : ArrayRef<PortInfo>(helperPorts).drop_front(2)) {
     p.name = b.getStringAttr("cpu_stream_" + p.name.getValue().str()); ports.push_back(p);

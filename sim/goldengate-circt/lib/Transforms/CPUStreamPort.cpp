@@ -2,7 +2,7 @@
 // Oracle: FPGATop.cpuManagedAXI4NodeTuple and cpu_managed_axi4 IO <> node.out.
 // Required boundary: uninstantiated GGHostMemoryPlatformWrapper with all 25
 // recorded U250 CPU stream scalars forwarded uniquely to its retained child.
-// Required engines: one outgoing TracerV CPU stream, zero incoming streams.
+// Required engines: buffered outgoing CPU streams, zero incoming streams.
 // Mutation: aggregate 64/512/16 AXI4 slave plus combinational leaf adapter.
 // Unused AW/AR metadata and W data/last inputs have no users in this profile.
 // No state, buffering, ID adaptation, or protocol gating is added here.
@@ -24,7 +24,13 @@ LogicalResult goldengate::assembleCPUStreamPort(CircuitOp circuit,
   for(auto m:circuit.getOps<FModuleLike>()) {
     auto n=m.getModuleName();if(n==newName||n==helperName)return reject("CPU stream platform adapter already exists");
     auto f=dyn_cast<FModuleOp>(m.getOperation());if(!f)continue;
-    if(n==oldName)inner=f;if(n=="GGCPUStreamRead")read=f;if(n=="GGEmptyCPUStreamWrite")write=f;
+    if(n==oldName)inner=f;if(n=="GGCPUStreamRead")read=f;
+    // Catalog composition preserves the empty writer's module identity. Its
+    // stream contract, rather than its generated name, identifies this engine.
+    if(auto count=f->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount")) {
+      if(write||count.getInt()!=0)return reject("CPU stream platform adapter requires one zero-sink writer");
+      write=f;
+    }
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto addr=read?read->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits"):IntegerAttr();
@@ -78,8 +84,12 @@ LogicalResult goldengate::assembleCPUStreamPort(CircuitOp circuit,
     auto n="cpu_stream_"+leaf.name.str();Value a=arg(inner,consumed.at(n)),v=childPort(n);
     if(!v||v.getType()!=a.getType()||!a.hasOneUse())return reject("CPU stream scalar requires one exact child forwarding connection");
     auto d=leaf.direction==Direction::In?v:a,s=leaf.direction==Direction::In?a:v;
-    unsigned count=0;for(auto c:inner.getOps<ConnectOp>())count+=c.getDest()==d&&c.getSrc()==s;
-    if(count!=1)return reject("CPU stream scalar requires a unique direct child binding");
+    unsigned drivers=0,matches=0;
+    for(auto &op:inner.getBodyBlock()->getOperations())
+      if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==d) {
+        ++drivers;matches+=op.getOperand(1)==s;
+      }
+    if(drivers!=1||matches!=1)return reject("CPU stream scalar requires a unique direct child binding");
   }
   // All rejection paths precede mutation. Generate ordinary FIRRTL operations.
   auto token=[&](ArrayRef<std::pair<StringRef,unsigned>> fs){

@@ -108,7 +108,7 @@ int main(int argc,char **argv) {
       auto target=cast<StringAttr>(cast<DictionaryAttr>(a).getAs<ArrayAttr>("targets")[0]).getValue();
       require(target.starts_with("~GGCPUStreamPlatformWrapper|"+std::string(i<3?"GGCPUStreamPlatformWrapper":"GGHostMemoryPlatformWrapper")+">"),"annotation transfer/retention");
     }
-    for(unsigned mode=0;mode<10;++mode) {
+    for(unsigned mode=0;mode<14;++mode) {
       auto test=fixture(ctx);auto tc=*test->getOps<CircuitOp>().begin();auto t=top(tc,"GGHostMemoryPlatformWrapper");OpBuilder b(&ctx);
       if(mode==0)tc->removeAttr("rawAnnotations");
       else if(mode==1)tc.setName("Wrong");
@@ -118,11 +118,28 @@ int main(int argc,char **argv) {
       else if(mode==6){for(auto conn:t.getOps<ConnectOp>())if(path(t,conn.getDest())=="sim.cpu_stream_ar_valid"){conn.erase();break;}}
       else if(mode==7){for(auto conn:t.getOps<ConnectOp>())if(path(t,conn.getDest())=="sim.cpu_stream_ar_valid"){b.setInsertionPoint(conn);b.create<ConnectOp>(conn.getLoc(),conn.getDest(),conn.getSrc());break;}}
       else if(mode==8){b.setInsertionPointToStart(top(tc,"GGHostMemoryReadResponseWrapper").getBodyBlock());b.create<InstanceOp>(tc.getLoc(),t,"nested");}
+      else if(mode>=10) {
+        if(mode==13) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());auto w=b.create<FModuleOp>(tc.getLoc(),b.getStringAttr("DuplicateWriter"),ConventionAttr::get(&ctx,Convention::Internal),ArrayRef<PortInfo>{});
+          w->setAttr("goldengate.fromHostCPUStreamCount",b.getI32IntegerAttr(0));
+        } else for(auto conn:t.getOps<ConnectOp>())if(path(t,conn.getDest())=="sim.cpu_stream_ar_valid") {
+          b.setInsertionPoint(conn);auto wrong=b.create<WireOp>(conn.getLoc(),conn.getSrc().getType(),"wrongDriver").getResult();
+          if(mode==10)b.create<ConnectOp>(conn.getLoc(),conn.getDest(),wrong);
+          else b.create<StrictConnectOp>(conn.getLoc(),conn.getDest(),mode==11?wrong:conn.getSrc());break;
+        }
+      }
       else {auto names=t.getPortNamesAttr();SmallVector<Attribute> ns(names.begin(),names.end());for(auto &n:ns)if(cast<StringAttr>(n).getValue()=="cpu_stream_ar_valid")n=b.getStringAttr("cpu_stream_unknown");t.setPortNamesAttr(b.getArrayAttr(ns));}
       auto s=dump(*test);require(failed(goldengate::assembleCPUStreamPort(tc,error))&&!error.empty(),"invalid boundary accepted");require(s==dump(*test),"rejection mutated IR");
     }
+    // Catalog names and strict forwarding have the same semantic contract.
+    auto catalog=fixture(ctx);auto cc=*catalog->getOps<CircuitOp>().begin();OpBuilder cb(&ctx);
+    top(cc,"GGEmptyCPUStreamWrite").setName("CatalogRocket_GGEmptyCPUStreamWrite");
+    for(auto conn:llvm::make_early_inc_range(top(cc,"GGHostMemoryPlatformWrapper").getOps<ConnectOp>())) {
+      cb.setInsertionPoint(conn);cb.create<StrictConnectOp>(conn.getLoc(),conn.getDest(),conn.getSrc());conn.erase();
+    }
+    require(succeeded(goldengate::assembleCPUStreamPort(cc,error))&&succeeded(verify(*catalog)),"catalog writer/strict forwarding rejected");bindings(cc);behavior(cc);
     auto s=dump(*root);require(failed(goldengate::assembleCPUStreamPort(c,error)),"repeat accepted");require(s==dump(*root),"repeat mutated IR");
-    llvm::outs()<<"11 atomic rejections; old bodies, aggregate bindings and copied/consumed targets preserved\n";
+    llvm::outs()<<"15 atomic rejections; old bodies, aggregate bindings and copied/consumed targets preserved\n";
     if(argc>=2){std::error_code ec;llvm::raw_fd_ostream os(argv[1],ec);require(!ec,"cannot write helper");os<<"module { firrtl.circuit \"GGCPUStreamPortAdapter\" {\n";top(c,"GGCPUStreamPortAdapter")->print(os);os<<"\n} }\n";}
     if(argc>=3) {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"real parse");auto rc=*real->getOps<CircuitOp>().begin();auto n=rc->getAttrOfType<ArrayAttr>("rawAnnotations").size();

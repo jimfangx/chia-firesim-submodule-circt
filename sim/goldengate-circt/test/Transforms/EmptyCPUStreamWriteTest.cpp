@@ -62,10 +62,8 @@ struct Interpreter {
     memo.insert_or_assign(v, n); return n;
   }
 };
-void behavior(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  require(succeeded(goldengate::addEmptyCPUStreamWrite(c, error)), error);
-  require(succeeded(verify(*root)), "IR invalid"); Interpreter sim(named(c, "GGEmptyCPUStreamWrite"));
+void behavior(FModuleOp helper) {
+  Interpreter sim(helper);
   std::mt19937_64 rng(163); unsigned cases = 0;
   auto sample = [&](unsigned flags, unsigned id, unsigned size, uint64_t strobe) {
     sim.memo.clear(); sim.put(1, flags&1); sim.put(3, (flags>>1)&1); sim.put(4, id);
@@ -135,7 +133,13 @@ void rejection(MLIRContext &context) {
   }
 }
 }
-int main() {
-  try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>(); behavior(context); mapping(context); rejection(context); return 0; }
+int main(int argc, char **argv) {
+  try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>(); if (argc == 3 && StringRef(argv[1]) == "--expanded-boundary") {
+    auto root = parseSourceFile<ModuleOp>(argv[2], &context); require(bool(root) && succeeded(verify(*root)), "expanded IR invalid");
+    behavior(named(*root->getOps<CircuitOp>().begin(), "CatalogRocket_GGEmptyCPUStreamWrite")); return 0;
+  }
+  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  require(succeeded(goldengate::addEmptyCPUStreamWrite(c, error)), error);
+  require(succeeded(verify(*root)), "IR invalid"); behavior(named(c, "GGEmptyCPUStreamWrite")); mapping(context); rejection(context); return 0; }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
