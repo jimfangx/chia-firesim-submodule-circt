@@ -182,6 +182,12 @@ void rejected(MLIRContext &ctx,unsigned mode) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();
+    if(argc==3&&StringRef(argv[1])=="--expanded-boundary") {
+      auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(root),"cannot parse expanded AR boundary");
+      require(succeeded(verify(*root)),"expanded AR boundary verifier");
+      auto c=*root->getOps<CircuitOp>().begin();require(c.getName()=="GGHostMemoryReadWrapper","expanded AR top");
+      compare(c);bindings(c);return 0;
+    }
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
     std::map<std::string,std::string> before;for(auto m:c.getOps<FModuleOp>())before[m.getName().str()]=dump(m);
     std::string error;require(succeeded(goldengate::addHostMemoryReadArbiter(c,error)),error);require(succeeded(verify(*root)),"IR verifier");

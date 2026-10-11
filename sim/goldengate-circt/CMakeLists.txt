@@ -439,7 +439,8 @@ if(BUILD_TESTING)
     lib/Transforms/FASEDHostMemoryBuffer.cpp
     lib/Transforms/FASEDAddressTranslation.cpp
     lib/Transforms/HostMemoryWriteArbiter.cpp
-    lib/Transforms/HostMemoryWriteResponses.cpp)
+    lib/Transforms/HostMemoryWriteResponses.cpp
+    lib/Transforms/HostMemoryReadArbiter.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-binding-test PRIVATE

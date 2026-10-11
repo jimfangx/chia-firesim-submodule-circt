@@ -289,4 +289,8 @@ mlir::LogicalResult mapPrintBridgeRocketHostMemoryWriteArbiter(
 /// Atomic; retain consumed B targets and transfer copied ports and AR/R/AW/W.
 mlir::LogicalResult mapPrintBridgeRocketHostMemoryWriteResponses(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Arbitrate host AR, retain stalled selection and widen FASED IDs to five bits.
+/// Atomic; retain consumed AR targets, transfer R and join AW/W/B/AR targets.
+mlir::LogicalResult mapPrintBridgeRocketHostMemoryReadArbiter(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

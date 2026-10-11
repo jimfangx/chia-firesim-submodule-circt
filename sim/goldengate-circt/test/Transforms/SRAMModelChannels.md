@@ -3853,3 +3853,74 @@ expanded replays, 19 rejection cases per order, FIRRTL verification,
 Comparison and semantic stderr logs are empty. Existing shared clock-control,
 U250 recovery and harness edits are excluded from this checkpoint. The
 migration remains incomplete.
+
+### Iteration 109: compose host AR arbitration on the expanded Print boundary
+
+`mapPrintBridgeRocketHostMemoryReadArbiter` attaches the shared CIRCT
+`HostMemoryReadArbiter` pass to the actual expanded Print/LoadMem/FASED AW/W/B
+boundary. It validates the expanded FASED allocation, stages and verifies the
+transformation, then moves only the new wrapper and arbiter into the live
+circuit. Existing module, port and SSA argument identities remain intact.
+The shared pass now checks both LoadMem B scalar routes and the FASED B
+aggregate route before attaching AR, and transfers whole retained FASED R
+channel targets as well as their leaves.
+
+The new `GGHostMemoryReadWrapper` has 113 ports: 111 copied ports, remaining
+FASED R and the joined host AW/W/B/AR master. Its 122 connections preserve
+all copied controls and Print interfaces, forward host clock/reset to the
+arbiter, arbitrate LoadMem/FASED AR, and retain AW/W/B/R routing. Copied ports
+and whole retained R targets transfer to the public top. Host AW/W/B channel
+and leaf targets rename `host_mem_write` to `host_mem`; consumed AR targets
+and old aggregate identities remain on the retained inner module.
+
+The executable Scala pipeline in `MidasTransforms.scala` and host clock/reset
+semantics in `FAMETransform.scala` were reread. The arbitration oracle is
+`FPGATop.scala`'s AXI4Xbar, Rocket Chip `amba/axi4/Xbar.scala`'s `returnWinner`
+and `tilelink/Arbiter.scala`'s round-robin policy. Exact immutable artifact:
+
+```
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+`PrintRocketHostMemoryReadArbiterCompare.py` anchors 49 recorded `AXI4Xbar`
+AR selection, ready and payload equations, seven synchronous state-update
+anchors, and the 5-bit host / 4-bit FASED ID and 34-bit address ABI. Priority
+rotates on idle selection, before acceptance; selection locks through stalls.
+LoadMem emits ID 16, length 0, size 3 and burst 1. FASED IDs zero-extend to
+five bits; all selected payload fields preserve the recorded Mux1H behavior.
+
+Replay the actual iteration-108 expanded boundary with
+`goldengate-print-binding-test --rocket-host-memory-read-arbiter-boundary
+INPUT OUTPUT_PREFIX`, or its `-reverse` variant, after sourcing the project
+environment. Both orders check 21 atomic rejections, including malformed
+interfaces, collisions, constructor mismatch, missing AR/R/B bindings,
+missing/duplicate host clock/reset and repeated attachment. A separate nested
+target probe checks thirteen copied, consumed, channel and aggregate targets.
+Then run `goldengate-host-memory-read-arbiter-test --expanded-boundary OUTPUT`
+and the structured comparison with `--before`, `--after`, `--baseline`,
+`--sfc` and `--report-json`. The native-helper baseline is
+`iteration81-print-rocket-fased-read-buffer/candidate/
+post-fame-host-memory-read-arbiter.mlir`; mutable evidence is under
+`iteration109-print-rocket-host-memory-read-arbiter/`.
+
+Next smallest step: compose the existing host R response router onto this
+expanded Print boundary, preserving LoadMem read data/handshake and FASED R
+identities, then compare ID selection, truncation and selected-consumer
+backpressure against the same SFC AXI4Xbar. Expanded Print production
+CLI/driver integration and runtime parity, general FAME1/FAME5, multiclock
+support and the SFC UART baseline remain incomplete. Supplied iteration-108
+harness feedback passes CIRCT replacertl and required Verilator workloads;
+it does not establish runtime parity for this newly expanded Print path.
+No FireSim manager verification gate was started by the implementation agent.
+
+Validation: the compiler and Print/native host read test executables build.
+All three focused CTests pass in 17.17 seconds. Both expanded replays and
+21 atomic rejections per order pass. Each emitted arbiter passes 512
+exhaustive state/input/reset cases (8,192 checks) and a 12,001-cycle trace
+(192,016 checks, 5,056 stalled cycles and 5,143 contention cycles). FIRRTL
+verification and the structured golden comparison pass in both orders;
+all 277 prior module bodies including 21 Print modules are unchanged,
+111 ports are copied, and 122 routes and recursive archive targets match.
+The helper is identical to the native baseline. Comparison and semantic
+stderr logs are empty. Existing shared clock-control, U250 recovery and
+harness edits are excluded from this checkpoint. The port remains incomplete.

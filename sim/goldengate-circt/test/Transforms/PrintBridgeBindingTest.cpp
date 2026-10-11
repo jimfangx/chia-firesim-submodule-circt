@@ -2292,6 +2292,106 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+void rocketHostMemoryReadArbiter(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  SmallVector<SmallVector<PortInfo>> priorPorts;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+    arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+  }
+  const StringRef additions[]{"GGHostMemoryReadWrapper", "GGHostMemoryReadArbiter"};
+  for (unsigned bad = 0; bad < 20; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); OpBuilder b(ctx);
+    auto top = named(c, original.getName());
+    auto sim = child(top, named(c, "GGHostMemoryWriteWrapper"));
+    auto router = child(top, named(c, "GGHostMemoryWriteResponseRouter"));
+    if (bad < 2) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(), b.getStringAttr(additions[bad]), top.getConventionAttr(), ArrayRef<PortInfo>{});
+    } else if (bad == 2) c.setName("WrongTop");
+    else if (bad == 3) c->removeAttr("rawAnnotations");
+    else if (bad == 4) sim.setName("missingSim");
+    else if (bad == 5) router.setName("missingRouter");
+    else if (bad == 6) {
+      b.setInsertionPointToEnd(top.getBodyBlock()); b.create<InstanceOp>(c.getLoc(), top, "extra");
+    } else if (bad == 7 || bad == 8) {
+      SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
+      names[port(top, bad == 7 ? "loadmem_mem_ar_valid" : "host_mem_write")] = b.getStringAttr("wrongPort"); top.setPortNames(names);
+    } else if (bad == 9) {
+      auto engine = named(c, "GGFASEDTokenEngine");
+      auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+      NamedAttrList k(key), widths(key.getAs<DictionaryAttr>("axi4Widths"));
+      widths.set("idBits", b.getI64IntegerAttr(5)); k.set("axi4Widths", widths.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", k.getDictionary(ctx));
+    } else {
+      bool changed = false;
+      for (auto &op : llvm::make_early_inc_range(top.getBodyBlock()->getOperations())) {
+        if (!isa<ConnectOp, StrictConnectOp>(op)) continue;
+        Value dest = op.getOperand(0), source = op.getOperand(1);
+        auto src = source.getDefiningOp<SubfieldOp>();
+        auto dst = dest.getDefiningOp<SubfieldOp>();
+        auto sm = named(c, "GGHostMemoryWriteWrapper");
+        bool match = bad == 10 ? src && src.getFieldName() == "ar" :
+            bad == 11 ? src && src.getFieldName() == "r" :
+            bad == 12 ? dest == router.getResult(0) :
+            bad == 13 ? dest == sim.getResult(port(sm, "loadmem_mem_b_valid")) :
+            bad == 14 ? dst && dst.getInput() == router.getResult(1) && dst.getFieldName() == "ready" :
+            bad == 15 ? source == router.getResult(2) :
+            dest == sim.getResult(port(sm, (bad == 16 || bad == 18) ? "hostClock" : "hostReset"));
+        if (!match) continue;
+        if (bad >= 18) { b.setInsertionPoint(&op); b.create<ConnectOp>(c.getLoc(), dest, source); }
+        else op.erase();
+        changed = true; break;
+      }
+      require(changed, "AR malformed fixture did not change a binding");
+    }
+    auto before = dump(*test);
+    require(failed(goldengate::mapPrintBridgeRocketHostMemoryReadArbiter(c, error)) &&
+        !error.empty() && dump(*test) == before,
+        "expanded host AR rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+  }
+  {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); OpBuilder b(ctx);
+    auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> archive(raw.begin(), raw.end());
+    auto prefix = "~" + original.getName().str() + "|" + original.getName().str() + ">";
+    SmallVector<Attribute> targets;
+    for (auto n : {"hostReset", "loadmem_mem_ar_bits_addr", "fased_host_mem.ar", "fased_host_mem.ar.bits.id", "fased_host_mem",
+                   "fased_host_mem.r", "fased_host_mem.r.bits.id", "host_mem_write.aw", "host_mem_write.w", "host_mem_write.b",
+                   "host_mem_write.aw.bits.id", "host_mem_write.b.bits.id", "host_mem_write"})
+      targets.push_back(b.getStringAttr(prefix + n));
+    archive.push_back(b.getDictionaryAttr({b.getNamedAttr("nested", b.getArrayAttr(targets))}));
+    c->setAttr("rawAnnotations", b.getArrayAttr(archive));
+    require(succeeded(goldengate::mapPrintBridgeRocketHostMemoryReadArbiter(c, error)), error);
+    auto text = dump(c.getOperation());
+    for (auto n : {"hostReset", "fased_host_mem.r", "fased_host_mem.r.bits.id", "host_mem.aw", "host_mem.w", "host_mem.b", "host_mem.aw.bits.id", "host_mem.b.bits.id"})
+      require(text.find("~GGHostMemoryReadWrapper|GGHostMemoryReadWrapper>" + std::string(n) + "\"") != std::string::npos, "copied or remaining AR-stage target lost");
+    for (auto n : {"loadmem_mem_ar_bits_addr", "fased_host_mem.ar", "fased_host_mem.ar.bits.id", "fased_host_mem", "host_mem_write"})
+      require(text.find("~GGHostMemoryReadWrapper|" + original.getName().str() + ">" + n + "\"") != std::string::npos, "consumed AR-stage target lost");
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketHostMemoryReadArbiter(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == arguments[j].size(), "host AR changed prior module identity");
+    for (auto [p, arg] : llvm::enumerate(arguments[j])) {
+      auto info = m.getPorts()[p], old = priorPorts[j][p];
+      require(m.getArguments()[p] == arg && info.name == old.name && info.type == old.type && info.direction == old.direction &&
+          info.annotations == old.annotations && info.sym == old.sym, "host AR changed a prior port or argument");
+    }
+  }
+  auto top = named(f.circuit, additions[0]);
+  require(top.getNumPorts() == 113 && llvm::range_size(top.getOps<InstanceOp>()) == 2, "host AR wrapper geometry");
+  child(top, original); child(top, named(f.circuit, additions[1]));
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketHostMemoryReadArbiter(f.circuit, error)) && dump(*f.root) == before, "repeated host AR changed IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-host-memory-read-arbiter-reverse.mlir" : ".rocket-host-memory-read-arbiter.mlir")).str(), ec);
+    require(!ec, "cannot write expanded host AR boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketHostMemoryWriteResponses(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -4076,6 +4176,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketLoadMemEngine(f, output, reverse, rejected);
       rocketHostMemoryWriteArbiter(f, output, reverse, rejected);
       rocketHostMemoryWriteResponses(f, output, reverse, rejected);
+      rocketHostMemoryReadArbiter(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -4413,6 +4514,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-host-memory-read-arbiter-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded host AW/W/B boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketHostMemoryReadArbiter(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded host AR arbiter boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-host-memory-write-responses-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded host AW/W boundary");

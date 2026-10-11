@@ -88,22 +88,28 @@ LogicalResult goldengate::addHostMemoryReadArbiter(CircuitOp circuit,
     if(!sim)return {};for(auto [i,p]:llvm::enumerate(sim.getPortNames()))if(cast<StringAttr>(p).getValue()==n)return sim.getResult(i);return {};
   };
   unsigned awb=0,wb=0,bb=0,rb=0,ab=0,lrb=0,lvb=0,lab=0,cb=0,rstb=0;
+  unsigned loadB=0,loadReady=0,fasedB=0;
   if(sim&&router&&router.getNumResults()==3) {
     Value sm=simPort("fased_host_mem"),sw=simPort("host_mem_write");
-    for(auto c:inner.getOps<ConnectOp>()) {
-      awb+=fieldIs(c.getDest(),arg(inner,*w),"aw")&&fieldIs(c.getSrc(),sw,"aw");
-      wb+=fieldIs(c.getDest(),arg(inner,*w),"w")&&fieldIs(c.getSrc(),sw,"w");
-      bb+=c.getDest()==router.getResult(0)&&fieldIs(c.getSrc(),arg(inner,*w),"b");
-      rb+=fieldIs(c.getDest(),sm,"r")&&fieldIs(c.getSrc(),arg(inner,*mem),"r");
-      ab+=fieldIs(c.getDest(),arg(inner,*mem),"ar")&&fieldIs(c.getSrc(),sm,"ar");
-      lrb+=c.getDest()==simPort("loadmem_mem_ar_ready")&&c.getSrc()==arg(inner,*lr);
-      lvb+=c.getDest()==arg(inner,*lv)&&c.getSrc()==simPort("loadmem_mem_ar_valid");
-      lab+=c.getDest()==arg(inner,*la)&&c.getSrc()==simPort("loadmem_mem_ar_bits_addr");
-      cb+=c.getDest()==simPort("hostClock")&&c.getSrc()==arg(inner,*clock);
-      rstb+=c.getDest()==simPort("hostReset")&&c.getSrc()==arg(inner,*reset);
+    for(auto &op:inner.getBodyBlock()->getOperations()) {
+      if(!isa<ConnectOp,StrictConnectOp>(op))continue;
+      Value dest=op.getOperand(0),src=op.getOperand(1);
+      awb+=fieldIs(dest,arg(inner,*w),"aw")&&fieldIs(src,sw,"aw");
+      wb+=fieldIs(dest,arg(inner,*w),"w")&&fieldIs(src,sw,"w");
+      bb+=dest==router.getResult(0)&&fieldIs(src,arg(inner,*w),"b");
+      loadB+=dest==simPort("loadmem_mem_b_valid")&&fieldIs(src,router.getResult(1),"valid");
+      loadReady+=fieldIs(dest,router.getResult(1),"ready")&&src==simPort("loadmem_mem_b_ready");
+      fasedB+=fieldIs(dest,sm,"b")&&src==router.getResult(2);
+      rb+=fieldIs(dest,sm,"r")&&fieldIs(src,arg(inner,*mem),"r");
+      ab+=fieldIs(dest,arg(inner,*mem),"ar")&&fieldIs(src,sm,"ar");
+      lrb+=dest==simPort("loadmem_mem_ar_ready")&&src==arg(inner,*lr);
+      lvb+=dest==arg(inner,*lv)&&src==simPort("loadmem_mem_ar_valid");
+      lab+=dest==arg(inner,*la)&&src==simPort("loadmem_mem_ar_bits_addr");
+      cb+=dest==simPort("hostClock")&&src==arg(inner,*clock);
+      rstb+=dest==simPort("hostReset")&&src==arg(inner,*reset);
     }
   }
-  if(used||instances!=2||!sim||!router||awb!=1||wb!=1||bb!=1||rb!=1||ab!=1||lrb!=1||lvb!=1||lab!=1||cb!=1||rstb!=1)
+  if(used||instances!=2||!sim||!router||awb!=1||wb!=1||bb!=1||rb!=1||ab!=1||lrb!=1||lvb!=1||lab!=1||cb!=1||rstb!=1||loadB!=1||loadReady!=1||fasedB!=1)
     return reject("host memory read arbiter requires the unique two-instance AW/W/B, AR/R and host-clock bindings");
   // All contract checks precede mutations.
   auto f=[&](Value v,StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};
@@ -185,7 +191,7 @@ LogicalResult goldengate::addHostMemoryReadArbiter(CircuitOp circuit,
         auto root=ref.take_front(ref.find_first_of(".[")).str();
         if(ref.starts_with("host_mem_write.")) {
           suffix="|"+newName.str()+">host_mem"+ref.drop_front(StringRef("host_mem_write").size()).str();
-        } else if(copied.count(root)||ref.starts_with("fased_host_mem.r."))
+        } else if(copied.count(root)||ref=="fased_host_mem.r"||ref.starts_with("fased_host_mem.r."))
           suffix.replace(0,mp.size(),"|"+newName.str()+">");
       }
       return b.getStringAttr(np+suffix);
