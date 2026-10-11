@@ -264,4 +264,9 @@ mlir::LogicalResult mapPrintBridgeRocketControlMaster(
 /// identities and transfer mapped leaf and copied annotation targets.
 mlir::LogicalResult mapPrintBridgeRocketFASEDHostMemory(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Translate the expanded Rocket/Print memory master into the recorded host
+/// region. Atomic; preserve prior IR identities and pre-translation memory
+/// targets, transfer copied targets and retain valid-qualified bounds checks.
+mlir::LogicalResult mapPrintBridgeRocketFASEDAddressTranslation(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

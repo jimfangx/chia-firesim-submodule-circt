@@ -2292,6 +2292,140 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+void rocketFASEDAddressTranslation(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto decoder = named(f.circuit, "GGControlAddressDecode");
+  auto engine = named(f.circuit, "GGFASEDTokenEngine");
+  auto constructor = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+  auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto names = llvm::to_vector(original.getPortNames());
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  SmallVector<SmallVector<PortInfo>> priorPorts;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+    arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+  }
+  for (unsigned bad = 0; bad < 18; ++bad) {
+    FModuleOp collision; InstanceOp extra;
+    if (bad < 2) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr(bad == 0 ?
+          "GGFASEDAddressTranslation" : "GGFASEDAddressTranslationWrapper"),
+          original.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 2) {
+      b.setInsertionPointToEnd(original.getBodyBlock());
+      extra = b.create<InstanceOp>(f.circuit.getLoc(), original, "duplicate");
+    }
+    if (bad == 3) {
+      SmallVector<Attribute> changed(regions.begin(), regions.end());
+      NamedAttrList row(cast<DictionaryAttr>(changed[1])); row.set("start", b.getI64IntegerAttr(256));
+      changed[1] = row.getDictionary(ctx);
+      decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(changed));
+    }
+    if (bad == 4) f.circuit.setName("WrongTop");
+    if (bad == 5) f.circuit->removeAttr("rawAnnotations");
+    if (bad >= 6 && bad <= 8) {
+      const StringRef missing[]{"fased_host_mem", "hostClock", "hostReset"};
+      auto changed = names; changed[port(original, missing[bad - 6])] = b.getStringAttr("missingBoundary");
+      original.setPortNames(changed);
+    }
+    if (bad >= 9 && bad <= 11) {
+      NamedAttrList changed(constructor);
+      if (bad == 9) changed.set("memoryRegionName", b.getStringAttr("WrongRegion"));
+      if (bad == 10) {
+        NamedAttrList edge(constructor.getAs<DictionaryAttr>("axi4Edge"));
+        auto addresses = cast<ArrayAttr>(edge.get("address"));
+        SmallVector<Attribute> rows(addresses.begin(), addresses.end());
+        NamedAttrList row(cast<DictionaryAttr>(rows[0])); row.set("mask", b.getI64IntegerAttr(1));
+        rows[0] = row.getDictionary(ctx); edge.set("address", b.getArrayAttr(rows));
+        changed.set("axi4Edge", edge.getDictionary(ctx));
+      }
+      if (bad == 11) changed.erase("axi4Edge");
+      engine->setAttr("goldengate.bridgeConstructor", changed.getDictionary(ctx));
+    }
+    if (bad >= 12 && bad <= 14) {
+      const StringRef fields[]{"addrBits", "dataBits", "idBits"};
+      NamedAttrList widths(constructor.getAs<DictionaryAttr>("axi4Widths"));
+      widths.set(fields[bad - 12], b.getI64IntegerAttr(1));
+      NamedAttrList changed(constructor); changed.set("axi4Widths", widths.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", changed.getDictionary(ctx));
+    }
+    if (bad == 15) engine->removeAttr("goldengate.bridgeConstructor");
+    if (bad == 16) engine.setName("MissingEngine");
+    if (bad == 17) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      collision = b.create<FModuleOp>(f.circuit.getLoc(), b.getStringAttr("SecondMemoryEngine"),
+          original.getConventionAttr(), ArrayRef<PortInfo>{});
+      collision->setAttr("goldengate.bridgeConstructor", constructor);
+    }
+    auto before = dump(*f.root);
+    require(failed(goldengate::mapPrintBridgeRocketFASEDAddressTranslation(f.circuit, error)) &&
+        !error.empty() && dump(*f.root) == before,
+        "expanded translation rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+    original.setPortNames(names); decoder->setAttr("goldengate.controlRegions", regions);
+    engine.setName("GGFASEDTokenEngine"); engine->setAttr("goldengate.bridgeConstructor", constructor);
+    f.circuit->setAttr("rawAnnotations", raw);
+    if (collision) collision.erase(); if (extra) extra.erase(); f.circuit.setName(original.getName());
+  }
+  SmallVector<Attribute> annotated(raw.begin(), raw.end());
+  const StringRef probes[]{"ctrl.aw.bits.addr", "hostReset", "fased_host_mem.aw.bits.addr",
+      "fased_host_mem.ar.bits.addr", "fased_host_mem.r.bits.data", "fased_host_mem", ""};
+  for (auto probe : probes) {
+    std::string target = "~GGFASEDHostMemoryWrapper";
+    if (!probe.empty()) target += "|GGFASEDHostMemoryWrapper>" + probe.str();
+    annotated.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.TranslationBoundary")),
+        b.getNamedAttr("target", b.getStringAttr(target))}));
+  }
+  f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annotated));
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDAddressTranslation(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  auto top = named(f.circuit, "GGFASEDAddressTranslationWrapper");
+  auto helper = named(f.circuit, "GGFASEDAddressTranslation");
+  require(f.circuit.getName() == top.getName() && bool(child(top, original)) && bool(child(top, helper)),
+      "expanded translation hierarchy differs");
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == arguments[j].size(),
+        "expanded translation changed an existing module identity");
+    for (auto [i, arg] : llvm::enumerate(arguments[j])) {
+      auto p = m.getPorts()[i], old = priorPorts[j][i];
+      require(m.getArguments()[i] == arg && p.name == old.name && p.type == old.type &&
+          p.direction == old.direction && p.annotations == old.annotations && p.sym == old.sym,
+          "expanded translation changed a prior port or argument identity");
+    }
+  }
+  auto addressWidth = [](Type t) {
+    auto field = [](Type t, StringRef n) -> Type {
+      auto bundle = cast<BundleType>(t); return bundle.getElementType(bundle.getElementIndex(n).value());
+    };
+    return cast<UIntType>(field(field(field(t, "aw"), "bits"), "addr")).getWidth();
+  };
+  require(top.getNumPorts() == original.getNumPorts() &&
+      addressWidth(original.getPortType(port(original, "fased_host_mem"))) == 35 &&
+      addressWidth(top.getPortType(port(top, "fased_host_mem"))) == 34 &&
+      llvm::range_size(helper.getOps<AssertOp>()) == 4 &&
+      helper.getOps<RegOp>().empty() && helper.getOps<RegResetOp>().empty(),
+      "expanded translation address widths, assertions or state differ");
+  auto transferred = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  for (auto [i, probe] : llvm::enumerate(probes)) {
+    std::string target = "~GGFASEDAddressTranslationWrapper";
+    if (!probe.empty()) target += std::string(i < 2 ? "|GGFASEDAddressTranslationWrapper>" :
+        "|GGFASEDHostMemoryWrapper>") + probe.str();
+    require(cast<DictionaryAttr>(transferred[raw.size() + i]).getAs<StringAttr>("target").getValue() == target,
+        "expanded translation target transfer differs");
+  }
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDAddressTranslation(f.circuit, error)) &&
+      dump(*f.root) == before, "repeated expanded translation changed IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output +
+        (reverse ? ".rocket-fased-address-translation-reverse.mlir" : ".rocket-fased-address-translation.mlir")).str(), ec);
+    require(!ec, "cannot write expanded translation boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDHostMemory(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -3478,6 +3612,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDControl(f, output, reverse, rejected);
       rocketControlMaster(f, output, reverse, rejected);
       rocketFASEDHostMemory(f, output, reverse, rejected);
+      rocketFASEDAddressTranslation(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -3815,6 +3950,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fased-address-translation-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded host memory boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketFASEDAddressTranslation(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded address translation boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fased-host-memory-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded control master boundary");

@@ -31,6 +31,7 @@
 #include "goldengate/FASEDHistograms.h"
 #include "goldengate/FASEDMMIOBank.h"
 #include "goldengate/FASEDHostMemory.h"
+#include "goldengate/FASEDAddressTranslation.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1344,6 +1345,35 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDHostMemory(CircuitOp circuit,
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGFASEDHostMemoryWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires: unused expanded host memory master, live Rocket/Print allocation,
+// retained constructor/archive and the recorded MainMemory_0 address sets.
+// Consumes: the 35-bit host address boundary; no annotation classes consumed or
+// produced. Copied targets transfer; memory references retain inner semantics.
+// Mutates: append the verified FIRRTL translation helper and wrapper atomically.
+// Analyses required: live MMIO allocation; hierarchy analysis invalidated.
+// Preserves: all prior module/port/argument identities, state, control, clock,
+// channel and constructor metadata. Output: 34-bit host memory master with
+// valid-qualified, host-reset-gated bounds assertions before deinterleaving.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDAddressTranslation(
+    CircuitOp circuit, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDHostMemoryWrapper")
+    return reject("Rocket Print translation requires the assembled host memory master");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDAddressTranslation(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("Rocket Print translation produced invalid FIRRTL IR");
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGFASEDAddressTranslation" ||
+          m.getName() == "GGFASEDAddressTranslationWrapper")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

@@ -3412,3 +3412,79 @@ expanded memory master. Print-enabled production CLI/driver integration,
 general FAME1/FAME5, multiclock support and the UART-bearing SFC runtime
 baseline remain incomplete. No manager verification steps are started by the
 implementation agent; the harness owns replacertl, Verilator and U250 gates.
+
+## Iteration 103: expanded Print/Rocket FASED address translation
+
+`mapPrintBridgeRocketFASEDAddressTranslation` composes the shared native
+`addFASEDAddressTranslation` onto the expanded `GGFASEDHostMemoryWrapper`.
+It validates the live Rocket/Print allocation, stages and verifies on a clone,
+then commits only `GGFASEDAddressTranslation` and its wrapper plus the
+transferred archive. All prior module operations, ports and argument identities
+survive. The completed control fabric, two Print hosts, ingress/egress state,
+clock/reset and bridge/channel constructors remain intact.
+
+The executable oracle is `AXI4AddressTranslation.scala:24-51` and
+`FPGATop.scala:241-255`: the only MainMemory_0 region spans virtual addresses
+0x80000000 through 0x47fffffff and occupies 16 GiB starting at host address zero.
+Both 35-bit AW/AR addresses add 0x380000000 and retain bits 33:0. The four
+assertions check AW upper bound, AR upper bound, AW lower bound, AR lower bound
+on the host clock when reset is inactive. Requests qualify checks with valid,
+independently of ready. No state is introduced. Copied annotation targets
+transfer to the new top; all pre-translation memory targets retain the inner
+module because their address semantics differ from the translated boundary.
+MidasTransforms and FAMETransform were inspected; their clock/token behavior
+remains upstream of this SimulationMapping composition.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration103-print-rocket-fased-address-translation/`. Replays consume
+iteration 102's `binding.mlir.rocket-fased-host-memory[-reverse].mlir`:
+
+```text
+goldengate-print-binding-test --rocket-fased-address-translation-boundary INPUT OUTPUT_PREFIX
+goldengate-print-binding-test --rocket-fased-address-translation-boundary-reverse INPUT_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketFASEDAddressTranslationCompare.py \
+  --before INPUT --after OUTPUT --before INPUT_REVERSE --after OUTPUT_REVERSE \
+  --sfc SFC_SV --baseline ITERATION100/candidate/post-fame-fased-address-translation.mlir \
+  --report-json EVIDENCE/rocket-fased-address-translation-comparison.json
+```
+
+The exact immutable artifact compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, module `AXI4AddressTranslation`. Both orders
+match all 72 surviving AXI port widths/directions, 34 passthrough equations,
+two translated addresses, and four valid/reset assertion predicates and
+messages. SFC optimizes away both B.ready ports; native retains that ready
+passthrough. The helper also matches iteration 100's native ingestion of the
+immutable compiler fixture. SFC disables Print, so these matches establish
+the local memory contract rather than Print-enabled runtime parity.
+
+Both expanded candidates pass 1,024 actual SSA address/bounds vectors each,
+including both virtual limits, overflow/truncation, all valid/ready combinations
+and host reset. The helper has 35 passthrough connections and two address
+connections. The wrapper copies 109 ports, retains 110 final ports and has
+113 checked connections. All 261 prior module bodies, 21 Print modules,
+both Print regions (slaves 8/9 at 544/576), the full annotation archive and
+seven explicit translation target probes are preserved.
+
+Native compiler/test builds pass after correcting a NamedAttrList accessor in
+the new test. Print-binding and FASED-address-translation CTests pass in 5.59
+seconds; the latter includes 1,024 vectors and 15 atomic rejections. Both
+expanded replays pass 19 atomic rejections, including helper/wrapper collision,
+instantiated top, stale allocation, missing memory/clock/reset/archive,
+unsupported region/address sets/widths, missing constructor/engine, duplicate
+engine and repeat mapping. Replay, comparison and CTest stderr are empty;
+successful build stderr contains only Ninja log recovery. Supplied iteration
+102 harness feedback passes CIRCT replacertl, bare Verilator smoke and both
+required suites (90,141 portable and 90,805 Rocket checks). Those prior gate
+results do not validate enabled Print behavior in this increment.
+
+Next smallest step: compose native FASED read deinterleaving between this
+expanded memory master and translation, comparing complete-burst arbitration
+and response backpressure against the immutable SFC AXI4Deinterleaver boundary.
+Print-enabled production CLI/driver integration, general FAME1/FAME5,
+multiclock support and the UART-bearing SFC runtime baseline remain incomplete.
+The overall port is not complete. The harness owns manager verification;
+no replacertl, metasim or U250 buildbitstream steps were started here.
