@@ -32,6 +32,7 @@
 #include "goldengate/FASEDMMIOBank.h"
 #include "goldengate/FASEDHostMemory.h"
 #include "goldengate/FASEDAddressTranslation.h"
+#include "goldengate/FASEDReadDeinterleaver.h"
 #include "goldengate/FASEDHostOutstanding.h"
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDIngressWQueue.h"
@@ -1377,5 +1378,51 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDAddressTranslation(
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires: active expanded translation top, live Rocket/Print allocation and
+// the recorded sixteen-ID eight-beat constructor. No annotations consumed.
+// Mutates: insert verified native queues/helper at the unique pre-translation
+// master connection. Preserves: all existing module/port/argument identities,
+// annotation archive, constructor/channel metadata and control/clock bindings.
+// Hierarchy analysis invalidated; output retains the translated host interface.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDReadDeinterleaver(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDReadDeinterleaver(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "Rocket Print deinterleaver produced invalid FIRRTL IR";
+    return failure();
+  }
+  FModuleOp top, helper;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == circuit.getName()) top = m;
+  InstanceOp translation;
+  for (auto i : top.getOps<InstanceOp>()) {
+    if (i.getName() == "translation") translation = i;
+  }
+  ConnectOp boundary;
+  for (auto c : top.getOps<ConnectOp>())
+    if (c.getDest() == translation.getResult(2)) boundary = c;
+  // Staged validation proves this exact unique boundary and host bindings.
+  // Move only new definitions, then replace the one connection in the live top.
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGFASEDReadDeinterleaver" ||
+          m.getName() == "GGFASEDDeinterleaveQueue8") {
+        if (m.getName() == "GGFASEDReadDeinterleaver") helper = m;
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+      }
+  OpBuilder b(boundary); auto loc = boundary.getLoc();
+  auto deinterleaver = b.create<InstanceOp>(loc, helper, "deinterleaver");
+  for (auto c : llvm::make_early_inc_range(top.getOps<StrictConnectOp>()))
+    for (unsigned i = 0; i < 2; ++i)
+      if (c.getDest() == translation.getResult(i))
+        b.create<StrictConnectOp>(loc, deinterleaver.getResult(i), c.getSrc());
+  b.create<ConnectOp>(loc, deinterleaver.getResult(2), boundary.getSrc());
+  b.create<ConnectOp>(loc, translation.getResult(2), deinterleaver.getResult(3));
+  boundary.erase();
   return success();
 }

@@ -3488,3 +3488,73 @@ Print-enabled production CLI/driver integration, general FAME1/FAME5,
 multiclock support and the UART-bearing SFC runtime baseline remain incomplete.
 The overall port is not complete. The harness owns manager verification;
 no replacertl, metasim or U250 buildbitstream steps were started here.
+
+## Iteration 104: expanded Rocket/Print read deinterleaving
+
+`mapPrintBridgeRocketFASEDReadDeinterleaver` composes the shared native
+sixteen-ID, eight-beat response deinterleaver between the expanded host master
+and address translation. It validates the live Rocket/Print allocation, stages
+and verifies the native transformation on a clone, moves only the new queue
+and helper definitions, and replaces the unique internal master connection.
+The active top, all 263 prior module operations, their ports/block arguments,
+annotation archive, constructor metadata and existing control/clock bindings
+retain identity. Hierarchy analysis is invalidated. No annotation classes are
+consumed or produced. Unsupported constructors, missing bindings/archive,
+stale allocation, instantiated tops, symbol collisions and repeated mapping
+fail before live mutation.
+
+The executable oracle remains Scala `MidasTransforms`/`FAMETransform` followed
+by `SimulationMapping`/`FPGATop` and Rocket's `AXI4Deinterleaver`. Complete bursts
+increment per-ID pending counts; accepted RLAST decrements them. Arbitration
+uses next counts, chooses the lowest pending ID, and locks through stalls until
+accepted RLAST. Each queue is eight entries of 71-bit ID/data/resp/last payload,
+with asynchronous RAM reads and synchronous writes. Reset flushes pointer/full
+state and pending/lock state, leaves RAM unreset, and does not gate RAM writes.
+
+Mutable evidence is under the current U250 generated-source tree at
+`iteration104-print-rocket-fased-read-deinterleaver/`. Reproduce from iteration
+103's saved translation boundaries with:
+
+```
+goldengate-print-binding-test --rocket-fased-read-deinterleaver-boundary INPUT OUTPUT_PREFIX
+goldengate-print-binding-test --rocket-fased-read-deinterleaver-boundary-reverse INPUT_REVERSE OUTPUT_PREFIX
+goldengate-fased-read-deinterleaver-test --expanded-boundary OUTPUT
+goldengate-fased-read-deinterleaver-test --expanded-boundary OUTPUT_REVERSE
+python3 test/Transforms/PrintRocketFASEDReadDeinterleaverCompare.py \
+  --before INPUT --after OUTPUT --before INPUT_REVERSE --after OUTPUT_REVERSE \
+  --sfc SFC_SV --baseline ITERATION81/candidate/post-fame-fased-read-deinterleaver.mlir \
+  --report-json EVIDENCE/rocket-fased-read-deinterleaver-comparison.json
+```
+
+The exact immutable artifact compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `AXI4Deinterleaver` and `Queue_34`.
+Both orders match its 73 surviving ports, 30 passthrough routes, sixteen
+queue clock/reset/enqueue bindings, response payload selectors, pending-count
+increments/decrements, 32 bounds assertions, lowest-ID arbitration and burst
+locking. Queue geometry, pointer/full equations and ungated accepted RAM writes
+match. SFC removes both B.ready ports and the constant in.R.ready port; native
+retains those ready paths. Its queue/helper also exactly match iteration 81's
+native ingestion of the immutable compiler fixture. SFC disables Print, so
+this comparison establishes the local contract, not enabled-Print runtime parity.
+
+Both expanded replays pass 20 atomic rejections, preserve all 262 prior module
+bodies outside the changed top, all 110 top ports, 21 Print modules, allocation
+and the archive, and check all 116 wrapper connections. The actual emitted
+helper in each composed circuit passes 2,048 queue-state samples and 8,364
+hierarchical SSA edges against independent FIFO/complete-burst models: 6,050
+enqueues, 3,927 dequeues, 1,945 stalls, 186 full cycles, 721 simultaneous accepted
+last retirement/enqueue cycles and 42 resets. Queue samples include 136 reset
+writes, 258 pointer wraps and 61 RAM collisions. Compiler and test builds pass;
+Print-binding and shared deinterleaver CTests pass in 24.09 seconds. Replay,
+behavior, CTest and comparison stderr are empty. The build log only reports
+Ninja log recovery warnings. Supplied iteration 103 harness feedback passes
+CIRCT replacertl and required Verilator workloads; these prior results do not
+establish Print-enabled runtime parity for this increment.
+
+Next smallest step: compose the shared native FASED host memory buffer after
+translation and compare the five AXI channel queues with the immutable SFC
+boundary. Print-enabled production CLI/driver integration, general FAME1/FAME5,
+multiclock support and the UART-bearing SFC runtime baseline remain incomplete.
+No FireSim manager verification gates were started here. The port is incomplete.

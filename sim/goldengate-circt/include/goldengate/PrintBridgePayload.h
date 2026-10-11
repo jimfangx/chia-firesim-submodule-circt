@@ -269,4 +269,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDHostMemory(
 /// targets, transfer copied targets and retain valid-qualified bounds checks.
 mlir::LogicalResult mapPrintBridgeRocketFASEDAddressTranslation(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Deinterleave expanded Rocket/Print read responses before translation with
+/// sixteen eight-beat queues. Atomic; preserve existing IR identities/targets.
+mlir::LogicalResult mapPrintBridgeRocketFASEDReadDeinterleaver(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

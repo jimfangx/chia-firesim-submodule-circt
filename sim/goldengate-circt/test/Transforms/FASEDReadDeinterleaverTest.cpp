@@ -213,6 +213,15 @@ void behavior(CircuitOp circuit) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+    if(argc==3 && StringRef(argv[1])=="--expanded-boundary") {
+      auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);
+      require(bool(root) && succeeded(verify(*root)),"invalid expanded deinterleaver boundary");
+      auto circuit=*root->getOps<CircuitOp>().begin();
+      require(circuit.getName()=="GGFASEDAddressTranslationWrapper","unexpected expanded top");
+      queueEdges(circuit);behavior(circuit);
+      llvm::outs()<<"PASS expanded Print/Rocket deinterleaver SSA behavior\n";
+      return 0;
+    }
     auto root=fixture(ctx);auto circuit=*root->getOps<CircuitOp>().begin();std::string error;
     require(succeeded(goldengate::addFASEDAddressTranslation(circuit,error)),error);
     auto wrapper=top(circuit,"GGFASEDAddressTranslationWrapper");auto annotations=circuit->getAttr("rawAnnotations");

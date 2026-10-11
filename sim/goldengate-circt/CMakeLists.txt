@@ -435,6 +435,7 @@ if(BUILD_TESTING)
     lib/Transforms/SimulationMaster.cpp
     lib/Transforms/SimulationMasterControl.cpp
     lib/Transforms/FASEDHostMemory.cpp
+    lib/Transforms/FASEDReadDeinterleaver.cpp
     lib/Transforms/FASEDAddressTranslation.cpp)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)

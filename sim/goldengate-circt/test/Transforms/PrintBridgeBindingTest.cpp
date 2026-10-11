@@ -2292,6 +2292,93 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+void rocketFASEDReadDeinterleaver(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  SmallVector<SmallVector<PortInfo>> priorPorts;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+    arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+  }
+  for (unsigned bad = 0; bad < 19; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto circuit = *test->getOps<CircuitOp>().begin(); OpBuilder b(ctx);
+    auto top = named(circuit, original.getName());
+    auto engine = named(circuit, "GGFASEDTokenEngine");
+    if (bad < 2) {
+      b.setInsertionPointToEnd(circuit.getBodyBlock());
+      b.create<FModuleOp>(circuit.getLoc(), b.getStringAttr(bad == 0 ?
+          "GGFASEDReadDeinterleaver" : "GGFASEDDeinterleaveQueue8"),
+          top.getConventionAttr(), ArrayRef<PortInfo>{});
+    } else if (bad == 2) circuit.setName("WrongTop");
+    else if (bad == 3) circuit->removeAttr("rawAnnotations");
+    else if (bad >= 4 && bad <= 9) {
+      const StringRef fields[]{"addrBits", "dataBits", "idBits", "maxReadTransfer", "idReuse", "maxFlight"};
+      auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
+      StringRef dict = bad < 7 ? "axi4Widths" : "axi4Edge";
+      NamedAttrList row(key.getAs<DictionaryAttr>(dict)); row.set(fields[bad - 4], b.getI64IntegerAttr(99));
+      NamedAttrList changed(key); changed.set(dict, row.getDictionary(ctx));
+      engine->setAttr("goldengate.bridgeConstructor", changed.getDictionary(ctx));
+    } else if (bad == 10) {
+      b.setInsertionPointToEnd(top.getBodyBlock()); b.create<InstanceOp>(circuit.getLoc(), top, "duplicateTop");
+    } else if (bad == 11) {
+      b.setInsertionPointToEnd(top.getBodyBlock());
+      b.create<InstanceOp>(circuit.getLoc(), named(circuit, "GGFASEDHostMemoryWrapper"), "duplicateSim");
+    } else if (bad == 12) {
+      for (auto c : top.getOps<ConnectOp>()) if (auto i = c.getDest().getDefiningOp<InstanceOp>())
+        if (i.getName() == "translation") { c.erase(); break; }
+    } else if (bad == 13 || bad == 14) {
+      auto translation = child(top, named(circuit, "GGFASEDAddressTranslation"));
+      for (auto c : top.getOps<StrictConnectOp>())
+        if (c.getDest() == translation.getResult(bad - 13)) { c.erase(); break; }
+    } else if (bad == 15) engine->removeAttr("goldengate.bridgeConstructor");
+    else if (bad == 16) {
+      auto decoder = named(circuit, "GGControlAddressDecode");
+      auto rows = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+      SmallVector<Attribute> changed(rows.begin(), rows.end());
+      NamedAttrList row(cast<DictionaryAttr>(changed[1])); row.set("start", b.getI64IntegerAttr(256));
+      changed[1] = row.getDictionary(ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(changed));
+    } else if (bad == 17) {
+      auto inner = named(circuit, "GGFASEDHostMemoryWrapper");
+      auto names = llvm::to_vector(inner.getPortNames());
+      names[port(inner, "fased_host_mem")] = b.getStringAttr("MissingMaster"); inner.setPortNames(names);
+    } else engine.setName("MissingEngine");
+    auto before = dump(*test);
+    require(failed(goldengate::mapPrintBridgeRocketFASEDReadDeinterleaver(circuit, error)) &&
+        !error.empty() && dump(*test) == before,
+        "expanded deinterleaver rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFASEDReadDeinterleaver(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  require(named(f.circuit, f.circuit.getName()) == original &&
+      f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations") == raw,
+      "expanded deinterleaver changed top or annotation identity");
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == arguments[j].size(),
+        "expanded deinterleaver changed a prior module identity");
+    for (auto [i, arg] : llvm::enumerate(arguments[j])) {
+      auto p = m.getPorts()[i], old = priorPorts[j][i];
+      require(m.getArguments()[i] == arg && p.name == old.name && p.type == old.type &&
+          p.direction == old.direction && p.annotations == old.annotations && p.sym == old.sym,
+          "expanded deinterleaver changed a prior port or argument identity");
+    }
+  }
+  auto helper = named(f.circuit, "GGFASEDReadDeinterleaver");
+  require(bool(child(original, helper)) && llvm::range_size(helper.getOps<InstanceOp>()) == 16 &&
+      llvm::range_size(helper.getOps<AssertOp>()) == 32,
+      "expanded deinterleaver queue hierarchy or assertions differ");
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFASEDReadDeinterleaver(f.circuit, error)) &&
+      dump(*f.root) == before, "repeated expanded deinterleaver changed IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output +
+        (reverse ? ".rocket-fased-read-deinterleaver-reverse.mlir" : ".rocket-fased-read-deinterleaver.mlir")).str(), ec);
+    require(!ec, "cannot write expanded deinterleaver boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDAddressTranslation(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -3613,6 +3700,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketControlMaster(f, output, reverse, rejected);
       rocketFASEDHostMemory(f, output, reverse, rejected);
       rocketFASEDAddressTranslation(f, output, reverse, rejected);
+      rocketFASEDReadDeinterleaver(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -3950,6 +4038,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fased-read-deinterleaver-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded translation boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketFASEDReadDeinterleaver(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded read deinterleaver boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fased-address-translation-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded host memory boundary");
