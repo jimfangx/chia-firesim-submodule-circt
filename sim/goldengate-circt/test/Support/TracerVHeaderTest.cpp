@@ -6,6 +6,7 @@
 #include "goldengate/BlockDevHeader.h"
 #include "goldengate/TracerVHeader.h"
 #include "goldengate/TracerVTokenEngine.h"
+#include "goldengate/CPUStreamRead.h"
 #include "goldengate/TSIHeader.h"
 #include "goldengate/UARTHeader.h"
 #include "goldengate/ResetPulseHeader.h"
@@ -100,7 +101,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
   if (bad == 3) params.set("widthBytes",b.getI64IntegerAttr(32));
   if (bad == 4) params.set("name",b.getStringAttr("wrong_stream"));
   queue->setAttr("goldengate.streamParameters",params.getDictionary(&ctx));
-  require(succeeded(goldengate::addCPUStreamRead(qc,error)),error);
+  // Keep the CPU catalog identity consistent with the cloned queue's widget
+  // number; the header now validates this identity as well as stream geometry.
+  auto sourceQueue = named(qc,"GGTracerVStreamQueue6144");
+  NamedAttrList sourceParams(sourceQueue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters"));
+  sourceParams.set("name",b.getStringAttr("TRACERVBRIDGEMODULE_2_to_cpu_stream"));
+  sourceQueue->setAttr("goldengate.streamParameters",sourceParams.getDictionary(&ctx));
+  require(succeeded(goldengate::addCPUStreamRead(qc,
+      {{"TRACERVBRIDGEMODULE_2_to_cpu_stream", "tracerv_stream", 6144}}, error)),error);
   b.setInsertionPointToEnd(c.getBodyBlock()); auto transport = cast<FModuleOp>(b.clone(*named(qc,"GGCPUStreamRead")));
   if (bad == 5) transport->setAttr("goldengate.streamAddressSpaceBits",b.getI64IntegerAttr(18));
   auto decoder = b.create<FModuleOp>(loc,b.getStringAttr("GGControlAddressDecode"),top.getConventionAttr(),ArrayRef<PortInfo>{

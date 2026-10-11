@@ -1,7 +1,7 @@
 // See LICENSE for license details.
 // Oracle: TracerVBridgeModule.genHeader, RationalClock.toC, Widget.genConstructor.
 // Required input invariants: live Rocket trigger bank/token engine, 6144-beat
-// stream queue, single-stream CPU transport and allocated host control graph.
+// stream queue, ordered CPU transport and allocated host control graph.
 // Annotations consumed: none; reads BridgeIO, ChannelClockInfo and OutputFile.
 // Annotations produced: extends the sole .const.h OutputFile with driver ABI.
 // IR mutations: only retained output annotation body and completion marker.
@@ -179,26 +179,39 @@ LogicalResult goldengate::prepareTracerVHeader(
   auto bytes = stream ? stream.getAs<IntegerAttr>("widthBytes") : IntegerAttr();
   auto streamName = stream ? stream.getAs<StringAttr>("name") : StringAttr();
   auto space = transport->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits");
-  // CPUStreamRead currently implements only stream zero at address window zero.
+  auto sources = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+  // TracerV retains slot zero when expanded Print queues follow it. AXI
+  // scalar ports follow all ordered source ports, not just the TracerV port.
+  if (!sources || sources.empty() || sources.size() > INT32_MAX / 4)
+    return reject("TracerV requires an ordered CPU stream catalog");
+  unsigned sourceCount = sources.size(), addressPort = sourceCount + 5;
+  auto first = dyn_cast<DictionaryAttr>(sources[0]);
+  auto sourcePort = first ? first.getAs<StringAttr>("port") : StringAttr();
   if (!index || index.getInt() != 0 || !depth || depth.getInt() != 6144 || !bytes || bytes.getInt() != 64 ||
       !streamName || streamName.getValue() != "TRACERVBRIDGEMODULE_" + std::to_string(widgetIndex) + "_to_cpu_stream" ||
       !space || space.getInt() != 19 || queue.getNumPorts() != 5 ||
       fieldType(queue.getPortType(2),"bits") != uint(512) || fieldType(queue.getPortType(3),"bits") != uint(512) ||
-      transport.getNumPorts() != 15 || fieldType(transport.getPortType(2),"bits") != uint(512))
+      !first || first.getAs<StringAttr>("name") != streamName ||
+      !sourcePort || sourcePort.getValue() != "tracerv_stream" ||
+      transport.getNumPorts() != sourceCount + 14 ||
+      transport.getPortName(2) != (sourceCount == 1 ? "stream" : "stream_0") ||
+      fieldType(transport.getPortType(2),"bits") != uint(512))
     return reject("TracerV stream index, name, capacity or CPU transport differs from its driver");
-  if (transport.getPortName(6) != "ar_bits_addr" || transport.getPortType(6) != uint(64) ||
-      transport.getPortDirection(6) != Direction::In || transport.getPortType(12) != uint(512))
+  if (transport.getPortName(addressPort) != "ar_bits_addr" || transport.getPortType(addressPort) != uint(64) ||
+      transport.getPortDirection(addressPort) != Direction::In || transport.getPortType(sourceCount + 11) != uint(512))
     return reject("TracerV CPU stream address/data boundary differs");
-  unsigned grants = 0;
+  SmallVector<unsigned> grants(sourceCount, 0);
   for (auto eq : transport.getOps<EQPrimOp>()) {
     auto bits = eq.getLhs().getDefiningOp<BitsPrimOp>();
-    if (!bits || bits.getInput() != transport.getBodyBlock()->getArgument(6)) continue;
-    auto zero = eq.getRhs().getDefiningOp<ConstantOp>();
-    if (bits.getHi() != 63 || bits.getLo() != space.getInt() || !zero || !zero.getValue().isZero())
-      return reject("TracerV CPU stream grant does not select stream zero");
-    ++grants;
+    if (!bits || bits.getInput() != transport.getBodyBlock()->getArgument(addressPort)) continue;
+    auto selector = eq.getRhs().getDefiningOp<ConstantOp>();
+    if (bits.getHi() != 63 || bits.getLo() != space.getInt() || !selector ||
+        selector.getValue().getLimitedValue() >= sourceCount)
+      return reject("TracerV CPU stream grant differs from the ordered allocation");
+    ++grants[selector.getValue().getLimitedValue()];
   }
-  if (grants != 1) return reject("TracerV CPU stream has missing or ambiguous address grant");
+  if (llvm::any_of(grants, [](unsigned n) { return n != 1; }))
+    return reject("TracerV CPU stream has missing or ambiguous address grants");
   unsigned memories = 0;
   for (auto mem : queue.getOps<MemOp>()) {
     if (mem.getDepth() != uint64_t(depth.getInt()) || mem.getDataType() != uint(512) ||

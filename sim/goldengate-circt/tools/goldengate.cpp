@@ -26,6 +26,7 @@
 #include "goldengate/BlockDevHeader.h"
 #include "goldengate/TracerVHeader.h"
 #include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/RocketDriverHeader.h"
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/FASEDHeader.h"
 #include "goldengate/XDCEmission.h"
@@ -3793,28 +3794,8 @@ int main(int argc, char **argv) {
         return fail("F1 shim annotations: " + error);
       llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
       auto prepareDriverHeaders = [&]() -> int {
-        if (failed(goldengate::prepareSimulationMasterHeader(circuit, error)))
-          return fail("SimulationMaster driver header: " + error);
-        if (failed(goldengate::prepareClockBridgeHeader(circuit, error)))
-          return fail("ClockBridge driver header: " + error);
-        if (failed(goldengate::prepareResetPulseHeader(circuit, error)))
-          return fail("ResetPulseBridge driver header: " + error);
-        if (failed(goldengate::prepareLoadMemHeader(circuit, error)))
-          return fail("LoadMem driver header: " + error);
-        if (failed(goldengate::preparePeekPokeHeader(circuit, error)))
-          return fail("PeekPoke driver header: " + error);
-        if (failed(goldengate::prepareUARTHeader(circuit, error)))
-          return fail("UART driver header: " + error);
-        if (failed(goldengate::prepareTSIHeader(circuit, error)))
-          return fail("TSI driver header: " + error);
-        if (failed(goldengate::prepareBlockDevHeader(circuit, error)))
-          return fail("BlockDev driver header: " + error);
-        if (failed(goldengate::prepareTracerVHeader(circuit, error)))
-          return fail("TracerV driver header: " + error);
-        if (failed(goldengate::prepareCPUManagedStreamHeader(circuit, error)))
-          return fail("CPU managed stream driver header: " + error);
-        if (failed(goldengate::prepareFASEDHeader(circuit, error)))
-          return fail("FASED driver header: " + error);
+        if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))
+          return fail("Rocket driver headers: " + error);
         return 0;
       };
       // MMIO header analysis uses the assembled aggregate banks. Capture its

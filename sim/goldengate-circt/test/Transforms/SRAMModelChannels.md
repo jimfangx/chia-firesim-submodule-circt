@@ -4706,3 +4706,66 @@ Print/count fragment, not the complete enabled-Print production driver header.
 Next: compose it with native Rocket constructors and interface/collateral output,
 then connect the expanded path to production enabled-Print ingestion. Enabled
 Print runtime and the SFC UART-bearing workload differential remain pending.
+
+### Native Rocket header transaction and expanded TracerV (iteration 122)
+
+`prepareRocketDriverHeaders` now composes all eleven native Rocket constructor
+sections on a private CIRCT circuit clone. Production `goldengate.cpp` invokes
+this API after interface generation, including its AutoILA capture path. Only
+the retained output annotations are published after every emitter succeeds.
+The original hardware, semantic/opaque archive and interface header survive an
+early failure or a failure in the final FASED emitter. Constructor order follows
+the existing production sequence and the driver's GET_CORE_CONSTRUCTOR,
+GET_MANAGED_STREAM_CONSTRUCTOR and GET_BRIDGE_CONSTRUCTOR phases.
+
+The TracerV header emitter now reads the actual ordered CPU stream catalog.
+It checks the TracerV slot-zero identity and helper port layout, locates AXI
+address/data ports after all source ports, and requires exactly one native SSA
+address-window grant per allocated stream. Duplicate, missing and out-of-range
+selectors are rejected. This permits the already-transformed three-stream
+TracerV/Print boundary without weakening its queue/clock/MMIO checks.
+
+Reproduce complete native collateral with `goldengate-print-binding-test
+--rocket-native-driver-headers NATIVE_IR DIRECTORY`, using
+`circt-ingestion/post-fame-f1-shim.mlir`. The replay regenerates its already
+present interface outputs, retaining platform defines and all other annotations,
+then tests eight atomic composition rejections, including the final FASED
+failure, before emitting native `.const.h`, `.const.vh` and `.defines.vh`.
+`PrintRocketDriverHeaderCompare.py NATIVE_IR DIRECTORY GOLDEN REPORT` checks
+the constructor catalog, active allocated register addresses and the oracle's
+F1Shim bus widths and NastiRouter regions.
+
+Reproduce expanded focused collateral with `goldengate-print-binding-test
+--rocket-driver-headers EXPANDED_IR DIRECTORY NATIVE_IR`, using both
+iteration-120 F1Shim orders. This explicitly imports retained TracerV BridgeIO
+and ChannelClockInfo analysis from the native boundary into the TEST fixture;
+unseeded TracerV emission must reject. It emits `tracerv-print.const.h` and
+`print-bridge-decoders.h`, checks four atomic catalog/selector rejections and
+preserves hardware. These files contain focused TracerV/Print/CPU fragments,
+not a complete enabled-Print production driver.
+
+Complete expanded composition currently rejects the LoadMem boundary atomically:
+its shared engine instantiates catalog-prefixed writer/FIFO helpers directly,
+while the native header expects older live wrappers. The imported FIFO/writer,
+expanded `FPGATop.mem_0`, immutable SFC `LoadMemWriter` and `F1Shim.io_slave_0`
+all use 64-bit memory data; the separate CPU transport uses 512-bit data.
+Resolve the expanded LoadMem live hierarchy and direct engine wiring contract
+before publishing complete enabled-Print collateral; do not hide that mismatch
+by renaming imported definitions or emitting unchecked constructors.
+
+Exact read-only oracle remains the U250 fixture's
+`design/FireSim-generated.sv` path recorded above. Evidence is in the generated
+U250 directory's `iteration122-print-rocket-collateral/`, including complete
+native and focused expanded headers, replay logs and structured comparisons.
+Production/focused builds pass, as do four focused CTests and all three boundary
+replays. All three constructor headers compile against the actual driver headers
+with `-std=c++20 -Wall -Wextra -Werror -fsyntax-only` under the standard GET_*
+phases. Native `.const.h` and `.const.vh` equal the preceding production output;
+all eleven native regions and nine AXI widths match SFC. Both expanded headers
+have identical allocation and the native TracerV constructor ABI. Their eight
+unchanged large-bank regions and queue/count/DMA ABI match SFC, with the expected
+new Print bases 544/576 and CPU counts 624/628/632 versus SFC's single count at
+568. Initial test-fixture/nullable-attribute mistakes were corrected before these
+passing replays; no immutable artifact was modified.
+No FireSim manager verification gate was started. Enabled-Print production
+ingestion/runtime and the SFC UART-bearing differential remain pending.

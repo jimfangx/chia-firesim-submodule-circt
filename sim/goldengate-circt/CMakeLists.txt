@@ -18,6 +18,7 @@ add_executable(goldengate-circt
   lib/Support/BlockDevHeader.cpp
   lib/Support/TracerVHeader.cpp
   lib/Support/PrintBridgeHeader.cpp
+  lib/Support/RocketDriverHeader.cpp
   lib/Support/CPUManagedStreamHeader.cpp
   lib/Support/FASEDHeader.cpp
   lib/Support/SimulatorRTL.cpp
@@ -366,6 +367,19 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-print-host COMMAND goldengate-print-host-test)
   add_executable(goldengate-print-binding-test
     test/Transforms/PrintBridgeBindingTest.cpp
+    lib/Support/RocketDriverHeader.cpp
+    lib/Support/AnnotationEmission.cpp
+    lib/Support/MetasimInterfaceHeader.cpp
+    lib/Support/SimulationMasterHeader.cpp
+    lib/Support/ClockBridgeHeader.cpp
+    lib/Support/ResetPulseHeader.cpp
+    lib/Support/LoadMemHeader.cpp
+    lib/Support/PeekPokeHeader.cpp
+    lib/Support/UARTHeader.cpp
+    lib/Support/TSIHeader.cpp
+    lib/Support/BlockDevHeader.cpp
+    lib/Support/TracerVHeader.cpp
+    lib/Support/FASEDHeader.cpp
     lib/Support/PrintBridgeHeader.cpp
     lib/Support/CPUManagedStreamHeader.cpp
     lib/Transforms/PrintBridgePayload.cpp

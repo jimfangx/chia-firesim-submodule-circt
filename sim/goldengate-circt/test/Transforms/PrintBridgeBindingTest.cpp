@@ -2,6 +2,10 @@
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/RocketDriverHeader.h"
+#include "goldengate/TracerVHeader.h"
+#include "goldengate/MetasimInterfaceHeader.h"
+#include "goldengate/AnnotationEmission.h"
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/CPUStreamCountBank.h"
@@ -2292,6 +2296,155 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+
+void rocketDriverHeaders(Fixture &f, StringRef directory, StringRef nativeBoundary) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto collect = [&](CircuitOp c) {
+    SmallVector<FModuleOp> hosts;
+    for (auto row : named(c, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+      hosts.push_back(named(c, cast<DictionaryAttr>(row).getAs<StringAttr>("hostModule").getValue()));
+    return hosts;
+  };
+  // The earlier expanded hardware replay imported only constructor/channel
+  // annotations needed by its transforms. It intentionally lacks TracerV's
+  // driver clock analysis. Require rejection before copying this analysis
+  // from the actual native boundary explicitly in the TEST fixture.
+  auto native = parseSourceFile<ModuleOp>(nativeBoundary, ctx);
+  require(bool(native), "cannot parse native Rocket header oracle boundary");
+  auto nc = *native->getOps<CircuitOp>().begin();
+  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  bool bridge = false, clocks = false;
+  for (auto row : nc->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto dict = cast<DictionaryAttr>(row);
+    if (dict.getAs<StringAttr>("class") == goldengate::AnnotationClasses::BridgeIO &&
+        dict.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.TracerVBridgeModule") {
+      require(dict.getAs<DictionaryAttr>("widgetConstructorKey") ==
+          named(f.circuit, "GGTracerVTokenEngine")->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"),
+          "native and expanded TracerV constructors differ");
+      annotations.push_back(row); bridge = true;
+    }
+    if (dict.getAs<StringAttr>("class") == goldengate::AnnotationClasses::ChannelClockInfo) {
+      annotations.push_back(row); clocks = true;
+    }
+  }
+  require(bridge && clocks, "native boundary lacks resolved TracerV clock analysis");
+  require(succeeded(goldengate::prepareMetasimInterfaceHeader(f.circuit, "FireSim", error)), error);
+  auto missing = dump(*f.root);
+  require(failed(goldengate::prepareTracerVHeader(f.circuit, error)) && dump(*f.root) == missing,
+      "TracerV fabricated missing clock analysis");
+  auto interface = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  for (unsigned i = raw.size(); i < interface.size(); ++i) annotations.push_back(interface[i]);
+  f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  // The whole driver must still reject this expanded boundary: LoadMem's
+  // shared engine has not yet been ported to the native header contract.
+  auto original = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto baseline = dump(*f.root);
+  require(failed(goldengate::prepareRocketDriverHeaders(f.circuit, error)) &&
+      error.find("LoadMem") != std::string::npos && dump(*f.root) == baseline,
+      "expanded driver composition omitted the unresolved LoadMem contract");
+  llvm::outs() << "Expanded composition remains atomic at the LoadMem mismatch: " << error << '\n';
+  for (unsigned bad = 0; bad < 4; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); auto transport = named(c, "GGCPUStreamRead");
+    auto sources = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+    if (bad == 0 || bad == 3) {
+      SmallVector<Attribute> rows(sources.begin(), sources.end()); NamedAttrList first(cast<DictionaryAttr>(rows[0]));
+      if (bad == 0) first.set("name", b.getStringAttr("PRINTBRIDGEMODULE_0_to_cpu_stream"));
+      else first.erase("port");
+      rows[0] = first.getDictionary(ctx); transport->setAttr("goldengate.sourceStreams", b.getArrayAttr(rows));
+    } else {
+      b.setInsertionPointToStart(transport.getBodyBlock());
+      for (auto eq : transport.getOps<EQPrimOp>()) {
+        auto bits = eq.getLhs().getDefiningOp<BitsPrimOp>();
+        auto selector = eq.getRhs().getDefiningOp<ConstantOp>();
+        if (bits && bits.getInput() == transport.getArgument(port(transport, "ar_bits_addr")) &&
+            selector && selector.getValue().isOne()) {
+          auto invalid = b.create<ConstantOp>(c.getLoc(), cast<UIntType>(selector.getType()), APInt(45, bad == 1 ? 0 : 3));
+          eq->setOperand(1, invalid); break;
+        }
+      }
+    }
+    auto saved = dump(*test);
+    require(failed(goldengate::prepareTracerVHeader(c, error)) && !error.empty() && dump(*test) == saved,
+        "expanded TracerV identity/selector rejection " + std::to_string(bad));
+  }
+  require(succeeded(goldengate::prepareTracerVHeader(f.circuit, error)), error);
+  auto updated = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  f.circuit->setAttr("rawAnnotations", original);
+  require(dump(*f.root) == baseline, "TracerV header changed hardware");
+  f.circuit->setAttr("rawAnnotations", updated);
+  std::string header, decoders;
+  auto hosts = collect(f.circuit);
+  require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, hosts, header, error)) &&
+      succeeded(goldengate::preparePrintBridgeDecoderHeader(f.circuit, hosts, decoders, error)), error);
+  require(succeeded(goldengate::emitOutputFiles(f.circuit, directory, "FireSim-generated", error)), error);
+  // Emit a reviewable TracerV/Print/CPU fragment pair. The whole-platform API
+  // above rejects; these focused files are not a complete production driver.
+  for (auto row : updated) {
+    auto d = cast<DictionaryAttr>(row);
+    auto suffix = d.getAs<StringAttr>("fileSuffix");
+    if (suffix && suffix == ".const.h") header = d.getAs<StringAttr>("body").getValue().str() + header;
+  }
+  for (auto [name, body] : {std::pair<StringRef,StringRef>{"tracerv-print.const.h", header}, {"print-bridge-decoders.h", decoders}}) {
+    std::error_code ec; llvm::raw_fd_ostream file((directory + "/" + name).str(), ec);
+    require(!ec, "cannot write focused expanded header"); file << body;
+  }
+  llvm::outs() << "PASS expanded TracerV/Print/CPU fragments, four selector/identity rejections and atomic incomplete-driver rejection\n";
+}
+
+void rocketNativeDriverHeaders(CircuitOp c, ModuleOp root, StringRef directory) {
+  auto *ctx = c.getContext(); OpBuilder b(ctx); std::string error;
+  // The recorded assembled boundary already includes interface outputs. Replay
+  // that same interface generation, retaining the platform defines/archive.
+  SmallVector<Attribute> retained;
+  for (auto row : c->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto d = cast<DictionaryAttr>(row); auto suffix = d.getAs<StringAttr>("fileSuffix");
+    if (d.getAs<StringAttr>("class") == goldengate::AnnotationClasses::OutputFile &&
+        suffix && (suffix == ".const.h" || suffix == ".const.vh")) continue;
+    retained.push_back(row);
+  }
+  c->setAttr("rawAnnotations", b.getArrayAttr(retained));
+  require(succeeded(goldengate::prepareMetasimInterfaceHeader(c, "FireSim", error)), error);
+  for (unsigned bad = 0; bad < 7; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(root->clone())); auto nc = *test->getOps<CircuitOp>().begin();
+    if (bad == 0) nc.setName("FPGATop");
+    else if (bad == 1) named(nc, "GGSingleClockBridge")->removeAttr("goldengate.mmioRegisters");
+    else if (bad == 2) named(nc, "GGFASEDTokenEngine")->removeAttr("goldengate.bridgeConstructor");
+    else if (bad == 3) nc->removeAttr("rawAnnotations");
+    else {
+      auto raw = nc->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> rows;
+      for (auto row : raw) {
+        auto d = cast<DictionaryAttr>(row);
+        auto suffix = d.getAs<StringAttr>("fileSuffix");
+        if (suffix && suffix == ".const.h") {
+          if (bad == 4) continue;
+          if (bad == 5) rows.push_back(row);
+          if (bad == 6) {NamedAttrList marked(d); marked.set("goldengate.cpuManagedStreamHeader", b.getBoolAttr(true)); row = marked.getDictionary(ctx);}
+        }
+        rows.push_back(row);
+      }
+      nc->setAttr("rawAnnotations", b.getArrayAttr(rows));
+    }
+    auto saved = dump(*test);
+    require(failed(goldengate::prepareRocketDriverHeaders(nc, error)) && !error.empty() && dump(*test) == saved,
+        "native driver transaction rejection " + std::to_string(bad));
+    if (bad == 2) require(error.find("FASED") != std::string::npos, "expected final-emitter failure");
+  }
+  auto original = c->getAttrOfType<ArrayAttr>("rawAnnotations"); auto hardware = dump(root);
+  require(succeeded(goldengate::prepareRocketDriverHeaders(c, error)), error);
+  auto updated = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  c->setAttr("rawAnnotations", original); require(dump(root) == hardware, "composition changed hardware"); c->setAttr("rawAnnotations", updated);
+  for (auto row : original) {
+    auto d = cast<DictionaryAttr>(row);
+    if (d.getAs<StringAttr>("class") != goldengate::AnnotationClasses::OutputFile)
+      require(llvm::is_contained(updated, row), "composition lost semantic/opaque annotation");
+  }
+  auto saved = dump(root);
+  require(failed(goldengate::prepareRocketDriverHeaders(c, error)) && dump(root) == saved, "duplicate native header transaction");
+  require(succeeded(goldengate::emitOutputFiles(c, directory, "FireSim-generated", error)), error);
+  llvm::outs() << "PASS native Rocket transactional driver composition, eight atomic rejections and preserved hardware/archive\n";
+}
 
 void rocketAllocatedHeader(Fixture &f, StringRef output) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error, header, decoders;
@@ -5608,6 +5761,18 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]) == "--rocket-native-driver-headers") {
+      auto root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(root), "cannot parse native Rocket F1Shim boundary");
+      auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+      rocketNativeDriverHeaders(c, *root, argv[3]);
+      return 0;
+    }
+    if (argc == 5 && StringRef(argv[1]) == "--rocket-driver-headers") {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded Rocket F1Shim boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); rocketDriverHeaders(f, argv[3], argv[4]); return 0;
+    }
     if (argc == 4 && StringRef(argv[1]) == "--rocket-allocated-header") {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded Rocket F1Shim boundary");
