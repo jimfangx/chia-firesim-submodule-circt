@@ -2292,6 +2292,98 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+void rocketLoadMemEngine(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  SmallVector<SmallVector<PortInfo>> priorPorts;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+    arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+  }
+  const StringRef helpers[]{"GGLoadMemWriter", "GGLoadMemRequestQueue2", "GGLoadMemRequestArbiter",
+      "GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataFIFO", "GGLoadMemReadRequests", "GGLoadMemReadDataFIFO"};
+  auto helper = [&](CircuitOp c, StringRef n) -> FModuleOp {
+    for (auto m : c.getOps<FModuleOp>())
+      if (m.getName() == n || m.getName().ends_with(("_" + n).str())) return m;
+    throw std::runtime_error("missing native LoadMem catalog");
+  };
+  for (unsigned bad = 0; bad < 18; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); OpBuilder b(ctx);
+    auto top = named(c, original.getName());
+    if (bad < 2) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(), b.getStringAttr(bad == 0 ? "GGPrintLoadMemWrapper" : "GGPrintLoadMemEngine"),
+          top.getConventionAttr(), ArrayRef<PortInfo>{});
+    } else if (bad < 9) helper(c, helpers[bad - 2]).setName("MissingCatalog");
+    else if (bad == 9) c.setName("WrongTop");
+    else if (bad == 10) c->removeAttr("rawAnnotations");
+    else if (bad == 11) {
+      b.setInsertionPointToEnd(top.getBodyBlock()); b.create<InstanceOp>(c.getLoc(), top, "usedTop");
+    } else if (bad == 12) {
+      auto m = helper(c, helpers[0]); SmallVector<Attribute> names(m.getPortNames().begin(), m.getPortNames().end());
+      names[4] = b.getStringAttr("wrongPayload"); m.setPortNames(names);
+    } else if (bad == 13) {
+      SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
+      names[port(top, "loadmem_mcr")] = b.getStringAttr("missingMCR"); top.setPortNames(names);
+    } else if (bad == 14) {
+      auto m = helper(c, helpers[0]); auto copy = cast<FModuleOp>(m->clone());
+      copy.setName("Duplicate_GGLoadMemWriter"); c.getBodyBlock()->push_back(copy);
+    } else if (bad == 15 || bad == 16) {
+      auto m = helper(c, helpers[bad == 15 ? 0 : 6]);
+      SmallVector<Attribute> types(m.getPortTypes().begin(), m.getPortTypes().end());
+      types[4] = TypeAttr::get(UIntType::get(ctx, 32, false)); m.setPortTypes(types);
+    } else child(top, named(c, "GGFASEDHostMemoryBuffer")).setName("MissingBuffer");
+    auto before = dump(*test);
+    require(failed(goldengate::mapPrintBridgeRocketLoadMemEngine(c, error)) &&
+        !error.empty() && dump(*test) == before,
+        "expanded LoadMem engine rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+  }
+  // Probe nested target identity independently of the retained real archive.
+  {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); OpBuilder b(ctx);
+    auto prefix = "~" + original.getName().str();
+    auto probe = b.getDictionaryAttr({b.getNamedAttr("nested", b.getArrayAttr({
+        b.getStringAttr(prefix + "|" + original.getName().str() + ">hostReset"),
+        b.getStringAttr(prefix + "|" + original.getName().str() + ">loadmem_mcr.read[4].bits")}))});
+    SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").begin(), c->getAttrOfType<ArrayAttr>("rawAnnotations").end());
+    raw.push_back(probe); c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+    require(succeeded(goldengate::mapPrintBridgeRocketLoadMemEngine(c, error)), error);
+    auto text = dump(c.getOperation());
+    require(text.find("~GGPrintLoadMemWrapper|GGPrintLoadMemWrapper>hostReset") != std::string::npos &&
+        text.find("~GGPrintLoadMemWrapper|" + original.getName().str() + ">loadmem_mcr.read[4].bits") != std::string::npos,
+        "LoadMem copied/consumed nested targets differ");
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketLoadMemEngine(f.circuit, error)) &&
+      succeeded(verify(*f.root)), error);
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == arguments[j].size(),
+        "LoadMem engine changed an existing module identity");
+    for (auto [p, arg] : llvm::enumerate(arguments[j])) {
+      auto info = m.getPorts()[p], old = priorPorts[j][p];
+      require(m.getArguments()[p] == arg && info.name == old.name && info.type == old.type &&
+          info.direction == old.direction && info.annotations == old.annotations && info.sym == old.sym,
+          "LoadMem engine changed a prior port or SSA argument");
+    }
+  }
+  auto top = named(f.circuit, "GGPrintLoadMemWrapper"), engine = named(f.circuit, "GGPrintLoadMemEngine");
+  require(top.getNumPorts() == original.getNumPorts() + 15 && engine.getNumPorts() == 19 &&
+      llvm::range_size(top.getOps<InstanceOp>()) == 2 && llvm::range_size(engine.getOps<InstanceOp>()) == 7 &&
+      engine.getOps<AssertOp>().begin() != engine.getOps<AssertOp>().end(),
+      "LoadMem engine wrapper/helper geometry or permission checks differ");
+  child(top, original); child(top, engine);
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketLoadMemEngine(f.circuit, error)) &&
+      dump(*f.root) == before, "repeated LoadMem engine changed IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output +
+        (reverse ? ".rocket-loadmem-engine-reverse.mlir" : ".rocket-loadmem-engine.mlir")).str(), ec);
+    require(!ec, "cannot write expanded LoadMem engine boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketFASEDHostMemoryBuffer(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); std::string error;
   const StringRef definitions[]{"GGFASEDHostMemoryBuffer", "GGFASEDMemoryAddressQueue2",
@@ -3787,6 +3879,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketFASEDAddressTranslation(f, output, reverse, rejected);
       rocketFASEDReadDeinterleaver(f, output, reverse, rejected);
       rocketFASEDHostMemoryBuffer(f, output, reverse, rejected);
+      rocketLoadMemEngine(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -4124,6 +4217,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-loadmem-engine-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded buffered boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketLoadMemEngine(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded LoadMem engine boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fased-host-memory-buffer-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded deinterleaver boundary");

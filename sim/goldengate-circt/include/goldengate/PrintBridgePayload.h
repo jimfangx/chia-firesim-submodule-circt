@@ -277,4 +277,8 @@ mlir::LogicalResult mapPrintBridgeRocketFASEDReadDeinterleaver(
 /// Atomic; preserve the expanded Print/Rocket module, port and target identities.
 mlir::LogicalResult mapPrintBridgeRocketFASEDHostMemoryBuffer(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach the catalogued LoadMem writer, queues and nine decoded MCR words.
+/// Atomic; retain existing modules and transfer copied top port targets.
+mlir::LogicalResult mapPrintBridgeRocketLoadMemEngine(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

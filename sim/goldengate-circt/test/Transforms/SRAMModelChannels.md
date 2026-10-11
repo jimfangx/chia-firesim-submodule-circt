@@ -3630,3 +3630,79 @@ source IDs and accepted WLAST retirement with SFC `AXI4Xbar`/`Queue_21`.
 Print-enabled production CLI/driver integration, general FAME1/FAME5,
 multiclock support and the UART-bearing SFC runtime baseline remain incomplete.
 No FireSim manager verification gates were started here. The port is incomplete.
+
+### Expanded Print/Rocket LoadMem engine attachment (iteration 106)
+
+The iteration 105 translated/buffered Print boundary retains the nine-word
+`loadmem_mcr` interface but has no LoadMem AXI engine pins. Replaying the native
+host write arbiter there rejected the missing AW/W ports. The prerequisite is
+now `mapPrintBridgeRocketLoadMemEngine`: it composes the existing native writer,
+write-request queue/priority arbiter, MMIO bank, write-data FIFO, read-request
+engine and read-data FIFO through CIRCT FIRRTL operations. It supplies the
+sixteen 34-bit-address/64-bit-data AXI pins needed by the next arbiter step.
+No writer, queue, register or FIFO state is duplicated in the composition.
+
+`GGPrintLoadMemEngine` has 19 ports and seven helper instances. Its nine-word
+MCR interface connects words 0/1/2/3/5 to the existing bank, word 4 to the
+32-to-64 write FIFO, words 6/7 to the read-request engine and word 8 to the
+64-to-32 read FIFO. The additional word-4 read and word-8 write permission
+assertions are enabled outside host reset. The queued write request sets
+`zero=false`; the existing arbiter gives queued writes priority over the
+16-GiB zero-fill request. `ZERO_FINISHED` comes from writer request readiness.
+The read-address concatenation/truncation behavior remains in the shared
+native read-request helper and matches the Scala/SFC oracle.
+
+`GGPrintLoadMemWrapper` retains 109 of the old 110 ports, consumes the MCR
+port and adds sixteen memory ports, giving 125 ports and two instances.
+Construction and verification happen on a clone before moving only these two
+new definitions into the live circuit. All 270 previous module operations,
+ports and SSA arguments retain identity. Copied top port targets move to the
+new top; the consumed MCR target remains on the inner top. Circuit identities
+are recursively rewritten in the raw annotation archive. Missing/ambiguous
+catalogs, wrong catalog port names/types/directions, unsupported allocation,
+missing archive/host/MCR interfaces, missing buffered hierarchy, instantiated
+tops, symbol collisions and repeated composition reject before live mutation.
+Callers must rebuild hierarchy/target analyses after the new top is installed.
+
+Evidence is under the U250 generated-source tree at
+`iteration106-print-rocket-loadmem-engine/`. Replay iteration 105's two saved
+buffered boundaries with:
+
+```
+goldengate-print-binding-test --rocket-loadmem-engine-boundary INPUT OUTPUT_PREFIX
+goldengate-print-binding-test --rocket-loadmem-engine-boundary-reverse INPUT_REVERSE OUTPUT_PREFIX
+python3 test/Transforms/PrintRocketLoadMemEngineCompare.py \
+  --before INPUT --after OUTPUT --before INPUT_REVERSE --after OUTPUT_REVERSE \
+  --sfc SFC_SV --baseline ITERATION81/candidate/post-fame-host-memory-write-arbiter.mlir \
+  --report-json EVIDENCE/rocket-loadmem-engine-comparison.json
+```
+
+The exact immutable artifact compared is
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules `LoadMemWidget`,
+`Nasti2AXI4IdentityModule`, `Arbiter` and `Queue_27`. The comparison checks
+sixteen memory pins, 75 widget equations, sixteen identity-conversion routes,
+write-first arbitration, zero-fill constants and the depth-two request queue.
+It separately checks all 128 outer-wrapper and 80 engine connections,
+unchanged prior module bodies, seven shared helper definitions against the
+native iteration 81 boundary, all 21 Print modules and nested archive targets.
+The fixture disables Print; this local composition does not establish
+Print-enabled production runtime parity.
+
+Next smallest step: adapt the native host write-arbiter composition to this
+new LoadMem/FASED boundary and compare AW reservations, IDs and WLAST
+retirement with SFC `AXI4Xbar`/`Queue_21`. Print-enabled production integration,
+general FAME1/FAME5 and multiclock coverage remain incomplete. The harness owns
+manager verification; no manager gate was started in this iteration.
+
+Validation: both expanded annotation orders pass all 19 atomic rejection
+checks and the complete structured comparison. The native compiler and Print
+binding executable build; Print binding CTest passes in 5.21 seconds and the
+six shared LoadMem semantic CTests pass in 30.51 seconds (161,864 modeled
+cycles plus 4,096 arbiter cases). Successful replay/comparison stderr is
+empty. An initial missing-archive negative test exposed a null-attribute
+assertion; explicit archive preflight fixes it and the final replays cover
+that case without mutation. Supplied iteration 105 harness feedback passes
+CIRCT replacertl and required Verilator workloads; those earlier gates do
+not verify this new Print-enabled composition. The overall port is incomplete.

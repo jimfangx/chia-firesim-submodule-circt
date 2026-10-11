@@ -1467,3 +1467,247 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDHostMemoryBuffer(
   boundary.erase();
   return success();
 }
+
+LogicalResult goldengate::mapPrintBridgeRocketLoadMemEngine(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (!circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    return reject("Print LoadMem engine requires the preserved annotation archive");
+  constexpr StringLiteral oldName = "GGFASEDAddressTranslationWrapper";
+  constexpr StringLiteral newName = "GGPrintLoadMemWrapper";
+  constexpr StringLiteral engineName = "GGPrintLoadMemEngine";
+  if (circuit.getName() != oldName)
+    return reject("Print LoadMem engine requires the buffered translated top");
+  FModuleOp inner;
+  const StringRef names[]{"GGLoadMemWriter", "GGLoadMemRequestQueue2", "GGLoadMemRequestArbiter",
+      "GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataFIFO", "GGLoadMemReadRequests", "GGLoadMemReadDataFIFO"};
+  const unsigned counts[]{20, 4, 12, 10, 9, 16, 9};
+  SmallVector<FModuleOp> helpers(7); unsigned matches[7]{};
+  for (auto m : circuit.getOps<FModuleLike>()) {
+    if (m.getModuleName() == newName || m.getModuleName() == engineName)
+      return reject("Print LoadMem engine or wrapper already exists");
+    auto f = dyn_cast<FModuleOp>(m.getOperation()); if (!f) continue;
+    if (f.getName() == oldName) inner = f;
+    for (unsigned j = 0; j < 7; ++j)
+      if (f.getName() == names[j] || f.getName().ends_with(("_" + names[j]).str())) {
+        helpers[j] = f; ++matches[j];
+      }
+  }
+  for (unsigned j = 0; j < 7; ++j)
+    if (matches[j] != 1 || helpers[j].getNumPorts() != counts[j])
+      return reject("Print LoadMem engine needs the unique native writer/queue/bank catalog");
+  auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, uint(1)},
+      {b.getStringAttr("valid"), false, uint(1)}, {b.getStringAttr("bits"), false, uint(32)}});
+  auto mcrType = BundleType::get(ctx, {{b.getStringAttr("read"), false, FVectorType::get(token, 9)},
+      {b.getStringAttr("write"), true, FVectorType::get(token, 9)}, {b.getStringAttr("wstrb"), true, uint(4)}});
+  // Check the entire catalog interface before creating any indexed subfields.
+  // A matching name/count alone cannot prove the recorded Rocket geometry.
+  auto request = BundleType::get(ctx, {{b.getStringAttr("zero"), false, uint(1)},
+      {b.getStringAttr("addr"), false, uint(34)}, {b.getStringAttr("len"), false, uint(34)}});
+  auto requestToken = BundleType::get(ctx, {{b.getStringAttr("ready"), true, uint(1)},
+      {b.getStringAttr("valid"), false, uint(1)}, {b.getStringAttr("bits"), false, request}});
+  SmallVector<BundleType::BundleElement> bankFields;
+  for (unsigned word : {0U, 1U, 2U, 3U, 5U}) {
+    bankFields.push_back({b.getStringAttr("read_" + std::to_string(word)), false, token});
+    bankFields.push_back({b.getStringAttr("write_" + std::to_string(word)), true, token});
+  }
+  bankFields.push_back({b.getStringAttr("wstrb"), true, uint(4)});
+  auto bankType = BundleType::get(ctx, bankFields);
+  SmallVector<SmallVector<PortInfo>> expected(7);
+  auto add = [&](unsigned j, StringRef name, Type type, Direction dir) {
+    expected[j].push_back({b.getStringAttr(name), type, dir});
+  };
+  for (unsigned j : {0U, 1U, 3U, 4U, 5U, 6U}) {
+    add(j, "clock", ClockType::get(ctx), Direction::In); add(j, "reset", uint(1), Direction::In);
+  }
+  const StringRef wn[]{"req_ready", "req_valid", "req_bits_zero", "req_bits_addr", "req_bits_len",
+      "data_ready", "data_valid", "data_bits", "mem_aw_ready", "mem_aw_valid", "mem_aw_bits_addr",
+      "mem_aw_bits_len", "mem_w_ready", "mem_w_valid", "mem_w_bits_data", "mem_w_bits_last", "mem_b_ready", "mem_b_valid"};
+  const unsigned ww[]{1,1,1,34,34,1,1,64,1,1,34,8,1,1,64,1,1,1};
+  for (unsigned p = 0; p < 18; ++p) add(0, wn[p], uint(ww[p]),
+      llvm::is_contained(ArrayRef<unsigned>({0,5,9,10,11,13,14,15,16}), p) ? Direction::Out : Direction::In);
+  add(1, "enq", requestToken, Direction::In); add(1, "deq", requestToken, Direction::Out);
+  const StringRef an[]{"in_0_ready", "in_0_valid", "in_0_bits_zero", "in_0_bits_addr", "in_0_bits_len",
+      "in_1_ready", "in_1_valid", "out_ready", "out_valid", "out_bits_zero", "out_bits_addr", "out_bits_len"};
+  const unsigned aw[]{1,1,1,34,34,1,1,1,1,1,34,34};
+  for (unsigned p = 0; p < 12; ++p) add(2, an[p], uint(aw[p]),
+      p == 0 || p == 5 || p >= 8 ? Direction::Out : Direction::In);
+  const StringRef bn[]{"write_ready", "write_valid", "write_bits_addr", "write_bits_len", "zero_ready", "zero_valid", "zero_finished"};
+  const unsigned bw[]{1,1,34,34,1,1,1};
+  for (unsigned p = 0; p < 7; ++p) add(3, bn[p], uint(bw[p]),
+      p == 0 || p == 4 || p == 6 ? Direction::In : Direction::Out);
+  add(3, "mcr", bankType, Direction::Out);
+  const StringRef fn[]{"in_ready", "in_valid", "in_bits", "out_ready", "out_valid", "out_bits", "count"};
+  for (unsigned j : {4U, 6U}) {
+    const unsigned fw[]{1,1,j == 4 ? 32U : 64U,1,1,j == 4 ? 64U : 32U,j == 4 ? 6U : 2U};
+    for (unsigned p = 0; p < 7; ++p) add(j, fn[p], uint(fw[p]),
+        p == 0 || p >= 4 ? Direction::Out : Direction::In);
+  }
+  const StringRef rn[]{"write_6_ready", "write_6_valid", "write_6_bits", "read_6_valid", "read_6_bits",
+      "write_7_ready", "write_7_valid", "write_7_bits", "read_7_valid", "read_7_bits", "read_7_ready",
+      "mem_ar_ready", "mem_ar_valid", "mem_ar_bits_addr"};
+  const unsigned rw[]{1,1,32,1,32,1,1,32,1,32,1,1,1,34};
+  for (unsigned p = 0; p < 14; ++p) add(5, rn[p], uint(rw[p]),
+      llvm::is_contained(ArrayRef<unsigned>({0,3,4,5,8,9,12,13}), p) ? Direction::Out : Direction::In);
+  for (unsigned j = 0; j < 7; ++j)
+    for (auto [p, info] : llvm::enumerate(helpers[j].getPorts())) {
+      auto want = expected[j][p];
+      if (info.name != want.name || info.type != want.type || info.direction != want.direction)
+        return reject("Print LoadMem native catalog port name/type/direction differs");
+    }
+  std::optional<unsigned> mcr, clock, reset;
+  if (!inner) return reject("Print LoadMem engine has no active module");
+  for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
+    if (p.name == "loadmem_mcr" && p.type == mcrType && p.direction == Direction::In) mcr = i;
+    if (p.name == "hostClock" && p.type == ClockType::get(ctx) && p.direction == Direction::In) clock = i;
+    if (p.name == "hostReset" && p.type == uint(1) && p.direction == Direction::In) reset = i;
+    if (p.name.getValue().starts_with("loadmem_mem_")) return reject("Print LoadMem AXI boundary already exists");
+  }
+  bool used = false; circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == oldName; });
+  if (!mcr || !clock || !reset || used)
+    return reject("Print LoadMem engine needs exact host clock/reset and nine-word MCR boundary");
+  const StringRef children[]{"sim", "translation", "deinterleaver", "memory_buffer"};
+  const StringRef modules[]{"GGFASEDHostMemoryWrapper", "GGFASEDAddressTranslation",
+      "GGFASEDReadDeinterleaver", "GGFASEDHostMemoryBuffer"};
+  unsigned seen[4]{};
+  for (auto inst : inner.getOps<InstanceOp>()) {
+    bool found = false;
+    for (unsigned j = 0; j < 4; ++j)
+      if (inst.getName() == children[j] && inst.getModuleName() == modules[j]) {
+        found = true; ++seen[j];
+      }
+    if (!found) return reject("Print LoadMem engine requires the translated/deinterleaved/buffered hierarchy");
+  }
+  if (llvm::any_of(seen, [](unsigned n) { return n != 1; }))
+    return reject("Print LoadMem engine requires all four existing buffered top instances");
+  // Construct on a clone, including type verification, before committing any
+  // live operations. Catalog namespaces are resolved by unique helper identity.
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  SmallVector<FModuleOp> h;
+  for (auto prior : helpers) for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == prior.getName()) h.push_back(m);
+  FModuleOp old;
+  for (auto m : staged->getOps<FModuleOp>()) if (m.getName() == oldName) old = m;
+  SmallVector<PortInfo> ep{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+      {b.getStringAttr("reset"), uint(1), Direction::In}, {b.getStringAttr("mcr"), mcrType, Direction::Out}};
+  // Native writer and reader ports already carry the recorded 34/64 geometry.
+  for (auto p : ArrayRef<PortInfo>(h[0].getPorts()).drop_front(10)) { p.name = b.getStringAttr(("loadmem_" + p.name.getValue()).str()); ep.push_back(p); }
+  for (auto p : ArrayRef<PortInfo>(h[5].getPorts()).drop_front(13)) { p.name = b.getStringAttr(("loadmem_" + p.name.getValue()).str()); ep.push_back(p); }
+  ep.push_back({b.getStringAttr("loadmem_mem_r_ready"), uint(1), Direction::Out});
+  ep.push_back({b.getStringAttr("loadmem_mem_r_valid"), uint(1), Direction::In});
+  ep.push_back({b.getStringAttr("loadmem_mem_r_bits_data"), uint(64), Direction::In});
+  b.setInsertionPointToEnd(staged->getBodyBlock());
+  auto engine = b.create<FModuleOp>(loc, b.getStringAttr(engineName), old.getConventionAttr(), ep);
+  b.setInsertionPointToStart(engine.getBodyBlock());
+  const StringRef instNames[]{"writer", "write_requests", "request_arbiter", "registers", "write_data", "read_requests", "read_data"};
+  SmallVector<InstanceOp> i;
+  for (unsigned j = 0; j < 7; ++j) i.push_back(b.create<InstanceOp>(loc, h[j], instNames[j]));
+  auto arg = [&](unsigned p) { return engine.getArgument(p); };
+  auto field = [&](Value v, StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
+  auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
+  auto constant = [&](unsigned w, uint64_t n) -> Value { return b.create<ConstantOp>(loc, uint(w), APInt(w, n)); };
+  auto lane = [&](StringRef group, unsigned word) -> Value {
+    return b.create<SubindexOp>(loc, field(arg(2), group), word);
+  };
+  for (unsigned j : {0U, 1U, 3U, 4U, 5U, 6U})
+    for (unsigned p = 0; p < 2; ++p) connect(i[j].getResult(p), arg(p));
+  // Queued writes have priority over whole-DRAM zero fill; completion is
+  // writer req.ready. Reuse the native queue/arbiter instead of duplicating it.
+  connect(i[3].getResult(2), field(i[1].getResult(2), "ready"));
+  connect(field(i[1].getResult(2), "valid"), i[3].getResult(3));
+  auto bits = field(i[1].getResult(2), "bits");
+  connect(field(bits, "zero"), constant(1, 0));
+  connect(field(bits, "addr"), i[3].getResult(4)); connect(field(bits, "len"), i[3].getResult(5));
+  connect(field(i[1].getResult(3), "ready"), i[2].getResult(0));
+  connect(i[2].getResult(1), field(i[1].getResult(3), "valid"));
+  const StringRef requestFields[]{"zero", "addr", "len"};
+  for (unsigned p = 0; p < 3; ++p)
+    connect(i[2].getResult(2 + p), field(field(i[1].getResult(3), "bits"), requestFields[p]));
+  connect(i[3].getResult(6), i[2].getResult(5)); connect(i[2].getResult(6), i[3].getResult(7));
+  connect(i[2].getResult(7), i[0].getResult(2)); connect(i[0].getResult(3), i[2].getResult(8));
+  for (unsigned p = 0; p < 3; ++p) connect(i[0].getResult(4 + p), i[2].getResult(9 + p));
+  connect(i[3].getResult(8), i[0].getResult(2));
+  connect(i[4].getResult(5), i[0].getResult(7));
+  connect(i[0].getResult(8), i[4].getResult(6)); connect(i[0].getResult(9), i[4].getResult(7));
+  for (unsigned p = 10; p < 20; ++p) {
+    bool input = h[0].getPortDirection(p) == Direction::In;
+    connect(input ? i[0].getResult(p) : arg(p - 7), input ? arg(p - 7) : i[0].getResult(p));
+  }
+  for (unsigned p = 13; p < 16; ++p) {
+    bool input = h[5].getPortDirection(p) == Direction::In;
+    connect(input ? i[5].getResult(p) : arg(p), input ? arg(p) : i[5].getResult(p));
+  }
+  connect(arg(16), i[6].getResult(2)); connect(i[6].getResult(3), arg(17)); connect(i[6].getResult(4), arg(18));
+  // Assemble decoded MCR words using the same permissions/handshakes as
+  // LoadMem.scala. Address/status register and queue state stays in the catalog.
+  for (unsigned word : {0U, 1U, 2U, 3U, 5U}) {
+    auto rd = field(i[3].getResult(9), "read_" + std::to_string(word));
+    auto wr = field(i[3].getResult(9), "write_" + std::to_string(word));
+    b.create<ConnectOp>(loc, lane("read", word), rd);
+    b.create<ConnectOp>(loc, wr, lane("write", word));
+  }
+  connect(field(i[3].getResult(9), "wstrb"), field(arg(2), "wstrb"));
+  auto rd4 = lane("read", 4), wr4 = lane("write", 4);
+  connect(field(wr4, "ready"), i[4].getResult(2)); connect(i[4].getResult(3), field(wr4, "valid"));
+  connect(i[4].getResult(4), field(wr4, "bits"));
+  connect(field(rd4, "valid"), constant(1, 0)); connect(field(rd4, "bits"), constant(32, 0));
+  for (unsigned word = 6; word <= 7; ++word) {
+    auto rd = lane("read", word), wr = lane("write", word); unsigned p = word == 6 ? 2 : 7;
+    connect(field(wr, "ready"), i[5].getResult(p)); connect(i[5].getResult(p + 1), field(wr, "valid"));
+    connect(i[5].getResult(p + 2), field(wr, "bits"));
+    connect(field(rd, "valid"), i[5].getResult(p + 3)); connect(field(rd, "bits"), i[5].getResult(p + 4));
+    if (word == 7) connect(i[5].getResult(12), field(rd, "ready"));
+  }
+  auto rd8 = lane("read", 8), wr8 = lane("write", 8);
+  connect(i[6].getResult(5), field(rd8, "ready"));
+  connect(field(rd8, "valid"), i[6].getResult(6)); connect(field(rd8, "bits"), i[6].getResult(7));
+  connect(field(wr8, "ready"), constant(1, 0));
+  auto active = b.create<NotPrimOp>(loc, arg(1));
+  b.create<AssertOp>(loc, arg(0), b.create<NotPrimOp>(loc, field(rd4, "ready")), active,
+      "Can only write to this decoupled sink", ValueRange{}, "");
+  b.create<AssertOp>(loc, arg(0), b.create<NotPrimOp>(loc, field(wr8, "valid")), active,
+      "Can only read from this decoupled source", ValueRange{}, "");
+  SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
+  for (auto [p, info] : llvm::enumerate(old.getPorts())) if (p != *mcr) { copied.push_back(p); ports.push_back(info); }
+  llvm::append_range(ports, ArrayRef<PortInfo>(ep).drop_front(3));
+  b.setInsertionPointToEnd(staged->getBodyBlock());
+  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(newName), old.getConventionAttr(), ports);
+  b.setInsertionPointToStart(wrapper.getBodyBlock());
+  auto sim = b.create<InstanceOp>(loc, old, "sim"), loadmem = b.create<InstanceOp>(loc, engine, "loadmem");
+  for (auto [p, index] : llvm::enumerate(copied)) {
+    bool input = old.getPortDirection(index) == Direction::In;
+    b.create<ConnectOp>(loc, input ? sim.getResult(index) : wrapper.getArgument(p), input ? wrapper.getArgument(p) : sim.getResult(index));
+    if (index == *clock || index == *reset) connect(loadmem.getResult(index == *clock ? 0 : 1), wrapper.getArgument(p));
+  }
+  b.create<ConnectOp>(loc, sim.getResult(*mcr), loadmem.getResult(2));
+  for (unsigned p = 3; p < ep.size(); ++p) {
+    auto outer = wrapper.getArgument(copied.size() + p - 3); bool input = ep[p].direction == Direction::In;
+    connect(input ? loadmem.getResult(p) : outer, input ? outer : loadmem.getResult(p));
+  }
+  if (failed(verify(*staged))) return reject("Print LoadMem engine catalog types or composed FIRRTL differ");
+  // Copied targets move to the new public top. The consumed MCR identity
+  // remains on the retained inner top; recurse through nested annotation data.
+  std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
+    if (auto s = dyn_cast<StringAttr>(a)) {
+      auto v = s.getValue(); std::string oldPrefix = "~" + oldName.str(), newPrefix = "~" + newName.str();
+      if (v == oldPrefix) return b.getStringAttr(newPrefix);
+      if (!v.consume_front(oldPrefix + "|")) return a;
+      std::string suffix = "|" + v.str(); StringRef ref(suffix); std::string mp = "|" + oldName.str() + ">";
+      if (ref.consume_front(mp)) {
+        auto root = ref.take_front(ref.find_first_of(".["));
+        for (auto p : copied) if (root == old.getPortName(p)) { suffix.replace(0, mp.size(), "|" + newName.str() + ">"); break; }
+      }
+      return b.getStringAttr(newPrefix + suffix);
+    }
+    if (auto xs = dyn_cast<ArrayAttr>(a)) { SmallVector<Attribute> out; for (auto x : xs) out.push_back(retarget(x)); return b.getArrayAttr(out); }
+    if (auto xs = dyn_cast<DictionaryAttr>(a)) { NamedAttrList out; for (auto x : xs) out.set(x.getName(), retarget(x.getValue())); return out.getDictionary(ctx); }
+    return a;
+  };
+  auto raw = retarget(circuit->getAttr("rawAnnotations"));
+  for (auto m : {engine, wrapper}) m->moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", raw); circuit.setName(newName);
+  return success();
+}
