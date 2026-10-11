@@ -309,4 +309,8 @@ mlir::LogicalResult mapPrintBridgeRocketHostMemoryPort(
 /// Atomic; preserve prior IR and transfer copied top targets.
 mlir::LogicalResult mapPrintBridgeRocketEmptyCPUStreamWrite(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Attach independent depth-two AW/W queues to the expanded CPU write boundary.
+/// Atomic; retain existing identities and consumed AW/W targets.
+mlir::LogicalResult mapPrintBridgeRocketCPUStreamWriteBuffer(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

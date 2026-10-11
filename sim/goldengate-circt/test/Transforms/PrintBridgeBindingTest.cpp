@@ -2292,6 +2292,79 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+void rocketCPUStreamWriteBuffer(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, f.circuit.getName());
+  const StringRef additions[]{"GGPrintCPUStreamWriteBufferWrapper", "GGCPUStreamAWQueue2", "GGCPUStreamWQueue2"};
+  SmallVector<Attribute> annos(f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+  SmallVector<Attribute> targets;
+  for (StringRef n : {"cpu_stream_aw_valid", "cpu_stream_w_bits_strb", "hostClock", "hostReset",
+                     "mem_0.aw.bits.id", "cpu_stream_b_bits_id", "cpu_stream_ar_bits_addr"})
+    targets.push_back(b.getStringAttr("~GGPrintCPUStreamWriteWrapper|GGPrintCPUStreamWriteWrapper>" + n));
+  annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.CPUStreamWriteBufferTargets")),
+      b.getNamedAttr("nested", b.getDictionaryAttr({b.getNamedAttr("targets", b.getArrayAttr(targets))}))}));
+  f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  SmallVector<SmallVector<PortInfo>> priorPorts; SmallVector<Operation *> operations;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts());
+    arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+    for (auto &op : m.getBodyBlock()->getOperations()) operations.push_back(&op);
+  }
+  for (unsigned bad = 0; bad < 10; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); auto top = named(c, original.getName());
+    if (bad < 3) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(), b.getStringAttr(additions[bad]), top.getConventionAttr(), ArrayRef<PortInfo>{});
+    } else if (bad == 3) c->removeAttr("rawAnnotations");
+    else if (bad == 4) c.setName("WrongTop");
+    else if (bad == 5 || bad == 6 || bad == 9) {
+      SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
+      names[port(top, bad == 5 ? "hostClock" : bad == 6 ? "cpu_stream_w_bits_strb" : "other")] =
+          b.getStringAttr(bad == 9 ? "cpu_stream_aw_bits_addr" : "wrongField"); top.setPortNames(names);
+    } else if (bad == 7) {
+      b.setInsertionPointToStart(top.getBodyBlock()); b.create<InstanceOp>(c.getLoc(), top, "alreadyUsed");
+    } else named(c, "GGPrintBridgeHostWrapper")->removeAttr("goldengate.printHostBindings");
+    auto before = dump(*test);
+    require(failed(goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(c, error)) && !error.empty() && dump(*test) == before,
+        "expanded CPU AW/W buffer rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && m.getNumPorts() == arguments[j].size(), "CPU AW/W buffer changed prior module identity");
+    for (auto [p, arg] : llvm::enumerate(arguments[j])) {
+      auto info = m.getPorts()[p], old = priorPorts[j][p];
+      require(m.getArguments()[p] == arg && info.name == old.name && info.type == old.type && info.direction == old.direction &&
+          info.annotations == old.annotations && info.sym == old.sym, "CPU AW/W buffer changed prior metadata or SSA argument");
+    }
+  }
+  SmallVector<Operation *> live;
+  for (auto m : existing) for (auto &op : m.getBodyBlock()->getOperations()) live.push_back(&op);
+  require(live == operations, "CPU AW/W buffer replaced prior operations");
+  auto wrapper = named(f.circuit, additions[0]);
+  require(wrapper.getNumPorts() == 122 && llvm::range_size(wrapper.getOps<InstanceOp>()) == 3 &&
+      port(wrapper, "cpu_stream_aw_bits_addr") == 120 && port(wrapper, "cpu_stream_aw_bits_len") == 121,
+      "CPU AW/W buffer wrapper geometry");
+  child(wrapper, original); child(wrapper, named(f.circuit, additions[1])); child(wrapper, named(f.circuit, additions[2]));
+  auto updated = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(updated.size() == annos.size(), "CPU AW/W buffer changed annotation count");
+  auto probe = cast<DictionaryAttr>(updated[updated.size() - 1]).getAs<DictionaryAttr>("nested").getAs<ArrayAttr>("targets");
+  for (auto [i, target] : llvm::enumerate(probe)) {
+    auto module = i < 2 ? original.getName() : additions[0];
+    auto suffix = cast<StringAttr>(targets[i]).getValue().split('>').second;
+    require(cast<StringAttr>(target).getValue() == ("~GGPrintCPUStreamWriteBufferWrapper|" + module + ">" + suffix).str(),
+        "CPU AW/W buffer failed recursive copied/consumed target transfer");
+  }
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(f.circuit, error)) && dump(*f.root) == before,
+      "repeated CPU AW/W buffer changed IR"); ++rejected;
+  if (!output.empty()) {
+    std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-cpu-stream-write-buffer-reverse.mlir" : ".rocket-cpu-stream-write-buffer.mlir")).str(), ec);
+    require(!ec, "cannot write expanded CPU AW/W buffer boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketEmptyCPUStreamWrite(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -4557,6 +4630,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       rocketHostMemoryOutputBuffer(f, output, reverse, rejected);
       rocketHostMemoryPort(f, output, reverse, rejected);
       rocketEmptyCPUStreamWrite(f, output, reverse, rejected);
+      rocketCPUStreamWriteBuffer(f, output, reverse, rejected);
     }
     if (!output.empty()) {
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
@@ -4894,6 +4968,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-cpu-stream-write-buffer-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded CPU write boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketCPUStreamWriteBuffer(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded CPU AW/W buffer boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-empty-cpu-stream-write-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded host memory platform boundary");

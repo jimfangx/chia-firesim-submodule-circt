@@ -111,10 +111,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         b.getNamedAttr("target", b.getStringAttr("~GGCPUStreamWriteWrapper|GGCPUStreamWriteWrapper>" + std::string(n)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
-void behavior(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  require(succeeded(goldengate::addCPUStreamWriteBuffer(c, error)), error);
-  require(succeeded(verify(*root)), "queue IR verification failed");
+void behavior(CircuitOp c) {
   std::mt19937_64 random(164);
   for (auto name : {"GGCPUStreamAWQueue2", "GGCPUStreamWQueue2"}) {
     Interpreter sim(named(c, name)); std::deque<std::map<std::string, uint64_t>> expected;
@@ -195,7 +192,20 @@ void rejection(MLIRContext &context) {
   }
 }
 }
-int main() {
-  try {MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();behavior(context);mapping(context);rejection(context);return 0;}
+int main(int argc, char **argv) {
+  try {
+    MLIRContext context; context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+    if (argc == 2) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &context);
+      require(bool(root) && succeeded(verify(*root)), "invalid expanded queue boundary");
+      behavior(*root->getOps<CircuitOp>().begin());
+    } else {
+      require(argc == 1, "usage: goldengate-cpu-stream-write-buffer-test [boundary.mlir]");
+      auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+      require(succeeded(goldengate::addCPUStreamWriteBuffer(c, error)) && succeeded(verify(*root)), error);
+      behavior(c); mapping(context); rejection(context);
+    }
+    return 0;
+  }
   catch(const std::exception &e) {llvm::errs()<<e.what()<<'\n';return 1;}
 }

@@ -2,10 +2,14 @@
 // FPGATop CPU AXI4Buffer(): independent depth-two AW and W queues, flow=false,
 // pipe=false. Retains the common AW address/length fields from golden Queue_51;
 // W data/last have no users in Rocket's empty incoming CPU stream configuration.
-// Requires the uninstantiated write wrapper, exact U250 AW/W scalars and raw
+// Requires an uninstantiated active boundary, exact U250 AW/W scalars and raw
 // annotations. Rejects boundary/module collisions before mutation. AW/W targets
 // stay on the inner engine-facing boundary; other copied ports move outward.
 // Produces native FIRRTL memories/registers and a connected outer boundary.
+// Consumes no annotations; recursively transfers circuit/copied-port targets.
+// Mutates only by adding two queue modules, a wrapper and its archive/name.
+// Requires no external analysis; preserves prior module, port and SSA identity.
+// Output invariant: independent synchronous-write/asynchronous-read queues.
 // B, AR, R buffering and the FPGA shell remain subsequent compiler stages.
 #include "goldengate/TracerVTokenEngine.h"
 #include "mlir/IR/Builders.h"
@@ -15,11 +19,17 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addCPUStreamWriteBuffer(CircuitOp circuit,
                                                 std::string &error) {
-  constexpr llvm::StringLiteral wrapperName = "GGCPUStreamWriteBufferWrapper";
+  return attachCPUStreamWriteBuffer(circuit, "GGCPUStreamWriteWrapper",
+                                   "GGCPUStreamWriteBufferWrapper", error);
+}
+
+LogicalResult goldengate::attachCPUStreamWriteBuffer(
+    CircuitOp circuit, llvm::StringRef inputBoundary,
+    llvm::StringRef wrapperName, std::string &error) {
   constexpr llvm::StringLiteral awName = "GGCPUStreamAWQueue2";
   constexpr llvm::StringLiteral wName = "GGCPUStreamWQueue2";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGCPUStreamWriteWrapper")
+  if (circuit.getName() != inputBoundary)
     return reject("CPU AW/W buffers require the active CPU write wrapper");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {

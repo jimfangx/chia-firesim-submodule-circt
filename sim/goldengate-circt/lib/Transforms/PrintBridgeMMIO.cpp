@@ -9,6 +9,7 @@
 #include "goldengate/HostMemoryOutputBuffer.h"
 #include "goldengate/HostMemoryPort.h"
 #include "goldengate/EmptyCPUStreamWrite.h"
+#include "goldengate/TracerVTokenEngine.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/ControlErrorSlave.h"
@@ -1915,6 +1916,32 @@ LogicalResult goldengate::mapPrintBridgeRocketEmptyCPUStreamWrite(
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGPrintCPUStreamWriteWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
+// CPU stream sink stalls. Stage shared native queues and publish only additions.
+LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  if (circuit.getName() != "GGPrintCPUStreamWriteWrapper") {
+    error = "Print CPU AW/W buffers require the expanded empty CPU write boundary";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamWriteBuffer(*staged, "GGPrintCPUStreamWriteWrapper",
+                                       "GGPrintCPUStreamWriteBufferWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "Print CPU AW/W buffers produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGPrintCPUStreamWriteBufferWrapper" ||
+          m.getName() == "GGCPUStreamAWQueue2" || m.getName() == "GGCPUStreamWQueue2")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

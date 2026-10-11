@@ -28,6 +28,10 @@ mlir::LogicalResult addEmptyCPUStreamWrite(circt::firrtl::CircuitOp circuit,
 // Buffer U250 CPU AXI AW and W independently with depth-two queues.
 mlir::LogicalResult addCPUStreamWriteBuffer(circt::firrtl::CircuitOp circuit,
                                           std::string &error);
+// Attach the same native queues to an expanded boundary. Preserves existing
+// modules and transfers copied targets while retaining consumed AW/W targets.
+mlir::LogicalResult attachCPUStreamWriteBuffer(circt::firrtl::CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error);
 // Queue U250 CPU AXI AR independently; the engine dequeues on the last R beat.
 mlir::LogicalResult addCPUStreamReadBuffer(circt::firrtl::CircuitOp circuit,
                                          std::string &error);

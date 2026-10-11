@@ -4203,3 +4203,65 @@ stall/reset behavior with SFC before composing AR/R/B queues and the aggregate
 CPU platform port. Production Print CLI/driver/runtime parity, general
 FAME1/FAME5, multiclock and the SFC UART-bearing baseline remain incomplete.
 Overall port completion is not claimed.
+
+### Iteration 114: expanded Print CPU AW/W buffering
+
+`mapPrintBridgeRocketCPUStreamWriteBuffer` now stages the shared native
+`attachCPUStreamWriteBuffer` builder after the expanded empty CPU writer. It
+publishes `GGPrintCPUStreamWriteBufferWrapper`, `GGCPUStreamAWQueue2`, and
+`GGCPUStreamWQueue2`; no retained module body, port metadata, SSA argument or
+operation is replaced. The native production entry point delegates to the same
+builder with its existing boundary names.
+
+The Scala oracle is `FPGATop.scala`'s `AXI4Buffer()` between the CPU master and
+stream engine, in the post-FAME `SimulationMapping` neighborhood recorded by
+`MidasTransforms.scala`. Both AW/W queues have depth two, flow=false and
+pipe=false. RAM read latency is zero and write latency one. Reset flushes the
+three control bits, while a pre-edge accepted enqueue still writes RAM during
+reset. The empty incoming stream stalls each dequeue independently: two
+transactions can enter each queue before its ready drops. The AW ID and W strb
+presented to the engine then remain at the first accepted payload until reset.
+AW addr/len are stored for the shared Queue_51 shape, though this empty writer
+has no consumers for them. W data/last remain absent, consistent with SFC's
+eliminated fields.
+
+Exact immutable golden compared:
+
+```text
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+`PrintRocketCPUStreamWriteBufferCompare.py` checks `Queue_51`, `Queue_52`, and
+`AXI4Buffer_2`: payload widths, depth-two memories, pointer/occupancy equations,
+reset-only control flushing, accepted reset-edge RAM writes and independent
+channel wiring. SFC removes W's constant-zero dequeue ready and pointer;
+CIRCT retains the generic native queue and connects its dequeue to the native
+zero-ready engine. The generated queue bodies match the shared native baseline
+`iteration81-print-rocket-fased-read-buffer/candidate/post-fame-cpu-stream-platform.mlir`.
+
+Both constructor orders preserve 289 prior module bodies and all 21 Print
+modules, produce 292 modules and 122 top ports (120 plus AW addr/len), and have
+133 wrapper routes. Seven engine-facing AW/W targets remain on the consumed
+inner boundary; 113 copied ports, including host clock/reset, mem_0, B and AR/R,
+move to the new boundary. A nested mixed-target probe and the complete retained
+annotation archive pass comparison. Each replay passes 11 atomic rejection
+cases, including collisions, absent archive/allocation, malformed clock/write
+fields, already-instantiated boundaries and repeated application.
+
+`CPUStreamWriteBufferTest.cpp` now accepts an actual generated boundary and
+interprets its native queue operations against an independent deque. Each
+order passes 20,400 cycles per queue: stalled fill/head retention, random
+occupancy, full/empty no-bypass behavior, simultaneous enqueue/dequeue,
+pointer wrap, and reset with accepted RAM writes. Across both orders this is
+81,600 checked cycles. Focused CTests `goldengate-print-binding`,
+`goldengate-cpu-stream-write-buffer`, and `goldengate-cpu-stream-read-buffer`
+pass. Artifacts, stdout/stderr and comparison JSON are under:
+
+```text
+sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration114-print-rocket-cpu-aw-w-buffer/
+```
+
+Next: attach the shared native AR queue to this expanded CPU boundary, then
+R and B queues and the platform aggregate. Production Print integration,
+enabled Print runtime equivalence, and the UART-bearing SFC runtime baseline
+remain pending. No manager verification steps were started in this iteration.
