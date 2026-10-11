@@ -1972,3 +1972,29 @@ LogicalResult goldengate::mapPrintBridgeRocketCPUStreamReadBuffer(
   circuit.setName(staged->getName());
   return success();
 }
+
+// R buffering lets the engine enqueue beats independently from host dequeue.
+// Publish only the shared response queue and verified expanded wrapper.
+LogicalResult goldengate::mapPrintBridgeRocketCPUStreamResponseBuffer(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  if (circuit.getName() != "GGPrintCPUStreamReadBufferWrapper") {
+    error = "Print CPU R buffer requires the expanded CPU AR buffer boundary";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamResponseBuffer(*staged, "GGPrintCPUStreamReadBufferWrapper",
+                                      "GGPrintCPUStreamResponseBufferWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "Print CPU R buffer produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGPrintCPUStreamResponseBufferWrapper" ||
+          m.getName() == "GGCPUStreamRQueue2")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}

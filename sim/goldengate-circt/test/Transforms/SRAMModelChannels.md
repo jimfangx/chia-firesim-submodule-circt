@@ -4323,3 +4323,58 @@ Next: attach the native R response queue to this expanded boundary, then B
 and the platform aggregate. Production Print integration, enabled Print
 runtime equivalence, and the UART-bearing SFC runtime baseline remain pending.
 No manager verification steps were started in this iteration.
+
+
+## Iteration 116: expanded Print CPU R response buffering
+
+`attachCPUStreamResponseBuffer` shares the native depth-two R queue builder
+between the existing simulator path and the expanded Print circuit.
+`mapPrintBridgeRocketCPUStreamResponseBuffer` requires the validated expanded
+CPU AR boundary, clones for staging, verifies the result, and publishes only
+`GGCPUStreamRQueue2` and `GGPrintCPUStreamResponseBufferWrapper`. Existing
+modules, operations, SSA arguments, port annotations and inner symbols retain
+identity. Six R targets stay on the inner boundary; the remaining 116 ports
+move to the new outer boundary in the recursively transferred archive.
+
+The Scala oracle is `FPGATop.scala`'s default `AXI4Buffer()` in the
+`SimulationMapping` neighborhood of `MidasTransforms.scala`; its host clock
+and reset follow the conventions established by `FAMETransform.scala`.
+Exact immutable golden compared:
+
+```text
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+`PrintRocketCPUStreamResponseBufferCompare.py` checks Queue_55's
+id16/data512/resp2/last1 RAM payloads, depth two, flow=false, pipe=false,
+occupancy and reset equations, asynchronous reads and accepted reset-edge
+RAM writes. SFC folds the engine's constant Okay response into the queue's
+RAM write instead of exposing an engine response port. The comparison checks
+that specialization and the native engine's constant-zero response, all SFC
+AXI4Buffer_2 R routes, and all 130 native wrapper routes. The queue body is
+identical to the shared native baseline
+`iteration81-print-rocket-fased-read-buffer/candidate/post-fame-cpu-stream-platform.mlir`.
+
+Both annotation orders retain all 293 previous module bodies and all 21 Print
+modules, produce 295 modules, and retain all 122 public ports. Mixed nested
+copied/consumed targets and the complete retained annotation archive match.
+Each order checks 11 atomic rejections for collisions, missing archive or
+Print allocation, wrong boundary, malformed clock/R interface, unsupported
+R fields, instantiated top, wrong payload width and repeated application.
+
+`CPUStreamResponseBufferTest.cpp` accepts the actual emitted boundary and
+interprets its queue operations against an independent deque. Each order
+checks 20,400 cycles using all 512 data bits and all four response fields,
+including full/empty no-bypass, pointer wrap, stalls, simultaneous transfers,
+reset flush and reset-edge RAM writes: 40,800 cycles across both orders.
+Focused Print binding, CPU AR and CPU R CTests pass; the production compiler
+builds. Artifacts and stdout/stderr are retained under:
+
+```text
+sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration116-print-rocket-cpu-r-buffer/
+```
+
+Next: attach native B response buffering to this expanded boundary, then the
+platform aggregate. Production Print integration, enabled Print runtime
+parity, and the UART-bearing SFC runtime baseline remain pending. Manager
+verification remains owned by the harness; none was started here.

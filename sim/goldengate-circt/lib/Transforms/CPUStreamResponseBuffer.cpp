@@ -3,8 +3,14 @@
 // id16/data512/resp2/last1 as in U250 Queue_55. The engine advances at enqueue,
 // independently of host dequeue; its Okay response is stored, not bypassed.
 // Flush pointer/occupancy state on reset while retaining RAM write semantics.
-// Requires the exact uninstantiated AR wrapper with retained annotations; all
-// checks precede mutation. R targets stay engine-facing; copied ports move out.
+// Requires: active uninstantiated AR boundary, exact U250 R/host clock/reset
+// ports, retained rawAnnotations, unused wrapper and queue symbols.
+// Consumes/produces no annotation classes; recursively transfers circuit and
+// copied-port archive targets, retaining consumed R targets on the inner module.
+// Mutates: adds one queue and wrapper, updates circuit name and archive.
+// Analyses: none required; prior operations, SSA values and metadata preserved.
+// Output: same public ports, depth-two response storage; all checks precede
+// mutation. The expanded Print caller stages and verifies before publication.
 // B buffering, remaining bridges and complete simulator emission remain later.
 #include "goldengate/TracerVTokenEngine.h"
 #include "mlir/IR/Builders.h"
@@ -14,9 +20,15 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addCPUStreamResponseBuffer(CircuitOp circuit,
                                                    std::string &error) {
-  constexpr llvm::StringLiteral wrapperName = "GGCPUStreamResponseBufferWrapper";
+  return attachCPUStreamResponseBuffer(circuit, "GGCPUStreamReadBufferWrapper",
+                                       "GGCPUStreamResponseBufferWrapper", error);
+}
+
+LogicalResult goldengate::attachCPUStreamResponseBuffer(
+    CircuitOp circuit, llvm::StringRef inputBoundary, llvm::StringRef wrapperName,
+    std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGCPUStreamReadBufferWrapper")
+  if (circuit.getName() != inputBoundary)
     return reject("CPU R buffer requires the active CPU AR buffer wrapper");
   constexpr llvm::StringLiteral queueName = "GGCPUStreamRQueue2";
   FModuleOp inner;

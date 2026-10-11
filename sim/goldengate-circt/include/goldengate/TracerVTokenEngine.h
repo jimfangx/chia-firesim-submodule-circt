@@ -42,6 +42,10 @@ mlir::LogicalResult attachCPUStreamReadBuffer(circt::firrtl::CircuitOp circuit,
 // Buffer U250 CPU AXI R beats independently from host read backpressure.
 mlir::LogicalResult addCPUStreamResponseBuffer(circt::firrtl::CircuitOp circuit,
                                              std::string &error);
+// Attach the shared native R queue to an expanded boundary, retaining consumed
+// R targets and transferring copied ports to the verified outer wrapper.
+mlir::LogicalResult attachCPUStreamResponseBuffer(circt::firrtl::CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error);
 // Buffer U250 CPU AXI B responses, preserving the empty sink queue boundary.
 mlir::LogicalResult addCPUStreamWriteResponseBuffer(circt::firrtl::CircuitOp circuit,
                                                   std::string &error);

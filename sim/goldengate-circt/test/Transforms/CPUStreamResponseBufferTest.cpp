@@ -111,10 +111,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         b.getNamedAttr("target", b.getStringAttr("~GGCPUStreamReadBufferWrapper|GGCPUStreamReadBufferWrapper>" + std::string(n)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
-void behavior(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  require(succeeded(goldengate::addCPUStreamResponseBuffer(c, error)), error);
-  require(succeeded(verify(*root)), "R queue IR verification failed");
+void behavior(CircuitOp c) {
   Interpreter sim(named(c, "GGCPUStreamRQueue2")); std::deque<std::map<std::string, APInt>> expected;
   std::mt19937_64 random(166);
   unsigned pushes = 0, pops = 0, blocked = 0, emptyBlocked = 0, resetWrites = 0, simultaneous = 0;
@@ -207,7 +204,20 @@ void rejection(MLIRContext &context) {
   }
 }
 }
-int main() {
-  try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>(); behavior(context); mapping(context); rejection(context); return 0; }
-  catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+int main(int argc, char **argv) {
+  try {
+    MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 2) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &context);
+      require(bool(root) && succeeded(verify(*root)), "cannot parse verified expanded R boundary");
+      auto c = *root->getOps<CircuitOp>().begin();
+      require(c.getName() == "GGPrintCPUStreamResponseBufferWrapper", "wrong expanded R boundary");
+      behavior(c); return 0;
+    }
+    require(argc == 1, "usage: goldengate-cpu-stream-response-buffer-test [expanded-boundary.mlir]");
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+    require(succeeded(goldengate::addCPUStreamResponseBuffer(c, error)), error);
+    require(succeeded(verify(*root)), "R queue IR verification failed");
+    behavior(c); mapping(context); rejection(context); return 0;
+  } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
