@@ -285,4 +285,8 @@ mlir::LogicalResult mapPrintBridgeRocketLoadMemEngine(
 /// Atomic; retain prior IR and consumed targets, transfer copied public targets.
 mlir::LogicalResult mapPrintBridgeRocketHostMemoryWriteArbiter(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Route host B by LoadMem ID 16 / FASED IDs 0..15; join the host AW/W/B port.
+/// Atomic; retain consumed B targets and transfer copied ports and AR/R/AW/W.
+mlir::LogicalResult mapPrintBridgeRocketHostMemoryWriteResponses(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

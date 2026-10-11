@@ -3,10 +3,13 @@
 // AXI4Xbar B cone. One output sink makes response arbitration combinational.
 // Required input invariants: uninstantiated GGHostMemoryWriteWrapper; exact
 //   AW/W master, remaining FASED B/AR/R and LoadMem B boundaries; recorded
-//   35/64/4 FASED constructor and its unique two-instance wrapper bindings.
+//   35/64/4 FASED constructor and its unique two-instance wrapper bindings,
+//   retaining either the original FASED or expanded Print/LoadMem assembly
+//   with direct host clock/reset forwarding to both children.
 // Annotations consumed: none. Annotations produced: none.
 // IR mutations: add B demultiplexer and a wrapper joining host AW/W/B;
-//   retarget copied ports and AW/W leaves; retain consumed B identities inside.
+//   retarget copied ports and whole AW/W/AR/R channels and their leaves;
+//   retain consumed B and prior aggregate identities inside.
 // Analyses required: port, constructor and local SSA connectivity inspection.
 // Analyses preserved: existing module bodies, bridge keys and annotation classes.
 // Output invariants: LoadMem ID 16, FASED IDs 0..15 (trimmed to four bits);
@@ -76,7 +79,8 @@ LogicalResult goldengate::routeHostMemoryWriteResponses(CircuitOp circuit,
   bool used=false;circuit.walk([&](InstanceOp i){used|=i.getModuleName()==oldName;});
   InstanceOp sim,arb;unsigned instances=0;
   for(auto i:inner.getOps<InstanceOp>()) {
-    ++instances;if(i.getName()=="sim"&&i.getModuleName()=="GGFASEDAddressTranslationWrapper")sim=i;
+    ++instances;if(i.getName()=="sim"&&(i.getModuleName()=="GGFASEDAddressTranslationWrapper"||
+                                     i.getModuleName()=="GGPrintLoadMemWrapper"))sim=i;
     if(i.getName()=="write_arbiter"&&i.getModuleName()==arbiter.getName())arb=i;
   }
   auto arg=[&](FModuleOp m,unsigned i){return m.getBodyBlock()->getArgument(i);};
@@ -98,6 +102,21 @@ LogicalResult goldengate::routeHostMemoryWriteResponses(CircuitOp circuit,
   }
   if(used||instances!=2||!sim||!arb||wb!=1||bb!=1||rb!=1||ab!=1||lrb!=1||lvb!=1)
     return reject("host write response router requires the unique two-instance AW/W and B/AR/R bindings");
+  // Both supported assembly profiles must retain the reservation queue's host
+  // clock/reset and forward the same host domain to the buffered masters.
+  auto unique=[&](Value dest,Value src) {
+    unsigned drivers=0,matches=0;
+    for(auto &op:inner.getBodyBlock()->getOperations())
+      if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==dest) {
+        ++drivers;matches+=op.getOperand(1)==src;
+      }
+    return dest&&src&&drivers==1&&matches==1;
+  };
+  if(!unique(simPort("hostClock"),arg(inner,*clock))||
+     !unique(simPort("hostReset"),arg(inner,*reset))||
+     !unique(arb.getResult(0),arg(inner,*clock))||
+     !unique(arb.getResult(1),arg(inner,*reset)))
+    return reject("host write response router requires direct host clock/reset forwarding");
   // All validation precedes mutations; retained modules preserve consumed targets.
   auto f=[&](Value v,StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};
   auto c=[&](Value d,Value s){b.create<StrictConnectOp>(loc,d,s);};
@@ -142,8 +161,9 @@ LogicalResult goldengate::routeHostMemoryWriteResponses(CircuitOp circuit,
       std::string suffix="|"+v.str();StringRef ref(suffix);
       if(ref.consume_front(mp)) {
         auto root=ref.take_front(ref.find_first_of(".[")).str();
-        bool preserved=ref.starts_with("fased_host_mem.ar.")||ref.starts_with("fased_host_mem.r.")||
-          ref.starts_with("host_mem_write.aw.")||ref.starts_with("host_mem_write.w.");
+        bool preserved=false;
+        for(auto channel:{"fased_host_mem.ar","fased_host_mem.r","host_mem_write.aw","host_mem_write.w"})
+          preserved|=ref==channel||ref.starts_with(std::string(channel)+".");
         if(copied.count(root)||preserved)suffix.replace(0,mp.size(),"|"+newName.str()+">");
       }
       return b.getStringAttr(np+suffix);

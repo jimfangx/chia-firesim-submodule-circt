@@ -3,6 +3,7 @@
 // for the implemented Print hosts and their live CPU stream count bank.
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/HostMemoryWriteArbiter.h"
+#include "goldengate/HostMemoryWriteResponses.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/ControlErrorSlave.h"
@@ -1735,6 +1736,32 @@ LogicalResult goldengate::mapPrintBridgeRocketHostMemoryWriteArbiter(
       if (m.getName() == "GGHostMemoryWriteWrapper" ||
           m.getName() == "GGHostMemoryWriteArbiter" ||
           m.getName() == "GGHostMemoryWriteSourceQueue2")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Join host B to the expanded Print/LoadMem/FASED AW/W boundary. The shared
+// FIRRTL router implements AXI4Xbar's ID selection, truncation and selected
+// sink backpressure. Consumed B targets remain on the retained inner module.
+// Stage and verify both additions before changing any live operation identity.
+LogicalResult goldengate::mapPrintBridgeRocketHostMemoryWriteResponses(
+    CircuitOp circuit, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGHostMemoryWriteWrapper")
+    return reject("Rocket Print host write responses require the AW/W attachment");
+  if (!circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    return reject("Rocket Print host write responses require the annotation archive");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(routeHostMemoryWriteResponses(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("Rocket Print host write responses produced invalid FIRRTL IR");
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGHostMemoryWriteResponseWrapper" ||
+          m.getName() == "GGHostMemoryWriteResponseRouter")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

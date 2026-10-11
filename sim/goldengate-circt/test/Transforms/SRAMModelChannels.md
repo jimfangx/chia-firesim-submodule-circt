@@ -3780,3 +3780,76 @@ semantic and comparison stderr files are empty. A C++ test operand-setter
 compile error was corrected before the final successful build; its failed
 build log is retained. Existing shared-worktree changes remain outside this
 checkpoint. The overall port remains incomplete.
+
+### Iteration 108: expanded Print host B response composition
+
+`mapPrintBridgeRocketHostMemoryWriteResponses` composes the shared native
+`routeHostMemoryWriteResponses` FIRRTL router onto the expanded
+`GGHostMemoryWriteWrapper`. The native preflight now accepts either the
+original FASED address-translation child or `GGPrintLoadMemWrapper`; both
+must forward the host clock/reset directly to the retained master and AW/W
+reservation arbiter. The Print entry point also checks the live expanded
+control allocation, stages both new modules on a clone and verifies the
+result before moving only the additions to the live circuit. Existing module
+operations, ports and SSA arguments retain their identities.
+
+The new `GGHostMemoryWriteResponseWrapper` has 116 ports: 114 copied ports,
+remaining FASED AR/R and the joined host AW/W/B master. Its 122 connections
+preserve the LoadMem/FASED response flips and every copied control/Print port.
+LoadMem B and FASED B targets remain on the retained inner top. Copied ports,
+whole AW/W/AR/R channels and their leaves transfer to the new public top;
+original aggregate targets stay inside. No annotation class is consumed.
+
+The executable Scala pipeline in `MidasTransforms.scala` and host clock/reset
+semantics in `FAMETransform.scala` were reread. The response oracle is
+`FPGATop.scala`'s host AXI4Xbar and Rocket Chip `amba/axi4/Xbar.scala`'s ID
+range trimming and response fanout. Exact immutable golden compared:
+
+```
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+`PrintRocketHostMemoryWriteResponsesCompare.py` anchors seven `AXI4Xbar` B
+selection/payload/ready equations and the 5-bit host, 4-bit FASED and 2-bit
+response ABI. ID 16 selects LoadMem, IDs 0..15 select FASED with four-bit ID
+truncation, and IDs 17..31 block both consumers. Host ready depends on the
+selected consumer's ready independently of valid. LoadMem exposes only B
+ready/valid; FASED receives the response bits unchanged.
+
+Replay the prior iteration's actual expanded AW/W boundary with
+`goldengate-print-binding-test --rocket-host-memory-write-responses-boundary
+INPUT OUTPUT_PREFIX`, or the `-reverse` variant, after sourcing the FireSim
+project environment. Then run
+`goldengate-host-memory-write-responses-test --expanded-boundary OUTPUT` and
+the structured comparison with `--before`, `--after`, `--baseline`, `--sfc`
+and `--report-json`. Both orders exercise 19 atomic rejections, including
+missing and duplicate clock/reset drivers, malformed interfaces, missing
+B/AR/R bindings, constructor mismatches, collisions and repeated composition.
+A separate nested-target probe checks twelve copied/consumed leaf, channel
+and aggregate identities.
+
+The structured comparison passes in both orders, preserves all 275 prior
+module bodies including 21 Print modules, and matches the B router to the existing non-Print native
+boundary in `iteration81-print-rocket-fased-read-buffer/candidate/
+post-fame-host-memory-write-responses.mlir`. The SSA interpreter exhausts
+1,024 ID/response/valid/two-ready combinations (5,120 leaf checks, including
+480 unmatched-ID cases) on each emitted candidate. Evidence is under the
+mutable generated Rocket directory's
+`iteration108-print-rocket-host-memory-write-responses/`.
+
+Next smallest step: compose the existing host AR arbiter on this expanded
+Print boundary, preserving LoadMem read request and FASED R identities, then
+compare its stalled selection and ID insertion with the recorded AXI4Xbar.
+Expanded Print production CLI/driver integration and runtime parity, general
+FAME1/FAME5, multiclock support and the SFC UART baseline remain incomplete.
+Supplied iteration 107 harness feedback passes CIRCT replacertl and required
+Verilator workloads; it does not exercise this newly expanded Print path.
+No FireSim manager verification gate was started by the implementation agent.
+
+Validation: the compiler, Print binding and native host write/read test
+executables build. All four focused CTests pass in 17.04 seconds. Both
+expanded replays, 19 rejection cases per order, FIRRTL verification,
+1,024-case SSA comparisons and the structured golden comparison pass.
+Comparison and semantic stderr logs are empty. Existing shared clock-control,
+U250 recovery and harness edits are excluded from this checkpoint. The
+migration remains incomplete.

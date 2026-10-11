@@ -129,6 +129,17 @@ void rejected(MLIRContext &ctx,unsigned mode) {
   if(mode==7){b.setInsertionPointToStart(top(c,"UnusedFixture").getBodyBlock());b.create<InstanceOp>(c.getLoc(),m,"used_top");}
   if(mode==8){auto names=m.getPortNamesAttr();SmallVector<Attribute> out(names.begin(),names.end());for(auto &n:out)if(cast<StringAttr>(n).getValue()=="loadmem_mem_b_valid")n=b.getStringAttr("wrong");m.setPortNamesAttr(b.getArrayAttr(out));}
   if(mode==9){for(auto conn:m.getOps<ConnectOp>()){auto f=conn.getSrc().getDefiningOp<SubfieldOp>();if(f&&f.getFieldName()=="b"){b.setInsertionPoint(conn);b.create<ConnectOp>(conn.getLoc(),conn.getDest(),conn.getSrc());break;}}}
+  if(mode>=10) {
+    Value dest;
+    for(auto i:m.getOps<InstanceOp>()) {
+      if(mode<12&&i.getName()=="sim")
+        for(unsigned p=0;p<i.getNumResults();++p)
+          if(i.getPortName(p)==(mode==10?"hostClock":"hostReset"))dest=i.getResult(p);
+      if(mode>=12&&i.getName()=="write_arbiter")dest=i.getResult(mode==12?0:1);
+    }
+    for(auto &op:llvm::make_early_inc_range(m.getBodyBlock()->getOperations()))
+      if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==dest){op.erase();break;}
+  }
   auto before=dump(root->getOperation());std::string error;
   require(failed(goldengate::routeHostMemoryWriteResponses(c,error))&&!error.empty(),"contract rejection");
   require(dump(root->getOperation())==before,"rejection mutated circuit");
@@ -137,6 +148,13 @@ void rejected(MLIRContext &ctx,unsigned mode) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();
+    if(argc==3&&StringRef(argv[1])=="--expanded-boundary") {
+      auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);
+      require(bool(root)&&succeeded(verify(*root)),"expanded B boundary verifier");
+      auto c=*root->getOps<CircuitOp>().begin();
+      require(c.getName()=="GGHostMemoryWriteResponseWrapper","expanded B boundary top");
+      compare(c);bindings(c);return 0;
+    }
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
     std::map<std::string,std::string> before;for(auto m:c.getOps<FModuleOp>())before[m.getName().str()]=dump(m);
     std::string error;require(succeeded(goldengate::routeHostMemoryWriteResponses(c,error)),error);
@@ -150,8 +168,8 @@ int main(int argc,char **argv) {
       std::string n=std::vector<std::string>{"diagnostic","loadmem_mem_b_valid","fased_host_mem.b.bits.id","fased_host_mem.r.bits.id","fased_host_mem","host_mem_write.aw.bits.id","host_mem_write"}[i];
       require(target(i)==prefix+(copied?"GGHostMemoryWriteResponseWrapper":"GGHostMemoryWriteWrapper")+">"+n,"target identity mismatch");
     }
-    compare(c);bindings(c);for(unsigned i=0;i<10;++i)rejected(ctx,i);
-    llvm::outs()<<"Ten atomic rejections, seven target identities and preserved inner bodies pass\n";
+    compare(c);bindings(c);for(unsigned i=0;i<14;++i)rejected(ctx,i);
+    llvm::outs()<<"Fourteen atomic rejections, seven target identities and preserved inner bodies pass\n";
     if(argc>=3) {
       auto realRoot=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(realRoot),"cannot parse real AW/W boundary");
       auto real=*realRoot->getOps<CircuitOp>().begin();
