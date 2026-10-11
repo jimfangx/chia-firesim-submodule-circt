@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Oracle: FPGATopImp clock/reset, WidgetMMIO, mem and cpu_managed_axi4 IO.
-// Requires: uninstantiated GGCPUStreamPlatformWrapper, exact recorded U250
+// Requires: uninstantiated supported CPU platform wrapper, exact recorded U250
 // AXI4 port contracts, uniquely forwarded platform ports, retained annotations.
 // Annotations consumed: none. Produces HostClockSource on FPGATop.clock.
 // Transferred: the five public port targets (hostClock/hostReset renamed).
@@ -8,6 +8,8 @@
 // Mutation: one FPGATop module/instance and five ordinary aggregate connects.
 // Diagnostic outputs remain internal; no input, protocol field, state, clock
 // gate or reset rule is removed. No new buffering or target-cycle logic.
+// Required analysis: boundary port/driver contract and FAME host identities.
+// Preserves existing SSA/operations; hierarchy analyses must be rebuilt.
 #include "goldengate/FPGATopShell.h"
 #include "goldengate/AnnotationClasses.h"
 #include "mlir/IR/Builders.h"
@@ -59,8 +61,16 @@ Contract expected(StringRef root) {
 } // namespace
 LogicalResult goldengate::assembleFPGATopShell(CircuitOp circuit,
                                               std::string &error) {
-  constexpr StringLiteral oldName="GGCPUStreamPlatformWrapper", newName="FPGATop";
+  return attachFPGATopShell(circuit, "GGCPUStreamPlatformWrapper", error);
+}
+LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
+                                           StringRef oldName,
+                                           std::string &error) {
+  constexpr StringLiteral newName="FPGATop";
   auto reject=[&](StringRef s){error=s.str();return failure();};
+  bool print = oldName == "GGPrintCPUStreamPlatformWrapper";
+  if (!print && oldName != "GGCPUStreamPlatformWrapper")
+    return reject("unsupported FPGATop CPU platform boundary");
   FModuleOp inner;
   for (auto m:circuit.getOps<FModuleLike>()) {
     if (m.getModuleName()==newName) return reject("FPGATop shell already exists");
@@ -91,7 +101,10 @@ LogicalResult goldengate::assembleFPGATopShell(CircuitOp circuit,
         if (!isa<ClockType>(p.type)) return reject("invalid retained bridge clock");
       } else {
         Contract diagnostic;
-        if (!(n.starts_with("ctrl_")||n.starts_with("blockdev_")||n.starts_with("fased_"))||
+        // The validated expanded Print boundary also retains payload probes.
+        // Only passive data outputs may be hidden, never protocol inputs or
+        // additional clocks. The original boundary keeps its recorded names.
+        if ((!print && !(n.starts_with("ctrl_")||n.starts_with("blockdev_")||n.starts_with("fased_")))||
             !flatten(p.type,n.str(),false,diagnostic)) return reject("unrecognized diagnostic output");
         for (auto [name,contract]:diagnostic) if (contract.second) return reject("diagnostic bundle contains an input leaf");
       }
@@ -102,7 +115,8 @@ LogicalResult goldengate::assembleFPGATopShell(CircuitOp circuit,
   InstanceOp sim,cpu; unsigned instances=0;
   for (auto i:inner.getOps<InstanceOp>()) {
     ++instances;
-    if (i.getName()=="sim"&&i.getModuleName()=="GGHostMemoryPlatformWrapper") sim=i;
+    if (i.getName()=="sim"&&i.getModuleName()==
+        (print ? "GGPrintCPUStreamWriteResponseBufferWrapper" : "GGHostMemoryPlatformWrapper")) sim=i;
     if (i.getName()=="cpu_port"&&i.getModuleName()=="GGCPUStreamPortAdapter") cpu=i;
   }
   if (used||instances!=2||!sim||!cpu) return reject("FPGATop shell requires the unique CPU platform wrapper");
@@ -111,11 +125,19 @@ LogicalResult goldengate::assembleFPGATopShell(CircuitOp circuit,
     for (auto [i,p]:llvm::enumerate(instance.getPortNames()))
       if (cast<StringAttr>(p).getValue()==n) v=instance.getResult(i);
     auto p=inner.getPorts()[old.at(n)]; Value a=inner.getBodyBlock()->getArgument(old.at(n));
-    if (!v||v.getType()!=a.getType()||!a.hasOneUse()) return reject("platform port requires one exact child forwarding use");
+    if (!v||v.getType()!=a.getType()||!a.hasOneUse()||!v.hasOneUse())
+      return reject("platform port requires one exact child forwarding use");
     Value dest=p.direction==Direction::In?v:a,src=p.direction==Direction::In?a:v;
-    unsigned count=0;
-    for (auto c:inner.getOps<ConnectOp>()) count+=c.getDest()==dest&&c.getSrc()==src;
-    if (count!=1) return reject("platform port requires a unique direct child connection");
+    unsigned count=0; bool wrong=false;
+    // Inspect every driver, including strict connects, so a second driver
+    // cannot be concealed by the public argument's single forwarding use.
+    inner.walk([&](Operation *op) {
+      Value d,s;
+      if (auto c=dyn_cast<ConnectOp>(op)) {d=c.getDest();s=c.getSrc();}
+      else if (auto c=dyn_cast<StrictConnectOp>(op)) {d=c.getDest();s=c.getSrc();}
+      if (d==dest) {++count;wrong|=s!=src;}
+    });
+    if (count!=1||wrong) return reject("platform port requires a unique direct child connection");
   }
   unsigned hostClock=0,hostReset=0;
   for (auto a:raw) {

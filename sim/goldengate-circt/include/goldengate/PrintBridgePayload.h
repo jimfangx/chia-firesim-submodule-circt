@@ -329,4 +329,8 @@ mlir::LogicalResult mapPrintBridgeRocketCPUStreamWriteResponseBuffer(
 /// Atomic; preserve existing IR and CPU scalar targets, transfer copied ports.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamPort(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Assemble the five-port U250 shell around the expanded Print CPU platform.
+/// Requires FAME host identities; preserve all old IR and private targets.
+mlir::LogicalResult mapPrintBridgeRocketFPGATopShell(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

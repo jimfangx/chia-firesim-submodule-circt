@@ -2292,6 +2292,116 @@ void rocketControlMaster(Fixture &f, StringRef output, bool reverse, unsigned &r
   }
 }
 
+
+// This replay starts from a synthetic enabled-Print handoff plus actual Rocket
+// components. Seed the FAME identities explicitly in the TEST; the compiler
+// requires them and must not fabricate them from the host input port names.
+void rocketFPGATopShell(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
+  auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
+  auto original = named(f.circuit, "GGPrintCPUStreamPlatformWrapper");
+  auto missing = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFPGATopShell(f.circuit, error)) &&
+      dump(*f.root) == missing, "Print shell accepted missing FAME identities"); ++rejected;
+  SmallVector<Attribute> annos(f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+  for (auto [cls, n] : {std::pair<StringRef, StringRef>{goldengate::AnnotationClasses::HostClock, "hostClock"},
+                       {goldengate::AnnotationClasses::HostReset, "hostReset"}})
+    annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(cls)),
+        b.getNamedAttr("target", b.getStringAttr("~GGPrintCPUStreamPlatformWrapper|GGPrintCPUStreamPlatformWrapper>" + n))}));
+  SmallVector<Attribute> targets;
+  for (StringRef n : {"hostClock", "hostReset", "ctrl.aw.bits.addr", "mem_0.r.bits.data",
+                     "cpu_managed_axi4.r.bits.data", "other", "fased_pending_reads"})
+    targets.push_back(b.getStringAttr("~GGPrintCPUStreamPlatformWrapper|GGPrintCPUStreamPlatformWrapper>" + n));
+  annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.FPGATopTargets")),
+      b.getNamedAttr("nested", b.getDictionaryAttr({b.getNamedAttr("targets", b.getArrayAttr(targets))}))}));
+  f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annos));
+  SmallVector<FModuleOp> existing; SmallVector<SmallVector<Value>> arguments;
+  SmallVector<SmallVector<PortInfo>> priorPorts; SmallVector<Operation *> operations;
+  auto body = [](FModuleOp m) {
+    std::string text; llvm::raw_string_ostream out(text);
+    m->print(out, OpPrintingFlags().useLocalScope()); return text;
+  };
+  std::map<std::string, std::string> bodies;
+  for (auto m : f.circuit.getOps<FModuleOp>()) {
+    existing.push_back(m); priorPorts.push_back(m.getPorts()); bodies[m.getName().str()] = body(m);
+    arguments.emplace_back(m.getArguments().begin(), m.getArguments().end());
+    for (auto &op : m.getBodyBlock()->getOperations()) operations.push_back(&op);
+  }
+  for (unsigned bad = 0; bad < 15; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); auto top = named(c, original.getName());
+    auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> as(raw.begin(), raw.end());
+    if (bad == 0) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(), b.getStringAttr("FPGATop"), top.getConventionAttr(), ArrayRef<PortInfo>{});
+    } else if (bad == 1) c->removeAttr("rawAnnotations");
+    else if (bad == 2) c.setName("WrongTop");
+    else if (bad == 3) named(c, "GGPrintBridgeHostWrapper")->removeAttr("goldengate.printHostBindings");
+    else if (bad == 4) {as.push_back(as[as.size()-3]); c->setAttr("rawAnnotations", b.getArrayAttr(as));}
+    else if (bad == 5) {
+      NamedAttrList d(cast<DictionaryAttr>(as[as.size()-2])); d.set("target", b.getStringAttr("~Other|Other>reset"));
+      as[as.size()-2] = d.getDictionary(ctx); c->setAttr("rawAnnotations", b.getArrayAttr(as));
+    } else if (bad == 6) {
+      as.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::HostClockSource))}));
+      c->setAttr("rawAnnotations", b.getArrayAttr(as));
+    } else if (bad == 7) {
+      SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
+      names[port(top, "hostClock")] = b.getStringAttr("renamedClock"); top.setPortNames(names);
+    } else if (bad == 8) {
+      SmallVector<Attribute> types(top.getPortTypes().begin(), top.getPortTypes().end());
+      types[port(top, "cpu_managed_axi4")] = TypeAttr::get(UIntType::get(ctx, 512, false)); top.setPortTypes(types);
+    } else if (bad == 9) {
+      SmallVector<bool> dirs(top.getPortDirections().begin(), top.getPortDirections().end());
+      dirs[port(top, "other")] = false; top.setPortDirections(dirs);
+    } else if (bad == 10) {
+      b.setInsertionPointToEnd(top.getBodyBlock()); b.create<InstanceOp>(c.getLoc(), top, "alreadyUsed");
+    } else if (bad == 13 || bad == 14) {
+      SmallVector<Attribute> types(top.getPortTypes().begin(), top.getPortTypes().end());
+      Type diagnostic = bad == 13 ? Type(BundleType::get(ctx, {{b.getStringAttr("inputLeaf"), true, UIntType::get(ctx, 1, false)}}))
+                                  : Type(ClockType::get(ctx));
+      types[port(top, "other")] = TypeAttr::get(diagnostic); top.setPortTypes(types);
+    } else {
+      for (auto conn : top.getOps<ConnectOp>())
+        if (conn.getSrc() == top.getArguments()[port(top, "hostClock")]) {
+          if (bad == 11) conn.erase();
+          else {
+            // A competing driver does not use the public hostClock argument.
+            b.setInsertionPoint(conn);
+            auto clock = b.create<WireOp>(c.getLoc(), ClockType::get(ctx), "competingClock");
+            b.create<StrictConnectOp>(conn.getLoc(), conn.getDest(), clock.getResult());
+          }
+          break;
+        }
+    }
+    auto before = dump(*test);
+    require(failed(goldengate::mapPrintBridgeRocketFPGATopShell(c, error)) && !error.empty() && dump(*test) == before,
+        "Print FPGATop rejection " + std::to_string(bad) + " changed IR: " + error); ++rejected;
+  }
+  require(succeeded(goldengate::mapPrintBridgeRocketFPGATopShell(f.circuit, error)) && succeeded(verify(*f.root)), error);
+  for (auto [j, m] : llvm::enumerate(existing)) {
+    require(named(f.circuit, m.getName()) == m && body(m) == bodies.at(m.getName().str()), "Print shell changed prior module body/identity");
+    for (auto [p, arg] : llvm::enumerate(arguments[j])) {
+      auto info = m.getPorts()[p], old = priorPorts[j][p];
+      require(m.getArguments()[p] == arg && info.name == old.name && info.type == old.type && info.direction == old.direction &&
+          info.annotations == old.annotations && info.sym == old.sym, "Print shell changed prior metadata or SSA argument");
+    }
+  }
+  SmallVector<Operation *> live;
+  for (auto m : existing) for (auto &op : m.getBodyBlock()->getOperations()) live.push_back(&op);
+  require(live == operations, "Print shell replaced prior operations");
+  auto shell = named(f.circuit, "FPGATop"); child(shell, original);
+  require(shell.getNumPorts() == 5 && llvm::range_size(shell.getOps<InstanceOp>()) == 1 &&
+      llvm::range_size(shell.getOps<ConnectOp>()) == 5, "Print shell geometry");
+  require(f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations").size() == annos.size()+1, "Print shell annotation count");
+  auto before = dump(*f.root);
+  require(failed(goldengate::mapPrintBridgeRocketFPGATopShell(f.circuit, error)) && dump(*f.root) == before,
+      "repeated Print shell changed IR"); ++rejected;
+  if (!output.empty()) {
+    auto suffix = reverse ? ".rocket-fpga-top-shell-reverse.mlir" : ".rocket-fpga-top-shell.mlir";
+    std::error_code ec; llvm::raw_fd_ostream file((output + suffix).str(), ec);
+    require(!ec, "cannot write Print shell boundary"); f.root->print(file); file << '\n';
+  }
+}
+
 void rocketCPUStreamPort(Fixture &f, StringRef output, bool reverse, unsigned &rejected) {
   auto *ctx = f.circuit.getContext(); OpBuilder b(ctx); std::string error;
   auto original = named(f.circuit, f.circuit.getName());
@@ -5312,6 +5422,14 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-fpga-top-shell-boundary")) {
+      Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(f.root), "cannot parse expanded CPU platform boundary");
+      f.circuit = *f.root->getOps<CircuitOp>().begin(); unsigned rejected = 0;
+      rocketFPGATopShell(f, argv[3], StringRef(argv[1]).ends_with("-reverse"), rejected);
+      llvm::outs() << "PASS expanded Print FPGATop boundary and " << rejected << " atomic rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]).starts_with("--rocket-cpu-stream-platform-boundary")) {
       Fixture f(ctx); f.root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(f.root), "cannot parse expanded CPU B buffer boundary");

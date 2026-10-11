@@ -4490,3 +4490,78 @@ feedback passes CIRCT replacertl and required Verilator suites; these gates
 do not validate the expanded enabled-Print boundary. No manager verification
 step was started here. Shared recovery, clock-control and harness edits remain
 outside this checkpoint.
+
+## Expanded Print Rocket FPGATop shell (iteration 119)
+
+`mapPrintBridgeRocketFPGATopShell` validates the live Rocket Print allocation
+and composes the shared native shell around `GGPrintCPUStreamPlatformWrapper`.
+The shell retains its entire inner boundary and exposes only `clock`, `reset`,
+`ctrl`, `mem_0` and `cpu_managed_axi4`, with five direct aggregate connections.
+It adds no state, buffering, clock gating or target-cycle logic. The expanded
+profile permits passive data diagnostics to remain internal; hidden inputs,
+flipped diagnostic leaves and unrecognized clocks are rejected. The original
+profile retains its diagnostic name restrictions.
+
+The shared shell now requires one exact forwarding use on both the parent
+argument and child result, checks ordinary/strict drivers, and accepts valid
+strict scalar forwarding. This rejects an alternate child driver that does
+not increase the public argument's use count. FAME host clock/reset targets
+must identify the active inputs exactly once. Public targets transfer to the
+new shell (clock/reset renamed), private targets remain on the retained inner
+module, and one `HostClockSource` is produced on `~FPGATop|FPGATop>clock`.
+Clone staging verifies the result before publishing only the new shell, so all
+existing module, port, SSA and operation identities survive and rejection is
+atomic. Hierarchy analyses must be rebuilt after wrapping.
+
+The oracle is `FPGATop.scala`'s host clock annotation and direct flipped
+control/CPU and master memory IO, following `SimulationMapping` in
+`MidasTransforms.scala` and the host conventions in `FAMETransform.scala`.
+The expanded replay input comes from iteration 118 in both constructor orders.
+Its synthetic enabled-Print handoff lacks FAME host identities: the test
+explicitly supplies those two annotations and tests rejection without them.
+The compiler does not fabricate them. This is a boundary test, not evidence
+that enabled-Print production ingestion or runtime parity is complete.
+
+Reproduce with `goldengate-print-binding-test
+--rocket-fpga-top-shell-boundary[-reverse] INPUT OUTPUT_PREFIX`, then
+`PrintRocketFPGATopShellCompare.py --before INPUT --after OUTPUT --sfc GOLDEN
+--stub STUB --report-json REPORT`. Lower the emitted boundary-only stub with
+pinned `firtool --format=mlir STUB -o RTL`, and repeat the comparison with
+`--rtl RTL`. The stub contains the actual new shell and an opaque external
+child declaration; it is not a replacement simulator candidate.
+
+The exact immutable golden compared is:
+
+```text
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+The emitted FPGATop RTL matches all 121 external leaf names, widths and
+directions: clock/reset plus control (45), memory (37) and CPU (37). Both
+expanded orders retain all 299 prior module bodies, all 21 Print modules and
+93 private diagnostics, giving 300 modules with the new shell. The comparison
+checks all five native aggregate routes and the complete recursive annotation
+archive, including unique HostClockSource and private/public target probes.
+Both orders pass 17 atomic rejection checks and preserve existing IR identities.
+The shared shell test also covers valid strict scalar forwarding and competing
+strict drivers in both boundary profiles. Local module printing avoids repeated
+global printer-state construction during the large replay's body snapshots.
+
+Production compiler and focused test binaries build. The two CTests pass
+(2/2, 5.48 seconds). The original native Rocket replay produces five ports and
+1,677 annotations with all prior module bodies unchanged. Successful replay,
+comparison and lowering stderr logs are empty. Evidence and `compare.json`
+are under:
+
+```text
+sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration119-print-rocket-fpga-top-shell/
+```
+
+Next: compose this verified expanded boundary through shared F1Shim platform
+specialization, then collateral. Enabled-Print production integration and
+runtime parity remain pending; the immutable SFC fixture has Print disabled.
+Supplied iteration-118 CIRCT replacertl/Verilator gates pass, with the SFC
+UART-bearing runtime baseline still pending. Those gates do not validate this
+expanded Print path. No FireSim manager verification step was started here.
+Shared recovery, clock-control, harness and outer-plan changes are excluded
+from this checkpoint.

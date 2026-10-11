@@ -58,8 +58,8 @@ std::string path(FModuleOp m,Value v) {
   auto i=v.getDefiningOp<InstanceOp>();require(bool(i),"unknown root");
   return i.getName().str()+"."+i.getPortName(cast<OpResult>(v).getResultNumber()).str();
 }
-void check(CircuitOp c,unsigned oldCount) {
-  auto m=top(c,"FPGATop"),old=top(c,"GGCPUStreamPlatformWrapper");
+void check(CircuitOp c,unsigned oldCount,StringRef boundary="GGCPUStreamPlatformWrapper") {
+  auto m=top(c,"FPGATop"),old=top(c,boundary);
   require(c.getName()=="FPGATop"&&m.getNumPorts()==5,"public shell must have exactly five ports");
   unsigned instances=0;
   for(auto i:m.getOps<InstanceOp>()) {
@@ -90,10 +90,11 @@ void check(CircuitOp c,unsigned oldCount) {
   }
   require(clock==1&&reset==1,"unique FAME host identities");
 }
-void apply(CircuitOp c) {
+void apply(CircuitOp c,bool print=false) {
   auto count=c->getAttrOfType<ArrayAttr>("rawAnnotations").size();std::string error;
   std::map<std::string,std::string> bodies;for(auto m:c.getOps<FModuleOp>())bodies[m.getName().str()]=dump(m);
-  require(succeeded(goldengate::assembleFPGATopShell(c,error)),error);require(succeeded(verify(c)),"invalid shell IR");check(c,count);
+  auto boundary=print?"GGPrintCPUStreamPlatformWrapper":"GGCPUStreamPlatformWrapper";
+  require(succeeded(goldengate::attachFPGATopShell(c,boundary,error)),error);require(succeeded(verify(c)),"invalid shell IR");check(c,count,boundary);
   for(auto [n,s]:bodies)require(dump(top(c,n))==s,"old module body changed");
 }
 // Emit only the actual new wrapper and an external declaration for its child.
@@ -130,8 +131,43 @@ int main(int argc,char **argv) {
       if(mode==17||mode==18){for(auto conn:t.getOps<ConnectOp>())if(path(t,conn.getDest())=="sim.hostClock"){if(mode==17)conn.erase();else{b.setInsertionPoint(conn);b.create<ConnectOp>(conn.getLoc(),conn.getDest(),conn.getSrc());}break;}}
       auto s=dump(*test);require(failed(goldengate::assembleFPGATopShell(tc,error))&&!error.empty(),"invalid boundary accepted");require(s==dump(*test),"rejection mutated IR");
     }
+    // The expanded profile accepts additional passive payload diagnostics.
+    // Host annotations remain mandatory; no identities are synthesized.
+    auto expanded=fixture(ctx); auto ec=*expanded->getOps<CircuitOp>().begin();
+    auto source=dump(*expanded);
+    const std::pair<StringRef,StringRef> replacements[]{
+      {"GGCPUStreamPlatformWrapper","GGPrintCPUStreamPlatformWrapper"},
+      {"GGHostMemoryPlatformWrapper","GGPrintCPUStreamWriteResponseBufferWrapper"},
+      {"ctrl_diagnostic","payload_probe"}};
+    for(auto [from,to]:replacements) {
+      size_t pos=0;while((pos=source.find(from.str(),pos))!=std::string::npos){source.replace(pos,from.size(),to.str());pos+=to.size();}
+    }
+    expanded=parseSourceString<ModuleOp>(source,&ctx);require(bool(expanded),"expanded parse");
+    ec=*expanded->getOps<CircuitOp>().begin();
+    // A strict competing driver does not increase the public argument's use
+    // count, but must still reject both supported boundary profiles atomically.
+    for(bool print:{false,true}) {
+      auto test=print?OwningOpRef<ModuleOp>(cast<ModuleOp>(expanded->clone())):fixture(ctx);
+      auto tc=*test->getOps<CircuitOp>().begin();auto boundary=print?"GGPrintCPUStreamPlatformWrapper":"GGCPUStreamPlatformWrapper";
+      auto inner=top(tc,boundary);OpBuilder b(&ctx);
+      for(auto conn:inner.getOps<ConnectOp>())if(path(inner,conn.getDest())=="sim.hostClock") {
+        b.setInsertionPoint(conn);auto other=b.create<WireOp>(conn.getLoc(),ClockType::get(&ctx),"otherClock");
+        b.create<StrictConnectOp>(conn.getLoc(),conn.getDest(),other.getResult());break;
+      }
+      auto before=dump(*test);require(failed(goldengate::attachFPGATopShell(tc,boundary,error))&&before==dump(*test),"strict competing driver accepted or mutated IR");
+    }
+    // Exact forwarding via strict connects is also a supported input shape.
+    auto ei=top(ec,"GGPrintCPUStreamPlatformWrapper");OpBuilder eb(&ctx);
+    for(auto conn:llvm::make_early_inc_range(ei.getOps<ConnectOp>())) {
+      // Strict connects require passive types; AXI aggregates contain flips.
+      if(!isa<ClockType,UIntType>(conn.getDest().getType()))continue;
+      eb.setInsertionPoint(conn);eb.create<StrictConnectOp>(conn.getLoc(),conn.getDest(),conn.getSrc());conn.erase();
+    }
+    apply(ec,true);
+    auto ea=ec->getAttrOfType<ArrayAttr>("rawAnnotations");
+    require(cast<DictionaryAttr>(ea[5]).getAs<StringAttr>("target").getValue()=="~FPGATop|GGPrintCPUStreamPlatformWrapper>payload_probe","Print passive diagnostic target lost");
     auto s=dump(*root);require(failed(goldengate::assembleFPGATopShell(c,error)),"repeat accepted");require(s==dump(*root),"repeat mutated IR");
-    llvm::outs()<<"Five public identity bindings, retained private scalar/bundle/clock targets; HostClockSource added; 19 atomic rejections\n";
+    llvm::outs()<<"Five public identity bindings, retained private scalar/bundle/clock targets; HostClockSource added; 21 atomic rejections; expanded passive diagnostic profile\n";
     if(argc>=3) {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"real parse");auto rc=*real->getOps<CircuitOp>().begin();apply(rc);
       llvm::outs()<<"Real Rocket shell: 5 ports, "<<rc->getAttrOfType<ArrayAttr>("rawAnnotations").size()<<" annotations; old module bodies unchanged\n";

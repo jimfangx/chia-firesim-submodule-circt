@@ -9,6 +9,7 @@
 #include "goldengate/HostMemoryOutputBuffer.h"
 #include "goldengate/HostMemoryPort.h"
 #include "goldengate/CPUStreamPort.h"
+#include "goldengate/FPGATopShell.h"
 #include "goldengate/EmptyCPUStreamWrite.h"
 #include "goldengate/TracerVTokenEngine.h"
 #include "goldengate/ClockBridgeControl.h"
@@ -2056,6 +2057,30 @@ LogicalResult goldengate::mapPrintBridgeRocketCPUStreamPort(
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGPrintCPUStreamPlatformWrapper" || m.getName() == "GGCPUStreamPortAdapter")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Requires validated live Rocket Print allocation, expanded CPU platform and
+// explicit FAME host clock/reset identities. Consume no annotations; transfer
+// public targets and produce HostClockSource. Preserve private targets and all
+// existing IR identities. Rebuild hierarchy analyses after publishing the shell.
+// Output: five unchanged U250 interface types, one retained child, no new state.
+// Clone staging makes every unsupported boundary rejection atomic.
+LogicalResult goldengate::mapPrintBridgeRocketFPGATopShell(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachFPGATopShell(*staged, "GGPrintCPUStreamPlatformWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "Print FPGATop shell produced invalid FIRRTL IR"; return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "FPGATop")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
