@@ -234,20 +234,7 @@ void behavior(CircuitOp circuit) {
   llvm::outs()<<"6000 five-channel hierarchical SSA edges; accepted "<<pushes<<"/"<<pops<<", stalls "<<stalls<<", full "<<full<<", simultaneous "<<simultaneous<<", resets "<<resets<<"\n";
 }
 } // namespace
-int main(int argc,char **argv) {
-  try {
-    MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
-    auto root=fixture(ctx);auto circuit=*root->getOps<CircuitOp>().begin();
-    auto wrapper=top(circuit,"GGHostMemoryReadResponseWrapper");auto annotations=circuit->getAttr("rawAnnotations");
-    std::map<std::string,std::string> before;for(auto m:circuit.getOps<FModuleOp>())if(m!=wrapper)before[m.getName().str()]=dump(m);
-    require(succeeded(goldengate::addHostMemoryOutputBuffer(circuit,error)),error);
-    require(succeeded(verify(*root)),"invalid output buffer IR");
-    require(circuit->getAttr("rawAnnotations")==annotations&&wrapper.getNumPorts()==4,"top ports or annotations changed");
-    for(auto p:before)require(dump(top(circuit,p.first))==p.second,"existing inner module changed");
-    auto helper=top(circuit,"GGHostMemoryOutputBuffer");
-    require(std::distance(helper.getOps<InstanceOp>().begin(),helper.getOps<InstanceOp>().end())==5,"five queues missing");
-    queueEdges(circuit);behavior(circuit);
-    auto bindings=[&](FModuleOp t) {
+void bindings(FModuleOp t) {
       InstanceOp buffer;for(auto i:t.getOps<InstanceOp>())if(i.getName()=="host_memory_buffer")buffer=i;
       require(bool(buffer),"missing buffer instance");unsigned out=0,clock=0,reset=0;
       Value host;for(auto [i,p]:llvm::enumerate(t.getPorts()))if(p.name=="host_mem")host=t.getBodyBlock()->getArgument(i);
@@ -261,7 +248,29 @@ int main(int argc,char **argv) {
       for(auto f:t.getOps<SubfieldOp>())if(f.getInput()==buffer.getResult(2))++in[f.getFieldName().str()];
       require(out==1&&clock==1&&reset==1&&in.size()==5,"buffer boundary binding mismatch");
       for(auto n:{"aw","w","b","ar","r"})require(in[n]==1,"channel omitted or duplicated");
-    };
+    }
+int main(int argc,char **argv) {
+  try {
+    MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    if(argc==3 && StringRef(argv[1])=="--expanded-boundary") {
+      auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(root),"expanded boundary parse failed");
+      auto circuit=*root->getOps<CircuitOp>().begin();
+      require(succeeded(verify(*root)),"expanded boundary invalid");
+      bindings(top(circuit,"GGHostMemoryReadResponseWrapper"));
+      queueEdges(circuit);behavior(circuit);
+      llvm::outs()<<"PASS expanded Print buffer SSA, all queue states and five independent channels\n";
+      return 0;
+    }
+    auto root=fixture(ctx);auto circuit=*root->getOps<CircuitOp>().begin();
+    auto wrapper=top(circuit,"GGHostMemoryReadResponseWrapper");auto annotations=circuit->getAttr("rawAnnotations");
+    std::map<std::string,std::string> before;for(auto m:circuit.getOps<FModuleOp>())if(m!=wrapper)before[m.getName().str()]=dump(m);
+    require(succeeded(goldengate::addHostMemoryOutputBuffer(circuit,error)),error);
+    require(succeeded(verify(*root)),"invalid output buffer IR");
+    require(circuit->getAttr("rawAnnotations")==annotations&&wrapper.getNumPorts()==4,"top ports or annotations changed");
+    for(auto p:before)require(dump(top(circuit,p.first))==p.second,"existing inner module changed");
+    auto helper=top(circuit,"GGHostMemoryOutputBuffer");
+    require(std::distance(helper.getOps<InstanceOp>().begin(),helper.getOps<InstanceOp>().end())==5,"five queues missing");
+    queueEdges(circuit);behavior(circuit);
     bindings(wrapper);
     for(unsigned bad=0;bad<9;++bad) {
       auto test=fixture(ctx);auto c=*test->getOps<CircuitOp>().begin();auto t=top(c,"GGHostMemoryReadResponseWrapper");OpBuilder b(&ctx);

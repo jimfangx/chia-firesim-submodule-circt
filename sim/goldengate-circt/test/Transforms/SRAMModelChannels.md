@@ -3997,3 +3997,74 @@ and six port ABI checks match, all 279 prior module bodies remain unchanged,
 108 copied ports, 109 public ports and 117 routes match, and the R helper is
 identical to the native baseline. All five replay/comparison/semantic stderr
 logs are empty. The CIRCT port remains incomplete.
+
+### Iteration 111: expanded Print host memory output buffer
+
+`mapPrintBridgeRocketHostMemoryOutputBuffer` attaches FPGATop's final
+AXI4Buffer to the expanded Print/Rocket unified master. The shared CIRCT
+pass creates four queue definitions and five independent AW/W/B/AR/R
+instances; AW and AR share a definition but retain separate state. Requests
+flow toward host DRAM, while B and R flow toward the existing routers.
+Each queue has depth two, asynchronous RAM read, and neither flow nor pipe.
+Reset clears both pointers and occupancy; an accepted enqueue still writes
+RAM on a reset edge, matching Chisel Queue. The native preflight now counts
+both ordinary and strict clock/reset connects and rejects duplicate or
+conflicting drivers before mutation.
+
+The composition validates the recorded constructor/allocation and stages the
+shared pass on a clone. After FIRRTL verification it moves only the five new
+modules, adds the buffer instance and three connections, then redirects the
+five existing host channel subfields in place. It retains all prior module,
+port, SSA argument and top operation identities. The recursive annotation
+archive stays identical; no target retargeting or consumption is needed.
+The top remains `GGHostMemoryReadResponseWrapper` with 109 public ports,
+three instances and 120 connections; 280 other module bodies and all 21 Print
+modules remain unchanged.
+
+Exact immutable golden:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintRocketHostMemoryOutputBufferCompare.py` checks `AXI4Buffer`'s five
+queue instances and `Queue_22/23/24/26`'s payload ABI, two-entry geometry,
+handshake/RAM equations and sequential reset/pointer/occupancy updates.
+Payload widths are 64/73/7/72 bits for address/write/ack/read. The candidate's
+five helper definitions also match the native baseline
+`iteration81-print-rocket-fased-read-buffer/candidate/
+post-fame-host-memory-output-buffer.mlir` exactly.
+
+After sourcing the project environment, replay both iteration-110 Print
+R-response boundaries with `goldengate-print-binding-test
+--rocket-host-memory-output-buffer-boundary INPUT OUTPUT_PREFIX` and its
+`-reverse` variant. Each checks 24 malformed inputs plus repeated attachment,
+including all helper collisions, missing channels, wrong constructors/ports,
+extra host uses/instances and missing/duplicate/conflicting clock/reset
+bindings. Run `goldengate-host-memory-output-buffer-test
+--expanded-boundary OUTPUT` to interpret the candidate's emitted queue SSA:
+256 exhaustive state/handshake/reset cases, followed by 6,000 five-channel
+cycles with independent stalls and resets. Run the structured comparator
+with paired `--before`/`--after`, `--baseline`, `--sfc`, and `--report-json`.
+Mutable evidence is under
+`iteration111-print-rocket-host-memory-output-buffer/` in the generated tree.
+
+Next smallest step: compose the native `specializeHostMemoryPort` on this
+expanded boundary, compare the 34/64/16-bit `mem_0` interface and request ID
+zero extension/response ID trimming against SFC FPGATop. Production Print
+CLI/driver integration/runtime parity, general FAME1/FAME5, multiclock and
+the SFC UART-bearing baseline remain incomplete. Supplied iteration-110
+harness feedback passes CIRCT replacertl and required Verilator workloads;
+those gates do not establish runtime parity for this expanded Print change.
+No FireSim manager verification step was started by the implementation agent.
+Shared clock-control, recovery and harness edits remain outside this checkpoint.
+
+Validation: the compiler and Print/native host response/output-buffer test
+executables build. All three focused CTests pass in 12.99 seconds. Both
+expanded replays and all 25 atomic rejections per order pass. Each emitted
+candidate passes 256 exhaustive queue states (48 reset writes, 64 full states,
+32 read/write collisions) and 6,000 hierarchical five-channel SSA edges:
+17,380 enqueues, 17,147 dequeues, 8,350 stalled outputs, 6,765 full states,
+9,487 simultaneous transfers and 44 resets. The structured comparison passes
+136 SFC queue equations, 36 payload ABI checks, 12 sequential state-update
+checks and the five AXI4Buffer instance mappings. All 280 prior non-top bodies,
+109 top ports, 120 routes, five native helper definitions, 21 Print modules
+and the recursive archive match in both orders. FIRRTL verification passes;
+all six replay/semantic/comparison/CTest stderr logs are empty. Overall port
+completion is not claimed.

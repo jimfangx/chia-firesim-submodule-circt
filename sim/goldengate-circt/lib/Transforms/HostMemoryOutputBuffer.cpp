@@ -86,16 +86,19 @@ LogicalResult goldengate::addHostMemoryOutputBuffer(CircuitOp circuit,
     if(!index||fields[*index])return reject("duplicate host memory channel boundary");
     fields[*index]=f;++count;
   }
-  unsigned bindings=0,clocks=0,resets=0;
-  for(auto c:top.getOps<ConnectOp>()) {
+  unsigned bindings=0,clocks=0,resets=0,clockDrivers=0,resetDrivers=0;
+  for(auto &op:top.getBodyBlock()->getOperations()) {
+    if(!isa<ConnectOp,StrictConnectOp>(op))continue;
+    Value dest=op.getOperand(0),src=op.getOperand(1);
     for(unsigned j:{0u,1u,3u})
-      bindings+=fieldIs(c.getDest(),host,master.getElements()[j].name)&&fieldIs(c.getSrc(),sm,master.getElements()[j].name);
-    bindings+=fieldIs(c.getDest(),sm,"b")&&fieldIs(c.getSrc(),host,"b");
-    bindings+=c.getDest()==router.getResult(0)&&fieldIs(c.getSrc(),host,"r");
-    clocks+=c.getDest()==simPort("hostClock")&&c.getSrc()==top.getBodyBlock()->getArgument(*clock);
-    resets+=c.getDest()==simPort("hostReset")&&c.getSrc()==top.getBodyBlock()->getArgument(*reset);
+      bindings+=fieldIs(dest,host,master.getElements()[j].name)&&fieldIs(src,sm,master.getElements()[j].name);
+    bindings+=fieldIs(dest,sm,"b")&&fieldIs(src,host,"b");
+    bindings+=dest==router.getResult(0)&&fieldIs(src,host,"r");
+    clockDrivers+=dest==simPort("hostClock");resetDrivers+=dest==simPort("hostReset");
+    clocks+=dest==simPort("hostClock")&&src==top.getBodyBlock()->getArgument(*clock);
+    resets+=dest==simPort("hostReset")&&src==top.getBodyBlock()->getArgument(*reset);
   }
-  if(count!=5||bindings!=5||clocks!=1||resets!=1)
+  if(count!=5||bindings!=5||clocks!=1||resets!=1||clockDrivers!=1||resetDrivers!=1)
     return reject("host memory output buffer requires all five direct host bindings and sim clock/reset");
   // Rejections precede mutation. Buffer the unified master in place so
   // all pre-existing module and annotation identities remain unchanged.

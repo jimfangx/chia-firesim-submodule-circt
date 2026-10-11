@@ -6,6 +6,7 @@
 #include "goldengate/HostMemoryWriteResponses.h"
 #include "goldengate/HostMemoryReadArbiter.h"
 #include "goldengate/HostMemoryReadResponses.h"
+#include "goldengate/HostMemoryOutputBuffer.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/ControlErrorSlave.h"
@@ -1820,5 +1821,47 @@ LogicalResult goldengate::mapPrintBridgeRocketHostMemoryReadResponses(
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
+  return success();
+}
+
+// FPGATop's final AXI4Buffer applies to the unified Print/Rocket host master.
+// Stage the shared queue pass and verify the complete expanded circuit before
+// transferring new definitions. Keep live top arguments, channel subfields,
+// connections and the recursive annotation archive at their original identities.
+LogicalResult goldengate::mapPrintBridgeRocketHostMemoryOutputBuffer(
+    CircuitOp circuit, std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addHostMemoryOutputBuffer(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "Rocket Print host output buffer produced invalid FIRRTL IR";
+    return failure();
+  }
+  FModuleOp top, helper;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == circuit.getName()) top = m;
+  Value host, clock, reset;
+  for (auto [i, p] : llvm::enumerate(top.getPorts())) {
+    auto arg = top.getArguments()[i];
+    if (p.name == "host_mem") host = arg;
+    if (p.name == "hostClock") clock = arg;
+    if (p.name == "hostReset") reset = arg;
+  }
+  SmallVector<SubfieldOp> channels;
+  for (auto &use : host.getUses()) channels.push_back(cast<SubfieldOp>(use.getOwner()));
+  const StringRef definitions[]{"GGHostMemoryOutputBuffer", "GGHostMemoryAddressQueue2",
+      "GGHostMemoryWriteQueue2", "GGHostMemoryAckQueue2", "GGHostMemoryReadQueue2"};
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (llvm::is_contained(definitions, m.getName())) {
+        if (m.getName() == definitions[0]) helper = m;
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+      }
+  OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->begin()); auto loc = top.getLoc();
+  auto buffer = b.create<InstanceOp>(loc, helper, "host_memory_buffer");
+  b.create<StrictConnectOp>(loc, buffer.getResult(0), clock);
+  b.create<StrictConnectOp>(loc, buffer.getResult(1), reset);
+  b.create<ConnectOp>(loc, host, buffer.getResult(3));
+  for (auto field : channels) field->setOperand(0, buffer.getResult(2));
   return success();
 }

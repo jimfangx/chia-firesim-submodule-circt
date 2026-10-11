@@ -297,4 +297,8 @@ mlir::LogicalResult mapPrintBridgeRocketHostMemoryReadArbiter(
 /// Atomic; preserve consumed R targets and transfer copied ports and AW/W/B/AR.
 mlir::LogicalResult mapPrintBridgeRocketHostMemoryReadResponses(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Buffer the unified host master with five independent no-flow/no-pipe queues.
+/// Atomic; retain prior modules, top ports, SSA values and archived targets.
+mlir::LogicalResult mapPrintBridgeRocketHostMemoryOutputBuffer(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate
