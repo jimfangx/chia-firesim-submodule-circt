@@ -3924,3 +3924,76 @@ all 277 prior module bodies including 21 Print modules are unchanged,
 The helper is identical to the native baseline. Comparison and semantic
 stderr logs are empty. Existing shared clock-control, U250 recovery and
 harness edits are excluded from this checkpoint. The port remains incomplete.
+
+### Iteration 110: compose host R responses on the expanded Print boundary
+
+`mapPrintBridgeRocketHostMemoryReadResponses` attaches the shared CIRCT
+`HostMemoryReadResponses` pass to the expanded Print/LoadMem/FASED AW/W/B/AR
+boundary. It checks the recorded expanded allocation, stages and verifies
+IR, then moves only the new wrapper and router into the live circuit. Prior
+module, port and SSA argument identities remain intact. The native pass now
+counts both ordinary and strict connections for unique boundary/clock/reset
+validation and transfers whole retained AW/W/B/AR channel targets as well
+as their leaves. Consumed LoadMem R scalars, FASED R and original aggregate
+targets remain on the retained inner module.
+
+The new `GGHostMemoryReadResponseWrapper` has 109 ports: 108 copied ports and
+one complete five-channel host master. Its 117 connections forward the
+copied controls and Print interfaces, retain AW/W/B/AR, and route host R to
+LoadMem data/handshake or the four-bit FASED R channel. The router is
+combinational; ID16 selects LoadMem, IDs0..15 select FASED, and IDs17..31
+stall. Ready depends on the selected consumer independently of host valid.
+FASED ID truncates to four bits; payload is broadcast without valid gating.
+
+`MidasTransforms.scala`, `FAMETransform.scala`, `FPGATop.scala`'s AXI4Xbar
+and Rocket Chip `amba/axi4/Xbar.scala`'s fanout/ID trimming were reread.
+Exact immutable comparison artifact:
+
+```
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+`PrintRocketHostMemoryReadResponsesCompare.py` anchors ten `AXI4Xbar` R
+selection, ready, ID, data, status and last equations, and six port ABI
+checks. The C++ interpreter independently evaluates each emitted router's
+SSA for all 32 IDs, four statuses, both last/valid/consumer-ready values
+and four 64-bit payload patterns. The structured comparison checks all
+279 prior bodies (including 21 Print modules), typed ports, all routes,
+recursive archive transfer and equality with the native R helper.
+
+After sourcing the project environment, replay both iteration-109 boundaries
+with `goldengate-print-binding-test
+--rocket-host-memory-read-responses-boundary INPUT OUTPUT_PREFIX` and its
+`-reverse` variant. Each checks 25 atomic rejections, including malformed
+interfaces, constructor mismatch, collisions, missing AR/R/LoadMem data
+bindings, missing/duplicate sim and arbiter clock/reset (including mixed
+ordinary/strict duplicates), and repeated attachment. A nested probe checks
+15 copied, channel, consumed and aggregate targets. Run
+`goldengate-host-memory-read-responses-test --expanded-boundary OUTPUT` and
+then the structured comparison with `--before`, `--after`, `--baseline`,
+`--sfc` and `--report-json`. Native baseline:
+`iteration81-print-rocket-fased-read-buffer/candidate/
+post-fame-host-memory-read-responses.mlir`. Mutable evidence:
+`iteration110-print-rocket-host-memory-read-responses/`.
+
+Next smallest step: compose the existing five-channel host output buffer
+onto this expanded Print boundary and compare queue occupancy, reset,
+backpressure and payload stability against the SFC AXI4Buffer queues.
+Expanded Print production CLI/driver integration and runtime parity,
+general FAME1/FAME5, multiclock and the SFC UART baseline remain incomplete.
+Supplied iteration-109 harness feedback passes CIRCT replacertl and the
+required Verilator workloads; it does not establish runtime parity for this
+new expanded Print path. No FireSim manager verification gate was started
+by the implementation agent. Shared clock-control, U250 recovery and harness
+edits remain outside this checkpoint.
+
+Validation: the compiler and Print/native host read test executables build.
+All three focused CTests pass (native R/AR: 11.56 seconds; Print: 5.51 seconds).
+Both expanded replays, all 25 atomic rejections per order, and the nested
+15-target probes pass. Each emitted helper passes 8,192 exhaustive cases
+(65,536 leaf checks, including 3,840 unmatched-ID cases). FIRRTL verification
+and structured golden comparison pass in both orders: ten SFC R equations
+and six port ABI checks match, all 279 prior module bodies remain unchanged,
+108 copied ports, 109 public ports and 117 routes match, and the R helper is
+identical to the native baseline. All five replay/comparison/semantic stderr
+logs are empty. The CIRCT port remains incomplete.

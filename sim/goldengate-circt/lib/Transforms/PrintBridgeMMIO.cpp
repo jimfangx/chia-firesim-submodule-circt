@@ -5,6 +5,7 @@
 #include "goldengate/HostMemoryWriteArbiter.h"
 #include "goldengate/HostMemoryWriteResponses.h"
 #include "goldengate/HostMemoryReadArbiter.h"
+#include "goldengate/HostMemoryReadResponses.h"
 #include "goldengate/ClockBridgeControl.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/ControlErrorSlave.h"
@@ -1788,6 +1789,34 @@ LogicalResult goldengate::mapPrintBridgeRocketHostMemoryReadArbiter(
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGHostMemoryReadWrapper" ||
           m.getName() == "GGHostMemoryReadArbiter")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Complete the expanded Print host master with the shared AXI4Xbar R router.
+// Required: recorded allocation and uninstantiated AW/W/B/AR wrapper; the shared
+// pass validates constructor, types and unique scalar/aggregate connections.
+// Consume no annotations; preserve prior analyses/bodies and consumed R targets,
+// transfer copied ports and whole AW/W/B/AR targets in the recursive archive.
+// Stage and verify additions before committing; rejection preserves live SSA.
+LogicalResult goldengate::mapPrintBridgeRocketHostMemoryReadResponses(
+    CircuitOp circuit, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGHostMemoryReadWrapper")
+    return reject("Rocket Print host read responses require the AW/W/B/AR attachment");
+  if (!circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
+    return reject("Rocket Print host read responses require the annotation archive");
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(routeHostMemoryReadResponses(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("Rocket Print host read responses produced invalid FIRRTL IR");
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGHostMemoryReadResponseWrapper" ||
+          m.getName() == "GGHostMemoryReadResponseRouter")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

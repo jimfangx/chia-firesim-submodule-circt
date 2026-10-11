@@ -5,7 +5,7 @@
 //   and LoadMem R-data boundaries, unique two-instance AR-wrapper bindings.
 // Annotations consumed: none. Annotations produced: none.
 // IR mutations: add combinational R router; wrap and join all host AXI channels.
-//   Copied targets and AW/W/B/AR leaves transfer; consumed R and original
+//   Copied targets and whole AW/W/B/AR channels transfer; consumed R and original
 //   aggregate identities remain on retained inner modules.
 // Analyses required: constructor, port types/directions, local SSA connectivity.
 // Analyses preserved: existing bodies, annotation classes and bridge keys.
@@ -87,22 +87,23 @@ LogicalResult goldengate::routeHostMemoryReadResponses(CircuitOp circuit,
   unsigned awb=0,wb=0,bb=0,rb=0,ab=0,lrb=0,lvb=0,ldb=0,cb=0,rstb=0,acb=0,arstb=0,afb=0;
   if(sim&&arb&&arb.getNumResults()==5) {
     Value sm=simPort("fased_host_mem"),sw=simPort("host_mem_write");
-    for(auto c:inner.getOps<ConnectOp>()) {
-      awb+=fieldIs(c.getDest(),arg(inner,*host),"aw")&&fieldIs(c.getSrc(),sw,"aw");
-      wb+=fieldIs(c.getDest(),arg(inner,*host),"w")&&fieldIs(c.getSrc(),sw,"w");
-      bb+=fieldIs(c.getDest(),sw,"b")&&fieldIs(c.getSrc(),arg(inner,*host),"b");
-      rb+=fieldIs(c.getDest(),sm,"r")&&fieldIs(c.getSrc(),arg(inner,*mem),"r");
-      ab+=fieldIs(c.getDest(),arg(inner,*host),"ar")&&c.getSrc()==arb.getResult(4);
-      afb+=c.getDest()==arb.getResult(3)&&fieldIs(c.getSrc(),sm,"ar");
-      lrb+=c.getDest()==arg(inner,*lr)&&c.getSrc()==simPort("loadmem_mem_r_ready");
-      lvb+=c.getDest()==simPort("loadmem_mem_r_valid")&&c.getSrc()==arg(inner,*lv);
-      ldb+=c.getDest()==simPort("loadmem_mem_r_bits_data")&&c.getSrc()==arg(inner,*ld);
-      cb+=c.getDest()==simPort("hostClock")&&c.getSrc()==arg(inner,*clock);
-      rstb+=c.getDest()==simPort("hostReset")&&c.getSrc()==arg(inner,*reset);
-    }
-    for(auto c:inner.getOps<StrictConnectOp>()) {
-      acb+=c.getDest()==arb.getResult(0)&&c.getSrc()==arg(inner,*clock);
-      arstb+=c.getDest()==arb.getResult(1)&&c.getSrc()==arg(inner,*reset);
+    for(auto &op:inner.getBodyBlock()->getOperations()) {
+      if(!isa<ConnectOp,StrictConnectOp>(op))continue;
+      Value dest=op.getOperand(0),src=op.getOperand(1);
+      awb+=fieldIs(dest,arg(inner,*host),"aw")&&fieldIs(src,sw,"aw");
+      wb+=fieldIs(dest,arg(inner,*host),"w")&&fieldIs(src,sw,"w");
+      bb+=fieldIs(dest,sw,"b")&&fieldIs(src,arg(inner,*host),"b");
+      rb+=fieldIs(dest,sm,"r")&&fieldIs(src,arg(inner,*mem),"r");
+      ab+=fieldIs(dest,arg(inner,*host),"ar")&&src==arb.getResult(4);
+      afb+=dest==arb.getResult(3)&&fieldIs(src,sm,"ar");
+      lrb+=dest==arg(inner,*lr)&&src==simPort("loadmem_mem_r_ready");
+      lvb+=dest==simPort("loadmem_mem_r_valid")&&src==arg(inner,*lv);
+      ldb+=dest==simPort("loadmem_mem_r_bits_data")&&src==arg(inner,*ld);
+      cb+=dest==simPort("hostClock")&&src==arg(inner,*clock);
+      rstb+=dest==simPort("hostReset")&&src==arg(inner,*reset);
+
+      acb+=dest==arb.getResult(0)&&src==arg(inner,*clock);
+      arstb+=dest==arb.getResult(1)&&src==arg(inner,*reset);
     }
   }
   if(used||instances!=2||!sim||!arb||awb!=1||wb!=1||bb!=1||rb!=1||ab!=1||afb!=1||
@@ -153,8 +154,11 @@ LogicalResult goldengate::routeHostMemoryReadResponses(CircuitOp circuit,
       std::string suffix="|"+v.str();StringRef ref(suffix);
       if(ref.consume_front(mp)) {
         auto root=ref.take_front(ref.find_first_of(".[")).str();
-        bool preserved=ref.starts_with("host_mem.aw.")||ref.starts_with("host_mem.w.")||
-          ref.starts_with("host_mem.b.")||ref.starts_with("host_mem.ar.");
+        bool preserved=false;
+        for(auto channel:{"aw","w","b","ar"}) {
+          std::string prefix="host_mem."+std::string(channel);
+          preserved|=ref==prefix||ref.starts_with(prefix+".")||ref.starts_with(prefix+"[");
+        }
         if(copied.count(root)||preserved)suffix.replace(0,mp.size(),"|"+newName.str()+">");
       }
       return b.getStringAttr(np+suffix);

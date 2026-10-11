@@ -293,4 +293,8 @@ mlir::LogicalResult mapPrintBridgeRocketHostMemoryWriteResponses(
 /// Atomic; retain consumed AR targets, transfer R and join AW/W/B/AR targets.
 mlir::LogicalResult mapPrintBridgeRocketHostMemoryReadArbiter(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Route host R by LoadMem ID 16 / FASED IDs 0..15 and join all AXI channels.
+/// Atomic; preserve consumed R targets and transfer copied ports and AW/W/B/AR.
+mlir::LogicalResult mapPrintBridgeRocketHostMemoryReadResponses(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

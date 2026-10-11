@@ -90,7 +90,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
   circuit->setAttr("rawAnnotations",b.getArrayAttr(ann));
   require(succeeded(goldengate::addHostMemoryReadArbiter(circuit,error)),error);
   ann.clear();
-  for(auto n:{"diagnostic","loadmem_mem_r_ready","loadmem_mem_r_valid","loadmem_mem_r_bits_data","fased_host_mem.r.bits.id","fased_host_mem","host_mem.aw.bits.id","host_mem.ar.bits.id","host_mem","host_mem.b.bits.resp"})
+  for(auto n:{"diagnostic","loadmem_mem_r_ready","loadmem_mem_r_valid","loadmem_mem_r_bits_data","fased_host_mem.r.bits.id","fased_host_mem","host_mem.aw.bits.id","host_mem.ar.bits.id","host_mem","host_mem.b.bits.resp","host_mem.aw","host_mem.w","host_mem.b","host_mem.ar"})
     ann.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Target")),b.getNamedAttr("target",b.getStringAttr("~GGHostMemoryReadWrapper|GGHostMemoryReadWrapper>"+std::string(n)))}));
   circuit->setAttr("rawAnnotations",b.getArrayAttr(ann));return root;
 }
@@ -155,19 +155,25 @@ void rejected(MLIRContext &ctx,unsigned mode) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();
+    if(argc==3&&StringRef(argv[1])=="--expanded-boundary") {
+      auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);
+      require(bool(root),"cannot parse expanded Print R boundary");
+      require(succeeded(verify(*root)),"expanded boundary verifier");
+      auto c=*root->getOps<CircuitOp>().begin();compare(c);bindings(c);return 0;
+    }
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
     std::map<std::string,std::string> before;for(auto m:c.getOps<FModuleOp>())before[m.getName().str()]=dump(m);
     std::string error;require(succeeded(goldengate::routeHostMemoryReadResponses(c,error)),error);require(succeeded(verify(*root)),"IR verifier");
     for(auto [n,s]:before)require(dump(top(c,n))==s,"pre-existing module changed");
-    auto as=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(as.size()==10,"annotation count");
-    std::vector<std::string> refs{"diagnostic","loadmem_mem_r_ready","loadmem_mem_r_valid","loadmem_mem_r_bits_data","fased_host_mem.r.bits.id","fased_host_mem","host_mem.aw.bits.id","host_mem.ar.bits.id","host_mem","host_mem.b.bits.resp"};
-    for(unsigned i=0;i<10;++i) {
-      bool moved=i==0||i==6||i==7||i==9;
+    auto as=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(as.size()==14,"annotation count");
+    std::vector<std::string> refs{"diagnostic","loadmem_mem_r_ready","loadmem_mem_r_valid","loadmem_mem_r_bits_data","fased_host_mem.r.bits.id","fased_host_mem","host_mem.aw.bits.id","host_mem.ar.bits.id","host_mem","host_mem.b.bits.resp","host_mem.aw","host_mem.w","host_mem.b","host_mem.ar"};
+    for(unsigned i=0;i<14;++i) {
+      bool moved=i==0||i==6||i==7||i==9||i>=10;
       auto target=cast<DictionaryAttr>(as[i]).getAs<StringAttr>("target").getValue();
       require(target=="~GGHostMemoryReadResponseWrapper|"+std::string(moved?"GGHostMemoryReadResponseWrapper":"GGHostMemoryReadWrapper")+">"+refs[i],"target identity mismatch");
     }
     compare(c);bindings(c);for(unsigned i=0;i<11;++i)rejected(ctx,i);
-    llvm::outs()<<"Eleven atomic rejections, ten target identities and preserved inner bodies pass\n";
+    llvm::outs()<<"Eleven atomic rejections, fourteen target identities and preserved inner bodies pass\n";
     if(argc>=3) {
       auto realRoot=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(realRoot),"cannot parse real AR boundary");auto real=*realRoot->getOps<CircuitOp>().begin();
       // Snapshot one boundary; production comparison scans all old modules in
