@@ -6016,17 +6016,20 @@ int main(int argc, char **argv) {
     }
     if (argc == 3 && (StringRef(argv[1]) == "--selected-print-cpu-read-buffer" ||
                       StringRef(argv[1]) == "--selected-print-cpu-response-buffer" ||
-                      StringRef(argv[1]) == "--selected-print-cpu-write-response-buffer")) {
-      bool writeResponse = StringRef(argv[1]) == "--selected-print-cpu-write-response-buffer";
+                      StringRef(argv[1]) == "--selected-print-cpu-write-response-buffer" ||
+                      StringRef(argv[1]) == "--selected-print-cpu-port")) {
+      bool platform = StringRef(argv[1]) == "--selected-print-cpu-port";
+      bool writeResponse = platform || StringRef(argv[1]) == "--selected-print-cpu-write-response-buffer";
       bool response = StringRef(argv[1]) == "--selected-print-cpu-response-buffer";
-      const StringRef inner = writeResponse ? "GGSelectedPrintCPUStreamResponseBufferWrapper" : response ? "GGSelectedPrintCPUStreamReadBufferWrapper" :
+      const StringRef inner = platform ? "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" : writeResponse ? "GGSelectedPrintCPUStreamResponseBufferWrapper" : response ? "GGSelectedPrintCPUStreamReadBufferWrapper" :
                                         "GGSelectedPrintCPUStreamWriteBufferWrapper";
-      const StringRef outer = writeResponse ? "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" : response ? "GGSelectedPrintCPUStreamResponseBufferWrapper" :
+      const StringRef outer = platform ? "GGSelectedPrintCPUStreamPlatformWrapper" : writeResponse ? "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" : response ? "GGSelectedPrintCPUStreamResponseBufferWrapper" :
                                         "GGSelectedPrintCPUStreamReadBufferWrapper";
       const StringRef dataPort = writeResponse ? "cpu_stream_b_bits_id" : response ? "cpu_stream_r_bits_data" : "cpu_stream_ar_bits_addr";
       const StringRef validPort = writeResponse ? "cpu_stream_b_valid" : response ? "cpu_stream_r_valid" : "cpu_stream_ar_valid";
       auto map = [&](CircuitOp circuit, ArrayRef<FModuleOp> hosts, std::string &error) {
-        return writeResponse ? goldengate::mapPrintBridgeCPUStreamWriteResponseBuffer(circuit, hosts, error) :
+        return platform ? goldengate::mapPrintBridgeCPUStreamPort(circuit, hosts, error) :
+               writeResponse ? goldengate::mapPrintBridgeCPUStreamWriteResponseBuffer(circuit, hosts, error) :
                response ? goldengate::mapPrintBridgeCPUStreamResponseBuffer(circuit, hosts, error) :
                           goldengate::mapPrintBridgeCPUStreamReadBuffer(circuit, hosts, error);
       };
@@ -6045,7 +6048,7 @@ int main(int argc, char **argv) {
         std::string text; llvm::raw_string_ostream out(text);
         m->print(out, OpPrintingFlags().useLocalScope()); return text;
       };
-      for (unsigned bad = 0; bad < 12; ++bad) {
+      for (unsigned bad = 0; bad < (platform ? 18U : 12U); ++bad) {
         OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
         auto tc = *test->getOps<CircuitOp>().begin(); auto top = named(tc, inner);
         auto hs = hostsFor(tc);
@@ -6071,7 +6074,7 @@ int main(int argc, char **argv) {
           named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
         } else if (bad == 10) {
           named(tc, "GGEmptyCPUStreamWrite")->setAttr("goldengate.fromHostCPUStreamCount", b.getI32IntegerAttr(1));
-        } else {
+        } else if (bad == 11) {
           auto writer = named(tc, "GGEmptyCPUStreamWrite");
           for (auto conn : writer.getOps<StrictConnectOp>())
             if (conn.getDest() == writer.getBodyBlock()->getArgument(port(writer, "aw_ready"))) {
@@ -6079,6 +6082,27 @@ int main(int argc, char **argv) {
               conn->setOperand(1, b.create<ConstantOp>(conn.getLoc(), UIntType::get(&ctx, 1), APInt(1, 1)).getResult());
               break;
             }
+        }
+        if (bad == 12) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("GGCPUStreamPortAdapter"),
+              top.getConventionAttr(), ArrayRef<PortInfo>{});
+        } else if (bad == 13) {
+          SmallVector<Attribute> types(top.getPortTypes().begin(), top.getPortTypes().end());
+          types[port(top, dataPort)] = TypeAttr::get(UIntType::get(&ctx, 8));
+          top.setPortTypes(types);
+        } else if (bad == 14) {
+          SmallVector<bool> dirs(top.getPortDirections().begin(), top.getPortDirections().end());
+          dirs[port(top, validPort)] = false; top.setPortDirections(dirs);
+        } else if (bad == 15 || bad == 16) {
+          for (auto conn : top.getOps<StrictConnectOp>())
+            if (conn.getDest() == top.getBodyBlock()->getArgument(port(top, validPort))) {
+              if (bad == 15) conn.erase();
+              else { b.setInsertionPoint(conn); b.create<StrictConnectOp>(conn.getLoc(), conn.getDest(), conn.getSrc()); }
+              break;
+            }
+        } else if (bad == 17) {
+          named(tc, "GGCPUStreamRead")->setAttr("goldengate.streamAddressSpaceBits", b.getI32IntegerAttr(18));
         }
         auto before = dump(*test);
         require(failed(map(tc, hs, error)) &&
@@ -6112,14 +6136,14 @@ int main(int argc, char **argv) {
       auto probe = cast<DictionaryAttr>(updated[updated.size()-1]).getAs<DictionaryAttr>("nested").getAs<ArrayAttr>("targets");
       for (auto [i, n] : llvm::enumerate(probes))
         require(cast<StringAttr>(probe[i]).getValue() ==
-            ("~" + outer + "|" + (i < 2 ? inner : outer) + ">" + n).str(),
+            ("~" + outer + "|" + (i < 2 || (platform && n.starts_with("cpu_stream_")) ? inner : outer) + ">" + n).str(),
             "selected Print CPU buffer lost recursive copied/consumed target");
       require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), headerAfter, error)) &&
           headerAfter == headerBefore, "selected Print CPU buffer changed allocated driver collateral: " + error);
       auto before = dump(*source);
       require(failed(map(c, hostsFor(c), error)) &&
           dump(*source) == before, "selected Print CPU buffer repeat changed IR");
-      llvm::outs() << "PASS selected Print " << (writeResponse ? "B response" : response ? "R response" : "independent AR") << " queue and unchanged allocated headers, 13 atomic rejections, retained SSA/module identities and recursive targets\n";
+      llvm::outs() << "PASS selected Print " << (platform ? "AXI port adapter" : writeResponse ? "B response queue" : response ? "R response queue" : "independent AR queue") << " and unchanged allocated headers, " << (platform ? 19 : 13) << " atomic rejections, retained SSA/module identities and recursive targets\n";
       return 0;
     }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-cpu-write-buffer") {

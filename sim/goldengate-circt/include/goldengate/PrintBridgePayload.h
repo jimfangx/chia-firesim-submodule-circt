@@ -345,6 +345,11 @@ mlir::LogicalResult mapPrintBridgeCPUStreamResponseBuffer(
 mlir::LogicalResult mapPrintBridgeCPUStreamWriteResponseBuffer(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
+/// Expose selected buffered CPU streams as the U250 64/512/16 AXI slave.
+/// Validate live allocation; preserve all prior SSA and CPU scalar identities.
+mlir::LogicalResult mapPrintBridgeCPUStreamPort(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
 /// Attach an independent depth-two AR queue to the expanded CPU AW/W boundary.
 /// Atomic; retain existing identities and consumed AR targets.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamReadBuffer(

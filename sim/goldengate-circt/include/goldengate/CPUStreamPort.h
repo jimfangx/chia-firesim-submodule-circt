@@ -5,7 +5,7 @@
 namespace goldengate {
 mlir::LogicalResult assembleCPUStreamPort(circt::firrtl::CircuitOp circuit,
                                          std::string &error);
-/// Select the original memory platform or expanded Print B-buffer boundary.
+/// Select the original memory platform or selected/expanded Print B boundary.
 /// Validate its exact scalar forwarding before generating the shared AXI adapter.
 mlir::LogicalResult attachCPUStreamPort(circt::firrtl::CircuitOp circuit,
     llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error);

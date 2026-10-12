@@ -2227,6 +2227,39 @@ LogicalResult goldengate::mapPrintBridgeCPUStreamWriteResponseBuffer(CircuitOp c
   return success();
 }
 
+// Oracle: FPGATop.cpu_managed_axi4 <> AXI4Buffer. This combinational adapter
+// consumes the 25 buffered CPU scalars and preserves copied interfaces and
+// allocated headers. Stage/verify first; publish only the adapter and wrapper.
+// No annotations are consumed; rebuild hierarchy analyses after wrapping.
+LogicalResult goldengate::mapPrintBridgeCPUStreamPort(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintCPUStreamWriteResponseBufferWrapper") {
+    error = "selected Print CPU port requires the completed B buffer boundary";
+    return failure();
+  }
+  if (failed(validateCPUStreamAddressQueue(circuit, error))) return failure();
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamPort(*staged,
+          "GGSelectedPrintCPUStreamWriteResponseBufferWrapper",
+          "GGSelectedPrintCPUStreamPlatformWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print CPU port produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintCPUStreamPlatformWrapper" ||
+          m.getName() == "GGCPUStreamPortAdapter")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(

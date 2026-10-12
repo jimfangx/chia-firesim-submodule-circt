@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Oracle: FPGATop.cpuManagedAXI4NodeTuple and cpu_managed_axi4 IO <> node.out.
-// Required boundary: selected uninstantiated platform or expanded Print B
+// Required boundary: selected uninstantiated platform or selected/expanded Print B
 // wrapper. All 25 CPU scalars forward uniquely to the retained child or B queue.
 // Required engines: buffered outgoing CPU streams, zero incoming streams.
 // Mutation: aggregate 64/512/16 AXI4 slave plus combinational leaf adapter.
@@ -25,7 +25,8 @@ LogicalResult goldengate::assembleCPUStreamPort(CircuitOp circuit,
 
 LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
     StringRef oldName, StringRef newName, std::string &error) {
-  bool print = oldName == "GGPrintCPUStreamWriteResponseBufferWrapper";
+  bool selected = oldName == "GGSelectedPrintCPUStreamWriteResponseBufferWrapper";
+  bool print = selected || oldName == "GGPrintCPUStreamWriteResponseBufferWrapper";
   if (oldName != "GGHostMemoryPlatformWrapper" && !print) {
     error = "CPU stream platform adapter requires a supported selected boundary";
     return failure();
@@ -75,8 +76,8 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
       if(!found)return reject("CPU stream platform adapter requires exact U250 scalar widths/directions and no extra stream fields");
     }
   }
-  if(consumed.size()!=std::size(leaves)||!old.count("hostClock")||!old.count("hostReset")||!old.count("mem_0"))
-    return reject("CPU stream platform adapter requires all 25 CPU scalar fields and host memory/clock/reset");
+  if(consumed.size()!=std::size(leaves)||!old.count("hostClock")||!old.count("hostReset")||(!selected && !old.count("mem_0")))
+    return reject("CPU stream platform adapter requires all 25 CPU scalar fields, host clock/reset and profile memory");
   auto cp=inner.getPorts()[old.at("hostClock")],rp=inner.getPorts()[old.at("hostReset")];
   if(cp.type!=ClockType::get(ctx)||cp.direction!=Direction::In||rp.type!=uint(1)||rp.direction!=Direction::In)
     return reject("CPU stream platform adapter requires host clock/reset inputs");
@@ -85,7 +86,7 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
   for(auto i:inner.getOps<InstanceOp>()) {
     ++instances;
     if(i.getName()=="sim" && i.getModuleName()==(print ?
-        "GGPrintCPUStreamResponseBufferWrapper" : "GGHostMemoryReadResponseWrapper")) sim=i;
+        (selected ? "GGSelectedPrintCPUStreamResponseBufferWrapper" : "GGPrintCPUStreamResponseBufferWrapper") : "GGHostMemoryReadResponseWrapper")) sim=i;
     if(i.getName()==(print ? "bQueue" : "memory_port") &&
         i.getModuleName()==(print ? "GGCPUStreamBQueue2" : "GGHostMemoryPortAdapter")) companion=i;
   }

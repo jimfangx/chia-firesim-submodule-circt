@@ -147,8 +147,10 @@ int main(int argc,char **argv) {
         auto real=parseSourceFile<ModuleOp>(argv[i],&ctx);require(bool(real),"Print platform parse");
         auto rc=*real->getOps<CircuitOp>().begin();
         require(succeeded(verify(*real)),"Print platform invalid");
-        bindings(rc,"GGPrintCPUStreamPlatformWrapper","GGPrintCPUStreamWriteResponseBufferWrapper");behavior(rc);
-        llvm::outs()<<"PASS expanded Print platform identity wiring for every CPU payload bit: "<<argv[i]<<"\n";
+        bool selected = rc.getName() == "GGSelectedPrintCPUStreamPlatformWrapper";
+        bindings(rc, selected ? "GGSelectedPrintCPUStreamPlatformWrapper" : "GGPrintCPUStreamPlatformWrapper",
+                 selected ? "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" : "GGPrintCPUStreamWriteResponseBufferWrapper");behavior(rc);
+        llvm::outs()<<"PASS Print platform identity wiring for every CPU payload bit: "<<argv[i]<<"\n";
       }
       return 0;
     }

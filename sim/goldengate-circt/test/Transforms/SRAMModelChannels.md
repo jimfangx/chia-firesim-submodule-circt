@@ -5689,3 +5689,65 @@ fixture disables Print, so transport parity does not establish enabled-Print
 runtime parity. Host-memory/platform attachment and enabled-Print runtime remain
 pending. Next smallest step: attach the selected buffered CPU scalars to the
 native U250 aggregate AXI port adapter while preserving allocated collateral.
+
+
+## Iteration 139: selected Print CPU aggregate U250 AXI port
+
+Prior-iteration harness feedback reports CIRCT replacertl, Verilator bare,
+portable FAME and Rocket suites passing. The Rocket UART-bearing SFC baseline
+remains pending. No manager verification step or hardware command was started
+in this iteration.
+
+`--map-print-host-cpu-port` requires the selected B buffer boundary. The native
+composition adds `GGSelectedPrintCPUStreamPlatformWrapper` and the shared
+`GGCPUStreamPortAdapter` through FIRRTL operations. FPGATop.scala's
+`cpuManagedAXI4NodeTuple` and `cpu_managed_axi4 <> node.out` are the oracle:
+expose the U250 slave with address64/data512/ID16, forward 25 supported CPU
+leaves, and leave 12 unused AW/AR metadata and W data/last inputs without users.
+No state or protocol gating is added. The selected profile does not yet own a
+platform memory port; the expanded profile retains its existing memory-port
+requirement. Both still require the exact 25 scalar widths/directions, unique
+child/B-queue forwarding, outgoing allocation and one zero-sink writer.
+
+The selected composition validates preceding AW/AR queue geometry and live
+Print/count/TracerV driver allocation, stages and verifies on a clone, then
+publishes only the new wrapper and adapter. Every prior module, operation, SSA
+value and copied port retains identity. Consumed CPU scalar targets remain on
+the inner module; copied targets move outward, including nested annotation
+arrays/dictionaries and control bundle components. Both allocated-header
+emitters accept the new top and retain their live hierarchy, count/DMA and
+empty-writer checks. Hierarchy analyses must be rebuilt after wrapping.
+
+Mutable evidence: generated U250 `iteration139-print-cpu-port/`. The native
+compiler, Print binding, CPU header and CPU port targets build. Joint Print/
+TracerV and Print-only replays emit
+`{candidate,compatibility}/post-print-cpu-port.{mlir,sv}` and
+`post-print-cpu-port-all.json`. Print binding, CPU header and CPU port CTests
+pass (3/3); the CLI rejects a missing B stage before reading input files. Both
+focused selected composition tests use the preserved iteration-138 B handoffs
+and pass 19 atomic rejection cases, identical allocated headers, recursive
+target transfer and unchanged operation/module identities. The actual emitted
+adapters pass identity-driver checks for every payload bit, including R512,
+plus all 12 unused input fields. These checks inspect candidate FIRRTL
+operations and do not substitute for enabled-Print runtime verification.
+
+Exact immutable RTL artifact:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedCPUStreamPortCompare.py` matches FPGATop's 37-leaf ABI, all 25
+buffered identity routes and 12 unused inputs. Each emitted candidate SV has
+that exact CPU port ABI, and its adapter matches the native baseline module.
+Joint Print/TracerV retains 103 prior module bodies, 64 copied ports (65 public
+ports including the aggregate) and 90 wrapper connections. Print-only retains
+97 bodies, 72 copied ports (73 public ports) and 98 connections. All preceding
+module bodies and the complete recursively transferred annotation/analysis
+archive match. Full results are in `sfc-comparison.json`.
+
+Replay input is the primary immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected iteration-67 Print
+annotations and the native Rocket control catalog. Neither immutable fixture
+was modified. Intermediate outputs are compressed after comparison; the B and
+CPU-port MLIR and CPU-port SV handoffs used by tests remain raw. The fixture
+disables Print: shared transport parity does not establish enabled-Print
+runtime parity. Selected host-memory/platform integration remains pending.
+Next smallest step: bind the selected target memory channels to the native
+FASED host-memory boundary, preserving this CPU port and allocated collateral.
