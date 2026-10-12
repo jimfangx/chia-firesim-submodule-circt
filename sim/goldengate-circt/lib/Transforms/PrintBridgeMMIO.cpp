@@ -295,8 +295,11 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
   auto hosts = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
   auto bindings = top ? top->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings") : ArrayAttr{};
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
-  if (!hosts || hosts.empty() || !bindings || bindings.size() != hosts.size() + (rocket ? 7 : 1) ||
-      !regions || regions.size() != hosts.size() + (rocket ? 11 : 1))
+  bool tracerV = false;
+  if (top) for (auto port : top.getPorts()) tracerV |= port.name == "tracerv_ctrl";
+  unsigned selectedBanks = tracerV ? 2 : 1;
+  if (!hosts || hosts.empty() || !bindings || bindings.size() != hosts.size() + (rocket ? 7 : selectedBanks) ||
+      !regions || regions.size() != hosts.size() + (rocket ? 11 : selectedBanks))
     return reject("Print control responses require the complete selected or Rocket bank catalog");
   auto writes = [&]() -> ArrayAttr {
     for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == "GGControlWidgetWriteWrapper")
@@ -309,7 +312,16 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
   // Master/FASED/TSI/BlockDev exposed, as in the native platform pipeline.
   llvm::StringMap<StringAttr> expected;
   SmallVector<FModuleOp> printHosts;
+  SmallVector<ControlMMIOWidget> widgets;
   llvm::StringSet<> hostNames;
+  if (!rocket && tracerV) {
+    ControlMMIOWidget widget;
+    if (failed(deriveControlMMIOWidget(circuit, "TracerVBridgeModule_0", "GGTracerVMCRFile",
+            {"GGTracerVTriggerConfig"}, widget, error))) return failure();
+    if (widget.registerCount != 15) return reject("Print responses require fifteen live TracerV trigger words");
+    widgets.push_back(widget);
+    expected.try_emplace("TracerVBridgeModule_0", StringAttr::get(circuit.getContext(), "tracerv_ctrl"));
+  }
   for (auto attr : hosts) {
     auto row = dyn_cast<DictionaryAttr>(attr);
     auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};
@@ -317,13 +329,25 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
     if (!name || !port || name.getValue().empty() || port.getValue().empty() ||
         !expected.try_emplace(name.getValue(), port).second)
       return reject("Print control responses require unique complete Print identities");
-    if (rocket) {
-      auto hostName = row.getAs<StringAttr>("hostModule"); FModuleOp host;
-      if (hostName) for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == hostName) host = m;
-      if (!host || !hostNames.insert(host.getName()).second ||
-          name.getValue() != "PrintBridgeModule_" + std::to_string(printHosts.size()))
-        return reject("Rocket Print responses require instantiated constructor order");
-      printHosts.push_back(host);
+    auto hostName = row.getAs<StringAttr>("hostModule"); FModuleOp host;
+    if (hostName) for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == hostName) host = m;
+    InstanceOp instance;
+    for (auto i : bound.getOps<InstanceOp>()) if (i.getName() == name.getValue()) instance = i;
+    if (!host || !instance || instance.getModuleName() != host.getName() ||
+        !hostNames.insert(host.getName()).second ||
+        (rocket && name.getValue() != "PrintBridgeModule_" + std::to_string(printHosts.size())))
+      return reject("Print responses require the live instantiated host catalog");
+    printHosts.push_back(host);
+    if (!rocket) {
+      auto info = host->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+      auto config = info ? info.getAs<StringAttr>("configModule") : StringAttr{};
+      auto mcr = info ? info.getAs<StringAttr>("mcrModule") : StringAttr{};
+      if (!config || !mcr) return reject("Print responses require live configuration and MCR identities");
+      ControlMMIOWidget widget;
+      if (failed(deriveControlMMIOWidget(circuit, name.getValue(), mcr.getValue(),
+              {config.getValue()}, widget, error))) return failure();
+      if (widget.registerCount != 6) return reject("Print responses require six configuration words");
+      widgets.push_back(widget);
     }
   }
   if (!expected.try_emplace("CPUManagedStreamEngine_0",
@@ -337,23 +361,30 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
     for (auto [name, port] : early)
       if (!expected.try_emplace(name, StringAttr::get(circuit.getContext(), port)).second)
         return reject("Rocket Print response bank identity collides");
-    SmallVector<goldengate::ControlMMIOWidget> widgets;
-    SmallVector<goldengate::ControlMMIORegion> allocated;
-    if (failed(goldengate::allocateRocketControlMMIORegions(circuit, 25, printHosts,
+  }
+  SmallVector<ControlMMIORegion> allocated;
+  if (rocket) {
+    if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts,
             widgets, allocated, error))) return failure();
-    if (allocated.size() != regions.size()) return reject("Rocket response allocation count differs");
-    for (auto [i, region] : llvm::enumerate(allocated)) {
-      auto row = dyn_cast<DictionaryAttr>(regions[i]);
-      auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
-      auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr{};
-      auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr{};
-      auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr{};
-      if (!name || name != region.name || !start || !size || !slave ||
-          start.getValue().getBitWidth() > 64 || size.getValue().getBitWidth() > 64 ||
-          slave.getValue().getBitWidth() > 64 || start.getInt() != int64_t(region.start) ||
-          size.getInt() != int64_t(region.size) || slave.getInt() != int64_t(i))
-        return reject("Rocket response region differs from the live register allocation");
-    }
+  } else {
+    ControlMMIOWidget counts;
+    if (failed(deriveControlMMIOWidget(circuit, "CPUManagedStreamEngine_0", "GGCPUStreamMCRFile",
+            {"GGCPUStreamCountBank"}, counts, error))) return failure();
+    widgets.push_back(counts);
+    if (failed(allocateControlMMIORegions(25, widgets, allocated, error))) return failure();
+  }
+  if (allocated.size() != regions.size()) return reject("Print response allocation count differs");
+  for (auto [i, region] : llvm::enumerate(allocated)) {
+    auto row = dyn_cast<DictionaryAttr>(regions[i]);
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
+    auto start = row ? row.getAs<IntegerAttr>("start") : IntegerAttr{};
+    auto size = row ? row.getAs<IntegerAttr>("size") : IntegerAttr{};
+    auto slave = row ? row.getAs<IntegerAttr>("slave") : IntegerAttr{};
+    if (!name || name != region.name || !start || !size || !slave ||
+        start.getValue().getBitWidth() > 64 || size.getValue().getBitWidth() > 64 ||
+        slave.getValue().getBitWidth() > 64 || start.getInt() != int64_t(region.start) ||
+        size.getInt() != int64_t(region.size) || slave.getInt() != int64_t(i))
+      return reject("Print response region differs from the live register allocation");
   }
   for (auto attr : bindings) {
     auto row = dyn_cast<DictionaryAttr>(attr);
@@ -365,7 +396,7 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
     expected.erase(it);
   }
   if (!expected.empty()) return reject("Print control response bank is unbound");
-  if (rocket) {
+  {
     // Catalog equality is insufficient if both rows are stale. The response
     // slave must be the same slave already connected to the bank's AR port.
     auto path = [](Value value) -> std::string {
@@ -381,7 +412,7 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
     for (auto connect : top.getOps<ConnectOp>()) {
       auto dest = path(connect.getDest()), src = path(connect.getSrc());
       if (!dest.empty() && !src.empty() && !ar.try_emplace(dest, src).second)
-        return reject("Rocket responses require uniquely driven AR request banks");
+        return reject("Print responses require uniquely driven AR request banks");
     }
     for (auto attr : bindings) {
       auto row = cast<DictionaryAttr>(attr);
@@ -390,10 +421,10 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
       if (!slave || slave.getValue().getBitWidth() > 64 || slave.getInt() < 0 ||
           uint64_t(slave.getInt()) >= regions.size() ||
           cast<DictionaryAttr>(regions[slave.getInt()]).getAs<StringAttr>("name") != name)
-        return reject("Rocket response binding differs from its allocated slave identity");
+        return reject("Print response binding differs from its allocated slave identity");
       auto found = ar.find("sim." + port.getValue().str() + ".ar");
       if (found == ar.end() || found->second != "controlReadDispatch.slave_" + std::to_string(slave.getInt()) + "_ar")
-        return reject("Rocket response bank differs from its connected AR request slave");
+        return reject("Print response bank differs from its connected AR request slave");
     }
   }
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));

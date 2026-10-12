@@ -131,8 +131,10 @@ mlir::LogicalResult mapPrintBridgeTracerVControl(
 // address collateral remain separate boundaries. Fixed U250 Nasti widths.
 mlir::LogicalResult mapPrintBridgeControlDispatch(
     circt::firrtl::CircuitOp circuit, std::string &error);
-// Consume every selected bank's B/R response through the native NastiRouter
+// Consume every selected Print/count bank and optional live TracerV bank's
+// B/R response through the native NastiRouter
 // arbiters and 64-slot ID trackers. Input: GGControlReadDispatchWrapper.
+// Re-derive live register allocation and check connected AR slave identity.
 // Stage all four passes; MMIO master bundle and driver assembly follow later.
 mlir::LogicalResult mapPrintBridgeControlResponses(
     circt::firrtl::CircuitOp circuit, std::string &error);

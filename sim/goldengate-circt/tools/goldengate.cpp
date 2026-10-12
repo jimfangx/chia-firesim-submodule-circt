@@ -493,8 +493,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-tracerv requires --stop-after-print-host-binding");
   if (mapPrintHostTracerV && mapPrintHostCPUStreams && !mapPrintHostTracerVQueue)
     return fail("Print TracerV CPU allocation requires --map-print-host-tracerv-queue");
-  if (mapPrintHostTracerV && mapPrintHostResponses)
-    return fail("Print TracerV response assembly remains a separate compiler boundary");
+  if (mapPrintHostTracerV && mapPrintHostMaster)
+    return fail("Print TracerV allocated master collateral remains a separate compiler boundary");
   if (mapPrintHostCPUStreams && !stopAfterPrintHostBinding)
     return fail("--map-print-host-cpu-streams requires --stop-after-print-host-binding");
   if (mapPrintHostControl && !mapPrintHostCPUStreams)

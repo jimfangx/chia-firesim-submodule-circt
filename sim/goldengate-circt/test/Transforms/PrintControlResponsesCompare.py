@@ -55,8 +55,10 @@ def without_targets(value):
 
 
 def main():
-    evidence, golden = map(Path, sys.argv[1:])
-    candidate = evidence / "candidate"
+    evidence, golden = map(Path, sys.argv[1:3])
+    tracerv = len(sys.argv) == 4 and sys.argv[3] == "--tracerv"
+    candidate = evidence / ("production" if tracerv else "candidate")
+    banks = (["tracerv_ctrl"] if tracerv else []) + ["print_0_ctrl", "cpuStream_ctrl", "ctrl_error"]
     native = clean((candidate / "post-print-control-responses.sv").read_text())
     reference = clean(golden.read_text())
     _, router = module(reference, "NastiRouter")
@@ -86,7 +88,7 @@ def main():
     ):
         arb = instance(body, kind, name)
         inner = instance(body, "GGControlReadTrackerWrapper" if channel == "r" else "GGControlReadArbiterWrapper", "sim")
-        for i, bank in enumerate(("print_0_ctrl", "cpuStream_ctrl", "ctrl_error")):
+        for i, bank in enumerate(banks):
             prefix = f"{bank}_{channel}_"
             ap = f"in_{i}_"
             for field in ("ready", "valid", "bits_id") + (("bits_last",) if channel == "r" else ()):
@@ -104,15 +106,15 @@ def main():
                 assert equations(body)[f"ctrl_write_tracker_deq_{i}_tag"].strip() == arb[ap + "bits_id"]
                 for field in ("valid", "tag"):
                     assert wt[f"deq_{i}_{field}"] == w_inner[f"ctrl_write_tracker_deq_{i}_{field}"]
-            ref_index = i if i < 2 else 11
-            rp = f"io_slave_{ref_index}_{channel}_" if i < 2 else f"err_slave_io_{channel}_"
+            ref_index = i if bank != "ctrl_error" else 11
+            rp = f"io_slave_{ref_index}_{channel}_" if bank != "ctrl_error" else f"err_slave_io_{channel}_"
             names = {rp + "ready": "ready", rp + "valid": "valid"}
             if channel == "r":
                 names[rp + "bits_last"] = "last"
             expected = terms(rq[f"{queue}_queue_io_deq_{ref_index}_valid"], rq, names)
             # SFC has constant final-beat normal MCR responses. Its error
             # endpoint and this native general response boundary keep R.last.
-            specialized = actual - {"last"} if channel == "r" and i < 2 else actual
+            specialized = actual - {"last"} if channel == "r" and bank != "ctrl_error" else actual
             assert specialized == expected, f"{bank} retirement differs from SFC"
             assert rq[f"{queue}_queue_io_deq_{ref_index}_tag"].strip() == rp + "bits_id"
             retirement[f"{bank}.{channel}"] = sorted(actual)
@@ -130,13 +132,63 @@ def main():
     before = json.loads((candidate / "post-print-control-dispatch-all.json").read_text())
     after = json.loads((candidate / "post-print-control-responses-all.json").read_text())
     assert without_targets(before) == without_targets(after), "response mapping changed annotation classes/payload/order"
+    from PrintRocketMasterCompare import native_module
+    before_ir = (candidate / "post-print-control-dispatch.mlir").read_text()
+    retained = re.findall(r"firrtl.module @([^ (]+)", before_ir)
+    for name in retained:
+        assert native_module(before_ir, name) == native_module(mlir, name), f"response mapping changed {name}"
+    from PrintRocketResponsesCompare import wiring
+    read_nets = wiring(mlir, "GGControlReadArbiterWrapper", aggregate=True)
+    write_nets = wiring(mlir, "GGControlWriteArbiterWrapper", aggregate=True)
+    for i, bank in enumerate(banks):
+        for channel, nets, arbiter in (("r", read_nets, "readArbiter"), ("b", write_nets, "writeArbiter")):
+            ap = f"{arbiter}.in_{i}_"
+            bp = f"sim.ctrl_error_{channel}_" if bank == "ctrl_error" else f"sim.{bank}.{channel}."
+            bits = bp + ("bits_" if bank == "ctrl_error" else "bits.")
+            assert nets[bp + "ready"] == ap + "ready" and nets[ap + "valid"] == bp + "valid"
+            for field in ("resp", "id", "user") + (("data", "last") if channel == "r" else ()):
+                assert nets[ap + "bits_" + field] == bits + field, f"{bank} response {field} detached"
+    def transfer(value, old, new, copied):
+        if isinstance(value, str):
+            if value == '~' + old:
+                return '~' + new
+            if not value.startswith('~' + old + '|'):
+                return value
+            suffix = value[len(old) + 1:]
+            prefix = '|' + old + '>'
+            if suffix.startswith(prefix):
+                root = re.split(r'[.\[]', suffix[len(prefix):])[0]
+                survives = root in copied
+                if root in banks and old == 'GGControlReadTrackerWrapper':
+                    fields = suffix[len(prefix) + len(root):]
+                    survives = fields == '.b' or fields.startswith('.b.')
+                if survives:
+                    suffix = '|' + new + '>' + suffix[len(prefix):]
+            return '~' + new + suffix
+        if isinstance(value, list):
+            return [transfer(v, old, new, copied) for v in value]
+        if isinstance(value, dict):
+            return {k: transfer(v, old, new, copied) for k, v in value.items()}
+        return value
+    chain = ['GGControlReadDispatchWrapper', 'GGControlReadTrackerWrapper',
+             'GGControlReadArbiterWrapper', 'GGControlWriteArbiterWrapper', 'GGControlWriteTrackerWrapper']
+    transferred = before
+    for old, new in zip(chain, chain[1:]):
+        old_ports = set(re.findall(r'\b(?:in|out) %(\w+):', native_module(mlir, old).splitlines()[0]))
+        new_ports = set(re.findall(r'\b(?:in|out) %(\w+):', native_module(mlir, new).splitlines()[0]))
+        transferred = transfer(transferred, old, new, old_ports & new_ports)
+    assert transferred == after, 'response composition changed target identities'
+    clocks = lambda rows: [r for r in rows if r['class'] == 'midas.passes.ChannelClockInfoAnnotation']
+    assert clocks(before) == clocks(after), 'response composition changed analyzed clocks'
     report = {"golden": str(golden), "candidate": str(candidate / "post-print-control-responses.sv"),
               "retirement": retirement, "tracker_slots": 64, "tag_width": 12,
-              "enqueue_capacity_id_route_connected": True, "annotation_payloads_preserved": True,
+              "enqueue_capacity_id_route_connected": True, "retained_modules": len(retained),
+              "selected_banks": banks, "annotation_records": len(after),
+              "exact_target_transfer": True, "clock_map_preserved": True, "annotation_payloads_preserved": True,
               "reference_normal_r_last": 1, "reference_has_print_host": False,
               "reference_unused_route_storage_eliminated": True}
     (evidence / "control-responses-comparison.json").write_text(json.dumps(report, indent=2) + "\n")
-    print("PASS six Print/count/error retirement predicates, response IDs and tracker/arbiter connectivity versus SFC")
+    print(f"PASS {2 * len(banks)} selected B/R retirement predicates and IDs versus SFC; {len(retained)} modules unchanged")
 
 
 if __name__ == "__main__":

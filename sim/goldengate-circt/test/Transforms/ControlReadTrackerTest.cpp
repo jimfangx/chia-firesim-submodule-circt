@@ -289,9 +289,9 @@ void testCount(MLIRContext &ctx, unsigned count, bool noBindings, unsigned &tota
   auto before = dump(*root); require(failed(goldengate::addControlReadTracker(c, error)), "repeat accepted"); require(dump(*root) == before, "repeat mutated IR");
   total += cases;
 }
-void test(MLIRContext &ctx) {
+void test(MLIRContext &ctx, ArrayRef<unsigned> counts) {
   unsigned total = 0, rejected = 0;
-  for (unsigned count : {1U, 2U, 3U, 11U, 13U, 31U, 63U}) testCount(ctx, count, false, total);
+  for (unsigned count : counts) testCount(ctx, count, false, total);
   testCount(ctx, 3, true, total);
   std::string error;
   auto reject = [&](OwningOpRef<ModuleOp> r) {
@@ -307,10 +307,22 @@ void test(MLIRContext &ctx) {
     NamedAttrList row(cast<DictionaryAttr>(out[1])); row.erase(key); out[1] = row.getDictionary(&ctx);
     d->setAttr("goldengate.controlRegions", ArrayAttr::get(&ctx, out)); reject(std::move(r));
   }
-  llvm::outs() << "Control read tracker: " << total << " collision/retirement/reset cycles across 1,2,3,11,13,31,63 regions and empty bindings; wrapper final-beat wiring, targets and " << rejected + 8 << " atomic rejections passed\n";
+  llvm::outs() << "Control read tracker: " << total << " collision/retirement/reset cycles across";
+  for (unsigned count : counts) llvm::outs() << ' ' << count;
+  llvm::outs() << " regions and empty bindings; wrapper final-beat wiring, targets and " << rejected + 8 << " atomic rejections passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
+  SmallVector<unsigned> counts{1U, 2U, 3U, 11U, 13U, 31U, 63U};
+  if (argc != 1) {
+    unsigned count = 0;
+    if (argc != 3 || StringRef(argv[1]) != "--regions" ||
+        StringRef(argv[2]).getAsInteger(10, count) || !count || count > 63) {
+      llvm::errs() << "usage: goldengate-control-read-tracker-test [--regions 1..63]\n";
+      return 1;
+    }
+    counts.assign(1, count);
+  }
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { test(ctx); return 0; } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  try { test(ctx, counts); return 0; } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

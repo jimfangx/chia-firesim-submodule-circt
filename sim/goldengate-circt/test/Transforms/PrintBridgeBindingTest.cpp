@@ -212,7 +212,7 @@ struct Fixture {
     for (unsigned d = 0; d < 2; ++d) for (unsigned f = 0; f < fields; ++f)
       text += ", out %source" + std::to_string(d) + "_" + std::to_string(f) +
           ": !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: " + std::string(f == 2 ? "sint<5>" : f == 4 ? "uint<3>" : "uint<1>") + ">";
-    text += ", out %tracerv_stream: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<512>>, out %tracerv_stream_count: !firrtl.uint<13>, out %other: !firrtl.uint<8>) {} } }";
+    text += ", out %preceding_stream: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<512>>, out %preceding_stream_count: !firrtl.uint<13>, out %other: !firrtl.uint<8>) {} } }";
     root = parseSourceString<ModuleOp>(text, &ctx); require(bool(root), "fixture parse");
     circuit = *root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
     SmallVector<Attribute> raw;
@@ -327,7 +327,7 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
       header == lastHeader && dump(*f.root) == corruptIR, "Print decoder rejection not transactional");
   f.hosts[1]->setAttr("goldengate.printHost", info);
   require(f.circuit.getName() == wrapper.getName() && wrapper.getNumPorts() == 11 && dump(old) == oldText && succeeded(verify(*f.root)), "invalid binding or changed original top");
-  for (auto name : {"hostClock", "hostReset", "tracerv_stream", "tracerv_stream_count", "other"})
+  for (auto name : {"hostClock", "hostReset", "preceding_stream", "preceding_stream_count", "other"})
     require(wrapper.getPortType(port(wrapper, name)) == old.getPortType(port(old, name)), "lost nonprint port");
   auto target = child(wrapper, old); Interpreter sim(wrapper); std::mt19937_64 rng(15);
   unsigned evaluations = 0;
@@ -387,8 +387,8 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   auto before = dump(*f.root);
   require(failed(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)) && !error.empty() && dump(*f.root) == before, "repeated bind not atomic");
   require(succeeded(goldengate::mapPrintBridgeCPUStreams(f.circuit,
-      {{"TRACERVBRIDGEMODULE_0_to_cpu_stream", "tracerv_stream", 6144}},
-      {{"TRACERVBRIDGEMODULE_0_to_cpu_stream", "tracerv_stream_count", 13}}, error)) && succeeded(verify(*f.root)), error);
+      {{"TRACERVBRIDGEMODULE_0_to_cpu_stream", "preceding_stream", 6144}},
+      {{"TRACERVBRIDGEMODULE_0_to_cpu_stream", "preceding_stream_count", 13}}, error)) && succeeded(verify(*f.root)), error);
   auto read = named(f.circuit, "GGCPUStreamRead");
   auto allocations = read->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
   auto mmio = named(f.circuit, "GGCPUStreamCountBank")->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
@@ -5229,6 +5229,14 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       f.circuit.getBodyBlock()->push_back(m->clone());
     }
     auto original = named(f.circuit, "Top");
+    // This case attaches the actual TracerV queue/control pair, so restore
+    // its reserved names instead of the generic preceding-stream fixture.
+    SmallVector<Attribute> originalPorts(original.getPortNames().begin(), original.getPortNames().end());
+    for (auto &name : originalPorts) {
+      if (name == b.getStringAttr("preceding_stream")) name = b.getStringAttr("tracerv_stream");
+      if (name == b.getStringAttr("preceding_stream_count")) name = b.getStringAttr("tracerv_stream_count");
+    }
+    original.setPortNames(originalPorts);
     auto importedTop = named(f.circuit, queueTop.getName());
     // Preserve the five live Rocket bridge control endpoints while appending
     // Print and expanding the CPU stream engine. They share the final router.
@@ -5631,16 +5639,16 @@ void allocatedHeaders(MLIRContext &ctx, StringRef output) {
       for (auto [name, bits] : {std::make_pair("valid", 1U), std::make_pair("bits", 512U)})
         b.create<StrictConnectOp>(f.circuit.getLoc(), b.create<SubfieldOp>(f.circuit.getLoc(), enq, name),
             b.create<ConstantOp>(f.circuit.getLoc(), UIntType::get(&ctx, bits), APInt(bits, 0)));
-      b.create<ConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, "tracerv_stream")), q.getResult(3));
-      b.create<StrictConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, "tracerv_stream_count")), q.getResult(4));
+      b.create<ConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, "preceding_stream")), q.getResult(3));
+      b.create<StrictConnectOp>(f.circuit.getLoc(), original.getArgument(port(original, "preceding_stream_count")), q.getResult(4));
     }
     if (reverse) std::reverse(f.hosts.begin(), f.hosts.end());
     require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
     SmallVector<goldengate::CPUStreamSourcePort> earlier;
     SmallVector<goldengate::CPUStreamCountPort> earlierCounts;
     if (reverse) {
-      earlier.push_back({"TRACERVBRIDGEMODULE_0_to_cpu_stream", "tracerv_stream", 6144});
-      earlierCounts.push_back({"TRACERVBRIDGEMODULE_0_to_cpu_stream", "tracerv_stream_count", 13});
+      earlier.push_back({"TRACERVBRIDGEMODULE_0_to_cpu_stream", "preceding_stream", 6144});
+      earlierCounts.push_back({"TRACERVBRIDGEMODULE_0_to_cpu_stream", "preceding_stream_count", 13});
     }
     require(succeeded(goldengate::mapPrintBridgeCPUStreams(f.circuit, earlier, earlierCounts, error)), error);
     require(succeeded(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)), error);
@@ -5839,8 +5847,8 @@ void allocationRejections(MLIRContext &ctx) {
       SmallVector<Attribute> fewer(registers.begin(), registers.end() - 1);
       config->setAttr("goldengate.mmioRegisters", b.getArrayAttr(fewer));
     }
-    SmallVector<goldengate::CPUStreamSourcePort> sources{{"tracerv", "tracerv_stream", 6144}};
-    SmallVector<goldengate::CPUStreamCountPort> counts{{bad == 7 ? "wrong" : "tracerv", "tracerv_stream_count", 13}};
+    SmallVector<goldengate::CPUStreamSourcePort> sources{{"tracerv", "preceding_stream", 6144}};
+    SmallVector<goldengate::CPUStreamCountPort> counts{{bad == 7 ? "wrong" : "tracerv", "preceding_stream_count", 13}};
     auto before = dump(*f.root);
     require(failed(goldengate::mapPrintBridgeCPUStreams(f.circuit, sources, counts, error)) &&
         !error.empty() && dump(*f.root) == before,
@@ -6005,6 +6013,79 @@ int main(int argc, char **argv) {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
       nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
+    }
+    if (argc == 3 && StringRef(argv[1]) == "--print-tracerv-control-responses") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source), "cannot parse selected Print/TracerV request boundary");
+      auto original = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+      for (unsigned bad = 0; bad < 12; ++bad) {
+        OwningOpRef<CircuitOp> copy(cast<CircuitOp>(original->clone()));
+        auto c = *copy; auto top = named(c, c.getName());
+        auto bindings = top->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
+        if (bad <= 2) {
+          SmallVector<Attribute> rows(bindings.begin(), bindings.end());
+          NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+          if (bad == 0) rows.erase(rows.begin());
+          if (bad == 1) row.set("port", b.getStringAttr("print_0_ctrl"));
+          if (bad == 2) row.set("slave", b.getI32IntegerAttr(1));
+          if (bad != 0) rows[0] = row.getDictionary(&ctx);
+          auto stale = b.getArrayAttr(rows);
+          top->setAttr("goldengate.controlReadBindings", stale);
+          named(c, "GGControlWidgetWriteWrapper")->setAttr("goldengate.controlWriteBindings", stale);
+        }
+        if (bad == 3 || bad == 4) {
+          auto decoder = named(c, "GGControlAddressDecode");
+          auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+          SmallVector<Attribute> rows(regions.begin(), regions.end());
+          NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+          row.set(bad == 3 ? "start" : "size", b.getI64IntegerAttr(bad == 3 ? 4 : 32));
+          rows[0] = row.getDictionary(&ctx); decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(rows));
+        }
+        if (bad >= 5 && bad <= 7) {
+          ConnectOp trace, print;
+          for (auto op : top.getOps<ConnectOp>()) {
+            auto field = op.getDest().getDefiningOp<SubfieldOp>();
+            auto base = field ? field.getInput().getDefiningOp<InstanceOp>() : InstanceOp{};
+            if (!base || base.getName() != "sim" || field.getFieldName() != "ar") continue;
+            auto port = base.getPortNameStr(cast<OpResult>(field.getInput()).getResultNumber());
+            if (port == "tracerv_ctrl") trace = op;
+            if (port == "print_0_ctrl") print = op;
+          }
+          require(trace && print, "selected AR bank connections absent");
+          if (bad == 5) trace->setOperand(1, print.getSrc());
+          if (bad == 6) trace.erase();
+          if (bad == 7) { b.setInsertionPointAfter(trace); b.clone(*trace); }
+        }
+        if (bad == 8) named(c, "GGTracerVTriggerConfig")->removeAttr("goldengate.mmioRegisters");
+        if (bad == 9) c->removeAttr("rawAnnotations");
+        if (bad == 10) {
+          b.setInsertionPointToEnd(c.getBodyBlock());
+          b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGControlWriteTracker"),
+              ConventionAttr::get(&ctx, Convention::Internal), SmallVector<PortInfo>{});
+        }
+        if (bad == 11) {
+          auto bound = named(c, "GGPrintBridgeHostWrapper");
+          for (auto i : bound.getOps<InstanceOp>()) if (i.getName() == "PrintBridgeModule_0") {
+            i.setModuleNameAttr(FlatSymbolRefAttr::get(&ctx, "MissingPrintHost")); break;
+          }
+        }
+        auto before = dump(c); std::string error;
+        require(failed(goldengate::mapPrintBridgeControlResponses(c, error)) && !error.empty() && dump(c) == before,
+            "joint response mapping accepted/mutated malformed boundary " + std::to_string(bad));
+      }
+      auto retained = named(original, "GGTracerVBridgeControlWrapper"); auto before = dump(retained);
+      std::string error;
+      require(succeeded(goldengate::mapPrintBridgeControlResponses(original, error)) && succeeded(verify(*source)), error);
+      require(original.getName() == "GGControlWriteTrackerWrapper" && dump(retained) == before,
+          "joint responses changed existing TracerV transport");
+      auto arbiter = named(original, "GGControlReadArbiterWrapper");
+      require(arbiter->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings").size() == 3,
+          "joint responses lost a bank");
+      for (auto port : named(original, original.getName()).getPorts())
+        require(port.name != "tracerv_ctrl" && port.name != "print_0_ctrl" && port.name != "cpuStream_ctrl",
+            "selected B/R response bank remained exposed");
+      llvm::outs() << "PASS joint Print/TracerV/count B/R composition and twelve atomic rejections including stale AR wiring\n";
+      return 0;
     }
     if (argc == 3 && StringRef(argv[1]) == "--print-tracerv-control-dispatch") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);

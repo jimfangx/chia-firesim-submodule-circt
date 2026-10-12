@@ -5271,3 +5271,66 @@ fixture was edited. SFC has Print disabled: shared transport comparisons do
 not establish enabled-Print platform/runtime parity. No manager verification
 step was started. Next smallest step: assemble the joint B/R arbiters and ID
 trackers for these three banks, then attach the platform control master.
+
+## Iteration 132: live TracerV/Print/count B/R response assembly
+
+The iteration-131 harness passed CIRCT replacertl, Verilator bare smoke,
+90,141 portable checks and 90,805 Rocket checks; its SFC UART-bearing baseline
+remains pending. These baseline gates do not establish enabled-Print runtime.
+
+`--map-print-host-responses` now composes the selected live TracerV path with
+Print and CPU occupancy banks. The composer re-derives the fifteen TracerV
+trigger words, six Print configuration words and live CPU count allocation,
+then checks every decoder region and matching AW/W/AR bank identity against
+that allocation. It checks the actual AR slave connections even for selected
+composition, so equally stale read/write catalogs cannot redirect responses.
+The native read tracker, burst-locking R arbiter, B arbiter and write tracker
+consume the three banks plus the error endpoint. All four passes are staged
+and verified before committing new FIRRTL modules and annotation transfers.
+The joint master flag still rejects: its allocated Print header requires the
+next change to support the additional TracerV region.
+
+Evidence is in the mutable generated U250 directory
+`iteration132-print-tracerv-responses/`: the successful compiler replay,
+`production/post-print-control-responses.{mlir,sv}`, all annotations, focused
+native composition with twelve atomic rejection cases, and comparison reports.
+The focused cases cover missing/aliased banks, stale slave identities and
+region bounds, removed/swapped/duplicate AR drivers, missing register metadata,
+missing annotations, a late write-tracker collision, and a detached Print host.
+A fresh Print-only replay under `compatibility/` also passes the same response
+comparison. The broader native binding test passes after renaming its generic
+preceding stream fixture: it had used the reserved live `tracerv_stream` name
+without a TracerV control bank. The initial test failure is retained in
+`iteration132-ctest.log`; the corrected run is in `print-binding-final.log`.
+The actual Rocket queue/control fixture retains its reserved TracerV names.
+Its thirteen-bank catalog allocation passes both constructor orders and forty
+atomic rejections, recorded in `rocket-catalog.stdout.log`.
+The write tracker and both arbiters pass their full native CTest matrices.
+The broad read-tracker run was interrupted after 466.50 seconds, with its
+log preserved; it is not claimed as passing. `ControlReadTrackerTest.cpp`
+now accepts an optional `--regions N` while retaining the full default matrix
+and all malformed-boundary tests. The selected two- and three-bank runs retain
+1,500 randomized cycles, directed ID collisions/full-queue/reset/final-beat
+checks, empty bindings and atomic rejections; evidence is in
+`read-tracker-{2,3}.{stdout,stderr}.log`.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintControlResponsesCompare.py --tracerv` matches eight `NastiRouter`
+retirement predicates and response IDs, request acceptance/capacity/ID/route
+connections, both 64-slot reorder queues and 12-bit tags, and each bank's actual
+R/B payload/readiness/valid wiring. Normal SFC MCR R.last is optimized to one;
+the native general boundary retains it, as does the SFC error endpoint. The
+comparison checks all 84 retained module bodies, 1,713 ordered annotation
+payloads and exact recursive target transfers through four wrappers, and the
+unchanged analyzed clock map. The request comparison still matches its eight
+SFC handshake predicates and all three banks' existing request connections.
+
+Input is the primary immutable fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, with the selected Print
+annotations from iteration 67 and the native Rocket control catalog. Neither
+immutable fixture was edited. The recorded SFC has Print disabled; these shared
+transport comparisons do not establish enabled-Print platform/runtime parity.
+No manager verification step was started. Next smallest step: extend allocated
+Print header validation to the joint live register map, then attach the native
+platform control master and compare its addresses and stream indices.
