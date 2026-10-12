@@ -10,6 +10,7 @@
 #include "goldengate/TargetUtils.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/CPUManagedStreamHeader.h"
+#include "goldengate/TracerVHeader.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -162,8 +163,9 @@ LogicalResult goldengate::preparePrintBridgeDecoderHeader(CircuitOp circuit,
 // live queued hosts, matching control identities and the materialized registry.
 // Reads retained bridge constructors/clocks; consumes/produces no annotations.
 // InstanceGraph and SSA forwarding validate queue storage/count/DMA identity.
-// Preserves all IR and analyses; publish the Print/count text only after the
-// complete batch succeeds. Other Rocket bridge constructors remain separate.
+// Preserves all IR and analyses; publish Print/count and selected TracerV text
+// only after the complete batch succeeds. Rocket bridge constructors remain
+// separate because RocketDriverHeader already emits them.
 LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
     ArrayRef<FModuleOp> hosts, std::string &header, std::string &error) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
@@ -331,7 +333,11 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
   staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(raw));
   if (failed(prepareCPUManagedStreamHeader(*staged, error, rocket ?
           CPUStreamHeaderBoundary::Complete : CPUStreamHeaderBoundary::SelectedOutgoing))) return failure();
-  auto cpu = cast<DictionaryAttr>(staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back()).getAs<StringAttr>("body");
+  // The selected joint boundary owns the Trace driver too. Reuse its native
+  // emitter to validate the actual trigger-register SSA, constructor payload,
+  // analyzed clock and live queue before publishing any caller collateral.
+  if (tracerV && failed(prepareTracerVHeader(*staged, error))) return failure();
+  auto transportHeader = cast<DictionaryAttr>(staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back()).getAs<StringAttr>("body");
   std::string result; llvm::raw_string_ostream out(result);
   out << (rocket ? "// Rocket Print/count allocation" : "// Selected Print/count allocation")
       << "; include under the standard Golden Gate GET_* guards.\n"
@@ -349,6 +355,6 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
       out << "  /* " << field << " */ " << region->start + 4 * i << "ULL,\n";
     out << "}, " << slot << "U, args, " << streamIndices[slot] << "U).release());\n";
   }
-  out << "#endif // GET_BRIDGE_CONSTRUCTOR\n" << cpu.getValue(); out.flush();
+  out << "#endif // GET_BRIDGE_CONSTRUCTOR\n" << transportHeader.getValue(); out.flush();
   header = std::move(result); return success();
 }

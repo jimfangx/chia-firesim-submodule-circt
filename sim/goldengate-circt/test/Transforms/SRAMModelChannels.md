@@ -5387,3 +5387,55 @@ Print and the CPU stream engine; it still lacks an allocated TracerV driver
 constructor and full platform attachment. No manager verification step was
 started. Next smallest step: derive TracerV constructor collateral from this
 same joint live allocation, before attaching the complete platform wrapper.
+
+## Iteration 134: allocated TracerV constructor in joint Print collateral
+
+The iteration-133 harness passed CIRCT replacertl, Verilator bare smoke,
+90,141 portable checks and 90,805 Rocket checks. The SFC UART-bearing runtime
+baseline remains pending; these gates cover the baseline compiler path.
+
+`preparePrintBridgeAllocatedHeader` now composes the existing native TracerV
+header emitter with Print and CPU stream collateral for a selected joint
+control master. The emitter reads CIRCT FIRRTL operations and validates live
+instance paths, actual trigger-register reset/update/read SSA, constructor
+payload, analyzed rational clock, queue storage and ordered stream selectors.
+It runs on the existing scratch clone and publishes caller text only after
+the whole batch succeeds. Existing Rocket driver assembly continues to own its
+TracerV constructor, avoiding duplicate registration.
+
+Evidence is in the mutable generated U250 directory
+`iteration134-print-tracerv-collateral/`. Native compiler, binding and TracerV
+header targets build successfully. The focused binding test passes eleven
+atomic rejections, including changed traceEnable reset state, missing token
+engine constructor and missing Trace clockInfo. The default Print binding and
+TracerV header CTests pass. A fresh compiler replay emits
+`candidate/print-bridge-allocated.const.h` with one `tracerv_t` constructor,
+widget/stream index 0, fifteen addresses 0 through 56, queue depth 6,144,
+retirement width 1 and clock ratio 1:1. Print retains widget index 0, stream
+index 1, six addresses 64 through 84 and count address 100. All four emitted
+GET_* guards compile as C++20 against the actual FireSim driver headers,
+including the firechip TracerV header.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintAllocatedHeaderCompare.py --tracerv --tracerv-annotations ...` recovers
+all fifteen register names and word offsets from SFC executable assignments,
+including reset/write muxes and truncated words, and matches the emitted
+constructor. SFC queue depth, beat size, count permissions and DMA geometry
+also match. Selected TracerV base 0 versus SFC 256, and Print count 100 versus
+SFC Trace count 568, remain explicit catalog differences. The control-master
+comparison matches all 45 SFC control ports and preserves 92 preceding module
+bodies, copied ports and annotation identities.
+
+Exact immutable annotation and clock artifacts in the primary fixture:
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json`
+and `firechip.chip.FireSim.FireSimRocketConfig.firesimRationalClockBridge.freq-summary`
+in that same directory. TraceBundleWidths (1/40/32/64/40) and the three
+recorded 1:1 clock aliases match the constructor payload and clock record.
+The fixtures contain no generated C++ header; this is a structured comparison
+against their RTL, constructor annotation and frequency summary.
+
+Neither immutable fixture was edited. The SFC fixture disables Print, so this
+does not establish enabled-Print platform/runtime parity. No manager gate was
+started. Next smallest step: attach the selected joint control/stream boundary
+to the native platform wrapper and compare its external ports and allocation.

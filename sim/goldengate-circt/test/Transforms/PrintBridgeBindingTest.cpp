@@ -6035,7 +6035,12 @@ int main(int argc, char **argv) {
       require(header.find("}, 0U, args, 1U).release()") != std::string::npos &&
           header.find("524288ULL, 100ULL, 6144U, 64U)") != std::string::npos,
           "joint Print stream index or count address differs");
-      for (unsigned bad = 0; bad < 8; ++bad) {
+      require(header.find("registry.add_widget(new tracerv_t(") != std::string::npos &&
+          header.find(".initDone = 0") != std::string::npos &&
+          header.find(".triggerSelector = 56") != std::string::npos &&
+          header.find("},\n  0,\n  args,\n  0,\n  6144,\n  1,\n") != std::string::npos,
+          "joint Trace constructor differs from live MMIO/widget/stream allocation");
+      for (unsigned bad = 0; bad < 11; ++bad) {
         OwningOpRef<CircuitOp> copy(cast<CircuitOp>(c->clone())); auto test = *copy;
         if (bad < 3) {
           auto bank = named(test, "GGTracerVTriggerConfig");
@@ -6053,7 +6058,7 @@ int main(int argc, char **argv) {
           SmallVector<Attribute> rows(regs.begin(), regs.end()); NamedAttrList row(cast<DictionaryAttr>(rows[0]));
           row.set(bad == 3 ? "name" : "port", b.getStringAttr("detached_trace")); rows[0] = row.getDictionary(&ctx);
           transport->setAttr("goldengate.sourceStreams", b.getArrayAttr(rows));
-        } else {
+        } else if (bad < 8) {
           auto read = named(test, "GGControlReadDispatchWrapper");
           auto regs = read->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
           SmallVector<Attribute> rows(regs.begin(), regs.end()); NamedAttrList row(cast<DictionaryAttr>(rows[0]));
@@ -6061,13 +6066,36 @@ int main(int argc, char **argv) {
           else { row.set(bad == 6 ? "port" : "slave", bad == 6 ? Attribute(b.getStringAttr("print_0_ctrl")) : Attribute(b.getI32IntegerAttr(1))); rows[0] = row.getDictionary(&ctx); }
           read->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
           named(test, "GGControlWidgetWriteWrapper")->setAttr("goldengate.controlWriteBindings", b.getArrayAttr(rows));
+        } else if (bad == 8) {
+          // Allocation alone cannot detect changed executable trigger state.
+          for (auto reg : named(test, "GGTracerVTriggerConfig").getOps<RegResetOp>())
+            if (reg.getName() == "traceEnable") {
+              b.setInsertionPoint(reg);
+              auto zero = b.create<ConstantOp>(reg.getLoc(), UIntType::get(&ctx, 1), APInt(1, 0));
+              reg->setOperand(2, zero.getResult());
+              break;
+            }
+        } else if (bad == 9) {
+          named(test, "GGTracerVTokenEngine")->removeAttr("goldengate.bridgeConstructor");
+        } else {
+          auto annotations = test->getAttrOfType<ArrayAttr>("rawAnnotations");
+          SmallVector<Attribute> rows(annotations.begin(), annotations.end());
+          bool changed = false;
+          for (auto &attr : rows) {
+            auto row = dyn_cast<DictionaryAttr>(attr);
+            auto widget = row ? row.getAs<StringAttr>("widgetClass") : StringAttr{};
+            if (!widget || widget.getValue() != "firechip.goldengateimplementations.TracerVBridgeModule") continue;
+            NamedAttrList malformed(row); malformed.erase("clockInfo"); attr = malformed.getDictionary(&ctx); changed = true;
+          }
+          require(changed, "joint Trace clock annotation missing");
+          test->setAttr("rawAnnotations", b.getArrayAttr(rows));
         }
         auto saved = dump(test); std::string rejected = "preserve";
         require(failed(goldengate::preparePrintBridgeAllocatedHeader(test, hostsFor(test), rejected, error)) &&
             !error.empty() && rejected == "preserve" && dump(test) == saved,
             "joint allocated header accepted or mutated corruption " + std::to_string(bad));
       }
-      llvm::outs() << "PASS joint Print/TracerV allocated header, live addresses/stream index and eight atomic rejections\n";
+      llvm::outs() << "PASS joint Print/TracerV constructors, live addresses/stream index and eleven atomic rejections\n";
       return 0;
     }
     if (argc == 3 && StringRef(argv[1]) == "--print-tracerv-control-responses") {

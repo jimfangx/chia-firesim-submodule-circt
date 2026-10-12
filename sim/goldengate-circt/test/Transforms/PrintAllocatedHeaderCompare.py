@@ -7,13 +7,19 @@ compare its shared count-word and DMA geometry, recording that difference.
 """
 import json
 import re
-import sys
+import argparse
 from pathlib import Path
 from PrintControlResponsesCompare import clean, equations, module
 
 
-tracerv = '--tracerv' in sys.argv[1:]
-evidence, golden = (Path(arg).resolve() for arg in sys.argv[1:] if arg != '--tracerv')
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('evidence', type=Path)
+parser.add_argument('golden', type=Path)
+parser.add_argument('--tracerv', action='store_true')
+parser.add_argument('--tracerv-annotations', type=Path)
+options = parser.parse_args()
+tracerv = options.tracerv
+evidence, golden = options.evidence.resolve(), options.golden.resolve()
 candidate = evidence / 'candidate'
 header = (candidate / 'print-bridge-allocated.const.h').read_text()
 ir = (candidate / 'post-print-control-master.mlir').read_text()
@@ -51,6 +57,28 @@ top = equations(module(reference, 'FPGATop')[1])
 if tracerv:
     _, trace = module(reference, 'TracerVBridgeModule')
     assert set(map(int, re.findall(r'crFile_io_mcr_write_(\d+)_valid', trace))) == set(range(15))
+    # Widget.genConstructor uses the bank's byte offset order. Recover it
+    # from the immutable executable register assignments, including truncation.
+    trace_equations = equations(trace)
+    def expand_mux(text):
+        return re.sub(r'\b_GEN_\d+\b', lambda m: '(' + expand_mux(trace_equations[m[0]]) + ')', text)
+    trace_words = []
+    for name, rhs in re.findall(r'(\w+)\s*<=\s*([^;]+);', trace):
+        words = set(re.findall(r'crFile_io_mcr_write_(\d+)_bits', expand_mux(rhs)))
+        if words:
+            assert len(words) == 1
+            trace_words.append((name, words.pop()))
+    assert len(trace_words) == 15
+    trace_addresses = [(name, int(value)) for name, value in
+                       re.findall(r'^\s*\.(\w+) = (\d+),$', header, re.M)]
+    expected_trace = sorted(((name, 4 * int(word)) for name, word in trace_words), key=lambda r: r[1])
+    assert trace_addresses == expected_trace
+    assert header.count('registry.add_widget(new tracerv_t(') == 1
+    constructor = re.search(r'TRACERVBRIDGEMODULE_struct\{.*?\},\s*(\d+),\s*args,\s*(\d+),\s*(\d+),\s*(\d+),\s*ClockInfo\{"([^"]+)", (\d+)U, (\d+)U\}', header, re.S)
+    assert constructor
+    widget, stream, trace_depth, retire, clock, mult, div = constructor.groups()
+    assert tuple(map(int, (widget, stream, trace_depth, retire, mult, div))) == (0, 0, 6144, 1, 1, 1)
+    assert clock == 'uart_clock,clock_1000.0MHz,harnessbinder_clock,reference'
     for channel in ('aw', 'ar'):
         assert re.search(r"25'h100 <= io_master_" + channel + r"_bits_addr & io_master_" + channel + r"_bits_addr < 25'h140", router)
         assert top['TracerVBridgeModule_0_io_ctrl_' + channel + '_valid'].strip() == 'ctrlInterconnect_io_slaves_2_' + channel + '_valid'
@@ -66,6 +94,29 @@ report = {'golden': str(golden), 'candidate': str(candidate / 'print-bridge-allo
           'absolute_address_match': count == 568, 'reference_has_print_host': False}
 if tracerv:
     report.update(candidate_tracerv_address=0, golden_tracerv_address=256,
-                  tracerv_register_words=15, tracerv_region_bytes=64)
+                  tracerv_register_words=15, tracerv_region_bytes=64,
+                  tracerv_constructor=dict(register_addresses=trace_addresses, widget_index=int(widget),
+                      stream_index=int(stream), depth=int(trace_depth), retire_width=int(retire),
+                      clock=dict(name=clock, multiplier=int(mult), divisor=int(div))))
+if options.tracerv_annotations:
+    assert tracerv
+    annotations = options.tracerv_annotations.resolve()
+    bridges = [r for r in json.loads(annotations.read_text()) if
+               r.get('widgetClass') == 'firechip.goldengateimplementations.TracerVBridgeModule']
+    assert len(bridges) == 1
+    key = bridges[0]['widgetConstructorKey']
+    assert key['retireWidth'] == int(retire)
+    assert (key['iaddrWidth'], key['insnWidth'], key['causeWidth'], key['tvalWidth']) == (40, 32, 64, 40)
+    frequency = annotations.with_name(annotations.name.removesuffix('.anno.json') + '.firesimRationalClockBridge.freq-summary')
+    frequencies = re.findall(r'Output clock ([^,]+), requested: ([\d.]+) MHz, actual: ([\d.]+) MHz \(division of (\d+)\)', frequency.read_text())
+    assert len(frequencies) == 3
+    assert ','.join(row[0] for row in frequencies) + ',reference' == clock
+    assert all(requested == actual and int(division) == int(div) == int(mult) for _, requested, actual, division in frequencies)
+    report.update(golden_annotations=str(annotations), golden_frequency_summary=str(frequency),
+                  tracerv_constructor_payload_match=True, tracerv_clock_ratio_match=True)
 (evidence / 'allocated-header-comparison.json').write_text(json.dumps(report, indent=2) + '\n')
 print(f'PASS allocated six-word Print ABI and SFC CPU queue/count/DMA geometry; Print stream {index}, count address {count} versus 568 reflects different widget catalogs')
+if tracerv:
+    print('PASS one allocated TracerV constructor, fifteen SFC register offsets, widget/stream 0, depth 6144 and retirement width 1')
+if options.tracerv_annotations:
+    print('PASS immutable TraceBundleWidths constructor payload and rational-clock frequency summary')
