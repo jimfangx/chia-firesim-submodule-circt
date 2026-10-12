@@ -196,6 +196,8 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
   auto transport = live("GGCPUStreamRead");
   if (!bound || !decoder || !reads || !writes || !transport)
     return reject("allocated Print header requires unique live hosts, decoder and control/stream bindings");
+  bool tracerV = !rocket && llvm::any_of(reads.getPorts(),
+      [](const auto &p) { return p.name == "tracerv_ctrl"; });
   auto catalog = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
   auto readBindings = reads->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
   auto writeBindings = writes->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
@@ -203,7 +205,7 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
   auto sources = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
   if (!catalog || catalog.size() != hosts.size() || !readBindings || readBindings != writeBindings ||
       !actual || !sources || (rocket ? actual.size() != hosts.size() + 11 :
-          (readBindings.size() != hosts.size() + 1 || actual.size() != readBindings.size())))
+          (readBindings.size() != hosts.size() + 1 + tracerV || actual.size() != readBindings.size())))
     return reject("allocated Print header requires a complete matching Print/count catalog");
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<StringAttr> controlPorts;
@@ -262,7 +264,33 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
     // deriving a Print-only map would silently emit wrong driver addresses.
     SmallVector<ControlMMIOWidget> complete;
     if (failed(allocateRocketControlMMIORegions(circuit, 25, hosts, complete, regions, error))) return failure();
-  } else if (failed(allocateControlMMIORegions(25, widgets, regions, error))) return failure();
+  } else {
+    SmallVector<ControlMMIOWidget> complete;
+    if (tracerV) {
+      ControlMMIOWidget trace;
+      if (!live("GGTracerVMCRFile") || !live("GGTracerVTriggerConfig") ||
+          failed(deriveControlMMIOWidget(circuit, "TracerVBridgeModule_0", "GGTracerVMCRFile",
+              {"GGTracerVTriggerConfig"}, trace, error)) || trace.registerCount != 15)
+        return reject("allocated Print header requires the live fifteen-word TracerV bank");
+      unsigned matches = 0;
+      for (auto attr : sources) {
+        auto source = dyn_cast<DictionaryAttr>(attr);
+        if (source && source.getAs<StringAttr>("name") == "TRACERVBRIDGEMODULE_0_to_cpu_stream") {
+          if (source.getAs<StringAttr>("port") != "tracerv_stream")
+            return reject("allocated Print header TracerV stream differs from its live queue");
+          ++matches;
+        }
+      }
+      if (matches != 1) return reject("allocated Print header requires one live TracerV stream");
+      // SFC registers TracerV before Print. Stable size sorting determines
+      // regions; Print widget indices and stream indices remain independent.
+      complete.push_back(trace);
+      complete.append(widgets.begin(), widgets.end());
+      widgets.push_back(trace);
+      controlPorts.push_back(StringAttr::get(circuit.getContext(), "tracerv_ctrl"));
+    } else complete = widgets;
+    if (failed(allocateControlMMIORegions(25, complete, regions, error))) return failure();
+  }
   if (regions.size() != actual.size())
     return reject("allocated Print header region count differs from materialized allocation");
   for (auto [i, region] : llvm::enumerate(regions)) {
@@ -274,9 +302,9 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
       return reject("allocated Print header MMIO regions differ from materialized register allocation");
     unsigned matches = 0;
     auto widget = llvm::find_if(widgets, [&](const auto &w) { return w.name == region.name; });
-    // Native Rocket bridges are attached at later wrappers. Only the Print
-    // and count constructor bindings belong to this fragment, but validate
-    // every region against the complete materialized register registry above.
+    // Native Rocket bridges are attached at later wrappers. Check every
+    // selected bank, including TracerV, and validate all Rocket regions
+    // against the complete materialized register registry above.
     if (widget == widgets.end()) continue;
     for (auto attr : readBindings) {
       auto binding = dyn_cast<DictionaryAttr>(attr);

@@ -10,6 +10,7 @@ import re
 import sys
 from pathlib import Path
 from PrintControlResponsesCompare import clean, equations, instance, module, without_targets
+from PrintRocketMasterCompare import native_module
 
 
 def ports(header):
@@ -82,6 +83,11 @@ def main():
     old_name, new_name = 'GGControlWriteTrackerWrapper', 'GGControlMasterWrapper'
     # Annotation references name aggregate FIRRTL ports, before RTL flattening.
     master_mlir = (candidate / 'post-print-control-master.mlir').read_text()
+    prior_mlir = (candidate / 'post-print-control-responses.mlir').read_text()
+    retained = re.findall(r'^    firrtl.module @(\w+)\(', prior_mlir, re.M)
+    for name in retained:
+        assert native_module(prior_mlir, name) == native_module(master_mlir, name), f'master changed retained module {name}'
+    assert set(re.findall(r'^    firrtl.module @(\w+)\(', master_mlir, re.M)) - set(retained) == {'GGControlMasterWrapper'}
     ir_header = re.search(r'firrtl.module @GGControlMasterWrapper\((.*?)\)', master_mlir, re.S)
     assert ir_header, 'missing master FIRRTL port declarations'
     copied_roots = set(re.findall(r'\b(?:in|out|inout) %([\w]+):', ir_header[1])) - {'ctrl'}
@@ -110,10 +116,11 @@ def main():
     report = {'golden': str(golden), 'candidate': str(candidate / 'post-print-control-master.sv'),
               'control_ports': native_ctrl, 'master_connections': mapped,
               'copied_ports': len(copied), 'folded_constant_outputs': folded,
+              'retained_modules': len(retained),
               'annotation_targets_preserved': True,
               'reference_has_print_host': False}
     (evidence / 'control-master-comparison.json').write_text(json.dumps(report, indent=2) + '\n')
-    print('PASS all 45 SFC U250 control widths/directions and native master connections; copied ports and annotation targets preserved')
+    print(f'PASS all 45 SFC U250 control widths/directions and native master connections; {len(retained)} retained modules, copied ports and annotation targets preserved')
 
 
 if __name__ == '__main__':

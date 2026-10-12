@@ -6014,6 +6014,62 @@ int main(int argc, char **argv) {
     if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
       nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--print-tracerv-allocated-header") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source), "cannot parse joint Print/TracerV response boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error, header;
+      require(succeeded(goldengate::bindControlMaster(c, "GGControlWriteTrackerWrapper", error)) &&
+          succeeded(verify(*source)), error);
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      auto before = dump(*source);
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), header, error)) &&
+          dump(*source) == before, error);
+      for (unsigned word = 0; word < 6; ++word)
+        require(header.find(std::to_string(64 + 4 * word) + "ULL,") != std::string::npos,
+            "joint Print address differs from live decoder");
+      require(header.find("}, 0U, args, 1U).release()") != std::string::npos &&
+          header.find("524288ULL, 100ULL, 6144U, 64U)") != std::string::npos,
+          "joint Print stream index or count address differs");
+      for (unsigned bad = 0; bad < 8; ++bad) {
+        OwningOpRef<CircuitOp> copy(cast<CircuitOp>(c->clone())); auto test = *copy;
+        if (bad < 3) {
+          auto bank = named(test, "GGTracerVTriggerConfig");
+          auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+          if (bad == 0) bank->removeAttr("goldengate.mmioRegisters");
+          else {
+            SmallVector<Attribute> rows(regs.begin(), regs.end());
+            if (bad == 1) rows.pop_back();
+            else { NamedAttrList row(cast<DictionaryAttr>(rows[0])); row.set("offset", b.getI64IntegerAttr(4)); rows[0] = row.getDictionary(&ctx); }
+            bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+          }
+        } else if (bad < 5) {
+          auto transport = named(test, "GGCPUStreamRead");
+          auto regs = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+          SmallVector<Attribute> rows(regs.begin(), regs.end()); NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+          row.set(bad == 3 ? "name" : "port", b.getStringAttr("detached_trace")); rows[0] = row.getDictionary(&ctx);
+          transport->setAttr("goldengate.sourceStreams", b.getArrayAttr(rows));
+        } else {
+          auto read = named(test, "GGControlReadDispatchWrapper");
+          auto regs = read->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
+          SmallVector<Attribute> rows(regs.begin(), regs.end()); NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+          if (bad == 5) rows.erase(rows.begin());
+          else { row.set(bad == 6 ? "port" : "slave", bad == 6 ? Attribute(b.getStringAttr("print_0_ctrl")) : Attribute(b.getI32IntegerAttr(1))); rows[0] = row.getDictionary(&ctx); }
+          read->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
+          named(test, "GGControlWidgetWriteWrapper")->setAttr("goldengate.controlWriteBindings", b.getArrayAttr(rows));
+        }
+        auto saved = dump(test); std::string rejected = "preserve";
+        require(failed(goldengate::preparePrintBridgeAllocatedHeader(test, hostsFor(test), rejected, error)) &&
+            !error.empty() && rejected == "preserve" && dump(test) == saved,
+            "joint allocated header accepted or mutated corruption " + std::to_string(bad));
+      }
+      llvm::outs() << "PASS joint Print/TracerV allocated header, live addresses/stream index and eight atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--print-tracerv-control-responses") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source), "cannot parse selected Print/TracerV request boundary");

@@ -5334,3 +5334,56 @@ transport comparisons do not establish enabled-Print platform/runtime parity.
 No manager verification step was started. Next smallest step: extend allocated
 Print header validation to the joint live register map, then attach the native
 platform control master and compare its addresses and stream indices.
+
+## Iteration 133: joint TracerV/Print control master and allocated collateral
+
+The iteration-132 harness passed CIRCT replacertl, Verilator bare smoke,
+90,141 portable checks and 90,805 Rocket checks. Its SFC UART-bearing baseline
+remains pending; these baseline gates do not establish enabled-Print runtime.
+
+`--map-print-host-master` now accepts the live selected TracerV/Print/count
+pipeline and attaches the native `GGControlMasterWrapper` through the existing
+CIRCT FIRRTL control-master pass. Allocated-header preparation re-derives
+TracerV's fifteen-word bank and validates its live stream identity and matching
+read/write binding along with Print and CPU count banks. It uses the Scala
+`Widget.scala` registration order and stable descending region-size allocation;
+Print constructor indices remain independent of CPU stream order. The resulting
+map has TracerV at byte 0 (64 bytes), Print at 64 (32 bytes), and CPU counts at
+96 (8 bytes). The Print constructor uses widget index 0 and stream index 1,
+six MMIO addresses 64 through 84, DMA base 524,288 and count address 100.
+Header generation preserves IR and existing platform collateral.
+
+Evidence is in the mutable generated U250 directory
+`iteration133-print-tracerv-master/`. Native compiler and binding-test builds
+pass. `goldengate-print-binding-test --print-tracerv-allocated-header` consumes
+the iteration-132 response MLIR, verifies the newly bound control master and
+read-only header generation, and passes eight atomic rejections: missing,
+truncated or duplicate-offset Trace registers; changed Trace stream name or
+port; removed control binding; aliased port; and stale slave identity. The
+default `goldengate-print-binding` CTest passes as well. A fresh compiler replay
+produces `candidate/post-print-control-master.{mlir,sv}` and
+`candidate/print-bridge-allocated.const.h`. That header compiles as C++17 against
+the actual FireSim driver headers under all four emitted GET_* guards.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintControlMasterCompare.py` matches all 45 SFC `FPGATop` control-port
+widths/directions and all corresponding native master-to-router connections;
+all 92 preceding FIRRTL module bodies, copied ports and recursively retargeted
+annotation payloads stay unchanged. `PrintAllocatedHeaderCompare.py --tracerv`
+matches the SFC fifteen-word Trace bank and 64-byte region, and CPU queue depth
+6,144, 512-bit beat, read-only 32-bit count word and 524,288-byte DMA window.
+Absolute addresses differ explicitly: selected Trace 0 versus SFC 256, and
+Print count 100 versus SFC Trace count 568, due to their different widget
+catalogs. Fresh Print-only compatibility replay passes both comparisons
+(86 retained modules, stream 0, count address 32).
+
+Input is the primary immutable fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, iteration-67 selected Print
+annotations and the native Rocket control catalog. Neither immutable fixture
+was edited. The SFC fixture disables Print; shared ABI comparisons do not
+establish enabled-Print platform/runtime parity. The emitted fragment constructs
+Print and the CPU stream engine; it still lacks an allocated TracerV driver
+constructor and full platform attachment. No manager verification step was
+started. Next smallest step: derive TracerV constructor collateral from this
+same joint live allocation, before attaching the complete platform wrapper.
