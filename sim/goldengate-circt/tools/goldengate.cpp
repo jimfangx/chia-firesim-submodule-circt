@@ -45,6 +45,8 @@
 #include "goldengate/GlobalResetWiring.h"
 #include "goldengate/HostClockWiring.h"
 #include "goldengate/BridgeAnalysis.h"
+#include "goldengate/ControlCatalog.h"
+#include "mlir/Parser/Parser.h"
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/ChannelClockInfo.h"
 #include "goldengate/CombDependencyAnalysis.h"
@@ -387,7 +389,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master]]]]] "
+                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -400,6 +402,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostControl = false;
   bool mapPrintHostResponses = false;
   bool mapPrintHostMaster = false;
+  llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
     bool baseSeen = false, depthSeen = false, triggersSeen = false;
@@ -446,6 +449,10 @@ int main(int argc, char **argv) {
         if (baseSeen) return fail("duplicate --output-filename-base");
         baseSeen = true;
         outputBase = value;
+      } else if (option == "--print-rocket-control-catalog") {
+        if (!printRocketControlCatalog.empty() || value.empty())
+          return fail("--print-rocket-control-catalog requires one nonempty path");
+        printRocketControlCatalog = value;
       } else if (option == "--ila-depth" || option == "--ila-probe-triggers") {
         bool &seen = option == "--ila-depth" ? depthSeen : triggersSeen;
         unsigned count = 0;
@@ -458,6 +465,8 @@ int main(int argc, char **argv) {
       }
     }
   }
+  if (!printRocketControlCatalog.empty() && !stopAfterPrintHostBinding)
+    return fail("--print-rocket-control-catalog requires --stop-after-print-host-binding");
   if (mapPrintHostCPUStreams && !stopAfterPrintHostBinding)
     return fail("--map-print-host-cpu-streams requires --stop-after-print-host-binding");
   if (mapPrintHostControl && !mapPrintHostCPUStreams)
@@ -532,6 +541,16 @@ int main(int argc, char **argv) {
     if (bindPrintHostConstructors) {
       if (failed(goldengate::bindPrintBridgeHosts(circuit, hosts, error)))
         return fail("PrintBridge post-FAME host binding: " + error);
+      if (!printRocketControlCatalog.empty()) {
+        auto catalog = mlir::parseSourceFile<mlir::ModuleOp>(printRocketControlCatalog, &context);
+        if (!catalog || std::distance(catalog->getOps<CircuitOp>().begin(),
+                                     catalog->getOps<CircuitOp>().end()) != 1)
+          return fail("Print Rocket control catalog must contain one CIRCT FIRRTL circuit");
+        auto source = *catalog->getOps<CircuitOp>().begin();
+        if (failed(goldengate::importRocketControlCatalog(circuit, source, error)))
+          return fail("Print Rocket control catalog import: " + error);
+        llvm::outs() << "Imported native Rocket register-bank dependency closure for Print host assembly\n";
+      }
       if (failed(mlir::verify(*module)))
         return fail("PrintBridge host binding produced invalid FIRRTL IR");
       std::string printHeader;

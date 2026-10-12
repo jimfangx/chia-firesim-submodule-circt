@@ -4909,3 +4909,83 @@ import in the enabled-Print production assembly, retain the Print synthesis
 clock map through FAME/host binding, then call the complete driver transaction.
 Enabled-Print production runtime and the SFC UART-bearing differential remain
 pending; the overall compiler migration is incomplete.
+
+### Production native control catalog ingestion (iteration 125)
+
+`ControlCatalog` ports the host-definition linking part of the Scala
+`SimulationMapping`/`PreLinkRenaming` boundary into CIRCT FIRRTL operations.
+The generic import checks explicit roots, their complete instance dependency
+closures, shared definitions, recursion and symbol collisions. A private
+verified candidate is committed by moving only new definitions, preserving
+the active top and existing operation handles. Private helpers receive the
+`CatalogRocket_` namespace; compatible physical blackbox declarations are
+reused even when their CIRCT symbols differ. Unrelated parameterized external
+declarations remain intact. Source hardware and annotations never change;
+failure leaves the destination intact.
+
+The production `--compile-baseline --stop-after-print-host-binding` path now
+accepts `--print-rocket-control-catalog NATIVE_F1SHIM.mlir`. It imports 21 public
+Rocket register-bank/adapter roots and six private LoadMem engine roots. It
+does not import the native platform top, allocated CPU transport or LoadMem
+construction wrappers. The existing expanded assembly replay uses this same
+compiler API instead of its unchecked test-only definition copier.
+
+Production replay initially exposed a duplicate physical clock-gate declaration
+and target hierarchy captured through LoadMem wrappers. The final import
+reuses the compatible clock gate and roots the direct engines. Expanded replay
+then found that MMIO allocation consumed the wrappers' register descriptors.
+The importer validates the complete nine-word LoadMem registry/MCR interface
+and retains those three descriptors on the direct engines. Allocation selects
+those modules in linked catalogs and the original wrappers in native assembly.
+Hardware operations remain identical to native; no register schema is invented.
+The existing LoadMem comparison now checks every prior module body by identity
+instead of assuming the historical 270-module catalog with duplicated targets.
+
+Evidence is under the mutable generated U250 directory
+`iteration125-control-catalog/`: build and CTest logs, `catalog.mlir`, production
+enabled-Print ingestion MLIR/RTL and retained annotations, comparison reports,
+CLI rejection report and production preservation report. Four focused CTests
+pass. The small two-circuit fixture checks seven atomic rejection cases and
+shared storage/physical blackbox identity. Native catalog replay additionally
+checks three atomic malformed LoadMem descriptor rejections and the direct
+nine-word MCR interface. Three invalid CLI option combinations reject early.
+The focused expanded replay passes thirteen-bank allocation in both constructor
+orders and 40 atomic rejection cases. Reproduce with
+`goldengate-print-binding-test --rocket-catalog-allocation
+circt-ingestion/post-fame-tracerv-stream-queue.mlir
+circt-ingestion/post-fame-f1-shim.mlir OUTPUT_PREFIX`.
+The historical forward/reverse LoadMem engine comparison also passes with
+the updated body-preservation check. The longer end-to-end expanded attachment
+replay was stopped after progressing through FASED attachment; it is not
+reported as a complete replay pass.
+
+Exact immutable input:
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`.
+The selected annotation input remains iteration 67's recorded enabled-Print
+subset. Production import emits RTL with empty stderr and preserves all 34
+existing definitions, all 1,713 retained annotation records and the Print
+decoder header. The native source is the current
+`circt-ingestion/post-fame-f1-shim.mlir` boundary. Both imported candidates retain
+all 28 hardware definitions and the three exact LoadMem register descriptors.
+
+Exact read-only RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+Comparison matches SimulationMaster's five register widths, four reset values,
+ordered INIT_DONE/PRESENCE_READ/PRESENCE_WRITE slots, and the LoadMem contract:
+sixteen memory pins, 34-bit addresses, 64-bit memory data, 75 widget equations,
+sixteen identity routes, depth-two write requests and queued-write priority
+over zero fill. These checks cover shared SFC behavior; the oracle disables
+Print. No immutable fixture is modified and no manager verification gate is
+started in this iteration.
+`PrintRocketMMIOCompare.py` also matches all eleven native SFC AW/AR
+regions/slaves. The two focused linked catalogs emit the same thirteen-bank
+allocation: Print at 544/576, three CPU count words at 624 and ResetPulse at
+640, with the complete LoadMem region retained. Its report is under
+`iteration125-control-catalog/mmio-comparison/`.
+
+This is production definition ingestion, not full live platform attachment.
+Next smallest step: import the native TracerV/bridge token and stream boundary,
+invoke checked clock-analysis transfer while retaining the existing Print
+clock map, then compose the expanded CPU/control path and complete driver
+collateral transaction. Enabled-Print production runtime, the SFC UART-bearing
+differential and the overall compiler migration remain incomplete.

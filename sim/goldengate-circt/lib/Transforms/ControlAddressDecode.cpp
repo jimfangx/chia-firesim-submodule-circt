@@ -150,9 +150,17 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
       error = "Rocket control catalog would omit a materialized queued Print host"; return failure();
     }
   }
-  if (failed(bank("LoadMemWidget_0", "GGLoadMemMCRFile",
-      {"GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataWrapper",
-       "GGLoadMemReadRequestWrapper", "GGLoadMemReadDataWrapper"})) ||
+  // A linked host catalog retains the construction descriptors on the direct
+  // engines. Native assembly still has the original wrappers. Select by live
+  // module identity; a partial imported catalog must fail registry validation.
+  bool importedLoadMem = llvm::any_of(circuit.getOps<FModuleOp>(), [](FModuleOp m) {
+    return m.getName() == "CatalogRocket_GGLoadMemWriteDataFIFO";
+  });
+  const StringRef loadmemRegisters[]{"GGLoadMemWriteMMIOBank",
+      importedLoadMem ? "CatalogRocket_GGLoadMemWriteDataFIFO" : "GGLoadMemWriteDataWrapper",
+      importedLoadMem ? "CatalogRocket_GGLoadMemReadRequests" : "GGLoadMemReadRequestWrapper",
+      importedLoadMem ? "CatalogRocket_GGLoadMemReadDataFIFO" : "GGLoadMemReadDataWrapper"};
+  if (failed(bank("LoadMemWidget_0", "GGLoadMemMCRFile", loadmemRegisters)) ||
       failed(bank("CPUManagedStreamEngine_0", "GGCPUStreamMCRFile", {"GGCPUStreamCountBank"}))) return failure();
   widgets.assign(catalog.begin(), catalog.end()); return success();
 }

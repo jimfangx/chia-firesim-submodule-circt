@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/BridgeClockInfo.h"
+#include "goldengate/ControlCatalog.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/RocketDriverHeader.h"
@@ -60,6 +61,62 @@ InstanceOp child(FModuleOp m, FModuleOp target) {
     require(!found, "multiple child instances"); found = i;
   }
   require(bool(found), "missing child instance"); return found;
+}
+// Linking a valid bank may still capture a different child definition. Test
+// that closure identity, collisions and incompatible blackboxes fail atomically.
+void controlCatalogImport(MLIRContext &ctx) {
+  auto source = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "Source" {
+    firrtl.module @Source() {}
+    firrtl.module @Bank(in %clk: !firrtl.clock) {
+      %child = firrtl.instance child @Storage(in clk: !firrtl.clock)
+      firrtl.connect %child, %clk : !firrtl.clock, !firrtl.clock
+      %gate = firrtl.instance gate @Gate(in clk: !firrtl.clock)
+      firrtl.connect %gate, %clk : !firrtl.clock, !firrtl.clock
+    }
+    firrtl.extmodule @Gate(in clk: !firrtl.clock) attributes {defname = "Gate"}
+    firrtl.module @Storage(in %clk: !firrtl.clock) {}
+    firrtl.module @Unrelated() {}
+  } })", &ctx);
+  auto destination = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "Destination" {
+    firrtl.module @Destination() {}
+    firrtl.extmodule @LocalGate(in clk: !firrtl.clock) attributes {defname = "Gate"}
+  } })", &ctx);
+  require(bool(source) && bool(destination), "invalid control catalog fixture");
+  auto src = *source->getOps<CircuitOp>().begin(), dst = *destination->getOps<CircuitOp>().begin();
+  auto original = dump(*source); std::string error;
+  auto reject = [&](ArrayRef<StringRef> roots) {
+    auto before = dump(*destination);
+    require(failed(goldengate::importControlCatalog(dst, src, roots, error)) &&
+        !error.empty() && dump(*destination) == before && dump(*source) == original,
+        "failed catalog import changed either circuit");
+  };
+  reject({"Bank", "Missing"}); reject({"Bank", "Bank"}); reject({"Source"});
+  auto external = *dst.getOps<FExtModuleOp>().begin();
+  external->setAttr("test.differentParameters", UnitAttr::get(&ctx)); reject({"Bank"});
+  external->removeAttr("test.differentParameters");
+  auto collision = named(src, "Storage")->clone();
+  SymbolTable::setSymbolName(collision, "CatalogRocket_Storage");
+  collision->setAttr("test.differentStorage", UnitAttr::get(&ctx));
+  dst.getBodyBlock()->push_back(collision); reject({"Bank"}); collision->erase();
+  auto bank = named(src, "Bank")->clone(), storage = named(src, "Storage")->clone();
+  dst.getBodyBlock()->push_back(bank); dst.getBodyBlock()->push_back(storage);
+  external->remove();
+  auto sourceGate = (*src.getOps<FExtModuleOp>().begin())->clone();
+  dst.getBodyBlock()->push_back(sourceGate);
+  storage->setAttr("test.differentStorage", UnitAttr::get(&ctx)); reject({"Bank"});
+  storage->removeAttr("test.differentStorage");
+  auto before = dump(*destination);
+  require(succeeded(goldengate::importControlCatalog(dst, src, {"Bank"}, error)) &&
+      dump(*destination) == before, "identical shared closure was duplicated");
+  bank->erase(); storage->erase(); sourceGate->erase(); dst.getBodyBlock()->push_back(external);
+  require(succeeded(goldengate::importControlCatalog(dst, src, {"Bank"}, error)) &&
+      succeeded(verify(*destination)) && dump(*source) == original,
+      "valid control catalog failed import: " + error);
+  require(std::distance(dst.getOps<FModuleLike>().begin(), dst.getOps<FModuleLike>().end()) == 4 &&
+      child(named(dst, "Bank"), named(dst, "CatalogRocket_Storage")),
+      "catalog imported unrelated modules or lost child identity");
+  reject({"Bank"});
+  llvm::outs() << "PASS control catalog: isolated closure, shared storage and physical blackbox identity, seven atomic rejections\n";
 }
 // Small SSA fixture tests the import independently of the large Rocket replay.
 void bridgeClockImport(MLIRContext &ctx) {
@@ -5150,7 +5207,8 @@ void rocketResponses(Fixture &f, ArrayAttr reads, StringRef output, bool reverse
   llvm::outs() << "PASS Rocket/Print responses: ten connected R/B sources, four late boundaries, fourteen retirements and unchanged annotation payloads\n";
 }
 
-void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseline, StringRef output) {
+void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseline, StringRef output,
+                   bool catalogOnly = false) {
   if (baseline.empty()) return;
   unsigned rejected = 0;
   for (bool reverse : {false, true}) {
@@ -5306,32 +5364,7 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       // Import only the actual register banks/adapters and their dependencies.
       // The existing expanded CPU bank remains connected to the live queues;
       // importing a historical platform wrapper would duplicate that transport.
-      llvm::StringSet<> present;
-      for (auto m : f.circuit.getOps<FModuleLike>()) present.insert(m.getModuleName());
-      const StringRef bankNames[]{"GGSimulationMasterBank", "GGPeekPokeMCRFile", "GGPeekPokeMMIOBank",
-          "GGResetPulseBridgeMCRFile", "GGResetPulseBridge", "GGBlockDevMMIOBank",
-          "GGUARTMCRFile", "GGUARTMMIOBank", "GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
-          "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors",
-          "GGTracerVMCRFile", "GGTracerVTriggerConfig", "GGTSIMMIOBank", "GGClockBridgeMCRFile",
-          "GGSingleClockBridge", "GGLoadMemMCRFile", "GGLoadMemWriteMMIOBank", "GGLoadMemWriteDataWrapper",
-          "GGLoadMemReadRequestWrapper", "GGLoadMemReadDataWrapper"};
-      auto importedName = [&](StringRef name) {
-        return llvm::is_contained(bankNames, name) ? name.str() : "CatalogRocket_" + name.str();
-      };
-      std::function<void(StringRef)> importBank = [&](StringRef name) {
-        auto symbol = importedName(name);
-        if (!present.insert(symbol).second) return;
-        FModuleLike found;
-        for (auto m : pc.getOps<FModuleLike>()) if (m.getModuleName() == name) found = m;
-        require(bool(found), "missing Rocket bank dependency " + name.str());
-        auto copy = found->clone(); SymbolTable::setSymbolName(copy, symbol);
-        f.circuit.getBodyBlock()->push_back(copy);
-        copy->walk([&](InstanceOp i) {
-          auto originalName = i.getModuleName().str(); importBank(originalName);
-          i.setModuleNameAttr(FlatSymbolRefAttr::get(&ctx, importedName(originalName)));
-        });
-      };
-      for (StringRef name : bankNames) importBank(name);
+      require(succeeded(goldengate::importRocketControlCatalog(f.circuit, pc, error)), error);
       require(succeeded(verify(*f.root)), "expanded Rocket platform register banks invalid");
       SmallVector<goldengate::ControlMMIOWidget> catalog;
       before = dump(*f.root);
@@ -5394,6 +5427,11 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       if (!output.empty()) {
         std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-mmio-reverse.mlir" : ".rocket-mmio.mlir")).str(), ec);
         require(!ec, "cannot write full Rocket/Print decoder"); decoded->print(file); file << '\n';
+      }
+      if (catalogOnly) {
+        std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".catalog-reverse.mlir" : ".catalog.mlir")).str(), ec);
+        require(!ec, "cannot write allocated Rocket/Print catalog"); f.root->print(file); file << '\n';
+        continue;
       }
       // Attach the actual LoadMem AXI adapter. Its MCR-side register fragments
       // remain an explicit boundary here; the five original bridge controls,
@@ -5566,6 +5604,11 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
       std::error_code ec; llvm::raw_fd_ostream file((output + (reverse ? ".rocket-streams-reverse.mlir" : ".rocket-streams.mlir")).str(), ec);
       require(!ec, "cannot write Rocket/Print stream boundary"); f.root->print(file); file << '\n';
     }
+  }
+  if (catalogOnly) {
+    llvm::outs() << "PASS imported Rocket/Print catalog allocation: thirteen banks, both constructor orders and "
+                 << rejected << " atomic rejections\n";
+    return;
   }
   llvm::outs() << "PASS actual Rocket queue plus two Print hosts: three live DMA/count bindings, both constructor orders and "
                << rejected << " atomic rejections\n";
@@ -5899,6 +5942,41 @@ int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     bridgeClockImport(ctx);
+    controlCatalogImport(ctx);
+    if (argc == 5 && StringRef(argv[1]) == "--rocket-catalog-allocation") {
+      rocketStreams(ctx, argv[2], argv[3], argv[4], true);
+      return 0;
+    }
+    if (argc == 4 && StringRef(argv[1]) == "--rocket-control-catalog") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source), "cannot parse native Rocket control catalog");
+      Fixture f(ctx); std::string error;
+      auto c = *source->getOps<CircuitOp>().begin();
+      require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
+      auto fragment = named(c, "GGLoadMemReadDataWrapper");
+      auto rows = fragment->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+      auto before = dump(*f.root);
+      for (StringRef field : {"name", "offset", "readable"}) {
+        NamedAttrList bad(cast<DictionaryAttr>(rows[0])); bad.erase(field);
+        fragment->setAttr("goldengate.mmioRegisters", ArrayAttr::get(&ctx, {bad.getDictionary(&ctx)}));
+        auto sourceBefore = dump(*source);
+        require(failed(goldengate::importRocketControlCatalog(f.circuit, c, error)) &&
+            !error.empty() && dump(*f.root) == before && dump(*source) == sourceBefore,
+            "invalid LoadMem descriptor changed either catalog circuit");
+      }
+      fragment->setAttr("goldengate.mmioRegisters", rows);
+      require(succeeded(goldengate::importRocketControlCatalog(f.circuit, c, error)) &&
+          succeeded(verify(*f.root)), error);
+      goldengate::ControlMMIOWidget loadmem;
+      require(succeeded(goldengate::deriveControlMMIOWidget(f.circuit, "LoadMemWidget_0", "GGLoadMemMCRFile",
+          {"GGLoadMemWriteMMIOBank", "CatalogRocket_GGLoadMemWriteDataFIFO",
+           "CatalogRocket_GGLoadMemReadRequests", "CatalogRocket_GGLoadMemReadDataFIFO"}, loadmem, error)) &&
+          loadmem.registerCount == 9, "imported direct engine descriptors lost the nine-word LoadMem ABI");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[3], ec);
+      require(!ec, "cannot write imported catalog"); f.root->print(out); out << '\n';
+      llvm::outs() << "PASS native Rocket register catalog imported into live Print host boundary, three atomic LoadMem descriptor rejections\n";
+      return 0;
+    }
     if (argc == 4 && StringRef(argv[1]) == "--rocket-native-driver-headers") {
       auto root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(root), "cannot parse native Rocket F1Shim boundary");
