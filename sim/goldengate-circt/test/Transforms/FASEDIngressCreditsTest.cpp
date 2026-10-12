@@ -21,7 +21,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressARQueueWrapper\" { firrtl.module @GGFASEDIngressARQueueWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse"); auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
@@ -59,7 +59,29 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   SmallVector<Attribute> raw;
   for(auto suffix:{"","|GGFASEDIngressARQueueWrapper>other","|GGFASEDIngressARQueueWrapper>fased_ingress_aw_deq.bits.addr","|GGFASEDTokenEngine"})
     raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr(std::string("~GGFASEDIngressARQueueWrapper")+suffix))}));
-  if(mode!=20)c->setAttr("rawAnnotations",b.getArrayAttr(raw));return root;
+  if(mode!=20)c->setAttr("rawAnnotations",b.getArrayAttr(raw));
+  if (selected) {
+    inner.setName("GGSelectedPrintFASEDIngressARQueueWrapper");
+    if (mode == 18) {
+      (*inner.getOps<InstanceOp>().begin()).erase();
+      b.setInsertionPointToStart(inner.getBodyBlock()); b.create<InstanceOp>(c.getLoc(),inner,"used");
+    }
+    if (mode != 19) c.setName(inner.getName());
+    if (mode == 17) named(c, "GGFASEDIngressCreditsWrapper").setName("GGSelectedPrintFASEDIngressCreditsWrapper");
+    if (mode != 20) {
+      SmallVector<Attribute> updated;
+      for (auto a : raw) {
+        NamedAttrList row(cast<DictionaryAttr>(a));
+        auto target = cast<StringAttr>(row.get("target")).getValue().str();
+        const std::string old = "GGFASEDIngressARQueueWrapper";
+        for (size_t i=0; (i=target.find(old,i))!=std::string::npos; i+=std::string("GGSelectedPrintFASEDIngressARQueueWrapper").size())
+          target.replace(i,old.size(),"GGSelectedPrintFASEDIngressARQueueWrapper");
+        row.set("target", b.getStringAttr(target)); updated.push_back(row.getDictionary(&ctx));
+      }
+      c->setAttr("rawAnnotations", b.getArrayAttr(updated));
+    }
+  }
+  return root;
 }
 struct Interpreter {
   FModuleOp module;
@@ -137,8 +159,8 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx, bool selected=false) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDIngressCredits(c,error)),error);
   require(succeeded(verify(*root)),"invalid credit IR");
   Interpreter sim(named(c,"GGFASEDIngressCredits"));SmallVector<Value> regs;
@@ -161,7 +183,7 @@ void behavior(MLIRContext &ctx) {
     require(sim.state[regs[0]].getZExtValue()==next(aw,f(3),f(1)?f(4):done),"AW credit differs");
     require(sim.state[regs[1]].getZExtValue()==next(w,f(2),f(1)?f(5):done),"W credit differs");++cases;
   }
-  auto wrapper=named(c,"GGFASEDIngressCreditsWrapper");Interpreter wired(wrapper);
+  auto wrapper=named(c,selected ? "GGSelectedPrintFASEDIngressCreditsWrapper" : "GGFASEDIngressCreditsWrapper");Interpreter wired(wrapper);
   InstanceOp inner,credit;for(auto i:wrapper.getOps<InstanceOp>()){if(i.getName()=="sim")inner=i;else credit=i;}
   require(wrapper.getPorts().size()==9,"boundary count differs");
   for(unsigned flags=0;flags<512;++flags){
@@ -184,17 +206,25 @@ void behavior(MLIRContext &ctx) {
   require(wired.drivers.at(wired.key(credit.getResult(0)))==wired.arg(0),"host clock differs");
   const llvm::StringRef targets[]{"~GGFASEDIngressCreditsWrapper","~GGFASEDIngressCreditsWrapper|GGFASEDIngressCreditsWrapper>other","~GGFASEDIngressCreditsWrapper|GGFASEDIngressCreditsWrapper>fased_ingress_aw_deq.bits.addr","~GGFASEDIngressCreditsWrapper|GGFASEDTokenEngine"};
   auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw.size()==4,"lost annotations");
-  for(unsigned i=0;i<4;++i)require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()==targets[i],"target transfer differs");
+  for(unsigned i=0;i<4;++i) {
+    auto expected=targets[i].str();
+    if (selected) {
+      const std::string old="GGFASEDIngressCreditsWrapper", replacement="GGSelectedPrintFASEDIngressCreditsWrapper";
+      for(size_t j=0;(j=expected.find(old,j))!=std::string::npos;j+=replacement.size())
+        expected.replace(j,old.size(),replacement);
+    }
+    require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()==expected,"target transfer differs");
+  }
   llvm::outs()<<cases<<" credit transitions and 512 wrapper cases passed\n";
 }
-void rejection(MLIRContext &ctx){
+void rejection(MLIRContext &ctx, bool selected=false){
   for(unsigned mode=1;mode<=20;++mode){
-    auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
+    auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
     {llvm::raw_string_ostream out(before);root->print(out);}
     require(failed(goldengate::addFASEDIngressCredits(c,error))&&!error.empty(),"malformed boundary accepted");
     {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");
   }
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
   require(succeeded(goldengate::addFASEDIngressCredits(c,error)),error);
   {llvm::raw_string_ostream out(before);root->print(out);}
   require(failed(goldengate::addFASEDIngressCredits(c,error)),"repeat accepted");
@@ -203,5 +233,5 @@ void rejection(MLIRContext &ctx){
 }
 }
 int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try{behavior(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;
+  try{behavior(ctx);rejection(ctx);behavior(ctx,true);rejection(ctx,true);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;
 }

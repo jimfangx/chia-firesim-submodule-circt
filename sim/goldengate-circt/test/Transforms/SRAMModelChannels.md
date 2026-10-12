@@ -5906,3 +5906,62 @@ Print runtime parity and complete FASED timing/host issue are still unproven.
 Next smallest step: attach native AW/W credit counters to the selected ingress
 boundary, retaining CPU ports and live allocated headers, before transaction
 ordering and host issue. No harness-owned manager gate was started here.
+
+### Iteration 143: selected Print FASED AW/W ingress credits
+
+`mapPrintBridgeFASEDIngressCredits` attaches the shared native
+`GGFASEDIngressCredits` helper after selected AW/W/AR queues. The selected top
+becomes `GGSelectedPrintFASEDIngressCreditsWrapper`; the legacy wrapper remains
+supported. CLI `--map-print-host-fased-ingress-credits` requires
+`--map-print-host-fased-ingress` and emits `post-print-fased-ingress-credits.mlir`,
+its complete annotation archive and simulator SV. Publication follows clone
+preflight and verification; prior live modules and operation identities survive.
+Allocated Print/TracerV and CPU stream headers recognize the new top and retain
+their live hierarchy/SSA validation.
+
+Oracle: `midas/models/dram/IngressUnit.scala` and `midas/widgets/Lib.scala`, in the
+Golden Gate pipeline reviewed in `MidasTransforms.scala` and
+`fame/FAMETransform.scala`. AW credits increment on accepted final-W enqueue;
+W credits increment on AW enqueue. Relaxed mode retires on AW or accepted final-W
+dequeue respectively. Ordered mode retires both on write completion, computed
+from pre-edge counter values and current enqueue pulses. Completion remains
+combinational during reset. Both four-bit counters saturate at ten and use the
+qualified ingress reset. HostClock drives both, and all copied CPU/queue ports
+remain intact. Transaction-order storage and host issue gates are subsequent
+transforms; raw dequeue readiness remains an explicit boundary.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration143-print-fased-credits`.
+Native build and three targeted CTest suites passed (7.86 seconds): Print binding,
+CPU-managed stream headers and ingress credits. The native FIRRTL interpreter
+checks 16384 counter transitions, including reset and states above the maximum,
+and 512 wrapper event/status/clock cases in each legacy and selected fixture;
+each fixture rejects 21 malformed/repeated attachments atomically. Focused
+selected composition tests pass with and without TracerV, preserving prior
+module/SSA identities, byte-identical allocated headers and recursively copied
+aggregate target identity; each rejects eight malformed cases plus a repeat.
+CLI dependency preflight rejects before file ingestion or output mutation.
+Both complete native CLI replays from the primary immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected iteration-67 Print
+annotations and the native Rocket control catalog pass. Replay intermediates
+are compressed after comparison; input queue and output credit MLIR/annotation
+archives and final credit SV remain raw.
+
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+modules `IngressModule`, `SatUpDownCounter_1` and `FASEDMemoryTimingModel`.
+`PrintSelectedFASEDIngressCreditsCompare.py` passes actual SFC completion/event,
+mode-dependent retirement, saturation/zero reset and qualified ingress reset
+checks. Each candidate passes 8192 credit cases; helper operations equal
+`circt-ingestion/post-fame-fased-ingress-credits.mlir` exactly. Emitted RTL retains
+four-bit zero-reset counters and all credit status outputs. Print/TracerV and
+Print-only preserve respectively 116/110 prior module bodies, 77/85 wrapper
+connections and all 1713 annotation rows with recursive target transfer.
+Report: `sfc-comparison.json`. Neither immutable fixture was modified.
+
+The golden disables Print, so enabled Print runtime parity remains unproven.
+FASED timing, transaction ordering and host issue remain incomplete. Next
+smallest step: attach the native 20-entry transaction-order queue to selected
+AR enqueue and write completion, preserving qualified reset and live headers.
+No harness-owned manager verification step was started here; supplied iteration
+142 replacertl and Verilator gates passed, with the SFC UART baseline pending.

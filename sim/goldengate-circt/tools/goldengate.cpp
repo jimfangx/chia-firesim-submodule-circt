@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress]]]]]]]]]]]]] "
+                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits]]]]]]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -409,7 +409,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostCPUResponseBuffer = false, mapPrintHostCPUWriteResponseBuffer = false;
   bool mapPrintHostCPUPort = false, mapPrintHostFASEDTokens = false;
   bool mapPrintHostFASEDOutstanding = false;
-  bool mapPrintHostFASEDIngress = false;
+  bool mapPrintHostFASEDIngress = false, mapPrintHostFASEDIngressCredits = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -429,6 +429,11 @@ int main(int argc, char **argv) {
         // standalone post-FAME binding boundary, without returning at import.
         materializePrintTokens = materializePrintControls =
             materializePrintHosts = bindPrintHostConstructors = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-ingress-credits") {
+        if (mapPrintHostFASEDIngressCredits) return fail("duplicate --map-print-host-fased-ingress-credits");
+        mapPrintHostFASEDIngressCredits = true;
         continue;
       }
       if (option == "--map-print-host-fased-ingress") {
@@ -554,6 +559,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-cpu-response-buffer requires --map-print-host-cpu-read-buffer");
   if (mapPrintHostCPUWriteResponseBuffer && !mapPrintHostCPUResponseBuffer)
     return fail("--map-print-host-cpu-write-response-buffer requires --map-print-host-cpu-response-buffer");
+  if (mapPrintHostFASEDIngressCredits && !mapPrintHostFASEDIngress)
+    return fail("--map-print-host-fased-ingress-credits requires --map-print-host-fased-ingress");
   if (mapPrintHostFASEDIngress && !mapPrintHostFASEDOutstanding)
     return fail("--map-print-host-fased-ingress requires --map-print-host-fased-outstanding");
   if (mapPrintHostFASEDOutstanding && !mapPrintHostFASEDTokens)
@@ -887,6 +894,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED ingress queue output: " + error);
         llvm::outs() << "Attached selected Print FASED AW/W/AR ingress queues in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDIngressCredits) {
+        if (failed(goldengate::mapPrintBridgeFASEDIngressCredits(circuit, hosts, error)))
+          return fail("PrintBridge FASED ingress credits: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-ingress-credits.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-ingress-credits.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-ingress-credits-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED ingress credit MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED ingress credit output: " + error);
+        llvm::outs() << "Attached selected Print FASED AW/W ingress credits in " << tokenIR << '\n';
       }
       return 0;
     }

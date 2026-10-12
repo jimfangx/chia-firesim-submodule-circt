@@ -15,9 +15,11 @@ using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDIngressCredits(CircuitOp circuit, std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDIngressCredits";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDIngressCreditsWrapper";
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressARQueueWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressCreditsWrapper"
+                                               : "GGFASEDIngressCreditsWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDIngressARQueueWrapper")
+  if (!selected && circuit.getName() != "GGFASEDIngressARQueueWrapper")
     return reject("FASED ingress credits require the active AR ingress wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
