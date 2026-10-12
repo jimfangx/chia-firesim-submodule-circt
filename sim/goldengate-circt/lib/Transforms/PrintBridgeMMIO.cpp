@@ -2157,6 +2157,42 @@ LogicalResult goldengate::mapPrintBridgeCPUStreamReadBuffer(CircuitOp circuit,
   return success();
 }
 
+// Oracle: FPGATop's AXI4Buffer and CPUManagedStreamEngine's R-fire counter.
+// Requires the selected AR boundary and validated live Print allocation.
+// Engine R fire becomes queue enqueue; host dequeue independently drains beats.
+// No annotations consumed/produced: consumed R targets retain inner identity,
+// copied targets transfer outward. Stage and verify on a clone, then publish
+// only the R queue/wrapper and archive. Retain preceding operations and SSA;
+// rebuild hierarchy analyses after wrapping. B buffering remains separate.
+LogicalResult goldengate::mapPrintBridgeCPUStreamResponseBuffer(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintCPUStreamReadBufferWrapper") {
+    error = "selected Print CPU R requires the completed AR buffer boundary";
+    return failure();
+  }
+  if (failed(validateCPUStreamAddressQueue(circuit, error))) return failure();
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamResponseBuffer(*staged,
+          "GGSelectedPrintCPUStreamReadBufferWrapper",
+          "GGSelectedPrintCPUStreamResponseBufferWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print CPU R produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintCPUStreamResponseBufferWrapper" ||
+          m.getName() == "GGCPUStreamRQueue2")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(

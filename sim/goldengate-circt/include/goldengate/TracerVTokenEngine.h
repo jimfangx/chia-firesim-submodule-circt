@@ -46,6 +46,9 @@ mlir::LogicalResult attachCPUStreamWriteBuffer(circt::firrtl::CircuitOp circuit,
 // Queue U250 CPU AXI AR independently; the engine dequeues on the last R beat.
 mlir::LogicalResult addCPUStreamReadBuffer(circt::firrtl::CircuitOp circuit,
                                          std::string &error);
+// Validate the shared U250 AW/AR payload queue before composing later stages.
+mlir::LogicalResult validateCPUStreamAddressQueue(circt::firrtl::CircuitOp circuit,
+                                                std::string &error);
 // Attach the shared native AR queue to an expanded boundary, transferring
 // copied targets while retaining consumed AR targets on the inner module.
 mlir::LogicalResult attachCPUStreamReadBuffer(circt::firrtl::CircuitOp circuit,

@@ -6014,9 +6014,23 @@ int main(int argc, char **argv) {
     if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
       nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
     }
-    if (argc == 3 && StringRef(argv[1]) == "--selected-print-cpu-read-buffer") {
+    if (argc == 3 && (StringRef(argv[1]) == "--selected-print-cpu-read-buffer" ||
+                      StringRef(argv[1]) == "--selected-print-cpu-response-buffer")) {
+      bool response = StringRef(argv[1]) == "--selected-print-cpu-response-buffer";
+      const StringRef inner = response ? "GGSelectedPrintCPUStreamReadBufferWrapper" :
+                                        "GGSelectedPrintCPUStreamWriteBufferWrapper";
+      const StringRef outer = response ? "GGSelectedPrintCPUStreamResponseBufferWrapper" :
+                                        "GGSelectedPrintCPUStreamReadBufferWrapper";
+      const StringRef dataPort = response ? "cpu_stream_r_bits_data" : "cpu_stream_ar_bits_addr";
+      const StringRef validPort = response ? "cpu_stream_r_valid" : "cpu_stream_ar_valid";
+      auto map = [&](CircuitOp circuit, ArrayRef<FModuleOp> hosts, std::string &error) {
+        return response ? goldengate::mapPrintBridgeCPUStreamResponseBuffer(circuit, hosts, error) :
+                          goldengate::mapPrintBridgeCPUStreamReadBuffer(circuit, hosts, error);
+      };
+      const StringRef probes[]{validPort, dataPort, "hostClock", "ctrl.aw.bits.addr",
+                               "cpu_stream_aw_valid", response ? "cpu_stream_ar_bits_addr" : "cpu_stream_r_ready"};
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
-      require(bool(source) && succeeded(verify(*source)), "invalid selected Print AW/W boundary");
+      require(bool(source) && succeeded(verify(*source)), "invalid selected Print CPU buffer boundary");
       auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
       auto hostsFor = [&](CircuitOp circuit) {
         SmallVector<FModuleOp> hosts;
@@ -6030,14 +6044,14 @@ int main(int argc, char **argv) {
       };
       for (unsigned bad = 0; bad < 12; ++bad) {
         OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
-        auto tc = *test->getOps<CircuitOp>().begin(); auto top = named(tc, "GGSelectedPrintCPUStreamWriteBufferWrapper");
+        auto tc = *test->getOps<CircuitOp>().begin(); auto top = named(tc, inner);
         auto hs = hostsFor(tc);
         if (bad == 0) tc.setName("Wrong");
         else if (bad == 1) tc->removeAttr("rawAnnotations");
         else if (bad == 2) hs.clear();
         else if (bad == 3) {
           b.setInsertionPointToEnd(tc.getBodyBlock());
-          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("GGSelectedPrintCPUStreamReadBufferWrapper"),
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr(outer),
               top.getConventionAttr(), ArrayRef<PortInfo>{});
         } else if (bad == 4) {
           named(tc, "GGCPUStreamAWQueue2")->setAttr("goldengate.queueDepth", b.getI64IntegerAttr(3));
@@ -6045,8 +6059,8 @@ int main(int argc, char **argv) {
           (*named(tc, "GGCPUStreamAWQueue2").getOps<MemOp>().begin())->setAttr("readLatency", b.getI32IntegerAttr(1));
         } else if (bad < 8) {
           SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
-          names[port(top, "cpu_stream_ar_bits_addr")] = b.getStringAttr(bad == 6 ?
-              "missing_ar_addr" : "cpu_stream_ar_unsupported");
+          names[port(top, dataPort)] = b.getStringAttr(bad == 6 ?
+              "missing_cpu_payload" : (response ? "cpu_stream_r_unsupported" : "cpu_stream_ar_unsupported"));
           top.setPortNames(names);
         } else if (bad == 8) {
           named(tc, "GGCPUStreamRead")->removeAttr("goldengate.sourceStreams");
@@ -6064,16 +6078,16 @@ int main(int argc, char **argv) {
             }
         }
         auto before = dump(*test);
-        require(failed(goldengate::mapPrintBridgeCPUStreamReadBuffer(tc, hs, error)) &&
+        require(failed(map(tc, hs, error)) &&
             !error.empty() && dump(*test) == before,
-            "selected Print CPU AR rejection mutated IR " + std::to_string(bad));
+            "selected Print CPU buffer rejection mutated IR " + std::to_string(bad));
       }
-      // AR targets retain the inner identity; other interfaces move outward.
+      // Consumed CPU targets retain inner identity; copied interfaces move outward.
       // Check nested arrays/dictionaries and an aggregate control component.
       auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> as(raw.begin(), raw.end());
       SmallVector<Attribute> targets;
-      for (auto n : {"cpu_stream_ar_valid", "cpu_stream_ar_bits_addr", "hostClock", "ctrl.aw.bits.addr", "cpu_stream_aw_valid", "cpu_stream_r_ready"})
-        targets.push_back(b.getStringAttr("~GGSelectedPrintCPUStreamWriteBufferWrapper|GGSelectedPrintCPUStreamWriteBufferWrapper>" + std::string(n)));
+      for (auto n : probes)
+        targets.push_back(b.getStringAttr(("~" + inner + "|" + inner + ">" + n).str()));
       as.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.SelectedCPUReadTargets")),
           b.getNamedAttr("nested", b.getDictionaryAttr({b.getNamedAttr("targets", b.getArrayAttr(targets))}))}));
       c->setAttr("rawAnnotations", b.getArrayAttr(as));
@@ -6084,27 +6098,25 @@ int main(int argc, char **argv) {
       }
       std::string headerBefore, headerAfter;
       require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), headerBefore, error)), error);
-      require(succeeded(goldengate::mapPrintBridgeCPUStreamReadBuffer(c, hostsFor(c), error)) &&
+      require(succeeded(map(c, hostsFor(c), error)) &&
           succeeded(verify(*source)), error);
       for (auto m : modules) require(named(c, m.getName()) == m && moduleBody(m) == bodies.at(m.getName().str()),
-          "selected Print CPU AR changed existing module");
+          "selected Print CPU buffer changed existing module");
       SmallVector<Operation *> after;
       for (auto m : modules) for (auto &op : m.getBodyBlock()->getOperations()) after.push_back(&op);
-      require(after == ops, "selected Print CPU AR replaced existing operations");
+      require(after == ops, "selected Print CPU buffer replaced existing operations");
       auto updated = c->getAttrOfType<ArrayAttr>("rawAnnotations");
       auto probe = cast<DictionaryAttr>(updated[updated.size()-1]).getAs<DictionaryAttr>("nested").getAs<ArrayAttr>("targets");
-      const StringRef probes[]{"cpu_stream_ar_valid", "cpu_stream_ar_bits_addr", "hostClock", "ctrl.aw.bits.addr", "cpu_stream_aw_valid", "cpu_stream_r_ready"};
       for (auto [i, n] : llvm::enumerate(probes))
         require(cast<StringAttr>(probe[i]).getValue() ==
-            "~GGSelectedPrintCPUStreamReadBufferWrapper|" +
-            std::string(i < 2 ? "GGSelectedPrintCPUStreamWriteBufferWrapper" : "GGSelectedPrintCPUStreamReadBufferWrapper") + ">" + n.str(),
-            "selected Print CPU AR lost recursive copied/consumed target");
+            ("~" + outer + "|" + (i < 2 ? inner : outer) + ">" + n).str(),
+            "selected Print CPU buffer lost recursive copied/consumed target");
       require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), headerAfter, error)) &&
-          headerAfter == headerBefore, "selected Print CPU AR changed allocated driver collateral: " + error);
+          headerAfter == headerBefore, "selected Print CPU buffer changed allocated driver collateral: " + error);
       auto before = dump(*source);
-      require(failed(goldengate::mapPrintBridgeCPUStreamReadBuffer(c, hostsFor(c), error)) &&
-          dump(*source) == before, "selected Print CPU AR repeat changed IR");
-      llvm::outs() << "PASS selected Print independent AR queue and unchanged allocated headers, 13 atomic rejections, retained SSA/module identities and recursive targets\n";
+      require(failed(map(c, hostsFor(c), error)) &&
+          dump(*source) == before, "selected Print CPU buffer repeat changed IR");
+      llvm::outs() << "PASS selected Print " << (response ? "R response" : "independent AR") << " queue and unchanged allocated headers, 13 atomic rejections, retained SSA/module identities and recursive targets\n";
       return 0;
     }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-cpu-write-buffer") {

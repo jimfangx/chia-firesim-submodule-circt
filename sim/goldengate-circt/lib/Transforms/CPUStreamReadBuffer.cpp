@@ -23,22 +23,16 @@ LogicalResult goldengate::addCPUStreamReadBuffer(CircuitOp circuit,
                                    "GGCPUStreamReadBufferWrapper", error);
 }
 
-LogicalResult goldengate::attachCPUStreamReadBuffer(CircuitOp circuit,
-    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error) {
+// Shared geometry validation for composing a later response-buffer boundary.
+// Keep the AR helper's interface/storage contract identical at both stages.
+LogicalResult goldengate::validateCPUStreamAddressQueue(CircuitOp circuit,
+    std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != inputBoundary)
-    return reject("CPU AR buffer requires the active CPU AW/W buffer wrapper");
-  FModuleOp inner, queue;
-  for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getModuleName() == wrapperName)
-      return reject("CPU AR buffer wrapper already exists");
-    if (m.getModuleName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
-    if (m.getModuleName() == "GGCPUStreamAWQueue2") queue = dyn_cast<FModuleOp>(m.getOperation());
-  }
-  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!inner || !raw || !queue)
-    return reject("CPU AR buffer needs a top, retained annotations and native AW/AR queue");
-  auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();
+  FModuleOp queue;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGCPUStreamAWQueue2") queue = m;
+  if (!queue) return reject("CPU AR buffer needs the native AW/AR queue");
+  auto *context = circuit.getContext(); OpBuilder b(context);
   auto uint = [&](unsigned w) { return UIntType::get(context, w, false); };
   auto bit = uint(1);
   auto payload = BundleType::get(context, {{b.getStringAttr("id"), false, uint(16)},
@@ -67,6 +61,27 @@ LogicalResult goldengate::attachCPUStreamReadBuffer(CircuitOp circuit,
   }
   if (memoryCount != 1)
     return reject("CPU AR buffer queue needs one payload memory");
+  return success();
+}
+
+LogicalResult goldengate::attachCPUStreamReadBuffer(CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error) {
+  auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
+  if (circuit.getName() != inputBoundary)
+    return reject("CPU AR buffer requires the active CPU AW/W buffer wrapper");
+  FModuleOp inner, queue;
+  for (auto m : circuit.getOps<FModuleLike>()) {
+    if (m.getModuleName() == wrapperName)
+      return reject("CPU AR buffer wrapper already exists");
+    if (m.getModuleName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
+    if (m.getModuleName() == "GGCPUStreamAWQueue2") queue = dyn_cast<FModuleOp>(m.getOperation());
+  }
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!inner || !raw || !queue)
+    return reject("CPU AR buffer needs a top, retained annotations and native AW/AR queue");
+  if (failed(validateCPUStreamAddressQueue(circuit, error))) return failure();
+  auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();
+  auto uint = [&](unsigned w) { return UIntType::get(context, w, false); };
   const llvm::StringRef names[]{"hostClock", "hostReset", "cpu_stream_ar_ready", "cpu_stream_ar_valid",
       "cpu_stream_ar_bits_id", "cpu_stream_ar_bits_addr", "cpu_stream_ar_bits_len", "cpu_stream_ar_bits_size"};
   const unsigned widths[]{0, 1, 1, 1, 16, 64, 8, 3};

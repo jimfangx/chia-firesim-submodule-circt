@@ -30,10 +30,12 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
   bool selected = boundary == CPUStreamHeaderBoundary::SelectedOutgoing;
   bool bufferedSelected = selected &&
       (circuit.getName() == "GGSelectedPrintCPUStreamWriteBufferWrapper" ||
-       circuit.getName() == "GGSelectedPrintCPUStreamReadBufferWrapper");
+       circuit.getName() == "GGSelectedPrintCPUStreamReadBufferWrapper" ||
+       circuit.getName() == "GGSelectedPrintCPUStreamResponseBufferWrapper");
   if (selected && circuit.getName() != "GGControlMasterWrapper" &&
       circuit.getName() != "GGSelectedPrintCPUStreamWriteBufferWrapper" &&
-      circuit.getName() != "GGSelectedPrintCPUStreamReadBufferWrapper")
+      circuit.getName() != "GGSelectedPrintCPUStreamReadBufferWrapper" &&
+      circuit.getName() != "GGSelectedPrintCPUStreamResponseBufferWrapper")
     return reject("selected outgoing CPU header requires the assembled selected control master");
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw) return reject("CPUManagedStreamEngine header needs retained annotations");

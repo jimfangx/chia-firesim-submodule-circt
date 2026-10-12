@@ -5563,3 +5563,68 @@ fixture was edited. The SFC fixture disables Print, so these shared transport
 matches do not establish enabled-Print platform/runtime parity. R/B buffering
 and host-memory/platform attachment remain pending. Next smallest step: attach
 and compare the selected boundary's native depth-two CPU R response queue.
+
+## Iteration 137: selected Print CPU R response buffering
+
+The iteration-136 harness passed CIRCT replacertl and Verilator bare, portable
+(90,141 checks) and Rocket (90,805 checks) workloads. The SFC UART-bearing
+runtime baseline remains pending. No FireSim manager verification step was
+started in this iteration.
+
+`--map-print-host-cpu-response-buffer` requires the selected AR buffer stage and
+attaches `GGSelectedPrintCPUStreamResponseBufferWrapper` plus the shared native
+`GGCPUStreamRQueue2`. CPUManagedStreamEngine R fire now enqueues a response;
+host R dequeue independently drains it. ID/data/response/last are retained
+under host backpressure. The read engine retires the AR head on the final
+response enqueue, as in FPGATop's default AXI4Buffer. The selected composition
+validates live Print allocation, stages and verifies on a clone, and publishes
+only the new queue/wrapper and recursively retargeted archive. Existing module,
+operation, SSA, port and allocation identities remain intact. Both allocated
+header emitters accept the new selected boundary while retaining their existing
+live hierarchy and zero-sink writer checks.
+
+The first focused rejection run found that R attachment accepted a malformed
+preceding AW/AR helper (queueDepth=3). The existing native AR interface/storage
+validator is now shared as `validateCPUStreamAddressQueue` and required before
+selected R attachment. This also rejects changed memory read latency without
+mutating live IR. The successful final runs cover thirteen atomic rejections,
+recursive consumed R and copied control/clock/AR targets, unchanged module and
+operation identities, and identical allocated driver headers before/after
+wrapping. The refactored selected AR tests pass on both variants as well.
+
+Evidence: the mutable generated U250 directory
+`iteration137-print-cpu-response-buffer/`. Native compiler, Print binding,
+CPU managed stream header, AR buffer and R buffer targets build. Final joint
+TracerV/Print and Print-only replays emit
+`{candidate,compatibility}/post-print-cpu-response-buffer.{mlir,sv}` and
+`post-print-cpu-response-buffer-all.json`. The option rejects a missing AR
+stage. Print binding, CPU managed stream header, AR buffer and R buffer CTests
+pass (4/4). Each actual candidate R queue passes 20,400 interpreted cycles
+against an independent deque oracle: 7,904 pushes, 6,881 pops, 346 reset-time
+writes, 1,089 full-with-pop blocks and 1,503 empty-with-push blocks. Coverage
+includes held complete payloads, simultaneous push/pop, occupancy reset and
+accepted reset-time RAM writes.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedCPUResponseCompare.py` matches Queue_55/AXI4Buffer_2's R contract:
+depth two, no flow or pipe, payload widths 16/512/2/1, stored Okay response,
+control-only reset flushing and accepted reset-time RAM writes. It also checks
+Queue_51 and CPUManagedStreamEngine's final-beat AR dequeue and retained R ID.
+The native R queue is identical to the baseline operation emitter. All fourteen
+native R routes match; SFC specializes the constant response into its RAM write
+and exposes thirteen routes. The joint candidate preserves 99 preceding module
+bodies and 89 ports (83 copied, 97 wrapper connections); Print-only preserves
+93 bodies and 97 ports (91 copied, 105 connections). Both preserve the complete
+annotation archive and clock/control/stream analysis metadata. The final report
+is `sfc-comparison-final.json`.
+
+Replay input is the primary immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, the iteration-67 selected
+Print annotations and the native Rocket control catalog. Neither fixture was
+modified. Large intermediate FIRRTL/MLIR/RTL replay outputs are compressed;
+the AR/R handoffs and the AW/W handoff used by the focused tests remain raw.
+The recorded SFC fixture disables Print, so shared transport parity does not
+establish enabled-Print runtime parity. B buffering, host-memory/platform
+attachment and enabled-Print runtime remain pending. Next smallest step:
+attach and compare the selected native depth-two CPU B response queue.

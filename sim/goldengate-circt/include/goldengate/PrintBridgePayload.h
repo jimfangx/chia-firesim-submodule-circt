@@ -335,6 +335,11 @@ mlir::LogicalResult mapPrintBridgeCPUStreamWriteBuffer(
 mlir::LogicalResult mapPrintBridgeCPUStreamReadBuffer(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
+/// Attach a depth-two R response queue to the selected Print AR boundary.
+/// Validate live allocation; atomically retain prior IR and consumed R targets.
+mlir::LogicalResult mapPrintBridgeCPUStreamResponseBuffer(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
 /// Attach an independent depth-two AR queue to the expanded CPU AW/W boundary.
 /// Atomic; retain existing identities and consumed AR targets.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamReadBuffer(
