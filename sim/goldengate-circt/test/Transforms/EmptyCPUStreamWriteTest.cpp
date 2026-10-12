@@ -134,9 +134,11 @@ void rejection(MLIRContext &context) {
 }
 }
 int main(int argc, char **argv) {
-  try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>(); if (argc == 3 && StringRef(argv[1]) == "--expanded-boundary") {
+  try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>(); if (argc == 3 &&
+      (StringRef(argv[1]) == "--expanded-boundary" || StringRef(argv[1]) == "--selected-boundary")) {
     auto root = parseSourceFile<ModuleOp>(argv[2], &context); require(bool(root) && succeeded(verify(*root)), "expanded IR invalid");
-    behavior(named(*root->getOps<CircuitOp>().begin(), "CatalogRocket_GGEmptyCPUStreamWrite")); return 0;
+    behavior(named(*root->getOps<CircuitOp>().begin(), StringRef(argv[1]) == "--selected-boundary" ?
+        "GGEmptyCPUStreamWrite" : "CatalogRocket_GGEmptyCPUStreamWrite")); return 0;
   }
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addEmptyCPUStreamWrite(c, error)), error);

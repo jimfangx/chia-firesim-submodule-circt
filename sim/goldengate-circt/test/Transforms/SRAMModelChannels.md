@@ -5439,3 +5439,62 @@ Neither immutable fixture was edited. The SFC fixture disables Print, so this
 does not establish enabled-Print platform/runtime parity. No manager gate was
 started. Next smallest step: attach the selected joint control/stream boundary
 to the native platform wrapper and compare its external ports and allocation.
+
+## Iteration 135: selected Print CPU empty writer and AW/W buffering
+
+The iteration-134 harness passed CIRCT replacertl, Verilator bare smoke,
+90,141 portable checks and 90,805 Rocket checks. Its SFC UART-bearing runtime
+baseline remains pending. No manager verification step was started here.
+
+The selected joint control master exposes only CPU AR/R; it cannot yet attach
+the complete platform slave. `--map-print-host-cpu-write-buffer` now requires
+`--map-print-host-master` and adds the Scala zero-sink AW/W/B defaults and two
+independent depth-two AW/W queues. `materializeEmptyCPUStreamWrite` shares the
+existing baseline operation emitter with this selected boundary. The Print
+composition validates live allocated driver/stream/control identities before
+staging both wrappers, the empty writer and queue memories/registers on a
+clone. Verification precedes publication of additions and recursive annotation
+retargeting. Existing modules, operations, SSA values and allocation metadata
+remain intact. Incoming CPU streams are still unsupported.
+
+Evidence is in the mutable generated U250 directory
+`iteration135-print-cpu-write-buffer/`. Native compiler, Print binding, empty
+writer and AW/W buffer targets build successfully. Fresh joint TracerV/Print
+and Print-only compiler replays emit
+`{candidate,compatibility}/post-print-cpu-write-buffer.{mlir,sv}` and corresponding
+annotation archives. The joint allocated header is unchanged from iteration
+134. The compiler rejects the new option without its required master stage.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedCPUWriteCompare.py` matches `CPUManagedStreamEngine` live AW-ID
+forwarding, zero ready/B-valid/response, reset-gated size-six/full-strobe
+assertions and `Queue_51`, `Queue_52`, `AXI4Buffer_2` payload/storage/reset and
+handshake contracts. SFC eliminates the W dequeue and specializes its read
+address to zero; the native queue retains the general dequeue, whose ready is
+bound to the empty writer's zero. AW and W each retain two payload entries,
+no flow/pipe, asynchronous reads and synchronous writes, including accepted
+RAM writes during reset while occupancy resets empty.
+
+The generated empty writer passes 73,984 interpreted operation cases, all
+65,536 live AW IDs and every write strobe lane. Each generated AW/W queue passes
+20,400 cycles against a separate deque oracle, including full/empty stalls,
+simultaneous push/pop and reset-time writes. The structured comparison preserves
+93 prior module bodies, 89 final public ports and 100 buffered routes for the
+joint candidate; Print-only preserves 87 bodies, 97 ports and 108 routes.
+Both retain all archived annotation payloads, recursive target transfers,
+clock analysis and MMIO/CPU stream allocation metadata. The five additions are
+ordinary FIRRTL operations, not imported Scala or an SFC compiler fallback.
+The selected binding test passes 11 atomic rejections, preserved operation and
+module identities, and recursive copied targets. It discovers ordered hosts
+from the binding registry, since helper modules also retain Print metadata.
+The Print binding, empty CPU writer and CPU write buffer CTests pass (3/3).
+
+Input remains the primary immutable fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, iteration-67 selected Print
+annotations and the native Rocket control catalog. Neither immutable fixture
+was edited. The fixture disables Print, so shared transport matches do not
+establish enabled-Print platform/runtime parity. The boundary still exposes
+unimplemented bridge inputs and lacks the host-memory port and CPU AR/R/B
+buffers. Next smallest step: attach the independent native AR queue while
+preserving the joint allocation, then add R/B buffering before platform ports.

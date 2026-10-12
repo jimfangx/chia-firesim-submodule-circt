@@ -2,6 +2,7 @@
 // Compose Widget.scala's size-sorted control allocation and io.ctrl binding
 // for the implemented Print hosts and their live CPU stream count bank.
 #include "goldengate/PrintBridgePayload.h"
+#include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/HostMemoryWriteArbiter.h"
 #include "goldengate/HostMemoryWriteResponses.h"
 #include "goldengate/HostMemoryReadArbiter.h"
@@ -2078,6 +2079,44 @@ LogicalResult goldengate::mapPrintBridgeRocketEmptyCPUStreamWrite(
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGPrintCPUStreamWriteWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
+// Oracle: CPUManagedStreamEngine's empty sinkParams and FPGATop's AXI4Buffer.
+// Requires a selected unused control master and validated live Print/stream
+// allocation. No annotations consumed/produced; copied targets move outward,
+// AW/W targets remain at the engine-facing boundary. Stage native helper and
+// queues on a clone; publish only verified additions and the retargeted archive.
+// Preserve all preceding operation, port, SSA, constructor and clock identities.
+// Rebuild hierarchy analysis after wrapping. AR/R/B buffering remains separate.
+LogicalResult goldengate::mapPrintBridgeCPUStreamWriteBuffer(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGControlMasterWrapper") {
+    error = "selected Print CPU AW/W requires the completed control master";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(materializeEmptyCPUStreamWrite(*staged, "GGControlMasterWrapper",
+          "GGSelectedPrintCPUStreamWriteWrapper", error)) ||
+      failed(attachCPUStreamWriteBuffer(*staged, "GGSelectedPrintCPUStreamWriteWrapper",
+          "GGSelectedPrintCPUStreamWriteBufferWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print CPU AW/W produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGEmptyCPUStreamWrite" ||
+          m.getName() == "GGSelectedPrintCPUStreamWriteWrapper" ||
+          m.getName() == "GGCPUStreamAWQueue2" || m.getName() == "GGCPUStreamWQueue2" ||
+          m.getName() == "GGSelectedPrintCPUStreamWriteBufferWrapper")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());

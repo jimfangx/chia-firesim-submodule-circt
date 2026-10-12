@@ -324,6 +324,12 @@ mlir::LogicalResult mapPrintBridgeRocketEmptyCPUStreamWrite(
 /// Atomic; retain existing identities and consumed AW/W targets.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamWriteBuffer(
     circt::firrtl::CircuitOp circuit, std::string &error);
+/// Materialize zero-sink AW/W/B and independent depth-two AW/W queues for the
+/// selected Print control master. Validate live allocated collateral first;
+/// atomically preserve existing IR identities and copied/consumed targets.
+mlir::LogicalResult mapPrintBridgeCPUStreamWriteBuffer(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
 /// Attach an independent depth-two AR queue to the expanded CPU AW/W boundary.
 /// Atomic; retain existing identities and consumed AR targets.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamReadBuffer(

@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master]]]]] "
+                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -405,6 +405,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostControl = false;
   bool mapPrintHostResponses = false;
   bool mapPrintHostMaster = false;
+  bool mapPrintHostCPUWriteBuffer = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -424,6 +425,11 @@ int main(int argc, char **argv) {
         // standalone post-FAME binding boundary, without returning at import.
         materializePrintTokens = materializePrintControls =
             materializePrintHosts = bindPrintHostConstructors = true;
+        continue;
+      }
+      if (option == "--map-print-host-cpu-write-buffer") {
+        if (mapPrintHostCPUWriteBuffer) return fail("duplicate --map-print-host-cpu-write-buffer");
+        mapPrintHostCPUWriteBuffer = true;
         continue;
       }
       if (option == "--map-print-host-master") {
@@ -501,6 +507,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-responses requires --map-print-host-control");
   if (mapPrintHostMaster && !mapPrintHostResponses)
     return fail("--map-print-host-master requires --map-print-host-responses");
+  if (mapPrintHostCPUWriteBuffer && !mapPrintHostMaster)
+    return fail("--map-print-host-cpu-write-buffer requires --map-print-host-master");
   ilaOptions.outputBaseFilename = outputBase.str();
   if (auto error = llvm::sys::fs::create_directories(outputDir))
     return fail("cannot create output directory: " + error.message());
@@ -706,6 +714,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, masterRTL, error)))
           return fail("PrintBridge control master output: " + error);
         llvm::outs() << "Bound selected Print MMIO to the native U250 control master in " << masterIR << '\n';
+      }
+      if (mapPrintHostCPUWriteBuffer) {
+        if (failed(goldengate::mapPrintBridgeCPUStreamWriteBuffer(circuit, hosts, error)))
+          return fail("PrintBridge CPU AW/W buffers: " + error);
+        llvm::SmallString<256> writeIR(outputDir), writeRTL(outputDir), writeAnnos(outputDir);
+        llvm::sys::path::append(writeIR, "post-print-cpu-write-buffer.mlir");
+        llvm::sys::path::append(writeRTL, "post-print-cpu-write-buffer.sv");
+        llvm::sys::path::append(writeAnnos, "post-print-cpu-write-buffer-all.json");
+        llvm::raw_fd_ostream writeOut(writeIR, ec);
+        if (ec) return fail("cannot write Print CPU AW/W MLIR: " + ec.message());
+        module->print(writeOut); writeOut << '\n'; writeOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, writeAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, writeRTL, error)))
+          return fail("PrintBridge CPU AW/W output: " + error);
+        llvm::outs() << "Buffered selected Print CPU AW/W with independent depth-two native queues in " << writeIR << '\n';
       }
       return 0;
     }

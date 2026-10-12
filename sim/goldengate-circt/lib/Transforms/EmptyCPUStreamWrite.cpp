@@ -2,7 +2,7 @@
 // CPUManagedStreamEngine's AW/W/B defaults for Rocket's empty sinkParams.
 // Requires the uninstantiated CPU control wrapper and its retained annotations.
 // No stream sinks are implemented here: the native pipeline currently supports
-// the sole outgoing TracerV stream. Reject incoming-stream boundaries and name
+// outgoing streams only. Reject incoming-stream boundaries and name
 // collisions before mutation. U250 has no AXI user bits; no zero-width user
 // port is synthesized. AW/W payload fields unused by the oracle are omitted.
 // Copies the existing boundary and retargets its ports, adding a stateless
@@ -16,11 +16,16 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addEmptyCPUStreamWrite(CircuitOp circuit,
                                                 std::string &error) {
+  return materializeEmptyCPUStreamWrite(circuit, "GGCPUStreamControlWrapper",
+                                       "GGCPUStreamWriteWrapper", error);
+}
+
+LogicalResult goldengate::materializeEmptyCPUStreamWrite(CircuitOp circuit,
+    StringRef inputBoundary, StringRef wrapperName, std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGEmptyCPUStreamWrite";
-  constexpr llvm::StringLiteral wrapperName = "GGCPUStreamWriteWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGCPUStreamControlWrapper")
-    return reject("empty CPU stream write requires the CPU control wrapper");
+  if (circuit.getName() != inputBoundary)
+    return reject("empty CPU stream write requires the active selected boundary");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == helperName || m.getModuleName() == wrapperName)
