@@ -1,7 +1,7 @@
 // See LICENSE for license details.
 // CPUManagedStreamEngine's TracerV Queue(UInt(512.W), 6144),
 // flow=false, pipe=false. Match the SFC synchronous read address pipeline.
-// Requires: uninstantiated Rocket TracerV control wrapper, host clock/reset,
+// Requires: explicitly selected uninstantiated boundary, host clock/reset,
 // a Decoupled UInt<512> producer and retained annotations. Validates atomically.
 // Consumes: no annotations. Transfers circuit identity and copied port targets;
 // producer stream targets remain on the original module. Produces stream/RAM
@@ -18,11 +18,17 @@ using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addTracerVStreamQueue(CircuitOp circuit, std::string &error) {
+  return attachTracerVStreamQueue(circuit, "GGTracerVBridgeControlWrapper",
+                                  "GGTracerVStreamQueueWrapper", error);
+}
+
+LogicalResult goldengate::attachTracerVStreamQueue(CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error) {
   constexpr llvm::StringLiteral queueName = "GGTracerVStreamQueue6144";
-  constexpr llvm::StringLiteral wrapperName = "GGTracerVStreamQueueWrapper";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
-  if (circuit.getName() != "GGTracerVBridgeControlWrapper")
-    return reject("TracerV stream queue requires the active TracerV control wrapper");
+  if (inputBoundary.empty() || wrapperName.empty() || inputBoundary == wrapperName || wrapperName == queueName ||
+      circuit.getName() != inputBoundary)
+    return reject("TracerV stream queue requires the selected active boundary and a distinct wrapper");
   FModuleOp inner;
   for (auto &op : circuit.getBodyBlock()->getOperations()) {
     auto m = dyn_cast<FModuleLike>(&op);

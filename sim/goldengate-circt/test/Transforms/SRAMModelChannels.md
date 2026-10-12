@@ -5108,3 +5108,61 @@ Next smallest step: attach the existing 6144-entry TracerV stream queue to
 the expanded CPU-stream/count and platform MMIO/control path. Enabled-Print
 production runtime, the SFC UART-bearing baseline and the overall port remain
 incomplete.
+
+### Live Print/TracerV stream queue and build repair (iteration 129)
+
+The interrupted iteration 128 left the expanded queue attachment in the live
+worktree. Its manager `replacertl` failed while compiling the new nested
+annotation fixture in `TracerVStreamQueueTest.cpp`: mismatched parentheses
+caused cascading initializer-list errors. Full stdout, stderr and the manager
+log `2026-10-12--07-03-36-replacertl-UTI5HXCI0BG5P69M.log` were inspected.
+The fixture now constructs targets, nested dictionary and annotation in named
+steps. Production `sim/make/goldengate.mk` explicitly builds the
+`goldengate-circt` target; focused validation separately builds its test
+executables. The native compiler and repaired queue test both build successfully.
+No manager gate was rerun by the implementation agent.
+
+The production enabled-Print compiler replay now accepts the existing token
+and trigger flags followed by `--map-print-host-tracerv-queue`. It uses
+`attachTracerVStreamQueue` to wrap `GGTracerVTriggerWrapper` in
+`GGPrintTracerVStreamQueueWrapper`, buffering only the TracerV stream. The
+original standalone queue entry point still selects its original boundary.
+All other ports, inner Print bodies and the Print host registry are retained.
+The new boundary exposes the thirteen-bit TracerV occupancy count; producer
+stream targets stay on the inner module, copied port targets move to the
+wrapper, and nested raw annotation targets are updated recursively. Seven
+expanded invalid-boundary cases reject without changing IR.
+
+Evidence is in the mutable generated U250 directory
+`iteration129-print-tracerv-queue/`: build and CTest logs, production
+MLIR/FIRRTL/annotations/RTL, five early CLI rejections, queue comparison and
+the shared expression-parser trigger regression. The queue CTest passes with
+28,303 pushes, 28,213 pops and 343 read/write collisions through actual native
+memory operations, including full/empty stalls and reset-time writes.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+module `Queue_50`, instantiated as the TracerV outgoing queue in SFC's
+CPUManagedStreamEngine. `PrintTracerVQueueCompare.py` evaluates emitted scalar
+register assignments and expressions: 4,496 boundary/random states yield
+44,960 matching pointer/read-address next-state, ready/valid/count and memory
+write comparisons. Both sides capture the lookahead address without reset
+and allow RAM writes during reset. The 6144x512 RAM geometry, memory interfaces
+and actual wrapper connections match structurally; this evaluator does not
+simulate RAM arrays. The native CTest independently covers payload ordering.
+The unsigned sized-cast expression support added to the shared test evaluator
+also passes the previous 110,592 SFC trigger comparisons.
+
+All 64 preexisting native module bodies, including the trigger bank and Print
+host registry, remain identical. The new queue body matches the existing
+native F1Shim queue; all 1,713 annotation payloads/classes/order and the
+analyzed clock map are preserved. The SFC FIRRTL input and selected enabled
+Print annotations are the same as iteration 127. Neither immutable fixture
+was edited. This comparison covers shared queue semantics; the immutable
+platform has Print disabled and enabled-Print full runtime remains unverified.
+
+Next smallest step: discover the preserved inner Print host registry through
+the TracerV wrappers, allocate both CPU streams and their occupancy registers,
+then compose TracerV and Print MMIO/control paths. The manager gate must still
+verify the build repair; the SFC UART-bearing baseline and overall port remain
+incomplete.

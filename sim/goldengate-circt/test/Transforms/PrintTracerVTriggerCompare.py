@@ -45,6 +45,9 @@ class Parser:
             while self.peek() == ',':
                 self.take(); fields.append(self.expression())
             self.take('}'); node = ('cat', fields)
+        elif token.isdigit() and self.peek() == "'":
+            self.take(); self.take('(')
+            node = ('cast', int(token), self.expression()); self.take(')')
         else:
             assert re.fullmatch(r"\w+|\d+'[hdb][0-9a-f]+", token), token
             node = ('leaf', token)
@@ -103,6 +106,8 @@ class RTL:
 
     def eval(self, node):
         kind = node[0]
+        if kind == 'cast':
+            return node[1], self.eval(node[2])[1] & ((1 << node[1]) - 1)
         if kind == 'leaf':
             token = node[1]
             if token in self.inputs: return self.widths[token], self.inputs[token]

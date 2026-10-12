@@ -189,6 +189,70 @@ void mapping(MLIRContext &context) {
   require(q->getAttrOfType<DictionaryAttr>("goldengate.streamParameters").getAs<IntegerAttr>("depth").getInt() == 6144 &&
       (*q.getOps<MemOp>().begin())->getAttrOfType<StringAttr>("goldengate.ramStyle") == "ULTRA", "stream/RAM metadata missing");
 }
+void expandedMapping(MLIRContext &context) {
+  constexpr llvm::StringLiteral input = "GGTracerVTriggerWrapper";
+  constexpr llvm::StringLiteral output = "GGPrintTracerVStreamQueueWrapper";
+  auto printed = [](Operation *op) { std::string s; llvm::raw_string_ostream out(s); op->print(out); return s; };
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin();
+    auto inner = named(c, "GGTracerVBridgeControlWrapper"); OpBuilder b(&context);
+    inner.setName(input); c.setName(input);
+    auto token = inner.getPortType(2);
+    inner.insertPorts({{4, PortInfo(b.getStringAttr("print_stream_0"), token, Direction::Out)}});
+    auto registry = b.getArrayAttr({b.getDictionaryAttr({
+        b.getNamedAttr("module", b.getStringAttr("PrintHost")),
+        b.getNamedAttr("stream", b.getStringAttr("print_stream_0"))})});
+    inner->setAttr("goldengate.printHostBindings", registry);
+    auto targets = b.getArrayAttr({
+        b.getStringAttr("~GGTracerVTriggerWrapper|GGTracerVTriggerWrapper>tracerv_stream.bits"),
+        b.getStringAttr("~GGTracerVTriggerWrapper|GGTracerVTriggerWrapper>print_stream_0.bits"),
+        b.getStringAttr("~GGTracerVTriggerWrapper|GGTracerVTriggerWrapper>hostClock")});
+    auto nested = b.getDictionaryAttr({b.getNamedAttr("targets", targets)});
+    auto annotation = b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
+        b.getNamedAttr("nested", nested)});
+    c->setAttr("rawAnnotations", b.getArrayAttr({annotation}));
+    StringRef selected = input, wrapper = output;
+    if (bad == 1) selected = "WrongTop";
+    if (bad == 2) wrapper = input;
+    if (bad == 3) wrapper = "";
+    if (bad == 4) wrapper = "GGTracerVStreamQueue6144";
+    if (bad == 5) c->removeAttr("rawAnnotations");
+    if (bad == 6) {
+      auto names = SmallVector<Attribute>(inner.getPortNames().begin(), inner.getPortNames().end());
+      names[4] = b.getStringAttr("tracerv_stream_count"); inner.setPortNames(names);
+    }
+    if (bad == 7) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(), b.getStringAttr(output), inner.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    std::string before = printed(*root), innerBefore = printed(inner), error;
+    auto result = goldengate::attachTracerVStreamQueue(c, selected, wrapper, error);
+    if (bad) require(failed(result) && !error.empty() && printed(*root) == before,
+                     "expanded queue rejection mutated IR");
+    else {
+      require(succeeded(result) && succeeded(verify(*root)), error);
+      require(printed(inner) == innerBefore && inner->getAttr("goldengate.printHostBindings") == registry,
+              "expanded queue changed Print host body/registry");
+      auto top = named(c, output); InstanceOp sim, fifo;
+      for (auto i : top.getOps<InstanceOp>()) if (i.getModuleName() == input) sim = i; else fifo = i;
+      require(sim && fifo && top.getNumPorts() == 6 && top.getPortName(5) == "tracerv_stream_count",
+              "expanded queue/count boundary differs");
+      bool printForwarded = false;
+      for (auto conn : top.getOps<ConnectOp>())
+        printForwarded |= conn.getDest() == top.getBodyBlock()->getArgument(4) && conn.getSrc() == sim.getResult(4);
+      require(printForwarded, "expanded Print stream not forwarded");
+      auto row = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]);
+      auto targets = row.getAs<DictionaryAttr>("nested").getAs<ArrayAttr>("targets");
+      const StringRef expected[]{
+          "~GGPrintTracerVStreamQueueWrapper|GGTracerVTriggerWrapper>tracerv_stream.bits",
+          "~GGPrintTracerVStreamQueueWrapper|GGPrintTracerVStreamQueueWrapper>print_stream_0.bits",
+          "~GGPrintTracerVStreamQueueWrapper|GGPrintTracerVStreamQueueWrapper>hostClock"};
+      for (unsigned i = 0; i < 3; ++i) require(cast<StringAttr>(targets[i]) == expected[i], "expanded recursive target differs");
+    }
+  }
+  llvm::outs() << "Expanded Print stream/registry forwarding and seven atomic queue rejections passed\n";
+}
 void rejection(MLIRContext &context) {
   for (unsigned bad = 0; bad < 6; ++bad) {
     auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin();
@@ -215,7 +279,7 @@ void rejection(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(context); mapping(context); rejection(context);
+    behavior(context); mapping(context); expandedMapping(context); rejection(context);
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

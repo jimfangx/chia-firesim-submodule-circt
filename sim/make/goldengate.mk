@@ -68,7 +68,8 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) 
 	cmake -S $(firesim_base_dir)/goldengate-circt -B $(goldengate_circt_build) -G Ninja \
 		-DCIRCT_DIR=$(GOLDENGATE_CIRCT_PREFIX)/lib/cmake/circt \
 		-DZLIB_ROOT=$(abspath $(GOLDENGATE_CIRCT_PREFIX)/..)
-	cmake --build $(goldengate_circt_build)
+	# Build the compiler here; CTest executables are built by focused validation.
+	cmake --build $(goldengate_circt_build) --target goldengate-circt
 	rm -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f
 	# A disabled rebuild must not retain a previous enabled build's ILA IP.
 	rm -f $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl $(GENERATED_DIR)/$(BASE_FILE_NAME).*.ipgen.tcl

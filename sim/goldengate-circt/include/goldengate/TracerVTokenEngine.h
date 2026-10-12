@@ -23,6 +23,10 @@ mlir::LogicalResult addTracerVTriggerConfig(circt::firrtl::CircuitOp circuit,
 // Buffer the sole Rocket CPU stream with its 6144-entry synchronous-read queue.
 mlir::LogicalResult addTracerVStreamQueue(circt::firrtl::CircuitOp circuit,
                                          std::string &error);
+// Attach the shared queue to an expanded boundary. Keep producer stream targets
+// on the inner module, transfer copied targets, and preserve other host modules.
+mlir::LogicalResult attachTracerVStreamQueue(circt::firrtl::CircuitOp circuit,
+    llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error);
 // Drain the buffered Rocket stream through the U250 CPU AXI read interface.
 mlir::LogicalResult addCPUStreamRead(circt::firrtl::CircuitOp circuit,
                                    std::string &error);
