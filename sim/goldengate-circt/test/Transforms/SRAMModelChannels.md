@@ -5628,3 +5628,64 @@ The recorded SFC fixture disables Print, so shared transport parity does not
 establish enabled-Print runtime parity. B buffering, host-memory/platform
 attachment and enabled-Print runtime remain pending. Next smallest step:
 attach and compare the selected native depth-two CPU B response queue.
+
+## Iteration 138: selected Print CPU B response buffering
+
+The iteration-137 harness passed CIRCT replacertl and Verilator bare, portable
+(90,141 checks) and Rocket (90,805 checks) workloads. The SFC UART-bearing
+runtime baseline remains pending. No FireSim manager verification step was
+started in this iteration.
+
+`--map-print-host-cpu-write-response-buffer` requires the selected R buffer
+stage and attaches `GGSelectedPrintCPUStreamWriteResponseBufferWrapper` plus
+`GGCPUStreamBQueue2` through FIRRTL operations. FPGATop's default AXI4Buffer
+and CPUManagedStreamEngine's zero-sink branch are the oracle: writer B valid
+stays zero, response is Okay, and ID comes from AW. Preserve the outer queue's
+RAM reads when invalid rather than bypassing storage with the live writer ID
+or response. The selected composition validates the preceding AW/AR geometry
+and live Print allocation, stages and verifies on a clone, then publishes only
+the new queue/wrapper and recursively transferred archive. Existing module,
+operation, SSA, port and allocated header identities are retained. The two
+allocated header emitters accept this new boundary and keep all live hierarchy,
+stream count and empty-writer checks. Hierarchy analyses must be rebuilt after
+wrapping; no annotations are added or consumed.
+
+Evidence: the mutable generated U250 directory
+`iteration138-print-cpu-write-response-buffer/`. Native compiler, Print binding,
+CPU managed stream header and B buffer targets build. Joint TracerV/Print and
+Print-only native replays emit
+`{candidate,compatibility}/post-print-cpu-write-response-buffer.{mlir,sv}` and
+`post-print-cpu-write-response-buffer-all.json`. The CLI rejects a missing R
+stage. Print binding, CPU managed stream header and B buffer CTests pass (3/3).
+Both selected B composition tests use the preserved iteration-137 R handoffs
+and pass thirteen atomic rejections, nested copied/consumed target transfers,
+unchanged module/operation identities and identical allocated headers. The
+shared focused AR and R branches also pass on the new joint replay handoffs.
+Each actual emitted B queue passes 20,400 interpreted cycles against an
+independent deque oracle: 7,878 pushes, 6,933 pops, 295 reset-time RAM writes,
+1,045 full-with-pop blocks and 1,499 empty-with-push blocks. A further 1,024
+zero-sink cycles preserve RAM contents and invalid payload reads through reset.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedCPUWriteResponseCompare.py` matches Queue_53, AXI4Buffer_2 and
+CPUManagedStreamEngine's B contracts: depth two, ID16/response2, control-only
+reset, zero valid/Okay writer and RAM reads when invalid. The generic native
+queue is identical to the baseline operation emitter and independently tested
+with traffic. All ten native B routes match; SFC specializes enqueue valid and
+response, exposing seven B routes. Joint TracerV/Print retains 101 prior module
+bodies and 89 ports (85 copied, 95 wrapper connections); Print-only retains 95
+bodies and 97 ports (93 copied, 103 connections). Four consumed B port targets
+stay on the retained inner module with the new circuit identity; all copied
+ports transfer outward. The complete annotation archive and other analysis
+metadata are retained. The report is `sfc-comparison.json`.
+
+Replay input is the primary immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, the iteration-67 selected
+Print annotations and native Rocket control catalog. Neither fixture was
+modified. Large intermediate FIRRTL/MLIR/RTL outputs are compressed; R/B and
+AW/W/AR handoffs used by comparisons and focused tests remain raw. The recorded
+fixture disables Print, so transport parity does not establish enabled-Print
+runtime parity. Host-memory/platform attachment and enabled-Print runtime remain
+pending. Next smallest step: attach the selected buffered CPU scalars to the
+native U250 aggregate AXI port adapter while preserving allocated collateral.

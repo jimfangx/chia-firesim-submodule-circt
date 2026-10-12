@@ -227,7 +227,8 @@ int main(int argc, char **argv) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(root) && succeeded(verify(*root)), "cannot parse verified Print CPU B boundary");
       auto c = *root->getOps<CircuitOp>().begin();
-      require(c.getName() == "GGPrintCPUStreamWriteResponseBufferWrapper", "wrong Print CPU B boundary");
+      require(c.getName() == "GGPrintCPUStreamWriteResponseBufferWrapper" ||
+              c.getName() == "GGSelectedPrintCPUStreamWriteResponseBufferWrapper", "wrong Print CPU B boundary");
       behavior(c); return 0;
     }
     require(argc == 1, "expected an optional Print CPU B boundary path");

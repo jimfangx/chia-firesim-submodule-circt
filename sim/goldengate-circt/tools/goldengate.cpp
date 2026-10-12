@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer]]]]]]]] "
+                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -406,7 +406,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostResponses = false;
   bool mapPrintHostMaster = false;
   bool mapPrintHostCPUWriteBuffer = false, mapPrintHostCPUReadBuffer = false;
-  bool mapPrintHostCPUResponseBuffer = false;
+  bool mapPrintHostCPUResponseBuffer = false, mapPrintHostCPUWriteResponseBuffer = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -426,6 +426,11 @@ int main(int argc, char **argv) {
         // standalone post-FAME binding boundary, without returning at import.
         materializePrintTokens = materializePrintControls =
             materializePrintHosts = bindPrintHostConstructors = true;
+        continue;
+      }
+      if (option == "--map-print-host-cpu-write-response-buffer") {
+        if (mapPrintHostCPUWriteResponseBuffer) return fail("duplicate --map-print-host-cpu-write-response-buffer");
+        mapPrintHostCPUWriteResponseBuffer = true;
         continue;
       }
       if (option == "--map-print-host-cpu-response-buffer") {
@@ -524,6 +529,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-cpu-read-buffer requires --map-print-host-cpu-write-buffer");
   if (mapPrintHostCPUResponseBuffer && !mapPrintHostCPUReadBuffer)
     return fail("--map-print-host-cpu-response-buffer requires --map-print-host-cpu-read-buffer");
+  if (mapPrintHostCPUWriteResponseBuffer && !mapPrintHostCPUResponseBuffer)
+    return fail("--map-print-host-cpu-write-response-buffer requires --map-print-host-cpu-response-buffer");
   ilaOptions.outputBaseFilename = outputBase.str();
   if (auto error = llvm::sys::fs::create_directories(outputDir))
     return fail("cannot create output directory: " + error.message());
@@ -774,6 +781,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, readRTL, error)))
           return fail("PrintBridge CPU R output: " + error);
         llvm::outs() << "Buffered selected Print CPU R with an independent depth-two native queue in " << readIR << '\n';
+      }
+      if (mapPrintHostCPUWriteResponseBuffer) {
+        if (failed(goldengate::mapPrintBridgeCPUStreamWriteResponseBuffer(circuit, hosts, error)))
+          return fail("PrintBridge CPU B buffer: " + error);
+        llvm::SmallString<256> readIR(outputDir), readRTL(outputDir), readAnnos(outputDir);
+        llvm::sys::path::append(readIR, "post-print-cpu-write-response-buffer.mlir");
+        llvm::sys::path::append(readRTL, "post-print-cpu-write-response-buffer.sv");
+        llvm::sys::path::append(readAnnos, "post-print-cpu-write-response-buffer-all.json");
+        llvm::raw_fd_ostream readOut(readIR, ec);
+        if (ec) return fail("cannot write Print CPU B MLIR: " + ec.message());
+        module->print(readOut); readOut << '\n'; readOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, readAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, readRTL, error)))
+          return fail("PrintBridge CPU B output: " + error);
+        llvm::outs() << "Buffered selected Print CPU B with an independent depth-two native queue in " << readIR << '\n';
       }
       return 0;
     }

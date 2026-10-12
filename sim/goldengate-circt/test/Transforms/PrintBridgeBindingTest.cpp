@@ -6015,16 +6015,19 @@ int main(int argc, char **argv) {
       nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
     }
     if (argc == 3 && (StringRef(argv[1]) == "--selected-print-cpu-read-buffer" ||
-                      StringRef(argv[1]) == "--selected-print-cpu-response-buffer")) {
+                      StringRef(argv[1]) == "--selected-print-cpu-response-buffer" ||
+                      StringRef(argv[1]) == "--selected-print-cpu-write-response-buffer")) {
+      bool writeResponse = StringRef(argv[1]) == "--selected-print-cpu-write-response-buffer";
       bool response = StringRef(argv[1]) == "--selected-print-cpu-response-buffer";
-      const StringRef inner = response ? "GGSelectedPrintCPUStreamReadBufferWrapper" :
+      const StringRef inner = writeResponse ? "GGSelectedPrintCPUStreamResponseBufferWrapper" : response ? "GGSelectedPrintCPUStreamReadBufferWrapper" :
                                         "GGSelectedPrintCPUStreamWriteBufferWrapper";
-      const StringRef outer = response ? "GGSelectedPrintCPUStreamResponseBufferWrapper" :
+      const StringRef outer = writeResponse ? "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" : response ? "GGSelectedPrintCPUStreamResponseBufferWrapper" :
                                         "GGSelectedPrintCPUStreamReadBufferWrapper";
-      const StringRef dataPort = response ? "cpu_stream_r_bits_data" : "cpu_stream_ar_bits_addr";
-      const StringRef validPort = response ? "cpu_stream_r_valid" : "cpu_stream_ar_valid";
+      const StringRef dataPort = writeResponse ? "cpu_stream_b_bits_id" : response ? "cpu_stream_r_bits_data" : "cpu_stream_ar_bits_addr";
+      const StringRef validPort = writeResponse ? "cpu_stream_b_valid" : response ? "cpu_stream_r_valid" : "cpu_stream_ar_valid";
       auto map = [&](CircuitOp circuit, ArrayRef<FModuleOp> hosts, std::string &error) {
-        return response ? goldengate::mapPrintBridgeCPUStreamResponseBuffer(circuit, hosts, error) :
+        return writeResponse ? goldengate::mapPrintBridgeCPUStreamWriteResponseBuffer(circuit, hosts, error) :
+               response ? goldengate::mapPrintBridgeCPUStreamResponseBuffer(circuit, hosts, error) :
                           goldengate::mapPrintBridgeCPUStreamReadBuffer(circuit, hosts, error);
       };
       const StringRef probes[]{validPort, dataPort, "hostClock", "ctrl.aw.bits.addr",
@@ -6060,7 +6063,7 @@ int main(int argc, char **argv) {
         } else if (bad < 8) {
           SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
           names[port(top, dataPort)] = b.getStringAttr(bad == 6 ?
-              "missing_cpu_payload" : (response ? "cpu_stream_r_unsupported" : "cpu_stream_ar_unsupported"));
+              "missing_cpu_payload" : (writeResponse ? "cpu_stream_b_unsupported" : response ? "cpu_stream_r_unsupported" : "cpu_stream_ar_unsupported"));
           top.setPortNames(names);
         } else if (bad == 8) {
           named(tc, "GGCPUStreamRead")->removeAttr("goldengate.sourceStreams");
@@ -6116,7 +6119,7 @@ int main(int argc, char **argv) {
       auto before = dump(*source);
       require(failed(map(c, hostsFor(c), error)) &&
           dump(*source) == before, "selected Print CPU buffer repeat changed IR");
-      llvm::outs() << "PASS selected Print " << (response ? "R response" : "independent AR") << " queue and unchanged allocated headers, 13 atomic rejections, retained SSA/module identities and recursive targets\n";
+      llvm::outs() << "PASS selected Print " << (writeResponse ? "B response" : response ? "R response" : "independent AR") << " queue and unchanged allocated headers, 13 atomic rejections, retained SSA/module identities and recursive targets\n";
       return 0;
     }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-cpu-write-buffer") {
