@@ -18,6 +18,9 @@
 #include "goldengate/TracerVHeader.h"
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/FASEDHeader.h"
+#include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/AnnotationClasses.h"
+#include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
 
 using namespace mlir;
@@ -42,7 +45,60 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
       error = name.str() + " driver header: " + error; return failure();
     }
   }
-  if (failed(prepareCPUManagedStreamHeader(*staged, error))) return failure();
+  FModuleOp printWrapper;
+  for (auto m : staged->getOps<FModuleOp>()) if (m.getName() == "GGPrintBridgeHostWrapper") printWrapper = m;
+  bool hasPrint = bool(printWrapper);
+  for (auto row : raw) {
+    auto d = dyn_cast<DictionaryAttr>(row);
+    if (d && d.getAs<StringAttr>("class") == AnnotationClasses::BridgeIO &&
+        d.getAs<StringAttr>("widgetClass") == AnnotationClasses::PrintBridgeModule) hasPrint = true;
+  }
+  if (!hasPrint) {
+    if (failed(prepareCPUManagedStreamHeader(*staged, error))) return failure();
+  } else {
+    auto bindings = printWrapper ? printWrapper->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr();
+    if (!bindings || bindings.empty()) return reject("Rocket Print driver needs the complete bound host catalog");
+    SmallVector<FModuleOp> hosts;
+    for (auto row : bindings) {
+      auto d = dyn_cast<DictionaryAttr>(row); auto name = d ? d.getAs<StringAttr>("hostModule") : StringAttr();
+      FModuleOp host;
+      if (name) for (auto m : staged->getOps<FModuleOp>()) if (m.getName() == name) {
+        if (host) return reject("Rocket Print driver has ambiguous host definitions"); host = m;
+      }
+      if (!host) return reject("Rocket Print driver host is missing from the live catalog");
+      hosts.push_back(host);
+    }
+    std::string fragment, decoder;
+    if (failed(preparePrintBridgeAllocatedHeader(*staged, hosts, fragment, error)) ||
+        failed(preparePrintBridgeDecoderHeader(*staged, hosts, decoder, error))) return failure();
+    // Embed the decoder under GET_INCLUDES so the ordinary OutputFile emitter
+    // needs no special filename or driver build dependency. This header is
+    // included again under each constructor phase, so omit its pragma once.
+    StringRef include = "#include \"print-bridge-decoders.h\"";
+    auto position = fragment.find(include.str());
+    auto pragma = decoder.find("#pragma once\n");
+    if (position == std::string::npos || pragma == std::string::npos)
+      return reject("Rocket Print decoder/constructor header contract differs");
+    decoder.erase(pragma, StringRef("#pragma once\n").size());
+    fragment.replace(position, include.size(),
+        "#ifndef GOLDENGATE_PRINT_BRIDGE_DECODERS\n#define GOLDENGATE_PRINT_BRIDGE_DECODERS\n" +
+        decoder + "#endif // GOLDENGATE_PRINT_BRIDGE_DECODERS");
+    OpBuilder b(circuit.getContext());
+    auto annotations = staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> updated(annotations.begin(), annotations.end()); bool found = false;
+    for (auto &row : updated) {
+      auto d = dyn_cast<DictionaryAttr>(row); auto suffix = d ? d.getAs<StringAttr>("fileSuffix") : StringAttr();
+      if (!d || d.getAs<StringAttr>("class") != AnnotationClasses::OutputFile || !suffix || suffix != ".const.h") continue;
+      auto body = d.getAs<StringAttr>("body");
+      if (found || !body || d.get("goldengate.cpuManagedStreamHeader") || d.get("goldengate.printBridgeHeader"))
+        return reject("Rocket Print driver requires one unextended CPU/Print header");
+      found = true; NamedAttrList output(d); output.set("body", b.getStringAttr(body.getValue().str() + fragment));
+      output.set("goldengate.cpuManagedStreamHeader", b.getBoolAttr(true));
+      output.set("goldengate.printBridgeHeader", b.getBoolAttr(true)); row = output.getDictionary(circuit.getContext());
+    }
+    if (!found) return reject("Rocket Print driver interface header is missing");
+    staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(updated));
+  }
   // This final emitter can still reject a stale memory allocation. Even such
   // a late failure must leave the original interface header and archive intact.
   if (failed(prepareFASEDHeader(*staged, error))) return failure();

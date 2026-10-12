@@ -4769,3 +4769,80 @@ new Print bases 544/576 and CPU counts 624/628/632 versus SFC's single count at
 passing replays; no immutable artifact was modified.
 No FireSim manager verification gate was started. Enabled-Print production
 ingestion/runtime and the SFC UART-bearing differential remain pending.
+
+### Complete expanded Rocket/Print driver transaction (iteration 123)
+
+`prepareLoadMemHeader` now resolves the direct expanded LoadMem engine's live
+writer, packing FIFO, read request queue, unpacking FIFO and register bank by
+instance identity. Catalog prefixes remain intact. The emitter validates the
+nine public decoded MCR slots, both directions of the bank/vector connections,
+byte strobes, shared host clock/reset, writer completion, data handshakes,
+read-address acknowledgement and physical AXI connections through FIRRTL SSA.
+It rejects conflicting declared/SSA MCR types and eight-word vectors before
+publishing collateral. Native wrapper validation remains in place.
+
+`prepareRocketDriverHeaders` now composes the expanded Print factories and CPU
+stream descriptors with all eleven native constructors on the same private
+circuit clone. Inline Print decoders are embedded in the ordinary `.const.h`
+under GET_INCLUDES and a decoder include guard; a separate decoder file and
+driver build dependency are unnecessary. The original circuit's annotations
+are published only after the final FASED emitter succeeds. Print host, clock,
+stream and register failures must leave hardware, the semantic/opaque archive
+and the original interface header unchanged.
+
+Reproduce native and complete expanded outputs with the iteration-122 replay
+commands above. The expanded command now emits complete
+`FireSim-generated.const.h`, `.const.vh` and `.defines.vh`; it replaces the
+earlier focused TracerV/Print fragment output. The replay still explicitly
+imports native TracerV BridgeIO/ChannelClockInfo into the TEST fixture and
+requires unseeded TracerV emission to reject. This import is not a production
+replacement for clock analysis.
+
+`PrintRocketLoadMemHeaderCompare.py EXPANDED_IR HEADER NATIVE_IR NATIVE_HEADER
+GOLDEN REPORT` compares actual direct engine connections and five live helper
+bodies, all nine LoadMem addresses, the 64/32-bit chunk ABI, complete constructor
+presence, native struct allocations and interface bus widths.
+`PrintRocketAllocatedHeaderCompare.py` additionally checks both Print banks,
+three CPU stream descriptors, the unchanged large-bank prefix and the SFC
+queue/count/DMA contract.
+
+Exact read-only oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+The relevant boundaries are LoadMemWidget, LoadMemWriter, NastiRouter,
+Nasti2AXI4IdentityModule, Arbiter, Queue_27, CPUManagedStreamEngine and F1Shim.
+The oracle disables Print: new Print bases 544/576, CPU counts 624/628/632 and
+the shifted small-bank tail are expected catalog differences; LoadMem remains
+at 384 with 64 bytes reserved and two 32-bit data chunks per memory beat.
+
+Validation: production compiler and both focused binaries build. Five focused
+CTest cases pass. Native replay passes eight atomic transaction rejections;
+each expanded ordering passes eleven direct LoadMem, four TracerV and seven
+complete transaction rejections, including a failure in the final FASED emitter.
+An initial malformed MCR-type negative exposed a missing declared/SSA type
+check; the corrected emitter rejects both inconsistent types and a consistently
+typed eight-word vector. Final replay and comparison logs pass.
+
+Both expanded headers match the SFC LoadMem boundary's sixteen memory ports,
+75 widget equations, sixteen identity conversion routes, depth-two request
+queue and queued-write priority over zero fill. All 80 direct CIRCT engine
+connections and five unchanged live helper bodies agree with the native/SFC
+contract. The nine addresses are 384 through 416 in four-byte steps. Native
+comparison matches eleven regions and nine bus widths; expanded comparison
+matches the eight unchanged regions and records the expected Print/count
+allocation differences. LoadMem and TracerV constructor text is identical to
+native in both orderings. Native `.const.h`, `.const.vh` and `.defines.vh`
+remain byte-identical to iteration 122. All three complete headers compile
+against actual driver includes with `-std=c++20 -Wall -Wextra -Werror
+-fsyntax-only` under the standard GET_* phases.
+
+Evidence: generated U250 directory `iteration123-print-rocket-collateral/`,
+containing native/forward/reverse complete collateral, replay and C++ compile
+logs, native comparison JSON, and both LoadMem/allocation comparison JSONs;
+compiler build log is `iteration123-final-build.log`. No immutable fixture was
+modified and no manager verification gate was started.
+
+Next smallest step: connect production enabled-Print ingestion to the expanded
+assembly, preserving actual retained TracerV/Print clock analysis through that
+path, then invoke this complete transactional header API. Enabled-Print runtime
+and the SFC UART-bearing differential remain pending; this milestone completes
+the expanded boundary's driver collateral, not the overall compiler port.

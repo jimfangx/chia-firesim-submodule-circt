@@ -3,6 +3,7 @@
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/RocketDriverHeader.h"
+#include "goldengate/LoadMemHeader.h"
 #include "goldengate/TracerVHeader.h"
 #include "goldengate/MetasimInterfaceHeader.h"
 #include "goldengate/AnnotationEmission.h"
@@ -2336,14 +2337,47 @@ void rocketDriverHeaders(Fixture &f, StringRef directory, StringRef nativeBounda
   auto interface = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   for (unsigned i = raw.size(); i < interface.size(); ++i) annotations.push_back(interface[i]);
   f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
-  // The whole driver must still reject this expanded boundary: LoadMem's
-  // shared engine has not yet been ported to the native header contract.
   auto original = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto baseline = dump(*f.root);
-  require(failed(goldengate::prepareRocketDriverHeaders(f.circuit, error)) &&
-      error.find("LoadMem") != std::string::npos && dump(*f.root) == baseline,
-      "expanded driver composition omitted the unresolved LoadMem contract");
-  llvm::outs() << "Expanded composition remains atomic at the LoadMem mismatch: " << error << '\n';
+  for (unsigned bad = 0; bad < 6; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin();
+    auto wrapper = named(c,"GGPrintBridgeHostWrapper");
+    if (bad == 0) wrapper->removeAttr("goldengate.printHostBindings");
+    if (bad == 1) {
+      auto rows = llvm::to_vector(wrapper->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"));
+      NamedAttrList first(cast<DictionaryAttr>(rows[0])); first.set("hostModule",b.getStringAttr("MissingPrintHost"));
+      rows[0] = first.getDictionary(ctx); wrapper->setAttr("goldengate.printHostBindings",b.getArrayAttr(rows));
+    }
+    if (bad == 2) {
+      auto transport = named(c,"GGCPUStreamRead");
+      auto rows = llvm::to_vector(transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams"));
+      NamedAttrList first(cast<DictionaryAttr>(rows[1])); first.set("port",b.getStringAttr("wrong_print_stream"));
+      rows[1] = first.getDictionary(ctx); transport->setAttr("goldengate.sourceStreams",b.getArrayAttr(rows));
+    }
+    if (bad == 3) {
+      auto rows = llvm::to_vector(c->getAttrOfType<ArrayAttr>("rawAnnotations"));
+      for (auto &row : rows) {
+        auto d = cast<DictionaryAttr>(row);
+        if (d.getAs<StringAttr>("class") == goldengate::AnnotationClasses::BridgeIO &&
+            d.getAs<StringAttr>("widgetClass") == goldengate::AnnotationClasses::PrintBridgeModule) {
+          NamedAttrList changed(d); changed.erase("clockInfo"); row = changed.getDictionary(ctx); break;
+        }
+      }
+      c->setAttr("rawAnnotations",b.getArrayAttr(rows));
+    }
+    if (bad == 4) {
+      auto host = collect(c)[0]; auto info = host->getAttrOfType<DictionaryAttr>("goldengate.printHost");
+      auto config = named(c,info.getAs<StringAttr>("configModule").getValue());
+      auto rows = llvm::to_vector(config->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      NamedAttrList first(cast<DictionaryAttr>(rows[0])); first.set("offset",b.getI32IntegerAttr(4));
+      rows[0] = first.getDictionary(ctx); config->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+    }
+    if (bad == 5) named(c,"GGFASEDTokenEngine")->removeAttr("goldengate.bridgeConstructor");
+    auto saved = dump(*test); error.clear();
+    require(failed(goldengate::prepareRocketDriverHeaders(c,error)) && !error.empty() && dump(*test) == saved,
+        "expanded driver transaction rejection " + std::to_string(bad));
+  }
   for (unsigned bad = 0; bad < 4; ++bad) {
     OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
     auto c = *test->getOps<CircuitOp>().begin(); auto transport = named(c, "GGCPUStreamRead");
@@ -2369,28 +2403,61 @@ void rocketDriverHeaders(Fixture &f, StringRef directory, StringRef nativeBounda
     require(failed(goldengate::prepareTracerVHeader(c, error)) && !error.empty() && dump(*test) == saved,
         "expanded TracerV identity/selector rejection " + std::to_string(bad));
   }
-  require(succeeded(goldengate::prepareTracerVHeader(f.circuit, error)), error);
+  for (unsigned bad = 0; bad < 11; ++bad) {
+    OwningOpRef<ModuleOp> test(cast<ModuleOp>(f.root->clone()));
+    auto c = *test->getOps<CircuitOp>().begin(); auto engine = named(c,"GGPrintLoadMemEngine");
+    InstanceOp pack, writer, requests;
+    for (auto i : engine.getOps<InstanceOp>()) {
+      if (i.getName() == "write_data") pack = i;
+      if (i.getName() == "writer") writer = i;
+      if (i.getName() == "read_requests") requests = i;
+    }
+    require(pack && writer && requests, "direct LoadMem fixture helpers absent");
+    if (bad == 0) pack.setNameAttr(b.getStringAttr("missing_write_data"));
+    if (bad == 1) { b.setInsertionPointToStart(engine.getBodyBlock()); b.create<InstanceOp>(c.getLoc(),named(c,pack.getModuleName()),"duplicate_pack"); }
+    if (bad == 2) named(c,pack.getModuleName())->setAttr("goldengate.inputWidth",b.getI32IntegerAttr(64));
+    if (bad == 3 || bad == 5 || bad == 6 || bad == 7)
+      for (auto conn : engine.getOps<StrictConnectOp>()) {
+        Value destination = bad == 3 ? pack.getResult(3) : bad == 5 ? pack.getResult(0) :
+                            bad == 6 ? requests.getResult(12) : writer.getResult(10);
+        if (conn.getDest() == destination) conn->setOperand(1,engine.getArgument(bad == 5 ? 1 : 17));
+      }
+    if (bad == 4) for (auto index : engine.getOps<SubindexOp>()) {
+      auto field = index.getInput().getDefiningOp<SubfieldOp>();
+      if (field && field.getInput() == engine.getArgument(2) && field.getFieldName() == "write" && index.getIndex() == 0) {
+        index->setAttr("index",b.getI32IntegerAttr(1)); break;
+      }
+    }
+    if (bad == 8) {
+      auto helper = named(c,pack.getModuleName());
+      auto types = llvm::to_vector(helper.getPortTypes()); types.pop_back(); helper.setPortTypes(types);
+    }
+    if (bad == 9 || bad == 10) {
+      auto types = llvm::to_vector(engine.getPortTypes());
+      auto mcr = cast<BundleType>(engine.getPortType(2)); auto elements = llvm::to_vector(mcr.getElements());
+      elements[0].type = FVectorType::get(cast<FVectorType>(elements[0].type).getElementType(),8);
+      types[2] = TypeAttr::get(BundleType::get(ctx,elements)); engine.setPortTypes(types);
+      if (bad == 10) engine.getArgument(2).setType(BundleType::get(ctx,elements));
+    }
+    auto saved = dump(*test);
+    require(failed(goldengate::prepareLoadMemHeader(c,error)) && !error.empty() && dump(*test) == saved,
+        "direct LoadMem rejection " + std::to_string(bad));
+  }
+  require(succeeded(goldengate::prepareRocketDriverHeaders(f.circuit, error)), error);
   auto updated = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   f.circuit->setAttr("rawAnnotations", original);
-  require(dump(*f.root) == baseline, "TracerV header changed hardware");
+  require(dump(*f.root) == baseline, "expanded driver headers changed hardware");
   f.circuit->setAttr("rawAnnotations", updated);
-  std::string header, decoders;
-  auto hosts = collect(f.circuit);
-  require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, hosts, header, error)) &&
-      succeeded(goldengate::preparePrintBridgeDecoderHeader(f.circuit, hosts, decoders, error)), error);
-  require(succeeded(goldengate::emitOutputFiles(f.circuit, directory, "FireSim-generated", error)), error);
-  // Emit a reviewable TracerV/Print/CPU fragment pair. The whole-platform API
-  // above rejects; these focused files are not a complete production driver.
-  for (auto row : updated) {
+  for (auto row : original) {
     auto d = cast<DictionaryAttr>(row);
-    auto suffix = d.getAs<StringAttr>("fileSuffix");
-    if (suffix && suffix == ".const.h") header = d.getAs<StringAttr>("body").getValue().str() + header;
+    if (d.getAs<StringAttr>("class") != goldengate::AnnotationClasses::OutputFile)
+      require(llvm::is_contained(updated,row),"expanded driver lost semantic/opaque annotation");
   }
-  for (auto [name, body] : {std::pair<StringRef,StringRef>{"tracerv-print.const.h", header}, {"print-bridge-decoders.h", decoders}}) {
-    std::error_code ec; llvm::raw_fd_ostream file((directory + "/" + name).str(), ec);
-    require(!ec, "cannot write focused expanded header"); file << body;
-  }
-  llvm::outs() << "PASS expanded TracerV/Print/CPU fragments, four selector/identity rejections and atomic incomplete-driver rejection\n";
+  auto saved = dump(*f.root);
+  require(failed(goldengate::prepareRocketDriverHeaders(f.circuit,error)) && dump(*f.root) == saved,
+      "duplicate expanded driver transaction");
+  require(succeeded(goldengate::emitOutputFiles(f.circuit, directory, "FireSim-generated", error)), error);
+  llvm::outs() << "PASS complete expanded Rocket/Print driver, eleven LoadMem and four TracerV atomic rejections, seven atomic composition rejections and preserved hardware/archive\n";
 }
 
 void rocketNativeDriverHeaders(CircuitOp c, ModuleOp root, StringRef directory) {
