@@ -22,10 +22,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0, bool selected = false) {
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDTokenWrapper\" { firrtl.module @GGFASEDTokenWrapper() {} } }", &ctx);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
+  if (selected) c.setName("GGSelectedPrintFASEDTokenWrapper");
   OpBuilder b(c.getBodyBlock(), c.getBodyBlock()->begin()); auto bit = UIntType::get(&ctx, 1, false);
   auto readiness = BundleType::get(&ctx, {{b.getStringAttr("readValid"), false, bit},
       {b.getStringAttr("writeValid"), false, bit}, {b.getStringAttr("hostMemIdle"), false, bit}});
@@ -47,11 +48,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0) {
   if (mode == 9) { b.setInsertionPointToStart(inner.getBodyBlock()); b.create<InstanceOp>(c.getLoc(), inner, "used"); }
   if (mode == 10) c.setName("other");
   SmallVector<Attribute> raw;
-  for (auto suffix : {"", "|GGFASEDTokenWrapper>other", "|GGFASEDTokenWrapper>fased_readiness",
-      "|GGFASEDTokenWrapper>fased_readiness.readValid", "|GGFASEDTokenWrapper>fased_readiness.writeValid",
-      "|GGFASEDTokenWrapper>fased_readiness.hostMemIdle", "|GGFASEDTokenEngine"})
+  const std::string prefix = "~" + c.getName().str();
+  const std::string modulePrefix = "|" + c.getName().str() + ">";
+  const std::string suffixes[]{"", modulePrefix + "other", modulePrefix + "fased_readiness",
+      modulePrefix + "fased_readiness.readValid", modulePrefix + "fased_readiness.writeValid",
+      modulePrefix + "fased_readiness.hostMemIdle", "|GGFASEDTokenEngine"};
+  for (const auto &suffix : suffixes)
     raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
-        b.getNamedAttr("target", b.getStringAttr(std::string("~GGFASEDTokenWrapper") + suffix))}));
+        b.getNamedAttr("target", b.getStringAttr(prefix + suffix))}));
   if (mode != 11) c->setAttr("rawAnnotations", b.getArrayAttr(raw));
   return root;
 }
@@ -131,8 +135,10 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void behavior(MLIRContext &ctx, bool selected) {
+  const std::string old = selected ? "GGSelectedPrintFASEDTokenWrapper" : "GGFASEDTokenWrapper";
+  const std::string top = selected ? "GGSelectedPrintFASEDHostOutstandingWrapper" : "GGFASEDHostOutstandingWrapper";
+  auto root = fixture(ctx, 0, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDHostOutstanding(c, error)), error);
   require(succeeded(verify(*root)), "invalid FASED host outstanding IR");
   Interpreter sim(named(c, "GGFASEDHostOutstanding")); unsigned cases = 0;
@@ -158,7 +164,7 @@ void behavior(MLIRContext &ctx) {
       require(sim.state[state[1]].getZExtValue() == next(writes, f(5)&&f(6), f(7)&&f(8)), "write counter differs");
       ++cases;
     }
-  auto wrapper = named(c, "GGFASEDHostOutstandingWrapper"); Interpreter wired(wrapper);
+  auto wrapper = named(c, top); Interpreter wired(wrapper);
   InstanceOp inner, counter; for (auto i : wrapper.getOps<InstanceOp>()) { if (i.getName() == "sim") inner = i; else counter = i; }
   require(wrapper.getPorts().size() == 7, "wrapper boundary port count differs");
   for (unsigned flags = 0; flags < 8192; ++flags) {
@@ -175,26 +181,26 @@ void behavior(MLIRContext &ctx) {
     require(wired.output(inner.getResult(2), "writeValid").getBoolValue() == bool(f(2)), "write readiness differs");
     require(wired.output(wired.arg(5), "").getBoolValue() == bool(f(3)) && wired.output(wired.arg(6), "").getBoolValue() == bool(f(4)), "host status boundary differs");
   }
-  const llvm::StringRef targets[]{"~GGFASEDHostOutstandingWrapper", "~GGFASEDHostOutstandingWrapper|GGFASEDHostOutstandingWrapper>other",
-      "~GGFASEDHostOutstandingWrapper|GGFASEDTokenWrapper>fased_readiness",
-      "~GGFASEDHostOutstandingWrapper|GGFASEDHostOutstandingWrapper>fased_egress_readiness.readValid",
-      "~GGFASEDHostOutstandingWrapper|GGFASEDHostOutstandingWrapper>fased_egress_readiness.writeValid",
-      "~GGFASEDHostOutstandingWrapper|GGFASEDHostOutstandingWrapper>fased_host_mem_idle",
-      "~GGFASEDHostOutstandingWrapper|GGFASEDTokenEngine"};
+  const std::string targets[]{"~" + top, "~" + top + "|" + top + ">other",
+      "~" + top + "|" + old + ">fased_readiness",
+      "~" + top + "|" + top + ">fased_egress_readiness.readValid",
+      "~" + top + "|" + top + ">fased_egress_readiness.writeValid",
+      "~" + top + "|" + top + ">fased_host_mem_idle",
+      "~" + top + "|GGFASEDTokenEngine"};
   auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(raw.size() == 7, "annotation classes lost");
   for (unsigned i = 0; i < 7; ++i) require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue() == targets[i], "annotation target differs");
   llvm::outs() << cases << " host counter transitions and 8192 boundary cases passed\n";
 }
-void rejection(MLIRContext &ctx) {
+void rejection(MLIRContext &ctx, bool selected) {
   for (unsigned mode = 1; mode <= 11; ++mode) {
-    auto root = fixture(ctx, mode); auto c = *root->getOps<CircuitOp>().begin(); std::string before, after, error;
+    auto root = fixture(ctx, mode, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string before, after, error;
     { llvm::raw_string_ostream out(before); root->print(out); }
     require(failed(goldengate::addFASEDHostOutstanding(c, error)) && !error.empty(), "malformed boundary accepted");
     { llvm::raw_string_ostream out(after); root->print(out); }
     require(before == after, "rejection mutated circuit");
   }
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto root = fixture(ctx, 0, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDHostOutstanding(c, error)), error);
   require(failed(goldengate::addFASEDHostOutstanding(c, error)), "repeated pass accepted");
   llvm::outs() << "11 atomic preflight rejections and repeated pass rejection passed\n";
@@ -202,6 +208,6 @@ void rejection(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { behavior(ctx); rejection(ctx); } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
+  try { for (bool selected : {false, true}) { behavior(ctx, selected); rejection(ctx, selected); } } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
   return 0;
 }

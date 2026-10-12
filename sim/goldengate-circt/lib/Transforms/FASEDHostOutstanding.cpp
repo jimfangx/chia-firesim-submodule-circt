@@ -17,9 +17,10 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDHostOutstanding(CircuitOp circuit, std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDHostOutstanding";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDHostOutstandingWrapper";
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDTokenWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDHostOutstandingWrapper" : "GGFASEDHostOutstandingWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDTokenWrapper")
+  if (!selected && circuit.getName() != "GGFASEDTokenWrapper")
     return reject("FASED host outstanding needs the active FASED token wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {

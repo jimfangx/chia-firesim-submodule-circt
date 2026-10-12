@@ -5796,3 +5796,55 @@ ingress capacity, timing and response readiness remain exposed. Next smallest
 step: attach the native host-outstanding counters to this selected boundary,
 then the AW/W/AR ingress queues, preserving CPU and live allocated collateral.
 Manager verification remains harness-owned; no manager gate was started here.
+
+### Iteration 141: selected Print FASED host-memory counters
+
+`mapPrintBridgeFASEDHostOutstanding` now composes the shared native saturating
+counters onto `GGSelectedPrintFASEDTokenWrapper`, producing
+`GGSelectedPrintFASEDHostOutstandingWrapper`. The CLI exposes this stage with
+`--map-print-host-fased-outstanding`, requiring `--map-print-host-fased-tokens`.
+Live allocated Print/optional TracerV collateral is checked before staging;
+verified additions and recursive target transfers are published atomically.
+Existing module/operation identities are retained. The CPU aggregate and all
+other copied ports retain their routes. Host AR/AW handshakes increment the
+four-bit read/write counters, last-R/B handshakes decrement them, and host
+reset clears them. Their maximum is the recorded constructor's ten requests.
+Target reset neither clears nor gates these counters: the token engine waits
+for their combined idle status. Egress readiness and host transactions remain
+explicit boundary inputs.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration141-print-fased-outstanding`.
+Native build and three targeted CTest suites passed: Print binding, CPU-managed
+stream headers and FASED host outstanding. Counter tests cover 262144 native
+state/handshake/reset transitions and 8192 boundary cases in each of the legacy
+and selected fixtures, plus eleven atomic malformed rejections and a repeat
+rejection per fixture. Focused selected composition tests pass on both the
+Print/TracerV and Print-only boundaries, preserving allocated headers and
+module/SSA identities, with nine atomic malformed/repeat rejections per case.
+Both complete native CLI replays emitted verified MLIR, annotation archives
+and simulator RTL. CLI predecessor preflight passed. The comparison test's
+type spelling and grouped SV port parsing were corrected during validation.
+
+Exact immutable golden comparison:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+modules `FASEDMemoryTimingModel` and `SatUpDownCounter_1`.
+`PrintSelectedFASEDOutstandingCompare.py` passes counter width/max, increment
+and decrement events, saturation/reset structure, idle/read-inflight and target
+reset readiness. The SFC fixture specializes host R/B ready to true; the native
+boundary retains those inputs. Candidate counters match the native
+`circt-ingestion/post-fame-fased-host-outstanding.mlir` helper operations and
+retain both four-bit states and status/count outputs in emitted SV. Joint and
+compatibility candidates preserve respectively 107/101 prior modules, 60/68
+copied ports, 68/76 wrapper connections and all 1713 annotation rows with the
+intended recursive target transfer. Report: `sfc-comparison.json`.
+
+Replay input is the primary immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected iteration-67 Print
+annotations and the native Rocket control catalog. Neither golden was modified.
+Intermediate outputs are compressed after comparison; token/counter MLIR,
+annotation archives and counter SV remain raw. The golden disables Print, so
+these results establish shared FASED semantics, not enabled-Print runtime parity.
+Next smallest step: attach the native AW/W/AR ingress queues, preserving host
+counters, CPU ports and live allocated collateral. Manager verification remains
+harness-owned; no manager gate was started here.

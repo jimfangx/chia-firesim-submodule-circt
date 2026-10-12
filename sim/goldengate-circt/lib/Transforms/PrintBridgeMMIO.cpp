@@ -2288,6 +2288,34 @@ LogicalResult goldengate::mapPrintBridgeFASEDTokens(CircuitOp circuit,
   return success();
 }
 
+// Oracle: FASEDMemoryTimingModel host-memory counters, independent of target reset.
+// The selected live registry is retained; only the counter wrapper/helper and
+// recursively transferred endpoint annotations are published. Analyses invalid.
+LogicalResult goldengate::mapPrintBridgeFASEDHostOutstanding(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDTokenWrapper") {
+    error = "selected Print FASED counters require the completed token boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDHostOutstanding(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED counters produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintFASEDHostOutstandingWrapper" ||
+          m.getName() == "GGFASEDHostOutstanding")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(

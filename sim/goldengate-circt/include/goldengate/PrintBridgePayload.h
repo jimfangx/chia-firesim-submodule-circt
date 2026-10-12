@@ -165,6 +165,11 @@ mlir::LogicalResult mapPrintBridgeRocketBlockDev(
 mlir::LogicalResult mapPrintBridgeFASEDTokens(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+// Attach host-reset-only saturating read/write counters after selected tokens.
+// Preserve prior modules/SSA and revalidate the live allocated driver header.
+mlir::LogicalResult mapPrintBridgeFASEDHostOutstanding(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.
