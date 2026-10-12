@@ -6014,6 +6014,81 @@ int main(int argc, char **argv) {
     if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
       nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-tokens") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected CPU platform boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      for (unsigned bad = 0; bad < 13; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        if (bad == 0) tc.setName("Wrong");
+        else if (bad == 1) tc->removeAttr("rawAnnotations");
+        else if (bad == 2) hs.clear();
+        else if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        else if (bad == 4 || bad == 5) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr(bad == 4 ? "GGFASEDTokenEngine" : "GGSelectedPrintFASEDTokenWrapper"),
+              named(tc, "GGSelectedPrintCPUStreamPlatformWrapper").getConventionAttr(), ArrayRef<PortInfo>{});
+        } else {
+          auto raw = tc->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> as(raw.begin(), raw.end());
+          unsigned bridge = 0, channel = 0;
+          StringAttr name;
+          for (auto [i, attr] : llvm::enumerate(as)) {
+            auto d = dyn_cast<DictionaryAttr>(attr);
+            auto widget = d ? d.getAs<StringAttr>("widgetClass") : StringAttr{};
+            if (widget && widget.getValue() == "midas.models.FASEDMemoryTimingModel") {
+              bridge = i; name = d.getAs<DictionaryAttr>("channelMapping").getAs<StringAttr>("axi4_aw_fwd");
+            }
+          }
+          for (auto [i, attr] : llvm::enumerate(as))
+            if (cast<DictionaryAttr>(attr).getAs<StringAttr>("globalName") == name) channel = i;
+          NamedAttrList row(cast<DictionaryAttr>(as[bad < 9 ? bridge : channel]));
+          if (bad == 6) as.push_back(as[bridge]);
+          else if (bad == 7) row.erase("widgetConstructorKey");
+          else if (bad == 8) row.erase("channelMapping");
+          else if (bad == 9) row.set("clock", b.getStringAttr("wrongClock"));
+          else if (bad == 10) row.erase("sources");
+          else if (bad == 11) {
+            auto endpoints = cast<ArrayAttr>(row.get("sources")); SmallVector<Attribute> reversed;
+            for (unsigned i = endpoints.size(); i; --i) reversed.push_back(endpoints[i-1]);
+            row.set("sources", b.getArrayAttr(reversed));
+          } else as.push_back(as[channel]);
+          if (bad != 6 && bad != 12) as[bad < 9 ? bridge : channel] = row.getDictionary(&ctx);
+          tc->setAttr("rawAnnotations", b.getArrayAttr(as));
+        }
+        auto before = dump(*test);
+        require(failed(goldengate::mapPrintBridgeFASEDTokens(tc, hs, error)) && !error.empty() && dump(*test) == before,
+            "selected FASED malformed boundary mutated IR " + std::to_string(bad));
+      }
+      SmallVector<FModuleOp> modules; SmallVector<Operation *> ops; std::map<std::string, std::string> bodies;
+      auto body = [](FModuleOp m) { std::string text; llvm::raw_string_ostream out(text); m->print(out, OpPrintingFlags().useLocalScope()); return text; };
+      for (auto m : c.getOps<FModuleOp>()) {
+        modules.push_back(m); bodies[m.getName().str()] = body(m);
+        for (auto &op : m.getBodyBlock()->getOperations()) ops.push_back(&op);
+      }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDTokens(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      SmallVector<Operation *> after;
+      for (auto m : modules) {
+        require(named(c, m.getName()) == m && body(m) == bodies.at(m.getName().str()), "selected FASED replaced prior module");
+        for (auto &op : m.getBodyBlock()->getOperations()) after.push_back(&op);
+      }
+      require(after == ops, "selected FASED replaced prior operations");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected FASED changed allocated collateral: " + error);
+      auto before = dump(*source);
+      require(failed(goldengate::mapPrintBridgeFASEDTokens(c, hostsFor(c), error)) && dump(*source) == before,
+          "selected FASED repeat mutated IR");
+      llvm::outs() << "PASS selected FASED token composition, unchanged allocated headers/SSA, 14 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && (StringRef(argv[1]) == "--selected-print-cpu-read-buffer" ||
                       StringRef(argv[1]) == "--selected-print-cpu-response-buffer" ||
                       StringRef(argv[1]) == "--selected-print-cpu-write-response-buffer" ||

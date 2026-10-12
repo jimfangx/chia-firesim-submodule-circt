@@ -159,6 +159,12 @@ mlir::LogicalResult mapPrintBridgeRocketTSI(
 // allocated MMIO slave after the expanded Print/TSI boundary. Atomic.
 mlir::LogicalResult mapPrintBridgeRocketBlockDev(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Bind eleven Rocket memory channels after the selected Print CPU AXI port.
+// Preserve the live Print/optional TracerV allocation; stage and verify before
+// publishing. Timing, ingress capacity and egress readiness remain explicit.
+mlir::LogicalResult mapPrintBridgeFASEDTokens(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

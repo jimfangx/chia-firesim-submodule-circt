@@ -22,10 +22,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool normalized = false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool normalized = false, bool selected = false) {
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGBlockDevResponseSchedulerWrapper\" { firrtl.module @GGBlockDevResponseSchedulerWrapper() {} } }", &ctx);
   require(bool(root), "fixture parse failed");
   auto c = *root->getOps<CircuitOp>().begin();
+  if (selected) c.setName("GGSelectedPrintCPUStreamPlatformWrapper");
   (*c.getOps<FModuleOp>().begin()).erase();
   OpBuilder b(c.getBodyBlock(), c.getBodyBlock()->begin());
   auto uint = [&](unsigned w) { return UIntType::get(&ctx, w, false); };
@@ -70,7 +71,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool normalized = false) {
   auto path = [&](unsigned j, llvm::StringRef suffix) {
     std::string normalizedSuffix = suffix.str();
     if (normalized && suffix.starts_with(".bits.bits_")) normalizedSuffix.replace(10, 1, ".");
-    return b.getStringAttr("~GGBlockDevResponseSchedulerWrapper|GGBlockDevResponseSchedulerWrapper>token" + std::to_string(j) + normalizedSuffix);
+    return b.getStringAttr("~" + c.getName().str() + "|" + c.getName().str() + ">token" + std::to_string(j) + normalizedSuffix);
   };
   SmallVector<Attribute> raw{dict({str("class", goldengate::AnnotationClasses::BridgeIO),
       str("widgetClass", "midas.models.FASEDMemoryTimingModel"), str("target", "~FireSim|FireSim>ep_0"),
@@ -93,7 +94,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool normalized = false) {
         b.getNamedAttr("channelInfo", info.getDictionary(&ctx)), str("clock", "sameClock"),
         b.getNamedAttr(j < 6 ? "sources" : "sinks", b.getArrayAttr(ends))}));
   }
-  raw.push_back(dict({str("class", "test.Annotation"), str("target", "~GGBlockDevResponseSchedulerWrapper|GGBlockDevResponseSchedulerWrapper>other")}));
+  raw.push_back(dict({str("class", "test.Annotation"), str("target", "~" + c.getName().str() + "|" + c.getName().str() + ">other")}));
   c->setAttr("rawAnnotations", b.getArrayAttr(raw)); return root;
 }
 struct Interpreter {
@@ -172,8 +173,8 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void behavior(MLIRContext &ctx, bool selected = false) {
+  auto root = fixture(ctx, false, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDTokenEngine(c, error)), error);
   require(succeeded(verify(*root)), "invalid FASED IR");
   Interpreter sim(named(c, "GGFASEDTokenEngine")); std::mt19937_64 rng(207);
@@ -218,10 +219,10 @@ void behavior(MLIRContext &ctx) {
   require(excluded && pendingReset && hostResetFire, "missing FASED reset/capacity coverage");
   llvm::outs() << samples << " FASED token/reset/AXI payload cases passed\n";
 }
-void wiring(MLIRContext &ctx, bool normalized = false) {
-  auto root = fixture(ctx, normalized); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void wiring(MLIRContext &ctx, bool normalized = false, bool selected = false) {
+  auto root = fixture(ctx, normalized, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDTokenEngine(c, error)), error);
-  auto wrapper = named(c, "GGFASEDTokenWrapper"); Interpreter sim(wrapper);
+  auto wrapper = named(c, selected ? "GGSelectedPrintFASEDTokenWrapper" : "GGFASEDTokenWrapper"); Interpreter sim(wrapper);
   require(wrapper.getNumPorts() == 10, "incorrect seven-port FASED boundary");
   InstanceOp inner, widget;
   for (auto i : wrapper.getOps<InstanceOp>()) { if (i.getModuleName() == "GGFASEDTokenEngine") widget = i; else inner = i; }
@@ -270,7 +271,7 @@ void wiring(MLIRContext &ctx, bool normalized = false) {
   auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(raw.size() == 13, "annotation classes consumed");
   auto target = cast<DictionaryAttr>(raw[0]).getAs<StringAttr>("target");
-  require(target.getValue() == "~GGFASEDTokenWrapper|GGFASEDTokenEngine>hPort", "bridge target not transferred");
+  require(target.getValue() == "~" + c.getName().str() + "|GGFASEDTokenEngine>hPort", "bridge target not transferred");
   for (unsigned j = 0; j < 11; ++j) {
     auto ends = cast<DictionaryAttr>(raw[j+1]).getAs<ArrayAttr>(j < 6 ? "sinks" : "sources");
     require(ends && !ends.empty(), "channel endpoint not transferred");
@@ -305,6 +306,7 @@ void rejection(MLIRContext &ctx) {
 }
 int main() {
   try { MLIRContext ctx; ctx.getOrLoadDialect<FIRRTLDialect>(); ctx.getOrLoadDialect<circt::hw::HWDialect>();
-    behavior(ctx); wiring(ctx); wiring(ctx, true); rejection(ctx); return 0;
+    behavior(ctx); wiring(ctx); wiring(ctx, true);
+    behavior(ctx, true); wiring(ctx, true, true); rejection(ctx); return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

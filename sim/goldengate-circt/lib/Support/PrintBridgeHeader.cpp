@@ -177,7 +177,8 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
       circuit.getName() == "GGSelectedPrintCPUStreamReadBufferWrapper" ||
       circuit.getName() == "GGSelectedPrintCPUStreamResponseBufferWrapper" ||
       circuit.getName() == "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" ||
-      circuit.getName() == "GGSelectedPrintCPUStreamPlatformWrapper";
+      circuit.getName() == "GGSelectedPrintFASEDTokenWrapper" ||
+       circuit.getName() == "GGSelectedPrintCPUStreamPlatformWrapper";
   if ((!rocket && !selected) || hosts.empty())
     return reject("allocated Print header requires the selected control master or Rocket F1Shim and queued hosts");
   std::string decoderText;

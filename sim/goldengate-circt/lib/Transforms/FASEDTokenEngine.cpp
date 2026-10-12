@@ -1,5 +1,5 @@
 // See LICENSE for license details.
-// Requires: uninstantiated BlockDev response scheduler top, Rocket FASED widths,
+// Requires: uninstantiated BlockDev scheduler or selected Print CPU platform top,
 // eleven single-clock channels with exact types and retained endpoint targets.
 // Consumes: eleven channel-facing ports; transfers bridge/channel endpoints.
 // Produces: ordinary FIRRTL HostPort, ingress snoop, timing and reset gates.
@@ -20,10 +20,11 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDTokenEngine(CircuitOp circuit, std::string &error) {
   constexpr llvm::StringLiteral engineName = "GGFASEDTokenEngine";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDTokenWrapper";
+  bool selected = circuit.getName() == "GGSelectedPrintCPUStreamPlatformWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDTokenWrapper" : "GGFASEDTokenWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGBlockDevResponseSchedulerWrapper")
-    return reject("FASED token mapping requires the active BlockDev response scheduler wrapper");
+  if (!selected && circuit.getName() != "GGBlockDevResponseSchedulerWrapper")
+    return reject("FASED token mapping requires the BlockDev scheduler or selected Print CPU platform wrapper");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == engineName || m.getModuleName() == wrapperName)

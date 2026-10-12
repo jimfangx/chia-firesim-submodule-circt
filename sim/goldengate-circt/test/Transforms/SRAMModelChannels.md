@@ -5751,3 +5751,48 @@ disables Print: shared transport parity does not establish enabled-Print
 runtime parity. Selected host-memory/platform integration remains pending.
 Next smallest step: bind the selected target memory channels to the native
 FASED host-memory boundary, preserving this CPU port and allocated collateral.
+
+### Iteration 140: selected Print FASED target-token boundary
+
+`mapPrintBridgeFASEDTokens` now composes the shared native FASED token engine
+onto `GGSelectedPrintCPUStreamPlatformWrapper`, producing
+`GGSelectedPrintFASEDTokenWrapper`. The CLI exposes the stage with
+`--map-print-host-fased-tokens`, requiring `--map-print-host-cpu-port`.
+It revalidates the live Print/optional TracerV allocation, stages and verifies
+all additions, and publishes only the engine/wrapper and transferred raw
+annotations. Existing module bodies and operation identities are retained.
+The eleven memory channels become an ordinary FIRRTL HostPort with the SFC
+own-predicate exclusion gates, targetFire, AXI ingress snoops and distinct
+model/ingress/egress reset gates. The CPU AXI aggregate and other ports are
+copied unchanged; Print/TracerV allocated driver text remains identical.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration140-print-fased-tokens`.
+Both native CLI replays (Print/TracerV and Print-only compatibility) passed,
+including MLIR verification and simulator RTL/annotation emission. Native
+build and three relevant CTest suites passed; after fixing test-only attribute
+lookups, the binding suite passed again. Focused composition tests passed on
+both replayed CPU-port boundaries, with 14 atomic malformed/repeat rejections,
+unchanged allocated headers and retained module/SSA identities. The FASED
+unit test also exercises the selected entry with 4096 token/reset/payload
+cases, 8192 eleven-channel gate cases and 460 payload bindings. CLI dependency
+preflight passed.
+
+Exact immutable golden comparison:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+module `FASEDMemoryTimingModel`. `PrintSelectedFASEDTokensCompare.py` passed
+shared targetFire/ingress-offer, reset and AW/W/AR snoop equations, 256 Boolean
+cases per candidate, eleven token gates and 46 payload routes. The native
+engine matches `circt-ingestion/post-fame-fased-token.mlir`. Candidate and
+compatibility preserve respectively 105/99 prior modules, 54/62 copied ports,
+122/130 wrapper connections and all 1713 annotation rows with the intended
+recursive target transfer. Report: `sfc-comparison.json`. The compiler replay
+input is the immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`; neither golden was written.
+
+Scope remains partial: the golden disables Print, so this comparison proves
+shared FASED semantics rather than enabled-Print runtime parity. Host idle,
+ingress capacity, timing and response readiness remain exposed. Next smallest
+step: attach the native host-outstanding counters to this selected boundary,
+then the AW/W/AR ingress queues, preserving CPU and live allocated collateral.
+Manager verification remains harness-owned; no manager gate was started here.
