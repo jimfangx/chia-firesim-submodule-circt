@@ -3,6 +3,11 @@
 #include "goldengate/TargetUtils.h"
 
 namespace goldengate {
+// Check the analyzed rational domain of every mapped channel before its host
+// module exists. BridgeIO.target is resolved separately after host binding.
+mlir::LogicalResult validateBridgeChannelClocks(
+    circt::firrtl::CircuitOp circuit, mlir::DictionaryAttr bridge,
+    std::string &error);
 // Resolve a retained BridgeIO to a CIRCT port and check every mapped channel
 // against the sole ChannelClockInfo analysis. Never infer a default clock.
 std::optional<GGTarget> resolveBridgeClockInfo(

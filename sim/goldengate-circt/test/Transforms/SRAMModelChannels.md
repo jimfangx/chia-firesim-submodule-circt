@@ -4989,3 +4989,62 @@ invoke checked clock-analysis transfer while retaining the existing Print
 clock map, then compose the expanded CPU/control path and complete driver
 collateral transaction. Enabled-Print production runtime, the SFC UART-bearing
 differential and the overall compiler migration remain incomplete.
+
+### Live TracerV binding beside production Print hosts (iteration 126)
+
+The enabled-Print host boundary already retains all twelve Rocket TracerV
+tokens and their analyzed rational clock. `bindPrintBridgeTracerV` validates
+that existing channel clock map, then attaches the shared CIRCT TracerV engine
+directly to `GGPrintBridgeHostWrapper`. No second target hierarchy is imported.
+The generalized token attachment preserves the original Print host module and
+every other port, binds the ten incoming payloads and two outgoing trigger
+tokens, and publishes the live `GGTracerVTokenEngine>hPort` annotation target.
+Each per-token ready/valid predicate excludes that token's own handshake,
+matching `HostPortIOConnectChannels2Port` in Scala `midas/core/FPGATop.scala`.
+The host hardware continues to implement the existing TracerV consumption,
+512-bit cycle/PC packing and trigger history through FIRRTL operations.
+
+The production compiler exposes this boundary with
+`--compile-baseline --stop-after-print-host-binding --map-print-host-tracerv`.
+It accepts the native control catalog option from iteration 125. TracerV
+control and stream ports remain explicit; combining this stage with CPU stream
+allocation rejects early until trigger configuration and queue attachment are
+ported to the expanded boundary.
+
+Evidence is under the mutable generated U250 directory
+`iteration126-print-tracerv/`: production MLIR, RTL and retained annotations,
+focused binding IR, build/CTest logs, CLI rejection report and semantic
+`comparison.json`. Three focused CTests pass. The production-bound Print replay
+checks twenty atomic rejection cases (malformed rational clocks, missing or
+duplicate clock maps/channels, duplicate constructor and wrong latency), live
+clock-target resolution, unchanged Print hardware and repeat rejection.
+Three invalid CLI combinations reject before loading inputs.
+
+The read-only SFC input and annotation oracles are
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`
+and its sibling `firechip.chip.FireSim.FireSimRocketConfig.anno.json`.
+The selected enabled-Print annotation subset remains iteration 67's input.
+The candidate preserves all 61 preexisting module bodies, all 1,713 annotation
+records apart from target retargeting and added TracerV channel endpoints, and
+the sole analyzed clock map. All twelve local names, latency-one directions
+and constructor widths match the immutable annotation oracle. The retained
+TracerV clock is the named 1/1 domain
+`uart_clock,clock_1000.0MHz,harnessbinder_clock,reference`.
+
+Exact RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintTracerVBindingCompare.py` verifies all twelve actual wrapper payload
+connections and aggregate/excluded handshake predicates. It compares emitted
+TracerV host-port widths, 512-bit stream width, five handshake/trigger outputs
+and stream payload against SFC `TracerVBridgeModule`. All 1,024 Boolean input
+combinations with seeded 40-bit PCs and 64-bit cycles match: 6,144 output
+samples. The engine body also matches the existing native F1Shim boundary
+exactly. Existing TracerV sequential behavior and header CTests pass. These
+checks cover shared SFC behavior; the immutable oracle disables Print. No
+fixture was edited and no manager verification gate was started.
+
+Next smallest step: attach the existing fifteen-word TracerV trigger bank and
+6144-entry stream queue to this expanded live boundary, retain the Print host
+registry for CPU allocation, and compose their control/stream attachments.
+Enabled-Print production runtime, the SFC UART-bearing differential and the
+overall compiler migration remain incomplete.

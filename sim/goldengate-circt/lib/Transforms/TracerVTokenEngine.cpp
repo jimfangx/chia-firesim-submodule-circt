@@ -10,11 +10,16 @@ using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addTracerVTokenEngine(CircuitOp circuit, std::string &error) {
+  return attachTracerVTokenEngine(circuit, "GGPeekPokeBridgeControlWrapper", error);
+}
+
+LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
+    llvm::StringRef inputBoundary, std::string &error) {
   constexpr llvm::StringLiteral engineName = "GGTracerVTokenEngine";
   constexpr llvm::StringLiteral wrapperName = "GGTracerVTokenWrapper";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
-  if (circuit.getName() != "GGPeekPokeBridgeControlWrapper")
-    return reject("TracerV token mapping requires the active PeekPoke control wrapper");
+  if (inputBoundary.empty() || circuit.getName() != inputBoundary)
+    return reject("TracerV token mapping requires the selected active boundary");
   FModuleOp inner;
   for (auto &op : circuit.getBodyBlock()->getOperations()) {
     auto m = dyn_cast<FModuleLike>(&op);

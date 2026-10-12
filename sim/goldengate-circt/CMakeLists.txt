@@ -59,6 +59,7 @@ add_executable(goldengate-circt
   lib/Transforms/PrintBridgeMMIO.cpp
   lib/Transforms/ControlCatalog.cpp
   lib/Transforms/PrintBridgeBinding.cpp
+  lib/Transforms/PrintBridgeTracerV.cpp
   lib/Transforms/AutoILAWiring.cpp
   lib/Transforms/GlobalResetWiring.cpp
   lib/Analysis/PrintClockSources.cpp
@@ -394,6 +395,8 @@ if(BUILD_TESTING)
     lib/Transforms/PrintBridgeMMIO.cpp
     lib/Transforms/ControlCatalog.cpp
     lib/Transforms/PrintBridgeBinding.cpp
+    lib/Transforms/PrintBridgeTracerV.cpp
+    lib/Transforms/TracerVTokenEngine.cpp
     lib/Transforms/CPUStreamQueue.cpp
     lib/Transforms/CPUStreamRead.cpp
     lib/Transforms/CPUStreamCountBank.cpp

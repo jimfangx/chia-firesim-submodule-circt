@@ -102,6 +102,11 @@ mlir::LogicalResult materializePrintBridgeHostQueues(
 mlir::LogicalResult bindPrintBridgeHosts(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+// Consume the live TracerV FAME tokens at the bound Print boundary. Preserve
+// Print hosts and analyzed clock metadata; expose native control/stream ports.
+mlir::LogicalResult bindPrintBridgeTracerV(
+    circt::firrtl::CircuitOp circuit, std::string &error);
+
 // Consume bound Print queue outputs into native CPU AXI AR/R and read-only
 // occupancy MCR words. Caller-supplied streams precede Print hosts; Print order
 // comes from the binding registry, independently of module traversal. Validate

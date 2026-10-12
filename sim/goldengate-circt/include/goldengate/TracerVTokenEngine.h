@@ -9,6 +9,11 @@ namespace goldengate {
 // control and stream boundaries until their subsequent compiler stages.
 mlir::LogicalResult addTracerVTokenEngine(circt::firrtl::CircuitOp circuit,
                                          std::string &error);
+// Attach the same native engine to an explicitly selected active boundary.
+// Validate twelve distinct latency-one tokens and host clock/reset before any
+// mutation. Preserve other ports/modules and their annotation identities.
+mlir::LogicalResult attachTracerVTokenEngine(circt::firrtl::CircuitOp circuit,
+    llvm::StringRef inputBoundary, std::string &error);
 // Connect the engine to Rocket's decoded 15-word configuration bank, preserving
 // host-cycle PC/instruction state and the delayed cycle/PC limit registers.
 mlir::LogicalResult addTracerVTriggerConfig(circt::firrtl::CircuitOp circuit,

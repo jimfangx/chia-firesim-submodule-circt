@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master]]]]] "
+                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -399,6 +399,7 @@ int main(int argc, char **argv) {
   bool enableAutoILA = false;
   bool stopAfterPrintHostBinding = false;
   bool mapPrintHostCPUStreams = false;
+  bool mapPrintHostTracerV = false;
   bool mapPrintHostControl = false;
   bool mapPrintHostResponses = false;
   bool mapPrintHostMaster = false;
@@ -426,6 +427,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-master") {
         if (mapPrintHostMaster) return fail("duplicate --map-print-host-master");
         mapPrintHostMaster = true;
+        continue;
+      }
+      if (option == "--map-print-host-tracerv") {
+        if (mapPrintHostTracerV) return fail("duplicate --map-print-host-tracerv");
+        mapPrintHostTracerV = true;
         continue;
       }
       if (option == "--map-print-host-responses") {
@@ -467,6 +473,10 @@ int main(int argc, char **argv) {
   }
   if (!printRocketControlCatalog.empty() && !stopAfterPrintHostBinding)
     return fail("--print-rocket-control-catalog requires --stop-after-print-host-binding");
+  if (mapPrintHostTracerV && !stopAfterPrintHostBinding)
+    return fail("--map-print-host-tracerv requires --stop-after-print-host-binding");
+  if (mapPrintHostTracerV && mapPrintHostCPUStreams)
+    return fail("Print TracerV token binding requires queue/control attachment before CPU allocation");
   if (mapPrintHostCPUStreams && !stopAfterPrintHostBinding)
     return fail("--map-print-host-cpu-streams requires --stop-after-print-host-binding");
   if (mapPrintHostControl && !mapPrintHostCPUStreams)
@@ -550,6 +560,11 @@ int main(int argc, char **argv) {
         if (failed(goldengate::importRocketControlCatalog(circuit, source, error)))
           return fail("Print Rocket control catalog import: " + error);
         llvm::outs() << "Imported native Rocket register-bank dependency closure for Print host assembly\n";
+      }
+      if (mapPrintHostTracerV) {
+        if (failed(goldengate::bindPrintBridgeTracerV(circuit, error)))
+          return fail("Print TracerV token binding: " + error);
+        llvm::outs() << "Bound twelve live Rocket TracerV tokens beside queued Print hosts\n";
       }
       if (failed(mlir::verify(*module)))
         return fail("PrintBridge host binding produced invalid FIRRTL IR");

@@ -42,15 +42,15 @@ bool validClock(DictionaryAttr clock) {
 }
 } // namespace
 
-std::optional<goldengate::GGTarget> goldengate::resolveBridgeClockInfo(
+LogicalResult goldengate::validateBridgeChannelClocks(
     CircuitOp circuit, DictionaryAttr bridge, std::string &error) {
-  auto reject = [&](StringRef why) -> std::optional<GGTarget> {
-    error = why.str(); return std::nullopt;
+  auto reject = [&](StringRef why) {
+    error = why.str(); return failure();
   };
   if (!bridge || bridge.getAs<StringAttr>("class") != AnnotationClasses::BridgeIO)
     return reject("expected retained BridgeIO clock identity");
   DictionaryAttr map; unsigned index = 0;
-  if (!clockMap(circuit, map, index, error)) return std::nullopt;
+  if (!clockMap(circuit, map, index, error)) return failure();
   auto info = map ? map.getAs<DictionaryAttr>("infoMap") : DictionaryAttr();
   auto clock = bridge.getAs<DictionaryAttr>("clockInfo");
   auto channels = bridge.getAs<DictionaryAttr>("channelMapping");
@@ -64,9 +64,18 @@ std::optional<goldengate::GGTarget> goldengate::resolveBridgeClockInfo(
         info.getAs<DictionaryAttr>(channel.getValue()) != clock)
       return reject("bridge clock differs from its unique analyzed channels");
   }
+  return success();
+}
+
+std::optional<goldengate::GGTarget> goldengate::resolveBridgeClockInfo(
+    CircuitOp circuit, DictionaryAttr bridge, std::string &error) {
+  if (failed(validateBridgeChannelClocks(circuit, bridge, error))) return std::nullopt;
   auto target = bridge.getAs<StringAttr>("target");
   auto resolved = target ? resolveAnnotationTarget(circuit, target.getValue(), error) : std::nullopt;
-  if (!resolved || !resolved->port) return reject("bridge clock target must resolve to a FIRRTL port");
+  if (!resolved || !resolved->port) {
+    error = "bridge clock target must resolve to a FIRRTL port";
+    return std::nullopt;
+  }
   return resolved;
 }
 

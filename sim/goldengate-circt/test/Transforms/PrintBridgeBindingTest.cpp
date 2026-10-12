@@ -5943,6 +5943,65 @@ int main(int argc, char **argv) {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     bridgeClockImport(ctx);
     controlCatalogImport(ctx);
+    if (argc == 4 && StringRef(argv[1]) == "--print-tracerv-binding") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source), "cannot parse bound Print TracerV tokens");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+      auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+      unsigned bridgeIndex = raw.size(), mapIndex = raw.size(), channelIndex = raw.size();
+      for (auto [i, attr] : llvm::enumerate(raw)) {
+        auto row = cast<DictionaryAttr>(attr);
+        if (auto widget = row.getAs<StringAttr>("widgetClass"); widget && widget == "firechip.goldengateimplementations.TracerVBridgeModule") bridgeIndex = i;
+        if (row.getAs<StringAttr>("class") == goldengate::AnnotationClasses::ChannelClockInfo) mapIndex = i;
+        if (auto name = row.getAs<StringAttr>("globalName"); name && name == "tracerv_triggerCredit") channelIndex = i;
+      }
+      require(bridgeIndex < raw.size() && mapIndex < raw.size() && channelIndex < raw.size(), "missing analyzed TracerV boundary");
+      auto bridge = cast<DictionaryAttr>(raw[bridgeIndex]);
+      auto clock = bridge.getAs<DictionaryAttr>("clockInfo");
+      auto map = cast<DictionaryAttr>(raw[mapIndex]);
+      auto info = map.getAs<DictionaryAttr>("infoMap");
+      std::string error;
+      auto reject = [&](SmallVector<Attribute> attrs) {
+        c->setAttr("rawAnnotations", b.getArrayAttr(attrs));
+        auto before = dump(*source);
+        require(failed(goldengate::bindPrintBridgeTracerV(c, error)) && !error.empty() && dump(*source) == before,
+            "invalid Print TracerV boundary mutated IR");
+        c->setAttr("rawAnnotations", raw);
+      };
+      for (StringRef field : {"name", "multiplier", "divisor"}) {
+        NamedAttrList bad(clock); bad.erase(field); NamedAttrList row(bridge);
+        row.set("clockInfo", bad.getDictionary(&ctx)); SmallVector<Attribute> attrs(raw.begin(), raw.end());
+        attrs[bridgeIndex] = row.getDictionary(&ctx); reject(attrs);
+      }
+      for (auto channel : bridge.getAs<DictionaryAttr>("channelMapping")) {
+        NamedAttrList missing(info); missing.erase(cast<StringAttr>(channel.getValue()).getValue());
+        NamedAttrList row(map); row.set("infoMap", missing.getDictionary(&ctx));
+        SmallVector<Attribute> attrs(raw.begin(), raw.end()); attrs[mapIndex] = row.getDictionary(&ctx); reject(attrs);
+      }
+      {
+        SmallVector<Attribute> attrs(raw.begin(), raw.end()); attrs.push_back(map); reject(attrs);
+        attrs.assign(raw.begin(), raw.end()); attrs.push_back(bridge); reject(attrs);
+        attrs.assign(raw.begin(), raw.end()); attrs.erase(attrs.begin() + mapIndex); reject(attrs);
+        attrs.assign(raw.begin(), raw.end()); attrs.push_back(raw[channelIndex]); reject(attrs);
+        NamedAttrList row(cast<DictionaryAttr>(raw[channelIndex]));
+        row.set("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+                                                  b.getNamedAttr("latency", b.getI64IntegerAttr(0))}));
+        attrs.assign(raw.begin(), raw.end()); attrs[channelIndex] = row.getDictionary(&ctx); reject(attrs);
+      }
+      auto original = named(c, "GGPrintBridgeHostWrapper"); auto originalBody = dump(original);
+      require(succeeded(goldengate::bindPrintBridgeTracerV(c, error)) && succeeded(verify(*source)), error);
+      auto newRaw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+      require(newRaw.size() == raw.size() && newRaw[mapIndex] == raw[mapIndex] && dump(original) == originalBody,
+          "TracerV binding changed Print hardware or analyzed clocks");
+      auto resolved = goldengate::resolveBridgeClockInfo(c, cast<DictionaryAttr>(newRaw[bridgeIndex]), error);
+      require(resolved && resolved->module.getModuleName() == "GGTracerVTokenEngine" && resolved->port == 2, error);
+      auto before = dump(*source);
+      require(failed(goldengate::bindPrintBridgeTracerV(c, error)) && dump(*source) == before, "repeat TracerV binding mutated IR");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[3], ec); require(!ec, ec.message());
+      source->print(out); out << '\n';
+      llvm::outs() << "Print TracerV live clock target, unchanged Print hardware, twenty atomic rejects and repeat rejection passed\n";
+      return 0;
+    }
     if (argc == 5 && StringRef(argv[1]) == "--rocket-catalog-allocation") {
       rocketStreams(ctx, argv[2], argv[3], argv[4], true);
       return 0;
