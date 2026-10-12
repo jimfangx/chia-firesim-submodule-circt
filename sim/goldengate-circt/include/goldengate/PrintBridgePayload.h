@@ -187,6 +187,12 @@ mlir::LogicalResult mapPrintBridgeFASEDIngressCredits(
 mlir::LogicalResult mapPrintBridgeFASEDIngressOrder(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+// Consume selected order/queue boundaries into native strict/relaxed host issue.
+// Actual AR/AW acceptance feeds outstanding counters; R/B handshakes remain
+// explicit. Publish only verified additions and retain allocated host collateral.
+mlir::LogicalResult mapPrintBridgeFASEDIngressIssue(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

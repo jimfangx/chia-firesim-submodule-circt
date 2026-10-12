@@ -15,9 +15,11 @@ using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDIngressIssue(CircuitOp circuit,std::string &error) {
   constexpr llvm::StringLiteral helperName="GGFASEDIngressIssue";
-  constexpr llvm::StringLiteral wrapperName="GGFASEDIngressIssueWrapper";
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressOrderWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressIssueWrapper"
+                                              : "GGFASEDIngressIssueWrapper";
   auto reject=[&](llvm::StringRef s){error=s.str();return failure();};
-  if(circuit.getName()!="GGFASEDIngressOrderWrapper")return reject("FASED ingress issue needs active order wrapper");
+  if(!selected && circuit.getName()!="GGFASEDIngressOrderWrapper")return reject("FASED ingress issue needs active order wrapper");
   FModuleOp inner,engine;
   for(auto m:circuit.getOps<FModuleLike>()){
     if(m.getModuleName()==helperName||m.getModuleName()==wrapperName)return reject("FASED ingress issue helper or wrapper already exists");

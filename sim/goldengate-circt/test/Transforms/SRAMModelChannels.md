@@ -6033,3 +6033,63 @@ Next smallest step: connect the selected native host issue policy to the order
 and ingress queues, consuming dequeue readiness into host AR/AW issue and W
 completion, before selected deadlock checks and host timing/egress. No
 harness-owned manager gate was started here; the overall port remains open.
+
+### Iteration 145: selected Print FASED host issue
+
+`mapPrintBridgeFASEDIngressIssue` atomically attaches the shared native
+`GGFASEDIngressIssue` operations after the selected transaction order boundary.
+It validates allocated host collateral, stages and verifies the composition,
+then publishes only the helper and `GGSelectedPrintFASEDIngressIssueWrapper`.
+The CLI's `--map-print-host-fased-ingress-issue` requires the completed order
+stage and emits MLIR, annotation archive and SV. Both allocated header emitters
+accept the resulting selected root. Legacy issue behavior remains supported.
+
+The wrapper consumes raw AW/W/AR dequeues, order dequeue and transaction
+handshakes. Strict reads require a read order entry and an idle host or an
+inflight read; strict AW requires an idle host and write order entry. Relaxed
+reads bypass ordering and relaxed AW/W use their credit availability. Actual
+AR/AW acceptance retires order entries and feeds the existing outstanding
+counters. W issue uses the strict write-data state or relaxed credits. Accepted
+AW sets the write-data state ahead of simultaneous final-W acceptance; ingress
+reset clears state without suppressing combinational requests. Payload bundles
+are unchanged. R/B response handshakes remain explicit. Consumed transaction
+leaf annotations follow the new request/response ports; whole transactions and
+raw queue/order identities remain on the inner order module.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration145-print-fased-issue`.
+Native build and three targeted CTest suites passed in 28.41 seconds: Print
+binding, CPU-managed stream headers and ingress issue. Each legacy/selected
+native interpreter fixture passes 65536 transitions with randomized payloads,
+320 simultaneous AW/final-W cases, 256 wrapper binding cases and 26 atomic
+rejections. Focused selected composition passes with and without TracerV,
+preserving allocated headers and prior module/operation identities, testing
+recursive copied and consumed target transfer and nine atomic rejection cases.
+CLI dependency/duplicate rejection occurs before input/output access.
+
+Both complete standalone native CLI replays from the primary immutable compiler
+fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, iteration-67
+selected Print annotations and the native Rocket control catalog pass. Both
+allocated headers and decoder collateral are byte-identical to iteration 144.
+
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDIngressIssueCompare.py` pins actual `IngressModule`
+request enable/ready/valid, order retirement, write-data priority and reset
+RTL equations and passes 32768 actual native IR cases per candidate, including
+160 AW/final-W collisions. Both share exactly the legacy native helper. All
+120 / 114 prior module bodies, 89 / 97 wrapper connections and 1713 annotation
+rows retain their intended identities in the TracerV / Print-only candidates.
+Emitted issue SV retains host-clocked write-data state with reset-to-zero.
+Input order and output issue MLIR/annotation archives and output issue SV remain
+raw; other own replay intermediates are compressed after comparison.
+
+Risk: the SFC fixture disables Print; this proves shared host issue and selected
+attachment semantics, not full enabled-Print simulator parity. The preceding
+harness's CIRCT replacertl/Verilator passes are baseline evidence; the Rocket
+UART-bearing SFC differential remains pending. Selected deadlock assertions,
+timing, responses and complete platform composition remain open. Next smallest
+step: attach the native qualified AW/W deadlock checks to selected ingress
+queues, forwarding credit/order context through the existing selected wrappers,
+before host timing and egress. No harness-owned manager gate was started here;
+the overall port remains open.
