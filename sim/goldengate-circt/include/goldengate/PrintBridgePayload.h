@@ -182,6 +182,11 @@ mlir::LogicalResult mapPrintBridgeFASEDIngress(
 mlir::LogicalResult mapPrintBridgeFASEDIngressCredits(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+// Attach the native 20-entry read/write completion order after selected credits.
+// Host issue dequeue readiness remains explicit; publish only verified additions.
+mlir::LogicalResult mapPrintBridgeFASEDIngressOrder(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

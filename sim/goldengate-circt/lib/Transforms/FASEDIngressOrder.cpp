@@ -14,9 +14,11 @@ using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDIngressOrder(CircuitOp circuit,std::string &error) {
   constexpr llvm::StringLiteral helperName="GGFASEDIngressOrder20";
-  constexpr llvm::StringLiteral wrapperName="GGFASEDIngressOrderWrapper";
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressCreditsWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressOrderWrapper"
+                                             : "GGFASEDIngressOrderWrapper";
   auto reject=[&](llvm::StringRef s){error=s.str();return failure();};
-  if(circuit.getName()!="GGFASEDIngressCreditsWrapper")
+  if(!selected && circuit.getName()!="GGFASEDIngressCreditsWrapper")
     return reject("FASED ingress order needs the active credit wrapper");
   FModuleOp inner,engine;
   for(auto m:circuit.getOps<FModuleLike>()){

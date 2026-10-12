@@ -5965,3 +5965,71 @@ smallest step: attach the native 20-entry transaction-order queue to selected
 AR enqueue and write completion, preserving qualified reset and live headers.
 No harness-owned manager verification step was started here; supplied iteration
 142 replacertl and Verilator gates passed, with the SFC UART baseline pending.
+
+
+### Iteration 144: selected Print FASED transaction order
+
+`mapPrintBridgeFASEDIngressOrder` attaches the shared native
+`GGFASEDIngressOrder20` after the selected AW/W credit boundary. The new top is
+`GGSelectedPrintFASEDIngressOrderWrapper`; legacy attachment remains supported.
+CLI `--map-print-host-fased-ingress-order` requires
+`--map-print-host-fased-ingress-credits` and emits
+`post-print-fased-ingress-order.mlir`, the complete annotation archive and SV.
+The composer validates the live allocated header, clones for preflight and
+verification, then publishes only the new helper/wrapper and transferred
+annotations. Prior modules and operation identities survive. Print and CPU
+header preparation accepts the new selected top.
+
+Scala oracle: `models/dram/IngressUnit.scala` and `models/dram/Util.scala`
+`DualQueue`, in the Golden Gate pipeline reread in `MidasTransforms.scala` and
+`fame/FAMETransform.scala`. Accepted AR enqueues read=true; pre-edge AW/W
+completion enqueues write=false. On dual enqueue read precedes write, with
+independent acceptance if one bank is full. Two ten-entry one-bit RAM banks
+have asynchronous reads and synchronous writes. Reset clears selector/pointer
+and full state, retaining RAM and accepted writes on the reset edge. Dequeue
+has no empty bypass and full banks have no pop-to-push readiness bypass.
+Host issue dequeue readiness remains explicit. The unused Scala `next`
+lookahead is not emitted by this helper; host issue and deadlock wiring remain
+subsequent selected transforms.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration144-print-fased-order`.
+Native build and three targeted CTest suites passed (12.83 seconds): Print
+binding, CPU-managed stream headers and ingress order. The actual native
+FIRRTL interpreter checks 20741 cycles, 2272 partial dual enqueues, 1066 bank
+wraps and 128 wrapper bindings in each legacy and selected fixture; each
+rejects 19 malformed/repeated attachments atomically. Focused selected
+composition tests pass with and without TracerV, preserving module/operation
+identities, byte-identical allocated headers and recursive aggregate target
+identity; each rejects eight malformed cases plus a repeat. CLI dependency and
+duplicate preflight reject before input ingestion or output mutation.
+
+Both complete native CLI replays from the primary immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected iteration-67 Print
+annotations and the native Rocket control catalog pass. They retain
+byte-identical `print-bridge-allocated.const.h` from iteration 143. Initial
+replay attempts before the build linked the updated CLI rejected the new option
+at parsing; both subsequent replays use the rebuilt compiler and pass.
+
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDIngressOrderCompare.py` passes against `IngressModule`,
+`DualQueue` and `Queue_10`, pinning actual accepted-event, bank routing,
+ready/valid, modulo-ten pointer and reset/RAM-write equations. Each native
+candidate checks 25600 bank-state/selector/handshake combinations. The helper
+is unchanged from the legacy native order boundary; all 118 / 112 prior module
+bodies, 80 / 88 wrapper connections and 1713 recursively transferred annotation
+rows match their intended structures in the TracerV / Print-only candidates.
+Emitted RAMs are ten-entry one-bit storage with asynchronous reads, synchronous
+writes, four-bit addresses and no reset input. Input credit and output order
+MLIR/annotation archives and output order SV remain raw; other own replay
+intermediates are compressed after comparison.
+
+Risk: the SFC fixture disables Print; this establishes shared FASED order and
+selected attachment parity, not complete enabled-Print simulator parity. The
+preceding harness's CIRCT replacertl and Verilator workload passes remain
+baseline evidence, and the Rocket UART-bearing SFC baseline is still pending.
+Next smallest step: connect the selected native host issue policy to the order
+and ingress queues, consuming dequeue readiness into host AR/AW issue and W
+completion, before selected deadlock checks and host timing/egress. No
+harness-owned manager gate was started here; the overall port remains open.
