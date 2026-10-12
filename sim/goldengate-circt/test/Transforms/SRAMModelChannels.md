@@ -5166,3 +5166,60 @@ the TracerV wrappers, allocate both CPU streams and their occupancy registers,
 then compose TracerV and Print MMIO/control paths. The manager gate must still
 verify the build repair; the SFC UART-bearing baseline and overall port remain
 incomplete.
+
+## Iteration 130: live Print/TracerV CPU stream and occupancy allocation
+
+The iteration-129 harness confirms CIRCT replacertl, bare Verilator smoke,
+90,141 portable checks (`0x78194504c338c229`) and 90,805 Rocket checks
+(`0x5f3744639d41ea35`) passed. Rocket differential comparison still awaits
+an SFC UART-bearing baseline. Those gates exercise the baseline platform;
+they do not validate the staged enabled-Print boundary introduced here.
+
+`mapPrintBridgeCPUStreams` now resolves the bound Print registry through the
+active top's retained `sim` instance chain. It checks unique registry metadata,
+acyclic reachability, matching port types/directions and unique direct SSA
+forwarding of each stream, occupancy count, control port and host clock/reset
+before staging any mutation. Existing bound host instance, local control bank,
+queue geometry and ordered identity checks remain in effect. The original
+Print module and registry stay intact; allocation commits the read/count
+wrappers and recursive annotation transfers together.
+
+The production compiler accepts the token, trigger and queue flags followed by
+`--map-print-host-cpu-streams`. It derives the preceding TracerV allocation
+from the actual live queue instance and appends Print, preserving Scala's
+stream order. The replay produces TracerV/Print source indices 0/1, 512-KiB
+windows at 0/524288, and read-only occupancy words at offsets 0/4. Joint Rocket
+control dispatch is explicitly rejected until the widget assembly is ported.
+
+Evidence is under the mutable generated U250 directory
+`iteration130-print-tracerv-cpu/`: native compiler build, nested allocation
+tests, multistream semantic tests, production MLIR/RTL/annotation outputs,
+early CLI rejection logs and `comparison.json`. The nested test preserves
+three forwarding wrappers and rejects nine malformed forwarding/identity
+cases atomically, alongside the existing eight allocation rejections.
+The native multistream interpreter passes 196,241 SSA cases, 41,088 R
+transfers, 36,992 unselected-counter updates and 27 atomic rejections.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+module `CPUManagedStreamEngine`. `PrintTracerVCPUCompare.py` evaluates emitted
+AR/R handshake, selected 512-bit data, ID, last, queue readiness and live
+count expressions for both windows against the SFC stream-0 contract.
+4,096 directed/random cases yield 49,152 matching signal checks. SFC has
+optimized away the response-code port; its constant is recovered from the
+actual `FPGATop.axi4buf_2` / `AXI4Buffer_2.nodeIn_r_deq_q` / `Queue_55` RAM
+writer. Count zero extension matches the SFC engine's thirteen-bit queue
+count. Native and emitted-RTL connections attach each payload and count to
+the corresponding retained live instance.
+
+All 66 preceding module bodies, 1,713 annotation payloads/classes/order and
+the analyzed clock map are unchanged. Input is the primary immutable fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, with the selected enabled
+Print annotations from iteration 67. Neither immutable fixture is edited.
+The recorded SFC platform has Print disabled: these shared transport checks
+and native semantic tests do not establish full enabled-Print runtime parity.
+No manager verification step was started by the implementation agent.
+
+Next smallest step: compose the live TracerV fifteen-word bank and Print local
+control banks with the shared CPU count bank in the Rocket control decoder,
+then connect joint read/write dispatch before platform/header assembly.

@@ -2,6 +2,7 @@
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/CPUStreamQueue.h"
 #include "goldengate/ControlAddressDecode.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
 #include <set>
@@ -34,9 +35,56 @@ LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
     return {};
   };
   top = find(circuit.getName());
-  auto bindings = top ? top->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
+  // TracerV token, trigger and queue construction retain the Print registry on
+  // the bound child. Resolve that live instance path before allocating streams;
+  // detached metadata or a wrapper with altered forwarding is not a source.
+  FModuleOp bound = top;
+  SmallVector<std::pair<FModuleOp, InstanceOp>> path;
+  llvm::StringSet<> visited;
+  while (bound && !bound->hasAttr("goldengate.printHostBindings")) {
+    if (!visited.insert(bound.getName()).second)
+      return reject("Print CPU allocation requires an acyclic registry instance path");
+    InstanceOp sim;
+    for (auto i : bound.getOps<InstanceOp>()) if (i.getName() == "sim") {
+      if (sim) return reject("Print CPU allocation requires a unique retained sim instance");
+      sim = i;
+    }
+    if (!sim) return reject("Print CPU allocation cannot reach the bound Print registry");
+    path.emplace_back(bound, sim);
+    bound = find(sim.getModuleName());
+  }
+  auto bindings = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
   if (!bindings || bindings.empty())
     return reject("Print CPU allocation requires the active bound Print host registry");
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m != bound && m->hasAttr("goldengate.printHostBindings"))
+      return reject("Print CPU allocation requires one unambiguous Print registry");
+  auto forwarded = [&](StringRef name) {
+    for (auto [wrapper, sim] : path) {
+      auto child = find(sim.getModuleName());
+      std::optional<unsigned> outerPort, innerPort;
+      for (auto [i, p] : llvm::enumerate(wrapper.getPorts()))
+        if (p.name == name) outerPort = i;
+      for (auto [i, p] : llvm::enumerate(child.getPorts()))
+        if (p.name == name) innerPort = i;
+      if (!outerPort || !innerPort) return false;
+      auto outer = wrapper.getPorts()[*outerPort], inner = child.getPorts()[*innerPort];
+      if (outer.type != inner.type || outer.direction != inner.direction) return false;
+      Value external = wrapper.getArgument(*outerPort), internal = sim.getResult(*innerPort);
+      auto dest = getFieldRefFromValue(outer.direction == Direction::In ? internal : external);
+      auto src = getFieldRefFromValue(outer.direction == Direction::In ? external : internal);
+      unsigned drivers = 0, matches = 0;
+      for (auto &op : *wrapper.getBodyBlock()) if (isa<ConnectOp, StrictConnectOp>(op) &&
+          getFieldRefFromValue(op.getOperand(0)) == dest) {
+        ++drivers;
+        matches += getFieldRefFromValue(op.getOperand(1)) == src;
+      }
+      if (drivers != 1 || matches != 1) return false;
+    }
+    return true;
+  };
+  if (!forwarded("hostClock") || !forwarded("hostReset"))
+    return reject("Print CPU allocation requires unchanged host clock/reset forwarding");
   SmallVector<CPUStreamSourcePort> sources(precedingSources);
   SmallVector<CPUStreamCountPort> counts(precedingCounts);
   llvm::StringSet<> hostNames, widgetNames;
@@ -62,13 +110,15 @@ LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
     // Resolve the real host instance and control port, not a detached metadata
     // row that could allocate a different bank from the one driving this queue.
     InstanceOp instance;
-    for (auto i : top.getOps<InstanceOp>()) if (i.getName() == widgetName.getValue()) instance = i;
+    for (auto i : bound.getOps<InstanceOp>()) if (i.getName() == widgetName.getValue()) instance = i;
     if (!instance || instance.getModuleName() != host.getName())
       return reject("Print CPU allocation host instance differs from its binding");
     bool foundControl = false;
-    for (auto p : top.getPorts()) if (p.name == control.getValue())
+    for (auto p : bound.getPorts()) if (p.name == control.getValue())
       foundControl = p.direction == Direction::In && p.type == host.getPortType(11);
     if (!foundControl) return reject("Print CPU allocation control port differs from the local AXI bank");
+    if (!forwarded(stream.getValue()) || !forwarded(count.getValue()) || !forwarded(control.getValue()))
+      return reject("Print CPU allocation requires live stream/count/control forwarding to the registry");
     ControlMMIOWidget widget;
     if (failed(deriveControlMMIOWidget(circuit, widgetName.getValue(), mcr.getValue(),
           {config.getValue()}, widget, error))) return failure();

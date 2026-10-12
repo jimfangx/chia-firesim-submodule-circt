@@ -5754,6 +5754,68 @@ void allocatedHeaders(MLIRContext &ctx, StringRef output) {
   llvm::outs() << "PASS allocated Print/count headers in both host orders, preceding live queue, register permutation and 44 atomic rejections\n";
 }
 
+void nestedCPUAllocation(MLIRContext &ctx) {
+  for (int bad = -1; bad < 9; ++bad) {
+    Fixture f(ctx); std::string error; OpBuilder b(&ctx);
+    require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
+    auto bound = named(f.circuit, f.circuit.getName());
+    auto registry = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+    auto first = cast<DictionaryAttr>(registry[0]), second = cast<DictionaryAttr>(registry[1]);
+    auto inner = bound;
+    for (unsigned depth = 0; depth < 3; ++depth) {
+      b.setInsertionPointToEnd(f.circuit.getBodyBlock());
+      auto wrapper = b.create<FModuleOp>(inner.getLoc(), b.getStringAttr("NestedPrint" + std::to_string(depth)),
+          inner.getConventionAttr(), inner.getPorts());
+      b.setInsertionPointToStart(wrapper.getBodyBlock());
+      auto sim = b.create<InstanceOp>(inner.getLoc(), inner, "sim");
+      for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
+        Value external = wrapper.getArgument(i), internal = sim.getResult(i);
+        b.create<ConnectOp>(inner.getLoc(), p.direction == Direction::In ? internal : external,
+            p.direction == Direction::In ? external : internal);
+      }
+      inner = wrapper;
+    }
+    f.circuit.setName(inner.getName());
+    auto sim = *inner.getOps<InstanceOp>().begin();
+    if (bad >= 0 && bad <= 4) {
+      StringRef key = bad == 1 ? "streamPort" : bad == 2 ? "controlPort" : "countPort";
+      auto name = bad == 3 ? StringRef("hostReset") : first.getAs<StringAttr>(key).getValue();
+      unsigned p = port(inner, name);
+      ConnectOp connection;
+      for (auto c : inner.getOps<ConnectOp>())
+        if (c.getDest() == inner.getArgument(p) || c.getDest() == sim.getResult(p)) connection = c;
+      require(bool(connection), "missing nested forwarding connection");
+      b.setInsertionPoint(connection);
+      if (bad == 3) connection->setOperand(1, b.create<ConstantOp>(inner.getLoc(), UIntType::get(&ctx, 1), APInt(1, 0)));
+      else if (bad == 4) b.create<ConnectOp>(inner.getLoc(), connection.getDest(), connection.getSrc());
+      else {
+        unsigned other = port(inner, second.getAs<StringAttr>(key).getValue());
+        connection->setOperand(1, bad == 2 ? inner.getArgument(other) : sim.getResult(other));
+      }
+    }
+    if (bad == 5) inner->setAttr("goldengate.printHostBindings", registry);
+    if (bad == 6) sim.setNameAttr(b.getStringAttr("detached"));
+    if (bad == 7) sim.setModuleNameAttr(FlatSymbolRefAttr::get(&ctx, inner.getName()));
+    if (bad == 8) {
+      auto names = llvm::to_vector(inner.getPortNames());
+      names[port(inner, first.getAs<StringAttr>("countPort").getValue())] = b.getStringAttr("missingCount");
+      inner.setPortNames(names);
+    }
+    auto before = dump(*f.root), boundBefore = dump(bound);
+    auto result = goldengate::mapPrintBridgeCPUStreams(f.circuit, {}, {}, error);
+    if (bad >= 0) require(failed(result) && !error.empty() && dump(*f.root) == before,
+        "nested Print allocation accepted or mutated corruption " + std::to_string(bad));
+    else {
+      require(succeeded(result) && succeeded(verify(*f.root)) && dump(bound) == boundBefore, error);
+      auto sources = named(f.circuit, "GGCPUStreamRead")->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+      auto counts = named(f.circuit, "GGCPUStreamCountBank")->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+      require(sources.size() == 2 && counts.size() == 2 && f.circuit.getName() == "GGCPUStreamCountWrapper",
+          "nested Print allocation lost an ordered queue/count");
+    }
+  }
+  llvm::outs() << "PASS nested Print allocation through three retained wrappers and nine atomic forwarding/identity rejections\n";
+}
+
 void allocationRejections(MLIRContext &ctx) {
   for (unsigned bad = 0; bad < 8; ++bad) {
     Fixture f(ctx); std::string error; OpBuilder b(&ctx);
@@ -5941,6 +6003,9 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
+      nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
+    }
     bridgeClockImport(ctx);
     controlCatalogImport(ctx);
     if (argc == 4 && StringRef(argv[1]) == "--print-tracerv-binding") {
@@ -6406,7 +6471,7 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS expanded FASED issue boundary and " << rejected << " atomic rejections\n";
       return 0;
     }
-    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
+    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); nestedCPUAllocation(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
     allocatedHeaders(ctx, argc > 1 ? argv[1] : "");
     platformCatalog(ctx, argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");
     rocketStreams(ctx, argc > 3 ? argv[3] : "", argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");

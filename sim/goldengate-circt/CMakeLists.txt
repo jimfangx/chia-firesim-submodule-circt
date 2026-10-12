@@ -476,6 +476,8 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-print-binding-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-print-binding COMMAND goldengate-print-binding-test)
+  add_test(NAME goldengate-print-nested-cpu-allocation
+    COMMAND goldengate-print-binding-test --nested-cpu-allocation-test)
   add_executable(goldengate-print-axi-test
     test/Transforms/PrintBridgeAXITest.cpp
     lib/Transforms/PrintBridgePayload.cpp lib/Transforms/PrintBridgeTokenStage.cpp

@@ -491,8 +491,10 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-tracerv-trigger requires --map-print-host-tracerv");
   if (mapPrintHostTracerV && !stopAfterPrintHostBinding)
     return fail("--map-print-host-tracerv requires --stop-after-print-host-binding");
-  if (mapPrintHostTracerV && mapPrintHostCPUStreams)
-    return fail("Print TracerV token binding requires queue/control attachment before CPU allocation");
+  if (mapPrintHostTracerV && mapPrintHostCPUStreams && !mapPrintHostTracerVQueue)
+    return fail("Print TracerV CPU allocation requires --map-print-host-tracerv-queue");
+  if (mapPrintHostTracerV && mapPrintHostControl)
+    return fail("Print TracerV control dispatch requires joint Rocket widget assembly");
   if (mapPrintHostCPUStreams && !stopAfterPrintHostBinding)
     return fail("--map-print-host-cpu-streams requires --stop-after-print-host-binding");
   if (mapPrintHostControl && !mapPrintHostCPUStreams)
@@ -630,9 +632,12 @@ int main(int argc, char **argv) {
       }
       llvm::outs() << "Bound " << hosts.size() << " queued PrintBridge hosts to post-FAME tokens in " << boundIR << '\n';
       if (mapPrintHostCPUStreams) {
-        // This boundary has materialized only Print hosts. Full platform
-        // assembly supplies earlier allocated streams (e.g. TracerV) explicitly.
-        if (failed(goldengate::mapPrintBridgeCPUStreams(circuit, {}, {}, error)))
+        // Preserve Scala stream order: the live buffered TracerV source precedes
+        // Print hosts, with one matching occupancy register per source.
+        auto allocated = mapPrintHostTracerVQueue ?
+            goldengate::mapPrintBridgeRocketCPUStreams(circuit, error) :
+            goldengate::mapPrintBridgeCPUStreams(circuit, {}, {}, error);
+        if (failed(allocated))
           return fail("PrintBridge CPU stream allocation: " + error);
         llvm::SmallString<256> cpuIR(outputDir), cpuRTL(outputDir), cpuAnnos(outputDir);
         llvm::sys::path::append(cpuIR, "post-print-cpu-streams.mlir");
