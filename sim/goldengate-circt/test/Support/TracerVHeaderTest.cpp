@@ -166,6 +166,11 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
       if (bad == 28) bridge.set("target",b.getStringAttr("~GGTracerVTriggerWrapper|GGTracerVTriggerConfig>mcr"));
       for (auto mapping : d.getAs<DictionaryAttr>("channelMapping"))
         clocks.set(cast<StringAttr>(mapping.getValue()).getValue(),clock);
+      if (bad == 34) {
+        NamedAttrList mapping(d.getAs<DictionaryAttr>("channelMapping"));
+        mapping.set(locals[0],mapping.get(locals[1]));
+        bridge.set("channelMapping",mapping.getDictionary(&ctx));
+      }
       annos.push_back(bridge.getDictionary(&ctx));
     } else annos.push_back(attr);
   }
@@ -210,12 +215,12 @@ int main(int argc, char **argv) {
       require(StringRef(body).contains(text),"TracerV allocation/stream/clock ABI differs");
     std::string error, before = dump(*root);
     require(failed(goldengate::prepareTracerVHeader(c,error)) && dump(*root) == before,"duplicate constructor changed IR");
-    for (unsigned bad = 1; bad <= 33; ++bad) {
+    for (unsigned bad = 1; bad <= 34; ++bad) {
       auto negative = fixture(ctx,bad); auto nc = *negative->getOps<CircuitOp>().begin(); before = dump(*negative);
       require(failed(goldengate::prepareTracerVHeader(nc,error)) && !error.empty() && dump(*negative) == before,
         "invalid boundary accepted or mutated: " + std::to_string(bad));
     }
-    llvm::outs() << "TracerV header: varied base/index/clock, fifteen words, stream geometry; preserved hardware/annotations; 34 atomic rejections passed\n";
+    llvm::outs() << "TracerV header: varied base/index/clock, fifteen words, stream geometry; preserved hardware/annotations; 35 atomic rejections passed\n";
     if (argc == 3) {
       auto boundary = parseSourceFile<ModuleOp>(argv[1],&ctx); require(bool(boundary),"boundary parse");
       auto bc = *boundary->getOps<CircuitOp>().begin();

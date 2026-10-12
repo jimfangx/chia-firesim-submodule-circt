@@ -4846,3 +4846,66 @@ assembly, preserving actual retained TracerV/Print clock analysis through that
 path, then invoke this complete transactional header API. Enabled-Print runtime
 and the SFC UART-bearing differential remain pending; this milestone completes
 the expanded boundary's driver collateral, not the overall compiler port.
+
+### Checked bridge clock analysis transfer (iteration 124)
+
+`BridgeClockInfo` now resolves retained BridgeIO clock identity to a CIRCT
+module port and checks the sole ChannelClockInfo map, positive rational ratio,
+and every unique mapped global channel. Production TracerV header emission
+uses this shared analysis and additionally rejects two payload fields aliased
+to one global channel. This alias previously passed when the clock records
+matched. Existing twelve-channel, constructor, live graph and stream checks
+remain in place.
+
+`importBridgeClockInfo` transfers the analyzed metadata for one imported bridge
+between assembly circuits in the same MLIR context. It resolves the source and
+destination port, checks module/field/type/direction and declared versus SSA
+port types, verifies both constructor identities, and requires one live
+instance path in the destination. It copies only that bridge's analyzed channel
+entries, merges them with existing destination domains, and retargets only the
+BridgeIO circuit component. Conflicting clock entries and repeated imports
+reject before mutation. Source hardware/annotations and unrelated destination
+annotations, including opaque historical targets, remain intact. No clock is
+inferred from the host or substituted when analysis is absent.
+
+The expanded driver replay now invokes this compiler operation instead of
+concatenating the complete native clock map and TracerV BridgeIO unchecked.
+These historical expanded fixtures still need the native boundary as a source:
+this does not connect enabled-Print production ingestion to the full assembly.
+A small two-circuit FIRRTL fixture tests twelve atomic rejections, preservation
+of an existing destination Print-domain entry, a selected-channel merge,
+source immutability and a repeated-import rejection. The production TracerV
+header test now includes the duplicate-channel case (35 total rejections).
+
+Build and evidence: generated U250 directory `iteration124-build-check.log`
+and `iteration124-bridge-clocks/`. The production compiler and both focused
+binaries build; four CTests (Print binding, TracerV header, LoadMem header,
+metasim interface header) pass. Native and both expanded complete-header
+replays pass their existing hardware/archive and transaction checks. All nine
+`.const.h`, `.const.vh`, `.defines.vh` outputs equal iteration 123 byte for byte;
+all three full C++ headers compile against the actual drivers with
+`-std=c++20 -Wall -Wextra -Werror -fsyntax-only`.
+
+Exact read-only annotation oracle:
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json`.
+Both emitted `bridge-clock-analysis.json` archives match its TracerV constructor
+and twelve local channel identities; the imported per-channel clock records
+match its RationalClockBridge constructor's named 1/1 domain. Their targets
+resolve to `GGTracerVTokenEngine>hPort` in the destination assembly circuit.
+`clock-comparison.json` records the comparison. Only the twelve selected
+TracerV entries are imported, rather than the native archive's unrelated map
+entries. The separate merge test establishes preservation of preexisting
+clock-map entries; these old expanded fixtures have no preexisting clock map.
+
+Exact RTL oracle remains the U250 fixture's
+`design/FireSim-generated.sv` path recorded in iteration 123. Native comparison
+matches all eleven regions and nine bus widths. Both LoadMem comparisons retain
+its sixteen memory ports, 75 equations, sixteen identity routes, depth-two
+request queue, write-over-zero-fill priority, nine MMIO addresses and 64/32-bit
+chunk ABI. No immutable fixture was edited and no manager gate was started.
+
+Next smallest step: invoke the checked transfer at the native bridge catalog
+import in the enabled-Print production assembly, retain the Print synthesis
+clock map through FAME/host binding, then call the complete driver transaction.
+Enabled-Print production runtime and the SFC UART-bearing differential remain
+pending; the overall compiler migration is incomplete.

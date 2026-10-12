@@ -16,6 +16,7 @@ add_executable(goldengate-circt
   lib/Support/UARTHeader.cpp
   lib/Support/TSIHeader.cpp
   lib/Support/BlockDevHeader.cpp
+  lib/Analysis/BridgeClockInfo.cpp
   lib/Support/TracerVHeader.cpp
   lib/Support/PrintBridgeHeader.cpp
   lib/Support/RocketDriverHeader.cpp
@@ -378,6 +379,7 @@ if(BUILD_TESTING)
     lib/Support/UARTHeader.cpp
     lib/Support/TSIHeader.cpp
     lib/Support/BlockDevHeader.cpp
+    lib/Analysis/BridgeClockInfo.cpp
     lib/Support/TracerVHeader.cpp
     lib/Support/FASEDHeader.cpp
     lib/Support/PrintBridgeHeader.cpp
@@ -815,6 +817,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-cpu-managed-stream-header COMMAND goldengate-cpu-managed-stream-header-test)
   add_executable(goldengate-tracerv-header-test
     test/Support/TracerVHeaderTest.cpp
+    lib/Analysis/BridgeClockInfo.cpp
     lib/Support/TracerVHeader.cpp lib/Support/BlockDevHeader.cpp
     lib/Support/TSIHeader.cpp lib/Support/UARTHeader.cpp
     lib/Support/PeekPokeHeader.cpp lib/Support/LoadMemHeader.cpp

@@ -10,7 +10,7 @@
 // Output invariants: one checked constructor; rejection precedes mutation.
 #include "goldengate/TracerVHeader.h"
 #include "goldengate/AnnotationClasses.h"
-#include "goldengate/TargetUtils.h"
+#include "goldengate/BridgeClockInfo.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
@@ -143,36 +143,25 @@ LogicalResult goldengate::prepareTracerVHeader(
       fieldType(fieldType(engine.getPortType(2),"hBits"),"tiletrace_trace_retiredinsns_0_iaddr") != uint(40) ||
       fieldType(engine.getPortType(4),"bits") != uint(512))
     return reject("TracerV header needs the live Rocket trace constructor and 512-bit stream");
-  DictionaryAttr bridge, clockMap;
+  DictionaryAttr bridge;
   for (auto attr : raw) {
     auto d = dyn_cast<DictionaryAttr>(attr);
     if (d.getAs<StringAttr>("class") == AnnotationClasses::BridgeIO &&
         d.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.TracerVBridgeModule") {
       if (bridge) return reject("ambiguous TracerV bridge identity"); bridge = d;
     }
-    if (d.getAs<StringAttr>("class") == AnnotationClasses::ChannelClockInfo) {
-      if (clockMap) return reject("ambiguous channel clock analysis"); clockMap = d;
-    }
   }
   auto clock = bridge ? bridge.getAs<DictionaryAttr>("clockInfo") : DictionaryAttr();
   auto clockName = clock ? clock.getAs<StringAttr>("name") : StringAttr();
   auto multiplier = clock ? clock.getAs<IntegerAttr>("multiplier") : IntegerAttr();
   auto divisor = clock ? clock.getAs<IntegerAttr>("divisor") : IntegerAttr();
-  auto target = bridge ? bridge.getAs<StringAttr>("target") : StringAttr();
-  auto resolved = target ? resolveAnnotationTarget(circuit,target.getValue(),error) : std::nullopt;
   auto mapping = bridge ? bridge.getAs<DictionaryAttr>("channelMapping") : DictionaryAttr();
-  auto infoMap = clockMap ? clockMap.getAs<DictionaryAttr>("infoMap") : DictionaryAttr();
-  if (!bridge || bridge.getAs<DictionaryAttr>("widgetConstructorKey") != key || !resolved ||
-      resolved->module != engine || !resolved->port || *resolved->port != 2 || resolved->fieldID != 0 ||
-      !clockName || clockName.getValue().empty() || clockName.getValue().contains('\0') ||
-      !multiplier || multiplier.getInt() <= 0 || multiplier.getInt() > UINT32_MAX ||
-      !divisor || divisor.getInt() <= 0 || divisor.getInt() > UINT32_MAX || !mapping || mapping.size() != 12 || !infoMap)
+  if (!mapping || mapping.size() != 12) return reject("TracerV requires twelve analyzed channels");
+  auto resolved = resolveBridgeClockInfo(circuit, bridge, error);
+  if (!resolved) return failure();
+  if (bridge.getAs<DictionaryAttr>("widgetConstructorKey") != key ||
+      resolved->module != engine || *resolved->port != 2 || resolved->fieldID != 0)
     return reject("TracerV driver needs a resolved engine HostPort and rational clock analysis");
-  for (auto member : mapping) {
-    auto channel = dyn_cast<StringAttr>(member.getValue());
-    if (!channel || infoMap.getAs<DictionaryAttr>(channel.getValue()) != clock)
-      return reject("TracerV driver clock differs from its analyzed channels");
-  }
   auto stream = queue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
   auto index = stream ? stream.getAs<IntegerAttr>("index") : IntegerAttr();
   auto depth = stream ? stream.getAs<IntegerAttr>("depth") : IntegerAttr();

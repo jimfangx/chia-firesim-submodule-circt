@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/BridgeClockInfo.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/RocketDriverHeader.h"
@@ -60,6 +61,88 @@ InstanceOp child(FModuleOp m, FModuleOp target) {
   }
   require(bool(found), "missing child instance"); return found;
 }
+// Small SSA fixture tests the import independently of the large Rocket replay.
+void bridgeClockImport(MLIRContext &ctx) {
+  auto make = [&](bool source) {
+    auto root = parseSourceString<ModuleOp>(source ? R"(module { firrtl.circuit "Source" {
+      firrtl.module @Source() {}
+      firrtl.module @Engine(in %hPort: !firrtl.uint<1>) {}
+    } })" : R"(module { firrtl.circuit "Destination" {
+      firrtl.module @Destination() {}
+      firrtl.module @Engine(in %hPort: !firrtl.uint<1>) {}
+    } })", &ctx);
+    require(bool(root), "bridge clock import fixture parse");
+    auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+    auto clock = b.getDictionaryAttr({b.getNamedAttr("name", b.getStringAttr("target")),
+        b.getNamedAttr("multiplier", b.getI64IntegerAttr(1)), b.getNamedAttr("divisor", b.getI64IntegerAttr(2))});
+    auto key = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Constructor"))});
+    auto engine = named(c,"Engine"); engine->setAttr("goldengate.bridgeConstructor", key);
+    b.setInsertionPointToStart(named(c,c.getName()).getBodyBlock());
+    b.create<InstanceOp>(c.getLoc(),engine,"bridge");
+    auto map = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelClockInfo)),
+        b.getNamedAttr("infoMap", b.getDictionaryAttr({b.getNamedAttr(source ? "trace" : "print", clock)}))});
+    SmallVector<Attribute> raw{map};
+    if (source) raw.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::BridgeIO)),
+        b.getNamedAttr("widgetClass", b.getStringAttr("test.Bridge")),
+        b.getNamedAttr("target", b.getStringAttr("~Source|Engine>hPort")),
+        b.getNamedAttr("widgetConstructorKey",key), b.getNamedAttr("clockInfo",clock),
+        b.getNamedAttr("channelMapping",b.getDictionaryAttr({b.getNamedAttr("payload",b.getStringAttr("trace"))}))}));
+    raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Opaque")),
+        b.getNamedAttr("target",b.getStringAttr("~Source|Engine>historical"))}));
+    c->setAttr("rawAnnotations",b.getArrayAttr(raw)); return root;
+  };
+  for (unsigned bad = 0; bad < 12; ++bad) {
+    auto src = make(true), dst = make(false); OpBuilder b(&ctx);
+    auto sc = *src->getOps<CircuitOp>().begin(), dc = *dst->getOps<CircuitOp>().begin();
+    auto rows = llvm::to_vector(sc->getAttrOfType<ArrayAttr>("rawAnnotations"));
+    NamedAttrList bridge(cast<DictionaryAttr>(rows[1]));
+    if (bad == 0) rows.erase(rows.begin());
+    if (bad == 1) {
+      NamedAttrList clock(cast<DictionaryAttr>(bridge.get("clockInfo"))); clock.set("divisor", b.getI64IntegerAttr(0));
+      bridge.set("clockInfo",clock.getDictionary(&ctx)); rows[1] = bridge.getDictionary(&ctx);
+    }
+    if (bad == 2) rows.push_back(rows[0]);
+    if (bad == 3) rows.push_back(rows[1]);
+    if (bad == 4) { bridge.set("target",b.getStringAttr("~Source|Engine>missing")); rows[1] = bridge.getDictionary(&ctx); }
+    if (bad == 5) named(dc,"Engine")->removeAttr("goldengate.bridgeConstructor");
+    if (bad == 6) (*named(dc,"Destination").getOps<InstanceOp>().begin()).erase();
+    if (bad == 7) { b.setInsertionPointToStart(named(dc,"Destination").getBodyBlock()); b.create<InstanceOp>(dc.getLoc(),named(dc,"Engine"),"second"); }
+    if (bad == 8) {
+      auto raw = llvm::to_vector(dc->getAttrOfType<ArrayAttr>("rawAnnotations"));
+      NamedAttrList map(cast<DictionaryAttr>(raw[0]));
+      map.set("infoMap",b.getDictionaryAttr({b.getNamedAttr("trace",b.getDictionaryAttr({}))}));
+      raw[0] = map.getDictionary(&ctx); dc->setAttr("rawAnnotations",b.getArrayAttr(raw));
+    }
+    if (bad == 9) {
+      bridge.set("channelMapping",b.getDictionaryAttr({b.getNamedAttr("first",b.getStringAttr("trace")),
+          b.getNamedAttr("second",b.getStringAttr("trace"))})); rows[1] = bridge.getDictionary(&ctx);
+    }
+    if (bad == 10) named(sc,"Engine")->removeAttr("goldengate.bridgeConstructor");
+    if (bad == 11) named(dc,"Engine").getArgument(0).setType(UIntType::get(&ctx,2));
+    sc->setAttr("rawAnnotations",b.getArrayAttr(rows));
+    auto sourceBefore = dump(*src), destinationBefore = dump(*dst); std::string error;
+    require(failed(goldengate::importBridgeClockInfo(dc,sc,"test.Bridge",error)) && !error.empty() &&
+        dump(*src) == sourceBefore && dump(*dst) == destinationBefore,
+        "bridge clock import atomic rejection " + std::to_string(bad));
+  }
+  auto src = make(true), dst = make(false);
+  auto sc = *src->getOps<CircuitOp>().begin(), dc = *dst->getOps<CircuitOp>().begin();
+  auto old = dc->getAttrOfType<ArrayAttr>("rawAnnotations"); auto sourceBefore = dump(*src); std::string error;
+  require(succeeded(goldengate::importBridgeClockInfo(dc,sc,"test.Bridge",error)),error);
+  auto raw = dc->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto map = cast<DictionaryAttr>(raw[0]).getAs<DictionaryAttr>("infoMap");
+  auto bridge = cast<DictionaryAttr>(raw[raw.size() - 1]);
+  require(raw.size() == old.size()+1 && raw[1] == old[1] && map.size() == 2 &&
+      map.get("print") == map.get("trace") && bridge.getAs<StringAttr>("target") == "~Destination|Engine>hPort" &&
+      dump(*src) == sourceBefore && goldengate::resolveBridgeClockInfo(dc,bridge,error).has_value(),
+      "bridge clock import lost destination analysis, opaque archive or source identity");
+  auto before = dump(*dst);
+  require(failed(goldengate::importBridgeClockInfo(dc,sc,"test.Bridge",error)) && dump(*dst) == before,
+      "duplicate bridge import changed IR");
+  llvm::outs() << "PASS bridge clock import: twelve atomic rejections, selected channel merge and retained foreign archive\n";
+}
+
 // The bridge anchor is intentionally unresolved: the constructor, not an
 // assumed top-level signal named synthesizedPrintf, identifies the host.
 struct Fixture {
@@ -2306,37 +2389,23 @@ void rocketDriverHeaders(Fixture &f, StringRef directory, StringRef nativeBounda
       hosts.push_back(named(c, cast<DictionaryAttr>(row).getAs<StringAttr>("hostModule").getValue()));
     return hosts;
   };
-  // The earlier expanded hardware replay imported only constructor/channel
-  // annotations needed by its transforms. It intentionally lacks TracerV's
-  // driver clock analysis. Require rejection before copying this analysis
-  // from the actual native boundary explicitly in the TEST fixture.
+  // Import only validated retained analysis for the live bridge. This replaces
+  // unchecked concatenation of the entire native clock map in the old replay.
   auto native = parseSourceFile<ModuleOp>(nativeBoundary, ctx);
   require(bool(native), "cannot parse native Rocket header oracle boundary");
   auto nc = *native->getOps<CircuitOp>().begin();
-  auto raw = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  SmallVector<Attribute> annotations(raw.begin(), raw.end());
-  bool bridge = false, clocks = false;
-  for (auto row : nc->getAttrOfType<ArrayAttr>("rawAnnotations")) {
-    auto dict = cast<DictionaryAttr>(row);
-    if (dict.getAs<StringAttr>("class") == goldengate::AnnotationClasses::BridgeIO &&
-        dict.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.TracerVBridgeModule") {
-      require(dict.getAs<DictionaryAttr>("widgetConstructorKey") ==
-          named(f.circuit, "GGTracerVTokenEngine")->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"),
-          "native and expanded TracerV constructors differ");
-      annotations.push_back(row); bridge = true;
-    }
-    if (dict.getAs<StringAttr>("class") == goldengate::AnnotationClasses::ChannelClockInfo) {
-      annotations.push_back(row); clocks = true;
-    }
-  }
-  require(bridge && clocks, "native boundary lacks resolved TracerV clock analysis");
   require(succeeded(goldengate::prepareMetasimInterfaceHeader(f.circuit, "FireSim", error)), error);
   auto missing = dump(*f.root);
   require(failed(goldengate::prepareTracerVHeader(f.circuit, error)) && dump(*f.root) == missing,
       "TracerV fabricated missing clock analysis");
-  auto interface = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  for (unsigned i = raw.size(); i < interface.size(); ++i) annotations.push_back(interface[i]);
-  f.circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  auto foreign = dump(*native);
+  require(succeeded(goldengate::importBridgeClockInfo(f.circuit, nc,
+      "firechip.goldengateimplementations.TracerVBridgeModule", error)), error);
+  require(dump(*native) == foreign, "clock import changed source circuit");
+  auto imported = dump(*f.root);
+  require(failed(goldengate::importBridgeClockInfo(f.circuit, nc,
+      "firechip.goldengateimplementations.TracerVBridgeModule", error)) && dump(*f.root) == imported,
+      "repeated clock import changed destination");
   auto original = f.circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto baseline = dump(*f.root);
   for (unsigned bad = 0; bad < 6; ++bad) {
@@ -2457,6 +2526,7 @@ void rocketDriverHeaders(Fixture &f, StringRef directory, StringRef nativeBounda
   require(failed(goldengate::prepareRocketDriverHeaders(f.circuit,error)) && dump(*f.root) == saved,
       "duplicate expanded driver transaction");
   require(succeeded(goldengate::emitOutputFiles(f.circuit, directory, "FireSim-generated", error)), error);
+  require(succeeded(goldengate::emitAllAnnotations(f.circuit, directory.str() + "/bridge-clock-analysis.json", error)), error);
   llvm::outs() << "PASS complete expanded Rocket/Print driver, eleven LoadMem and four TracerV atomic rejections, seven atomic composition rejections and preserved hardware/archive\n";
 }
 
@@ -5828,6 +5898,7 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    bridgeClockImport(ctx);
     if (argc == 4 && StringRef(argv[1]) == "--rocket-native-driver-headers") {
       auto root = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(root), "cannot parse native Rocket F1Shim boundary");
