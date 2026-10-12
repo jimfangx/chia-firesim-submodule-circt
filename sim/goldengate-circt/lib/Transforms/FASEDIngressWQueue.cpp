@@ -17,9 +17,10 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDIngressWQueue(CircuitOp circuit, std::string &error) {
   constexpr llvm::StringLiteral queueName = "GGFASEDIngressWQueue16";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDIngressWQueueWrapper";
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressAWWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressWQueueWrapper" : "GGFASEDIngressWQueueWrapper";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDIngressAWWrapper")
+  if (!selected && circuit.getName() != "GGFASEDIngressAWWrapper")
     return reject("FASED W ingress queue requires the active FASED AW ingress wrapper");
   FModuleOp inner, engine;
   for (auto &op : circuit.getBodyBlock()->getOperations()) {

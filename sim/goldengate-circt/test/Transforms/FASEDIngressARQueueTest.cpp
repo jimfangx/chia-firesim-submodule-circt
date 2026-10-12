@@ -100,7 +100,7 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false) {
   std::string text = R"(module {
     firrtl.circuit "GGFASEDIngressWQueueWrapper" {
       firrtl.module @GGFASEDIngressWQueueWrapper(
@@ -117,16 +117,23 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0) {
   if (variant == 6) replace("out %fased_ingress_reset", "in %fased_ingress_reset");
   if (variant == 7) replace("valid: uint<1>", "valid: uint<2>");
   if (variant == 8) replace("ready flip: uint<1>", "ready flip: uint<2>");
+  if (selected) {
+    size_t pos = 0;
+    while ((pos = text.find("GGFASEDIngressWQueueWrapper", pos)) != std::string::npos) {
+      text.replace(pos, 27, "GGSelectedPrintFASEDIngressWQueueWrapper");
+      pos += 40;
+    }
+  }
   auto root = parseSourceString<ModuleOp>(text, &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   SmallVector<Attribute> annos;
   for (auto name : {"fased_ingress_ar_enq.bits.user", "other", "fased_ingress_reset"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
-        b.getNamedAttr("target", b.getStringAttr("~GGFASEDIngressWQueueWrapper|GGFASEDIngressWQueueWrapper>" + std::string(name)))}));
+        b.getNamedAttr("target", b.getStringAttr((selected ? "~GGSelectedPrintFASEDIngressWQueueWrapper|GGSelectedPrintFASEDIngressWQueueWrapper>" : "~GGFASEDIngressWQueueWrapper|GGFASEDIngressWQueueWrapper>") + std::string(name)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
-void behavior(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void behavior(MLIRContext &context, bool selected = false) {
+  auto root = fixture(context, 0, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDIngressARQueue(c, error)), error);
   require(succeeded(verify(*root)), "queue IR verification failed");
   Interpreter sim(named(c, "GGFASEDIngressARQueue4")); std::deque<APInt> expected;
@@ -246,7 +253,7 @@ void rejection(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(context); mapping(context); rejection(context);
+    behavior(context); behavior(context, true); mapping(context); rejection(context);
     llvm::outs() << "Read address payload, full/empty stalls, reset/write, async RAM, wiring, annotation identity and 19 atomic rejections passed\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

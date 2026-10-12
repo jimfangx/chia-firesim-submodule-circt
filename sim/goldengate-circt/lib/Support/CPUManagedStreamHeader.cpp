@@ -35,6 +35,7 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
        circuit.getName() == "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" ||
        circuit.getName() == "GGSelectedPrintFASEDTokenWrapper" ||
        circuit.getName() == "GGSelectedPrintFASEDHostOutstandingWrapper" ||
+       circuit.getName() == "GGSelectedPrintFASEDIngressARQueueWrapper" ||
        circuit.getName() == "GGSelectedPrintCPUStreamPlatformWrapper");
   if (selected && circuit.getName() != "GGControlMasterWrapper" &&
       circuit.getName() != "GGSelectedPrintCPUStreamWriteBufferWrapper" &&
@@ -43,6 +44,7 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
       circuit.getName() != "GGSelectedPrintCPUStreamWriteResponseBufferWrapper" &&
       circuit.getName() != "GGSelectedPrintFASEDTokenWrapper" &&
       circuit.getName() != "GGSelectedPrintFASEDHostOutstandingWrapper" &&
+      circuit.getName() != "GGSelectedPrintFASEDIngressARQueueWrapper" &&
       circuit.getName() != "GGSelectedPrintCPUStreamPlatformWrapper")
     return reject("selected outgoing CPU header requires the assembled selected control master");
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");

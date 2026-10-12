@@ -6014,6 +6014,83 @@ int main(int argc, char **argv) {
     if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
       nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-ingress") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected host counter boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      // Probe recursive annotation identity, including a consumed aggregate leaf.
+      SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+      auto probe = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.IngressIdentity")),
+          b.getNamedAttr("targets", b.getArrayAttr({
+            b.getStringAttr("~GGSelectedPrintFASEDHostOutstandingWrapper"),
+            b.getStringAttr("~GGSelectedPrintFASEDHostOutstandingWrapper|GGSelectedPrintFASEDHostOutstandingWrapper>hostClock"),
+            b.getStringAttr("~GGSelectedPrintFASEDHostOutstandingWrapper|GGSelectedPrintFASEDHostOutstandingWrapper>fased_ingress.hBits.aw.bits.addr")}))});
+      raw.push_back(probe); c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+      for (unsigned bad = 0; bad < 13; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        if (bad == 0) tc.setName("Wrong");
+        else if (bad == 1) tc->removeAttr("rawAnnotations");
+        else if (bad == 2) hs.clear();
+        else if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        else if (bad >= 4 && bad <= 10) {
+          const StringRef names[]{"GGSelectedPrintFASEDIngressAWWrapper",
+              "GGSelectedPrintFASEDIngressWQueueWrapper", "GGSelectedPrintFASEDIngressARQueueWrapper",
+              "GGFASEDIngressAW", "GGFASEDIngressAWQueue10", "GGFASEDIngressWQueue16", "GGFASEDIngressARQueue4"};
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr(names[bad - 4]),
+              named(tc, "GGSelectedPrintFASEDHostOutstandingWrapper").getConventionAttr(), ArrayRef<PortInfo>{});
+        } else {
+          auto engine = named(tc, "GGFASEDTokenEngine");
+          if (bad == 11) engine->removeAttr("goldengate.bridgeConstructor");
+          else {
+            NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+            NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+            edge.set("maxWriteTransfer", b.getI64IntegerAttr(4));
+            key.set("axi4Edge", edge.getDictionary(&ctx));
+            engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+          }
+        }
+        auto before = dump(*test);
+        require(failed(goldengate::mapPrintBridgeFASEDIngress(tc, hs, error)) && !error.empty() && dump(*test) == before,
+            "selected FASED ingress rejection mutated IR " + std::to_string(bad));
+      }
+      SmallVector<FModuleOp> modules; SmallVector<Operation *> ops; std::map<std::string, std::string> bodies;
+      auto body = [](FModuleOp m) { std::string text; llvm::raw_string_ostream out(text); m->print(out, OpPrintingFlags().useLocalScope()); return text; };
+      for (auto m : c.getOps<FModuleOp>()) {
+        modules.push_back(m); bodies[m.getName().str()] = body(m);
+        for (auto &op : m.getBodyBlock()->getOperations()) ops.push_back(&op);
+      }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDIngress(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      SmallVector<Operation *> after;
+      for (auto m : modules) {
+        require(named(c, m.getName()) == m && body(m) == bodies.at(m.getName().str()), "selected FASED ingress queues replaced prior module");
+        for (auto &op : m.getBodyBlock()->getOperations()) after.push_back(&op);
+      }
+      require(after == ops, "selected FASED ingress queues replaced prior operations");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected FASED ingress queues changed allocated collateral: " + error);
+      auto transferred = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back());
+      auto targets = transferred.getAs<ArrayAttr>("targets");
+      const StringRef expected[]{"~GGSelectedPrintFASEDIngressARQueueWrapper",
+          "~GGSelectedPrintFASEDIngressARQueueWrapper|GGSelectedPrintFASEDIngressARQueueWrapper>hostClock",
+          "~GGSelectedPrintFASEDIngressARQueueWrapper|GGSelectedPrintFASEDHostOutstandingWrapper>fased_ingress.hBits.aw.bits.addr"};
+      for (unsigned i = 0; i < 3; ++i)
+        require(cast<StringAttr>(targets[i]).getValue() == expected[i], "selected ingress target identity differs");
+      auto before = dump(*source);
+      require(failed(goldengate::mapPrintBridgeFASEDIngress(c, hostsFor(c), error)) && dump(*source) == before,
+          "selected FASED ingress queues repeat mutated IR");
+      llvm::outs() << "PASS selected FASED ingress queues, unchanged allocated headers/SSA, 14 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-outstanding") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected token boundary");

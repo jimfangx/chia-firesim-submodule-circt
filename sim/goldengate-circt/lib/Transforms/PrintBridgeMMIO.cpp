@@ -2316,6 +2316,38 @@ LogicalResult goldengate::mapPrintBridgeFASEDHostOutstanding(CircuitOp circuit,
   return success();
 }
 
+// Oracle: IngressUnit.scala queues and DecoupledHelper capacity gating.
+// Stage all three queues so a late constructor/collision rejection cannot
+// publish a partially consumed ingress boundary. Prior live operations survive.
+LogicalResult goldengate::mapPrintBridgeFASEDIngress(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDHostOutstandingWrapper") {
+    error = "selected Print FASED ingress requires the completed host counter boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDIngressAWQueue(*staged, error)) ||
+      failed(addFASEDIngressWQueue(*staged, error)) ||
+      failed(addFASEDIngressARQueue(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED ingress produced invalid FIRRTL IR";
+    return failure();
+  }
+  const StringRef additions[]{"GGSelectedPrintFASEDIngressAWWrapper",
+      "GGSelectedPrintFASEDIngressWQueueWrapper", "GGSelectedPrintFASEDIngressARQueueWrapper",
+      "GGFASEDIngressAW", "GGFASEDIngressAWQueue10", "GGFASEDIngressWQueue16", "GGFASEDIngressARQueue4"};
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (llvm::is_contained(additions, m.getName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(

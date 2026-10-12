@@ -170,6 +170,12 @@ mlir::LogicalResult mapPrintBridgeFASEDTokens(
 mlir::LogicalResult mapPrintBridgeFASEDHostOutstanding(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+// Attach AW/W/AR ingress queues to selected host counters atomically.
+// Qualified ingress reset clears pointers; raw dequeue/credit pulses remain
+// explicit until host issue ordering is attached. Preserve live allocation/SSA.
+mlir::LogicalResult mapPrintBridgeFASEDIngress(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

@@ -5848,3 +5848,61 @@ these results establish shared FASED semantics, not enabled-Print runtime parity
 Next smallest step: attach the native AW/W/AR ingress queues, preserving host
 counters, CPU ports and live allocated collateral. Manager verification remains
 harness-owned; no manager gate was started here.
+
+### Iteration 142: selected Print FASED ingress queues
+
+`mapPrintBridgeFASEDIngress` attaches shared native AW/W/AR queue operations to
+`GGSelectedPrintFASEDHostOutstandingWrapper`. The new CLI stage
+`--map-print-host-fased-ingress` requires `--map-print-host-fased-outstanding`
+and emits `post-print-fased-ingress.mlir`, its complete annotation archive and
+simulator SV. The final top is `GGSelectedPrintFASEDIngressARQueueWrapper`.
+All three passes run on a clone; verification precedes publication of the seven
+new modules. Late W constructor and AR collision failures leave the live circuit
+unchanged. Live Print/optional TracerV allocation, prior module/operation identity,
+CPU AXI ports and driver headers survive the composition.
+
+Oracle: `midas/models/dram/IngressUnit.scala`, following the clock/channel and
+FAME semantics in `MidasTransforms.scala` and `fame/FAMETransform.scala`.
+The depths are AW=10, W=16 and AR=4; payload widths are 69/78/69 bits.
+Each enqueue valid includes the other two queues' readiness; ingress hReady
+combines all three capacities. Queue clocks use hostClock and resets use the
+qualified token-engine ingress reset. Reset flushes pointers/full state; writes
+accepted before the reset edge still update RAM. There is no flow/pipe bypass.
+Dequeue boundaries and accepted AW/AR/last-W pulses remain explicit for credits
+and host issue ordering.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration142-print-fased-ingress`.
+Native builds and five targeted CTest suites passed: Print binding, CPU-managed
+stream headers and AW/W/AR ingress queues (25.77 seconds). Actual native FIRRTL
+queue interpretation covers respectively 20386/20530/20194 cycles in each of the
+legacy and selected fixtures, with full/empty stalls, payload ordering, pointer
+wrap, simultaneous transfers, asynchronous reads and reset-edge writes.
+Both focused selected composition tests passed, preserving allocated headers,
+prior module/SSA identity and recursive copied/consumed annotation targets;
+each rejected thirteen malformed cases plus a repeat atomically. Both complete
+native CLI replays passed, with and without TracerV. CLI dependency preflight
+passed. `ctest-detail.log` retains individual behavioral summaries.
+
+Exact immutable golden comparison:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+modules `IngressModule`, `Queue_7`, `Queue_8`, `Queue_9` and
+`FASEDMemoryTimingModel`. `PrintSelectedFASEDIngressCompare.py` passes capacity
+and enqueue gates, queue depths, surviving SFC payload fields, RAM write/read
+qualification and qualified ingress reset routes. CIRCT emits packed RAM in
+separate memory modules; the comparison was corrected to inspect their actual
+geometry rather than expecting SFC's inline split field arrays. Candidate shared
+helpers match `circt-ingestion/post-fame-fased-ingress-ar.mlir` operations exactly.
+Print/TracerV and Print-only candidates preserve respectively 109/103 prior
+modules, 213/237 wrapper connections and all 1713 annotation rows with the
+intended recursive target transfer. Report: `sfc-comparison.json`.
+
+Replay input is the primary immutable compiler fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected iteration-67 Print
+annotations and the native Rocket control catalog. Neither golden was written.
+Intermediate artifacts are compressed; counter/ingress MLIR and annotation
+archives plus final ingress SV remain raw. The golden disables Print; enabled
+Print runtime parity and complete FASED timing/host issue are still unproven.
+Next smallest step: attach native AW/W credit counters to the selected ingress
+boundary, retaining CPU ports and live allocated headers, before transaction
+ordering and host issue. No harness-owned manager gate was started here.
