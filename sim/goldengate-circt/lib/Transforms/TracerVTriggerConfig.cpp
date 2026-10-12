@@ -2,6 +2,8 @@
 // TracerVBridge.scala: MMIO configuration and host-cycle trigger state.
 #include "goldengate/TracerVTokenEngine.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/OperationSupport.h"
+#include "mlir/IR/OwningOpRef.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -12,10 +14,11 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGTracerVTokenWrapper")
     return reject("TracerV trigger configuration requires the active token wrapper");
-  FModuleOp inner, engine;
+  FModuleOp inner, engine; FModuleLike existingBank;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == bankName || m.getName() == wrapperName)
-      return reject("TracerV trigger module or wrapper already exists");
+    if (m.getName() == wrapperName)
+      return reject("TracerV trigger wrapper already exists");
+    if (m.getName() == bankName) existingBank = m;
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGTracerVTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
   }
@@ -60,29 +63,21 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (instances != 1 || used) return reject("TracerV trigger mapping needs a unique engine in an uninstantiated top");
 
-  // All unsupported boundaries reject before mutation. Observe the masked trace
-  // independently of HostPort fire: the Scala PC/insn state runs on host clocks.
-  unsigned observationPort = inner.getNumPorts();
-  inner.insertPorts({{observationPort, PortInfo(b.getStringAttr("tracerv_trace"), trace, Direction::Out)}});
-  b.setInsertionPointToEnd(inner.getBodyBlock());
   auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
   auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
-  Value payload = field(tracer.getResult(2), "hBits");
-  Value observation = inner.getBodyBlock()->getArgument(observationPort);
-  connect(field(observation, "valid"), b.create<AndPrimOp>(loc, field(payload, observed[1]),
-      b.create<NotPrimOp>(loc, field(payload, observed[0]))));
-  connect(field(observation, "iaddr"), field(payload, observed[2]));
-  connect(field(observation, "insn"), field(payload, observed[3]));
   auto word = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
       {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, uint(32)}});
   auto words = FVectorType::get(word, 15);
   auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
       {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
-  b.setInsertionPointToEnd(circuit.getBodyBlock());
+  // Generate the canonical bank privately. A catalog definition may be reused
+  // only when ports, metadata and all hardware operations match, not by name.
+  b.clearInsertionPoint();
   SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
       {b.getStringAttr("reset"), bit, Direction::In}, {b.getStringAttr("trace"), trace, Direction::In},
       {b.getStringAttr("control"), control, Direction::In}, {b.getStringAttr("mcr"), mcr, Direction::Out}};
   auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName), ConventionAttr::get(ctx, Convention::Internal), bankPorts);
+  OwningOpRef<FModuleOp> stagedBank(bank);
   bank->setAttr("goldengate.bridgeConstructor", key);
   const llvm::StringRef names[]{"initDone", "traceEnable", "hostTriggerPCStartHigh", "hostTriggerPCStartLow",
       "hostTriggerPCEndHigh", "hostTriggerPCEndLow", "hostTriggerCycleCountStartHigh", "hostTriggerCycleCountStartLow",
@@ -138,6 +133,35 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   for (int i = 3; i >= 0; --i) trigger = mux(eq(config[14], constant(32, i)), selections[i], trigger);
   connect(field(arg(3), "initDone"), config[0]); connect(field(arg(3), "traceEnable"), config[1]);
   connect(field(arg(3), "trigger"), trigger);
+
+  if (existingBank) {
+    if (!isa<FModuleOp>(existingBank.getOperation()))
+      return reject("existing TracerV trigger bank is not a native module");
+    bank.setPortLocationsAttr(existingBank.getPortLocationsAttr());
+    // CIRCT's textual parser supplies an empty parameters attribute that the
+    // native builder omits. Normalize this empty default only; nonempty
+    // parameters, annotations and all hardware must still compare exactly.
+    if (auto parameters = existingBank->getAttrOfType<ArrayAttr>("parameters"); parameters && parameters.empty())
+      bank->setAttr("parameters", parameters);
+    if (!OperationEquivalence::isEquivalentTo(bank, existingBank,
+            OperationEquivalence::IgnoreLocations))
+      return reject("existing TracerV trigger bank differs from native configuration");
+    bank = cast<FModuleOp>(existingBank.getOperation());
+  } else {
+    circuit.getBodyBlock()->push_back(stagedBank.release());
+  }
+
+  // All unsupported boundaries reject before mutation. Observe the masked trace
+  // independently of HostPort fire: the Scala PC/insn state runs on host clocks.
+  unsigned observationPort = inner.getNumPorts();
+  inner.insertPorts({{observationPort, PortInfo(b.getStringAttr("tracerv_trace"), trace, Direction::Out)}});
+  b.setInsertionPointToEnd(inner.getBodyBlock());
+  Value payload = field(tracer.getResult(2), "hBits");
+  Value observation = inner.getBodyBlock()->getArgument(observationPort);
+  connect(field(observation, "valid"), b.create<AndPrimOp>(loc, field(payload, observed[1]),
+      b.create<NotPrimOp>(loc, field(payload, observed[0]))));
+  connect(field(observation, "iaddr"), field(payload, observed[2]));
+  connect(field(observation, "insn"), field(payload, observed[3]));
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (i != *controlPort && i != observationPort) {

@@ -16,6 +16,8 @@ mlir::LogicalResult attachTracerVTokenEngine(circt::firrtl::CircuitOp circuit,
     llvm::StringRef inputBoundary, std::string &error);
 // Connect the engine to Rocket's decoded 15-word configuration bank, preserving
 // host-cycle PC/instruction state and the delayed cycle/PC limit registers.
+// Reuse an imported bank only after full operation/metadata equivalence; all
+// unsupported or incompatible boundaries reject before mutating the circuit.
 mlir::LogicalResult addTracerVTriggerConfig(circt::firrtl::CircuitOp circuit,
                                            std::string &error);
 // Buffer the sole Rocket CPU stream with its 6144-entry synchronous-read queue.

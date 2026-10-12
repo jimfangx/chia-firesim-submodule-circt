@@ -187,7 +187,7 @@ void wiring(MLIRContext &ctx) {
   for (unsigned j = 0; j < 12; ++j) require(sim.output(inner.getResult(j + 2), j < 10 ? "ready" : "valid").isZero(), "stall lost");
   llvm::outs() << "4096 all-channel helper comparisons passed\n";
 }
-std::string print(ModuleOp root) { std::string s; llvm::raw_string_ostream out(s); root.print(out); return s; }
+std::string print(Operation *root) { std::string s; llvm::raw_string_ostream out(s); root->print(out); return s; }
 void annotationsAndRejection(MLIRContext &ctx) {
   auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   auto before = c->getAttrOfType<ArrayAttr>("rawAnnotations");
@@ -342,11 +342,79 @@ void triggerConfiguration(MLIRContext &ctx) {
   }
   llvm::outs() << samples << " native trigger configuration comparisons and wrapper/identity checks passed\n";
 }
+void triggerBankReuse(MLIRContext &ctx) {
+  auto oracle = fixture(ctx); auto oc = *oracle->getOps<CircuitOp>().begin();
+  std::string error;
+  require(succeeded(goldengate::addTracerVTokenEngine(oc, error)), error);
+  require(succeeded(goldengate::addTracerVTriggerConfig(oc, error)), error);
+  auto canonical = named(oc, "GGTracerVTriggerConfig");
+  for (unsigned mode = 0; mode < 8; ++mode) {
+    auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin();
+    require(succeeded(goldengate::addTracerVTokenEngine(c, error)), error);
+    // Reparse the real textual handoff as well as cloning in-memory IR.
+    auto parsed = parseSourceString<ModuleOp>(print(*oracle), &ctx);
+    require(bool(parsed), "cannot reparse trigger handoff");
+    auto pc = *parsed->getOps<CircuitOp>().begin();
+    auto bank = cast<FModuleOp>((mode == 7 ? named(pc, "GGTracerVTriggerConfig") : canonical)->clone());
+    c.getBodyBlock()->push_back(bank);
+    OpBuilder b(&ctx);
+    // Declaration locations differ across imported source files.
+    bank->setLoc(FileLineColLoc::get(&ctx, "catalog.fir", 37, 2));
+    SmallVector<Attribute> locations(bank.getNumPorts(), bank.getLoc());
+    bank.setPortLocationsAttr(b.getArrayAttr(locations));
+    for (auto arg : bank.getBodyBlock()->getArguments()) arg.setLoc(bank.getLoc());
+    if (mode == 1) {
+      NamedAttrList key(bank->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+      key.set("iaddrWidth", b.getI64IntegerAttr(39));
+      bank->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+    }
+    if (mode == 2) {
+      auto rows = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+      SmallVector<Attribute> changed(rows.begin(), rows.end()); NamedAttrList first(cast<DictionaryAttr>(rows[0]));
+      first.set("offset", b.getI32IntegerAttr(4)); changed[0] = first.getDictionary(&ctx);
+      bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(changed));
+    }
+    if (mode == 3) {
+      auto reg = *bank.getOps<RegResetOp>().begin();
+      b.setInsertionPoint(reg);
+      reg->setOperand(2, b.create<ConstantOp>(reg.getLoc(), UIntType::get(&ctx, 1), APInt(1, 1)));
+    }
+    if (mode == 4) {
+      Value start, end;
+      for (auto reg : bank.getOps<RegResetOp>()) {
+        if (reg.getName() == "triggerPCStart") start = reg.getResult();
+        if (reg.getName() == "triggerPCEnd") end = reg.getResult();
+      }
+      for (auto conn : bank.getOps<StrictConnectOp>()) if (conn.getDest() == start) conn->setOperand(1, end);
+    }
+    if (mode == 5) {
+      b.setInsertionPointToEnd(bank.getBodyBlock()); b.create<ConstantOp>(bank.getLoc(), UIntType::get(&ctx, 1), APInt(1, 0));
+    }
+    if (mode == 6) {
+      SmallVector<Attribute> names(bank.getPortNames().begin(), bank.getPortNames().end());
+      names[0] = b.getStringAttr("wrongClock"); bank.setPortNames(names);
+    }
+    auto before = print(*root), bankBefore = print(bank);
+    auto result = goldengate::addTracerVTriggerConfig(c, error);
+    if (mode == 0 || mode == 7) {
+      require(succeeded(result) && succeeded(verify(*root)), error);
+      require(named(c, "GGTracerVTriggerConfig") == bank && print(bank) == bankBefore,
+          "equivalent catalog bank was replaced or mutated");
+      unsigned count = 0;
+      for (auto m : c.getOps<FModuleOp>()) count += m.getName() == "GGTracerVTriggerConfig";
+      require(count == 1, "reused bank duplicated");
+    } else {
+      require(failed(result) && !error.empty() && print(*root) == before,
+          "incompatible catalog trigger bank accepted or mutated circuit");
+    }
+  }
+  llvm::outs() << "Native trigger bank reuse and six atomic hardware/metadata collision rejections passed\n";
+}
 } // namespace
 int main() {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(ctx); wiring(ctx); annotationsAndRejection(ctx); triggerConfiguration(ctx);
+    behavior(ctx); wiring(ctx); annotationsAndRejection(ctx); triggerConfiguration(ctx); triggerBankReuse(ctx);
     llvm::outs() << "TracerV identity, target transfer and atomic rejection passed\n"; return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

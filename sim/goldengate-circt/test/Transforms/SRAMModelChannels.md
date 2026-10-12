@@ -5048,3 +5048,63 @@ Next smallest step: attach the existing fifteen-word TracerV trigger bank and
 registry for CPU allocation, and compose their control/stream attachments.
 Enabled-Print production runtime, the SFC UART-bearing differential and the
 overall compiler migration remain incomplete.
+
+### Live Print/TracerV trigger configuration (iteration 127)
+
+The production enabled-Print path now accepts
+`--compile-baseline --stop-after-print-host-binding --map-print-host-tracerv
+--map-print-host-tracerv-trigger`. This attaches the existing native
+fifteen-word TracerV configuration bank to the live token engine, producing
+`GGTracerVTriggerWrapper`. Host clock/reset drive the bank, masked trace
+valid/PC/instruction drive its host-cycle trigger state, and the engine's
+64-bit target cycle drives the delayed cycle-range trigger. The wrapper
+forwards Print control, stream and count ports and exposes decoded
+`tracerv_mcr`; stream queue and platform MMIO composition remain pending.
+
+`addTracerVTriggerConfig` privately constructs the canonical bank before
+changing the target boundary. A bank imported by the Rocket control catalog
+is reused only after complete CIRCT operation/port/metadata equivalence.
+Declaration locations and the textual parser's empty `parameters` default
+are normalized for comparison. Hardware, constructor and register-map
+mismatches reject atomically; the original imported module handle survives.
+No Scala source, immutable fixture, or verification harness was changed.
+
+Evidence is in the mutable generated U250 directory
+`iteration127-print-tracerv-trigger/`: production MLIR/FIRRTL/annotations/RTL,
+fresh-bank replay, final build and CTest logs, four early CLI rejections, and
+`comparison.json`. Two focused CTests pass. The native TracerV test covers
+26,144 packet/next-state samples, 4,096 helper samples and 22,304 trigger-state
+samples; the added tests check in-memory and reparsed bank reuse, differing
+source locations, six atomic hardware/metadata collisions and no duplicate
+bank. Both creating a fresh bank and reusing the real catalog bank succeed.
+The two bank bodies match the existing native F1Shim definition.
+
+The exact immutable RTL comparison is
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintTracerVTriggerCompare.py` parses the emitted candidate and SFC
+`TracerVBridgeModule` clocked register assignments and unsigned expressions.
+It compares all 22 trigger register widths and next states, the three engine
+control outputs and two read words for 4,096 sampled pre-edge states:
+110,592 comparisons pass. Cases include host reset, target-reset trace
+masking, coincident start/end boundaries, zero instruction masks, selectors
+0 through 5, delayed PC/cycle limits and simultaneous decoded writes, with
+HostPort transfer stalled. These are sampled semantic checks, not a proof
+of equivalence. Write-only assertion behavior is covered separately by the
+native bank test, rather than the emitted-RTL evaluator.
+
+The candidate preserves 62 preexisting module bodies (including Print hosts
+and the catalog bank), apart from adding the trace observation port to the
+existing token wrapper. All 1,713 annotation records retain payload/class/order
+apart from target retargeting, and the analyzed clock map is unchanged. The
+emitted wrapper's actual bank/engine clock, trace and bidirectional control
+connections match. The SFC FIRRTL input remains
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`,
+with iteration 67's selected enabled-Print annotations. The immutable SFC
+platform disables Print; no enabled-Print full-runtime equivalence is claimed.
+No manager verification gate was started.
+
+Next smallest step: attach the existing 6144-entry TracerV stream queue to
+`GGTracerVTriggerWrapper`, preserve the inner Print host registry, then compose
+the expanded CPU-stream/count and platform MMIO/control path. Enabled-Print
+production runtime, the SFC UART-bearing baseline and the overall port remain
+incomplete.
