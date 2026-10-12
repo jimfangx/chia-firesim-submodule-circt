@@ -45,7 +45,8 @@ def instance(body, kind, name):
 
 
 evidence, golden = Path(sys.argv[1]), Path(sys.argv[2])
-candidate = evidence / "candidate"
+tracerv = len(sys.argv) == 4 and sys.argv[3] == "--tracerv"
+candidate = evidence / ("production" if tracerv else "candidate")
 native = clean((candidate / "post-print-control-dispatch.sv").read_text())
 reference = clean(golden.read_text())
 _, router = module(reference, "NastiRouter")
@@ -103,7 +104,12 @@ _, counts = module(native, "GGCPUStreamControlWrapper")
 inner = instance(writes, "GGControlWriteDispatchWrapper", "sim")
 read_inner = instance(reads, "GGControlWidgetWriteWrapper", "sim")
 dispatch = instance(reads, "GGControlReadDispatch", "controlReadDispatch")
-for slave, bank in enumerate(("print_0_ctrl", "cpuStream_ctrl")):
+banks = ("tracerv_ctrl", "print_0_ctrl", "cpuStream_ctrl") if tracerv else ("print_0_ctrl", "cpuStream_ctrl")
+for slave, bank in enumerate(banks):
+    for channel in ('aw', 'w'):
+        assert nw[f'slave_{slave}_{channel}_valid'].strip() == f'{channel}_valid & {channel}_route[{slave}]'
+    selected_read = dict(read_names, **{f'route[{slave}]': 'ar_selected'})
+    assert terms(nr[f'slave_{slave}_ar_valid'], nr, selected_read) == set(handshakes['slave_0_ar_valid'])
     for channel, fields in {"aw": ("valid", "ready", "bits_addr", "bits_len", "bits_id"),
                             "w": ("valid", "ready", "bits_data", "bits_last")}.items():
         for field in fields:
@@ -116,8 +122,23 @@ count_top = instance(counts, "GGCPUStreamCountWrapper", "sim")
 count_adapter = instance(counts, "GGCPUStreamMCRFile", "crFile")
 assert count_top["cpuStream_mcr_read_0_bits"] == count_adapter["mcr_read_0_bits"], "live count detached from AXI adapter"
 mlir = (candidate / "post-print-control-dispatch.mlir").read_text()
-assert 'name = "PrintBridgeModule_0", size = 32 : i64, slave = 0 : i32, start = 0 : i64' in mlir
-assert 'name = "CPUManagedStreamEngine_0", size = 4 : i64, slave = 1 : i32, start = 32 : i64' in mlir
+regions = [("TracerVBridgeModule_0", 15, 0, 64), ("PrintBridgeModule_0", 6, 64, 32),
+           ("CPUManagedStreamEngine_0", 2, 96, 8)] if tracerv else [
+           ("PrintBridgeModule_0", 6, 0, 32), ("CPUManagedStreamEngine_0", 1, 32, 4)]
+for slave, (name, words, base, size) in enumerate(regions):
+    assert f'name = "{name}", size = {size} : i64, slave = {slave} : i32, start = {base} : i64' in mlir
+if tracerv:
+    from PrintRocketMasterCompare import native_module
+    from PrintRocketResponsesCompare import wiring
+    before_ir = (candidate / "post-print-cpu-streams.mlir").read_text()
+    names = re.findall(r'^    firrtl.module @(\w+)\(', before_ir, re.M)
+    for name in names:
+        assert native_module(before_ir, name) == native_module(mlir, name), name
+    adapter_nets = wiring(native_module(mlir, "GGTracerVBridgeControlWrapper"),
+                          "GGTracerVBridgeControlWrapper", aggregate=True)
+    assert adapter_nets["crFile.nasti"] == "top.tracerv_ctrl"
+    assert adapter_nets["crFile.mcr"] == "sim.tracerv_mcr"
+    assert adapter_nets["crFile.clock"] == "top.hostClock" and adapter_nets["crFile.reset"] == "top.hostReset"
 before = json.loads((candidate / "post-print-cpu-streams-all.json").read_text())
 after = json.loads((candidate / "post-print-control-dispatch-all.json").read_text())
 assert Counter(a['class'] for a in before) == Counter(a['class'] for a in after), "control mapping changed annotation classes"
@@ -130,10 +151,46 @@ def without_targets(value):
         return {key: without_targets(item) for key, item in value.items()}
     return value
 assert without_targets(before) == without_targets(after), "control mapping changed annotation payloads/order"
+clock_map = lambda rows: [r for r in rows if r['class'] == 'midas.passes.ChannelClockInfoAnnotation']
+assert clock_map(before) == clock_map(after), 'request composition changed analyzed clocks'
+if tracerv:
+    def transfer(value, old, new, copied):
+        if isinstance(value, str):
+            if value == '~' + old:
+                return '~' + new
+            if not value.startswith('~' + old + '|'):
+                return value
+            suffix = value[len(old) + 1:]
+            prefix = '|' + old + '>'
+            if suffix.startswith(prefix):
+                root = re.split(r'[.\[]', suffix[len(prefix):])[0]
+                survives = root in copied
+                if root in banks and old in ('GGControlWriteDispatchWrapper', 'GGControlWidgetWriteWrapper'):
+                    suffix_fields = suffix[len(prefix) + len(root):]
+                    channels = ('ar', 'b', 'r') if old == 'GGControlWriteDispatchWrapper' else ('b', 'r')
+                    survives = any(suffix_fields == '.' + c or suffix_fields.startswith('.' + c + '.') for c in channels)
+                if survives:
+                    suffix = '|' + new + '>' + suffix[len(prefix):]
+            return '~' + new + suffix
+        if isinstance(value, list):
+            return [transfer(v, old, new, copied) for v in value]
+        if isinstance(value, dict):
+            return {k: transfer(v, old, new, copied) for k,v in value.items()}
+        return value
+    chain = ['GGCPUStreamCountWrapper', 'GGCPUStreamControlWrapper', 'GGControlErrorWrapper',
+             'GGControlDecodeWrapper', 'GGControlWriteRouteWrapper',
+             'GGControlWriteDispatchWrapper', 'GGControlWidgetWriteWrapper', 'GGControlReadDispatchWrapper']
+    transferred = before
+    for old, new in zip(chain, chain[1:]):
+        old_ports = set(re.findall(r'\b(?:in|out) %(\w+):', native_module(mlir, old).splitlines()[0]))
+        new_ports = set(re.findall(r'\b(?:in|out) %(\w+):', native_module(mlir, new).splitlines()[0]))
+        transferred = transfer(transferred, old, new, old_ports & new_ports)
+    assert transferred == after, 'request composition changed target identities'
 report = {"golden": str(golden), "candidate": str(candidate / "post-print-control-dispatch.sv"),
-          "handshakes": handshakes, "banks": [{"name": "PrintBridgeModule_0", "words": 6, "base": 0, "bytes": 32},
-                                               {"name": "CPUManagedStreamEngine_0", "words": 1, "base": 32, "bytes": 4}],
+          "handshakes": handshakes, "banks": [{"name": n, "words": w, "base": b, "bytes": s} for n,w,b,s in regions],
           "request_and_count_connected": True, "annotation_classes_preserved": True,
+          "annotation_records": len(after), "exact_target_transfer": tracerv,
+          "unchanged_input_modules": len(names) if tracerv else None, "clock_map_preserved": True,
           "reference_has_print_host": False, "response_arbitration": "explicit boundary"}
 (evidence / "control-dispatch-comparison.json").write_text(json.dumps(report, indent=2) + "\n")
 print("PASS Print MMIO request/count connectivity and eight SFC NastiRouter handshake predicates")

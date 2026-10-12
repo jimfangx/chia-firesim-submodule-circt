@@ -70,12 +70,50 @@
 #include "goldengate/TSIMMIOBank.h"
 #include "goldengate/SimulationMaster.h"
 #include "goldengate/SimulationMasterControl.h"
+#include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/ADT/StringMap.h"
 using namespace mlir;
 using namespace circt::firrtl;
+
+LogicalResult goldengate::mapPrintBridgeTracerVControl(CircuitOp circuit,
+                                                      std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  FModuleOp adapter;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGTracerVMCRFile") adapter = m;
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == "GGTracerVMCRFile"; });
+  if (used) return reject("Print TracerV control requires an uninstantiated catalog adapter");
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (adapter)
+    for (auto m : staged->getOps<FModuleOp>())
+      if (m.getName() == adapter.getName()) { m.erase(); break; }
+  if (failed(mapTracerVBridgeControl(*staged, 25, 12, error))) return failure();
+  FModuleOp native;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGTracerVMCRFile") native = m;
+  if (adapter) {
+    OwningOpRef<Operation *> normalized(native->clone());
+    normalized->setAttr(FModuleLike::getPortLocationsAttrName(), adapter.getPortLocationsAttr());
+    if (auto parameters = adapter->getAttrOfType<ArrayAttr>("parameters"); parameters && parameters.empty())
+      normalized->setAttr("parameters", parameters);
+    if (!OperationEquivalence::isEquivalentTo(normalized.get(), adapter,
+            OperationEquivalence::IgnoreLocations))
+      return reject("Print TracerV catalog adapter differs from native MCR transport");
+  }
+  if (failed(verify(*staged))) return reject("Print TracerV control produced invalid FIRRTL IR");
+  llvm::StringSet<> original;
+  for (auto m : circuit.getOps<FModuleLike>()) original.insert(m.getModuleName());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleLike>(&op); m && !original.count(m.getModuleName()))
+      op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
 
 LogicalResult goldengate::mapPrintBridgeControlDispatch(CircuitOp circuit,
                                                        std::string &error) {
@@ -94,6 +132,96 @@ LogicalResult goldengate::mapPrintBridgeControlDispatch(CircuitOp circuit,
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<ControlWidgetPort> controls;
   llvm::StringSet<> identities, ports, hosts;
+  // The selected Rocket path registers TracerV before Print. Resolve its real
+  // AXI adapter through each retained sim instance; a catalog alone is not live.
+  bool tracerV = false;
+  for (auto p : top.getPorts()) {
+    if (p.name == "tracerv_mcr")
+      return reject("Print control dispatch requires TracerV AXI transport before CPU allocation");
+    tracerV |= p.name == "tracerv_ctrl";
+  }
+  auto reader = find(circuit, "GGCPUStreamRead");
+  auto streams = reader ? reader->getAttrOfType<ArrayAttr>("goldengate.sourceStreams") : ArrayAttr{};
+  bool tracerVStream = false;
+  if (streams) for (auto attr : streams) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto port = row ? row.getAs<StringAttr>("port") : StringAttr{};
+    tracerVStream |= port && port == "tracerv_stream";
+  }
+  if (tracerV != tracerVStream)
+    return reject("Print TracerV control must match the allocated live CPU stream");
+  if (tracerV) {
+    FModuleOp current = top;
+    llvm::StringSet<> visited;
+    while (current && current.getName() != "GGTracerVBridgeControlWrapper") {
+      if (!visited.insert(current.getName()).second)
+        return reject("Print TracerV control path is cyclic");
+      InstanceOp sim;
+      for (auto i : current.getOps<InstanceOp>()) if (i.getName() == "sim") {
+        if (sim) return reject("Print TracerV control path has duplicate sim instances");
+        sim = i;
+      }
+      auto child = sim ? find(circuit, sim.getModuleName()) : FModuleOp{};
+      if (!child) return reject("Print TracerV control cannot reach the live adapter");
+      for (StringRef name : {"tracerv_ctrl", "hostClock", "hostReset"}) {
+        std::optional<unsigned> outer, inner;
+        for (auto [i,p] : llvm::enumerate(current.getPorts())) if (p.name == name) outer = i;
+        for (auto [i,p] : llvm::enumerate(child.getPorts())) if (p.name == name) inner = i;
+        if (!outer || !inner || current.getPortType(*outer) != child.getPortType(*inner) ||
+            current.getPortDirection(*outer) != Direction::In || child.getPortDirection(*inner) != Direction::In)
+          return reject("Print TracerV control forwarding has an incompatible port");
+        auto dest = getFieldRefFromValue(sim.getResult(*inner));
+        auto src = getFieldRefFromValue(current.getArgument(*outer));
+        unsigned drivers = 0, matches = 0;
+        for (auto &op : *current.getBodyBlock()) if (isa<ConnectOp, StrictConnectOp>(op) &&
+            getFieldRefFromValue(op.getOperand(0)) == dest) {
+          ++drivers; matches += getFieldRefFromValue(op.getOperand(1)) == src;
+        }
+        if (drivers != 1 || matches != 1)
+          return reject("Print TracerV control requires direct clock/reset/AXI forwarding");
+      }
+      current = child;
+    }
+    InstanceOp adapter, trigger;
+    if (current) for (auto i : current.getOps<InstanceOp>()) {
+      if (i.getName() == "crFile" && i.getModuleName() == "GGTracerVMCRFile") adapter = i;
+      if (i.getName() == "sim" && i.getModuleName() == "GGTracerVTriggerWrapper") trigger = i;
+    }
+    if (!adapter || !trigger) return reject("Print TracerV control lacks its live MCR/trigger instances");
+    auto connected = [&](Value dest, Value src) {
+      unsigned drivers = 0, matches = 0;
+      for (auto &op : *current.getBodyBlock()) if (isa<ConnectOp, StrictConnectOp>(op) &&
+          getFieldRefFromValue(op.getOperand(0)) == getFieldRefFromValue(dest)) {
+        ++drivers; matches += getFieldRefFromValue(op.getOperand(1)) == getFieldRefFromValue(src);
+      }
+      return drivers == 1 && matches == 1;
+    };
+    auto argument = [&](StringRef name) -> Value {
+      for (auto [i,p] : llvm::enumerate(current.getPorts())) if (p.name == name) return current.getArgument(i);
+      return {};
+    };
+    Value clock = argument("hostClock"), reset = argument("hostReset"), ctrl = argument("tracerv_ctrl");
+    Value bank, triggerClock, triggerReset;
+    auto triggerModule = find(circuit, trigger.getModuleName());
+    if (!triggerModule) return reject("Print TracerV control trigger module is absent");
+    for (auto [i,p] : llvm::enumerate(triggerModule.getPorts())) {
+      if (p.name == "tracerv_mcr") bank = trigger.getResult(i);
+      if (p.name == "hostClock") triggerClock = trigger.getResult(i);
+      if (p.name == "hostReset") triggerReset = trigger.getResult(i);
+    }
+    if (adapter.getNumResults() != 4 || !clock || !reset || !ctrl || !bank ||
+        !triggerClock || !triggerReset || !connected(triggerClock, clock) || !connected(triggerReset, reset) ||
+        adapter.getResult(2).getType() != ctrl.getType() || adapter.getResult(3).getType() != bank.getType() ||
+        !connected(adapter.getResult(0), clock) || !connected(adapter.getResult(1), reset) ||
+        !connected(adapter.getResult(2), ctrl) || !connected(adapter.getResult(3), bank))
+      return reject("Print TracerV control adapter is detached from the live trigger bank or AXI clock/reset");
+    ControlMMIOWidget widget;
+    if (failed(deriveControlMMIOWidget(circuit, "TracerVBridgeModule_0", "GGTracerVMCRFile",
+            {"GGTracerVTriggerConfig"}, widget, error))) return failure();
+    if (widget.registerCount != 15) return reject("Print TracerV control requires fifteen trigger words");
+    widgets.push_back(widget); controls.push_back({"TracerVBridgeModule_0", "tracerv_ctrl"});
+    identities.insert("TracerVBridgeModule_0"); ports.insert("tracerv_ctrl");
+  }
   for (auto attr : registry) {
     auto row = dyn_cast<DictionaryAttr>(attr);
     auto name = row ? row.getAs<StringAttr>("widgetName") : StringAttr{};

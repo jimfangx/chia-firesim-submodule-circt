@@ -121,6 +121,10 @@ mlir::LogicalResult mapPrintBridgeCPUStreams(
 // append the bound Print hosts to the shared outgoing DMA and MCR allocation.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreams(
     circt::firrtl::CircuitOp circuit, std::string &error);
+// Attach the live TracerV trigger bank's native AXI transport before queue/CPU
+// allocation. Reuse an imported adapter only if it equals the native hardware.
+mlir::LogicalResult mapPrintBridgeTracerVControl(
+    circt::firrtl::CircuitOp circuit, std::string &error);
 // Allocate implemented Print configuration banks and the live CPU count bank
 // through native MMIO AW/W/AR dispatch. Input: GGCPUStreamCountWrapper.
 // Stage and verify the whole composition; response arbitration and driver

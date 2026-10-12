@@ -5223,3 +5223,51 @@ No manager verification step was started by the implementation agent.
 Next smallest step: compose the live TracerV fifteen-word bank and Print local
 control banks with the shared CPU count bank in the Rocket control decoder,
 then connect joint read/write dispatch before platform/header assembly.
+
+## Iteration 131: live TracerV/Print/count MMIO request assembly
+
+The iteration-130 harness passed CIRCT replacertl, Verilator bare smoke,
+90,141 portable checks and 90,805 Rocket checks. The SFC UART-bearing baseline
+remains pending. These baseline gates do not validate enabled-Print runtime.
+
+The compiler now accepts the live TracerV token/trigger/queue and CPU stream
+flags together with `--map-print-host-control`. Before queue construction,
+`mapPrintBridgeTracerVControl` binds the actual fifteen-word trigger bank to
+the native 25-bit-address/12-bit-ID AXI MCR adapter. An imported adapter is
+reused only after exact operation equivalence, ignoring declaration locations
+and the parser's empty parameter default. Comparison normalizes a separate
+copy; existing hardware and its argument locations stay unchanged. Attachment
+stages and verifies all new hardware and annotation transfers atomically.
+
+Request dispatch resolves the live adapter through the unique retained `sim`
+path, verifies direct AXI/clock/reset forwarding and actual decoded-bank
+connections, and requires a corresponding allocated TracerV CPU stream.
+Scala `Widget.scala` size sorting places TracerV's 15 words at byte 0 (64-byte
+region), Print's six words at 64 (32 bytes), and the two read-only occupancy
+words at 96 (8 bytes). Native AW/W/AR dispatch consumes all three banks;
+B/R response assembly remains explicit, and the joint response CLI flag rejects.
+
+Evidence is in the mutable generated U250 directory
+`iteration131-print-tracerv-control/`: successful SFC-handoff compiler replay,
+MLIR/RTL/annotations, seven passing request/allocation CTests, focused live
+composition/catalog-reuse tests with ten atomic rejection cases, and both
+comparison reports. The initial signature-location failure is retained as
+`attempt1.stdout.log`/`attempt1.stderr.log` alongside the corrected replay.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintControlDispatchCompare.py --tracerv` matches eight `NastiRouter` request
+predicates, all three banks' actual request/readiness nets, and preserved
+module bodies and 1,713 ordered annotations including exact target transfers.
+`PrintTracerVCPUCompare.py` again matches 49,152 `CPUManagedStreamEngine`
+handshake/data/count signals; all 67 preceding bodies and analyzed clocks stay
+unchanged. A fresh Print-only compiler replay and dispatch comparison also
+pass under `compatibility/`.
+
+Input remains the primary immutable fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, with iteration-67 selected
+Print annotations and the native Rocket control catalog. Neither immutable
+fixture was edited. SFC has Print disabled: shared transport comparisons do
+not establish enabled-Print platform/runtime parity. No manager verification
+step was started. Next smallest step: assemble the joint B/R arbiters and ID
+trackers for these three banks, then attach the platform control master.

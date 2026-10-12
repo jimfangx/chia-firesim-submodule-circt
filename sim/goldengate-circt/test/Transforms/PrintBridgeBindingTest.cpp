@@ -6006,6 +6006,67 @@ int main(int argc, char **argv) {
     if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
       nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--print-tracerv-control-dispatch") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source), "cannot parse allocated Print/TracerV control boundary");
+      auto original = *source->getOps<CircuitOp>().begin();
+      // Reconstruct the decoded trigger boundary while retaining the imported
+      // adapter. Reuse must preserve that existing operation, and a modified
+      // catalog implementation must reject without replacing it.
+      for (bool altered : {false, true}) {
+        OwningOpRef<CircuitOp> copy(cast<CircuitOp>(original->clone()));
+        auto c = *copy;
+        for (StringRef name : {"GGCPUStreamCountWrapper", "GGCPUStreamReadWrapper",
+              "GGPrintTracerVStreamQueueWrapper", "GGTracerVBridgeControlWrapper"}) named(c, name).erase();
+        c.setName("GGTracerVTriggerWrapper");
+        c->setAttr("rawAnnotations", ArrayAttr::get(&ctx, {}));
+        auto adapter = named(c, "GGTracerVMCRFile");
+        if (altered) adapter->setAttr("test.alteredTransport", UnitAttr::get(&ctx));
+        auto before = dump(c), adapterBefore = dump(adapter); std::string error;
+        auto result = goldengate::mapPrintBridgeTracerVControl(c, error);
+        if (altered) require(failed(result) && !error.empty() && dump(c) == before,
+            "modified imported TracerV adapter was accepted or mutated");
+        else require(succeeded(result) && succeeded(verify(c)) && dump(adapter) == adapterBefore &&
+            named(c, "GGTracerVMCRFile") == adapter, "catalog adapter reuse changed existing hardware: " + error);
+      }
+      for (unsigned bad = 0; bad < 9; ++bad) {
+        OwningOpRef<CircuitOp> copy(cast<CircuitOp>(original->clone()));
+        auto c = *copy; auto top = named(c, c.getName());
+        auto transport = named(c, "GGTracerVBridgeControlWrapper");
+        auto bank = named(c, "GGTracerVTriggerConfig");
+        if (bad == 0) bank->removeAttr("goldengate.mmioRegisters");
+        if (bad == 1) c->removeAttr("rawAnnotations");
+        if (bad == 2) c.setName("GGPrintBridgeHostWrapper");
+        if (bad == 3) {
+          for (auto i : transport.getOps<InstanceOp>()) if (i.getName() == "crFile") {
+            i.setModuleNameAttr(FlatSymbolRefAttr::get(&ctx, "MissingTracerVAdapter")); break;
+          }
+        }
+        if (bad == 8) named(c, "GGCPUStreamRead")->removeAttr("goldengate.sourceStreams");
+        if (bad >= 4 && bad <= 7) {
+          auto wrapper = bad == 4 ? top : transport;
+          StringRef needle = bad == 4 ? "tracerv_ctrl" : bad == 5 ? "tracerv_mcr" : bad == 6 ? "hostClock" : "hostReset";
+          bool removed = false;
+          for (auto &op : llvm::make_early_inc_range(*wrapper.getBodyBlock())) if (isa<ConnectOp>(op)) {
+            auto text = dump(&op);
+            if (StringRef(text).contains(needle)) { op.erase(); removed = true; break; }
+          }
+          require(removed, "missing rejection connection " + needle.str());
+        }
+        auto before = dump(c); std::string error;
+        require(failed(goldengate::mapPrintBridgeControlDispatch(c, error)) && !error.empty() && dump(c) == before,
+            "TracerV control dispatch accepted/mutated malformed boundary " + std::to_string(bad));
+      }
+      std::string error;
+      require(succeeded(goldengate::mapPrintBridgeControlDispatch(original, error)) && succeeded(verify(*source)), error);
+      auto decode = named(original, "GGControlAddressDecode");
+      auto regions = decode->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+      require(regions && regions.size() == 3, "joint request allocation must have three banks");
+      require(cast<DictionaryAttr>(regions[0]).getAs<StringAttr>("name") == "TracerVBridgeModule_0",
+          "TracerV registration must precede Print in the selected allocation");
+      llvm::outs() << "PASS live Print/TracerV/count request dispatch, catalog reuse and ten atomic rejections\n";
+      return 0;
+    }
     bridgeClockImport(ctx);
     controlCatalogImport(ctx);
     if (argc == 4 && StringRef(argv[1]) == "--print-tracerv-binding") {

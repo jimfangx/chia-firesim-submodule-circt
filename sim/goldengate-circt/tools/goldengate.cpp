@@ -493,8 +493,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-tracerv requires --stop-after-print-host-binding");
   if (mapPrintHostTracerV && mapPrintHostCPUStreams && !mapPrintHostTracerVQueue)
     return fail("Print TracerV CPU allocation requires --map-print-host-tracerv-queue");
-  if (mapPrintHostTracerV && mapPrintHostControl)
-    return fail("Print TracerV control dispatch requires joint Rocket widget assembly");
+  if (mapPrintHostTracerV && mapPrintHostResponses)
+    return fail("Print TracerV response assembly remains a separate compiler boundary");
   if (mapPrintHostCPUStreams && !stopAfterPrintHostBinding)
     return fail("--map-print-host-cpu-streams requires --stop-after-print-host-binding");
   if (mapPrintHostControl && !mapPrintHostCPUStreams)
@@ -590,7 +590,10 @@ int main(int argc, char **argv) {
         llvm::outs() << "Attached native fifteen-word TracerV trigger bank beside queued Print hosts\n";
       }
       if (mapPrintHostTracerVQueue) {
-        if (failed(goldengate::attachTracerVStreamQueue(circuit, "GGTracerVTriggerWrapper",
+        if (mapPrintHostControl && failed(goldengate::mapPrintBridgeTracerVControl(circuit, error)))
+          return fail("Print TracerV AXI control binding: " + error);
+        if (failed(goldengate::attachTracerVStreamQueue(circuit,
+                mapPrintHostControl ? "GGTracerVBridgeControlWrapper" : "GGTracerVTriggerWrapper",
                 "GGPrintTracerVStreamQueueWrapper", error)))
           return fail("Print TracerV stream queue binding: " + error);
         llvm::outs() << "Buffered live TracerV stream with 6144 native entries beside queued Print hosts\n";
