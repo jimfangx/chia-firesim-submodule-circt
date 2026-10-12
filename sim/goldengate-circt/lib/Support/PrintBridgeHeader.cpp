@@ -170,7 +170,12 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
     ArrayRef<FModuleOp> hosts, std::string &header, std::string &error) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   bool rocket = circuit.getName() == "F1Shim";
-  if ((!rocket && circuit.getName() != "GGControlMasterWrapper") || hosts.empty())
+  // CPU buffering changes the top path, while the live register/stream
+  // allocation beneath it remains subject to all checks below.
+  bool selected = circuit.getName() == "GGControlMasterWrapper" ||
+      circuit.getName() == "GGSelectedPrintCPUStreamWriteBufferWrapper" ||
+      circuit.getName() == "GGSelectedPrintCPUStreamReadBufferWrapper";
+  if ((!rocket && !selected) || hosts.empty())
     return reject("allocated Print header requires the selected control master or Rocket F1Shim and queued hosts");
   std::string decoderText;
   if (failed(preparePrintBridgeDecoderHeader(circuit, hosts, decoderText, error))) return failure();

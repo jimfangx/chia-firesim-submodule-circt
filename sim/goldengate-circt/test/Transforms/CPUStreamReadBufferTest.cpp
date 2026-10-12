@@ -245,7 +245,8 @@ int main(int argc, char **argv) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(root) && succeeded(verify(*root)), "cannot parse/verify actual AR buffer boundary");
       auto c = *root->getOps<CircuitOp>().begin();
-      require(c.getName() == "GGPrintCPUStreamReadBufferWrapper", "wrong expanded AR boundary");
+      require(c.getName() == "GGPrintCPUStreamReadBufferWrapper" ||
+          c.getName() == "GGSelectedPrintCPUStreamReadBufferWrapper", "wrong AR boundary");
       behavior(c); return 0;
     }
     require(argc == 1, "usage: goldengate-cpu-stream-read-buffer-test [expanded-boundary.mlir]");

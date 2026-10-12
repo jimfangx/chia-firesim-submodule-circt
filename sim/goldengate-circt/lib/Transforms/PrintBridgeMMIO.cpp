@@ -2123,6 +2123,40 @@ LogicalResult goldengate::mapPrintBridgeCPUStreamWriteBuffer(CircuitOp circuit,
   return success();
 }
 
+// Oracle: FPGATop's AXI4Buffer and CPUManagedStreamEngine's final-beat AR
+// handshake. Requires the selected AW/W boundary and live allocated hosts.
+// Reuse the AW payload helper in a separate AR instance (independent state).
+// No annotations consumed/produced: copied targets move outward; consumed AR
+// targets retain their inner identity. Verify a clone before publishing only
+// the new wrapper and archive. All preceding operations/SSA/ports are retained;
+// hierarchy analyses must be rebuilt after wrapping. R/B buffering is separate.
+LogicalResult goldengate::mapPrintBridgeCPUStreamReadBuffer(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintCPUStreamWriteBufferWrapper") {
+    error = "selected Print CPU AR requires the completed AW/W buffer boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(attachCPUStreamReadBuffer(*staged,
+          "GGSelectedPrintCPUStreamWriteBufferWrapper",
+          "GGSelectedPrintCPUStreamReadBufferWrapper", error)))
+    return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print CPU AR produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintCPUStreamReadBufferWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(

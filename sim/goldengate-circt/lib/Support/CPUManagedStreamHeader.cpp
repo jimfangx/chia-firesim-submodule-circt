@@ -28,7 +28,12 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     CircuitOp circuit, std::string &error, CPUStreamHeaderBoundary boundary) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   bool selected = boundary == CPUStreamHeaderBoundary::SelectedOutgoing;
-  if (selected && circuit.getName() != "GGControlMasterWrapper")
+  bool bufferedSelected = selected &&
+      (circuit.getName() == "GGSelectedPrintCPUStreamWriteBufferWrapper" ||
+       circuit.getName() == "GGSelectedPrintCPUStreamReadBufferWrapper");
+  if (selected && circuit.getName() != "GGControlMasterWrapper" &&
+      circuit.getName() != "GGSelectedPrintCPUStreamWriteBufferWrapper" &&
+      circuit.getName() != "GGSelectedPrintCPUStreamReadBufferWrapper")
     return reject("selected outgoing CPU header requires the assembled selected control master");
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw) return reject("CPUManagedStreamEngine header needs retained annotations");
@@ -147,7 +152,9 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     incoming = module;
   }
   if (selected) {
-    if (llvm::any_of(circuit.getOps<FModuleLike>(), [](FModuleLike module) {
+    // Buffered selected boundaries own a real empty writer. Require its live
+    // zero-sink contract below; earlier boundaries must still omit all writes.
+    if (!bufferedSelected && llvm::any_of(circuit.getOps<FModuleLike>(), [](FModuleLike module) {
           return module.getModuleName() == "GGEmptyCPUStreamWrite" ||
               module->hasAttr("goldengate.fromHostCPUStreamCount");
         }))
@@ -156,16 +163,18 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     if (!module) return reject("selected outgoing CPU header requires a FIRRTL top");
     for (auto p : module.getPorts()) {
       auto name = p.name.getValue();
-      if (name.contains("from_cpu_stream") || name.starts_with("cpu_stream_aw_") ||
-          name.starts_with("cpu_stream_w_") || name.starts_with("cpu_stream_b_"))
+      if (name.contains("from_cpu_stream") || (!bufferedSelected &&
+          (name.starts_with("cpu_stream_aw_") || name.starts_with("cpu_stream_w_") ||
+           name.starts_with("cpu_stream_b_"))))
         return reject("selected outgoing CPU header cannot omit incoming CPU stream ports");
     }
   }
   auto sources = transport ? transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams") : ArrayAttr();
   auto space = transport ? transport->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits") : IntegerAttr();
   auto sinks = incoming ? incoming->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount") : IntegerAttr();
-  if (!transport || (!selected && !incoming) || !sources || sources.empty() || sources.size() > INT32_MAX / 4 ||
-      !space || space.getInt() < 6 || space.getInt() > 30 || (!selected && (!sinks || sinks.getInt() != 0)))
+  bool needsIncoming = !selected || bufferedSelected;
+  if (!transport || (needsIncoming && !incoming) || !sources || sources.empty() || sources.size() > INT32_MAX / 4 ||
+      !space || space.getInt() < 6 || space.getInt() > 30 || (needsIncoming && (!sinks || sinks.getInt() != 0)))
     return reject("CPU stream descriptors need ordered outgoing allocations and no incoming streams");
   unsigned n = sources.size(), mcrPort = n + 2, addressPort = n + 5;
   if (transport.getNumPorts() != n + 14 || bank.getNumPorts() != n + 3 ||
@@ -416,7 +425,7 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
       return reject("CPU queue has live instances outside the outgoing allocation");
   }
   // Empty incoming vectors are meaningful ABI state; check the actual transport.
-  if (!selected) for (StringRef port : {"aw_ready", "w_ready", "b_valid"}) {
+  if (needsIncoming) for (StringRef port : {"aw_ready", "w_ready", "b_valid"}) {
     std::optional<unsigned> n;
     for (auto [i, p] : llvm::enumerate(incoming.getPorts())) if (p.name == port) n = i;
     if (!n || incoming.getPortType(*n) != uint(1) || incoming.getPortDirection(*n) != Direction::Out)

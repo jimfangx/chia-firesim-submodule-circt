@@ -5498,3 +5498,68 @@ establish enabled-Print platform/runtime parity. The boundary still exposes
 unimplemented bridge inputs and lacks the host-memory port and CPU AR/R/B
 buffers. Next smallest step: attach the independent native AR queue while
 preserving the joint allocation, then add R/B buffering before platform ports.
+
+## Iteration 136: selected Print independent CPU AR buffering
+
+The iteration-135 harness passed CIRCT replacertl, Verilator bare smoke,
+90,141 portable checks and 90,805 Rocket checks. Its SFC UART-bearing baseline
+remains pending. No manager verification step was started here.
+
+`--map-print-host-cpu-read-buffer` requires the selected AW/W buffer stage and
+attaches `GGSelectedPrintCPUStreamReadBufferWrapper`. It reuses the native AW
+payload queue definition in a separate AR instance, with independent memory,
+pointers and occupancy. The wrapper forwards six AR signals through this queue
+and copies every other interface. CPUManagedStreamEngine retains the AR head
+until grant, R ready, stream valid and lastReadBeat all hold. The composition
+validates live Print allocation, stages on a clone, verifies, then publishes
+only the wrapper and recursively retargeted annotation archive. Existing
+modules, operations, SSA values, ports and allocation metadata stay intact.
+
+The first native replays exposed an allocation-validator mismatch: selected
+headers forbade the empty writer added by iteration 135. Buffered selected
+boundaries now require one live incoming engine with zero sink streams and
+validate its executable zero AW-ready, W-ready and B-valid defaults. Earlier
+outgoing-only boundaries retain their stricter omission checks. Both buffered
+boundary names are accepted by the header emitters, whose live hierarchy,
+stream/count SSA and MMIO allocation checks remain in force. Incoming streams
+remain unsupported. Focused rejection cases cover a nonzero sink count and a
+changed AW-ready default in addition to missing allocation, queue and port data.
+
+Evidence is in the mutable generated U250 directory
+`iteration136-print-cpu-read-buffer/`. Native compiler, Print binding, CPU AR
+buffer, managed stream header and CPU read targets build successfully. A final
+header guard edit occurred during the broad rebuild; the final native compiler
+object and link were rerun using CMake's exact generated commands before the
+successful replays (`final-native-link.log`). Joint TracerV/Print and Print-only
+replays emit `{candidate,compatibility}/post-print-cpu-read-buffer.{mlir,sv}`
+and annotation archives. The new CLI option rejects omission of its AW/W stage.
+
+Exact immutable RTL oracle:
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedCPUReadCompare.py` matches `Queue_51`, `AXI4Buffer_2` and
+`CPUManagedStreamEngine`: depth two, no flow or pipe, ID/address/length/size
+widths 16/64/8/3, reset flushing occupancy while accepted enqueue still writes
+RAM, all fourteen AR queue routes, final-beat dequeue and retained AR response
+ID. The shared native queue is identical to the baseline operation emitter.
+The joint candidate retains 98 preceding module bodies, 89 public ports,
+83 copied ports and 97 wrapper connections; Print-only retains 92 bodies,
+97 ports, 91 copied ports and 105 connections. Both preserve the complete
+annotation archive and clock/control/stream analysis metadata through recursive
+copied/consumed target transfer.
+
+Each actual generated AR queue passes 21,450 interpreted cycles against an
+independent deque oracle, including full/empty pressure, simultaneous enqueue
+and dequeue, reset-time writes and held burst heads. The focused binding test
+passes thirteen atomic rejections on each variant, preserves existing operation
+and module identities, checks nested copied and consumed targets, and requires
+allocated driver headers before and after AR wrapping to be identical. The
+Print binding, CPU managed stream header, CPU stream read and CPU AR buffer
+CTests pass (4/4).
+
+Replay input remains the primary immutable fixture's
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, the iteration-67 selected
+Print annotations and the native Rocket control catalog. Neither immutable
+fixture was edited. The SFC fixture disables Print, so these shared transport
+matches do not establish enabled-Print platform/runtime parity. R/B buffering
+and host-memory/platform attachment remain pending. Next smallest step: attach
+and compare the selected boundary's native depth-two CPU R response queue.
