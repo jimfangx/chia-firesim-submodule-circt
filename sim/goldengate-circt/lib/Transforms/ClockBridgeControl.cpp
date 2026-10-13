@@ -432,8 +432,11 @@ LogicalResult goldengate::mapBlockDevBridgeControl(CircuitOp circuit,
 // Platform control slave binding and simulator emission are separate steps.
 LogicalResult goldengate::mapFASEDBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
+  bool selected = circuit.getName() == "GGSelectedPrintFASEDMMIOWrapper";
+  StringRef input = selected ? "GGSelectedPrintFASEDMMIOWrapper" : "GGFASEDMMIOWrapper";
+  StringRef output = selected ? "GGSelectedPrintFASEDBridgeControlWrapper" : "GGFASEDBridgeControlWrapper";
   ControlMMIOWidget registry;
-  const llvm::StringRef modules[]{"GGFASEDMMIOWrapper"};
+  const llvm::StringRef modules[]{input};
   if (failed(deriveControlMMIORegistry(circuit, "FASEDMemoryTimingModel_0",
           modules, registry, error)))
     return failure();
@@ -445,8 +448,7 @@ LogicalResult goldengate::mapFASEDBridgeControl(CircuitOp circuit,
   // the assembled registry first, then let the shared transport check its
   // exact typed bank before any operation or annotation is changed.
   return mapBridgeControl(circuit, addressBits, idBits,
-      static_cast<unsigned>(registry.registerCount), "GGFASEDMMIOWrapper",
-      "GGFASEDBridgeControlWrapper",
+      static_cast<unsigned>(registry.registerCount), input, output,
       "GGFASEDMCRFile", "fasedBridge_mcr", "fasedBridge_ctrl", error);
 }
 

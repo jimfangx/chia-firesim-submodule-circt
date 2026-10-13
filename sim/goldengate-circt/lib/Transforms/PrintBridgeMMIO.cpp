@@ -1403,12 +1403,11 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDMMIOBank(CircuitOp circuit,
 // consumed slave references stay inner, unexpected decoded references reject.
 // Output: 21-word local decode, independently captured AW/W, held B/R flags/IDs,
 // live read data, zero legacy strobe and retirement through arbiter readiness.
-LogicalResult goldengate::mapPrintBridgeRocketFASEDControl(CircuitOp circuit,
-                                                          std::string &error) {
+static LogicalResult attachPrintFASEDControl(CircuitOp circuit, StringRef inputName,
+                                             std::string &error, bool bindSlave = true) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDMMIOWrapper")
-    return reject("Rocket Print FASED control requires the completed MMIO bank");
-  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  if (circuit.getName() != inputName)
+    return reject("Print FASED control requires the completed MMIO bank");
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(mapFASEDBridgeControl(*staged, 25, 12, error))) return failure();
   const StringRef fragments[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
@@ -1422,7 +1421,7 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDControl(CircuitOp circuit,
   SmallVector<DictionaryAttr> registered(widget.registerCount), assembled(widget.registerCount);
   for (auto m : staged->getOps<FModuleOp>()) {
     bool fragment = llvm::is_contained(fragments, m.getName());
-    if (!fragment && m.getName() != "GGFASEDMMIOWrapper") continue;
+    if (!fragment && m.getName() != inputName) continue;
     auto rows = m->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
     for (auto attr : rows) {
       auto row = cast<DictionaryAttr>(attr);
@@ -1439,7 +1438,7 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDControl(CircuitOp circuit,
       if (row.get(key) != assembled[word].get(key))
         return reject("Rocket Print FASED assembled registry differs from its allocated fragments");
   }
-  if (failed(bindFASEDBridgeControl(*staged, error))) return failure();
+  if (bindSlave && failed(bindFASEDBridgeControl(*staged, error))) return failure();
   if (failed(verify(*staged)))
     return reject("Rocket Print FASED control produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
@@ -1451,6 +1450,27 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDControl(CircuitOp circuit,
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
   circuit.setName(staged->getName());
   return success();
+}
+
+// The legacy and selected Print paths share the same native transport/binding.
+LogicalResult goldengate::mapPrintBridgeRocketFASEDControl(CircuitOp circuit,
+                                                          std::string &error) {
+  if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
+  return attachPrintFASEDControl(circuit, "GGFASEDMMIOWrapper", error);
+}
+
+// Requires the selected 21-word bank and live allocated Print host identities.
+// Consume the decoded bank; expose local AW/W/B/AR/R for later allocation.
+// No annotation classes are consumed/produced; copied port targets transfer,
+// decoded-bank references reject; internal timing/channel targets remain inner.
+// Preserve prior operations/SSA, timing state and allocated headers. Publish
+// only the verified shared MCRFile and wrapper; rebuild hierarchy analyses.
+LogicalResult goldengate::mapPrintBridgeFASEDControl(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  return attachPrintFASEDControl(circuit, "GGSelectedPrintFASEDMMIOWrapper", error, false);
 }
 
 // Requires: unused completed FASED control top, retained annotations, live

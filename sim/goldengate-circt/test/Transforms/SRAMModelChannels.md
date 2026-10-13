@@ -7368,3 +7368,71 @@ pending. No harness-owned manager gate was started. Next smallest step: attach
 the selected 21-word bank to the shared FASED MCRFile/control transport and
 compare all AXI address/data/response bindings with SFC. Global control fanout,
 token closure and platform assembly remain open; the port is incomplete.
+
+
+### Iteration 166 — selected Print FASED local MCRFile attachment
+
+The executable oracle remains `passes/MidasTransforms.scala`,
+`passes/fame/FAMETransform.scala`, and `widgets/{Widget,Lib}.scala`.
+`Widget.genCRFile` binds the ordered bank to the shared MCRFile. Extend that
+native FIRRTL transport to `GGSelectedPrintFASEDMMIOWrapper`; expose a
+25-bit-address/12-bit-ID `fasedBridge_ctrl` from the new
+`GGSelectedPrintFASEDBridgeControlWrapper`. The legacy Rocket composer and
+selected composer share attachment/registry validation, with optional existing
+slave binding only for the legacy allocated path. Retain all prior operations,
+SSA values, timing/histogram bank state, channel/constructor metadata and
+allocated Print/CPU headers. Copied targets transfer outward; unexpected
+references to the consumed decoded bank reject on a clone before publication.
+
+The local engine preserves independent AW/W captures, four host-reset flags,
+five unreset ID/data/index registers, 21-word `addr[6:2]` decoding, live read
+data, lane-zero invalid reads without a lane handshake, noncommitting invalid
+writes, single-beat assertions, and the legacy zero write strobe. The CLI flag
+`--map-print-host-fased-control` requires the MMIO-bank flag and emits
+`post-print-fased-control.{mlir,sv}` and `post-print-fased-control-all.json`.
+
+Observed prerequisite mismatch: the selected candidate control catalog has
+TracerV, Print and CPU streams; the compatibility catalog has Print and CPU
+streams. Neither has `FASEDMemoryTimingModel_0`. Attempted full binding correctly
+rejected this missing identity. Preserve both catalogs and their allocations;
+keep the local control port explicit until FASED allocation/dispatcher wiring
+is implemented. Initial mismatch logs are retained in the evidence directory.
+
+Evidence:
+`generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration166-print-fased-control/`.
+Compare against the immutable U250
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+modules `MCRFile_5`, `FASEDMemoryTimingModel`, `NastiRouter`, and `FPGATop`.
+The standalone replays use the immutable primary
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir` handoff. Recorded FIRRTL/RTL
+fixture checksums remain unchanged.
+
+Validation/results: native build, Print binding, CPU stream header, simulation
+master control and shared clock/control CTests pass. Both full native selected
+handoff replays pass. Both focused allocation tests preserve operation/SSA and
+header identity, exercise four target probes, and pass 19 atomic rejection
+cases each. The structured SFC comparison passes for both allocations: nine
+transport registers, four reset flags, 21 decoded words and 45 exported RTL
+control pins agree with the shared oracle. Candidate/compatibility retain
+152/146 preceding module bodies, copy 74/82 typed ports with 78/86 attachment
+connections, and preserve all 1,713 annotation records with expected outward
+target transfers. Preceding MMIO MLIR, SV, annotations and both allocated
+headers match iteration 165 exactly. The missing FASED catalog identity remains
+explicit in the comparison result; no shared-bus binding is claimed.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{ClockBridgeControl,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/PrintBridgeBindingTest.cpp`,
+`test/Transforms/PrintSelectedFASEDControlCompare.py`, and this document.
+The pre-existing UART changes in ClockBridgeControl are excluded from the
+checkpoint, along with unrelated platform/manager edits.
+
+Risk: immutable SFC disables Print, so shared transport comparisons do not
+establish enabled-Print runtime parity. Supplied iteration-165 CIRCT replacertl
+and Verilator suites pass but predate this change; Rocket's SFC UART-bearing
+baseline is still pending. No harness-owned manager step was started. Next
+smallest step: allocate the actual 21-word FASED bank in the selected control
+catalog, materialize its AW/W/AR dispatcher and B/R arbiter endpoints, then bind
+this local transport by catalog identity. Global host-memory/platform closure
+and enabled-Print runtime remain open; the port is incomplete.

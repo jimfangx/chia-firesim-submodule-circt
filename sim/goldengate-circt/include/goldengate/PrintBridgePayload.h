@@ -307,6 +307,12 @@ mlir::LogicalResult mapPrintBridgeFASEDMMIOBank(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+// Attach the shared 21-word MCRFile, exposing local control AW/W/B/AR/R.
+// Atomic; preserve bank state/host allocation. FASED catalog allocation follows.
+mlir::LogicalResult mapPrintBridgeFASEDControl(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

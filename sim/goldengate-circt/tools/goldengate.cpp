@@ -430,6 +430,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDStatistics = false;
   bool mapPrintHostFASEDHistograms = false;
   bool mapPrintHostFASEDMMIOBank = false;
+  bool mapPrintHostFASEDControl = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -525,6 +526,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-statistics") {
         if (mapPrintHostFASEDStatistics) return fail("duplicate --map-print-host-fased-statistics");
         mapPrintHostFASEDStatistics = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-control") {
+        if (mapPrintHostFASEDControl) return fail("duplicate --map-print-host-fased-control");
+        mapPrintHostFASEDControl = true;
         continue;
       }
       if (option == "--map-print-host-fased-mmio-bank") {
@@ -720,6 +726,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-response-errors requires --map-print-host-fased-functional-model-register");
   if (mapPrintHostFASEDStatistics && !mapPrintHostFASEDResponseErrors)
     return fail("--map-print-host-fased-statistics requires --map-print-host-fased-response-errors");
+  if (mapPrintHostFASEDControl && !mapPrintHostFASEDMMIOBank)
+    return fail("--map-print-host-fased-control requires --map-print-host-fased-mmio-bank");
   if (mapPrintHostFASEDMMIOBank && !mapPrintHostFASEDHistograms)
     return fail("--map-print-host-fased-mmio-bank requires --map-print-host-fased-histograms");
   if (mapPrintHostFASEDHistograms && !mapPrintHostFASEDStatistics)
@@ -1414,6 +1422,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED MMIO bank output: " + error);
         llvm::outs() << "Assembled selected Print FASED six MMIO fragments into global words 0-20 with reverse-ready and shared strobes in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDControl) {
+        if (failed(goldengate::mapPrintBridgeFASEDControl(circuit, hosts, error)))
+          return fail("PrintBridge FASED control: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-control.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-control.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-control-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED control MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED control output: " + error);
+        llvm::outs() << "Attached selected Print FASED 21-word MCRFile and exposed local AW/W/B/AR/R control in " << tokenIR << '\n';
       }
       return 0;
     }

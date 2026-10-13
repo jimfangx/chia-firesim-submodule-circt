@@ -6914,6 +6914,95 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS selected FASED response errors, unchanged allocated headers/SSA, 9 atomic rejections\n";
       return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-control") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected MMIO boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto localDump = [](Operation *op) {
+        std::string text; llvm::raw_string_ostream out(text);
+        op->print(out, OpPrintingFlags().useLocalScope()); out.flush(); return text;
+      };
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      StringRef old = "GGSelectedPrintFASEDMMIOWrapper", output = "GGSelectedPrintFASEDBridgeControlWrapper";
+      std::string consumed = "hostReset";
+      SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+      raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.ControlIdentity")),
+          b.getNamedAttr("targets", b.getArrayAttr({
+            b.getStringAttr("~" + old), b.getStringAttr("~" + old + "|" + old + ">hostClock"),
+            b.getStringAttr("~" + old + "|" + old + ">" + consumed),
+            b.getStringAttr("~" + old + "|GGFASEDHistograms>mcr.read[0].bits")}))}));
+      c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+      for (unsigned bad = 0; bad < 18; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc); auto top = named(tc, old);
+        if (bad == 0) tc.setName("Wrong");
+        if (bad == 1) tc->removeAttr("rawAnnotations");
+        if (bad == 2) hs.clear();
+        if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        if (bad == 4 || bad == 5) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr(bad == 4 ? "GGFASEDMCRFile" :
+              "GGSelectedPrintFASEDBridgeControlWrapper"),
+              top.getConventionAttr(), ArrayRef<PortInfo>{});
+        }
+        if (bad == 6) named(tc, "GGFASEDStatistics")->removeAttr("goldengate.mmioRegisters");
+        if (bad == 7) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          auto user = b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("ControlUser"), top.getConventionAttr(), ArrayRef<PortInfo>{});
+          b.setInsertionPointToStart(user.getBodyBlock()); b.create<InstanceOp>(tc.getLoc(), top, "used");
+        }
+        if (bad == 8) top->removeAttr("goldengate.mmioRegisters");
+        if (bad == 9 || bad == 10) {
+          auto rows = llvm::to_vector(top->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters").getValue());
+          NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+          row.set(bad == 9 ? "name" : "writeable", bad == 9 ? Attribute(b.getStringAttr("wrong")) : Attribute(b.getBoolAttr(false)));
+          rows[0] = row.getDictionary(&ctx); top->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+        }
+        if (bad >= 11 && bad <= 15) {
+          auto names = llvm::to_vector(top.getPortNames());
+          std::string port = bad == 11 ? "fasedBridge_mcr" : bad == 12 ? "hostClock" :
+              bad == 13 ? "hostReset" : bad == 14 ? "fasedBridge_mcr" : "hostReset";
+          for (auto &attr : names) if (cast<StringAttr>(attr).getValue() == port)
+            attr = b.getStringAttr(bad == 15 ? "fasedBridge_ctrl" : "missing");
+          if (bad == 14) named(tc, "GGFASEDHistograms").setName("MissingHistogramBank");
+          top.setPortNames(names);
+        }
+        if (bad == 16 || bad == 17) {
+          auto annos = llvm::to_vector(tc->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+          annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.DecodedReference")),
+              b.getNamedAttr("target", b.getStringAttr("~" + old + "|" + old + ">fasedBridge_mcr" +
+                  (bad == 16 ? ".read[0].bits" : "[0]")))}));
+          tc->setAttr("rawAnnotations", b.getArrayAttr(annos));
+        }
+        auto before = localDump(test->getOperation());
+        require(failed(goldengate::mapPrintBridgeFASEDControl(tc, hs, error)) && !error.empty() &&
+            localDump(test->getOperation()) == before, "selected FASED control rejection mutated IR " + std::to_string(bad));
+      }
+      SmallVector<FModuleOp> modules; std::map<std::string, std::string> bodies;
+      for (auto m : c.getOps<FModuleOp>()) { modules.push_back(m); bodies[m.getName().str()] = localDump(m.getOperation()); }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDControl(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      for (auto m : modules) require(named(c, m.getName()) == m && localDump(m.getOperation()) == bodies.at(m.getName().str()),
+          "FASED control changed prior module identity or body");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected FASED control changed allocated collateral: " + error);
+      auto targets = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back()).getAs<ArrayAttr>("targets");
+      const std::string expected[]{"~" + output.str(), "~" + output.str() + "|" + output.str() + ">hostClock",
+          "~" + output.str() + "|" + output.str() + ">" + consumed,
+          "~" + output.str() + "|GGFASEDHistograms>mcr.read[0].bits"};
+      for (unsigned i = 0; i < 4; ++i) require(cast<StringAttr>(targets[i]).getValue() == expected[i], "selected control target identity differs");
+      auto before = localDump(source->getOperation());
+      require(failed(goldengate::mapPrintBridgeFASEDControl(c, hostsFor(c), error)) && localDump(source->getOperation()) == before,
+          "selected FASED control repeat mutated IR");
+      llvm::outs() << "PASS selected FASED control, unchanged modules/SSA/allocated headers, 4 target probes, 19 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-mmio-bank") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected histogram boundary");
