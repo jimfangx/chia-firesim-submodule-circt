@@ -555,7 +555,13 @@ LogicalResult goldengate::normalizeFAMEInput(
   // before FAME computes channel connectivity. A connect inside a when is
   // controlled by the predicate as well as its source. Let CIRCT build those
   // muxes after ground lowering, including priority between repeated connects.
+  // SFC FIRRTL has no const type qualifier. Imported literals can nevertheless
+  // give nested when predicates const UInt types (PTW way masks in BOOM and
+  // Shuttle, and Gemmini conditions). Drop that qualifier before ExpandWhens
+  // combines them with dynamic predicates; literal values and named identities
+  // remain intact, and the generated conjunction has an ordinary Bool type.
   PassManager passes(module.getContext());
+  passes.nest<CircuitOp>().addPass(createDropConstPass());
   passes.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
   if (failed(passes.run(module))) {
     error = "CIRCT FAME input ExpandWhens failed";

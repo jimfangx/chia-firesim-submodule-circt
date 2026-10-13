@@ -75,7 +75,8 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) 
 	rm -f $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl $(GENERATED_DIR)/$(BASE_FILE_NAME).*.ipgen.tcl
 	$(goldengate_circt_build)/goldengate-circt $(FIRRTL_FILE) \
 		--annotation-file $(ANNO_FILE) --output-dir $(GENERATED_DIR)/circt-ingestion \
-		--compile-baseline --output-filename-base $(BASE_FILE_NAME) $(goldengate_circt_ila_flags)
+		--compile-baseline --platform-config $(PLATFORM_CONFIG) \
+		--output-filename-base $(BASE_FILE_NAME) $(goldengate_circt_ila_flags)
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).sv $(simulator_verilog)
 	@if test -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; then \
 		while IFS= read -r blackbox || test -n "$$blackbox"; do \

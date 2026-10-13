@@ -388,7 +388,7 @@ int main(int argc, char **argv) {
                     "--complete-autocounter-print-synthesis | "
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
-                    "[--output-filename-base name] [--enable-autoila] "
+                    "[--platform-config config] [--output-filename-base name] [--enable-autoila] "
                     "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser [--map-print-host-fased-timing-cycle]]]]]]]]]]]]]]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
@@ -396,6 +396,7 @@ int main(int argc, char **argv) {
 
   llvm::StringRef firPath(argv[1]), annoPath(argv[3]), outputDir(argv[5]);
   llvm::StringRef outputBase = "FireSim-generated";
+  llvm::StringRef platformConfig = "BaseXilinxAlveoU250Config";
   bool enableAutoILA = false;
   bool stopAfterPrintHostBinding = false;
   bool mapPrintHostCPUStreams = false;
@@ -435,6 +436,7 @@ int main(int argc, char **argv) {
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
     bool baseSeen = false, depthSeen = false, triggersSeen = false;
+    bool platformSeen = false;
     for (int i = 7; i < argc; ++i) {
       llvm::StringRef option(argv[i]);
       if (option == "--enable-autoila") {
@@ -650,7 +652,12 @@ int main(int argc, char **argv) {
       }
       if (i + 1 == argc) return fail("missing value for compiler option: " + option.str());
       llvm::StringRef value(argv[++i]);
-      if (option == "--output-filename-base") {
+      if (option == "--platform-config") {
+        if (platformSeen || value.empty())
+          return fail("--platform-config requires one nonempty configuration");
+        platformSeen = true;
+        platformConfig = value;
+      } else if (option == "--output-filename-base") {
         if (baseSeen) return fail("duplicate --output-filename-base");
         baseSeen = true;
         outputBase = value;
@@ -669,6 +676,30 @@ int main(int argc, char **argv) {
         return fail("unknown compiler option: " + option.str());
       }
     }
+    // Golden Gate configurations are executable compiler semantics, including
+    // partition extraction before FAME and QSFP platform interfaces. Do not
+    // compile a partition recipe as the unpartitioned U250 default.
+    llvm::SmallVector<llvm::StringRef> fragments;
+    platformConfig.split(fragments, '_', -1, false);
+    bool hasU250Base = false;
+    for (auto fragment : fragments) {
+      if (fragment == "BaseXilinxAlveoU250Config") {
+        if (hasU250Base) return fail("duplicate U250 base compiler configuration");
+        hasU250Base = true;
+      } else if (fragment == "WithAutoILA") {
+        enableAutoILA = true;
+      } else if (fragment.consume_front("ILADepth")) {
+        unsigned depth = 0;
+        if (fragment.getAsInteger(10, depth) || !depth)
+          return fail("invalid ILA depth compiler configuration");
+        if (!depthSeen) ilaOptions.dataDepth = depth;
+      } else {
+        return fail("unsupported Golden Gate platform configuration '" +
+                    platformConfig.str() + "': partition/QSFP and other compiler fragments must be ported before replay");
+      }
+    }
+    if (!hasU250Base)
+      return fail("Golden Gate platform configuration requires BaseXilinxAlveoU250Config");
   }
   if (!printRocketControlCatalog.empty() && !stopAfterPrintHostBinding)
     return fail("--print-rocket-control-catalog requires --stop-after-print-host-binding");

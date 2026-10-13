@@ -8,6 +8,7 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
 #include <set>
 #include <functional>
@@ -366,6 +367,66 @@ void conditionalDrivers(MLIRContext &context) {
   expect(model, "chosen", {"select", "nested", "a", "b"});
   expect(model, "overwritten", {"b"});
   expect(model, "state", {});
+}
+void constantConditionalDrivers(MLIRContext &context) {
+  // PTW's statically selected way mask appears under a dynamic outer when
+  // in BOOM and Shuttle. CIRCT imports that mask as a const UInt predicate.
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Model" {
+      firrtl.module @Model(in %select: !firrtl.uint<1>,
+          in %a: !firrtl.uint<8>, in %b: !firrtl.uint<8>,
+          out %chosen: !firrtl.uint<8>) {
+        %one = firrtl.constant 1 : !firrtl.const.uint<1>
+        firrtl.strictconnect %chosen, %a : !firrtl.uint<8>
+        firrtl.when %select : !firrtl.uint<1> {
+          firrtl.when %one : !firrtl.const.uint<1> {
+            firrtl.strictconnect %chosen, %b : !firrtl.uint<8>
+          }
+        }
+      }
+    }
+  })mlir", &context);
+  require(bool(root) && succeeded(verify(*root)), "const when fixture invalid");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto model = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context);
+  auto retained = b.getArrayAttr({b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DontTouch)),
+      b.getNamedAttr("target", b.getStringAttr("~Model|Model>chosen"))})});
+  circuit->setAttr("rawAnnotations", retained);
+  std::string error;
+  require(succeeded(goldengate::normalizeFAMEInput(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "const conditional normalization invalid");
+  require(circuit->getAttr("rawAnnotations") == retained,
+          "const lowering changed retained output identity");
+  bool hasWhen = false, hasConst = false;
+  circuit.walk([&](Operation *op) {
+    hasWhen |= isa<WhenOp>(op);
+    for (auto result : op->getResults())
+      hasConst |= circt::firrtl::containsConst(result.getType());
+  });
+  require(!hasWhen && !hasConst, "const conditional semantics not normalized");
+  expect(model, "chosen", {"select", "a", "b"});
+  Value driver;
+  for (auto connect : model.getOps<ConnectOp>())
+    if (connect.getDest() == model.getBodyBlock()->getArgument(3)) driver = connect.getSrc();
+  for (auto connect : model.getOps<StrictConnectOp>())
+    if (connect.getDest() == model.getBodyBlock()->getArgument(3)) driver = connect.getSrc();
+  require(bool(driver), "normalized conditional output has no driver");
+  for (unsigned select = 0; select < 2; ++select)
+    for (unsigned a = 0; a < 4; ++a) for (unsigned b = 0; b < 4; ++b) {
+      const uint64_t inputs[]{select, a, b};
+      std::function<uint64_t(Value)> eval = [&](Value value) -> uint64_t {
+        if (auto arg = dyn_cast<BlockArgument>(value)) return inputs[arg.getArgNumber()];
+        auto *op = value.getDefiningOp();
+        if (auto c = dyn_cast<ConstantOp>(op)) return c.getValue().getZExtValue();
+        if (isa<MuxPrimOp>(op)) return eval(op->getOperand(eval(op->getOperand(0)) ? 1 : 2));
+        if (isa<AndPrimOp>(op)) return eval(op->getOperand(0)) & eval(op->getOperand(1));
+        if (isa<NodeOp, PadPrimOp>(op)) return eval(op->getOperand(0));
+        throw std::runtime_error("unexpected normalized conditional operation");
+      };
+      require(eval(driver) == (select ? b : a), "const nested when changed selection priority");
+    }
 }
 void repeatedDrivers(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
@@ -731,6 +792,7 @@ int main(int argc, char **argv) {
     orderedSignals(context);
     constructedAggregates(context);
     conditionalDrivers(context);
+    constantConditionalDrivers(context);
     repeatedDrivers(context);
     selectedMemoryData(context);
     selectedAggregateAliases(context);

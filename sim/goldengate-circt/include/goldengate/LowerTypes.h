@@ -43,7 +43,7 @@ mlir::LogicalResult lowerTypesWithRetainedTargets(
     mlir::ModuleOp module, circt::firrtl::CircuitOp circuit,
     std::string &error, RetainedTargetScope scope = RetainedTargetScope::All);
 // Requires: fully initialized imported target FIRRTL and retained annotations.
-// Runs the ground-target transfer above followed by CIRCT ExpandWhens, matching
+// Runs ground-target transfer, CIRCT DropConst and ExpandWhens, matching
 // the Scala LowForm input to FAME. Conditional/last-connect drivers become
 // explicit muxes before FAME hierarchy and data dependencies are analyzed.
 // Consumes/produces annotations as above; ExpandWhens adds no GG annotations.
