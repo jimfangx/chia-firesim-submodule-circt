@@ -6287,3 +6287,76 @@ Next smallest step: attach the existing native WriteEgress acknowledgement
 counters/request scheduler to the selected read-scheduler root, retaining
 qualified reset/fire and allocated identities. No harness-owned manager gate
 was started; the overall port remains open.
+
+## Iteration 149: selected Print FASED write acknowledgment scheduling
+
+Attach shared native `GGFASEDWriteEgress` after the selected read-scheduler
+boundary. `--map-print-host-fased-write-egress` requires the read-scheduler
+option and emits `post-print-fased-write-egress.{mlir,sv}` plus full annotation
+JSON. The selected composer validates the existing allocation and verifies a
+clone before publishing only the helper and wrapper; prior module bodies,
+ports, operations, inner symbols and allocated collateral remain intact.
+Circuit and copied-port targets transfer recursively. The consumed whole host
+B bundle remains internal while its ready/valid leaves and write readiness
+map to the new response ports.
+
+The Scala oracle is `models/dram/EgressUnit.scala` WriteEgress, within the
+MidasTransforms/FAMETransform compiler flow. For the recorded 35/64/4-bit
+constructor with one request per ID, native FIRRTL holds sixteen wrapping
+acknowledgment counters, active-valid, request ID and sampled haveAck. Retry
+runs on host cycles without targetFire and uses the old active ID, even during
+a simultaneous new request. Sampling reads the previous counter value; a host
+B enqueue and retirement with the same ID cancel. A new request wins over
+retirement. Reset clears valid/haveAck/counters but leaves request ID unreset;
+response metadata defaults to zero and host B always accepts.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration149-print-fased-write-egress`.
+Native compiler, Print binding, write-egress and CPU managed-stream header
+binaries build successfully. Three focused CTests pass. Legacy and selected
+roots each exercise 42768 actual FIRRTL transitions (including 10000 continuous
+cycles), 64 wrapper cases, five annotation transfers and 21 atomic rejections.
+Each state run covers 65 same-ID cancellations, 5033 host-only retries, 1032
+chained requests, 8355 counter wraps and 533 old-counter samples. Both saved
+iteration-148 selected boundaries pass nine atomic composer rejections,
+unchanged prior module/operation identities and allocated headers, and seven
+recursive circuit/copied/mapped/consumed target probes. Native CLI dependency
+and duplicate-option rejection pass. The first build caught a local bool/SSA
+name collision; renaming the boundary selector fixed it without changing the
+acknowledgment equations.
+
+Both standalone native CLI replays ingest the primary immutable compiler
+fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print
+annotations and native Rocket control catalog, with and without TracerV.
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDWriteEgressCompare.py` pins WriteEgress's counter selectors,
+wrapping updates, cancellation, retry, state/reset priority and response
+validity, plus FASEDMemoryTimingModel's qualified reset/fire and host B/request
+wiring. Each allocation's actual emitted SSA passes 65536 combinations,
+including 128 same-ID cancellations, 8192 host-only retries, 2048 chained
+requests, 16320 counter wraps, 896 old-counter samples and 8192 reset-time
+starts. The native helper equals the previously oracle-compared baseline.
+All 127 / 121 prior module bodies survive; all 80 / 88 wrapper connections and
+1713 annotation records match expected transfers. Emitted RTL retains exactly
+the eighteen reset registers, unreset ID, response fields and qualified
+reset/fire bindings. Allocated Print headers and decoder collateral equal
+iteration 148 byte for byte. CIRCT groups reset assignments in one block;
+the comparison checks its register set and tolerates formatting whitespace.
+Before-write-egress MLIR/JSON and final MLIR/JSON/SV remain raw; 164 other own
+replay intermediates are compressed after comparison.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDWriteEgress,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDWriteEgressTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDWriteEgressCompare.py`, and this document.
+
+Risk: the SFC fixture disables Print, so this validates shared WriteEgress
+semantics and selected composition, with full enabled-Print simulator parity
+and the UART-bearing SFC differential still pending. Timing-model requests,
+target response/token closure and selected platform assembly remain open.
+Next smallest step: attach the existing native FASEDResponseReleaser to the
+selected write-egress root, retaining targetFire-qualified model state/reset
+and connecting read/write response release to the native egress schedulers.
+No harness-owned manager gate was started; the overall port remains open.

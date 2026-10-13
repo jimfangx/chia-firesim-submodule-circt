@@ -21,8 +21,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
-  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDReadSchedulerWrapper\" { firrtl.module @GGFASEDReadSchedulerWrapper() {} } }",&ctx);
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false) {
+  llvm::StringRef rootName=selected?"GGSelectedPrintFASEDReadSchedulerWrapper":"GGFASEDReadSchedulerWrapper";
+  std::string input="module { firrtl.circuit \"" + rootName.str() +
+      "\" { firrtl.module @" + rootName.str() + "() {} } }";
+  auto root=parseSourceString<ModuleOp>(input,&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();(*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());
   auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=uint(1);
   auto flat=BundleType::get(&ctx,{{b.getStringAttr("bReady"),false,bit},{b.getStringAttr("bValid"),false,uint(mode==8?2:1)}});
@@ -36,9 +39,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
   if(mode!=9){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     auto attrs=[&](std::initializer_list<std::pair<llvm::StringRef,int>> es){NamedAttrList list;for(auto [n,v]:es)list.set(n,b.getI64IntegerAttr(v));return list.getDictionary(&ctx);};
     if(mode!=20)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxWriteTransfer",mode==19?4:8},{"idReuse",mode==10?2:1},{"maxFlight",10}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
-  if(mode==12||mode==13)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==12?"GGFASEDWriteEgress":"GGFASEDWriteEgressWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==12||mode==13)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==12?"GGFASEDWriteEgress":selected?"GGSelectedPrintFASEDWriteEgressWrapper":"GGFASEDWriteEgressWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==14){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"used");}if(mode==15)c.setName("other");
-  SmallVector<Attribute> raw;for(auto n:{"other","fased_write_egress_valid","fased_host_write_responses","fased_host_write_responses.bReady","fased_host_write_responses.bValid"})raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~GGFASEDReadSchedulerWrapper|GGFASEDReadSchedulerWrapper>"+std::string(n)))}));
+  SmallVector<Attribute> raw;for(auto n:{"other","fased_write_egress_valid","fased_host_write_responses","fased_host_write_responses.bReady","fased_host_write_responses.bValid"})raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~"+rootName.str()+"|"+rootName.str()+">"+std::string(n)))}));
   if(mode!=11)c->setAttr("rawAnnotations",b.getArrayAttr(raw));return root;
 }
 struct Interpreter {
@@ -117,8 +120,8 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx,bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);require(succeeded(verify(*root)),"invalid write egress IR");
   Interpreter sim(named(c,"GGFASEDWriteEgress"));std::map<std::string,Value> regs;
   for(auto r:sim.module.getOps<RegResetOp>())regs[r.getName().str()]=r.getResult();for(auto r:sim.module.getOps<RegOp>())regs[r.getName().str()]=r.getResult();
@@ -151,9 +154,10 @@ void behavior(MLIRContext &ctx) {
     sample(sim.state[regs.at("currReqReg_valid")].getZExtValue(),sim.state[regs.at("haveAck")].getZExtValue(),sim.state[regs.at("currReqReg_bits")].getZExtValue(),random()%16,random()%16,random()%32,mask);}
   require(cancelled&&hostRetries&&priority&&wraps&&oldSample,"write egress coverage missing");llvm::outs()<<cases<<" write egress transitions; "<<cancelled<<" same-ID cancellations, "<<hostRetries<<" host-only retries, "<<priority<<" chained requests, "<<wraps<<" counter wraps, "<<oldSample<<" old counter samples passed\n";
 }
-void mapping(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);
-  Interpreter w(named(c,"GGFASEDWriteEgressWrapper"));InstanceOp inner,egress;for(auto i:w.module.getOps<InstanceOp>())if(i.getName()=="sim")inner=i;else egress=i;
+void mapping(MLIRContext &ctx,bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);
+  llvm::StringRef prefix=selected?"GGSelectedPrint":"GG";
+  Interpreter w(named(c,prefix.str()+"FASEDWriteEgressWrapper"));InstanceOp inner,egress;for(auto i:w.module.getOps<InstanceOp>())if(i.getName()=="sim")inner=i;else egress=i;
   require(w.module.getNumPorts()==7,"wrapper port count differs");require(w.drivers.at(w.key(egress.getResult(0)))==w.arg(0),"clock mapping differs");
   for(unsigned flags=0;flags<64;++flags){w.memo.clear();auto f=[&](unsigned i){return flags>>i&1;};
     w.put(inner.getResult(1),"",f(0));w.put(inner.getResult(2),"",f(1));w.put(egress.getResult(5),"hValid",f(2));w.put(w.arg(6),"tReady",f(3));w.put(w.arg(4),"valid",f(4));w.put(egress.getResult(4),"ready",f(5));
@@ -164,13 +168,18 @@ void mapping(MLIRContext &ctx) {
     for(unsigned id=0;id<16;++id){w.put(w.arg(4),"bits.id",id);w.put(w.arg(5),"bits",id);w.put(egress.getResult(5),"tBits.id",id);
       require(w.output(egress.getResult(4),"bits.id",4).getZExtValue()==id&&w.output(egress.getResult(3),"bits",4).getZExtValue()==id&&w.output(w.arg(6),"tBits.id",4).getZExtValue()==id,"request/response payload binding differs");}
   }
-  const llvm::StringRef refs[]{"|GGFASEDWriteEgressWrapper>other","|GGFASEDWriteEgressWrapper>fased_write_egress_resp.hValid","|GGFASEDReadSchedulerWrapper>fased_host_write_responses","|GGFASEDWriteEgressWrapper>fased_host_write_response.ready","|GGFASEDWriteEgressWrapper>fased_host_write_response.valid"};
-  auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw.size()==5,"lost annotations");for(unsigned i=0;i<5;++i)require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()=="~GGFASEDWriteEgressWrapper"+refs[i].str(),"annotation transfer differs");
+  const std::string refs[]{"|"+prefix.str()+"FASEDWriteEgressWrapper>other",
+    "|"+prefix.str()+"FASEDWriteEgressWrapper>fased_write_egress_resp.hValid",
+    "|"+prefix.str()+"FASEDReadSchedulerWrapper>fased_host_write_responses",
+    "|"+prefix.str()+"FASEDWriteEgressWrapper>fased_host_write_response.ready",
+    "|"+prefix.str()+"FASEDWriteEgressWrapper>fased_host_write_response.valid"};
+  auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw.size()==5,"lost annotations");
+  for(unsigned i=0;i<5;++i)require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()=="~"+prefix.str()+"FASEDWriteEgressWrapper"+refs[i],"annotation transfer differs");
   llvm::outs()<<"64 wrapper mapping cases and five target transfers passed\n";
 }
-void rejection(MLIRContext &ctx) {
-  for(unsigned mode=1;mode<=20;++mode){auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"21 atomic rejection cases passed\n";
+void rejection(MLIRContext &ctx,bool selected) {
+  for(unsigned mode=1;mode<=20;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"21 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{behavior(ctx);mapping(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected:{false,true}){behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

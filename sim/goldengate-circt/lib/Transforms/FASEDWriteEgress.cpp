@@ -6,6 +6,15 @@
 // ID even on a simultaneous new request. Same-ID enqueue/retirement cancel.
 // Only valid, haveAck and counters reset; the request ID remains unreset.
 // Timing-model requests and target payload remain explicit pending lowering.
+// Required input invariants: uninstantiated completed read scheduler boundary,
+// exact host/target response ports and recorded 35/64/4-bit constructor.
+// Annotations consumed: none; rawAnnotations is required and transferred.
+// Annotations produced: renamed circuit/copied ports and mapped response leaves.
+// IR mutations: append shared WriteEgress helper and wrapper; retain prior bodies.
+// Analyses required: constructor, port shape, symbol collision and top-use checks.
+// Analyses preserved: prior module bodies/ports; circuit hierarchy is extended.
+// Output invariants: host B always accepts, counters wrap, old-counter retry
+// sampling and qualified reset/fire match SFC; request ID remains unreset.
 #include "goldengate/FASEDWriteEgress.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -14,9 +23,11 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDWriteEgress(CircuitOp circuit, std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDWriteEgress";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDWriteEgressWrapper";
+  bool isSelectedPrint = circuit.getName() == "GGSelectedPrintFASEDReadSchedulerWrapper";
+  llvm::StringRef wrapperName = isSelectedPrint ? "GGSelectedPrintFASEDWriteEgressWrapper"
+                                        : "GGFASEDWriteEgressWrapper";
   auto reject = [&](llvm::StringRef s) { error=s.str();return failure(); };
-  if (circuit.getName() != "GGFASEDReadSchedulerWrapper")
+  if (!isSelectedPrint && circuit.getName() != "GGFASEDReadSchedulerWrapper")
     return reject("FASED write egress requires the active read scheduler wrapper");
   FModuleOp inner,engine;
   for (auto m:circuit.getOps<FModuleLike>()) {
