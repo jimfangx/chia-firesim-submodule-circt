@@ -88,7 +88,7 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false) {
   std::string text=R"(module {
     firrtl.circuit "GGFASEDIngressIssueWrapper" {
       firrtl.module @GGFASEDTokenEngine() attributes {goldengate.bridgeConstructor = {
@@ -116,13 +116,18 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0) {
   if (variant==12) replace("%other:","%fased_read_buffer_deq:");
   if (variant==13) replace("@GGFASEDTokenEngine","@missingEngine");
   if (variant==14) replace("maxReadTransfer","missingMaxReadTransfer");
+  if (selected) {
+    const std::string old = "GGFASEDIngressIssueWrapper", updated = "GGSelectedPrintFASEDIngressIssueWrapper";
+    for (size_t at = 0; (at = text.find(old, at)) != std::string::npos; at += updated.size())
+      text.replace(at, old.size(), updated);
+  }
   auto root=parseSourceString<ModuleOp>(text,&context);require(bool(root),"fixture parse failed");
   auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
   SmallVector<Attribute> annos;
   for (auto n:{"other","fased_host_responses","fased_host_responses.rReady","fased_host_responses.rValid",
                "fased_host_responses.rLast","fased_host_responses.bReady","fased_host_responses.bValid"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-      b.getNamedAttr("target",b.getStringAttr("~GGFASEDIngressIssueWrapper|GGFASEDIngressIssueWrapper>"+std::string(n)))}));
+      b.getNamedAttr("target",b.getStringAttr("~"+c.getName().str()+"|"+c.getName().str()+">"+std::string(n)))}));
   if (variant!=15) c->setAttr("rawAnnotations",b.getArrayAttr(annos));
   if (variant==16) {
     b.setInsertionPointToEnd(c.getBodyBlock());
@@ -130,22 +135,28 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0) {
   }
   if (variant==17) {
     b.setInsertionPointToEnd(named(c,"GGFASEDTokenEngine").getBodyBlock());
-    b.create<InstanceOp>(c.getLoc(),named(c,"GGFASEDIngressIssueWrapper"),"unexpectedUse");
+    b.create<InstanceOp>(c.getLoc(),named(c,c.getName()),"unexpectedUse");
   }
   return root;
 }
-void behavior(MLIRContext &context) {
-  auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &context, bool selected) {
+  auto root=fixture(context,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDReadBuffer(c,error)),error);
   require(succeeded(verify(*root)),"read buffer IR verification failed");
-  auto wrapper=named(c,"GGFASEDReadBufferWrapper");require(wrapper.getNumPorts()==7,"wrong outer boundary");
+  const std::string outer = selected ? "GGSelectedPrintFASEDReadBufferWrapper" : "GGFASEDReadBufferWrapper";
+  const std::string inner = selected ? "GGSelectedPrintFASEDIngressIssueWrapper" : "GGFASEDIngressIssueWrapper";
+  auto wrapper=named(c,outer);require(wrapper.getNumPorts()==7,"wrong outer boundary");
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
   const llvm::StringRef expected[]{"GGFASEDReadBufferWrapper>other","GGFASEDIngressIssueWrapper>fased_host_responses",
     "GGFASEDReadBufferWrapper>fased_host_read_response.ready","GGFASEDReadBufferWrapper>fased_host_read_response.valid",
     "GGFASEDReadBufferWrapper>fased_host_read_response.bits.last","GGFASEDReadBufferWrapper>fased_host_write_responses.bReady",
     "GGFASEDReadBufferWrapper>fased_host_write_responses.bValid"};
-  for (auto [i,a]:llvm::enumerate(annos)) require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue()==
-      "~GGFASEDReadBufferWrapper|"+expected[i].str(),"annotation transfer differs");
+  for (auto [i,a]:llvm::enumerate(annos)) {
+    std::string target = expected[i].str();
+    if (selected) target.insert(2, "SelectedPrint");
+    require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue()==
+        "~"+outer+"|"+target,"annotation transfer differs");
+  }
   Interpreter sim(named(c,"GGFASEDReadBuffer16x8"));std::mt19937_64 rng(216);
   unsigned same=0,advance=0,resetWrites=0,full=0,wrap=0,collisions=0;
   // Independent known-state samples include all IDs and arbitrary pointer/full
@@ -206,15 +217,15 @@ void behavior(MLIRContext &context) {
   llvm::outs()<<"40000 read buffer state/edge samples: same ID "<<same<<", prefetch "<<advance
     <<", reset writes "<<resetWrites<<", full "<<full<<", dequeue wraps "<<wrap<<", RUW collisions "<<collisions<<"\n";
 }
-void rejection(MLIRContext &context) {
+void rejection(MLIRContext &context, bool selected) {
   for (unsigned v=1;v<=17;++v) {
-    auto root=fixture(context,v);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
+    auto root=fixture(context,v,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
     {llvm::raw_string_ostream s(before);root->print(s);}
     require(failed(goldengate::addFASEDReadBuffer(c,error))&&!error.empty(),"invalid boundary accepted");
     {llvm::raw_string_ostream s(after);root->print(s);}
     require(before==after,"rejection mutated IR");
   }
-  auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
+  auto root=fixture(context,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
   require(succeeded(goldengate::addFASEDReadBuffer(c,error)),error);
   {llvm::raw_string_ostream s(before);root->print(s);}
   require(failed(goldengate::addFASEDReadBuffer(c,error)),"repeated pass accepted");
@@ -225,6 +236,6 @@ void rejection(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context;context.getOrLoadDialect<FIRRTLDialect>();context.getOrLoadDialect<circt::hw::HWDialect>();
-    behavior(context);rejection(context);return 0;
+    for (bool selected : {false,true}) { behavior(context,selected);rejection(context,selected); } return 0;
   } catch (const std::exception &e) {llvm::errs()<<e.what()<<'\n';return 1;}
 }

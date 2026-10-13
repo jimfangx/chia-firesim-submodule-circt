@@ -15,9 +15,10 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &error) {
   constexpr llvm::StringLiteral queueName = "GGFASEDReadBuffer16x8";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDReadBufferWrapper";
+  bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressIssueWrapper";
+  llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDReadBufferWrapper" : "GGFASEDReadBufferWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDIngressIssueWrapper")
+  if (!selected && circuit.getName() != "GGFASEDIngressIssueWrapper")
     return reject("FASED read buffer requires the active ingress issue wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {

@@ -2449,6 +2449,39 @@ LogicalResult goldengate::mapPrintBridgeFASEDIngressDeadlock(CircuitOp circuit,
   return addFASEDIngressDeadlock(circuit, error);
 }
 
+// Attach non-ROB ReadEgress after the completed selected host issue/assertions.
+// Stage and verify, then publish only the new response wrapper and shared queue.
+LogicalResult goldengate::mapPrintBridgeFASEDReadBuffer(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  bool deadlock = false;
+  circuit.walk([&](InstanceOp i) {
+    deadlock |= i.getModuleName() == "GGFASEDIngressDeadlock" &&
+        i.getInstanceName() == "ingressDeadlock" &&
+        i->getParentOfType<FModuleOp>().getName() == "GGFASEDIngressAW";
+  });
+  if (circuit.getName() != "GGSelectedPrintFASEDIngressIssueWrapper" || !deadlock) {
+    error = "selected Print FASED read buffer requires the completed ingress deadlock boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDReadBuffer(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED read buffer produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGFASEDReadBuffer16x8" ||
+          m.getName() == "GGSelectedPrintFASEDReadBufferWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(

@@ -6150,3 +6150,73 @@ attach the existing native non-ROB ReadEgress sixteen-ID, eight-beat response
 queues at this selected issue boundary, preserving qualified egress reset and
 allocated identities before response scheduling. No harness-owned manager gate
 was started in this iteration; the overall port remains open.
+
+### Selected Print non-ROB read response storage (iteration 147)
+
+`addFASEDReadBuffer` now accepts the selected Print ingress issue root as well
+as the original native root, producing `GGSelectedPrintFASEDReadBufferWrapper`
+with the same `GGFASEDReadBuffer16x8` FIRRTL operations. The native composer
+`mapPrintBridgeFASEDReadBuffer` requires the completed ingress assertion
+instance, validates allocated host collateral, stages and verifies on a clone,
+and publishes only the new wrapper and queue. Earlier modules, ports and SSA
+operations retain their identities. Header preparation recognizes the new root.
+
+The wrapper consumes flat R handshakes, exposes the full host R payload and
+preserves B handshakes separately. Host R ready remains unconditional, matching
+ReadEgress without ROB; internal enqueue still obeys per-ID queue full state.
+Data and last occupy a 65-bit synchronous memory with 128 entries. Qualified
+egress reset clears the 49 pointer/full/valid registers, never payload memory
+or the delayed dequeue ID. Current-ID prefetch and delayed-ID retirement remain
+unchanged. Raw dequeue address/readiness are explicit until response scheduling.
+Recursive target transfer preserves consumed aggregate identity under the inner
+issue wrapper and maps copied ports and consumed R/B leaves to the new root.
+
+Native CLI flag `--map-print-host-fased-read-buffer` requires
+`--map-print-host-fased-ingress-deadlock` and emits
+`post-print-fased-read-buffer.{mlir,sv}` plus the complete annotation archive.
+Missing dependency and duplicate option rejection precede input access.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration147-print-fased-read-buffer`.
+Native compiler, Print binding, read buffer and CPU managed-stream header tests
+build successfully. Three CTests pass in 102.79 seconds. The native FIRRTL
+interpreter runs 40000 known-state/edge samples for each legacy/selected root
+(80000 total), including full queues, ID switches, pointer wraps, simultaneous
+push/pop, reset-time writes and read/write collisions, with 18 atomic rejections
+per root. Both focused tests on iteration-146 deadlock boundaries pass ten
+atomic rejections and preserve module/SSA identities, recursive target probes
+and allocated headers. The first focused negative test deleted an instance
+while retaining its connection operands, causing a test-only invalid-SSA crash;
+replacing its module target preserves SSA and tests compiler rejection correctly.
+Backtrace and corrected passing logs are retained in the evidence directory.
+
+Both full standalone native CLI replays ingest the primary immutable compiler
+fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print
+annotations and the native Rocket control catalog, with and without TracerV.
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDReadBufferCompare.py` pins ReadEgress payload/ID/clock/reset
+wiring and all MultiQueue selectors, per-ID pointer/full updates, prefetch,
+reset and unreset memory behavior. Both candidates retain the oracle-compared
+native queue exactly. All 123 / 117 prior modules, 83 / 91 wrapper connections
+and 1713 annotation records match intended identities. Emitted RTL has an
+unreset `ram_128x65` with clocked read address/en and writes, the same 49 reset
+registers, delayed-ID update and unconditional host R ready. Allocated Print
+headers and decoder collateral equal iteration 146 byte for byte. Input
+before-buffer MLIR/JSON and final MLIR/JSON/SV remain raw; other own replay
+intermediates are compressed after comparison.
+
+Changed source files: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDReadBuffer,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDReadBufferTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDReadBufferCompare.py`, and this document.
+
+Risk: the golden fixture disables Print. This establishes shared read storage
+and selected composition, not full enabled-Print simulator parity. The Rocket
+UART-bearing SFC differential remains pending. Selected request scheduling,
+target response/token wiring, timing and full platform composition remain open.
+Next smallest step: attach the existing native ReadEgress request scheduler to
+this selected read buffer, consuming raw dequeue address/readiness and preserving
+qualified token fire, egress reset and allocated identities. No harness-owned
+manager gate was started; the overall port remains open.
