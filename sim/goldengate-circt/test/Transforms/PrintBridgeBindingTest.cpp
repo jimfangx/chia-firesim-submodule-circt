@@ -6914,6 +6914,148 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS selected FASED response errors, unchanged allocated headers/SSA, 9 atomic rejections\n";
       return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-statistics") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected response-error boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      // Probe circuit, copied scalar/aggregate and retained internal identity.
+      SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+      auto probe = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.StatisticsIdentity")),
+          b.getNamedAttr("targets", b.getArrayAttr({
+            b.getStringAttr("~GGSelectedPrintFASEDResponseErrorsWrapper"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseErrorsWrapper|GGSelectedPrintFASEDResponseErrorsWrapper>hostClock"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseErrorsWrapper|GGSelectedPrintFASEDResponseErrorsWrapper>fased_host_read_response.bits.resp"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseErrorsWrapper|GGSelectedPrintFASEDResponseErrorsWrapper>fased_response_errors_mcr.read[0].bits"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseErrorsWrapper|GGSelectedPrintFASEDResponseErrorsWrapper>fased_host_write_response.ready"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseErrorsWrapper|GGFASEDResponseReleaser>currentRead_full")}))});
+      raw.push_back(probe); c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+      for (unsigned bad = 0; bad < 12; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        if (bad == 0) tc.setName("Wrong");
+        else if (bad == 1) tc->removeAttr("rawAnnotations");
+        else if (bad == 2) hs.clear();
+        else if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        else if (bad == 4) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("GGSelectedPrintFASEDStatisticsWrapper"),
+              named(tc, "GGSelectedPrintFASEDResponseErrorsWrapper").getConventionAttr(), ArrayRef<PortInfo>{});
+        } else if (bad == 5) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          auto user = b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("AdmissionTopUser"),
+              named(tc, "GGSelectedPrintFASEDResponseErrorsWrapper").getConventionAttr(), ArrayRef<PortInfo>{});
+          b.setInsertionPointToStart(user.getBodyBlock());
+          b.create<InstanceOp>(tc.getLoc(), named(tc, "GGSelectedPrintFASEDResponseErrorsWrapper"), "used");
+        } else if (bad == 8) {
+          named(tc, "GGSelectedPrintFASEDWriteLatencyWrapper").setName("MissingHierarchy");
+        } else if (bad == 9) {
+          auto child = named(tc, "GGSelectedPrintFASEDWriteLatencyWrapper");
+          auto parent = named(tc, "GGSelectedPrintFASEDTimingAWQueueWrapper");
+          b.setInsertionPointToEnd(parent.getBodyBlock());
+          b.create<InstanceOp>(tc.getLoc(), child, "duplicate");
+        } else if (bad == 10) {
+          auto child = named(tc, "GGSelectedPrintFASEDReadLatencyWrapper");
+          child.insertPorts({{child.getNumPorts(), PortInfo(b.getStringAttr("fased_accepted_r_fire"),
+              UIntType::get(&ctx, 1, false), Direction::Out)}});
+        } else if (bad == 11) {
+          auto engine = named(tc, "GGFASEDTokenEngine");
+          NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+          NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+          edge.set("maxFlight", b.getIntegerAttr(IntegerType::get(&ctx, 128), APInt(128, 10)));
+          key.set("axi4Edge", edge.getDictionary(&ctx));
+          engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+        } else {
+          auto engine = named(tc, "GGFASEDTokenEngine");
+          if (bad == 6) engine->removeAttr("goldengate.bridgeConstructor");
+          else {
+            NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+            NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+            edge.set("maxFlight", b.getI64IntegerAttr(9));
+            key.set("axi4Edge", edge.getDictionary(&ctx));
+            engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+          }
+        }
+        auto before = dump(*test);
+        require(failed(goldengate::mapPrintBridgeFASEDStatistics(tc, hs, error)) && !error.empty() && dump(*test) == before,
+            "selected FASED statistics rejection mutated IR " + std::to_string(bad));
+      }
+      const StringRef hierarchy[]{"GGSelectedPrintFASEDResponseErrorsWrapper", "GGSelectedPrintFASEDFunctionalModelRegisterWrapper",
+          "GGSelectedPrintFASEDLatencyRegistersWrapper", "GGSelectedPrintFASEDRequestLimitsWrapper",
+          "GGSelectedPrintFASEDReadAdmissionWrapper", "GGSelectedPrintFASEDWriteAdmissionWrapper",
+          "GGSelectedPrintFASEDWriteRetirementWrapper", "GGSelectedPrintFASEDWritePairingWrapper",
+          "GGSelectedPrintFASEDTimingAWQueueWrapper", "GGSelectedPrintFASEDWriteLatencyWrapper",
+          "GGSelectedPrintFASEDReadLatencyWrapper", "GGSelectedPrintFASEDTimingCycleWrapper",
+          "GGSelectedPrintFASEDResponseReleaserWrapper"};
+      SmallVector<FModuleOp> modules; SmallVector<Operation *> retained;
+      std::map<std::string, std::string> unchangedBodies;
+      std::map<std::string, SmallVector<BlockArgument>> arguments;
+      std::map<std::string, SmallVector<PortInfo>> ports;
+      auto body = [](FModuleOp m) { std::string text; llvm::raw_string_ostream out(text); m->print(out, OpPrintingFlags().useLocalScope()); return text; };
+      for (auto m : c.getOps<FModuleOp>()) {
+        modules.push_back(m);
+        arguments[m.getName().str()] = llvm::to_vector(m.getArguments());
+        ports[m.getName().str()] = m.getPorts();
+        bool observed = llvm::is_contained(hierarchy, m.getName());
+        if (!observed) unchangedBodies[m.getName().str()] = body(m);
+        for (auto &op : m.getBodyBlock()->getOperations()) {
+          auto i = dyn_cast<InstanceOp>(&op);
+          if (observed && m.getName() != hierarchy[12] && i && i.getName() == "sim") {
+            i->setAttr("goldengate.test", b.getStringAttr("retained statistics metadata"));
+          } else retained.push_back(&op);
+        }
+      }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDStatistics(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      unsigned observations = 0, replacements = 0;
+      for (auto m : modules) {
+        require(named(c, m.getName()) == m, "selected statistics replaced prior module identity");
+        auto oldPorts = ports.at(m.getName().str());
+        bool observed = llvm::is_contained(hierarchy, m.getName());
+        require(m.getNumPorts() == oldPorts.size() + unsigned(observed), "statistics changed prior port count");
+        for (auto [j, arg] : llvm::enumerate(arguments.at(m.getName().str()))) {
+          auto port = m.getPorts()[j];
+          require(m.getArgument(j) == arg && port.name == oldPorts[j].name && port.type == oldPorts[j].type &&
+              port.direction == oldPorts[j].direction, "statistics changed prior port identity/type/order");
+        }
+        if (!observed) require(body(m) == unchangedBodies.at(m.getName().str()), "statistics changed unrelated body");
+        else {
+          require(m.getPortName(m.getNumPorts()-1) == "fased_accepted_r_fire", "statistics observation missing");
+          ++observations;
+          for (auto i : m.getOps<InstanceOp>()) if (m.getName() != hierarchy[12] && i.getName() == "sim") {
+            require(i->getAttrOfType<StringAttr>("goldengate.test").getValue() == "retained statistics metadata",
+                "statistics replacement lost instance metadata"); ++replacements;
+          }
+        }
+      }
+      SmallVector<Operation *> after;
+      for (auto m : modules) for (auto &op : m.getBodyBlock()->getOperations()) after.push_back(&op);
+      for (auto op : retained) require(llvm::is_contained(after, op), "statistics replaced retained operation");
+      require(observations == 13 && replacements == 12, "statistics response hierarchy differs");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected FASED statistics changed allocated collateral: " + error);
+      auto transferred = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back());
+      auto targets = transferred.getAs<ArrayAttr>("targets");
+      const StringRef expected[]{"~GGSelectedPrintFASEDStatisticsWrapper",
+          "~GGSelectedPrintFASEDStatisticsWrapper|GGSelectedPrintFASEDStatisticsWrapper>hostClock",
+          "~GGSelectedPrintFASEDStatisticsWrapper|GGSelectedPrintFASEDStatisticsWrapper>fased_host_read_response.bits.resp",
+          "~GGSelectedPrintFASEDStatisticsWrapper|GGSelectedPrintFASEDStatisticsWrapper>fased_response_errors_mcr.read[0].bits",
+          "~GGSelectedPrintFASEDStatisticsWrapper|GGSelectedPrintFASEDStatisticsWrapper>fased_host_write_response.ready",
+          "~GGSelectedPrintFASEDStatisticsWrapper|GGFASEDResponseReleaser>currentRead_full"};
+      for (unsigned i = 0; i < 6; ++i)
+        require(cast<StringAttr>(targets[i]).getValue() == expected[i], "selected statistics target identity differs");
+      auto before = dump(*source);
+      require(failed(goldengate::mapPrintBridgeFASEDStatistics(c, hostsFor(c), error)) && dump(*source) == before,
+          "selected FASED statistics repeat mutated IR");
+      llvm::outs() << "PASS selected FASED statistics, unchanged allocated headers/SSA, 13 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-read-admission") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected write admission boundary");

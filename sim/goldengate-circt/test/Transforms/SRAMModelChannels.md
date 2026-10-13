@@ -7187,3 +7187,63 @@ No harness-owned manager gate was started. Next smallest step: attach the
 allocated FASEDStatistics bank at this selected boundary and compare target-fire
 transaction/beat counters and read-only MMIO against SFC. Control fanout, token
 closure and platform assembly remain open; the port is incomplete.
+
+
+### Iteration 163: selected Print FASED statistics attachment
+
+Evidence: `generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration163-print-fased-statistics/`.
+
+The selected Print compiler now attaches the allocated `GGFASEDStatistics`
+bank after response errors. `--map-print-host-fased-statistics` requires the
+response-error stage and emits native FIRRTL MLIR, retained annotations and
+SystemVerilog. Shared native attachment supports both legacy and selected
+hierarchies and rejects oversized constructor integers before conversion.
+The composer verifies a clone before replaying the preflighted attachment,
+retaining all existing module and original port identities. It appends an
+internal `fased_accepted_r_fire` observation through 13 wrappers and replaces
+only the 12 connecting `sim` instances, preserving their metadata and drivers.
+The final response wrapper's separate `sim` and all unrelated operations remain.
+The public top copies its original ports and exports the four-word MCR fragment.
+
+Oracle: immutable
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+modules `LatencyPipe` and `FASEDMemoryTimingModel`; Scala
+`models/dram/TimingModel.scala:151-167`. Complete allocation replays ingest
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`.
+The four UInt<32> counters count accepted W/R beats (including nonfinal R)
+and AW/AR transactions, wrap at 32 bits and advance/reset only on targetFire,
+matching the SFC gated model clock. Read-only global words 14-17 at bytes 56-68
+retain full readback; assertions are disabled by host reset independently.
+Global MMIO fanout remains external at this boundary.
+
+Validation: native build and three CTest cases pass. Shared bank tests check
+65,536 cycles across legacy/selected profiles, 68 materialization/attachment
+and 52 boundary rejections. Both focused selected allocations check retained
+module/port/operation identities, instance metadata and target transfer, with
+13 atomic rejections each. Duplicate CLI flags and missing prerequisites fail
+without compilation. Both complete allocation replays and structured SFC
+comparisons pass:
+
+- candidate: 149 prior module identities, 136 unchanged bodies, 78 copied typed ports, 87 wrapper connections, 25 emitted MCR pins and 1713 transferred annotations; 36,384 counter/assertion transitions.
+- compatibility: 143 prior module identities, 130 unchanged bodies, 86 copied typed ports, 95 wrapper connections, 25 emitted MCR pins and 1713 transferred annotations; 36,384 counter/assertion transitions.
+
+The comparison checks all original drivers in the 13 observation modules,
+backpressure, nonfinal beats, wrapping, stalled model resets, host-only resets,
+read-only write violations and reset-suppressed assertions. Emitted RTL is
+checked for clock/reset/event guards, truncating increments and MCR wiring.
+The preceding response-error MLIR/SV/annotations and both allocated headers
+match iteration 162 exactly. Immutable reference checksums are unchanged.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDStatistics,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/{FASEDStatisticsTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDStatisticsCompare.py`, and this document.
+
+Risk: the recorded SFC fixture disables Print; selected composition and shared
+FASED semantics match while enabled-Print runtime parity remains open. Supplied
+iteration-162 CIRCT replacertl and Verilator regressions pass but predate this
+change; the Rocket SFC UART-bearing differential remains pending. No harness-owned
+manager gate was started. Next smallest step: attach the allocated FASEDHistograms
+bank and compare pre-edge occupancy bins and read-only MMIO with SFC. Control
+fanout, token closure and platform assembly remain open; the port is incomplete.

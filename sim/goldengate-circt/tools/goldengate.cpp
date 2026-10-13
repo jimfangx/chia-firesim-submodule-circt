@@ -427,6 +427,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDLatencyRegisters = false;
   bool mapPrintHostFASEDFunctionalModelRegister = false;
   bool mapPrintHostFASEDResponseErrors = false;
+  bool mapPrintHostFASEDStatistics = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -517,6 +518,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-response-errors") {
         if (mapPrintHostFASEDResponseErrors) return fail("duplicate --map-print-host-fased-response-errors");
         mapPrintHostFASEDResponseErrors = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-statistics") {
+        if (mapPrintHostFASEDStatistics) return fail("duplicate --map-print-host-fased-statistics");
+        mapPrintHostFASEDStatistics = true;
         continue;
       }
       if (option == "--map-print-host-fased-write-egress") {
@@ -700,6 +706,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-functional-model-register requires --map-print-host-fased-latency-registers");
   if (mapPrintHostFASEDResponseErrors && !mapPrintHostFASEDFunctionalModelRegister)
     return fail("--map-print-host-fased-response-errors requires --map-print-host-fased-functional-model-register");
+  if (mapPrintHostFASEDStatistics && !mapPrintHostFASEDResponseErrors)
+    return fail("--map-print-host-fased-statistics requires --map-print-host-fased-response-errors");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
     return fail("--map-print-host-fased-write-egress requires --map-print-host-fased-read-scheduler");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
@@ -1345,6 +1353,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED response errors output: " + error);
         llvm::outs() << "Attached selected Print FASED host-reset read-only MMIO words 19/20 and accepted host R/B errors in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDStatistics) {
+        if (failed(goldengate::mapPrintBridgeFASEDStatistics(circuit, hosts, error)))
+          return fail("PrintBridge FASED statistics: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-statistics.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-statistics.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-statistics-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED statistics MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED statistics output: " + error);
+        llvm::outs() << "Attached selected Print FASED target-fire read-only MMIO words 14-17 and accepted target AW/AR/W/R counters in " << tokenIR << '\n';
       }
       return 0;
     }

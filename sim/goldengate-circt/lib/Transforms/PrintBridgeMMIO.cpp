@@ -2885,6 +2885,32 @@ LogicalResult goldengate::mapPrintBridgeFASEDResponseErrors(CircuitOp circuit,
   return success();
 }
 
+// Requires selected response errors, allocated statistics bank and exact R hierarchy.
+// Verify attachment on a clone before replaying its fully preflighted mutations.
+// Preserve module/port identities; replace only twelve sim instances to append an
+// internal accepted-R observation. Four read-only counters sample targetFire.
+LogicalResult goldengate::mapPrintBridgeFASEDStatistics(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGSelectedPrintFASEDResponseErrorsWrapper")
+    return reject("selected Print FASED statistics requires the completed response-error boundary");
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  FModuleOp bank;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDStatistics") bank = m;
+  if (!bank) return reject("selected Print FASED statistics requires the allocated statistics bank");
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp stagedBank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == bank.getName()) stagedBank = m;
+  if (failed(attachFASEDStatistics(*staged, stagedBank, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("selected Print FASED statistics produced invalid FIRRTL IR");
+  return attachFASEDStatistics(circuit, bank, error);
+}
+
 // Requires the recorded selected Print retirement/allocation boundary and
 // annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
 // Verify on a clone, then publish only the wrapper and retargeted annotations;

@@ -15,11 +15,26 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+bool selected = false;
+std::string profile(llvm::StringRef input) {
+  std::string result = input.str();
+  if (selected) {
+    size_t pos = 0;
+    while ((pos = result.find("GGFASED", pos)) != std::string::npos) {
+      auto end = result.find("Wrapper", pos);
+      auto stop = result.find_first_not_of("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789", pos);
+      if (end != std::string::npos && (stop == std::string::npos || end < stop)) {
+        result.replace(pos, 7, "GGSelectedPrintFASED"); pos += 19;
+      } else pos += 7;
+    }
+  }
+  return result;
+}
 void require(bool ok, llvm::StringRef message) {
   if (!ok) throw std::runtime_error(message.str());
 }
 FModuleOp named(CircuitOp c, llvm::StringRef name) {
-  for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
+  for (auto m : c.getOps<FModuleOp>()) if (m.getName() == profile(name)) return m;
   throw std::runtime_error("missing module");
 }
 struct Interpreter {
@@ -73,7 +88,7 @@ const llvm::StringRef hierarchy[]{"GGFASEDResponseErrorsWrapper", "GGFASEDFuncti
     "GGFASEDTimingAWQueueWrapper", "GGFASEDWriteLatencyWrapper", "GGFASEDReadLatencyWrapper",
     "GGFASEDTimingCycleWrapper", "GGFASEDResponseReleaserWrapper"};
 OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
-  auto root=parseSourceString<ModuleOp>(R"(module {
+  auto root=parseSourceString<ModuleOp>(profile(R"(module {
     firrtl.circuit "GGFASEDResponseErrorsWrapper" {
       firrtl.module @GGFASEDTokenEngine() {}
       firrtl.module @GGFASEDResponseReleaser(out %r: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<user: uint<1>, id: uint<4>, last: uint<1>, data: uint<64>, resp: uint<2>>>) {}
@@ -82,14 +97,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         out %fased_model_reset: !firrtl.uint<1>, out %fased_tfire: !firrtl.uint<1>,
         out %fased_timing_requests: !firrtl.bundle<aw: bundle<ready: uint<1>, valid: uint<1>, bits: bundle<user: uint<1>, id: uint<4>, region: uint<4>, qos: uint<4>, prot: uint<3>, cache: uint<4>, lock: uint<1>, burst: uint<2>, size: uint<3>, len: uint<8>, addr: uint<35>>>, w: bundle<ready: uint<1>, valid: uint<1>, bits: bundle<user: uint<1>, strb: uint<8>, id: uint<4>, last: uint<1>, data: uint<64>>>, ar: bundle<ready: uint<1>, valid: uint<1>, bits: bundle<user: uint<1>, id: uint<4>, region: uint<4>, qos: uint<4>, prot: uint<3>, cache: uint<4>, lock: uint<1>, burst: uint<2>, size: uint<3>, len: uint<8>, addr: uint<35>>>>,
         out %other: !firrtl.uint<8>) {}
-    } })",&context);
+    } })").c_str(),&context);
   require(bool(root),"fixture parse failed"); auto c=*root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   named(c,"GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({
     b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(10))}))}));
   SmallVector<FModuleOp> modules{named(c,hierarchy[0])};
   for(unsigned i=1;i<std::size(hierarchy);++i) {
     b.setInsertionPointToEnd(c.getBodyBlock());
-    modules.push_back(b.create<FModuleOp>(c.getLoc(),b.getStringAttr(hierarchy[i]),
+    modules.push_back(b.create<FModuleOp>(c.getLoc(),b.getStringAttr(profile(hierarchy[i])),
         ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{}));
     b.setInsertionPointToEnd(modules[i-1].getBodyBlock());
     auto instance=b.create<InstanceOp>(c.getLoc(),modules[i],"sim");
@@ -100,7 +115,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
   SmallVector<Attribute> annos;
   for(auto name:{"fased_timing_requests.w.bits.last","hostReset","other"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-      b.getNamedAttr("target",b.getStringAttr("~GGFASEDResponseErrorsWrapper|GGFASEDResponseErrorsWrapper>"+std::string(name)))}));
+      b.getNamedAttr("target",b.getStringAttr(profile("~GGFASEDResponseErrorsWrapper|GGFASEDResponseErrorsWrapper>"+std::string(name))))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(annos)); return root;
 }
 std::string dump(Operation *op) {
@@ -259,7 +274,7 @@ void mapping(MLIRContext &context) {
     unsigned observed=0;
     for(auto conn:m.getOps<StrictConnectOp>())if(conn.getDest()==m.getArguments().back()) {
       if(j+1<std::size(hierarchy)) {
-        auto inst=conn.getSrc().getDefiningOp<InstanceOp>();require(inst && inst.getModuleName()==hierarchy[j+1] &&
+        auto inst=conn.getSrc().getDefiningOp<InstanceOp>();require(inst && inst.getModuleName()==profile(hierarchy[j+1]) &&
             inst->getAttrOfType<StringAttr>("goldengate.test").getValue()=="retained metadata","response chain metadata lost");
       } else {
         auto both=conn.getSrc().getDefiningOp<AndPrimOp>();require(bool(both),"read event must include ready/valid");
@@ -274,10 +289,10 @@ void mapping(MLIRContext &context) {
   }
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(annos.size()==3,"annotations lost");
   for(auto a:annos)require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue().starts_with(
-      "~GGFASEDStatisticsWrapper|GGFASEDStatisticsWrapper>"),"targets not retargeted");
+      profile("~GGFASEDStatisticsWrapper|GGFASEDStatisticsWrapper>")),"targets not retargeted");
 }
 void rejections(MLIRContext &context) {
-  for(unsigned mode=0;mode<25;++mode) {
+  for(unsigned mode=0;mode<26;++mode) {
     auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
     auto top=named(c,hierarchy[0]),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");if(mode==1)c->removeAttr("rawAnnotations");
@@ -291,7 +306,7 @@ void rejections(MLIRContext &context) {
     if(mode==16) {top.getArgument(4).setType(UIntType::get(&context,32,false));auto types=llvm::to_vector(top.getPortTypes());
       types[4]=TypeAttr::get(UIntType::get(&context,32,false));top.setPortTypes(types);}
     if(mode==17 || mode==18) {b.setInsertionPointToEnd(c.getBodyBlock());b.create<FModuleOp>(top.getLoc(),
-        b.getStringAttr(mode==17?"GGFASEDStatistics":"GGFASEDStatisticsWrapper"),
+        b.getStringAttr(profile(mode==17?"GGFASEDStatistics":"GGFASEDStatisticsWrapper")),
         ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{});}
     if(mode==19)named(c,hierarchy[6]).setName("missingHierarchy");
     if(mode==20) {auto m=named(c,hierarchy[6]);b.setInsertionPointToEnd(engine.getBodyBlock());b.create<InstanceOp>(m.getLoc(),m,"duplicate");}
@@ -300,6 +315,9 @@ void rejections(MLIRContext &context) {
     if(mode==23) {auto m=named(c,"GGFASEDResponseReleaser");auto names=llvm::to_vector(m.getPortNames());names[0]=b.getStringAttr("wrongResponse");m.setPortNames(names);
       auto inst=*named(c,hierarchy[12]).getOps<InstanceOp>().begin();inst.erase();b.setInsertionPointToEnd(named(c,hierarchy[12]).getBodyBlock());b.create<InstanceOp>(m.getLoc(),m,"releaser");}
     if(mode==24) {auto m=named(c,hierarchy[12]);(*m.getOps<InstanceOp>().begin()).setName("missingReleaser");}
+    if (mode == 25) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
+      b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight",
+        b.getIntegerAttr(IntegerType::get(&context, 128), APInt(128, 10)))}))}));
     std::string before;llvm::raw_string_ostream out(before);root->print(out);out.flush();std::string error;
     require(failed(goldengate::addFASEDStatistics(c,error)) && !error.empty(),"invalid boundary accepted");
     std::string after;llvm::raw_string_ostream next(after);root->print(next);next.flush();require(before==after,"rejection mutated circuit");
@@ -308,8 +326,10 @@ void rejections(MLIRContext &context) {
 }
 int main() {
   try {
-    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();phases(context);behavior(context);mapping(context);rejections(context);
-    llvm::outs()<<"FASED statistics: 32768 cycles, wraps, target-clock/reset bindings, 13 response hierarchy modules, targets and 25 atomic rejections passed\n";
+    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for (bool profileSelected : {false, true}) {
+      selected = profileSelected; phases(context);behavior(context);mapping(context);rejections(context);
+    }
+    llvm::outs()<<"FASED statistics: 65536 cycles across legacy/selected profiles, wraps, target-clock/reset bindings, 13 response hierarchy modules, targets and 52 atomic boundary rejections passed\n";
     return 0;
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
 }
