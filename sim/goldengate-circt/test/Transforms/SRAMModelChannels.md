@@ -7001,3 +7001,63 @@ step: attach the allocated FASEDLatencyRegisters bank to the selected root,
 consuming read/write latency inputs and exposing words 0/1, then compare host
 reset/write/readback semantics against SFC. No harness-owned manager gate was
 started; the overall port remains open.
+
+
+## Iteration 160 — selected Print FASED latency-register MMIO attachment
+
+`attachFASEDLatencyRegisters` now accepts both legacy and selected Print
+request-limit roots. `mapPrintBridgeFASEDLatencyRegisters` validates the allocated
+Print/CPU collateral, attaches the existing `GGFASEDLatencyRegisters` bank on a
+clone, verifies FIRRTL and publishes only the new selected wrapper and retargeted
+annotation archive. Prior modules and SSA retain their identity. Ten-flight
+constructor validation rejects oversized integer metadata before mutation.
+
+The wrapper consumes both 32-bit runtime latency inputs and exports the decoded
+MCR fragment for global words 0/1, byte offsets 0/4. Host clock/reset drive the
+bank; reset initializes both registers to 30 and takes priority over writes.
+Writes ignore wstrb and targetFire. Readback and the timing latencies retain all
+32 bits. `--map-print-host-fased-latency-registers` requires request limits and
+emits MLIR, annotation JSON and CIRCT SystemVerilog. Both allocated header
+emitters accept the new root without changing collateral.
+
+Evidence: `sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration160-print-fased-latency-registers/`.
+The native build and three CTest groups pass: Print binding, FASED latency
+registers and CPU stream header. The shared bank test interprets 65536 cycles
+across legacy/selected profiles and checks 70 atomic rejections. Both focused
+selected-boundary tests retain prior module/operation identities, six annotation
+probes and allocated headers, with nine atomic rejections each. CLI duplicate
+and missing-request-limit prerequisite rejections pass. Both fresh native
+compiler replays ingest the immutable SFC FIRRTL with selected Print annotations;
+all six preceding request-limit MLIR/SV/JSON artifacts equal iteration 159.
+
+Exact immutable artifact compared:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDLatencyRegistersCompare.py` matches FASEDMemoryTimingModel's
+host-clocked reset/write/readback semantics and LatencyPipe's zero-extended
+32-bit latencies and modulo-64-bit deadline equations. Actual CIRCT bank outputs
+and timing-helper SSA are interpreted for 52768 transitions per allocation,
+including 3346 zero-strobe writes, 17035 writes during reset, 26477 writes during
+target stalls, 2304 deadline underflows and 8192 deadline overflows. All 1713
+structured annotations transfer; the 146 / 140 prior module definitions remain
+unchanged. The 77 / 85 wrapper ports, 81 / 89 connections and 13 emitted MCR pins
+match. Constant-folded handshake signals are compared by value. The native bank
+body also equals `circt-ingestion/post-fame-fased-latency-registers.mlir`.
+Allocated Print/CPU headers equal iteration 159. Immutable FIRRTL/RTL SHA256
+values remain unchanged. Preceding/final boundaries are retained uncompressed;
+own intermediate outputs are compressed with decompressed SHA256 verification.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDLatencyRegisters,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/{FASEDLatencyRegistersTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDLatencyRegistersCompare.py`, and this document.
+
+Risk: the SFC fixture disables Print; shared latency semantics and selected
+composition match, while enabled-Print simulator parity remains unverified.
+Supplied iteration-159 Rocket gates pass but predate this change, and the SFC
+UART-bearing differential remains pending. The selected decoded MCR fragment
+still needs control fanout. Next smallest step: attach the allocated
+FASEDFunctionalModelRegister bank to consume ingress relaxation, expose global
+word 18 and compare reset, full readback and low-bit ingress behavior against
+SFC. Token closure and platform assembly remain open. No harness-owned manager
+gate was started; the overall port remains open.

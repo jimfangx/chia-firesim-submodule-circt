@@ -2792,6 +2792,37 @@ LogicalResult goldengate::mapPrintBridgeFASEDRequestLimits(CircuitOp circuit,
   return success();
 }
 
+// Requires completed selected request limits and a validated Print allocation.
+// Reuse the allocated latency-register bank; append only the wrapper on success.
+// Retarget the annotation archive, preserving all prior SSA and host allocations.
+// Host clock/reset drive words 0/1; decoded MCR remains external for fanout.
+LogicalResult goldengate::mapPrintBridgeFASEDLatencyRegisters(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDRequestLimitsWrapper") {
+    error = "selected Print FASED latency registers require the completed request limits boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDLatencyRegisters") bank = m;
+  if (failed(attachFASEDLatencyRegisters(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED latency registers produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintFASEDLatencyRegistersWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // Requires the recorded selected Print retirement/allocation boundary and
 // annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
 // Verify on a clone, then publish only the wrapper and retargeted annotations;

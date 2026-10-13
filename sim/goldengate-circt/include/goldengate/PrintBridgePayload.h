@@ -271,6 +271,12 @@ mlir::LogicalResult mapPrintBridgeFASEDRequestLimits(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach the allocated latency-register bank after selected request limits.
+/// Atomic; host-reset words 0/1 supply full-width timing latencies and readback.
+mlir::LogicalResult mapPrintBridgeFASEDLatencyRegisters(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

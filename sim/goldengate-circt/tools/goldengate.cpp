@@ -424,6 +424,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDWriteAdmission = false;
   bool mapPrintHostFASEDReadAdmission = false;
   bool mapPrintHostFASEDRequestLimits = false;
+  bool mapPrintHostFASEDLatencyRegisters = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -498,6 +499,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-request-limits") {
         if (mapPrintHostFASEDRequestLimits) return fail("duplicate --map-print-host-fased-request-limits");
         mapPrintHostFASEDRequestLimits = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-latency-registers") {
+        if (mapPrintHostFASEDLatencyRegisters) return fail("duplicate --map-print-host-fased-latency-registers");
+        mapPrintHostFASEDLatencyRegisters = true;
         continue;
       }
       if (option == "--map-print-host-fased-write-egress") {
@@ -675,6 +681,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-read-admission requires --map-print-host-fased-write-admission");
   if (mapPrintHostFASEDRequestLimits && !mapPrintHostFASEDReadAdmission)
     return fail("--map-print-host-fased-request-limits requires --map-print-host-fased-read-admission");
+  if (mapPrintHostFASEDLatencyRegisters && !mapPrintHostFASEDRequestLimits)
+    return fail("--map-print-host-fased-latency-registers requires --map-print-host-fased-request-limits");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
     return fail("--map-print-host-fased-write-egress requires --map-print-host-fased-read-scheduler");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
@@ -1275,6 +1283,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED request limits output: " + error);
         llvm::outs() << "Attached selected Print FASED host-reset MMIO words 2/3 and four-bit admission maxima in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDLatencyRegisters) {
+        if (failed(goldengate::mapPrintBridgeFASEDLatencyRegisters(circuit, hosts, error)))
+          return fail("PrintBridge FASED latency registers: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-latency-registers.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-latency-registers.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-latency-registers-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED latency registers MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED latency registers output: " + error);
+        llvm::outs() << "Attached selected Print FASED host-reset MMIO words 0/1 and full-width timing latencies in " << tokenIR << '\n';
       }
       return 0;
     }
