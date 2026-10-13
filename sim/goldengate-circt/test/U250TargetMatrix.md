@@ -167,3 +167,101 @@ agrees after the previously recorded `target/FireSim_` to
 `target_FAMETop/FireSim` hierarchy rename, retaining the same clock name, divide
 ratio and multicycle constraints. Exact fixture/candidate paths and results are
 in `immutable-rocket-comparison.json`; this does not establish RTL equivalence.
+
+
+## Iteration 169: native SimpleNIC token queues and channel gates
+
+`addNICTokenQueues` is now part of the active native baseline compiler after
+CPU stream platform assembly. A constructor-free SimpleNIC widget binds its
+fifteen latency-one channels to two instantiated depth-ten FIRRTL queues.
+No NIC annotation leaves the circuit unchanged. A malformed or unsupported
+NIC boundary is rejected before any mutation. This is a partial NIC lowering:
+seven-token CPU stream packet adapters, stream allocation, MMIO registers and
+the driver ABI remain unimplemented. Compilation emits the verified
+`post-fame-nic-token-queues.mlir` and annotation boundary, then reports these
+missing bindings; it does not emit an incomplete FPGA design as a success.
+
+Both queues store the 66 nonconstant packet bits (64 data, last, valid), with
+asynchronous reads, synchronous writes, host-reset pointer/occupancy state,
+non-power-of-two pointer wrap at nine, and flow/pipe disabled. Incoming keep
+is FF. The later outgoing packet adapter must restore the constant
+`data_in_ready = true` field. Target reset does not flush these queues.
+All four outgoing channels participate in the token handshake, including
+keep, whose data the host packet adapter discards. Each ready/valid gate
+excludes only its own channel predicate. Host-to-target and target-to-host
+queue progress are independent. Seven configuration inputs remain explicit;
+`nic_done` exposes the combinational source for the later sampled MMIO register.
+
+The new `goldengate-nic-token-queues` CTest passes on actual emitted operations:
+12,000 randomized channel-gate cases, all fifteen isolated channel stalls,
+queue-capacity stalls, independent direction progress, queue geometry and
+instantiation, consumed endpoint retention, copied clock transfer, and
+pre-mutation rejection of latency-two, duplicate and inconsistent clock
+annotations. A regression fixture also accepts and preserves the historical
+FAMETop clock identity after its physical port
+has been removed by FAME lowering.
+
+`test/Transforms/NICTokenQueuesCompare.py` compares the emitted native queue
+RTL to these exact immutable SFC modules:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+Queue_17 (host-to-NIC), Queue_18 (NIC-to-host)
+```
+
+A standalone Verilator unit simulation matches every ready/valid value and
+valid 66-bit payload against both SFC queues and an independent occupancy and
+ordering scoreboard over 40,000 cycles: 363 full, 2,561 empty, 20,809 simultaneous
+enqueue/dequeue, 353 reset, 29,610 enqueue and 28,032 dequeue cycles. Comparison
+of the SFC FPGA wrapper's fifteen exclusion gates also matches the predicates
+exercised by the CTest. This is unit RTL simulation, not a FireSim metasim gate.
+
+Evidence is retained under the fresh repository output directory:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration169-u250-target-matrix/
+```
+
+`nic-queues-final/comparison.json`, `sfc-gate-contracts.json`, generated native/SFC
+queue RTL and complete unit build/behavior logs retain this comparison.
+The next smallest porting step is the seven-token 512-bit packet adapters,
+including stalled seventh-token handling and their host-reset counters, before
+allocating NIC CPU streams and binding control/driver collateral.
+
+The actual archived NIC input also reaches this boundary in `replay-final`.
+All 1,792 annotation records survive queue assembly, with only the explicit
+circuit and copied-port target transfer; consumed channel endpoints still
+name the retained inner module. `nic-annotation-transfer.json` records the
+exact comparison. Its nine BridgeIO and 58 channel connection records at
+bridge extraction still match the SFC `post-bridge-extraction.json` boundary.
+The later model-port boundary retains the previously recorded SRAM mismatch
+(68 native channel connections versus 58 SFC); queue assembly does not claim
+to resolve it. The NIC row remains a compile failure with the specific
+packet-adapter/MMIO diagnostic despite this verified partial lowering.
+
+The first replay in `replay` diagnosed an overly strict attempt to resolve
+the historical `~GGCPUStreamPlatformWrapper|FAMETop>ep_3_clock` as a present
+port. SFC `FAMETransform.staleTopPort` removes target Clock ports while
+retaining this earlier channel clock identity. The corrected implementation
+requires a common retained clock string across the fifteen channels and
+preserves that identity; it uses the explicit host clock for queue state.
+`replay-final` contains the corrected compiler replay, and the initial logs
+remain available for that diagnosis.
+
+The final Rocket candidate RTL is unchanged from iteration 168. The recorded
+2026-10-01 immutable compiler input hashes and normalized U250 XDC constraints
+still agree, including the documented implementation hierarchy rename.
+`no-nic-rtl-comparison.json` and `immutable-rocket-comparison.json` record the
+exact final candidate and golden paths. No manager verification gate was run.
+
+The corrected full thirteen-target replay completed with compiler SHA256
+`62bccecc3f0780ee4d5209040a2ecc24c68956a308379c1bc44a8a2c9f65f9b1`.
+`replay-final/matrix.json` and `matrix.md` retain one compiled target, six
+lowering failures and six unsupported partition profiles, using every
+recipe's exact archived inputs and effective platform configuration. All
+seven base bridge/channel boundaries match; Shuttle's model-port boundary
+also matches, while the other six retain SRAM differences. The complete
+replay exits nonzero. Remaining failures are multiple/non-Rocket TracerV,
+FASED outstanding profiles beyond maxFlight=10, NIC packet/MMIO bindings,
+and partition/QSFP semantics. Compilation and annotation matches are partial
+evidence, not target behavioral or platform/ABI parity.

@@ -140,6 +140,7 @@
 #include "goldengate/BlockDevWriteAckQueue.h"
 #include "goldengate/BlockDevMMIOBank.h"
 #include "goldengate/TSIWordQueues.h"
+#include "goldengate/NICTokenQueues.h"
 #include "goldengate/TSIMMIOBank.h"
 #include "goldengate/ResetPulseBridge.h"
 #include "goldengate/PeekPokeCycleEngine.h"
@@ -4591,6 +4592,21 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuPlatformAnnotations, error)))
         return fail("CPU stream platform annotations: " + error);
       llvm::outs() << "Assembled CIRCT CPU-managed AXI4 slave in " << cpuPlatformPath << '\n';
+      if (failed(goldengate::addNICTokenQueues(circuit, error)))
+        return fail("NIC token queues: " + error);
+      if (circuit.getName() == "GGNICTokenQueuesWrapper") {
+        if (failed(mlir::verify(*module))) return fail("NIC token queues produced invalid FIRRTL IR");
+        llvm::SmallString<256> nicPath(outputDir), nicAnnotations(outputDir);
+        llvm::sys::path::append(nicPath, "post-fame-nic-token-queues.mlir");
+        llvm::sys::path::append(nicAnnotations, "post-fame-nic-token-queues-all.json");
+        std::error_code nicError;
+        llvm::raw_fd_ostream nicOut(nicPath, nicError);
+        if (nicError) return fail("cannot write NIC token queues: " + nicError.message());
+        module->print(nicOut); nicOut << '\n'; nicOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, nicAnnotations, error)))
+          return fail("NIC token queue annotations: " + error);
+        return fail("NIC CPU stream packet adapters and MMIO control binding are not implemented");
+      }
       if (failed(goldengate::assembleFPGATopShell(circuit, error)))
         return fail("FPGA top shell: " + error);
       if (failed(mlir::verify(*module))) return fail("FPGA top shell produced invalid FIRRTL IR");

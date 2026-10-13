@@ -147,6 +147,7 @@ add_executable(goldengate-circt
   lib/Transforms/BlockDevWriteAckQueue.cpp
   lib/Transforms/TSITokenEngine.cpp
   lib/Transforms/TSIWordQueues.cpp
+  lib/Transforms/NICTokenQueues.cpp
   lib/Transforms/TSIMMIOBank.cpp
   lib/Transforms/ControlReadArbiter.cpp
   lib/Transforms/ControlWriteArbiter.cpp
@@ -2005,4 +2006,17 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTSupport
     MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-output-selection COMMAND goldengate-fame-output-selection-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-token-queues-test
+    test/Transforms/NICTokenQueuesTest.cpp lib/Transforms/NICTokenQueues.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-nic-token-queues-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-token-queues-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-token-queues-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-token-queues-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-token-queues COMMAND goldengate-nic-token-queues-test)
 endif()
