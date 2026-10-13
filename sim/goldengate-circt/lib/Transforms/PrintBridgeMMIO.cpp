@@ -2854,6 +2854,37 @@ LogicalResult goldengate::mapPrintBridgeFASEDFunctionalModelRegister(CircuitOp c
   return success();
 }
 
+// Requires the completed selected functional-model register and Print allocation.
+// Reuse the allocated response-error bank; append only the wrapper on success.
+// Retarget the annotation archive, preserving all prior SSA and host allocations.
+// Observe accepted host R/B errors at words 19/20; decoded MCR remains external.
+LogicalResult goldengate::mapPrintBridgeFASEDResponseErrors(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDFunctionalModelRegisterWrapper") {
+    error = "selected Print FASED response errors requires the completed functional-model register boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDResponseErrors") bank = m;
+  if (failed(attachFASEDResponseErrors(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED response errors produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintFASEDResponseErrorsWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // Requires the recorded selected Print retirement/allocation boundary and
 // annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
 // Verify on a clone, then publish only the wrapper and retargeted annotations;

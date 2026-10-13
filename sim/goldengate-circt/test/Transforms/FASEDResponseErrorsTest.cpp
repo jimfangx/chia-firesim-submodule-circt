@@ -15,6 +15,19 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+bool selected = false;
+std::string profile(llvm::StringRef input) {
+  std::string result = input.str();
+  if (selected) for (auto suffix : {"ResponseErrorsWrapper", "FunctionalModelRegisterWrapper"}) {
+    std::string old = std::string("GGFASED") + suffix;
+    std::string replacement = std::string("GGSelectedPrintFASED") + suffix;
+    size_t pos = 0;
+    while ((pos = result.find(old, pos)) != std::string::npos) {
+      result.replace(pos, old.size(), replacement); pos += replacement.size();
+    }
+  }
+  return result;
+}
 void require(bool ok, llvm::StringRef message) {
   if (!ok) throw std::runtime_error(message.str());
 }
@@ -67,7 +80,7 @@ struct Interpreter {
   }
 };
 OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
-  auto root = parseSourceString<ModuleOp>(R"(module {
+  auto root = parseSourceString<ModuleOp>(profile(R"(module {
     firrtl.circuit "GGFASEDFunctionalModelRegisterWrapper" {
       firrtl.module @GGFASEDTokenEngine() {}
       firrtl.module @GGFASEDFunctionalModelRegisterWrapper(
@@ -76,14 +89,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         in %fased_host_write_response: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<user: uint<1>, id: uint<4>, resp: uint<2>>>,
         in %targetFire: !firrtl.uint<1>, in %modelReset: !firrtl.uint<1>,
         out %other: !firrtl.uint<8>) {}
-    } })", &context);
+    } })"), &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   named(c, "GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
     b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(10))}))}));
   SmallVector<Attribute> annos;
   for (auto name : {"fased_host_read_response.bits.resp", "fased_host_write_response.ready", "other"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
-        b.getNamedAttr("target", b.getStringAttr("~GGFASEDFunctionalModelRegisterWrapper|GGFASEDFunctionalModelRegisterWrapper>" + std::string(name)))}));
+        b.getNamedAttr("target", b.getStringAttr(profile("~GGFASEDFunctionalModelRegisterWrapper|GGFASEDFunctionalModelRegisterWrapper>") + std::string(name)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
 std::string dump(Operation *op) {
@@ -138,7 +151,7 @@ void phases(MLIRContext &context) {
     if (bad == 0) candidate = {};
     if (bad == 1) require(succeeded(goldengate::materializeFASEDResponseErrors(
         *foreign->getOps<CircuitOp>().begin(), candidate, error)), error);
-    if (bad == 2) candidate = named(circuit, "GGFASEDFunctionalModelRegisterWrapper");
+    if (bad == 2) candidate = named(circuit, profile("GGFASEDFunctionalModelRegisterWrapper"));
     if (bad >= 3 && bad <= 30) {
       SmallVector<PortInfo> malformed(candidate.getPorts());
       if (bad == 30) malformed.pop_back();
@@ -214,7 +227,7 @@ void behavior(MLIRContext &context) {
 void mapping(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDResponseErrors(c,error)),error);
-  auto top = named(c,"GGFASEDResponseErrorsWrapper"), bank = named(c,"GGFASEDResponseErrors");
+  auto top = named(c,profile("GGFASEDResponseErrorsWrapper")), bank = named(c,"GGFASEDResponseErrors");
   require(top.getNumPorts()==8 && top.getPortName(7)=="fased_response_errors_mcr","copied port shape mismatch");
   auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
   require(regs && regs.size()==2,"missing register map");
@@ -250,12 +263,12 @@ void mapping(MLIRContext &context) {
   require(std::distance(top.getOps<ConnectOp>().begin(),top.getOps<ConnectOp>().end())==8,"copied ports lost");
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(annos.size()==3,"annotations lost");
   for(auto a:annos) require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue().starts_with(
-      "~GGFASEDResponseErrorsWrapper|GGFASEDResponseErrorsWrapper>"),"target identity mismatch");
+      profile("~GGFASEDResponseErrorsWrapper|GGFASEDResponseErrorsWrapper>")),"target identity mismatch");
 }
 void rejections(MLIRContext &context) {
-  for(unsigned mode=0;mode<18;++mode) {
+  for(unsigned mode=0;mode<19;++mode) {
     auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
-    auto top=named(c,"GGFASEDFunctionalModelRegisterWrapper"),engine=named(c,"GGFASEDTokenEngine");
+    auto top=named(c,profile("GGFASEDFunctionalModelRegisterWrapper")),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");
     if(mode==1)c->removeAttr("rawAnnotations");
     if(mode==2)engine->removeAttr("goldengate.bridgeConstructor");
@@ -270,8 +283,11 @@ void rejections(MLIRContext &context) {
       auto types=llvm::to_vector(top.getPortTypes());types[index]=TypeAttr::get(UIntType::get(&context,32,false));top.setPortTypes(types);
     }
     if(mode==16 || mode==17) {b.setInsertionPointToEnd(c.getBodyBlock());b.create<FModuleOp>(top.getLoc(),
-        b.getStringAttr(mode==16?"GGFASEDResponseErrors":"GGFASEDResponseErrorsWrapper"),
+        b.getStringAttr(mode==16?"GGFASEDResponseErrors":profile("GGFASEDResponseErrorsWrapper")),
         ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{});}
+    if (mode == 18) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
+      b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight",
+        b.getIntegerAttr(IntegerType::get(&context, 128), APInt(128, 10)))}))}));
     std::string before;llvm::raw_string_ostream out(before);root->print(out);out.flush();std::string error;
     require(failed(goldengate::addFASEDResponseErrors(c,error)) && !error.empty(),"invalid boundary accepted");
     std::string after;llvm::raw_string_ostream next(after);root->print(next);next.flush();require(before==after,"rejection mutated circuit");
@@ -281,8 +297,10 @@ void rejections(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-    phases(context);behavior(context);mapping(context);rejections(context);
-    llvm::outs()<<"FASED response errors: 32768 cycles, handshake/host bindings, targets and 18 atomic rejections passed\n";
+    for (bool profileSelected : {false, true}) {
+      selected = profileSelected; phases(context);behavior(context);mapping(context);rejections(context);
+    }
+    llvm::outs()<<"FASED response errors: 65536 cycles across legacy/selected profiles, handshake/host bindings, targets and 38 atomic boundary rejections passed\n";
     return 0;
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
 }

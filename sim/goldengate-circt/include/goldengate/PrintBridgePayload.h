@@ -283,6 +283,12 @@ mlir::LogicalResult mapPrintBridgeFASEDFunctionalModelRegister(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach the allocated response-error bank after the selected functional-model register.
+/// Atomic; host-reset words 19/20 observe R/B handshakes with read-only assertions.
+mlir::LogicalResult mapPrintBridgeFASEDResponseErrors(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

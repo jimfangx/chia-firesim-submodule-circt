@@ -21,7 +21,10 @@ using namespace circt::firrtl;
 
 namespace {
 constexpr llvm::StringLiteral bankName = "GGFASEDResponseErrors";
-constexpr llvm::StringLiteral wrapperName = "GGFASEDResponseErrorsWrapper";
+llvm::StringRef wrapperName(CircuitOp circuit) {
+  return circuit.getName() == "GGSelectedPrintFASEDFunctionalModelRegisterWrapper"
+      ? "GGSelectedPrintFASEDResponseErrorsWrapper" : "GGFASEDResponseErrorsWrapper";
+}
 constexpr llvm::StringLiteral controlName = "fased_response_errors_mcr";
 SmallVector<PortInfo> responseErrorPorts(MLIRContext *ctx) {
   OpBuilder b(ctx);
@@ -46,11 +49,12 @@ SmallVector<PortInfo> responseErrorPorts(MLIRContext *ctx) {
 LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
     unsigned (&indices)[4], std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDFunctionalModelRegisterWrapper")
+  if (circuit.getName() != "GGFASEDFunctionalModelRegisterWrapper" &&
+      circuit.getName() != "GGSelectedPrintFASEDFunctionalModelRegisterWrapper")
     return reject("FASED response errors require the active functional-model register wrapper");
   FModuleOp engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == wrapperName)
+    if (m.getName() == wrapperName(circuit))
       return reject("FASED response errors wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
@@ -60,7 +64,7 @@ LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
   auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getInt() != 10)
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() != 10)
     return reject("FASED response errors currently require the recorded ten-flight constructor");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx);
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
@@ -178,7 +182,7 @@ LogicalResult goldengate::attachFASEDResponseErrors(CircuitOp circuit,
   }
   ports.push_back({b.getStringAttr(controlName), mcr, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
+  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName(circuit)), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), mmio = b.create<InstanceOp>(loc, bank, "responseErrors");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
@@ -197,7 +201,7 @@ LogicalResult goldengate::attachFASEDResponseErrors(CircuitOp circuit,
   }
   b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArguments().back(), mmio.getResult(8));
 
-  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
+  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName(circuit).str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
     if (auto s = dyn_cast<StringAttr>(a)) {
@@ -208,7 +212,7 @@ LogicalResult goldengate::attachFASEDResponseErrors(CircuitOp circuit,
       if (ref.consume_front(modulePrefix)) {
         auto local = ref.take_front(ref.find_first_of(".["));
         for (auto i : copied) if (local == inner.getPortName(i)) {
-          suffix.replace(0, modulePrefix.size(), "|" + wrapperName.str() + ">"); break;
+          suffix.replace(0, modulePrefix.size(), "|" + wrapperName(circuit).str() + ">"); break;
         }
       }
       return b.getStringAttr(newPrefix + suffix);
@@ -217,7 +221,7 @@ LogicalResult goldengate::attachFASEDResponseErrors(CircuitOp circuit,
     if (auto d = dyn_cast<DictionaryAttr>(a)) { NamedAttrList vs; for (auto v : d) vs.set(v.getName(), retarget(v.getValue())); return vs.getDictionary(ctx); }
     return a;
   };
-  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
+  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName(circuit));
   return success();
 }
 
