@@ -7061,3 +7061,62 @@ FASEDFunctionalModelRegister bank to consume ingress relaxation, expose global
 word 18 and compare reset, full readback and low-bit ingress behavior against
 SFC. Token closure and platform assembly remain open. No harness-owned manager
 gate was started; the overall port remains open.
+
+### Iteration 161: selected Print functional-model register attachment
+
+`--map-print-host-fased-functional-model-register` now attaches the allocated
+`GGFASEDFunctionalModelRegister` bank after selected latency registers. The
+shared FIRRTL operation composer supports both legacy and selected roots;
+selected publication adds only `GGSelectedPrintFASEDFunctionalModelRegisterWrapper`
+and retains all existing module/operation identities. Host clock/reset drive
+one 32-bit reset register, global MMIO word 18 (byte offset 72). Readback retains
+all bits, only bit zero drives ingress relaxation, and writes ignore byte
+strobes and targetFire. The decoded MCR fragment remains exposed for subsequent
+control fanout. Malformed constructors, including oversized maxFlight integers,
+fail before mutation. The Scala oracle is unchanged.
+
+Evidence: `sim/generated-src/xilinx_alveo_u250/`
+`xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/`
+`iteration161-print-fased-functional-model-register/` retains build/test/replay
+logs, the comparison report, final and preceding boundary MLIR/SV/annotation
+archives, headers, source snapshots and checksums. Intermediate artifacts are
+compressed only after checksum-verified round trips; golden fixtures are read-only.
+
+Comparison oracle:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/`
+`cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+`design/FireSim-generated.sv`, modules FASEDMemoryTimingModel and IngressModule.
+Ingestion uses the primary immutable
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`. Both fixture checksums remain
+unchanged. The native shared-bank reference is
+`circt-ingestion/post-fame-fased-functional-model-register.mlir`.
+
+Validation: native compiler build and three CTest cases pass. The bank test
+checks 65,536 cycles across legacy/selected profiles and 68 atomic rejections;
+both focused Print allocations preserve prior SSA and headers with nine atomic
+rejections each. Duplicate CLI flags and missing latency prerequisites are
+rejected. Both complete native allocation replays and semantic comparisons pass:
+
+- candidate: 147 prior modules unchanged, 77 typed wrapper ports, 80 connections, 7 emitted MCR pins and 1713 transferred annotations; 28,192 register transitions and 1,024 composed ingress issue cases.
+
+- compatibility: 141 prior modules unchanged, 85 typed wrapper ports, 88 connections, 7 emitted MCR pins and 1713 transferred annotations; 28,192 register transitions and 1,024 composed ingress issue cases.
+
+The comparison includes reset/write priority, zero-strobe writes, writes during
+target stalls, full-word readback and high-bit words that keep strict ingress
+ordering when bit zero is clear. Prior latency-register MLIR/SV/annotation
+boundaries and allocated headers match iteration 160 exactly.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDFunctionalModelRegister,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/{FASEDFunctionalModelRegisterTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDFunctionalModelRegisterCompare.py`, and this document.
+
+Risk: SFC disables Print in the recorded fixture, so shared FASED semantics and
+selected composition match while enabled-Print runtime parity remains open.
+Supplied iteration-160 CIRCT replacertl and Verilator regressions pass but
+predate this change; the Rocket SFC UART-bearing differential remains pending.
+No harness-owned manager gate was started. Next smallest step: attach the
+allocated FASEDResponseErrors bank at this selected boundary and compare accepted
+R/B error capture, reset and read-only MMIO words 19/20 against SFC. Control
+fanout, token closure and platform assembly remain open; the port is incomplete.

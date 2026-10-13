@@ -425,6 +425,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDReadAdmission = false;
   bool mapPrintHostFASEDRequestLimits = false;
   bool mapPrintHostFASEDLatencyRegisters = false;
+  bool mapPrintHostFASEDFunctionalModelRegister = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -504,6 +505,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-latency-registers") {
         if (mapPrintHostFASEDLatencyRegisters) return fail("duplicate --map-print-host-fased-latency-registers");
         mapPrintHostFASEDLatencyRegisters = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-functional-model-register") {
+        if (mapPrintHostFASEDFunctionalModelRegister) return fail("duplicate --map-print-host-fased-functional-model-register");
+        mapPrintHostFASEDFunctionalModelRegister = true;
         continue;
       }
       if (option == "--map-print-host-fased-write-egress") {
@@ -683,6 +689,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-request-limits requires --map-print-host-fased-read-admission");
   if (mapPrintHostFASEDLatencyRegisters && !mapPrintHostFASEDRequestLimits)
     return fail("--map-print-host-fased-latency-registers requires --map-print-host-fased-request-limits");
+  if (mapPrintHostFASEDFunctionalModelRegister && !mapPrintHostFASEDLatencyRegisters)
+    return fail("--map-print-host-fased-functional-model-register requires --map-print-host-fased-latency-registers");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
     return fail("--map-print-host-fased-write-egress requires --map-print-host-fased-read-scheduler");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
@@ -1298,6 +1306,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED latency registers output: " + error);
         llvm::outs() << "Attached selected Print FASED host-reset MMIO words 0/1 and full-width timing latencies in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDFunctionalModelRegister) {
+        if (failed(goldengate::mapPrintBridgeFASEDFunctionalModelRegister(circuit, hosts, error)))
+          return fail("PrintBridge FASED functional-model register: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-functional-model-register.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-functional-model-register.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-functional-model-register-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED functional-model register MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED functional-model register output: " + error);
+        llvm::outs() << "Attached selected Print FASED host-reset MMIO word 18 and bit-zero ingress relaxation in " << tokenIR << '\n';
       }
       return 0;
     }

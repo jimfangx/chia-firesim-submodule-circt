@@ -1,7 +1,8 @@
 // See LICENSE for license details.
 // Oracle: FuncModelProgrammableRegs, Widget.genAndAttachReg, MCRIO.bindReg.
 // Materialization requires a free bank symbol and preserves top/annotations.
-// Attachment requires an uninstantiated latency-register wrapper, host clock/reset,
+// Attachment requires an uninstantiated legacy or selected Print latency-register
+// wrapper, host clock/reset,
 // one-bit ingress relaxed input and retained ten-flight bridge constructor.
 // Consumes/produces annotations: none; preserves and explicitly retargets all.
 // IR mutations: a host-clocked 32-bit reset register, decoded MCR word 18
@@ -18,7 +19,10 @@ using namespace circt::firrtl;
 
 namespace {
 constexpr llvm::StringLiteral bankName = "GGFASEDFunctionalModelRegister";
-constexpr llvm::StringLiteral wrapperName = "GGFASEDFunctionalModelRegisterWrapper";
+StringRef wrapperName(CircuitOp circuit) {
+  return circuit.getName() == "GGSelectedPrintFASEDLatencyRegistersWrapper"
+      ? "GGSelectedPrintFASEDFunctionalModelRegisterWrapper" : "GGFASEDFunctionalModelRegisterWrapper";
+}
 constexpr llvm::StringLiteral controlName = "fased_functional_model_mcr";
 SmallVector<PortInfo> functionalModelPorts(MLIRContext *ctx) {
   OpBuilder b(ctx);
@@ -36,11 +40,12 @@ SmallVector<PortInfo> functionalModelPorts(MLIRContext *ctx) {
 LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
     unsigned (&indices)[3], std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDLatencyRegistersWrapper")
+  if (circuit.getName() != "GGFASEDLatencyRegistersWrapper" &&
+      circuit.getName() != "GGSelectedPrintFASEDLatencyRegistersWrapper")
     return reject("FASED functional model register requires the active latency register wrapper");
   FModuleOp engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == wrapperName)
+    if (m.getName() == wrapperName(circuit))
       return reject("FASED functional model register wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
@@ -50,7 +55,7 @@ LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
   auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getInt() != 10)
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() != 10)
     return reject("FASED functional model register currently requires the recorded ten-flight constructor");
   auto *ctx = circuit.getContext();
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
@@ -142,7 +147,7 @@ LogicalResult goldengate::attachFASEDFunctionalModelRegister(CircuitOp circuit,
   }
   ports.push_back({b.getStringAttr(controlName), mcr, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
+  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName(circuit)), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), mmio = b.create<InstanceOp>(loc, bank, "functionalModelRegister");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
@@ -155,7 +160,7 @@ LogicalResult goldengate::attachFASEDFunctionalModelRegister(CircuitOp circuit,
   connect(sim.getResult(*relaxed), mmio.getResult(2));
   b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArguments().back(), mmio.getResult(3));
 
-  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
+  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName(circuit).str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
     if (auto s = dyn_cast<StringAttr>(a)) {
@@ -166,7 +171,7 @@ LogicalResult goldengate::attachFASEDFunctionalModelRegister(CircuitOp circuit,
       if (ref.consume_front(modulePrefix)) {
         auto local = ref.take_front(ref.find_first_of(".["));
         for (auto i : copied) if (local == inner.getPortName(i)) {
-          suffix.replace(0, modulePrefix.size(), "|" + wrapperName.str() + ">"); break;
+          suffix.replace(0, modulePrefix.size(), "|" + wrapperName(circuit).str() + ">"); break;
         }
       }
       return b.getStringAttr(newPrefix + suffix);
@@ -175,7 +180,7 @@ LogicalResult goldengate::attachFASEDFunctionalModelRegister(CircuitOp circuit,
     if (auto d = dyn_cast<DictionaryAttr>(a)) { NamedAttrList vs; for (auto v : d) vs.set(v.getName(), retarget(v.getValue())); return vs.getDictionary(ctx); }
     return a;
   };
-  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
+  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName(circuit));
   return success();
 }
 

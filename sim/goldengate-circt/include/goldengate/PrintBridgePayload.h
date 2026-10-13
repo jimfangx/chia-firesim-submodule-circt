@@ -277,6 +277,12 @@ mlir::LogicalResult mapPrintBridgeFASEDLatencyRegisters(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach the allocated functional-model register after selected latency registers.
+/// Atomic; host-reset word 18 keeps full readback and drives ingress with bit zero.
+mlir::LogicalResult mapPrintBridgeFASEDFunctionalModelRegister(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.
