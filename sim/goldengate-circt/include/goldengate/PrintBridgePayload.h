@@ -241,6 +241,12 @@ mlir::LogicalResult mapPrintBridgeFASEDTimingAWQueue(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach pre-edge AW/final-W pairing and target-qualified pending counters.
+/// Atomic; B retirement and the runtime maximum remain explicit boundaries.
+mlir::LogicalResult mapPrintBridgeFASEDWritePairing(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

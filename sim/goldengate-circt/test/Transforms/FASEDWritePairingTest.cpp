@@ -21,8 +21,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
+bool selected = false;
+std::string oldName() { return selected ? "GGSelectedPrintFASEDTimingAWQueueWrapper" : "GGFASEDTimingAWQueueWrapper"; }
+std::string newName() { return selected ? "GGSelectedPrintFASEDWritePairingWrapper" : "GGFASEDWritePairingWrapper"; }
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
-  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDTimingAWQueueWrapper\" { firrtl.module @GGFASEDTimingAWQueueWrapper() {} } }",&ctx);
+  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"" + oldName() + "\" { firrtl.module @" + oldName() + "() {} } }",&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
   auto u=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=u(1);
@@ -51,15 +54,15 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   if(mode!=11){auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     if(mode!=17)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({
       b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==16?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));}
-  if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?"GGFASEDWritePairing":"GGFASEDWritePairingWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?"GGFASEDWritePairing":newName()),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   if(mode==18)c.setName("wrong");
   if(mode!=12)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~GGFASEDTimingAWQueueWrapper"),
-      b.getStringAttr("~GGFASEDTimingAWQueueWrapper|GGFASEDTimingAWQueueWrapper>other"),
-      b.getStringAttr("~GGFASEDTimingAWQueueWrapper|GGFASEDTimingAWQueueWrapper>fased_write_pair_complete"),
-      b.getStringAttr("~GGFASEDTimingAWQueueWrapper|GGFASEDTimingAWQueueWrapper>fased_timing_requests.aw.bits.id"),
-      b.getStringAttr("~GGFASEDTimingAWQueueWrapper|GGFASEDTokenEngine>state")}))})}));
+    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~" + oldName()),
+      b.getStringAttr("~" + oldName() + "|" + oldName() + ">other"),
+      b.getStringAttr("~" + oldName() + "|" + oldName() + ">fased_write_pair_complete"),
+      b.getStringAttr("~" + oldName() + "|" + oldName() + ">fased_timing_requests.aw.bits.id"),
+      b.getStringAttr("~" + oldName() + "|" + "GGFASEDTokenEngine>state")}))})}));
   return root;
 }
 struct Interpreter {
@@ -176,7 +179,7 @@ void behavior(MLIRContext &ctx) {
 }
 void mapping(MLIRContext &ctx) {
   auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDWritePairing(c,error)),error);
-  auto top=named(c,"GGFASEDWritePairingWrapper"),inner=named(c,"GGFASEDTimingAWQueueWrapper");require(top.getNumPorts()==8,"wrapper port count differs");
+  auto top=named(c,newName()),inner=named(c,oldName());require(top.getNumPorts()==8,"wrapper port count differs");
   const unsigned copied[]{0,1,2,3,5};for(unsigned i=0;i<5;++i)require(top.getPorts()[i].name==inner.getPorts()[copied[i]].name&&top.getPorts()[i].type==inner.getPorts()[copied[i]].type&&top.getPorts()[i].direction==inner.getPorts()[copied[i]].direction,"copied boundary differs");
   auto it=top.getOps<InstanceOp>().begin();auto sim=*it++;auto q=*it;Interpreter w(top);
   for(unsigned flags=0;flags<256;++flags){w.memo.clear();
@@ -194,7 +197,7 @@ void mapping(MLIRContext &ctx) {
     for(auto field:{"awValue","wValue","awFull","wFull"})require(w.output(w.arg(7),field,llvm::StringRef(field).ends_with("Full")?1:4).getZExtValue()==((flags%16)&(llvm::StringRef(field).ends_with("Full")?1:15)),"pending diagnostic binding differs");
   }
   auto ts=cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<ArrayAttr>("targets");
-  const llvm::StringRef expected[]{"~GGFASEDWritePairingWrapper","~GGFASEDWritePairingWrapper|GGFASEDWritePairingWrapper>other","~GGFASEDWritePairingWrapper|GGFASEDTimingAWQueueWrapper>fased_write_pair_complete","~GGFASEDWritePairingWrapper|GGFASEDWritePairingWrapper>fased_timing_requests.aw.bits.id","~GGFASEDWritePairingWrapper|GGFASEDTokenEngine>state"};
+  const std::string expected[]{"~" + newName(),"~" + newName() + "|" + newName() + ">other","~" + newName() + "|" + oldName() + ">fased_write_pair_complete","~" + newName() + "|" + newName() + ">fased_timing_requests.aw.bits.id","~" + newName() + "|" + "GGFASEDTokenEngine>state"};
   for(unsigned i=0;i<5;++i)require(cast<StringAttr>(ts[i]).getValue()==expected[i],"target transfer differs");llvm::outs()<<"256 wrapper mapping cases and five target transfers passed\n";
 }
 
@@ -207,4 +210,4 @@ void rejection(MLIRContext &ctx) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"23 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{behavior(ctx);mapping(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool profile : {false, true}) { selected=profile; llvm::outs() << (selected ? "selected Print: " : "legacy: "); behavior(ctx);mapping(ctx);rejection(ctx);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

@@ -6678,3 +6678,68 @@ latency MMIO, target token closure and selected platform assembly remain open.
 Next smallest step: attach native FASEDWritePairing to the selected AW queue
 root and compare saturating pending counters/newWReq against SFC LatencyPipe.
 No harness-owned manager gate was started; the overall port remains open.
+
+### Iteration 155 — selected Print AW/final-W pairing
+
+`--map-print-host-fased-write-pairing` requires the selected timing AW queue
+and attaches shared native `FASEDWritePairing` to
+`GGSelectedPrintFASEDTimingAWQueueWrapper`. The new
+`GGSelectedPrintFASEDWritePairingWrapper` consumes the external pairing pulse
+and derives it from accepted AW and final-W handshakes and pre-edge pending
+counts. Pairing is independent of reset, targetFire, saturation and B retirement.
+Two four-bit saturating counters hold on simultaneous increment/decrement,
+prevent underflow, and retain existing values when the runtime maximum drops.
+TargetFire qualifies state updates and reset. Target B.fire and the runtime
+maximum remain external; pending values/full flags are exposed for admission.
+The atomic composer validates allocated Print collateral, stages/verifies the
+native transform and publishes only its helper/wrapper and retargeted archive.
+Existing modules and SSA identities remain intact. Print/CPU header emitters
+accept the new root; the CLI emits `post-print-fased-write-pairing.{mlir,sv}`
+and all-annotation JSON.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration155-print-fased-write-pairing`.
+Compiler and focused binaries build. Print binding, FASED write pairing and CPU
+managed-stream header CTests pass. Both legacy and selected root profiles each
+pass 151072 actual FIRRTL counter/pairing transitions, 256 wrapper mapping
+cases, five annotation target transfers and 23 atomic rejections. Both real
+preceding selected allocations pass nine atomic composer rejections, retained
+module/operation handles and bodies, unchanged allocated headers and six
+circuit/copied/consumed/internal target probes. Missing CLI dependency and
+duplicate-option rejection pass.
+
+Both native CLI replays ingest the immutable primary SFC compiler oracle
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print annotations
+and native Rocket catalog, with and without TracerV. Exact immutable SFC artifact
+compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDWritePairingCompare.py` pins SatUpDownCounter_1, LatencyPipe
+and FASEDMemoryTimingModel equations and interprets actual native SSA against
+those equations. Each allocation passes 161072 transitions, including 18123
+AW-ahead pairs, 17916 W-ahead pairs, 40263 simultaneous pairs, 8748 saturation
+cases, 3343 empty retirements, 19807 simultaneous increment/decrement cases,
+88310 lowered-maximum cases, 75440 stalls, 32885 stalled resets and 32982
+target-qualified resets. The shared helper equals the oracle-compared native
+baseline. All 139 / 133 prior module bodies, 84 / 92 wrapper connections and
+1713 annotation records match preservation/transfer expectations. Emitted RTL
+preserves pre-edge pair computation, target-qualified reset, pending outputs
+and accepted AW/final-W/retirement/maximum wiring. Allocated Print headers and
+decoders equal iteration 154 byte for byte. Preceding AW-queue and final pairing
+MLIR/JSON/SV remain raw; other own replay intermediates are compressed with
+verified hashes.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDWritePairing,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDWritePairingTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDWritePairingCompare.py`, and this document.
+
+Risk: the immutable SFC fixture disables Print; this establishes shared FASED
+pairing semantics and selected composition, not enabled-Print simulator parity.
+Supplied iteration-154 Rocket Verilator gates pass but predate this change; the
+UART-bearing SFC differential remains pending. Selected B retirement, request
+admission, latency MMIO, target token closure and platform assembly remain open.
+Next smallest step: attach native FASEDWriteRetirement to the selected pairing
+root, observe the response releaser B handshake through the selected hierarchy
+and compare pending-counter retirement to SFC tNasti.b.fire. No harness-owned
+manager gate was started; the overall port remains open.

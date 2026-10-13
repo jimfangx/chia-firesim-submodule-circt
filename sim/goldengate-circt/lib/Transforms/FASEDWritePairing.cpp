@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Oracle: TimingModel.scala 108-114 and 236-239, widgets/Lib.scala 71-86.
-// Required invariants: uninstantiated GGFASEDTimingAWQueueWrapper, recorded
+// Required invariants: uninstantiated legacy or selected Print timing AW wrapper, recorded
 // 35/64/4-bit no-LLC model, exact clock/reset/fire/request/pairing boundaries.
 // Annotations consumed/produced: none; copied targets move to the new top;
 // consumed pairing targets remain on the instantiated inner module.
@@ -21,9 +21,11 @@ using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDWritePairing(CircuitOp circuit,
                                              std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDWritePairing";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDWritePairingWrapper";
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDTimingAWQueueWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDWritePairingWrapper"
+                                               : "GGFASEDWritePairingWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDTimingAWQueueWrapper")
+  if (!selected && circuit.getName() != "GGFASEDTimingAWQueueWrapper")
     return reject("FASED write pairing requires the active timing AW queue wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
