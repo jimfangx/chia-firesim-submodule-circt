@@ -295,6 +295,12 @@ mlir::LogicalResult mapPrintBridgeFASEDStatistics(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach the allocated occupancy histogram bank after selected statistics.
+/// Atomic; pre-edge read/AW counts sample targetFire into read-only words 4-13.
+mlir::LogicalResult mapPrintBridgeFASEDHistograms(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

@@ -6914,6 +6914,91 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS selected FASED response errors, unchanged allocated headers/SSA, 9 atomic rejections\n";
       return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-histograms") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected statistics boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+      raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.HistogramIdentity")),
+          b.getNamedAttr("targets", b.getArrayAttr({
+            b.getStringAttr("~GGSelectedPrintFASEDStatisticsWrapper"),
+            b.getStringAttr("~GGSelectedPrintFASEDStatisticsWrapper|GGSelectedPrintFASEDStatisticsWrapper>hostClock"),
+            b.getStringAttr("~GGSelectedPrintFASEDStatisticsWrapper|GGSelectedPrintFASEDStatisticsWrapper>fased_pending_reads.value"),
+            b.getStringAttr("~GGSelectedPrintFASEDStatisticsWrapper|GGSelectedPrintFASEDStatisticsWrapper>fased_statistics_mcr.read[0].bits"),
+            b.getStringAttr("~GGSelectedPrintFASEDStatisticsWrapper|GGFASEDResponseReleaser>currentRead_full")}))}));
+      c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+      for (unsigned bad = 0; bad < 12; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        auto top = named(tc, "GGSelectedPrintFASEDStatisticsWrapper");
+        if (bad == 0) tc.setName("Wrong");
+        if (bad == 1) tc->removeAttr("rawAnnotations");
+        if (bad == 2) hs.clear();
+        if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        if (bad == 4) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("GGSelectedPrintFASEDHistogramsWrapper"),
+              top.getConventionAttr(), ArrayRef<PortInfo>{});
+        }
+        if (bad == 5 || bad == 11) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          auto user = b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("HistogramUser"),
+              top.getConventionAttr(), ArrayRef<PortInfo>{});
+          b.setInsertionPointToStart(user.getBodyBlock());
+          b.create<InstanceOp>(tc.getLoc(), bad == 5 ? top : named(tc, "GGFASEDHistograms"), "used");
+        }
+        if (bad == 6) named(tc, "GGFASEDTokenEngine")->removeAttr("goldengate.bridgeConstructor");
+        if (bad == 7 || bad == 8) {
+          auto engine = named(tc, "GGFASEDTokenEngine");
+          NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+          NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+          edge.set("maxFlight", bad == 7 ? b.getI64IntegerAttr(9) :
+              b.getIntegerAttr(IntegerType::get(&ctx, 128), APInt(128, 10)));
+          key.set("axi4Edge", edge.getDictionary(&ctx));
+          engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+        }
+        if (bad == 9) named(tc, "GGFASEDHistograms").setName("MissingHistogramBank");
+        if (bad == 10) {
+          auto names = llvm::to_vector(top.getPortNames());
+          for (unsigned i = 0; i < names.size(); ++i)
+            if (cast<StringAttr>(names[i]).getValue() == "fased_pending_reads")
+              names[i] = b.getStringAttr("missing");
+          top.setPortNames(names);
+        }
+        auto before = dump(*test);
+        require(failed(goldengate::mapPrintBridgeFASEDHistograms(tc, hs, error)) && !error.empty() && dump(*test) == before,
+            "selected FASED histograms rejection mutated IR " + std::to_string(bad));
+      }
+      SmallVector<FModuleOp> modules; std::map<std::string, std::string> bodies;
+      for (auto m : c.getOps<FModuleOp>()) { modules.push_back(m); bodies[m.getName().str()] = dump(m); }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDHistograms(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      for (auto m : modules)
+        require(named(c, m.getName()) == m && dump(m) == bodies.at(m.getName().str()),
+            "histograms changed prior module identity or body");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected histograms changed allocated collateral: " + error);
+      auto targets = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back()).getAs<ArrayAttr>("targets");
+      const StringRef expected[]{"~GGSelectedPrintFASEDHistogramsWrapper",
+          "~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>hostClock",
+          "~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>fased_pending_reads.value",
+          "~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>fased_statistics_mcr.read[0].bits",
+          "~GGSelectedPrintFASEDHistogramsWrapper|GGFASEDResponseReleaser>currentRead_full"};
+      for (unsigned i = 0; i < 5; ++i)
+        require(cast<StringAttr>(targets[i]).getValue() == expected[i], "selected histograms target identity differs");
+      auto before = dump(*source);
+      require(failed(goldengate::mapPrintBridgeFASEDHistograms(c, hostsFor(c), error)) && dump(*source) == before,
+          "selected histograms repeat mutated IR");
+      llvm::outs() << "PASS selected FASED histograms, unchanged modules/SSA/allocated headers, 13 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-statistics") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected response-error boundary");

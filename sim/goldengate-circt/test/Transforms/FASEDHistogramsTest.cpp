@@ -15,11 +15,16 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+bool selectedProfile = false;
+std::string profileName(llvm::StringRef name) {
+  return selectedProfile && (name == "GGFASEDStatisticsWrapper" || name == "GGFASEDHistogramsWrapper")
+      ? "GGSelectedPrint" + name.drop_front(2).str() : name.str();
+}
 void require(bool ok, llvm::StringRef message) {
   if (!ok) throw std::runtime_error(message.str());
 }
 FModuleOp named(CircuitOp c, llvm::StringRef name) {
-  for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
+  for (auto m : c.getOps<FModuleOp>()) if (m.getName() == profileName(name)) return m;
   throw std::runtime_error("missing module");
 }
 struct Interpreter {
@@ -73,7 +78,7 @@ std::string histogramName(unsigned i) {
   return std::string(i<5?"writeOutstandingHistogram_":"readOutstandingHistogram_")+std::to_string(i%5);
 }
 OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
-  auto root=parseSourceString<ModuleOp>(R"(module {
+  std::string text=R"(module {
     firrtl.circuit "GGFASEDStatisticsWrapper" {
       firrtl.module @GGFASEDTokenEngine() {}
       firrtl.module @GGFASEDStatisticsWrapper(
@@ -82,14 +87,19 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         out %fased_pending_reads: !firrtl.bundle<value: uint<4>, full: uint<1>>,
         out %fased_pending_writes: !firrtl.bundle<awValue: uint<4>, wValue: uint<4>, awFull: uint<1>, wFull: uint<1>>,
         out %other: !firrtl.uint<8>) {}
-    } })",&context);
+    } })";
+  if (selectedProfile) {
+    size_t pos = 0; const std::string old = "GGFASEDStatisticsWrapper", next = profileName(old);
+    while ((pos = text.find(old, pos)) != std::string::npos) { text.replace(pos, old.size(), next); pos += next.size(); }
+  }
+  auto root=parseSourceString<ModuleOp>(text,&context);
   require(bool(root),"fixture parse failed");auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
   named(c,"GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({
     b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(10))}))}));
   SmallVector<Attribute> annos;
   for(auto name:{"fased_pending_writes.awValue","hostReset","other"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-      b.getNamedAttr("target",b.getStringAttr("~GGFASEDStatisticsWrapper|GGFASEDStatisticsWrapper>"+std::string(name)))}));
+      b.getNamedAttr("target",b.getStringAttr("~"+profileName("GGFASEDStatisticsWrapper")+"|"+profileName("GGFASEDStatisticsWrapper")+">"+std::string(name)))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(annos));return root;
 }
 std::string dump(Operation *op) {
@@ -235,7 +245,7 @@ void mapping(MLIRContext &context) {
   const int64_t expectedBounds[]{0,2,4,8};
   for(unsigned i=0;i<4;++i)require(cast<IntegerAttr>(bounds[i]).getInt()==expectedBounds[i],"wrong bin boundary");
   InstanceOp sim,helper;for(auto i:top.getOps<InstanceOp>()) {
-    if(i.getModuleName()=="GGFASEDStatisticsWrapper")sim=i;
+    if(i.getModuleName()==profileName("GGFASEDStatisticsWrapper"))sim=i;
     if(i.getModuleName()=="GGFASEDHistograms")helper=i;
   }
   require(sim && helper,"missing wrapper instances");
@@ -258,10 +268,10 @@ void mapping(MLIRContext &context) {
     }require(found,"copied port changed");++copies;}
   }require(copies==7,"missing copied port");
   for(auto a:c->getAttrOfType<ArrayAttr>("rawAnnotations"))require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue().starts_with(
-    "~GGFASEDHistogramsWrapper|GGFASEDHistogramsWrapper>"),"target transfer failed");
+    "~"+profileName("GGFASEDHistogramsWrapper")+"|"+profileName("GGFASEDHistogramsWrapper")+">"),"target transfer failed");
 }
 void rejections(MLIRContext &context) {
-  for(unsigned mode=0;mode<22;++mode) {
+  for(unsigned mode=0;mode<23;++mode) {
     auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
     auto top=named(c,"GGFASEDStatisticsWrapper"),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");if(mode==1)c->removeAttr("rawAnnotations");
@@ -275,8 +285,10 @@ void rejections(MLIRContext &context) {
     if(mode==18 || mode==19) {unsigned i=mode-14;auto t=UIntType::get(&context,32,false);top.getArgument(i).setType(t);
       auto types=llvm::to_vector(top.getPortTypes());types[i]=TypeAttr::get(t);top.setPortTypes(types);}
     if(mode==20 || mode==21) {b.setInsertionPointToEnd(c.getBodyBlock());b.create<FModuleOp>(top.getLoc(),
-        b.getStringAttr(mode==20?"GGFASEDHistograms":"GGFASEDHistogramsWrapper"),
+        b.getStringAttr(mode==20?"GGFASEDHistograms":profileName("GGFASEDHistogramsWrapper")),
         ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{});}
+    if(mode==22) engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getIntegerAttr(IntegerType::get(&context,128),APInt(128,10)))}))}));
     std::string before;llvm::raw_string_ostream out(before);root->print(out);out.flush();std::string error;
     require(failed(goldengate::addFASEDHistograms(c,error)) && !error.empty(),"invalid boundary accepted");
     std::string after;llvm::raw_string_ostream next(after);root->print(next);next.flush();require(before==after,"rejection mutated circuit");
@@ -285,8 +297,10 @@ void rejections(MLIRContext &context) {
 }
 int main() {
   try {
-    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();phases(context);behavior(context);mapping(context);rejections(context);
-    llvm::outs()<<"FASED histograms: 32768 cycles, all four-bit occupancies, constant fifth bins, target-clock/reset bindings, targets and 22 atomic rejections passed\n";
+    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for (bool selected : {false, true}) {
+      selectedProfile = selected; phases(context);behavior(context);mapping(context);rejections(context);
+    }
+    llvm::outs()<<"FASED histograms: 65536 cycles across legacy/selected profiles, all four-bit occupancies, constant fifth bins, target-clock/reset bindings, targets and 46 atomic boundary rejections passed\n";
     return 0;
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
 }

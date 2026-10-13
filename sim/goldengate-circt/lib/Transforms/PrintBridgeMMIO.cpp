@@ -2911,6 +2911,33 @@ LogicalResult goldengate::mapPrintBridgeFASEDStatistics(CircuitOp circuit,
   return attachFASEDStatistics(circuit, bank, error);
 }
 
+// Require the selected statistics boundary and its allocated histogram bank.
+// Verify on a clone and publish only the new wrapper and transferred archive.
+// Observe pre-edge pending read/AW counts; preserve all existing IR identities.
+LogicalResult goldengate::mapPrintBridgeFASEDHistograms(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGSelectedPrintFASEDStatisticsWrapper")
+    return reject("selected Print FASED histograms require the completed statistics boundary");
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDHistograms") bank = m;
+  if (failed(attachFASEDHistograms(*staged, bank, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("selected Print FASED histograms produced invalid FIRRTL IR");
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintFASEDHistogramsWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // Requires the recorded selected Print retirement/allocation boundary and
 // annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
 // Verify on a clone, then publish only the wrapper and retargeted annotations;

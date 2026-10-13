@@ -20,7 +20,10 @@ using namespace circt::firrtl;
 
 namespace {
 constexpr llvm::StringLiteral bankName="GGFASEDHistograms";
-constexpr llvm::StringLiteral wrapperName="GGFASEDHistogramsWrapper";
+llvm::StringRef wrapperName(CircuitOp circuit) {
+  return circuit.getName() == "GGSelectedPrintFASEDStatisticsWrapper"
+      ? "GGSelectedPrintFASEDHistogramsWrapper" : "GGFASEDHistogramsWrapper";
+}
 constexpr llvm::StringLiteral controlName="fased_histograms_mcr";
 SmallVector<PortInfo> histogramPorts(MLIRContext *ctx) {
   OpBuilder b(ctx);
@@ -41,11 +44,12 @@ SmallVector<PortInfo> histogramPorts(MLIRContext *ctx) {
 LogicalResult attachmentBoundary(CircuitOp circuit, FModuleOp &inner,
     unsigned (&indices)[6], std::string &error) {
   auto reject=[&](llvm::StringRef why){error=why.str();return failure();};
-  if(circuit.getName()!="GGFASEDStatisticsWrapper")
+  if(circuit.getName()!="GGFASEDStatisticsWrapper" &&
+      circuit.getName()!="GGSelectedPrintFASEDStatisticsWrapper")
     return reject("FASED histograms require the active statistics wrapper");
   FModuleOp engine;
   for(auto m:circuit.getOps<FModuleLike>()) {
-    if(m.getName()==wrapperName)
+    if(m.getName()==wrapperName(circuit))
       return reject("FASED histogram wrapper already exists");
     if(m.getName()==circuit.getName())inner=dyn_cast<FModuleOp>(m.getOperation());
     if(m.getName()=="GGFASEDTokenEngine")engine=dyn_cast<FModuleOp>(m.getOperation());
@@ -55,7 +59,7 @@ LogicalResult attachmentBoundary(CircuitOp circuit, FModuleOp &inner,
   auto key=engine?engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"):DictionaryAttr();
   auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
   auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
-  if(!flight || flight.getInt()!=10)
+  if(!flight || flight.getValue().getBitWidth()>64 || flight.getInt()!=10)
     return reject("FASED histograms currently require the recorded ten-flight constructor");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};auto bit=uint(1);
@@ -164,7 +168,7 @@ LogicalResult goldengate::attachFASEDHistograms(CircuitOp circuit,
   }
   ports.push_back({b.getStringAttr(controlName), mcr, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
+  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName(circuit)), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), mmio = b.create<InstanceOp>(loc, bank, "histograms");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
@@ -181,7 +185,7 @@ LogicalResult goldengate::attachFASEDHistograms(CircuitOp circuit,
   connect(mmio.getResult(5),field(sim.getResult(indices[5]),"awValue"));
   b.create<ConnectOp>(loc,wrapper.getArguments().back(),mmio.getResult(6));
 
-  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
+  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName(circuit).str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
     if (auto s = dyn_cast<StringAttr>(a)) {
@@ -192,7 +196,7 @@ LogicalResult goldengate::attachFASEDHistograms(CircuitOp circuit,
       if (ref.consume_front(modulePrefix)) {
         auto local = ref.take_front(ref.find_first_of(".["));
         for (auto i : copied) if (local == inner.getPortName(i)) {
-          suffix.replace(0, modulePrefix.size(), "|" + wrapperName.str() + ">"); break;
+          suffix.replace(0, modulePrefix.size(), "|" + wrapperName(circuit).str() + ">"); break;
         }
       }
       return b.getStringAttr(newPrefix + suffix);
@@ -201,7 +205,7 @@ LogicalResult goldengate::attachFASEDHistograms(CircuitOp circuit,
     if (auto d = dyn_cast<DictionaryAttr>(a)) { NamedAttrList vs; for (auto v : d) vs.set(v.getName(), retarget(v.getValue())); return vs.getDictionary(ctx); }
     return a;
   };
-  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
+  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName(circuit));
   return success();
 }
 
