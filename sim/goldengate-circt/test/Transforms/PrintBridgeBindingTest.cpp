@@ -6484,6 +6484,105 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS selected FASED write pairing, unchanged allocated headers/SSA, 9 atomic rejections\n";
       return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-write-retirement") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected write pairing boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      // Probe circuit, copied scalar/aggregate and retained internal identity.
+      SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+      auto probe = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.WriteRetirementIdentity")),
+          b.getNamedAttr("targets", b.getArrayAttr({
+            b.getStringAttr("~GGSelectedPrintFASEDWritePairingWrapper"),
+            b.getStringAttr("~GGSelectedPrintFASEDWritePairingWrapper|GGSelectedPrintFASEDWritePairingWrapper>hostClock"),
+            b.getStringAttr("~GGSelectedPrintFASEDWritePairingWrapper|GGSelectedPrintFASEDWritePairingWrapper>fased_timing_requests.ar.bits.id"),
+            b.getStringAttr("~GGSelectedPrintFASEDWritePairingWrapper|GGSelectedPrintFASEDWritePairingWrapper>fased_target_b_fire"),
+            b.getStringAttr("~GGSelectedPrintFASEDWritePairingWrapper|GGSelectedPrintFASEDWritePairingWrapper>fased_timing_aw_queue_ready"),
+            b.getStringAttr("~GGSelectedPrintFASEDWritePairingWrapper|GGFASEDResponseReleaser>currentRead_full")}))});
+      raw.push_back(probe); c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+      for (unsigned bad = 0; bad < 8; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        if (bad == 0) tc.setName("Wrong");
+        else if (bad == 1) tc->removeAttr("rawAnnotations");
+        else if (bad == 2) hs.clear();
+        else if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        else if (bad == 5) {
+          for (auto inst : named(tc, "GGSelectedPrintFASEDWritePairingWrapper").getOps<InstanceOp>())
+            if (inst.getInstanceName() == "sim") inst->setAttr("name", b.getStringAttr("wrong"));
+        } else if (bad == 4) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("GGSelectedPrintFASEDWriteRetirementWrapper"),
+              named(tc, "GGSelectedPrintFASEDWritePairingWrapper").getConventionAttr(), ArrayRef<PortInfo>{});
+        } else {
+          auto engine = named(tc, "GGFASEDTokenEngine");
+          if (bad == 6) engine->removeAttr("goldengate.bridgeConstructor");
+          else {
+            NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+            NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Widths")));
+            edge.set("idBits", b.getI64IntegerAttr(5));
+            key.set("axi4Widths", edge.getDictionary(&ctx));
+            engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+          }
+        }
+        auto before = dump(*test);
+        require(failed(goldengate::mapPrintBridgeFASEDWriteRetirement(tc, hs, error)) && !error.empty() && dump(*test) == before,
+            "selected FASED write retirement rejection mutated IR " + std::to_string(bad));
+      }
+      const StringRef observed[]{"GGSelectedPrintFASEDWritePairingWrapper", "GGSelectedPrintFASEDTimingAWQueueWrapper",
+          "GGSelectedPrintFASEDWriteLatencyWrapper", "GGSelectedPrintFASEDReadLatencyWrapper",
+          "GGSelectedPrintFASEDTimingCycleWrapper", "GGSelectedPrintFASEDResponseReleaserWrapper"};
+      auto isObserved = [&](FModuleOp m) { return llvm::is_contained(observed, m.getName()); };
+      SmallVector<FModuleOp> modules; SmallVector<Operation *> ops;
+      std::map<std::string, std::string> bodies;
+      std::map<std::string, SmallVector<PortInfo>> ports;
+      auto body = [](FModuleOp m) { std::string text; llvm::raw_string_ostream out(text); m->print(out, OpPrintingFlags().useLocalScope()); return text; };
+      for (auto m : c.getOps<FModuleOp>()) {
+        modules.push_back(m); bodies[m.getName().str()] = body(m); ports[m.getName().str()] = m.getPorts();
+        for (auto &op : m.getBodyBlock()->getOperations()) {
+          auto inst = dyn_cast<InstanceOp>(op);
+          if (!(isObserved(m) && inst && inst.getInstanceName() == "sim")) ops.push_back(&op);
+        }
+      }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDWriteRetirement(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      for (auto m : modules) {
+        require(named(c, m.getName()) == m, "selected retirement replaced prior module identity");
+        auto prior = ports.at(m.getName().str());
+        require(m.getNumPorts() == prior.size() + unsigned(isObserved(m)), "unexpected port mutation");
+        for (unsigned i = 0; i < prior.size(); ++i)
+          require(m.getPortName(i) == prior[i].name && m.getPortType(i) == prior[i].type &&
+              m.getPortDirection(i) == prior[i].direction, "retirement changed prior port");
+        if (!isObserved(m)) require(body(m) == bodies.at(m.getName().str()), "retirement changed unrelated body");
+        else require(m.getPortName(prior.size()) == "fased_accepted_b_fire", "missing B observation");
+      }
+      llvm::DenseSet<Operation *> after;
+      c.walk([&](Operation *op) { after.insert(op); });
+      for (auto *op : ops) require(after.count(op), "retirement replaced unrelated operation identity");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected FASED write retirement changed allocated collateral: " + error);
+      auto transferred = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back());
+      auto targets = transferred.getAs<ArrayAttr>("targets");
+      const StringRef expected[]{"~GGSelectedPrintFASEDWriteRetirementWrapper",
+          "~GGSelectedPrintFASEDWriteRetirementWrapper|GGSelectedPrintFASEDWriteRetirementWrapper>hostClock",
+          "~GGSelectedPrintFASEDWriteRetirementWrapper|GGSelectedPrintFASEDWriteRetirementWrapper>fased_timing_requests.ar.bits.id",
+          "~GGSelectedPrintFASEDWriteRetirementWrapper|GGSelectedPrintFASEDWritePairingWrapper>fased_target_b_fire",
+          "~GGSelectedPrintFASEDWriteRetirementWrapper|GGSelectedPrintFASEDWriteRetirementWrapper>fased_timing_aw_queue_ready",
+          "~GGSelectedPrintFASEDWriteRetirementWrapper|GGFASEDResponseReleaser>currentRead_full"};
+      for (unsigned i = 0; i < 6; ++i)
+        require(cast<StringAttr>(targets[i]).getValue() == expected[i], "selected write retirement target identity differs");
+      auto before = dump(*source);
+      require(failed(goldengate::mapPrintBridgeFASEDWriteRetirement(c, hostsFor(c), error)) && dump(*source) == before,
+          "selected FASED write retirement repeat mutated IR");
+      llvm::outs() << "PASS selected FASED write retirement, six observation hops, retained unrelated SSA/allocated headers, 9 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-timing-cycle") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected response releaser boundary");

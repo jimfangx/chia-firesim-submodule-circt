@@ -10,9 +10,10 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
-const llvm::StringRef names[]{"GGFASEDWritePairingWrapper", "GGFASEDTimingAWQueueWrapper",
-  "GGFASEDWriteLatencyWrapper", "GGFASEDReadLatencyWrapper", "GGFASEDTimingCycleWrapper",
-  "GGFASEDResponseReleaserWrapper"};
+bool selected = false;
+std::string wrapperName() { return selected ? "GGSelectedPrintFASEDWriteRetirementWrapper" : "GGFASEDWriteRetirementWrapper"; }
+std::string moduleName(llvm::StringRef suffix) { return (selected ? "GGSelectedPrintFASED" : "GGFASED") + suffix.str() + "Wrapper"; }
+SmallVector<std::string> names;
 void require(bool ok, llvm::StringRef why) { if (!ok) throw std::runtime_error(why.str()); }
 FModuleOp named(CircuitOp c, llvm::StringRef n) {
   for (auto m:c.getOps<FModuleOp>()) if (m.getName()==n) return m;
@@ -26,7 +27,7 @@ Value driver(FModuleOp m, Value v) {
   require(bool(found),"missing driver");return found;
 }
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
-  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDWritePairingWrapper\" { firrtl.module @GGFASEDWritePairingWrapper() {} } }",&ctx);
+  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"" + names[0] + "\" { firrtl.module @" + names[0] + "() {} } }",&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
   OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
@@ -60,14 +61,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   }
   if(mode==16) {b.setInsertionPointToEnd(inner.getBodyBlock());b.create<InstanceOp>(loc,named(c,names[3]),"shared");}
   if(mode==17) {auto other=make("Other",{});b.setInsertionPointToEnd(other.getBodyBlock());b.create<InstanceOp>(loc,inner,"used");}
-  if(mode==18)make("GGFASEDWriteRetirementWrapper",{});
+  if(mode==18)make(wrapperName(),{});
   if(mode==19)c.setName("Wrong");
   if(mode!=1)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({
     b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
     b.getNamedAttr("targets",b.getArrayAttr({
-      b.getStringAttr("~GGFASEDWritePairingWrapper|GGFASEDWritePairingWrapper>fased_target_b_fire"),
-      b.getStringAttr("~GGFASEDWritePairingWrapper|GGFASEDWritePairingWrapper>echo"),
-      b.getStringAttr("~GGFASEDWritePairingWrapper|GGFASEDTimingCycleWrapper/sim:GGFASEDResponseReleaserWrapper>echo")}))})}));
+      b.getStringAttr("~" + names[0] + "|" + names[0] + ">fased_target_b_fire"),
+      b.getStringAttr("~" + names[0] + "|" + names[0] + ">echo"),
+      b.getStringAttr("~" + names[0] + "|" + names[4] + "/sim:" + names[5] + ">echo")}))})}));
   return root;
 }
 void behavior(MLIRContext &ctx) {
@@ -101,9 +102,9 @@ void behavior(MLIRContext &ctx) {
   require(ready&&valid&&ready.getFieldIndex()==0&&valid.getFieldIndex()==1&&ready.getInput()==valid.getInput(),"wrong B fields");
   require(ready.getInput()==(*named(c,names[5]).getOps<InstanceOp>().begin()).getResult(4),"wrong response source");
   auto attrs=c->getAttrOfType<ArrayAttr>("rawAnnotations");auto targets=cast<DictionaryAttr>(attrs[0]).getAs<ArrayAttr>("targets");
-  require(cast<StringAttr>(targets[0]).getValue()=="~GGFASEDWriteRetirementWrapper|GGFASEDWritePairingWrapper>fased_target_b_fire","consumed target moved");
-  require(cast<StringAttr>(targets[1]).getValue()=="~GGFASEDWriteRetirementWrapper|GGFASEDWriteRetirementWrapper>echo","copied target not moved");
-  require(cast<StringAttr>(targets[2]).getValue()=="~GGFASEDWriteRetirementWrapper|GGFASEDTimingCycleWrapper/sim:GGFASEDResponseReleaserWrapper>echo","hierarchy target changed");
+  require(cast<StringAttr>(targets[0]).getValue()=="~" + wrapperName() + "|" + names[0] + ">fased_target_b_fire","consumed target moved");
+  require(cast<StringAttr>(targets[1]).getValue()=="~" + wrapperName() + "|" + wrapperName() + ">echo","copied target not moved");
+  require(cast<StringAttr>(targets[2]).getValue()=="~" + wrapperName() + "|" + names[4] + "/sim:" + names[5] + ">echo","hierarchy target changed");
   llvm::outs()<<"Six response observation hops, closed retirement feedback, existing users and annotation targets passed\n";
 }
 void rejection(MLIRContext &ctx) {
@@ -123,6 +124,13 @@ void rejection(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {behavior(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
+  try {
+    for (bool profile : {false, true}) {
+      selected = profile; names.clear();
+      for (auto suffix : {"WritePairing", "TimingAWQueue", "WriteLatency", "ReadLatency", "TimingCycle", "ResponseReleaser"})
+        names.push_back(moduleName(suffix));
+      behavior(ctx); rejection(ctx);
+    }
+  }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

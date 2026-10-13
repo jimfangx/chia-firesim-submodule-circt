@@ -8,7 +8,8 @@
 // Mutations: append six internal observation outputs and clone their instances;
 // wrap the top to feed the observed B handshake into both pending counters.
 // Analyses required/preserved: no cached analyses; hierarchy uses are checked
-// before mutation. Existing module, port and instance identities are preserved.
+// before mutation. Existing module and port identities are preserved; five
+// chain instances are replaced to append results, preserving attributes/users.
 // Output: retirement is valid && ready, independent of reset and targetFire.
 // The pending counters already gate state updates/reset on targetFire. Host B
 // acknowledgements and egress request acceptance are separate transactions.
@@ -20,15 +21,23 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::bindFASEDWriteRetirement(CircuitOp circuit,
                                                  std::string &error) {
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDWriteRetirementWrapper";
+  const bool selected =
+      circuit.getName() == "GGSelectedPrintFASEDWritePairingWrapper";
+  const llvm::StringRef wrapperName = selected
+      ? "GGSelectedPrintFASEDWriteRetirementWrapper"
+      : "GGFASEDWriteRetirementWrapper";
   constexpr llvm::StringLiteral observationName = "fased_accepted_b_fire";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (circuit.getName() != "GGFASEDWritePairingWrapper" || !raw)
+  if ((!selected && circuit.getName() != "GGFASEDWritePairingWrapper") || !raw)
     return reject("FASED write retirement requires the active pairing wrapper and annotations");
-  const llvm::StringRef names[]{"GGFASEDWritePairingWrapper", "GGFASEDTimingAWQueueWrapper",
-      "GGFASEDWriteLatencyWrapper", "GGFASEDReadLatencyWrapper",
-      "GGFASEDTimingCycleWrapper", "GGFASEDResponseReleaserWrapper"};
+  const llvm::StringRef names[]{
+      selected ? "GGSelectedPrintFASEDWritePairingWrapper" : "GGFASEDWritePairingWrapper",
+      selected ? "GGSelectedPrintFASEDTimingAWQueueWrapper" : "GGFASEDTimingAWQueueWrapper",
+      selected ? "GGSelectedPrintFASEDWriteLatencyWrapper" : "GGFASEDWriteLatencyWrapper",
+      selected ? "GGSelectedPrintFASEDReadLatencyWrapper" : "GGFASEDReadLatencyWrapper",
+      selected ? "GGSelectedPrintFASEDTimingCycleWrapper" : "GGFASEDTimingCycleWrapper",
+      selected ? "GGSelectedPrintFASEDResponseReleaserWrapper" : "GGFASEDResponseReleaserWrapper"};
   SmallVector<FModuleOp> modules;
   for (auto name : names) {
     FModuleOp found;

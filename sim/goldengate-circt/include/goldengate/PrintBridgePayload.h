@@ -247,6 +247,12 @@ mlir::LogicalResult mapPrintBridgeFASEDWritePairing(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Observe target B ready/valid through the six selected response wrappers and
+/// close pending AW/W retirement feedback. Atomic; retain prior module identities.
+mlir::LogicalResult mapPrintBridgeFASEDWriteRetirement(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

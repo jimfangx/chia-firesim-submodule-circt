@@ -6743,3 +6743,73 @@ Next smallest step: attach native FASEDWriteRetirement to the selected pairing
 root, observe the response releaser B handshake through the selected hierarchy
 and compare pending-counter retirement to SFC tNasti.b.fire. No harness-owned
 manager gate was started; the overall port remains open.
+
+
+## Iteration 156: selected Print FASED target B retirement
+
+`FASEDWriteRetirement` now supports the selected write-pairing root as well as
+its existing standalone/expanded Rocket root. It appends a one-bit observation
+through the six selected wrappers down to `GGFASEDResponseReleaser`, computes
+B.ready && B.valid, and closes that feedback into the pending AW/W counters.
+The outer retirement input is consumed. The observation is independent of
+reset/targetFire; existing counters qualify state updates and reset on targetFire.
+Host-memory B acknowledgements and egress request acceptance remain distinct.
+
+The selected atomic composer validates allocated Print collateral and the
+recorded 35/64/4-bit FASED constructor, stages/verifies the native mutation,
+then applies the fully preflighted pass to the original module operations.
+Module/port identities and unrelated operation handles remain intact. Exactly
+five chain instances are replaced to append outputs, retaining attributes and
+original users. Print/CPU header emitters accept the new root. The compiler CLI
+requires write pairing and emits `post-print-fased-write-retirement.{mlir,sv}`
+and all-annotation JSON.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration156-print-fased-write-retirement`.
+The compiler and focused binaries build. Print binding, FASED write retirement
+and CPU managed-stream header CTests pass. The native retirement test exercises
+both root profiles, six observation hops, original users/instance attributes,
+three target transfers and twenty atomic rejections per profile. Both real
+selected allocations pass nine atomic composer rejections, retained module and
+unrelated operation identities, original ports, six target probes and unchanged
+allocated collateral. Missing CLI dependency and duplicate option rejection pass.
+The real-boundary test caught missing constructor validation; the added guard
+rejects absent or incompatible profiles before mutation.
+
+Both native CLI replays ingest the immutable primary compiler oracle
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print annotations
+and native Rocket catalog, with and without TracerV. Exact immutable artifact
+compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDWriteRetirementCompare.py` pins LatencyPipe, AXI4Releaser,
+SatUpDownCounter_1 and FASEDMemoryTimingModel equations and interprets native
+counter SSA against them. Each allocation passes 292144 transitions: 73046
+accepted B handshakes, 35208 handshakes during target stalls, 73177 valid-without-
+ready cases, 72952 ready-without-valid cases, 1261 empty retirements, 16030
+simultaneous increments/retirements, 65758 target resets and 65657 stalled resets.
+All 1713 annotation records match structured target transfer expectations;
+135 / 129 unrelated module bodies remain unchanged, and all 141 / 135 original
+module identities are retained. The six modified wrappers preserve all prior
+port metadata and drivers; 508 / 556 prior/observation drivers and 78 / 86 outer
+connections match. Emitted RTL preserves all six observation hops and closes
+pending retirement onto the actual target B handshake. Allocated Print headers
+and decoders equal iteration 155 byte for byte.
+Final-binary replays reproduce all twelve oracle-compared preceding/final
+MLIR/RTL/annotation artifacts exactly; immutable oracle hashes remain unchanged.
+Those boundary artifacts remain raw. Other own replay intermediates are gzip
+compressed with verified hashes, saving approximately 6.6 GB across both runs.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDWriteRetirement,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/{FASEDWriteRetirementTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDWriteRetirementCompare.py`, and this document.
+
+Risk: the immutable SFC fixture disables Print; this proves shared FASED
+retirement semantics and selected composition, not enabled-Print simulator parity.
+Supplied iteration-155 Rocket Verilator gates pass but predate this change;
+the UART-bearing SFC differential remains pending. Selected request admission,
+latency MMIO, target token closure and platform assembly remain open.
+Next smallest step: attach native FASEDWriteAdmission to the selected retirement
+root and compare pending-counter/AW-queue capacity gating with SFC LatencyPipe.
+No harness-owned manager gate was started; the overall port remains open.
