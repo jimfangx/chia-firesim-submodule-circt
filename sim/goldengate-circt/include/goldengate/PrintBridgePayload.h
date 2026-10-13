@@ -223,6 +223,12 @@ mlir::LogicalResult mapPrintBridgeFASEDTimingCycle(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach the ten-entry, targetFire-qualified read deadline queue after model
+/// cycle construction. Atomic; consume nextRead/deadline ports and retain SSA.
+mlir::LogicalResult mapPrintBridgeFASEDReadLatency(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

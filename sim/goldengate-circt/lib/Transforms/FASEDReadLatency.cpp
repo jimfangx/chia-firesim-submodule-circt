@@ -6,6 +6,10 @@
 // AR acceptance enqueues independently of capacity; the SFC overflow assertion
 // diagnoses missing upstream admission control. Preserve Scala read len even
 // though AXI4Releaser doesn't use it and SFC optimizes its storage away.
+// Contract: require an uninstantiated timing-cycle root, exact 35/64/4 profile
+// and archived annotations. Consume deadline/nextRead boundary ports; retain
+// prior modules and their SSA, move copied targets to the new root and keep
+// consumed targets on the inner module. Validate all inputs before mutation.
 #include "goldengate/FASEDReadLatency.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -15,9 +19,11 @@ using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDReadLatency(CircuitOp circuit,
                                              std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDReadLatency10";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDReadLatencyWrapper";
+  bool selectedPrint = circuit.getName() == "GGSelectedPrintFASEDTimingCycleWrapper";
+  llvm::StringRef wrapperName = selectedPrint ? "GGSelectedPrintFASEDReadLatencyWrapper"
+                                            : "GGFASEDReadLatencyWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDTimingCycleWrapper")
+  if (!selectedPrint && circuit.getName() != "GGFASEDTimingCycleWrapper")
     return reject("FASED read latency requires the active timing cycle wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {

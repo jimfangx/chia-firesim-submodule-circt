@@ -416,6 +416,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDWriteEgress = false;
   bool mapPrintHostFASEDResponseReleaser = false;
   bool mapPrintHostFASEDTimingCycle = false;
+  bool mapPrintHostFASEDReadLatency = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -450,6 +451,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-timing-cycle") {
         if (mapPrintHostFASEDTimingCycle) return fail("duplicate --map-print-host-fased-timing-cycle");
         mapPrintHostFASEDTimingCycle = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-read-latency") {
+        if (mapPrintHostFASEDReadLatency) return fail("duplicate --map-print-host-fased-read-latency");
+        mapPrintHostFASEDReadLatency = true;
         continue;
       }
       if (option == "--map-print-host-fased-write-egress") {
@@ -611,6 +617,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-response-releaser requires --map-print-host-fased-write-egress");
   if (mapPrintHostFASEDTimingCycle && !mapPrintHostFASEDResponseReleaser)
     return fail("--map-print-host-fased-timing-cycle requires --map-print-host-fased-response-releaser");
+  if (mapPrintHostFASEDReadLatency && !mapPrintHostFASEDTimingCycle)
+    return fail("--map-print-host-fased-read-latency requires --map-print-host-fased-timing-cycle");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
     return fail("--map-print-host-fased-write-egress requires --map-print-host-fased-read-scheduler");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
@@ -1091,6 +1099,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED timing cycle output: " + error);
         llvm::outs() << "Attached selected Print FASED enabled cycle counter and latency release deadlines in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDReadLatency) {
+        if (failed(goldengate::mapPrintBridgeFASEDReadLatency(circuit, hosts, error)))
+          return fail("PrintBridge FASED read latency: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-read-latency.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-read-latency.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-read-latency-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED read latency MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED read latency output: " + error);
+        llvm::outs() << "Attached selected Print FASED ten-entry read deadline queue and AR acceptance in " << tokenIR << '\n';
       }
       return 0;
     }
