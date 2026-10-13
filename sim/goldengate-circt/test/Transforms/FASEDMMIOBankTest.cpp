@@ -7,6 +7,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+#include <functional>
 #include <stdexcept>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -28,7 +29,7 @@ unsigned globalWord(unsigned j,unsigned k,unsigned order) {
   unsigned local=order==1?lengths[j]-1-k:order==2?(3*k+1)%lengths[j]:k;
   return starts[j]+local;
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned order=0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned order=0,bool selected=false) {
   auto root=parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGFASEDHistogramsWrapper" {
     firrtl.module @GGFASEDTokenEngine() {} firrtl.module @GGFASEDHistogramsWrapper() {} } })",&ctx);
   require(bool(root),"fixture parse failed");auto c=*root->getOps<CircuitOp>().begin();
@@ -71,7 +72,27 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned order=0) {
       add(source+"."+g+"["+std::to_string(k)+"].bits",destination+"."+g+"["+std::to_string(globalWord(j,k,order))+"].bits");
   }
   add(old+"|GGFASEDLatencyRegisters>mcr.read[1].bits",next+"|GGFASEDLatencyRegisters>mcr.read[1].bits");
-  c->setAttr("rawAnnotations",b.getArrayAttr(annos));return root;
+  c->setAttr("rawAnnotations",b.getArrayAttr(annos));
+  if(selected) {
+    std::function<Attribute(Attribute)> rename=[&](Attribute a)->Attribute {
+      if(auto v=dyn_cast<StringAttr>(a)) {
+        std::string text=v.getValue().str();
+        for(auto name:{"GGFASEDHistogramsWrapper","GGFASEDMMIOWrapper"}) {
+          size_t pos=0;while((pos=text.find(name,pos))!=std::string::npos) {
+            auto replacement=std::string("GGSelectedPrint")+std::string(name).substr(2);
+            text.replace(pos,std::string(name).size(),replacement);pos+=replacement.size();
+          }
+        }return b.getStringAttr(text);
+      }
+      if(auto v=dyn_cast<ArrayAttr>(a)){SmallVector<Attribute> vs;for(auto x:v)vs.push_back(rename(x));return b.getArrayAttr(vs);}
+      if(auto v=dyn_cast<DictionaryAttr>(a)){NamedAttrList vs;for(auto x:v)vs.set(x.getName(),rename(x.getValue()));return vs.getDictionary(&ctx);}
+      return a;
+    };
+    named(c,"GGFASEDHistogramsWrapper").setName("GGSelectedPrintFASEDHistogramsWrapper");
+    c->setAttr("rawAnnotations",rename(c->getAttr("rawAnnotations")));
+    c.setName("GGSelectedPrintFASEDHistogramsWrapper");
+  }
+  return root;
 }
 std::string valueName(Value v,FModuleOp top) {
   if(auto f=v.getDefiningOp<SubfieldOp>())return valueName(f.getInput(),top)+"."+f.getFieldName().str();
@@ -80,11 +101,11 @@ std::string valueName(Value v,FModuleOp top) {
   auto inst=v.getDefiningOp<InstanceOp>();require(bool(inst),"unexpected wiring value");
   return inst.getName().str()+"."+cast<StringAttr>(inst.getPortNames()[cast<OpResult>(v).getResultNumber()]).getValue().str();
 }
-void mapping(MLIRContext &ctx,unsigned order) {
-  auto root=fixture(ctx,order);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void mapping(MLIRContext &ctx,unsigned order,bool selected) {
+  auto root=fixture(ctx,order,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDMMIOBank(c,error)),error);
   require(succeeded(verify(*root)),"assembled bank failed verifier");
-  auto top=named(c,"GGFASEDMMIOWrapper");require(top.getNumPorts()==4,"fragments were not consumed");
+  auto top=named(c,selected?"GGSelectedPrintFASEDMMIOWrapper":"GGFASEDMMIOWrapper");require(top.getNumPorts()==4,"fragments were not consumed");
   require(top.getPortName(3)=="fasedBridge_mcr" && top.getPortDirection(3)==Direction::Out,"wrong aggregate MCR port");
   auto type=cast<BundleType>(top.getPortType(3));
   require(cast<FVectorType>(type.getElement("read")->type).getNumElements()==21,"wrong aggregate lane count");
@@ -109,10 +130,10 @@ void mapping(MLIRContext &ctx,unsigned order) {
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(annos.size()==59,"annotation count changed");
   for(auto a:annos){auto row=cast<DictionaryAttr>(a);require(row.getAs<StringAttr>("target")==row.getAs<StringAttr>("expected"),"lane annotation target transfer failed");}
 }
-void rejection(MLIRContext &ctx) {
-  for(unsigned mode=0;mode<93;++mode) {
-    auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
-    auto top=named(c,"GGFASEDHistogramsWrapper"),engine=named(c,"GGFASEDTokenEngine");
+void rejection(MLIRContext &ctx,bool selected) {
+  for(unsigned mode=0;mode<94;++mode) {
+    auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
+    auto top=named(c,selected?"GGSelectedPrintFASEDHistogramsWrapper":"GGFASEDHistogramsWrapper"),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");if(mode==1)c->removeAttr("rawAnnotations");
     if(mode==2)engine->removeAttr("goldengate.bridgeConstructor");
     if(mode==3)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
@@ -135,7 +156,7 @@ void rejection(MLIRContext &ctx) {
         rows[0]=row.getDictionary(&ctx);
       }bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
     }
-    if(mode==64){b.setInsertionPointToEnd(c.getBodyBlock());b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDMMIOWrapper"),
+    if(mode==64){b.setInsertionPointToEnd(c.getBodyBlock());b.create<FModuleOp>(c.getLoc(),b.getStringAttr(selected?"GGSelectedPrintFASEDMMIOWrapper":"GGFASEDMMIOWrapper"),
         ConventionAttr::get(&ctx,Convention::Internal),ArrayRef<PortInfo>{});}
     if(mode==65){b.setInsertionPointToEnd(engine.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"usedTop");}
     if(mode==66){auto ports=llvm::to_vector(top.getPortNames());ports[2]=b.getStringAttr("fasedBridge_mcr");top.setPortNames(ports);}
@@ -146,7 +167,7 @@ void rejection(MLIRContext &ctx) {
       if(group==2){auto type=UIntType::get(&ctx,32,false);bank.getArgument(0).setType(type);
         bank.setPortTypes(ArrayRef<Attribute>{TypeAttr::get(type)});}
     }
-    if(mode>=85) {
+    if(mode>=85 && mode<93) {
       auto bank=named(c,modules[0]);auto rows=llvm::to_vector(bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
       NamedAttrList row(cast<DictionaryAttr>(rows[0]));
       if(mode==85)row.set("offset",b.getI32IntegerAttr(-4));
@@ -159,6 +180,8 @@ void rejection(MLIRContext &ctx) {
       rows[0]=mode==92?Attribute(b.getStringAttr("invalid row")):Attribute(row.getDictionary(&ctx));
       bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
     }
+    if(mode==93)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getIntegerAttr(b.getIntegerType(128),APInt(128,10)))}))}));
     std::string before,after;llvm::raw_string_ostream original(before);root->print(original);original.flush();std::string error;
     require(failed(goldengate::addFASEDMMIOBank(c,error)) && !error.empty(),"invalid fragment accepted");
     llvm::raw_string_ostream updated(after);root->print(updated);updated.flush();require(before==after,"rejected bank mutated IR");
@@ -166,6 +189,6 @@ void rejection(MLIRContext &ctx) {
 }
 }
 int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  for(unsigned order=0;order<3;++order)mapping(ctx,order);rejection(ctx);
-  llvm::outs()<<"FASED MMIO bank: three lane orders, 21 lanes, six strobe routes, 59 annotation targets and 93 atomic rejections passed\n";return 0;
+  for(bool selected:{false,true}) {for(unsigned order=0;order<3;++order)mapping(ctx,order,selected);rejection(ctx,selected);}
+  llvm::outs()<<"FASED MMIO bank: legacy/selected profiles, three lane orders each, 21 lanes, six strobe routes, 59 annotation targets and 188 atomic rejections passed\n";return 0;
 }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}}

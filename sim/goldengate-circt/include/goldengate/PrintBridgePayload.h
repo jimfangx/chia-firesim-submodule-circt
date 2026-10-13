@@ -301,6 +301,12 @@ mlir::LogicalResult mapPrintBridgeFASEDHistograms(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Assemble six allocated selected FASED fragments after occupancy histograms.
+/// Atomic; offsets determine 21 global lanes, with reverse-ready and shared strobes.
+mlir::LogicalResult mapPrintBridgeFASEDMMIOBank(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

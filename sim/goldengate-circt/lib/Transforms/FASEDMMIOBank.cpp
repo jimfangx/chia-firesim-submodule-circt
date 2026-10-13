@@ -18,10 +18,11 @@ using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDMMIOBank(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral wrapperName="GGFASEDMMIOWrapper";
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDHistogramsWrapper";
+  const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDMMIOWrapper" : "GGFASEDMMIOWrapper";
   constexpr llvm::StringLiteral controlName="fasedBridge_mcr";
   auto reject=[&](llvm::StringRef why){error=why.str();return failure();};
-  if(circuit.getName()!="GGFASEDHistogramsWrapper")
+  if(!selected && circuit.getName()!="GGFASEDHistogramsWrapper")
     return reject("FASED MMIO bank requires the active histogram wrapper");
   const llvm::StringRef modules[]{"GGFASEDLatencyRegisters","GGFASEDRequestLimits",
       "GGFASEDHistograms","GGFASEDStatistics","GGFASEDFunctionalModelRegister","GGFASEDResponseErrors"};
@@ -45,7 +46,7 @@ LogicalResult goldengate::addFASEDMMIOBank(CircuitOp circuit, std::string &error
   auto key=engine?engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"):DictionaryAttr();
   auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
   auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
-  if(!flight || flight.getInt()!=10)return reject("FASED MMIO bank requires the recorded ten-flight constructor");
+  if(!flight || flight.getValue().getBitWidth()>64 || flight.getInt()!=10)return reject("FASED MMIO bank requires the recorded ten-flight constructor");
   ControlMMIOWidget registry;
   if(failed(deriveControlMMIORegistry(circuit,"FASEDMemoryTimingModel_0",modules,registry,error)))
     return failure();

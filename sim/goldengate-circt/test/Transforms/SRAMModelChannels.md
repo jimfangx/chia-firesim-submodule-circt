@@ -7306,3 +7306,65 @@ pending. No harness-owned manager gate was started. Next smallest step: combine
 the allocated selected FASED MMIO fragments into the ordered 21-word bank and
 compare its offsets and lane wiring with SFC. Control fanout, token closure and
 platform assembly remain open; the port is incomplete.
+
+
+### Iteration 165: selected Print FASED 21-word MMIO assembly
+
+Evidence: generated directory `iteration165-print-fased-mmio-bank/`.
+The selected Print boundary now assembles the six allocated FASED register
+fragments through the shared CIRCT `addFASEDMMIOBank` implementation after
+histograms. The new `GGSelectedPrintFASEDMMIOWrapper` consumes the six fragment
+ports and exposes the ordered 21-word `fasedBridge_mcr` bundle. Registry row
+order identifies local lanes; byte offsets identify global lanes. Read-ready
+and write-valid/bits retain their reverse direction, and the aggregate strobe
+fans out to every fragment. No register state is duplicated. The selected
+composer validates allocation, verifies on a clone, then publishes only the
+new wrapper and transferred annotation archive, preserving all prior module
+and operation identities. Print/CPU stream collateral recognizes the new root.
+The CLI option `--map-print-host-fased-mmio-bank` requires histograms and emits
+`post-print-fased-mmio-bank.{mlir,sv}` and `-all.json`. Oversized constructor
+integers reject before calling `getInt()`.
+
+Oracle: immutable
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+modules `FASEDMemoryTimingModel` and `MCRFile_5`; Scala
+`models/dram/FASEDMemoryTimingModel.scala:584-589` and
+`widgets/Widget.scala:70-99,167-172`. Both complete native replays ingest
+immutable
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`.
+All 21 names, byte offsets 0-80 and permissions match SFC: writable words
+0-3/18, read-only words 4-17/19-20, all readable. Histogram fifth-bin reads
+retain SFC zero values. The semantic RTL comparison permits both direct
+instance connections and parent-folded constants proven in the emitted child.
+
+Validation: native build, three targeted CTest cases, both complete standalone
+compiler replays and both focused selected allocation tests pass. Shared bank
+tests cover legacy/selected profiles with three lane orders each, 21 lanes,
+six strobe routes, 59 annotation targets and 188 atomic rejections. The focused
+tests retain all module identities/bodies and allocated headers, probe seven
+circuit/copied-port/indexed-lane/strobe/whole-fragment/internal targets and
+check 13 atomic rejections per allocation, including repeat assembly. Duplicate
+CLI flags and missing histogram prerequisites reject before ingestion.
+Structured SFC comparison results:
+
+- candidate: 151 unchanged module bodies, 74 copied typed ports, 122 wrapper connections, 132 emitted fragment pins and 1713 transferred annotations.
+- compatibility: 145 unchanged module bodies, 82 copied typed ports, 130 wrapper connections, 132 emitted fragment pins and 1713 transferred annotations.
+
+Preceding histogram MLIR, SV and annotations and both allocated Print headers
+match iteration 164 exactly. Immutable reference checksums are unchanged.
+Earlier replay stages are compressed with verified decompressed checksums;
+histogram/MMIO artifacts remain directly inspectable.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDMMIOBank,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/{FASEDMMIOBankTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDMMIOBankCompare.py`, and this document.
+
+Risk: the immutable SFC fixture disables Print, so enabled-Print runtime parity
+remains open. Supplied iteration-164 CIRCT replacertl and Verilator regressions
+pass but predate this change; the Rocket SFC UART-bearing differential remains
+pending. No harness-owned manager gate was started. Next smallest step: attach
+the selected 21-word bank to the shared FASED MCRFile/control transport and
+compare all AXI address/data/response bindings with SFC. Global control fanout,
+token closure and platform assembly remain open; the port is incomplete.

@@ -6914,6 +6914,98 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS selected FASED response errors, unchanged allocated headers/SSA, 9 atomic rejections\n";
       return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-mmio-bank") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected histogram boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto localDump = [](Operation *op) {
+        std::string text; llvm::raw_string_ostream out(text);
+        op->print(out, OpPrintingFlags().useLocalScope()); out.flush(); return text;
+      };
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+      raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.MMIOIdentity")),
+          b.getNamedAttr("targets", b.getArrayAttr({
+            b.getStringAttr("~GGSelectedPrintFASEDHistogramsWrapper"),
+            b.getStringAttr("~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>hostClock"),
+            b.getStringAttr("~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>fased_statistics_mcr.read[0].bits"),
+            b.getStringAttr("~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>fased_histograms_mcr.write[9].ready"),
+            b.getStringAttr("~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>fased_latency_mcr.wstrb"),
+            b.getStringAttr("~GGSelectedPrintFASEDHistogramsWrapper|GGSelectedPrintFASEDHistogramsWrapper>fased_latency_mcr"),
+            b.getStringAttr("~GGSelectedPrintFASEDHistogramsWrapper|GGFASEDHistograms>mcr.read[0].bits")}))}));
+      c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+      for (unsigned bad = 0; bad < 12; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        auto top = named(tc, "GGSelectedPrintFASEDHistogramsWrapper");
+        if (bad == 0) tc.setName("Wrong");
+        if (bad == 1) tc->removeAttr("rawAnnotations");
+        if (bad == 2) hs.clear();
+        if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        if (bad == 4) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("GGSelectedPrintFASEDMMIOWrapper"),
+              top.getConventionAttr(), ArrayRef<PortInfo>{});
+        }
+        if (bad == 5) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          auto user = b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("MMIOUser"),
+              top.getConventionAttr(), ArrayRef<PortInfo>{});
+          b.setInsertionPointToStart(user.getBodyBlock()); b.create<InstanceOp>(tc.getLoc(), top, "used");
+        }
+        if (bad == 6) named(tc, "GGFASEDTokenEngine")->removeAttr("goldengate.bridgeConstructor");
+        if (bad == 7 || bad == 8) {
+          auto engine = named(tc, "GGFASEDTokenEngine");
+          NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+          NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+          edge.set("maxFlight", bad == 7 ? b.getI64IntegerAttr(9) :
+              b.getIntegerAttr(IntegerType::get(&ctx, 128), APInt(128, 10)));
+          key.set("axi4Edge", edge.getDictionary(&ctx));
+          engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+        }
+        if (bad == 9) named(tc, "GGFASEDHistograms").setName("MissingHistogramBank");
+        if (bad == 10) {
+          auto names = llvm::to_vector(top.getPortNames());
+          for (unsigned i = 0; i < names.size(); ++i)
+            if (cast<StringAttr>(names[i]).getValue() == "fased_statistics_mcr") names[i] = b.getStringAttr("missing");
+          top.setPortNames(names);
+        }
+        if (bad == 11) named(tc, "GGFASEDStatistics")->removeAttr("goldengate.mmioRegisters");
+        auto before = localDump(test->getOperation());
+        require(failed(goldengate::mapPrintBridgeFASEDMMIOBank(tc, hs, error)) && !error.empty() &&
+            localDump(test->getOperation()) == before, "selected FASED MMIO rejection mutated IR " + std::to_string(bad));
+      }
+      SmallVector<FModuleOp> modules; std::map<std::string, std::string> bodies;
+      for (auto m : c.getOps<FModuleOp>()) { modules.push_back(m); bodies[m.getName().str()] = localDump(m.getOperation()); }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDMMIOBank(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      for (auto m : modules)
+        require(named(c, m.getName()) == m && localDump(m.getOperation()) == bodies.at(m.getName().str()),
+            "MMIO bank changed prior module identity or body");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected MMIO bank changed allocated collateral: " + error);
+      auto targets = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back()).getAs<ArrayAttr>("targets");
+      const StringRef expected[]{"~GGSelectedPrintFASEDMMIOWrapper",
+          "~GGSelectedPrintFASEDMMIOWrapper|GGSelectedPrintFASEDMMIOWrapper>hostClock",
+          "~GGSelectedPrintFASEDMMIOWrapper|GGSelectedPrintFASEDMMIOWrapper>fasedBridge_mcr.read[14].bits",
+          "~GGSelectedPrintFASEDMMIOWrapper|GGSelectedPrintFASEDMMIOWrapper>fasedBridge_mcr.write[13].ready",
+          "~GGSelectedPrintFASEDMMIOWrapper|GGSelectedPrintFASEDMMIOWrapper>fasedBridge_mcr.wstrb",
+          "~GGSelectedPrintFASEDMMIOWrapper|GGSelectedPrintFASEDHistogramsWrapper>fased_latency_mcr",
+          "~GGSelectedPrintFASEDMMIOWrapper|GGFASEDHistograms>mcr.read[0].bits"};
+      for (unsigned i = 0; i < 7; ++i)
+        require(cast<StringAttr>(targets[i]).getValue() == expected[i], "selected MMIO target identity differs");
+      auto before = localDump(source->getOperation());
+      require(failed(goldengate::mapPrintBridgeFASEDMMIOBank(c, hostsFor(c), error)) && localDump(source->getOperation()) == before,
+          "selected MMIO repeat mutated IR");
+      llvm::outs() << "PASS selected FASED MMIO bank, unchanged modules/SSA/allocated headers, 7 target probes, 13 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-histograms") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected statistics boundary");

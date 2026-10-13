@@ -429,6 +429,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDResponseErrors = false;
   bool mapPrintHostFASEDStatistics = false;
   bool mapPrintHostFASEDHistograms = false;
+  bool mapPrintHostFASEDMMIOBank = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -524,6 +525,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-statistics") {
         if (mapPrintHostFASEDStatistics) return fail("duplicate --map-print-host-fased-statistics");
         mapPrintHostFASEDStatistics = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-mmio-bank") {
+        if (mapPrintHostFASEDMMIOBank) return fail("duplicate --map-print-host-fased-mmio-bank");
+        mapPrintHostFASEDMMIOBank = true;
         continue;
       }
       if (option == "--map-print-host-fased-histograms") {
@@ -714,6 +720,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-response-errors requires --map-print-host-fased-functional-model-register");
   if (mapPrintHostFASEDStatistics && !mapPrintHostFASEDResponseErrors)
     return fail("--map-print-host-fased-statistics requires --map-print-host-fased-response-errors");
+  if (mapPrintHostFASEDMMIOBank && !mapPrintHostFASEDHistograms)
+    return fail("--map-print-host-fased-mmio-bank requires --map-print-host-fased-histograms");
   if (mapPrintHostFASEDHistograms && !mapPrintHostFASEDStatistics)
     return fail("--map-print-host-fased-histograms requires --map-print-host-fased-statistics");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
@@ -1391,6 +1399,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED histograms output: " + error);
         llvm::outs() << "Attached selected Print FASED target-fire read-only MMIO words 4-13 and pre-edge read/AW occupancy bins in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDMMIOBank) {
+        if (failed(goldengate::mapPrintBridgeFASEDMMIOBank(circuit, hosts, error)))
+          return fail("PrintBridge FASED MMIO bank: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-mmio-bank.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-mmio-bank.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-mmio-bank-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED MMIO bank MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED MMIO bank output: " + error);
+        llvm::outs() << "Assembled selected Print FASED six MMIO fragments into global words 0-20 with reverse-ready and shared strobes in " << tokenIR << '\n';
       }
       return 0;
     }

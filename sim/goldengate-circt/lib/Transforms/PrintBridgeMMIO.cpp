@@ -2938,6 +2938,30 @@ LogicalResult goldengate::mapPrintBridgeFASEDHistograms(CircuitOp circuit,
   return success();
 }
 
+// Join allocated fragments through the shared registry/typed-bank assembler.
+// Validate selected allocation and stage verification before publishing only
+// the new wrapper/archive; retain all prior module and operation identities.
+LogicalResult goldengate::mapPrintBridgeFASEDMMIOBank(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (circuit.getName() != "GGSelectedPrintFASEDHistogramsWrapper")
+    return reject("selected Print FASED MMIO bank requires the completed histogram boundary");
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDMMIOBank(*staged, error))) return failure();
+  if (failed(verify(*staged)))
+    return reject("selected Print FASED MMIO bank produced invalid FIRRTL IR");
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintFASEDMMIOWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // Requires the recorded selected Print retirement/allocation boundary and
 // annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
 // Verify on a clone, then publish only the wrapper and retargeted annotations;
