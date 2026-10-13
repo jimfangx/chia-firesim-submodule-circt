@@ -184,6 +184,16 @@ target_link_libraries(goldengate-circt PRIVATE
 
 include(CTest)
 if(BUILD_TESTING)
+  add_executable(goldengate-bridge-promotion-test
+    test/Analysis/BridgePromotionTest.cpp lib/Analysis/BridgeAnalysis.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-bridge-promotion-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-bridge-promotion-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-bridge-promotion-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-bridge-promotion-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-bridge-promotion COMMAND goldengate-bridge-promotion-test)
   add_executable(goldengate-async-ram-model-test
     test/Transforms/AsyncRAMModelTest.cpp lib/Transforms/AsyncRAMModel.cpp)
   target_compile_features(goldengate-async-ram-model-test PRIVATE cxx_std_17)

@@ -515,13 +515,6 @@ mlir::LogicalResult goldengate::promoteBridgePorts(
     }
     bridge.instance.erase();
     if (includeAggregates) {
-      auto constructorKey =
-          Annotation(bridge.sourceAnnotation)
-              .getMember<DictionaryAttr>("widgetConstructorKey");
-      if (!constructorKey) {
-        error = "bridge has no widget constructor key: " + name;
-        return failure();
-      }
       SmallVector<NamedAttribute> channelMapping;
       for (const std::string &channel : bridge.channelNames)
         channelMapping.emplace_back(
@@ -530,17 +523,23 @@ mlir::LogicalResult goldengate::promoteBridgePorts(
       auto string = [&](llvm::StringRef value) {
         return StringAttr::get(circuit.getContext(), value);
       };
-      promotedAnnotations.push_back(DictionaryAttr::get(
-          circuit.getContext(),
-          {NamedAttribute(string("class"), string(AnnotationClasses::BridgeIO)),
-           NamedAttribute(string("target"),
-                          string("~" + circuit.getName().str() + "|" +
-                                 circuit.getName().str() + ">" + name)),
-           NamedAttribute(string("channelMapping"),
-                          DictionaryAttr::get(circuit.getContext(),
-                                              channelMapping)),
-           NamedAttribute(string("widgetClass"), string(bridge.widgetClass)),
-           NamedAttribute(string("widgetConstructorKey"), constructorKey)}));
+      SmallVector<NamedAttribute> bridgeIO{
+          NamedAttribute(string("class"), string(AnnotationClasses::BridgeIO)),
+          NamedAttribute(string("target"),
+                         string("~" + circuit.getName().str() + "|" +
+                                circuit.getName().str() + ">" + name)),
+          NamedAttribute(string("channelMapping"),
+                         DictionaryAttr::get(circuit.getContext(),
+                                             channelMapping)),
+          NamedAttribute(string("widgetClass"), string(bridge.widgetClass))};
+      // BridgeAnnotation.toIOAnnotation copies Option[_ <: AnyRef] unchanged.
+      // None is omitted from JSON (SimpleNIC uses it); Some is an opaque
+      // serializable value, interpreted later by the specific widget lowering.
+      if (auto constructorKey =
+              bridge.sourceAnnotation.get("widgetConstructorKey"))
+        bridgeIO.emplace_back(string("widgetConstructorKey"), constructorKey);
+      promotedAnnotations.push_back(
+          DictionaryAttr::get(circuit.getContext(), bridgeIO));
 
       // BridgeExtraction's PipeBridgeChannel connections refer to fields of
       // the newly promoted top port. Resolve each original module-local field

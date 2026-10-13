@@ -27,6 +27,7 @@ analyzeBridgeInstances(circt::firrtl::CircuitOp circuit, std::string &error);
 // Promote directly instantiated bridge ports to a single, directioned
 // top-level bundle, as in ExtractBridges. Aggregate promotion preserves the
 // FIRRTL bundle flips and vector shape. Analog ports remain unsupported.
+// BridgeIO annotations preserve optional constructor values, including absence.
 mlir::LogicalResult promoteBridgePorts(circt::firrtl::CircuitOp circuit,
                                        std::string &error,
                                        bool includeAggregates = false);
