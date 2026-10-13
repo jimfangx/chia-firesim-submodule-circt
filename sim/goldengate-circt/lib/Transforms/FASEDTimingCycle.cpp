@@ -5,6 +5,15 @@
 // Release cycles use zero-extended 32-bit runtime latencies, modulo 2^64,
 // less the one-cycle AXI4Releaser delay. Latency MMIO and completion queues
 // remain explicit boundaries for subsequent native transforms.
+// Required input invariants: uninstantiated response-releaser root, exact
+// host clock/model reset/targetFire ports, 35/64/4 constructor and raw archive.
+// Annotations consumed: none. Produced: recursively transferred raw targets;
+// copied root ports move to the new root, internal targets retain their module.
+// IR mutations: add timer and wrapper, update circuit name/archive only.
+// Analyses required: constructor and port identity. Preserved: prior operations,
+// ports, attached annotations and constructor. Output invariants: one 64-bit
+// register whose reset and increment both require targetFire; UInt32 latencies
+// remain external, with modulo-2^64 deadlines and unchanged existing wiring.
 #include "goldengate/FASEDTimingCycle.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -14,9 +23,11 @@ using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDTimingCycle(CircuitOp circuit,
                                              std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDTimingCycle";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDTimingCycleWrapper";
+  const bool isSelectedPrint = circuit.getName() == "GGSelectedPrintFASEDResponseReleaserWrapper";
+  const llvm::StringRef wrapperName = isSelectedPrint
+      ? "GGSelectedPrintFASEDTimingCycleWrapper" : "GGFASEDTimingCycleWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDResponseReleaserWrapper")
+  if (!isSelectedPrint && circuit.getName() != "GGFASEDResponseReleaserWrapper")
     return reject("FASED timing cycle requires the active response releaser wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {

@@ -16,6 +16,9 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+bool selectedPrint = false;
+llvm::StringRef oldRoot() { return selectedPrint ? "GGSelectedPrintFASEDResponseReleaserWrapper" : "GGFASEDResponseReleaserWrapper"; }
+llvm::StringRef newRoot() { return selectedPrint ? "GGSelectedPrintFASEDTimingCycleWrapper" : "GGFASEDTimingCycleWrapper"; }
 void require(bool ok, llvm::StringRef why) { if (!ok) throw std::runtime_error(why.str()); }
 FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
@@ -24,6 +27,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDResponseReleaserWrapper\" { firrtl.module @GGFASEDResponseReleaserWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();
+  c.setName(oldRoot());
   (*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
   auto u=[&](unsigned w){return UIntType::get(&ctx,w,false);};
   const llvm::StringRef names[]{"hostClock","fased_model_reset","fased_tfire"};
@@ -38,14 +42,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   if(mode!=6){auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     if(mode!=13)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({
       b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==12?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));}
-  if(mode==8||mode==9)b.create<FModuleOp>(loc,b.getStringAttr(mode==8?"GGFASEDTimingCycle":"GGFASEDTimingCycleWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==8||mode==9)b.create<FModuleOp>(loc,b.getStringAttr(mode==8?llvm::StringRef("GGFASEDTimingCycle"):newRoot()),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==10){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   if(mode==11)c.setName("wrong");
   if(mode!=7)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({
     b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~GGFASEDResponseReleaserWrapper"),
-      b.getStringAttr("~GGFASEDResponseReleaserWrapper|GGFASEDResponseReleaserWrapper>other"),
-      b.getStringAttr("~GGFASEDResponseReleaserWrapper|GGFASEDTokenEngine>state")}))})}));
+    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~" + oldRoot().str()),
+      b.getStringAttr("~" + oldRoot().str() + "|" + oldRoot().str() + ">other"),
+      b.getStringAttr("~" + oldRoot().str() + "|GGFASEDTokenEngine>state")}))})}));
   return root;
 }
 struct Interpreter {
@@ -152,7 +156,7 @@ void behavior(MLIRContext &ctx) {
 void mapping(MLIRContext &ctx) {
   auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDTimingCycle(c,error)),error);
-  auto top=named(c,"GGFASEDTimingCycleWrapper"),inner=named(c,"GGFASEDResponseReleaserWrapper");
+  auto top=named(c,newRoot()),inner=named(c,oldRoot());
   require(top.getNumPorts()==9,"wrapper port count differs");
   for(unsigned i=0;i<4;++i)require(top.getPorts()[i].name==inner.getPorts()[i].name&&top.getPorts()[i].type==inner.getPorts()[i].type&&top.getPorts()[i].direction==inner.getPorts()[i].direction,"copied port differs");
   auto it=top.getOps<InstanceOp>().begin();auto sim=*it++;auto timer=*it;Interpreter w(top);
@@ -166,7 +170,7 @@ void mapping(MLIRContext &ctx) {
     }
   }
   auto targets=cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<ArrayAttr>("targets");
-  const llvm::StringRef expected[]{"~GGFASEDTimingCycleWrapper","~GGFASEDTimingCycleWrapper|GGFASEDTimingCycleWrapper>other","~GGFASEDTimingCycleWrapper|GGFASEDTokenEngine>state"};
+  const std::string expected[]{"~"+newRoot().str(),"~"+newRoot().str()+"|"+newRoot().str()+">other","~"+newRoot().str()+"|GGFASEDTokenEngine>state"};
   for(unsigned i=0;i<3;++i)require(cast<StringAttr>(targets[i]).getValue()==expected[i],"target transfer differs");
   llvm::outs()<<"16 wrapper mapping cases and three target transfers passed\n";
 }
@@ -179,4 +183,4 @@ void rejection(MLIRContext &ctx) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"19 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{behavior(ctx);mapping(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected : {false,true}) {selectedPrint=selected; llvm::outs()<<newRoot()<<"\n"; behavior(ctx);mapping(ctx);rejection(ctx);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

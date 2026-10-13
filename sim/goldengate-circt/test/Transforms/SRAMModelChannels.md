@@ -6427,3 +6427,69 @@ assembly remain open. Next smallest step: attach existing native FASEDTimingCycl
 to the selected response-releaser root and compare targetFire-qualified cycle
 advancement, reset and latency-minus-one arithmetic with SFC LatencyPipe.
 No harness-owned manager gate was started; the overall port remains open.
+
+
+## Iteration 151: selected Print FASED model cycle and release deadlines
+
+Attach shared native `GGFASEDTimingCycle` after selected response release.
+`--map-print-host-fased-timing-cycle` requires response release and emits
+`post-print-fased-timing-cycle.{mlir,sv}` and full annotation JSON. The selected
+composer validates allocated hosts, stages and verifies a clone, then publishes
+only the new timer and wrapper. Prior modules, ports, ordinary SSA, constructors
+and allocated collateral remain unchanged. Circuit and copied port targets
+transfer recursively; internal targets retain their module identity.
+
+The Scala oracle is `models/dram/TimingModel.scala` and
+`models/dram/LatencyBandwidthPipe.scala`, with the model clock gate in
+`models/dram/FASEDMemoryTimingModel.scala`, within MidasTransforms/FAMETransform.
+One 64-bit register increments only on targetFire and samples reset on the
+same enabled edge. Each release deadline zero-extends its UInt32 runtime latency
+and computes cycle + latency - 1 modulo 2^64. Latency MMIO and completion queues
+remain external boundaries.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration151-print-fased-timing-cycle`.
+Native compiler and three focused test binaries build successfully. Print
+binding, timing cycle and CPU managed-stream header CTests pass. Legacy and
+selected roots each exercise 21152 actual FIRRTL transitions, including 10000
+continuous randomized cycles, 16 wrapper cases, three annotation transfers and
+19 atomic rejections. Both saved iteration-150 selected boundaries pass nine
+atomic composer rejections, prior module/operation identity and body checks,
+unchanged allocated headers, and four circuit/copied scalar/copied aggregate/
+internal target probes. CLI dependency and duplicate-option rejection pass.
+
+Both standalone native CLI replays ingest the primary immutable compiler
+fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print
+annotations and native Rocket control catalog, with and without TracerV.
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDTimingCycleCompare.py` pins LatencyPipe's 64-bit counter,
+zero-extended latency and minus-one equations, and FASEDMemoryTimingModel's
+gated clock/reset. Each allocation's actual emitted SSA passes 22048 transitions,
+including 10941 stalls, 5569 stalled resets, 5549 enabled resets, 64 counter wraps,
+64 deadline underflows and 710 deadline overflows. The helper equals the
+previously oracle-compared native baseline. All 131 / 125 prior module bodies,
+80 / 88 wrapper connections and 1713 annotation records match preservation and
+transfer expectations. Emitted RTL retains enabled reset/increment, UInt32
+zero-extension and explicit 64-bit truncation; CIRCT reassociates the modular
+sum as latency + (cycle - 1). The comparison uses emitted instance port bindings
+and the selected Print/count allocation, whose FASED latency bank remains
+external. Allocated Print headers and decoders equal iteration 150 byte for byte.
+Before-response-release MLIR/JSON and final MLIR/JSON/SV remain raw; other own
+replay intermediates are compressed after comparison.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDTimingCycle,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDTimingCycleTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDTimingCycleCompare.py`, and this document.
+
+Risk: the SFC fixture disables Print, so shared cycle/deadline semantics and
+selected composition are checked; full enabled-Print simulator parity remains
+open. The supplied iteration-150 Rocket Verilator regressions pass but predate
+this change; the UART-bearing SFC differential remains pending. Completion
+scheduling, latency MMIO, target token closure and selected platform assembly
+remain open. Next smallest step: attach existing native FASEDReadLatency to the
+selected timing-cycle root and compare its ten-entry flow queue, unsigned
+deadline comparison and targetFire-qualified state with SFC LatencyPipe/Queue_16.
+No harness-owned manager gate was started; the overall port remains open.

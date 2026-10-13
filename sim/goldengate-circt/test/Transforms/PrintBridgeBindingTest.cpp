@@ -6164,6 +6164,82 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS selected FASED deadlock, retained modules/ports/ordinary SSA/annotations/headers, 9 atomic rejections\n";
       return 0;
     }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-timing-cycle") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected response releaser boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      // Probe circuit, copied scalar/aggregate and retained internal identity.
+      SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
+      auto probe = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.TimingCycleIdentity")),
+          b.getNamedAttr("targets", b.getArrayAttr({
+            b.getStringAttr("~GGSelectedPrintFASEDResponseReleaserWrapper"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseReleaserWrapper|GGSelectedPrintFASEDResponseReleaserWrapper>hostClock"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseReleaserWrapper|GGSelectedPrintFASEDResponseReleaserWrapper>fased_timing_requests.ar.bits.id"),
+            b.getStringAttr("~GGSelectedPrintFASEDResponseReleaserWrapper|GGFASEDResponseReleaser>currentRead_full")}))});
+      raw.push_back(probe); c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+      for (unsigned bad = 0; bad < 8; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        if (bad == 0) tc.setName("Wrong");
+        else if (bad == 1) tc->removeAttr("rawAnnotations");
+        else if (bad == 2) hs.clear();
+        else if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        else if (bad == 4 || bad == 5) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr(bad == 4 ? "GGFASEDTimingCycle" : "GGSelectedPrintFASEDTimingCycleWrapper"),
+              named(tc, "GGSelectedPrintFASEDResponseReleaserWrapper").getConventionAttr(), ArrayRef<PortInfo>{});
+        } else {
+          auto engine = named(tc, "GGFASEDTokenEngine");
+          if (bad == 6) engine->removeAttr("goldengate.bridgeConstructor");
+          else {
+            NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+            NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Widths")));
+            edge.set("idBits", b.getI64IntegerAttr(5));
+            key.set("axi4Widths", edge.getDictionary(&ctx));
+            engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+          }
+        }
+        auto before = dump(*test);
+        require(failed(goldengate::mapPrintBridgeFASEDTimingCycle(tc, hs, error)) && !error.empty() && dump(*test) == before,
+            "selected FASED timing cycle rejection mutated IR " + std::to_string(bad));
+      }
+      SmallVector<FModuleOp> modules; SmallVector<Operation *> ops; std::map<std::string, std::string> bodies;
+      auto body = [](FModuleOp m) { std::string text; llvm::raw_string_ostream out(text); m->print(out, OpPrintingFlags().useLocalScope()); return text; };
+      for (auto m : c.getOps<FModuleOp>()) {
+        modules.push_back(m); bodies[m.getName().str()] = body(m);
+        for (auto &op : m.getBodyBlock()->getOperations()) ops.push_back(&op);
+      }
+      std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDTimingCycle(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      SmallVector<Operation *> after;
+      for (auto m : modules) {
+        require(named(c, m.getName()) == m && body(m) == bodies.at(m.getName().str()), "selected FASED timing cycle replaced prior module");
+        for (auto &op : m.getBodyBlock()->getOperations()) after.push_back(&op);
+      }
+      require(after == ops, "selected FASED timing cycle replaced prior operations");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected FASED timing cycle changed allocated collateral: " + error);
+      auto transferred = cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back());
+      auto targets = transferred.getAs<ArrayAttr>("targets");
+      const StringRef expected[]{"~GGSelectedPrintFASEDTimingCycleWrapper",
+          "~GGSelectedPrintFASEDTimingCycleWrapper|GGSelectedPrintFASEDTimingCycleWrapper>hostClock",
+          "~GGSelectedPrintFASEDTimingCycleWrapper|GGSelectedPrintFASEDTimingCycleWrapper>fased_timing_requests.ar.bits.id",
+          "~GGSelectedPrintFASEDTimingCycleWrapper|GGFASEDResponseReleaser>currentRead_full"};
+      for (unsigned i = 0; i < 4; ++i)
+        require(cast<StringAttr>(targets[i]).getValue() == expected[i], "selected timing cycle target identity differs");
+      auto before = dump(*source);
+      require(failed(goldengate::mapPrintBridgeFASEDTimingCycle(c, hostsFor(c), error)) && dump(*source) == before,
+          "selected FASED timing cycle repeat mutated IR");
+      llvm::outs() << "PASS selected FASED timing cycle, unchanged allocated headers/SSA, 9 atomic rejections\n";
+      return 0;
+    }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-response-releaser") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected write egress boundary");

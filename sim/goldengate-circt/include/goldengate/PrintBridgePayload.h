@@ -217,6 +217,11 @@ mlir::LogicalResult mapPrintBridgeFASEDWriteEgress(
 mlir::LogicalResult mapPrintBridgeFASEDResponseReleaser(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
+/// Attach the targetFire-qualified model cycle and latency deadlines after
+/// response release. Atomic; preserve prior SSA, allocation and copied targets.
+mlir::LogicalResult mapPrintBridgeFASEDTimingCycle(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
 
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
