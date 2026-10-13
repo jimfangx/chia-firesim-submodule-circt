@@ -19,16 +19,23 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::bindFASEDReadAdmission(CircuitOp circuit,
                                                  std::string &error) {
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDReadAdmissionWrapper";
+  const bool selectedPrint = circuit.getName() == "GGSelectedPrintFASEDWriteAdmissionWrapper";
+  const llvm::StringRef wrapperName = selectedPrint ? "GGSelectedPrintFASEDReadAdmissionWrapper"
+                                                   : "GGFASEDReadAdmissionWrapper";
   constexpr llvm::StringLiteral observationName = "fased_accepted_r_last_fire";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (circuit.getName() != "GGFASEDWriteAdmissionWrapper" || !raw)
+  if ((circuit.getName() != "GGFASEDWriteAdmissionWrapper" && !selectedPrint) || !raw)
     return reject("FASED read admission requires the active write-admission wrapper and annotations");
-  const llvm::StringRef names[]{"GGFASEDWriteAdmissionWrapper", "GGFASEDWriteRetirementWrapper",
-      "GGFASEDWritePairingWrapper", "GGFASEDTimingAWQueueWrapper",
-      "GGFASEDWriteLatencyWrapper", "GGFASEDReadLatencyWrapper",
-      "GGFASEDTimingCycleWrapper", "GGFASEDResponseReleaserWrapper"};
+  const llvm::StringRef names[]{
+      selectedPrint ? "GGSelectedPrintFASEDWriteAdmissionWrapper" : "GGFASEDWriteAdmissionWrapper",
+      selectedPrint ? "GGSelectedPrintFASEDWriteRetirementWrapper" : "GGFASEDWriteRetirementWrapper",
+      selectedPrint ? "GGSelectedPrintFASEDWritePairingWrapper" : "GGFASEDWritePairingWrapper",
+      selectedPrint ? "GGSelectedPrintFASEDTimingAWQueueWrapper" : "GGFASEDTimingAWQueueWrapper",
+      selectedPrint ? "GGSelectedPrintFASEDWriteLatencyWrapper" : "GGFASEDWriteLatencyWrapper",
+      selectedPrint ? "GGSelectedPrintFASEDReadLatencyWrapper" : "GGFASEDReadLatencyWrapper",
+      selectedPrint ? "GGSelectedPrintFASEDTimingCycleWrapper" : "GGFASEDTimingCycleWrapper",
+      selectedPrint ? "GGSelectedPrintFASEDResponseReleaserWrapper" : "GGFASEDResponseReleaserWrapper"};
   SmallVector<FModuleOp> modules;
   for (auto name : names) {
     FModuleOp found;

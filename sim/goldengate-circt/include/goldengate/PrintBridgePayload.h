@@ -259,6 +259,12 @@ mlir::LogicalResult mapPrintBridgeFASEDWriteAdmission(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Observe accepted final R through the eight selected response wrappers and
+/// close AR ready with the pending-read full flag. Atomic; keep AW/W admission.
+mlir::LogicalResult mapPrintBridgeFASEDReadAdmission(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

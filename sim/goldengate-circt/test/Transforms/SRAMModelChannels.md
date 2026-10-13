@@ -6876,3 +6876,66 @@ latency/max-request MMIO, target token closure and platform assembly remain open
 Next smallest step: attach native FASEDReadAdmission, observe accepted final R
 through the selected hierarchy, and compare pending-read AR readiness with SFC.
 No harness-owned manager gate was started; the overall port remains open.
+
+
+## Iteration 158 — selected Print FASED AR admission and final-R retirement
+
+`bindFASEDReadAdmission` now supports the selected Print write-admission root.
+`mapPrintBridgeFASEDReadAdmission` validates allocated Print/CPU collateral and
+the recorded 35/64/4-bit constructor, verifies the pass on a clone, then applies
+its preflighted mutations to the original module operations. Eight response
+wrappers append an accepted-final-R observation; seven rebuilt `sim` instances
+retain prior result users and custom attributes. The bottom observation is
+`releaser.r.ready && releaser.r.valid && releaser.r.bits.last`.
+
+The new `GGSelectedPrintFASEDReadAdmissionWrapper` closes AR readiness with
+`!pendingReads.full`, preserving AW/W readiness and all request payloads. Its
+four-bit native counter increments on accepted AR and decrements on accepted
+final R. Simultaneous increment/decrement holds, empty retirement saturates,
+reduced runtime maxima do not clamp existing state, and state/reset advance
+only on targetFire. The runtime read maximum and pending-read observation are
+explicit ports. The CLI stage `--map-print-host-fased-read-admission` requires
+write admission and emits MLIR, annotation JSON and CIRCT SystemVerilog.
+Allocated header emitters accept the new root.
+
+Evidence: `sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration158-print-fased-read-admission/`.
+The Print binding, FASED read-admission and CPU stream header CTest groups pass.
+The shared unit test covers both root profiles and 54 atomic rejection cases.
+Focused replay on each real selected boundary checks eight observation hops,
+retained module/SSA identities, six annotation probes, unchanged allocated
+collateral and nine atomic rejections. CLI duplicate/dependency rejection passes.
+Both fresh native compiler replays pass; all six preceding write-admission
+MLIR/SV/JSON files equal iteration 157 byte for byte.
+
+Exact immutable artifact compared:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDReadAdmissionCompare.py` compares LatencyPipe AR admission
+and final-R retirement, AXI4Releaser response ownership, SatUpDownCounter_1
+saturation/reset, and FASEDMemoryTimingModel clock/reset qualification. Each
+allocation matches 46384 native-SSA transitions: 16384 exhaustive states/flags
+plus 30000 seeded sequential samples. These include 5929 nonfinal accepted R
+beats, 13061 blocked AR requests, 23239 reduced-maximum cases, 682 simultaneous
+increment/decrements, and both target/stalled resets. All eight emitted RTL
+observation hops, 33 request pins and 1713 structured annotation records match.
+The 143 / 137 prior module identities remain; 135 / 129 unrelated module
+definitions are unchanged. All 679 / 743 prior-plus-observation drivers and
+89 / 97 wrapper connections match. Allocated headers equal iteration 157.
+Immutable FIRRTL/RTL fixture hashes remain unchanged. Raw preceding/final
+boundaries are retained; other own intermediates are compressed after verifying
+their decompressed SHA256 hashes.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDReadAdmission,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/{FASEDReadAdmissionTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDReadAdmissionCompare.py`, and this document.
+
+Risk: SFC disables Print, so shared FASED semantics and selected composition
+are established, while enabled-Print simulator parity remains unverified.
+Supplied iteration-157 Rocket gates pass but predate this change; the SFC
+UART-bearing differential remains pending. Selected maximum/latency MMIO,
+token closure and platform assembly are still open. Next smallest step:
+attach FASEDRequestLimits to the selected allocation, consuming read/write
+maximum inputs with host-reset MMIO words 2/3 and reset default 10, then compare
+readback and admission truncation against SFC. No harness-owned manager gate
+was started; the overall port remains open.

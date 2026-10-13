@@ -2727,6 +2727,40 @@ LogicalResult goldengate::mapPrintBridgeFASEDWriteRetirement(CircuitOp circuit,
   return bindFASEDWriteRetirement(circuit, error);
 }
 
+// Verify hierarchy observation and target retirement feedback on a clone before
+// applying the fully preflighted pass to the original module operations/users.
+LogicalResult goldengate::mapPrintBridgeFASEDReadAdmission(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDWriteAdmissionWrapper") {
+    error = "selected Print FASED read admission requires the completed write admission boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  FModuleOp engine;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDTokenEngine") engine = m;
+  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr{};
+  auto widths = key ? key.getAs<DictionaryAttr>("axi4Widths") : DictionaryAttr{};
+  auto has = [&](StringRef name, int value) {
+    auto attr = widths ? widths.getAs<IntegerAttr>(name) : IntegerAttr{};
+    return attr && attr.getValue().getBitWidth() <= 64 && attr.getInt() == value;
+  };
+  if (!has("addrBits", 35) || !has("dataBits", 64) || !has("idBits", 4)) {
+    error = "selected Print FASED read admission requires the recorded 35/64/4-bit profile";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(bindFASEDReadAdmission(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED read admission produced invalid FIRRTL IR";
+    return failure();
+  }
+  // Every rejection in bindFASEDReadAdmission precedes its first mutation.
+  return bindFASEDReadAdmission(circuit, error);
+}
+
 // Requires the recorded selected Print retirement/allocation boundary and
 // annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
 // Verify on a clone, then publish only the wrapper and retargeted annotations;

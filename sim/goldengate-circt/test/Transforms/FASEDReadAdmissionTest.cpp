@@ -10,10 +10,25 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
-const llvm::StringRef names[]{"GGFASEDWriteAdmissionWrapper", "GGFASEDWriteRetirementWrapper",
+llvm::StringRef names[]{"GGFASEDWriteAdmissionWrapper", "GGFASEDWriteRetirementWrapper",
   "GGFASEDWritePairingWrapper", "GGFASEDTimingAWQueueWrapper",
   "GGFASEDWriteLatencyWrapper", "GGFASEDReadLatencyWrapper", "GGFASEDTimingCycleWrapper",
   "GGFASEDResponseReleaserWrapper"};
+bool selectedPrint = false;
+std::string profile(llvm::StringRef text) {
+  std::string result = text.str();
+  if (selectedPrint) {
+    const llvm::StringRef wrappers[]{"WriteAdmission", "WriteRetirement", "WritePairing",
+      "TimingAWQueue", "WriteLatency", "ReadLatency", "TimingCycle", "ResponseReleaser", "ReadAdmission"};
+    for (auto name : wrappers) {
+      auto old = "GGFASED" + name.str() + "Wrapper";
+      auto replacement = "GGSelectedPrintFASED" + name.str() + "Wrapper";
+      for (size_t pos = 0; (pos = result.find(old, pos)) != std::string::npos; pos += replacement.size())
+        result.replace(pos, old.size(), replacement);
+    }
+  }
+  return result;
+}
 void require(bool ok, llvm::StringRef why) { if (!ok) throw std::runtime_error(why.str()); }
 FModuleOp named(CircuitOp c, llvm::StringRef n) {
   for (auto m:c.getOps<FModuleOp>()) if (m.getName()==n) return m;
@@ -27,7 +42,7 @@ Value driver(FModuleOp m, Value v) {
   require(bool(found),"missing driver");return found;
 }
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
-  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDWriteAdmissionWrapper\" { firrtl.module @GGFASEDWriteAdmissionWrapper() {} } }",&ctx);
+  auto root=parseSourceString<ModuleOp>(profile("module { firrtl.circuit \"GGFASEDWriteAdmissionWrapper\" { firrtl.module @GGFASEDWriteAdmissionWrapper() {} } }"),&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
   OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
@@ -71,14 +86,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   }
   if(mode==23) {b.setInsertionPointToEnd(inner.getBodyBlock());b.create<InstanceOp>(loc,named(c,names[3]),"shared");}
   if(mode==24) {auto other=make("Other",{});b.setInsertionPointToEnd(other.getBodyBlock());b.create<InstanceOp>(loc,inner,"used");}
-  if(mode==25)make("GGFASEDReadAdmissionWrapper",{});
+  if(mode==25)make(profile("GGFASEDReadAdmissionWrapper"),{});
   if(mode==26)c.setName("Wrong");
   if(mode!=1)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({
     b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
     b.getNamedAttr("targets",b.getArrayAttr({
-      b.getStringAttr("~GGFASEDWriteAdmissionWrapper|GGFASEDWriteAdmissionWrapper>fased_timing_requests.ar.ready"),
-      b.getStringAttr("~GGFASEDWriteAdmissionWrapper|GGFASEDWriteAdmissionWrapper>echo"),
-      b.getStringAttr("~GGFASEDWriteAdmissionWrapper|GGFASEDTimingCycleWrapper/sim:GGFASEDResponseReleaserWrapper>echo")}))})}));
+      b.getStringAttr(profile("~GGFASEDWriteAdmissionWrapper|GGFASEDWriteAdmissionWrapper>fased_timing_requests.ar.ready")),
+      b.getStringAttr(profile("~GGFASEDWriteAdmissionWrapper|GGFASEDWriteAdmissionWrapper>echo")),
+      b.getStringAttr(profile("~GGFASEDWriteAdmissionWrapper|GGFASEDTimingCycleWrapper/sim:GGFASEDResponseReleaserWrapper>echo"))}))})}));
   return root;
 }
 void behavior(MLIRContext &ctx) {
@@ -140,9 +155,9 @@ void behavior(MLIRContext &ctx) {
   }
   require(regs==1,"wrong read counter count");
   auto attrs=c->getAttrOfType<ArrayAttr>("rawAnnotations");auto targets=cast<DictionaryAttr>(attrs[0]).getAs<ArrayAttr>("targets");
-  require(cast<StringAttr>(targets[0]).getValue()=="~GGFASEDReadAdmissionWrapper|GGFASEDReadAdmissionWrapper>fased_timing_requests.ar.ready","AR target not transferred");
-  require(cast<StringAttr>(targets[1]).getValue()=="~GGFASEDReadAdmissionWrapper|GGFASEDReadAdmissionWrapper>echo","copied target not moved");
-  require(cast<StringAttr>(targets[2]).getValue()=="~GGFASEDReadAdmissionWrapper|GGFASEDTimingCycleWrapper/sim:GGFASEDResponseReleaserWrapper>echo","hierarchy target changed");
+  require(cast<StringAttr>(targets[0]).getValue()==profile("~GGFASEDReadAdmissionWrapper|GGFASEDReadAdmissionWrapper>fased_timing_requests.ar.ready"),"AR target not transferred");
+  require(cast<StringAttr>(targets[1]).getValue()==profile("~GGFASEDReadAdmissionWrapper|GGFASEDReadAdmissionWrapper>echo"),"copied target not moved");
+  require(cast<StringAttr>(targets[2]).getValue()==profile("~GGFASEDReadAdmissionWrapper|GGFASEDTimingCycleWrapper/sim:GGFASEDResponseReleaserWrapper>echo"),"hierarchy target changed");
   llvm::outs()<<"Eight final-R observation hops, pending-read counter/admission, existing users and annotation targets passed\n";
 }
 void rejection(MLIRContext &ctx) {
@@ -162,6 +177,15 @@ void rejection(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {behavior(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
+  try {
+    const llvm::StringRef selectedNames[]{"GGSelectedPrintFASEDWriteAdmissionWrapper", "GGSelectedPrintFASEDWriteRetirementWrapper",
+      "GGSelectedPrintFASEDWritePairingWrapper", "GGSelectedPrintFASEDTimingAWQueueWrapper",
+      "GGSelectedPrintFASEDWriteLatencyWrapper", "GGSelectedPrintFASEDReadLatencyWrapper",
+      "GGSelectedPrintFASEDTimingCycleWrapper", "GGSelectedPrintFASEDResponseReleaserWrapper"};
+    behavior(ctx); rejection(ctx);
+    selectedPrint = true;
+    for (unsigned i = 0; i < 8; ++i) names[i] = selectedNames[i];
+    behavior(ctx); rejection(ctx);
+  }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }
