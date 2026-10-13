@@ -2761,6 +2761,37 @@ LogicalResult goldengate::mapPrintBridgeFASEDReadAdmission(CircuitOp circuit,
   return bindFASEDReadAdmission(circuit, error);
 }
 
+// Requires completed selected read admission and a validated Print allocation.
+// Reuse the allocated request-limit bank; append only the wrapper on success.
+// Retarget the annotation archive, preserving all prior SSA and host allocations.
+// Host clock/reset drive words 2/3; decoded MCR remains external for fanout.
+LogicalResult goldengate::mapPrintBridgeFASEDRequestLimits(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDReadAdmissionWrapper") {
+    error = "selected Print FASED request limits require the completed read admission boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FModuleOp bank;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDRequestLimits") bank = m;
+  if (failed(attachFASEDRequestLimits(*staged, bank, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED request limits produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintFASEDRequestLimitsWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // Requires the recorded selected Print retirement/allocation boundary and
 // annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
 // Verify on a clone, then publish only the wrapper and retargeted annotations;

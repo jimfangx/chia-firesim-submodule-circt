@@ -423,6 +423,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDWriteRetirement = false;
   bool mapPrintHostFASEDWriteAdmission = false;
   bool mapPrintHostFASEDReadAdmission = false;
+  bool mapPrintHostFASEDRequestLimits = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -492,6 +493,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-read-admission") {
         if (mapPrintHostFASEDReadAdmission) return fail("duplicate --map-print-host-fased-read-admission");
         mapPrintHostFASEDReadAdmission = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-request-limits") {
+        if (mapPrintHostFASEDRequestLimits) return fail("duplicate --map-print-host-fased-request-limits");
+        mapPrintHostFASEDRequestLimits = true;
         continue;
       }
       if (option == "--map-print-host-fased-write-egress") {
@@ -667,6 +673,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-write-admission requires --map-print-host-fased-write-retirement");
   if (mapPrintHostFASEDReadAdmission && !mapPrintHostFASEDWriteAdmission)
     return fail("--map-print-host-fased-read-admission requires --map-print-host-fased-write-admission");
+  if (mapPrintHostFASEDRequestLimits && !mapPrintHostFASEDReadAdmission)
+    return fail("--map-print-host-fased-request-limits requires --map-print-host-fased-read-admission");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
     return fail("--map-print-host-fased-write-egress requires --map-print-host-fased-read-scheduler");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
@@ -1252,6 +1260,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED read admission output: " + error);
         llvm::outs() << "Attached selected Print FASED pending-full AR readiness and accepted final-R retirement in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDRequestLimits) {
+        if (failed(goldengate::mapPrintBridgeFASEDRequestLimits(circuit, hosts, error)))
+          return fail("PrintBridge FASED request limits: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-request-limits.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-request-limits.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-request-limits-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED request limits MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED request limits output: " + error);
+        llvm::outs() << "Attached selected Print FASED host-reset MMIO words 2/3 and four-bit admission maxima in " << tokenIR << '\n';
       }
       return 0;
     }

@@ -15,6 +15,19 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+bool selected = false;
+std::string profile(llvm::StringRef input) {
+  std::string result = input.str();
+  if (selected) for (auto suffix : {"ReadAdmissionWrapper", "RequestLimitsWrapper"}) {
+    std::string old = std::string("GGFASED") + suffix;
+    std::string replacement = std::string("GGSelectedPrintFASED") + suffix;
+    size_t pos = 0;
+    while ((pos = result.find(old, pos)) != std::string::npos) {
+      result.replace(pos, old.size(), replacement); pos += replacement.size();
+    }
+  }
+  return result;
+}
 void require(bool ok, llvm::StringRef message) {
   if (!ok) throw std::runtime_error(message.str());
 }
@@ -64,7 +77,7 @@ struct Interpreter {
   }
 };
 OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
-  auto root = parseSourceString<ModuleOp>(R"(module {
+  auto root = parseSourceString<ModuleOp>(profile(R"(module {
     firrtl.circuit "GGFASEDReadAdmissionWrapper" {
       firrtl.module @GGFASEDTokenEngine() {}
       firrtl.module @GGFASEDReadAdmissionWrapper(
@@ -72,14 +85,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         in %fased_write_max_reqs: !firrtl.uint<4>, in %fased_read_max_reqs: !firrtl.uint<4>,
         in %targetFire: !firrtl.uint<1>, in %modelReset: !firrtl.uint<1>,
         out %other: !firrtl.uint<8>) {}
-    } })", &context);
+    } })"), &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   named(c, "GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
     b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(10))}))}));
   SmallVector<Attribute> annos;
   for (auto name : {"fased_write_max_reqs", "fased_read_max_reqs", "other", "hostReset"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
-        b.getNamedAttr("target", b.getStringAttr("~GGFASEDReadAdmissionWrapper|GGFASEDReadAdmissionWrapper>" + std::string(name)))}));
+        b.getNamedAttr("target", b.getStringAttr(profile("~GGFASEDReadAdmissionWrapper|GGFASEDReadAdmissionWrapper>") + std::string(name)))}));
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
 std::string dump(Operation *op) {
@@ -130,7 +143,7 @@ void phases(MLIRContext &context) {
     if (bad == 0) candidate = {};
     if (bad == 1) require(succeeded(goldengate::materializeFASEDRequestLimits(
         *foreign->getOps<CircuitOp>().begin(), candidate, error)), error);
-    if (bad == 2) candidate = named(circuit, "GGFASEDReadAdmissionWrapper");
+    if (bad == 2) candidate = named(circuit, profile("GGFASEDReadAdmissionWrapper"));
     if (bad >= 3 && bad <= 15) {
       SmallVector<PortInfo> malformed(candidate.getPorts());
       if (bad == 15) malformed.pop_back();
@@ -195,7 +208,7 @@ void behavior(MLIRContext &context) {
 void mapping(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDRequestLimits(c, error)), error);
-  auto top = named(c, "GGFASEDRequestLimitsWrapper"), bank = named(c, "GGFASEDRequestLimits");
+  auto top = named(c, profile("GGFASEDRequestLimitsWrapper")), bank = named(c, "GGFASEDRequestLimits");
   require(top.getNumPorts() == 6 && top.getPortName(5) == "fased_request_limits_mcr", "limit ports not consumed");
   auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
   require(regs && regs.size() == 2, "missing register map");
@@ -222,14 +235,14 @@ void mapping(MLIRContext &context) {
   auto annos = c->getAttrOfType<ArrayAttr>("rawAnnotations"); require(annos.size() == 4, "annotations lost");
   for (unsigned i = 0; i < 4; ++i) {
     auto target = cast<DictionaryAttr>(annos[i]).getAs<StringAttr>("target").getValue();
-    require(target.starts_with("~GGFASEDRequestLimitsWrapper|") &&
-        target.contains(i < 2 ? "|GGFASEDReadAdmissionWrapper>" : "|GGFASEDRequestLimitsWrapper>"), "target identity lost");
+    require(target.starts_with(profile("~GGFASEDRequestLimitsWrapper|")) &&
+        target.contains(i < 2 ? profile("|GGFASEDReadAdmissionWrapper>") : profile("|GGFASEDRequestLimitsWrapper>")), "target identity lost");
   }
 }
 void rejections(MLIRContext &context) {
-  for (unsigned mode = 0; mode < 14; ++mode) {
+  for (unsigned mode = 0; mode < 15; ++mode) {
     auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
-    auto top = named(c, "GGFASEDReadAdmissionWrapper"), engine = named(c, "GGFASEDTokenEngine");
+    auto top = named(c, profile("GGFASEDReadAdmissionWrapper")), engine = named(c, "GGFASEDTokenEngine");
     if (mode == 0) c.setName("WrongTop");
     if (mode == 1) c->removeAttr("rawAnnotations");
     if (mode == 2) engine->removeAttr("goldengate.bridgeConstructor");
@@ -241,6 +254,8 @@ void rejections(MLIRContext &context) {
     }
     if (mode == 12) { b.setInsertionPointToStart(engine.getBodyBlock()); b.create<InstanceOp>(top.getLoc(), top, "usedTop"); }
     if (mode == 13) { auto names = llvm::to_vector(top.getPortNames()); names[6] = b.getStringAttr("fased_request_limits_mcr"); top.setPortNames(names); }
+    if (mode == 14) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getIntegerAttr(b.getIntegerType(128), APInt(128, 10)))}))}));
     std::string before; llvm::raw_string_ostream out(before); root->print(out); out.flush(); std::string error;
     require(failed(goldengate::addFASEDRequestLimits(c, error)) && !error.empty(), "invalid boundary accepted");
     std::string after; llvm::raw_string_ostream next(after); root->print(next); next.flush();
@@ -251,8 +266,11 @@ void rejections(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    phases(context); behavior(context); mapping(context); rejections(context);
-    llvm::outs() << "FASED request limits: 32768 cycles, host/admission bindings, targets and 14 atomic rejections passed\n";
+    for (bool selectedProfile : {false, true}) {
+      selected = selectedProfile;
+      phases(context); behavior(context); mapping(context); rejections(context);
+    }
+    llvm::outs() << "FASED request limits: 65536 cycles across legacy/selected profiles, host/admission bindings, targets and 68 atomic rejections passed\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
 }

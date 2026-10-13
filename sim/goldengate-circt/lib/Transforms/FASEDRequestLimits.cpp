@@ -1,8 +1,8 @@
 // See LICENSE for license details.
 // Oracle: SplitTransactionMMRegIO.maxReqRegisters, Widget.attachIO/genAndAttachReg, MCRIO.bindReg.
 // Materialization requires a free bank symbol and preserves top identity/annotations.
-// Attachment requires an uninstantiated GGFASEDReadAdmissionWrapper, host clock/reset,
-// four-bit admission inputs and the retained recorded ten-flight bridge profile.
+// Attachment requires an uninstantiated legacy or selected read-admission root,
+// host clock/reset, four-bit inputs and the retained ten-flight bridge profile.
 // Consumes/produces annotations: none; preserves and explicitly retargets all.
 // IR mutations: two host-clocked reset registers, a decoded MCR fragment for
 // words 2/3 (byte offsets 8/12), and a wrapper consuming both admission inputs.
@@ -18,7 +18,10 @@ using namespace circt::firrtl;
 
 namespace {
 constexpr llvm::StringLiteral bankName = "GGFASEDRequestLimits";
-constexpr llvm::StringLiteral wrapperName = "GGFASEDRequestLimitsWrapper";
+llvm::StringRef wrapperName(CircuitOp circuit) {
+  return circuit.getName() == "GGSelectedPrintFASEDReadAdmissionWrapper"
+      ? "GGSelectedPrintFASEDRequestLimitsWrapper" : "GGFASEDRequestLimitsWrapper";
+}
 constexpr llvm::StringLiteral controlName = "fased_request_limits_mcr";
 SmallVector<PortInfo> requestLimitPorts(MLIRContext *ctx) {
   OpBuilder b(ctx);
@@ -38,11 +41,12 @@ SmallVector<PortInfo> requestLimitPorts(MLIRContext *ctx) {
 LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
     unsigned (&indices)[4], std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDReadAdmissionWrapper")
+  if (circuit.getName() != "GGFASEDReadAdmissionWrapper" &&
+      circuit.getName() != "GGSelectedPrintFASEDReadAdmissionWrapper")
     return reject("FASED request limits require the active read admission wrapper");
   FModuleOp engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == wrapperName)
+    if (m.getName() == wrapperName(circuit))
       return reject("FASED request limit wrapper already exists");
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
@@ -52,7 +56,7 @@ LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
   auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getInt() != 10)
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() != 10)
     return reject("FASED request limits currently require the recorded ten-flight constructor");
   auto *ctx = circuit.getContext();
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
@@ -137,6 +141,7 @@ LogicalResult goldengate::attachFASEDRequestLimits(CircuitOp circuit,
   bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
   if (used) return reject("FASED request-limit attachment requires an uninstantiated bank");
+  auto name = wrapperName(circuit);
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto mcr = expected[3].type;
   std::optional<unsigned> clock = indices[0], reset = indices[1],
@@ -150,7 +155,7 @@ LogicalResult goldengate::attachFASEDRequestLimits(CircuitOp circuit,
   }
   ports.push_back({b.getStringAttr(controlName), mcr, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
-  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
+  auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(name), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), mmio = b.create<InstanceOp>(loc, bank, "requestLimits");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
@@ -164,7 +169,7 @@ LogicalResult goldengate::attachFASEDRequestLimits(CircuitOp circuit,
   connect(sim.getResult(*readLimit), field(mmio.getResult(2), "read"));
   b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArguments().back(), mmio.getResult(3));
 
-  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
+  std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + name.str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
     if (auto s = dyn_cast<StringAttr>(a)) {
@@ -175,7 +180,7 @@ LogicalResult goldengate::attachFASEDRequestLimits(CircuitOp circuit,
       if (ref.consume_front(modulePrefix)) {
         auto local = ref.take_front(ref.find_first_of(".["));
         for (auto i : copied) if (local == inner.getPortName(i)) {
-          suffix.replace(0, modulePrefix.size(), "|" + wrapperName.str() + ">"); break;
+          suffix.replace(0, modulePrefix.size(), "|" + name.str() + ">"); break;
         }
       }
       return b.getStringAttr(newPrefix + suffix);
@@ -184,7 +189,7 @@ LogicalResult goldengate::attachFASEDRequestLimits(CircuitOp circuit,
     if (auto d = dyn_cast<DictionaryAttr>(a)) { NamedAttrList vs; for (auto v : d) vs.set(v.getName(), retarget(v.getValue())); return vs.getDictionary(ctx); }
     return a;
   };
-  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
+  circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(name);
   return success();
 }
 

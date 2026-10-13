@@ -265,6 +265,12 @@ mlir::LogicalResult mapPrintBridgeFASEDReadAdmission(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach the allocated request-limit bank after selected read admission.
+/// Atomic; host-reset words 2/3 supply four-bit maxima and full-word readback.
+mlir::LogicalResult mapPrintBridgeFASEDRequestLimits(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.
