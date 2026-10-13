@@ -141,6 +141,7 @@
 #include "goldengate/BlockDevMMIOBank.h"
 #include "goldengate/TSIWordQueues.h"
 #include "goldengate/NICTokenQueues.h"
+#include "goldengate/NICPacketAdapters.h"
 #include "goldengate/TSIMMIOBank.h"
 #include "goldengate/ResetPulseBridge.h"
 #include "goldengate/PeekPokeCycleEngine.h"
@@ -4605,7 +4606,19 @@ int main(int argc, char **argv) {
         module->print(nicOut); nicOut << '\n'; nicOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, nicAnnotations, error)))
           return fail("NIC token queue annotations: " + error);
-        return fail("NIC CPU stream packet adapters and MMIO control binding are not implemented");
+        if (failed(goldengate::addNICPacketAdapters(circuit, error)))
+          return fail("NIC packet adapters: " + error);
+        if (failed(mlir::verify(*module))) return fail("NIC packet adapters produced invalid FIRRTL IR");
+        llvm::SmallString<256> packetPath(outputDir), packetAnnotations(outputDir);
+        llvm::sys::path::append(packetPath, "post-fame-nic-packet-adapters.mlir");
+        llvm::sys::path::append(packetAnnotations, "post-fame-nic-packet-adapters-all.json");
+        std::error_code packetError;
+        llvm::raw_fd_ostream packetOut(packetPath, packetError);
+        if (packetError) return fail("cannot write NIC packet adapters: " + packetError.message());
+        module->print(packetOut); packetOut << '\n'; packetOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, packetAnnotations, error)))
+          return fail("NIC packet adapter annotations: " + error);
+        return fail("NIC CPU stream allocation and MMIO control binding are not implemented");
       }
       if (failed(goldengate::assembleFPGATopShell(circuit, error)))
         return fail("FPGA top shell: " + error);

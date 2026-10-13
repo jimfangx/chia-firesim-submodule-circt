@@ -265,3 +265,85 @@ replay exits nonzero. Remaining failures are multiple/non-Rocket TracerV,
 FASED outstanding profiles beyond maxFlight=10, NIC packet/MMIO bindings,
 and partition/QSFP semantics. Compilation and annotation matches are partial
 evidence, not target behavioral or platform/ABI parity.
+
+
+## Iteration 170: native SimpleNIC packet adapters
+
+`addNICPacketAdapters` now runs after native NIC token queue assembly in the
+baseline compiler. It instantiates a decoder and encoder between the existing
+66-bit queue ports and explicit 512-bit CPU stream ports. The decoder holds
+its 32-bit token index on stalls and accepts a CPU packet only when the
+seventh NIC token is accepted. The encoder buffers six tokens in unreset
+registers, bypasses the seventh directly, and holds its index during output
+backpressure. Its 43-bit packet trace counter increments only on an accepted
+512-bit output packet. Host reset resets the three counters, preserving
+buffer contents. Payload layout is data `[511:64]`, seven last/ready/valid
+triplets `[63:43]`, and the packet counter `[42:0]`. Outgoing ready bits are
+one; incoming ready bits are unused at the queue boundary, matching the
+normal SimpleNIC widget. Loopback and multiple NIC modes remain unsupported.
+
+The compiler verifies and emits `post-fame-nic-packet-adapters.mlir` and
+`post-fame-nic-packet-adapters-all.json`. Stream allocation and MMIO control
+binding still cause an explicit compilation failure. The new boundary does
+not claim that a complete NIC FPGA design or driver is supported.
+
+`goldengate-nic-packet-adapters` CTest passes: verified FIRRTL geometry and
+instantiation, six unreset 66-bit buffers, 32/43-bit reset counters, consumed
+and copied target transfers, wrong-width rejection before mutation, repeated
+pass rejection, and no-NIC preservation. The standalone RTL fixture connects
+both instantiated adapters through a complete test top.
+
+`test/Transforms/NICPacketAdaptersCompare.py` lowers that actual native IR
+with firtool and compares it to the exact SFC modules
+`BigTokenToNICTokenAdapter` and `NICTokenToBigTokenAdapter` in:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+Ready/valid and payload comparisons pass over 40,000 standalone Verilator
+unit cycles, supplemented by independent packet-format and transaction
+scoreboards. Coverage: 21,318 decoded and 30,039 encoded token transactions,
+10,611 decoder stalls, 2,036 stalled seventh output tokens, 4,134 bypassed
+packets, 353 resets, and 14,345 input bubble cycles. This is compiler-unit RTL
+simulation; FireSim manager verification remains owned by the harness.
+
+Evidence and complete comparison/build/behavior logs are retained in:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration170-u250-target-matrix/nic-packets/
+```
+
+The next smallest step is allocating the NIC's 512-bit CPU streams alongside
+TracerV, with the oracle's 3,072-entry queues and distinct stream indices,
+before binding the NIC MMIO bank and driver collateral. Full-target behavioral
+comparison remains necessary after those boundaries are connected.
+
+The archived NIC target reaches both new adapter modules in `replay`.
+`nic-candidate-adapter-comparison.json` confirms that their complete module
+bodies and ports match the native fixture used in the SFC RTL differential.
+`nic-annotation-transfer.json` records preservation of all 1,792 annotation
+records after the explicit circuit/copied-port target transfer. The NIC
+compile fails specifically on CPU stream allocation and MMIO binding. Its
+nine BridgeIO and 58 channel connection records at bridge extraction match
+SFC; the later SRAM model-port mismatch remains unresolved.
+
+`no-nic-rtl-comparison.json` confirms that the single-core non-NIC Rocket RTL
+is unchanged from iteration 169 (SHA256
+`88b4a4760c0055046e67560e30294622d46bce18e426b373118d7dfbd586712a`).
+`immutable-rocket-comparison.json` rechecks the exact 2026-10-01 immutable
+`.sfc.fir`/`.anno.json` input hashes and U250 build-tree synthesis and
+implementation XDC. Normalized constraints match, with the same recorded
+`target/FireSim_` to `target_FAMETop/FireSim` implementation hierarchy rename.
+
+The complete thirteen-recipe replay uses compiler SHA256
+`6f91e8f9b9e26770c7f568ce3176220ec27cf98e86d99d716f46e248e3aa27eb`.
+`iteration170-u250-target-matrix/replay/matrix.json` and `matrix.md` retain
+one compiled target, six lowering failures and six unsupported partition
+profiles. All seven base bridge/channel annotation boundaries match SFC.
+Shuttle's model-port boundary matches; the other six retain the previously
+recorded SRAM differences. The replay correctly exits nonzero. Remaining
+failures are multiple/non-Rocket TracerV, FASED outstanding profiles beyond
+maxFlight=10, NIC stream/MMIO bindings, and partition/QSFP semantics. These
+annotation comparisons do not establish full target behavioral or ABI parity.
+No FireSim manager verification gate was initiated by this implementation turn.

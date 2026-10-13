@@ -148,6 +148,7 @@ add_executable(goldengate-circt
   lib/Transforms/TSITokenEngine.cpp
   lib/Transforms/TSIWordQueues.cpp
   lib/Transforms/NICTokenQueues.cpp
+  lib/Transforms/NICPacketAdapters.cpp
   lib/Transforms/TSIMMIOBank.cpp
   lib/Transforms/ControlReadArbiter.cpp
   lib/Transforms/ControlWriteArbiter.cpp
@@ -2019,4 +2020,16 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-nic-token-queues-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-nic-token-queues COMMAND goldengate-nic-token-queues-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-packet-adapters-test
+    test/Transforms/NICPacketAdaptersTest.cpp lib/Transforms/NICPacketAdapters.cpp)
+  target_compile_features(goldengate-nic-packet-adapters-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-packet-adapters-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-packet-adapters-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-packet-adapters-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-packet-adapters COMMAND goldengate-nic-packet-adapters-test)
 endif()
