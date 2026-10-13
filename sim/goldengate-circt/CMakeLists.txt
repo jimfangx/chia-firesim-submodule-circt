@@ -149,6 +149,7 @@ add_executable(goldengate-circt
   lib/Transforms/TSIWordQueues.cpp
   lib/Transforms/NICTokenQueues.cpp
   lib/Transforms/NICPacketAdapters.cpp
+  lib/Transforms/NICCPUStreamQueues.cpp
   lib/Transforms/TSIMMIOBank.cpp
   lib/Transforms/ControlReadArbiter.cpp
   lib/Transforms/ControlWriteArbiter.cpp
@@ -2032,4 +2033,17 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-nic-packet-adapters-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-nic-packet-adapters COMMAND goldengate-nic-packet-adapters-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-cpu-stream-queues-test
+    test/Transforms/NICCPUStreamQueuesTest.cpp lib/Transforms/NICCPUStreamQueues.cpp
+    lib/Transforms/CPUStreamQueue.cpp)
+  target_compile_features(goldengate-nic-cpu-stream-queues-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-cpu-stream-queues-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-cpu-stream-queues-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-cpu-stream-queues-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-cpu-stream-queues COMMAND goldengate-nic-cpu-stream-queues-test)
 endif()

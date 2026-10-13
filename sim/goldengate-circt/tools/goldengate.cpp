@@ -142,6 +142,7 @@
 #include "goldengate/TSIWordQueues.h"
 #include "goldengate/NICTokenQueues.h"
 #include "goldengate/NICPacketAdapters.h"
+#include "goldengate/NICCPUStreamQueues.h"
 #include "goldengate/TSIMMIOBank.h"
 #include "goldengate/ResetPulseBridge.h"
 #include "goldengate/PeekPokeCycleEngine.h"
@@ -4618,6 +4619,18 @@ int main(int argc, char **argv) {
         module->print(packetOut); packetOut << '\n'; packetOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, packetAnnotations, error)))
           return fail("NIC packet adapter annotations: " + error);
+        if (failed(goldengate::addNICCPUStreamQueues(circuit, error)))
+          return fail("NIC CPU stream queues: " + error);
+        if (failed(mlir::verify(*module))) return fail("NIC CPU stream queues produced invalid FIRRTL IR");
+        llvm::SmallString<256> streamQueuePath(outputDir), streamQueueAnnotations(outputDir);
+        llvm::sys::path::append(streamQueuePath, "post-fame-nic-cpu-stream-queues.mlir");
+        llvm::sys::path::append(streamQueueAnnotations, "post-fame-nic-cpu-stream-queues-all.json");
+        std::error_code streamQueueError;
+        llvm::raw_fd_ostream streamQueueOut(streamQueuePath, streamQueueError);
+        if (streamQueueError) return fail("cannot write NIC CPU stream queues: " + streamQueueError.message());
+        module->print(streamQueueOut); streamQueueOut << '\n'; streamQueueOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, streamQueueAnnotations, error)))
+          return fail("NIC CPU stream queue annotations: " + error);
         return fail("NIC CPU stream allocation and MMIO control binding are not implemented");
       }
       if (failed(goldengate::assembleFPGATopShell(circuit, error)))

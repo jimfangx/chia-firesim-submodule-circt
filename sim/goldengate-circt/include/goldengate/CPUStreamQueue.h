@@ -7,4 +7,7 @@ namespace goldengate {
 // and UInt<13> occupancy. Stream identity/index allocation belongs to callers.
 circt::firrtl::FModuleOp createCPUStreamQueue6144(
     circt::firrtl::CircuitOp circuit, llvm::StringRef name);
+// Same synchronous lookahead/reset policy, 3072x512 and UInt<12> count.
+circt::firrtl::FModuleOp createCPUStreamQueue3072(
+    circt::firrtl::CircuitOp circuit, llvm::StringRef name);
 }
