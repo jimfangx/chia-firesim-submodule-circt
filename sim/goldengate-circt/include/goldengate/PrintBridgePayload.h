@@ -204,6 +204,12 @@ mlir::LogicalResult mapPrintBridgeFASEDIngressDeadlock(
 mlir::LogicalResult mapPrintBridgeFASEDReadBuffer(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+/// Capture read requests and retire final response beats after selected storage.
+/// Atomic; retain prior IR, allocated headers and consumed annotation targets.
+mlir::LogicalResult mapPrintBridgeFASEDReadScheduler(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

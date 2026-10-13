@@ -21,8 +21,12 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
-  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDReadBufferWrapper\" { firrtl.module @GGFASEDReadBufferWrapper() {} } }",&ctx);
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false) {
+  llvm::StringRef rootName = selected ? "GGSelectedPrintFASEDReadBufferWrapper"
+                                      : "GGFASEDReadBufferWrapper";
+  std::string input = "module { firrtl.circuit \"" + rootName.str() +
+      "\" { firrtl.module @" + rootName.str() + "() {} } }";
+  auto root=parseSourceString<ModuleOp>(input,&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();(*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());
   auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> es){SmallVector<BundleType::BundleElement> fields;for(auto [n,w]:es)fields.push_back({b.getStringAttr(n),false,uint(w)});return BundleType::get(&ctx,fields);};
@@ -38,9 +42,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
   if(mode!=10){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     auto attrs=[&](std::initializer_list<std::pair<llvm::StringRef,int>> es){NamedAttrList list;for(auto [n,v]:es)list.set(n,b.getI64IntegerAttr(v));return list.getDictionary(&ctx);};
     engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxReadTransfer",8},{"idReuse",mode==11?2:1},{"maxFlight",10}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
-  if(mode==13||mode==14)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==13?"GGFASEDReadScheduler":"GGFASEDReadSchedulerWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==13||mode==14)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==13?"GGFASEDReadScheduler":selected?"GGSelectedPrintFASEDReadSchedulerWrapper":"GGFASEDReadSchedulerWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"used");}if(mode==16)c.setName("other");
-  SmallVector<Attribute> raw;for(auto n:{"other","fased_egress_readiness","fased_egress_readiness.readValid","fased_egress_readiness.writeValid","fased_read_buffer_address","fased_read_buffer_deq.valid","fased_read_buffer_deq.bits.data","fased_read_buffer_deq.bits.last"})raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~GGFASEDReadBufferWrapper|GGFASEDReadBufferWrapper>"+std::string(n)))}));
+  SmallVector<Attribute> raw;for(auto n:{"other","fased_egress_readiness","fased_egress_readiness.readValid","fased_egress_readiness.writeValid","fased_read_buffer_address","fased_read_buffer_deq.valid","fased_read_buffer_deq.bits.data","fased_read_buffer_deq.bits.last"})raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~"+c.getName().str()+"|"+c.getName().str()+">"+std::string(n)))}));
   if(mode!=12)c->setAttr("rawAnnotations",b.getArrayAttr(raw));return root;
 }
 struct Interpreter {
@@ -119,8 +123,8 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx,bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);require(succeeded(verify(*root)),"invalid scheduler IR");
   Interpreter sim(named(c,"GGFASEDReadScheduler"));auto valid=*sim.module.getOps<RegResetOp>().begin();auto id=*sim.module.getOps<RegOp>().begin();require(sim.state.size()==2,"scheduler state differs");
   std::mt19937_64 random(217);unsigned cases=0,chained=0,resetStarts=0,invalidRetire=0;
@@ -144,9 +148,9 @@ void behavior(MLIRContext &ctx) {
   }
   require(chained&&resetStarts&&invalidRetire,"scheduler edge coverage missing");llvm::outs()<<cases<<" scheduler edge cases, "<<chained<<" chained requests, "<<resetStarts<<" reset starts, "<<invalidRetire<<" invalid-buffer retirements passed\n";
 }
-void mapping(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);
-  Interpreter w(named(c,"GGFASEDReadSchedulerWrapper"));InstanceOp inner,scheduler;for(auto i:w.module.getOps<InstanceOp>())if(i.getName()=="sim")inner=i;else scheduler=i;
+void mapping(MLIRContext &ctx,bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);
+  Interpreter w(named(c,selected?"GGSelectedPrintFASEDReadSchedulerWrapper":"GGFASEDReadSchedulerWrapper"));InstanceOp inner,scheduler;for(auto i:w.module.getOps<InstanceOp>())if(i.getName()=="sim")inner=i;else scheduler=i;
   require(w.module.getNumPorts()==7,"wrapper port count differs");require(w.drivers.at(w.key(scheduler.getResult(0)))==w.arg(0),"clock mapping differs");
   for(unsigned flags=0;flags<32;++flags){w.memo.clear();auto f=[&](unsigned i){return flags>>i&1;};
     w.put(inner.getResult(1),"",f(0));w.put(inner.getResult(2),"",f(1));w.put(w.arg(4),"",f(2));w.put(scheduler.getResult(6),"hValid",f(3));w.put(w.arg(6),"tReady",f(4));
@@ -157,12 +161,16 @@ void mapping(MLIRContext &ctx) {
     w.put(scheduler.getResult(5),"",flags&15);require(w.output(inner.getResult(4),"",4).getZExtValue()==(flags&15),"address binding differs");
   }
   const llvm::StringRef refs[]{"|GGFASEDReadSchedulerWrapper>other","|GGFASEDReadBufferWrapper>fased_egress_readiness","|GGFASEDReadSchedulerWrapper>fased_read_egress_resp.hValid","|GGFASEDReadSchedulerWrapper>fased_write_egress_valid","|GGFASEDReadBufferWrapper>fased_read_buffer_address","|GGFASEDReadBufferWrapper>fased_read_buffer_deq.valid","|GGFASEDReadSchedulerWrapper>fased_read_egress_resp.tBits.data","|GGFASEDReadSchedulerWrapper>fased_read_egress_resp.tBits.last"};
-  auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw.size()==8,"lost annotations");for(unsigned i=0;i<8;++i)require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()=="~GGFASEDReadSchedulerWrapper"+refs[i].str(),"annotation target transfer differs");
+  auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw.size()==8,"lost annotations");
+  for(unsigned i=0;i<8;++i) {
+    std::string suffix=refs[i].str(); if(selected) suffix.insert(3,"SelectedPrint");
+    require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()=="~"+c.getName().str()+suffix,"annotation target transfer differs");
+  }
   llvm::outs()<<"32 wrapper mapping cases and eight target transfers passed\n";
 }
-void rejection(MLIRContext &ctx) {
-  for(unsigned mode=1;mode<=19;++mode){auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"20 atomic rejection cases passed\n";
+void rejection(MLIRContext &ctx,bool selected) {
+  for(unsigned mode=1;mode<=19;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"20 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{behavior(ctx);mapping(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected:{false,true}){behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

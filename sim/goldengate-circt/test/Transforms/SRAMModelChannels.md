@@ -6220,3 +6220,70 @@ Next smallest step: attach the existing native ReadEgress request scheduler to
 this selected read buffer, consuming raw dequeue address/readiness and preserving
 qualified token fire, egress reset and allocated identities. No harness-owned
 manager gate was started; the overall port remains open.
+
+### Iteration 148: selected Print ReadEgress request scheduling
+
+`mapPrintBridgeFASEDReadScheduler` extends the selected read-buffer boundary
+with the shared native `GGFASEDReadScheduler` and a selected wrapper. The shared
+pass accepts the legacy and selected roots, checks the exact uninstantiated
+clock/reset/fire/readiness/dequeue interface and recorded 35/64/4 no-ROB key,
+then captures requests, prefetches the new ID and retires accepted final beats.
+New requests win over retirement; reset clears only active-valid, and request
+ID capture remains unreset. Retirement/dequeue-ready intentionally do not add
+buffer-valid to the SFC token-fire condition. The selected composer validates
+allocated headers and verifies a clone before publishing only the two new
+modules. All prior module/port/SSA and attached annotation identities survive;
+the archived circuit/copied-port/mapped response-leaf targets transfer
+recursively, while consumed readiness/address/dequeue targets remain internal.
+The native CLI requires `--map-print-host-fased-read-buffer` before
+`--map-print-host-fased-read-scheduler` and emits final MLIR, full annotations
+and RTL. Both allocated header emitters recognize the new selected root.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration148-print-fased-read-scheduler`.
+Native compiler, Print binding, read scheduler and CPU managed-stream header
+binaries build successfully. Three focused CTests pass, with 32768 actual
+FIRRTL scheduler edges, 32 wrapper cases, eight target transfers and 20 atomic
+rejections for each legacy/selected root. Each exhaustive run includes 1024
+chained requests, 4096 reset-time starts and 1024 retirements without buffer
+valid. Both saved iteration-147 selected boundaries pass nine atomic composer
+rejections, unchanged old module/operation identities and allocated headers,
+and nine recursive circuit/copied/mapped/consumed target probes. Native CLI
+dependency and duplicate-flag rejection also pass.
+
+Both standalone full native CLI replays ingest the primary immutable compiler
+fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print
+annotations and the native Rocket control catalog, with and without TracerV.
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDReadSchedulerCompare.py` pins ReadEgress state, priority,
+prefetch, response payload and dequeue/valid equations plus the enclosing
+FASEDMemoryTimingModel's qualified reset/fire/request/response wiring. It
+interprets each candidate scheduler's actual SSA across 32768 cases and checks
+that the shared helper equals the previously oracle-compared native baseline.
+Both candidates match: all 125 / 119 prior module bodies survive, all 79 / 87
+wrapper connections and 1713 annotation records match intended transfers,
+and final emitted RTL preserves the two registers, reset/capture priority,
+response fields and qualified reset/token-fire binding. Metadata fields user
+and resp are optimized out of the SFC RTL; their retained zero values follow
+`junctions/nasti.scala` NastiReadDataChannel. Allocated Print headers and decoder
+collateral equal iteration 147 byte for byte. A comparison assertion initially
+rejected a line break after the emitted nonblocking assignment; allowing
+whitespace fixed the comparison without changing the compiler. Before-scheduler
+MLIR/JSON and final MLIR/JSON/SV remain raw; other own replay intermediates are
+compressed after comparison.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDReadScheduler,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDReadSchedulerTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDReadSchedulerCompare.py`, and this document.
+
+Risk: the SFC fixture disables Print, so this validates shared ReadEgress
+semantics and selected composition rather than full enabled-Print simulator
+parity. UART-bearing SFC differential remains pending. Timing-model and target
+response/token closure, write egress and selected platform assembly remain open.
+Next smallest step: attach the existing native WriteEgress acknowledgement
+counters/request scheduler to the selected read-scheduler root, retaining
+qualified reset/fire and allocated identities. No harness-owned manager gate
+was started; the overall port remains open.

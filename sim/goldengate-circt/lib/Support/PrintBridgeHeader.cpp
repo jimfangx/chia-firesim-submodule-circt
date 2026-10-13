@@ -184,6 +184,7 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
       circuit.getName() == "GGSelectedPrintFASEDIngressOrderWrapper" ||
       circuit.getName() == "GGSelectedPrintFASEDIngressIssueWrapper" ||
       circuit.getName() == "GGSelectedPrintFASEDReadBufferWrapper" ||
+      circuit.getName() == "GGSelectedPrintFASEDReadSchedulerWrapper" ||
        circuit.getName() == "GGSelectedPrintCPUStreamPlatformWrapper";
   if ((!rocket && !selected) || hosts.empty())
     return reject("allocated Print header requires the selected control master or Rocket F1Shim and queued hosts");

@@ -5,6 +5,14 @@
 // accepted final beat. Neither retirement nor dequeue-ready includes the
 // buffer's valid bit: token readiness guarantees that on legal target cycles.
 // Timing-model requests/response payload remain explicit until model lowering.
+// Required input: uninstantiated legacy or selected Print read-buffer top,
+// exact clock/reset/fire/readiness/dequeue ports, recorded 35/64/4 no-ROB key.
+// Annotations: consume none; transfer copied ports and mapped response leaves
+// recursively in rawAnnotations; retain targets of consumed internal ports.
+// IR mutations: append shared scheduler and wrapper, replace circuit root/archive.
+// Analyses: require constructor/port identity; preserve all existing module,
+// port, SSA and attached annotation identities. Output is verified FIRRTL with
+// explicit timing-model request/response ports and qualified reset/token fire.
 #include "goldengate/FASEDReadScheduler.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -13,9 +21,11 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDReadScheduler(CircuitOp circuit, std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDReadScheduler";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDReadSchedulerWrapper";
+  bool selected = circuit.getName() == "GGSelectedPrintFASEDReadBufferWrapper";
+  llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDReadSchedulerWrapper"
+                                        : "GGFASEDReadSchedulerWrapper";
   auto reject = [&](llvm::StringRef s) { error=s.str();return failure(); };
-  if (circuit.getName() != "GGFASEDReadBufferWrapper")
+  if (!selected && circuit.getName() != "GGFASEDReadBufferWrapper")
     return reject("FASED read scheduler requires the active read buffer wrapper");
   FModuleOp inner,engine;
   for (auto m:circuit.getOps<FModuleLike>()) {

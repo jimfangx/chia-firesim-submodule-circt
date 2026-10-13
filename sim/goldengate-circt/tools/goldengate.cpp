@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer]]]]]]]]]]]]]]]]]] "
+                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler]]]]]]]]]]]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -412,6 +412,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDIngress = false, mapPrintHostFASEDIngressCredits = false;
   bool mapPrintHostFASEDIngressOrder = false, mapPrintHostFASEDIngressIssue = false;
   bool mapPrintHostFASEDIngressDeadlock = false, mapPrintHostFASEDReadBuffer = false;
+  bool mapPrintHostFASEDReadScheduler = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -431,6 +432,11 @@ int main(int argc, char **argv) {
         // standalone post-FAME binding boundary, without returning at import.
         materializePrintTokens = materializePrintControls =
             materializePrintHosts = bindPrintHostConstructors = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-read-scheduler") {
+        if (mapPrintHostFASEDReadScheduler) return fail("duplicate --map-print-host-fased-read-scheduler");
+        mapPrintHostFASEDReadScheduler = true;
         continue;
       }
       if (option == "--map-print-host-fased-read-buffer") {
@@ -581,6 +587,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-cpu-response-buffer requires --map-print-host-cpu-read-buffer");
   if (mapPrintHostCPUWriteResponseBuffer && !mapPrintHostCPUResponseBuffer)
     return fail("--map-print-host-cpu-write-response-buffer requires --map-print-host-cpu-response-buffer");
+  if (mapPrintHostFASEDReadScheduler && !mapPrintHostFASEDReadBuffer)
+    return fail("--map-print-host-fased-read-scheduler requires --map-print-host-fased-read-buffer");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
     return fail("--map-print-host-fased-read-buffer requires --map-print-host-fased-ingress-deadlock");
   if (mapPrintHostFASEDIngressDeadlock && !mapPrintHostFASEDIngressIssue)
@@ -999,6 +1007,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED read buffer output: " + error);
         llvm::outs() << "Attached selected Print FASED sixteen synchronous 8-beat read response queues in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDReadScheduler) {
+        if (failed(goldengate::mapPrintBridgeFASEDReadScheduler(circuit, hosts, error)))
+          return fail("PrintBridge FASED read scheduler: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-read-scheduler.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-read-scheduler.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-read-scheduler-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED read scheduler MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED read scheduler output: " + error);
+        llvm::outs() << "Attached selected Print FASED read request capture and final-beat retirement in " << tokenIR << '\n';
       }
       return 0;
     }
