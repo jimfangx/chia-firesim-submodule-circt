@@ -6093,3 +6093,60 @@ step: attach the native qualified AW/W deadlock checks to selected ingress
 queues, forwarding credit/order context through the existing selected wrappers,
 before host timing and egress. No harness-owned manager gate was started here;
 the overall port remains open.
+
+### Iteration 146: selected Print qualified ingress deadlock assertions
+
+The shared native `addFASEDIngressDeadlock` now accepts the selected Print issue
+root and its unique six-instance ingress chain. The assertion helper remains
+identical to the baseline native implementation. It observes actual AW/W enqueue
+valid and ready, with relaxed credit emptiness or strict order unavailability;
+it does not observe accepted enqueue pulses. Qualified ingress reset disables
+both assertions on the host clock.
+
+`mapPrintBridgeFASEDIngressDeadlock` validates allocated Print collateral and
+verifies the entire propagation on a clone before applying the deterministic
+shared pass to live IR. Six internal policy inputs are appended without changing
+existing port indices, types, annotations or targets. The six chain instances
+are rebuilt with old results retargeted; prior module and ordinary operation
+identities remain intact. The root name, external ports and raw annotation
+archive remain unchanged. Native CLI flag
+`--map-print-host-fased-ingress-deadlock` requires the completed issue boundary
+and emits `post-print-fased-ingress-deadlock.{mlir,sv}` and the full JSON archive.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration146-print-fased-deadlock`.
+The native compiler, Print binding test and deadlock test build successfully.
+Both targeted CTest suites pass in 5.84 seconds. Legacy and selected interpreter
+fixtures each check 512 Boolean cases (32 W and 32 AW failures), six policy
+ports and 16 atomic rejections. Focused composition tests on both iteration-145
+issue candidates pass nine atomic rejections each, preserving modules, ordinary
+SSA operations, existing ports, raw annotations and allocated headers. CLI
+missing-dependency and duplicate-flag rejection precede input/output access.
+
+Both complete standalone native CLI replays ingest the primary immutable
+compiler fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected
+Print annotations and the native Rocket control catalog, with and without
+TracerV. Allocated headers and decoder collateral match iteration 145 exactly.
+
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDIngressDeadlockCompare.py` pins the actual `IngressModule`
+AW/W deadlock predicates, reset guards and assertion messages. Each candidate
+passes all 512 native predicate cases, exact six-port context forwarding,
+actual enqueue and qualified clock/reset wiring, and emitted SV policy,
+enqueue predicates and reset guards. The helper equals the shared native
+baseline. All 115 / 109 modules outside the seven-module chain, 489 / 537 chain
+connections and 1713 annotation rows retain their intended identities. The
+previous issue helper still passes 32768 cases and 160 simultaneous AW/final-W
+collisions per candidate. Before-issue and after-deadlock MLIR/JSON plus final
+SV remain raw; other own replay intermediates are compressed after comparison.
+
+Risk: the SFC fixture disables Print, so this proves shared ingress assertion
+semantics and their selected attachment, not complete enabled-Print simulator
+parity. The preceding harness CIRCT replacertl/Verilator passes remain baseline
+evidence, and the Rocket UART-bearing SFC differential is pending. Selected
+egress, timing and full platform composition remain open. Next smallest step:
+attach the existing native non-ROB ReadEgress sixteen-ID, eight-beat response
+queues at this selected issue boundary, preserving qualified egress reset and
+allocated identities before response scheduling. No harness-owned manager gate
+was started in this iteration; the overall port remains open.

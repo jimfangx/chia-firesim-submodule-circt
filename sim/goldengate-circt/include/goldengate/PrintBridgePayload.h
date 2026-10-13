@@ -193,6 +193,12 @@ mlir::LogicalResult mapPrintBridgeFASEDIngressOrder(
 mlir::LogicalResult mapPrintBridgeFASEDIngressIssue(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
+// Append qualified host-clock AW/W enqueue assertions after selected issue.
+// Atomic; retain existing port indices, module/ordinary SSA identities, raw
+// annotations and allocated collateral while extending six internal instances.
+mlir::LogicalResult mapPrintBridgeFASEDIngressDeadlock(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<circt::firrtl::FModuleOp> hosts, std::string &error);
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

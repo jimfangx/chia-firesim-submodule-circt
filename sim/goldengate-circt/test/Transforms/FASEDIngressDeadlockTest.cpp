@@ -16,10 +16,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressIssueWrapper\" { firrtl.module @GGFASEDIngressIssueWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse");
   auto c=*root->getOps<CircuitOp>().begin();(*c.getOps<FModuleOp>().begin()).erase();
+  if (selected) c.setName("GGSelectedPrintFASEDIngressIssueWrapper");
   OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());
   auto bit=UIntType::get(&ctx,1,false); auto clock=ClockType::get(&ctx);
   auto token=BundleType::get(&ctx,{{b.getStringAttr("ready"),true,bit},
@@ -30,7 +31,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
       {b.getStringAttr("writeReqDone"),false,bit}});
   auto make=[&](llvm::StringRef name,ArrayRef<PortInfo> ports) {
     b.setInsertionPointToEnd(c.getBodyBlock());
-    return b.create<FModuleOp>(c.getLoc(),b.getStringAttr(name),ConventionAttr::get(&ctx,Convention::Internal),ports);
+    std::string selectedName = name.str();
+    if (selected && name.ends_with("Wrapper")) selectedName.replace(0, 2, "GGSelectedPrint");
+    return b.create<FModuleOp>(c.getLoc(),b.getStringAttr(selectedName),ConventionAttr::get(&ctx,Convention::Internal),ports);
   };
   SmallVector<PortInfo> base{{b.getStringAttr("clock"),clock,Direction::In},
       {b.getStringAttr("reset"),bit,Direction::In}};
@@ -78,8 +81,8 @@ struct Eval {
     throw std::runtime_error("unsupported predicate");
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
+void behavior(MLIRContext &ctx, bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();
   auto raw=c->getAttr("rawAnnotations");auto top=named(c,c.getName());auto oldPorts=top.getPorts();
   std::string error;require(succeeded(goldengate::addFASEDIngressDeadlock(c,error)),error);
   require(succeeded(verify(*root)),"invalid deadlock IR");
@@ -112,14 +115,14 @@ void behavior(MLIRContext &ctx) {
   require(contexts==6,"wrong wrapper chain");
   llvm::outs()<<"512 deadlock cases (32 W and 32 AW failures), six internal policy ports passed\n";
 }
-void rejection(MLIRContext &ctx) {
+void rejection(MLIRContext &ctx, bool selected) {
   for(unsigned mode=1;mode<=15;++mode) {
-    auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
+    auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
     {llvm::raw_string_ostream out(before);root->print(out);}
     require(failed(goldengate::addFASEDIngressDeadlock(c,error))&&!error.empty(),"invalid ingress accepted");
     {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");
   }
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
   require(succeeded(goldengate::addFASEDIngressDeadlock(c,error)),error);
   {llvm::raw_string_ostream out(before);root->print(out);}
   require(failed(goldengate::addFASEDIngressDeadlock(c,error)),"repeat accepted");
@@ -129,6 +132,6 @@ void rejection(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {behavior(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
+  try {for (bool selected : {false, true}) {behavior(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

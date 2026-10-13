@@ -15,12 +15,18 @@ LogicalResult goldengate::addFASEDIngressDeadlock(CircuitOp circuit,
   auto reject = [&](llvm::StringRef message) { error = message.str(); return failure(); };
   constexpr llvm::StringLiteral helperName = "GGFASEDIngressDeadlock";
   constexpr llvm::StringLiteral contextName = "fased_ingress_deadlock_context";
-  if (circuit.getName() != "GGFASEDIngressIssueWrapper" ||
+  const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressIssueWrapper";
+  if ((!selected && circuit.getName() != "GGFASEDIngressIssueWrapper") ||
       !circuit->getAttrOfType<ArrayAttr>("rawAnnotations"))
     return reject("FASED deadlock checks require the active issue wrapper and annotations");
-  const llvm::StringRef names[]{"GGFASEDIngressIssueWrapper", "GGFASEDIngressOrderWrapper",
+  const llvm::StringRef legacy[]{"GGFASEDIngressIssueWrapper", "GGFASEDIngressOrderWrapper",
       "GGFASEDIngressCreditsWrapper", "GGFASEDIngressARQueueWrapper",
       "GGFASEDIngressWQueueWrapper", "GGFASEDIngressAWWrapper", "GGFASEDIngressAW"};
+  const llvm::StringRef print[]{"GGSelectedPrintFASEDIngressIssueWrapper",
+      "GGSelectedPrintFASEDIngressOrderWrapper", "GGSelectedPrintFASEDIngressCreditsWrapper",
+      "GGSelectedPrintFASEDIngressARQueueWrapper", "GGSelectedPrintFASEDIngressWQueueWrapper",
+      "GGSelectedPrintFASEDIngressAWWrapper", "GGFASEDIngressAW"};
+  auto names = selected ? ArrayRef<llvm::StringRef>(print) : ArrayRef<llvm::StringRef>(legacy);
   SmallVector<FModuleOp> modules;
   for (auto name : names) {
     FModuleOp found;

@@ -27,6 +27,7 @@
 #include "mlir/IR/SymbolTable.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/APSInt.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/StringSet.h"
 #include "llvm/Support/FileSystem.h"
 #include "llvm/Support/raw_ostream.h"
@@ -6086,6 +6087,81 @@ int main(int argc, char **argv) {
       require(failed(goldengate::mapPrintBridgeFASEDIngressCredits(c, hostsFor(c), error)) && dump(*source) == before,
           "selected FASED ingress credits repeat mutated IR");
       llvm::outs() << "PASS selected FASED ingress credits, unchanged allocated headers/SSA, 9 atomic rejections\n";
+      return 0;
+    }
+    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-ingress-deadlock") {
+      auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
+      require(bool(source) && succeeded(verify(*source)), "invalid selected ingress issue boundary");
+      auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
+      auto hostsFor = [&](CircuitOp circuit) {
+        SmallVector<FModuleOp> hosts;
+        for (auto attr : named(circuit, "GGPrintBridgeHostWrapper")->getAttrOfType<ArrayAttr>("goldengate.printHostBindings"))
+          hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
+        return hosts;
+      };
+      const StringRef chain[]{"GGSelectedPrintFASEDIngressIssueWrapper", "GGSelectedPrintFASEDIngressOrderWrapper",
+          "GGSelectedPrintFASEDIngressCreditsWrapper", "GGSelectedPrintFASEDIngressARQueueWrapper",
+          "GGSelectedPrintFASEDIngressWQueueWrapper", "GGSelectedPrintFASEDIngressAWWrapper", "GGFASEDIngressAW"};
+      for (unsigned bad = 0; bad < 8; ++bad) {
+        OwningOpRef<ModuleOp> test(cast<ModuleOp>(source->clone()));
+        auto tc = *test->getOps<CircuitOp>().begin(); auto hs = hostsFor(tc);
+        if (bad == 0) tc.setName("Wrong");
+        else if (bad == 1) tc->removeAttr("rawAnnotations");
+        else if (bad == 2) hs.clear();
+        else if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
+        else if (bad == 4) {
+          b.setInsertionPointToEnd(tc.getBodyBlock());
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr("GGFASEDIngressDeadlock"),
+              named(tc, chain[0]).getConventionAttr(), ArrayRef<PortInfo>{});
+        } else if (bad == 5) {
+          auto m = named(tc, chain[3]);
+          PortInfo port{b.getStringAttr("fased_ingress_deadlock_context"), UIntType::get(&ctx, 1, false), Direction::In};
+          SmallVector<std::pair<unsigned, PortInfo>> added{{m.getNumPorts(), port}};
+          m.insertPorts(added);
+        } else if (bad == 6) {
+          auto m = named(tc, chain[0]); b.setInsertionPointToEnd(m.getBodyBlock());
+          b.create<InstanceOp>(tc.getLoc(), named(tc, "GGFASEDIngressAW"), "shared");
+        } else {
+          auto m = named(tc, "GGFASEDIngressAW"); b.setInsertionPointToEnd(m.getBodyBlock());
+          b.create<InstanceOp>(tc.getLoc(), named(tc, "GGFASEDIngressAWQueue10"), "ingressDeadlock");
+        }
+        auto before = dump(*test);
+        require(failed(goldengate::mapPrintBridgeFASEDIngressDeadlock(tc, hs, error)) && !error.empty() && dump(*test) == before,
+            "selected FASED deadlock rejection mutated IR " + std::to_string(bad));
+      }
+      SmallVector<FModuleOp> modules; SmallVector<Operation *> retained;
+      std::map<std::string, SmallVector<PortInfo>> ports;
+      auto inChain = [&](StringRef n) { return llvm::is_contained(chain, n); };
+      for (auto m : c.getOps<FModuleOp>()) {
+        modules.push_back(m); ports[m.getName().str()] = m.getPorts();
+        for (auto &op : m.getBodyBlock()->getOperations()) {
+          auto i = dyn_cast<InstanceOp>(op);
+          if (!i || !inChain(i.getModuleName())) retained.push_back(&op);
+        }
+      }
+      auto raw = c->getAttr("rawAnnotations"); std::string beforeHeader, afterHeader;
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
+      require(succeeded(goldengate::mapPrintBridgeFASEDIngressDeadlock(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      for (auto m : modules) {
+        require(named(c, m.getName()) == m, "selected deadlock replaced prior module");
+        auto old = ports.at(m.getName().str());
+        require(m.getNumPorts() == old.size() + (inChain(m.getName()) && m.getName() != chain[0]), "unexpected policy port extension");
+        for (auto [j, p] : llvm::enumerate(old)) {
+          auto updated = m.getPorts()[j];
+          require(updated.name == p.name && updated.type == p.type && updated.direction == p.direction &&
+              updated.annotations == p.annotations, "selected deadlock changed existing port identity");
+        }
+      }
+      llvm::DenseSet<Operation *> live;
+      c.walk([&](Operation *op) { live.insert(op); });
+      for (auto *op : retained) require(live.contains(op), "selected deadlock replaced ordinary operation");
+      require(c->getAttr("rawAnnotations") == raw, "selected deadlock changed target archive");
+      require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), afterHeader, error)) && beforeHeader == afterHeader,
+          "selected deadlock changed allocated collateral: " + error);
+      auto before = dump(*source);
+      require(failed(goldengate::mapPrintBridgeFASEDIngressDeadlock(c, hostsFor(c), error)) && dump(*source) == before,
+          "selected deadlock repeat mutated IR");
+      llvm::outs() << "PASS selected FASED deadlock, retained modules/ports/ordinary SSA/annotations/headers, 9 atomic rejections\n";
       return 0;
     }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-ingress-issue") {

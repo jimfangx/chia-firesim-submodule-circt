@@ -2427,6 +2427,28 @@ LogicalResult goldengate::mapPrintBridgeFASEDIngressIssue(CircuitOp circuit,
   return success();
 }
 
+// Verify the complete context propagation on a clone before applying the same
+// deterministic, preflight-only rejecting pass to the live IR. Retain module,
+// existing port and ordinary operation identities; only the six chain instances
+// are rebuilt to append policy inputs, with every existing use retargeted.
+LogicalResult goldengate::mapPrintBridgeFASEDIngressDeadlock(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDIngressIssueWrapper") {
+    error = "selected Print FASED deadlock checks require the completed issue boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(addFASEDIngressDeadlock(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED deadlock checks produced invalid FIRRTL IR";
+    return failure();
+  }
+  return addFASEDIngressDeadlock(circuit, error);
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(
