@@ -15,9 +15,11 @@ using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDWriteLatency(CircuitOp circuit,
                                              std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDWriteLatency10";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDWriteLatencyWrapper";
+  bool selectedPrint = circuit.getName() == "GGSelectedPrintFASEDReadLatencyWrapper";
+  llvm::StringRef wrapperName = selectedPrint ? "GGSelectedPrintFASEDWriteLatencyWrapper"
+                                            : "GGFASEDWriteLatencyWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDReadLatencyWrapper")
+  if (!selectedPrint && circuit.getName() != "GGFASEDReadLatencyWrapper")
     return reject("FASED write latency requires the active read latency wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {

@@ -22,8 +22,9 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
-  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDWriteLatencyWrapper\" { firrtl.module @GGFASEDWriteLatencyWrapper() {} } }",&ctx);
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false) {
+  std::string input = selected ? "GGSelectedPrintFASEDWriteLatencyWrapper" : "GGFASEDWriteLatencyWrapper";
+  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"" + input + "\" { firrtl.module @" + input + "() {} } }",&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
   auto u=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=u(1);
@@ -53,15 +54,15 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   if(mode!=11){auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     if(mode!=17)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({
       b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==16?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));}
-  if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?"GGFASEDTimingAWQueue10":"GGFASEDTimingAWQueueWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?"GGFASEDTimingAWQueue10":selected?"GGSelectedPrintFASEDTimingAWQueueWrapper":"GGFASEDTimingAWQueueWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   if(mode==18)c.setName("wrong");
   if(mode!=12)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~GGFASEDWriteLatencyWrapper"),
-      b.getStringAttr("~GGFASEDWriteLatencyWrapper|GGFASEDWriteLatencyWrapper>other"),
-      b.getStringAttr("~GGFASEDWriteLatencyWrapper|GGFASEDWriteLatencyWrapper>fased_write_completion.bits.id"),
-      b.getStringAttr("~GGFASEDWriteLatencyWrapper|GGFASEDWriteLatencyWrapper>fased_timing_requests.aw.bits.id"),
-      b.getStringAttr("~GGFASEDWriteLatencyWrapper|GGFASEDTokenEngine>state")}))})}));
+    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~"+input),
+      b.getStringAttr("~"+input+"|"+input+">other"),
+      b.getStringAttr("~"+input+"|"+input+">fased_write_completion.bits.id"),
+      b.getStringAttr("~"+input+"|"+input+">fased_timing_requests.aw.bits.id"),
+      b.getStringAttr("~"+input+"|GGFASEDTokenEngine>state")}))})}));
   return root;
 }
 struct Interpreter {
@@ -154,8 +155,8 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx, bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDTimingAWQueue(c,error)),error);require(succeeded(verify(*root)),"invalid write latency IR");
   Interpreter sim(named(c,"GGFASEDTimingAWQueue10"));auto assertion=*sim.module.getOps<AssertOp>().begin();
   require(sim.ram.getDepth()==10 && sim.ram.getReadLatency()==0 && sim.ram.getWriteLatency()==1,"RAM geometry differs");
@@ -193,9 +194,9 @@ void behavior(MLIRContext &ctx) {
   require(flows&&fullPops&&stalls&&stalledResets&&wraps&&resetWrites,"queue coverage missing");
   llvm::outs()<<cases<<" timing AW queue transitions passed; flow="<<flows<<", full pops="<<fullPops<<", stalls="<<stalls<<", stalled resets="<<stalledResets<<", wraps="<<wraps<<", reset writes="<<resetWrites<<"\n";
 }
-void mapping(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDTimingAWQueue(c,error)),error);
-  auto top=named(c,"GGFASEDTimingAWQueueWrapper"),inner=named(c,"GGFASEDWriteLatencyWrapper");require(top.getNumPorts()==7,"wrapper port count differs");
+void mapping(MLIRContext &ctx, bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDTimingAWQueue(c,error)),error);
+  auto top=named(c,selected?"GGSelectedPrintFASEDTimingAWQueueWrapper":"GGFASEDTimingAWQueueWrapper"),inner=named(c,selected?"GGSelectedPrintFASEDWriteLatencyWrapper":"GGFASEDWriteLatencyWrapper");require(top.getNumPorts()==7,"wrapper port count differs");
   const unsigned copied[]{0,1,2,3,5};for(unsigned i=0;i<5;++i)require(top.getPorts()[i].name==inner.getPorts()[copied[i]].name&&top.getPorts()[i].type==inner.getPorts()[copied[i]].type&&top.getPorts()[i].direction==inner.getPorts()[copied[i]].direction,"copied boundary differs");
   auto it=top.getOps<InstanceOp>().begin();auto sim=*it++;auto q=*it;Interpreter w(top);
   for(unsigned flags=0;flags<64;++flags){w.memo.clear();
@@ -211,16 +212,23 @@ void mapping(MLIRContext &ctx) {
     require(w.output(w.arg(6),"",1).getZExtValue()==capacity,"capacity observation differs");}
   auto ts=cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<ArrayAttr>("targets");
   const llvm::StringRef expected[]{"~GGFASEDTimingAWQueueWrapper","~GGFASEDTimingAWQueueWrapper|GGFASEDTimingAWQueueWrapper>other","~GGFASEDTimingAWQueueWrapper|GGFASEDWriteLatencyWrapper>fased_write_completion.bits.id","~GGFASEDTimingAWQueueWrapper|GGFASEDTimingAWQueueWrapper>fased_timing_requests.aw.bits.id","~GGFASEDTimingAWQueueWrapper|GGFASEDTokenEngine>state"};
-  for(unsigned i=0;i<5;++i)require(cast<StringAttr>(ts[i]).getValue()==expected[i],"target transfer differs");llvm::outs()<<"64 wrapper mapping cases and five target transfers passed\n";
+  for(unsigned i=0;i<5;++i) {
+    std::string target = expected[i].str();
+    if (selected) for (auto name : {"GGFASEDTimingAWQueueWrapper", "GGFASEDWriteLatencyWrapper"}) {
+      size_t pos = 0; std::string from(name), to = "GGSelectedPrint" + from.substr(2);
+      while ((pos = target.find(from,pos)) != std::string::npos) { target.replace(pos,from.size(),to); pos += to.size(); }
+    }
+    require(cast<StringAttr>(ts[i]).getValue()==target,"target transfer differs");
+  }llvm::outs()<<"64 wrapper mapping cases and five target transfers passed\n";
 }
 
-void rejection(MLIRContext &ctx) {
-  for(unsigned mode=1;mode<=21;++mode){auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
+void rejection(MLIRContext &ctx, bool selected) {
+  for(unsigned mode=1;mode<=21;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
     {llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDTimingAWQueue(c,error))&&!error.empty(),"invalid boundary accepted");
     {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDTimingAWQueue(c,error)),error);
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDTimingAWQueue(c,error)),error);
   {llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDTimingAWQueue(c,error)),"repeat accepted");
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"22 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{behavior(ctx);mapping(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for (bool selected : {false,true}) {behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

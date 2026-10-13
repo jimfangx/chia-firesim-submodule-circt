@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Oracle: TimingModel.scala 234-254, LatencyPipe.awQueue (SFC Queue_14).
-// Required input invariants: uninstantiated GGFASEDWriteLatencyWrapper, recorded
+// Required input invariants: uninstantiated legacy or selected Print write latency top, recorded
 // 35/64/4-bit LatencyPipe profile, exact model clock/reset/fire, request and
 // completion bundles. Only ID is used from AW metadata in this no-LLC model.
 // Annotations consumed/produced: none. Retained targets on copied ports move to
@@ -21,9 +21,11 @@ using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDTimingAWQueue(CircuitOp circuit,
                                              std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDTimingAWQueue10";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDTimingAWQueueWrapper";
+  bool selectedPrint = circuit.getName() == "GGSelectedPrintFASEDWriteLatencyWrapper";
+  llvm::StringRef wrapperName = selectedPrint ? "GGSelectedPrintFASEDTimingAWQueueWrapper"
+                                            : "GGFASEDTimingAWQueueWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDWriteLatencyWrapper")
+  if (!selectedPrint && circuit.getName() != "GGFASEDWriteLatencyWrapper")
     return reject("FASED timing AW queue requires the active write latency wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {

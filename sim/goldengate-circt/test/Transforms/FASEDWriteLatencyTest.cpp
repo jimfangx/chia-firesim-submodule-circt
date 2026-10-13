@@ -17,6 +17,9 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+bool selectedPrint = false;
+llvm::StringRef oldRoot() { return selectedPrint ? "GGSelectedPrintFASEDReadLatencyWrapper" : "GGFASEDReadLatencyWrapper"; }
+llvm::StringRef newRoot() { return selectedPrint ? "GGSelectedPrintFASEDWriteLatencyWrapper" : "GGFASEDWriteLatencyWrapper"; }
 void require(bool ok, llvm::StringRef why) { if (!ok) throw std::runtime_error(why.str()); }
 FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
@@ -24,7 +27,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
 }
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDReadLatencyWrapper\" { firrtl.module @GGFASEDReadLatencyWrapper() {} } }",&ctx);
-  require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();
+  require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();c.setName(oldRoot());
   (*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
   auto u=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=u(1);
   auto payload=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> fields){
@@ -45,15 +48,15 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   if(mode!=11){auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     if(mode!=17)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({
       b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==16?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));}
-  if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?"GGFASEDWriteLatency10":"GGFASEDWriteLatencyWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?llvm::StringRef("GGFASEDWriteLatency10"):newRoot()),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   if(mode==18)c.setName("wrong");
   if(mode!=12)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~GGFASEDReadLatencyWrapper"),
-      b.getStringAttr("~GGFASEDReadLatencyWrapper|GGFASEDReadLatencyWrapper>other"),
-      b.getStringAttr("~GGFASEDReadLatencyWrapper|GGFASEDReadLatencyWrapper>fased_next_write.bits.id"),
-      b.getStringAttr("~GGFASEDReadLatencyWrapper|GGFASEDReadLatencyWrapper>fased_write_release_cycle"),
-      b.getStringAttr("~GGFASEDReadLatencyWrapper|GGFASEDTokenEngine>state")}))})}));
+    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~" + oldRoot().str()),
+      b.getStringAttr("~" + oldRoot().str() + "|" + oldRoot().str() + ">other"),
+      b.getStringAttr("~" + oldRoot().str() + "|" + oldRoot().str() + ">fased_next_write.bits.id"),
+      b.getStringAttr("~" + oldRoot().str() + "|" + oldRoot().str() + ">fased_write_release_cycle"),
+      b.getStringAttr("~" + oldRoot().str() + "|GGFASEDTokenEngine>state")}))})}));
   return root;
 }
 struct Interpreter {
@@ -191,7 +194,7 @@ void behavior(MLIRContext &ctx) {
 }
 void mapping(MLIRContext &ctx) {
   auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDWriteLatency(c,error)),error);
-  auto top=named(c,"GGFASEDWriteLatencyWrapper"),inner=named(c,"GGFASEDReadLatencyWrapper");require(top.getNumPorts()==7,"wrapper port count differs");
+  auto top=named(c,newRoot()),inner=named(c,oldRoot());require(top.getNumPorts()==7,"wrapper port count differs");
   const unsigned copied[]{0,1,2,3,6};for(unsigned i=0;i<5;++i)require(top.getPorts()[i].name==inner.getPorts()[copied[i]].name&&top.getPorts()[i].type==inner.getPorts()[copied[i]].type&&top.getPorts()[i].direction==inner.getPorts()[copied[i]].direction,"copied boundary differs");
   auto it=top.getOps<InstanceOp>().begin();auto sim=*it++;auto latency=*it;Interpreter w(top);
   for(unsigned flags=0;flags<16;++flags){w.memo.clear();w.put(sim.getResult(1),"",flags&1);w.put(sim.getResult(2),"",(flags>>1)&1);
@@ -205,7 +208,8 @@ void mapping(MLIRContext &ctx) {
     w.put(latency.getResult(5),"valid",1);w.put(latency.getResult(5),"bits.id",7);w.put(sim.getResult(5),"ready",1);
     require(w.output(sim.getResult(5),"valid",1).getZExtValue()==1 && w.output(sim.getResult(5),"bits.id",4).getZExtValue()==7 && w.output(latency.getResult(5),"ready",1).getZExtValue()==1,"write response binding differs");}
   auto ts=cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<ArrayAttr>("targets");
-  const llvm::StringRef expected[]{"~GGFASEDWriteLatencyWrapper","~GGFASEDWriteLatencyWrapper|GGFASEDWriteLatencyWrapper>other","~GGFASEDWriteLatencyWrapper|GGFASEDReadLatencyWrapper>fased_next_write.bits.id","~GGFASEDWriteLatencyWrapper|GGFASEDReadLatencyWrapper>fased_write_release_cycle","~GGFASEDWriteLatencyWrapper|GGFASEDTokenEngine>state"};
+  const std::string prefix = "~" + newRoot().str(), copiedPrefix = prefix + "|" + newRoot().str() + ">", retained = prefix + "|" + oldRoot().str() + ">";
+  const std::string expected[]{prefix, copiedPrefix+"other", retained+"fased_next_write.bits.id", retained+"fased_write_release_cycle", prefix+"|GGFASEDTokenEngine>state"};
   for(unsigned i=0;i<5;++i)require(cast<StringAttr>(ts[i]).getValue()==expected[i],"target transfer differs");llvm::outs()<<"16 wrapper mapping cases and five target transfers passed\n";
 }
 void rejection(MLIRContext &ctx) {
@@ -217,4 +221,4 @@ void rejection(MLIRContext &ctx) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"21 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{behavior(ctx);mapping(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected : {false,true}){selectedPrint=selected;llvm::outs()<<oldRoot()<<"\n";behavior(ctx);mapping(ctx);rejection(ctx);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

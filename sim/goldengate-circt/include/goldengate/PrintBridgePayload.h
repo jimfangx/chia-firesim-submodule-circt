@@ -229,6 +229,18 @@ mlir::LogicalResult mapPrintBridgeFASEDReadLatency(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Attach the ten-entry write deadline queue after read latency. Atomic; consume
+/// nextWrite/deadline ports, retain SSA and expose ungated completion/overflow.
+mlir::LogicalResult mapPrintBridgeFASEDWriteLatency(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
+/// Attach the ten-entry accepted AW ID queue after write latency. Atomic; oldest
+/// AW feeds completion ID, while the pairing pulse remains external and ungated.
+mlir::LogicalResult mapPrintBridgeFASEDTimingAWQueue(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

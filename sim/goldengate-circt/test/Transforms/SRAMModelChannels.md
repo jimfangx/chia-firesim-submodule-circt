@@ -6559,3 +6559,122 @@ latency MMIO, target token closure and selected platform assembly remain open.
 Next smallest step: attach native FASEDWriteLatency to the selected read-latency
 root and compare its ten-entry completion queue against SFC LatencyPipe/Queue_15.
 No harness-owned manager gate was started; the overall port remains open.
+
+### Iteration 153 — selected Print write deadline queue
+
+`--map-print-host-fased-write-latency` requires the selected read-latency stage
+and attaches the shared native `FASEDWriteLatency` transform to
+`GGSelectedPrintFASEDReadLatencyWrapper`. The new
+`GGSelectedPrintFASEDWriteLatencyWrapper` consumes nextWrite/deadline ports,
+exposes completion `{valid, bits.id}` and diagnostic queue capacity, and retains
+all prior module bodies and SSA identities. Completion valid remains ungated by
+capacity, targetFire and reset, preserving SFC's overflow assertion. Queue state
+and reset advance only on targetFire; enabled RAM writes survive reset. The
+atomic composer validates allocated Print collateral, stages/verifies the native
+transform and publishes only its helper/wrapper and transferred target archive.
+Allocated Print and CPU stream header emitters accept the new root. The CLI emits
+`post-print-fased-write-latency.{mlir,sv}` and its all-annotation JSON.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration153-print-fased-write-latency`.
+The native compiler and focused binaries build; Print binding, write latency and
+CPU managed-stream header CTests pass. Both legacy and selected root profiles
+each pass 30093 actual FIRRTL transitions, 16 wrapper cases, five target transfers
+and 21 atomic rejections. Both real preceding selected boundaries pass nine
+composer rejection cases, retained operation/module identities and bodies,
+unchanged allocated headers and six circuit/copied/consumed/internal target
+probes. CLI missing-dependency and duplicate-option rejection pass.
+
+Both standalone native CLI replays ingest the immutable primary compiler oracle
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print annotations
+and native Rocket catalog, with and without TracerV. Exact immutable SFC artifact
+compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDWriteLatencyCompare.py` pins Queue_15, LatencyPipe and
+FASEDMemoryTimingModel equations and interprets actual native SSA. Each allocation
+passes 47600 transitions: 203 flows, 1646 full pops, 18822 stalls, 4503 stalled
+resets, 1990 reset-edge RAM writes, 1172 pointer wraps, 8958 overflow assertion
+cases and 6516 equal deadlines. The helper equals the previously oracle-compared
+native baseline. All 135 / 129 prior module bodies, 82 / 90 wrapper connections
+and 1713 annotation records match preservation/transfer expectations. Emitted
+RTL preserves unsigned deadline comparison, qualified reset, separate 10x68
+memory geometry/write behavior and queue instance bindings. All allocated Print
+headers and decoders equal iteration 152 byte for byte. Before read-latency
+MLIR/JSON and final write-latency MLIR/JSON/SV remain raw; other own replay
+intermediates are compressed.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDWriteLatency,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDWriteLatencyTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDWriteLatencyCompare.py`, and this document.
+
+Risk: the immutable SFC fixture disables Print; these comparisons establish
+shared queue semantics and selected composition, not enabled-Print simulator
+parity. Supplied iteration-152 Rocket Verilator results pass but predate this
+change; the UART-bearing SFC differential remains pending. Completion still
+requires newWReq and the oldest AW ID from split-transaction pairing. Latency
+MMIO, target token closure and selected platform assembly remain open.
+Next smallest step: attach native FASEDTimingAWQueue to the selected write-latency
+root and compare its oldest-ID completion binding against SFC LatencyPipe/Queue_14.
+No harness-owned manager gate was started; the overall port remains open.
+
+### Iteration 154 — selected Print accepted AW ID queue
+
+`--map-print-host-fased-timing-aw-queue` requires selected write latency and
+attaches shared native `FASEDTimingAWQueue` to
+`GGSelectedPrintFASEDWriteLatencyWrapper`. The new
+`GGSelectedPrintFASEDTimingAWQueueWrapper` consumes completion metadata and
+binds it to the oldest accepted AW ID. AW.fire enqueues independently of queue
+capacity, reset and targetFire; the exposed pairing pulse drives both dequeue
+ready and write completion valid without an extra validity gate. TargetFire
+qualifies queue state/reset, RAM writes and overflow assertion enable. Capacity
+remains diagnostic. The atomic composer validates allocated Print collateral,
+stages/verifies the transform and publishes only its helper/wrapper and target
+archive. Header emitters accept the new root; CLI emits
+`post-print-fased-timing-aw-queue.{mlir,sv}` and all-annotation JSON.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration154-print-fased-timing-aw-queue`.
+Native compiler and focused binaries build. Print binding, timing AW queue and
+CPU managed-stream header CTests pass. Both legacy and selected root profiles
+each pass 30092 actual FIRRTL transitions, 64 wrapper mapping cases, five target
+transfers and 22 atomic rejections. Both real preceding selected allocations
+pass nine atomic composer rejections, retained module/operation identities,
+unchanged allocated headers and six circuit/copied/consumed/internal probes.
+CLI missing-dependency and duplicate-option rejection pass.
+
+Both standalone native CLI replays ingest the immutable primary compiler oracle
+`firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print annotations
+and native Rocket catalog, with and without TracerV. Exact immutable SFC artifact
+compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDTimingAWQueueCompare.py` pins Queue_14, LatencyPipe and
+FASEDMemoryTimingModel equations and interprets actual native SSA. Each allocation
+passes 58160 transitions: 570 flows, 2987 full pops, 24102 stalls, 7149 stalled
+resets, 3153 reset-edge RAM writes, 2533 pointer wraps and 3830 overflow cases.
+The helper equals the previously oracle-compared native baseline. All 137 / 131
+prior module bodies, 83 / 91 wrapper connections and 1713 annotations match
+preservation/transfer expectations. Emitted RTL preserves 10x4 memory geometry,
+qualified reset and RAM writes, AW acceptance and oldest-ID completion bindings.
+The first RTL check expected an intermediate acceptance wire and empty unused
+output; observed lowering emits inline AW acceptance and an unused-valid wire.
+The corrected check verifies these actual connections and that the unused valid
+wire cannot gate completion. Allocated Print headers and decoders equal iteration
+153 byte for byte. Before write-latency and final AW-queue MLIR/JSON/SV remain
+raw; other own replay intermediates are compressed.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDTimingAWQueue,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDTimingAWQueueTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDTimingAWQueueCompare.py`, and this document.
+
+Risk: the immutable SFC fixture disables Print; these comparisons establish
+shared queue semantics and selected composition, not enabled-Print simulator
+parity. Supplied iteration-153 Rocket Verilator results pass but predate this
+change; the UART-bearing SFC differential remains pending. AW/W pairing,
+latency MMIO, target token closure and selected platform assembly remain open.
+Next smallest step: attach native FASEDWritePairing to the selected AW queue
+root and compare saturating pending counters/newWReq against SFC LatencyPipe.
+No harness-owned manager gate was started; the overall port remains open.
