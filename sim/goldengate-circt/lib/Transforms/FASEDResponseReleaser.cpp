@@ -5,8 +5,15 @@
 // responses forward egress payloads even while invalid. Reads retire only on
 // an accepted last beat; replacement in that cycle keeps the queue occupied.
 // Model state and reset take effect only on targetFire (the SFC model clock).
-// Consumes timing and four egress boundaries; preserves constructor/annotations.
-// Timing completion metadata and AW/W/AR model ready remain explicit boundaries.
+// Required input invariants: uninstantiated legacy or selected Print write-egress
+// root with exact 35/64/4-bit model clock/reset/fire/timing/egress ports.
+// Annotations consumed: none. Produced: recursively transferred circuit/copied
+// ports and AW/W/AR request targets; consumed response targets remain internal.
+// IR mutations: append helper/wrapper, close timing responses and egress ports.
+// Analyses required: constructor and port types. Preserved: prior module SSA,
+// attached identities and constructor; hierarchy/target archive are extended.
+// Output invariants: targetFire-qualified occupancy/reset, unchanged payloads;
+// timing completion metadata and AW/W/AR model ready are explicit boundaries.
 #include "goldengate/FASEDResponseReleaser.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -16,9 +23,11 @@ using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDResponseReleaser(CircuitOp circuit,
                                                   std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGFASEDResponseReleaser";
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDResponseReleaserWrapper";
+  const bool isSelectedPrint = circuit.getName() == "GGSelectedPrintFASEDWriteEgressWrapper";
+  llvm::StringRef wrapperName = isSelectedPrint
+      ? "GGSelectedPrintFASEDResponseReleaserWrapper" : "GGFASEDResponseReleaserWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDWriteEgressWrapper")
+  if (!isSelectedPrint && circuit.getName() != "GGFASEDWriteEgressWrapper")
     return reject("FASED response releaser requires the active write egress wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {

@@ -212,6 +212,11 @@ mlir::LogicalResult mapPrintBridgeFASEDReadScheduler(
 mlir::LogicalResult mapPrintBridgeFASEDWriteEgress(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
+/// Close read/write target responses and native egress requests after selected
+/// write scheduling. Atomic; preserve prior SSA and allocated identities.
+mlir::LogicalResult mapPrintBridgeFASEDResponseReleaser(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
 
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host

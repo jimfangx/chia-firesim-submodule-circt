@@ -16,13 +16,16 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+bool selectedPrint = false;
+std::string oldRoot() { return selectedPrint ? "GGSelectedPrintFASEDWriteEgressWrapper" : "GGFASEDWriteEgressWrapper"; }
+std::string newRoot() { return selectedPrint ? "GGSelectedPrintFASEDResponseReleaserWrapper" : "GGFASEDResponseReleaserWrapper"; }
 void require(bool ok, llvm::StringRef why) { if (!ok) throw std::runtime_error(why.str()); }
 FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
-  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDWriteEgressWrapper\" { firrtl.module @GGFASEDWriteEgressWrapper() {} } }",&ctx);
+  auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"" + oldRoot() + "\" { firrtl.module @" + oldRoot() + "() {} } }",&ctx);
   require(bool(root),"fixture parse"); auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
   auto *cx = &ctx; OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin()); auto loc=c.getLoc();
@@ -72,12 +75,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
     if(mode!=18) engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({
       b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==17?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));
   }
-  if(mode==13 || mode==14) b.create<FModuleOp>(loc,b.getStringAttr(mode==13?"GGFASEDResponseReleaser":"GGFASEDResponseReleaserWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==13 || mode==14) b.create<FModuleOp>(loc,b.getStringAttr(mode==13?std::string("GGFASEDResponseReleaser"):newRoot()),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   if(mode==16)c.setName("wrong");
   SmallVector<Attribute> raw;
   for(auto n:{"other","fased_timing.aw.bits.id","fased_timing.w.ready","fased_timing.ar.valid","fased_timing.r.bits.data","fased_read_egress_req.valid","fased_write_egress_resp.tBits.id"})
-    raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~GGFASEDWriteEgressWrapper|GGFASEDWriteEgressWrapper>"+std::string(n)))}));
+    raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~"+oldRoot()+"|"+oldRoot()+">"+std::string(n)))}));
   if(mode!=12)c->setAttr("rawAnnotations",b.getArrayAttr(raw)); return root;
 }
 struct Interpreter {
@@ -193,7 +196,7 @@ void behavior(MLIRContext &ctx) {
 }
 void mapping(MLIRContext &ctx) {
   auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDResponseReleaser(c,error)),error);
-  Interpreter w(named(c,"GGFASEDResponseReleaserWrapper"));InstanceOp sim,rel;for(auto i:w.module.getOps<InstanceOp>())if(i.getName()=="sim")sim=i;else rel=i;
+  Interpreter w(named(c,newRoot()));InstanceOp sim,rel;for(auto i:w.module.getOps<InstanceOp>())if(i.getName()=="sim")sim=i;else rel=i;
   require(w.module.getNumPorts()==7,"wrapper port count differs");require(w.drivers.at(w.key(rel.getResult(0)))==w.arg(0),"clock binding differs");
   for(unsigned flags=0;flags<64;++flags){w.memo.clear();auto f=[&](unsigned i){return flags>>i&1;};
     w.put(sim.getResult(1),"",f(0));w.put(sim.getResult(2),"",f(1));
@@ -210,9 +213,12 @@ void mapping(MLIRContext &ctx) {
     for(auto ch:{"aw","w","ar"}){w.put(sim.getResult(3),std::string(ch)+".valid",f(2));w.put(w.arg(4),std::string(ch)+".ready",f(3));
       require(w.output(w.arg(4),std::string(ch)+".valid",1).getZExtValue()==f(2)&&w.output(sim.getResult(3),std::string(ch)+".ready",1).getZExtValue()==f(3),"model request flip binding differs");}
   }
-  const llvm::StringRef refs[]{"|GGFASEDResponseReleaserWrapper>other","|GGFASEDResponseReleaserWrapper>fased_timing_requests.aw.bits.id","|GGFASEDResponseReleaserWrapper>fased_timing_requests.w.ready","|GGFASEDResponseReleaserWrapper>fased_timing_requests.ar.valid","|GGFASEDWriteEgressWrapper>fased_timing.r.bits.data","|GGFASEDWriteEgressWrapper>fased_read_egress_req.valid","|GGFASEDWriteEgressWrapper>fased_write_egress_resp.tBits.id"};
+  const std::string refs[]{"|"+newRoot()+">other", "|"+newRoot()+">fased_timing_requests.aw.bits.id",
+    "|"+newRoot()+">fased_timing_requests.w.ready", "|"+newRoot()+">fased_timing_requests.ar.valid",
+    "|"+oldRoot()+">fased_timing.r.bits.data", "|"+oldRoot()+">fased_read_egress_req.valid",
+    "|"+oldRoot()+">fased_write_egress_resp.tBits.id"};
   auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw.size()==7,"lost annotations");
-  for(unsigned i=0;i<7;++i)require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()=="~GGFASEDResponseReleaserWrapper"+refs[i].str(),"annotation transfer differs");
+  for(unsigned i=0;i<7;++i)require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue()=="~"+newRoot()+refs[i],"annotation transfer differs");
   llvm::outs()<<"64 wrapper mapping cases and seven target transfers passed\n";
 }
 void rejection(MLIRContext &ctx) {
@@ -224,4 +230,4 @@ void rejection(MLIRContext &ctx) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"22 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{behavior(ctx);mapping(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected:{false,true}){selectedPrint=selected;llvm::outs()<<oldRoot()<<"\n";behavior(ctx);mapping(ctx);rejection(ctx);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

@@ -389,7 +389,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress]]]]]]]]]]]]]]]]]]]] "
+                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser]]]]]]]]]]]]]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -414,6 +414,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDIngressDeadlock = false, mapPrintHostFASEDReadBuffer = false;
   bool mapPrintHostFASEDReadScheduler = false;
   bool mapPrintHostFASEDWriteEgress = false;
+  bool mapPrintHostFASEDResponseReleaser = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -438,6 +439,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-read-scheduler") {
         if (mapPrintHostFASEDReadScheduler) return fail("duplicate --map-print-host-fased-read-scheduler");
         mapPrintHostFASEDReadScheduler = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-response-releaser") {
+        if (mapPrintHostFASEDResponseReleaser) return fail("duplicate --map-print-host-fased-response-releaser");
+        mapPrintHostFASEDResponseReleaser = true;
         continue;
       }
       if (option == "--map-print-host-fased-write-egress") {
@@ -595,6 +601,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-cpu-write-response-buffer requires --map-print-host-cpu-response-buffer");
   if (mapPrintHostFASEDReadScheduler && !mapPrintHostFASEDReadBuffer)
     return fail("--map-print-host-fased-read-scheduler requires --map-print-host-fased-read-buffer");
+  if (mapPrintHostFASEDResponseReleaser && !mapPrintHostFASEDWriteEgress)
+    return fail("--map-print-host-fased-response-releaser requires --map-print-host-fased-write-egress");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
     return fail("--map-print-host-fased-write-egress requires --map-print-host-fased-read-scheduler");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
@@ -1045,6 +1053,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED write egress output: " + error);
         llvm::outs() << "Attached selected Print FASED write acknowledgment counters and request retirement in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDResponseReleaser) {
+        if (failed(goldengate::mapPrintBridgeFASEDResponseReleaser(circuit, hosts, error)))
+          return fail("PrintBridge FASED response releaser: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-response-releaser.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-response-releaser.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-response-releaser-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED response releaser MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED response releaser output: " + error);
+        llvm::outs() << "Attached selected Print FASED target response occupancy and egress request release in " << tokenIR << '\n';
       }
       return 0;
     }

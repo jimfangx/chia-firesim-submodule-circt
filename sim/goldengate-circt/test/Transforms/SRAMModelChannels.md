@@ -6360,3 +6360,70 @@ Next smallest step: attach the existing native FASEDResponseReleaser to the
 selected write-egress root, retaining targetFire-qualified model state/reset
 and connecting read/write response release to the native egress schedulers.
 No harness-owned manager gate was started; the overall port remains open.
+
+
+## Iteration 150: selected Print FASED target response release
+
+Attach shared native `GGFASEDResponseReleaser` after selected write scheduling.
+`--map-print-host-fased-response-releaser` requires write egress and emits
+`post-print-fased-response-releaser.{mlir,sv}` and full annotation JSON. The
+composer validates allocated hosts and verifies a clone before moving only the
+new helper and wrapper into the circuit. Existing module/port/operation handles,
+attached identities, constructor and allocated collateral survive. Circuit and
+copied targets transfer recursively; AW/W/AR leaves transfer to the explicit
+request bundle, while consumed response/egress targets retain their inner module.
+
+The Scala oracle is `models/dram/Util.scala` AXI4Releaser and
+`models/dram/FASEDMemoryTimingModel.scala` within MidasTransforms/FAMETransform.
+One-entry pipe queues track response occupancy without storing metadata. Reads
+retire only on accepted last beats, writes on accepted responses. Same-cycle
+replacement keeps occupancy. Completion acceptance produces combinational
+egress requests, even without targetFire; only targetFire updates or resets
+occupancy. Responses forward the current egress payload, including when invalid.
+Timing completion metadata and model AW/W/AR readiness remain explicit boundaries.
+
+Evidence directory:
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration150-print-fased-response-releaser`.
+Native compiler and three focused test binaries build successfully. Print binding,
+response releaser and CPU managed-stream header CTests pass. Legacy and selected
+roots each exercise 18192 actual FIRRTL state transitions, including 10000
+continuous randomized cycles, 64 wrapper cases, seven annotation transfers and
+22 atomic rejections. Both saved iteration-149 selected boundaries pass nine
+atomic composer rejections, prior module/operation identity and body checks,
+unchanged allocated headers, and seven recursive circuit/copied/request/consumed
+annotation probes. CLI dependency and duplicate-option rejection also pass.
+
+Both standalone native CLI replays ingest the primary immutable compiler
+fixture's `firechip.chip.FireSim.FireSimRocketConfig.sfc.fir`, selected Print
+annotations and native Rocket control catalog, with and without TracerV.
+Exact immutable SFC artifact compared:
+`deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDResponseReleaserCompare.py` pins AXI4Releaser, Queue_12,
+Queue_13, LatencyPipe and FASEDMemoryTimingModel state, pipe readiness, payload,
+last-beat retirement, replacement and gated clock/reset equations. Each
+allocation's actual emitted SSA passes 131072 combinations, including 2048
+read replacements, 16384 non-last beats, 24576 blocked read requests, 24576
+occupied resets without targetFire, 37376 combinational accepts without fire
+and 32768 empty pushes without flow-through. The helper matches the previously
+oracle-compared native baseline. All 129 / 123 prior module bodies, all 89 / 97
+wrapper connections and 1713 annotation records match expected preservation
+and transfer. Emitted RTL retains qualified model reset/fire, two occupancy
+registers and egress response payload forwarding. Allocated Print headers and
+decoders equal iteration 149 byte for byte. Before-write-egress MLIR/JSON and
+final MLIR/JSON/SV remain raw; other own replay intermediates are compressed.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDResponseReleaser,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`,
+`tools/goldengate.cpp`, `test/Transforms/{FASEDResponseReleaserTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDResponseReleaserCompare.py`, and this document.
+
+Risk: the SFC fixture disables Print, so shared response release semantics and
+selected composition are checked; full enabled-Print simulator parity remains
+open. The supplied iteration-149 Rocket Verilator regressions pass, but the
+UART-bearing SFC differential remains pending and those gates predate this
+change. Timing completion scheduling, target token closure and selected platform
+assembly remain open. Next smallest step: attach existing native FASEDTimingCycle
+to the selected response-releaser root and compare targetFire-qualified cycle
+advancement, reset and latency-minus-one arithmetic with SFC LatencyPipe.
+No harness-owned manager gate was started; the overall port remains open.
