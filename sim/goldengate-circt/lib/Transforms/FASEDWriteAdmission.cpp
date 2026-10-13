@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Oracle: TimingModel.scala SplitTransactionModel AW/W ready := ~pending.full.
-// Required invariants: uninstantiated write-retirement top, exact recorded
+// Required invariants: uninstantiated legacy or selected Print write-retirement top, exact recorded
 // 35/64/4-bit requests and four-bit pending-counter observations.
 // Annotations consumed/produced: none; copied top references transfer to the
 // wrapper, including ready fields whose identities now denote driven outputs.
@@ -19,10 +19,12 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::bindFASEDWriteAdmission(CircuitOp circuit,
                                                 std::string &error) {
-  constexpr llvm::StringLiteral wrapperName = "GGFASEDWriteAdmissionWrapper";
+  bool selectedPrint = circuit.getName() == "GGSelectedPrintFASEDWriteRetirementWrapper";
+  llvm::StringRef wrapperName = selectedPrint ? "GGSelectedPrintFASEDWriteAdmissionWrapper"
+                                              : "GGFASEDWriteAdmissionWrapper";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (circuit.getName() != "GGFASEDWriteRetirementWrapper" || !raw)
+  if ((!selectedPrint && circuit.getName() != "GGFASEDWriteRetirementWrapper") || !raw)
     return reject("FASED write admission requires the active retirement wrapper and annotations");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {

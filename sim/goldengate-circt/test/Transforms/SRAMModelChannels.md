@@ -6813,3 +6813,66 @@ latency MMIO, target token closure and platform assembly remain open.
 Next smallest step: attach native FASEDWriteAdmission to the selected retirement
 root and compare pending-counter/AW-queue capacity gating with SFC LatencyPipe.
 No harness-owned manager gate was started; the overall port remains open.
+
+### Iteration 157: selected Print FASED pending-full write admission
+
+The shared native `bindFASEDWriteAdmission` now accepts the selected Print
+retirement root as well as the legacy root. `mapPrintBridgeFASEDWriteAdmission`
+validates the selected allocation and recorded 35/64/4-bit constructor, verifies
+a staged clone, then publishes only `GGSelectedPrintFASEDWriteAdmissionWrapper`
+and transferred annotations. Existing module and SSA identities remain intact.
+The CLI exposes `--map-print-host-fased-write-admission`, requires the preceding
+retirement stage, and emits corresponding MLIR, annotation JSON and RTL.
+Allocated Print/CPU header emitters accept the resulting root.
+
+The Scala `SplitTransactionModel` in `models/dram/TimingModel.scala:226-231`
+drives AW and W ready from their separate pending-full inversions. The AW queue
+has its own overflow assertion; it does not participate in those ready
+expressions. The new wrapper uses two native FIRRTL NotPrimOps, drives both
+inner and observable AW/W ready, changes only their two bundle flips, and
+preserves valid, payload fields and AR reverse readiness. Readiness is independent
+from reset, targetFire, queue capacity and B readiness; pending-counter updates
+retain the predecessor's target-clock qualification and accepted B retirement.
+
+Evidence: `sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration157-print-fased-write-admission/`.
+All three selected CTest groups pass (Print binding, CPU stream header and FASED
+write admission). The shared admission test covers both roots and 32 atomic
+rejections. Focused replay on each real selected retirement boundary passes
+six annotation identity probes, retained prior SSA/allocated headers and nine
+atomic rejections, including a malformed constructor. CLI duplicate/dependency
+rejections also pass. Two fresh native CLI replays ingest the immutable SFC
+handoff with and without TracerV; their preceding retirement MLIR, RTL and JSON
+match all six corresponding iteration-156 artifacts byte for byte.
+
+Exact immutable artifact compared:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+`PrintSelectedFASEDWriteAdmissionCompare.py` pins LatencyPipe pending-full ready,
+accepted AW/final-W increments and accepted B decrements, SatUpDownCounter_1
+saturation/reset equations, and FASEDMemoryTimingModel clock/reset qualification.
+Each allocation matches 554288 native-SSA counter transitions, including 34631
+zero-maximum cases, 145297 blocked AW requests, 141823 blocked W requests,
+108745 handshakes during target stalls and 22716 simultaneous retirements.
+All 33 emitted request pins match the expected admission/passthrough connectivity;
+all 1713 annotations match structured target transfer. The 142 / 136 prior
+module definitions remain unchanged; 77 / 85 port identities/types and 85 / 93
+wrapper connections match. Allocated headers equal iteration 156 byte for byte.
+The RTL comparison follows intermediate full-flag wire aliases, avoiding a
+spelling assumption observed during its first run. Immutable oracle hashes
+remain unchanged. Preceding/final boundary artifacts remain raw; other own
+replay intermediates are compressed with verified decompressed SHA256 hashes.
+Compression of 104 files per allocation saves approximately 3.42 GB in total.
+
+Changed sources: `include/goldengate/PrintBridgePayload.h`,
+`lib/Transforms/{FASEDWriteAdmission,PrintBridgeMMIO}.cpp`,
+`lib/Support/{CPUManagedStreamHeader,PrintBridgeHeader}.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/{FASEDWriteAdmissionTest,PrintBridgeBindingTest}.cpp`,
+`test/Transforms/PrintSelectedFASEDWriteAdmissionCompare.py`, and this document.
+
+Risk: the SFC fixture disables Print, so shared FASED admission semantics and
+selected composition are established, while enabled-Print simulator parity is
+unverified. Supplied iteration-156 Rocket Verilator gates pass but predate this
+change; the SFC UART-bearing differential remains pending. Selected AR admission,
+latency/max-request MMIO, target token closure and platform assembly remain open.
+Next smallest step: attach native FASEDReadAdmission, observe accepted final R
+through the selected hierarchy, and compare pending-read AR readiness with SFC.
+No harness-owned manager gate was started; the overall port remains open.

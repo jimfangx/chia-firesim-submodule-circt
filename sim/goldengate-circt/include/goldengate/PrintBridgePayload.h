@@ -253,6 +253,12 @@ mlir::LogicalResult mapPrintBridgeFASEDWriteRetirement(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
     std::string &error);
 
+/// Close selected AW/W reverse readiness with the pending full flags. Atomic;
+/// preserve AR reverse readiness, payload types, prior SSA and allocated headers.
+mlir::LogicalResult mapPrintBridgeFASEDWriteAdmission(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
+    std::string &error);
+
 // Compose the eleven live FASED channels, host outstanding counters and three
 // ingress queues after expanded Print/BlockDev. Atomic; egress readiness, host
 // transactions and queue dequeue boundaries remain for later timing/MMIO passes.

@@ -2727,6 +2727,47 @@ LogicalResult goldengate::mapPrintBridgeFASEDWriteRetirement(CircuitOp circuit,
   return bindFASEDWriteRetirement(circuit, error);
 }
 
+// Requires the recorded selected Print retirement/allocation boundary and
+// annotations. Consume AW/W reverse-ready inputs; emit NotPrimOps from full.
+// Verify on a clone, then publish only the wrapper and retargeted annotations;
+// preserve every prior module, operation, payload and allocated control region.
+LogicalResult goldengate::mapPrintBridgeFASEDWriteAdmission(CircuitOp circuit,
+    ArrayRef<FModuleOp> hosts, std::string &error) {
+  if (circuit.getName() != "GGSelectedPrintFASEDWriteRetirementWrapper") {
+    error = "selected Print FASED write admission requires the completed write retirement boundary";
+    return failure();
+  }
+  std::string header;
+  if (failed(preparePrintBridgeAllocatedHeader(circuit, hosts, header, error)))
+    return failure();
+  FModuleOp engine;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDTokenEngine") engine = m;
+  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr{};
+  auto widths = key ? key.getAs<DictionaryAttr>("axi4Widths") : DictionaryAttr{};
+  auto has = [&](StringRef name, int value) {
+    auto attr = widths ? widths.getAs<IntegerAttr>(name) : IntegerAttr{};
+    return attr && attr.getValue().getBitWidth() <= 64 && attr.getInt() == value;
+  };
+  if (!has("addrBits", 35) || !has("dataBits", 64) || !has("idBits", 4)) {
+    error = "selected Print FASED write admission requires the recorded 35/64/4-bit profile";
+    return failure();
+  }
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  if (failed(bindFASEDWriteAdmission(*staged, error))) return failure();
+  if (failed(verify(*staged))) {
+    error = "selected Print FASED write admission produced invalid FIRRTL IR";
+    return failure();
+  }
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto m = dyn_cast<FModuleOp>(&op))
+      if (m.getName() == "GGSelectedPrintFASEDWriteAdmissionWrapper")
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
+  circuit.setName(staged->getName());
+  return success();
+}
+
 // FPGATop's AXI4Buffer accepts two independent AW/W entries before the empty
 // CPU stream sink stalls. Stage shared native queues and publish only additions.
 LogicalResult goldengate::mapPrintBridgeRocketCPUStreamWriteBuffer(

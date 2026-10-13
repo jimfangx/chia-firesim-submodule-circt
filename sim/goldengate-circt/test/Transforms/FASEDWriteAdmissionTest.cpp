@@ -17,9 +17,10 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m:c.getOps<FModuleOp>()) if (m.getName()==name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDWriteRetirementWrapper\" { firrtl.module @GGFASEDWriteRetirementWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();
+  if(selected)c.setName("GGSelectedPrintFASEDWriteRetirementWrapper");
   (*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
   auto u=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=u(1);
   auto payload=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> fields){
@@ -39,14 +40,15 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   if(mode==1||mode==2)ps[mode-1].name=b.getStringAttr("missing");
   if(mode==3||mode==4)ps[mode-3].direction=Direction::In;
   auto top=b.create<FModuleOp>(loc,b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ps);
-  if(mode==13)b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDWriteAdmissionWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  if(mode==13)b.create<FModuleOp>(loc,b.getStringAttr(selected?"GGSelectedPrintFASEDWriteAdmissionWrapper":"GGFASEDWriteAdmissionWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==14){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
+  std::string circuitTarget="~"+c.getName().str(), topTarget=circuitTarget+"|"+top.getName().str()+">";
   if(mode==15)c.setName("wrong");
   if(mode!=12)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
-    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~GGFASEDWriteRetirementWrapper"),
-      b.getStringAttr("~GGFASEDWriteRetirementWrapper|GGFASEDWriteRetirementWrapper>fased_timing_requests.aw.ready"),
-      b.getStringAttr("~GGFASEDWriteRetirementWrapper|GGFASEDWriteRetirementWrapper>fased_pending_writes.wFull"),
-      b.getStringAttr("~GGFASEDWriteRetirementWrapper|GGFASEDWritePairingWrapper>fased_target_b_fire")}))})}));
+    b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr(circuitTarget),
+      b.getStringAttr(topTarget+"fased_timing_requests.aw.ready"),
+      b.getStringAttr(topTarget+"fased_pending_writes.wFull"),
+      b.getStringAttr(circuitTarget+"|GGFASEDWritePairingWrapper>fased_target_b_fire")}))})}));
   return root;
 }
 std::string key(Value v) {
@@ -79,13 +81,14 @@ struct Wiring {
     return eval(key(v),inputs);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
+void behavior(MLIRContext &ctx, bool selected) {
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();
   auto inner=named(c,c.getName());auto oldPorts=inner.getPorts();std::string oldIR,error;
   {llvm::raw_string_ostream out(oldIR);inner.print(out);}
   require(succeeded(goldengate::bindFASEDWriteAdmission(c,error)),error);
   require(succeeded(verify(*root)),"invalid write admission IR");
   std::string after;{llvm::raw_string_ostream out(after);inner.print(out);}require(oldIR==after,"inner module changed");
+  const std::string newName=c.getName().str();
   auto top=named(c,c.getName());require(top.getNumPorts()==oldPorts.size(),"port count changed");
   for(unsigned i=0;i<oldPorts.size();++i) {
     require(top.getPortName(i)==oldPorts[i].name&&top.getPortDirection(i)==oldPorts[i].direction,"port identity changed");
@@ -113,21 +116,21 @@ void behavior(MLIRContext &ctx) {
     require(wiring.eval("port0.aw.bits.id",inputs)==11&&wiring.eval("port0.w.bits.data",inputs)==0xa5,"payload changed");
   }
   auto targets=cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<ArrayAttr>("targets");
-  const char *expected[]{"~GGFASEDWriteAdmissionWrapper",
-    "~GGFASEDWriteAdmissionWrapper|GGFASEDWriteAdmissionWrapper>fased_timing_requests.aw.ready",
-    "~GGFASEDWriteAdmissionWrapper|GGFASEDWriteAdmissionWrapper>fased_pending_writes.wFull",
-    "~GGFASEDWriteAdmissionWrapper|GGFASEDWritePairingWrapper>fased_target_b_fire"};
+  const std::string expected[]{"~"+newName,
+    "~"+newName+"|"+newName+">fased_timing_requests.aw.ready",
+    "~"+newName+"|"+newName+">fased_pending_writes.wFull",
+    "~"+newName+"|GGFASEDWritePairingWrapper>fased_target_b_fire"};
   for(unsigned i=0;i<4;++i)require(cast<StringAttr>(targets[i]).getValue()==expected[i],"annotation target changed incorrectly");
   llvm::outs()<<"Closed AW/W admission, observed readiness, payload/AR passthrough and target transfer passed\n";
 }
-void rejection(MLIRContext &ctx) {
+void rejection(MLIRContext &ctx, bool selected) {
   for(unsigned mode=1;mode<=15;++mode) {
-    auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
+    auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
     {llvm::raw_string_ostream out(before);root->print(out);}
     require(failed(goldengate::bindFASEDWriteAdmission(c,error))&&!error.empty(),"unsupported boundary accepted");
     {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");
   }
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
   require(succeeded(goldengate::bindFASEDWriteAdmission(c,error)),error);
   {llvm::raw_string_ostream out(before);root->print(out);}
   require(failed(goldengate::bindFASEDWriteAdmission(c,error)),"repeat accepted");
@@ -137,6 +140,6 @@ void rejection(MLIRContext &ctx) {
 }
 int main() {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try{behavior(ctx);rejection(ctx);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
+  try{for(bool selected:{false,true}){behavior(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

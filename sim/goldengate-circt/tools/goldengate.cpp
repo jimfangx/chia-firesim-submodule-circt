@@ -421,6 +421,7 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDTimingAWQueue = false;
   bool mapPrintHostFASEDWritePairing = false;
   bool mapPrintHostFASEDWriteRetirement = false;
+  bool mapPrintHostFASEDWriteAdmission = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -480,6 +481,11 @@ int main(int argc, char **argv) {
       if (option == "--map-print-host-fased-write-retirement") {
         if (mapPrintHostFASEDWriteRetirement) return fail("duplicate --map-print-host-fased-write-retirement");
         mapPrintHostFASEDWriteRetirement = true;
+        continue;
+      }
+      if (option == "--map-print-host-fased-write-admission") {
+        if (mapPrintHostFASEDWriteAdmission) return fail("duplicate --map-print-host-fased-write-admission");
+        mapPrintHostFASEDWriteAdmission = true;
         continue;
       }
       if (option == "--map-print-host-fased-write-egress") {
@@ -651,6 +657,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-write-pairing requires --map-print-host-fased-timing-aw-queue");
   if (mapPrintHostFASEDWriteRetirement && !mapPrintHostFASEDWritePairing)
     return fail("--map-print-host-fased-write-retirement requires --map-print-host-fased-write-pairing");
+  if (mapPrintHostFASEDWriteAdmission && !mapPrintHostFASEDWriteRetirement)
+    return fail("--map-print-host-fased-write-admission requires --map-print-host-fased-write-retirement");
   if (mapPrintHostFASEDWriteEgress && !mapPrintHostFASEDReadScheduler)
     return fail("--map-print-host-fased-write-egress requires --map-print-host-fased-read-scheduler");
   if (mapPrintHostFASEDReadBuffer && !mapPrintHostFASEDIngressDeadlock)
@@ -1206,6 +1214,21 @@ int main(int argc, char **argv) {
             failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
           return fail("PrintBridge FASED write retirement output: " + error);
         llvm::outs() << "Attached selected Print FASED target B ready/valid observation and closed pending write retirement feedback in " << tokenIR << '\n';
+      }
+      if (mapPrintHostFASEDWriteAdmission) {
+        if (failed(goldengate::mapPrintBridgeFASEDWriteAdmission(circuit, hosts, error)))
+          return fail("PrintBridge FASED write admission: " + error);
+        llvm::SmallString<256> tokenIR(outputDir), tokenRTL(outputDir), tokenAnnos(outputDir);
+        llvm::sys::path::append(tokenIR, "post-print-fased-write-admission.mlir");
+        llvm::sys::path::append(tokenRTL, "post-print-fased-write-admission.sv");
+        llvm::sys::path::append(tokenAnnos, "post-print-fased-write-admission-all.json");
+        llvm::raw_fd_ostream tokenOut(tokenIR, ec);
+        if (ec) return fail("cannot write Print FASED write admission MLIR: " + ec.message());
+        module->print(tokenOut); tokenOut << '\n'; tokenOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, tokenAnnos, error)) ||
+            failed(goldengate::emitSimulatorRTL(*module, firPath, tokenRTL, error)))
+          return fail("PrintBridge FASED write admission output: " + error);
+        llvm::outs() << "Attached selected Print FASED pending-full AW/W readiness and preserved AR handshake in " << tokenIR << '\n';
       }
       return 0;
     }
