@@ -3113,3 +3113,109 @@ pulse with the SFC `LatencyPipe` counter cone. Control responses/slave-1 binding
 generalized FASED geometry, multiple/wider TracerV profiles, complete NIC host
 memory/stream composition, recorded clock-gate shim behavior and partition/QSFP
 integration remain incomplete.
+
+## Iteration 203: NIC pending AW/W counters and completion pairing
+
+The production compiler now runs `addFASEDWritePairing` on the NIC path after
+the accepted-AW metadata queue, verifies the FIRRTL operations and emits the
+pairing boundary and annotations. Two four-bit saturating counters advance and
+reset only on targetFire. The pre-edge comparison of pending AW/W counts drives
+the existing queue's completion pulse. Accepted AW and last-W handshakes remain
+combinational; completion is not gated by full, reset or targetFire. The compiler
+still rejects NIC before target B retirement and runtime admission are bound.
+This is an additional native compiler boundary, not a complete NIC compile.
+
+Evidence is in the standard Rocket generated-source directory:
+
+```text
+iteration203-u250-target-matrix/
+  build.log
+  compiler.sha256
+  ctest.log
+  ctest-details.log
+  write-pairing-preflight.json
+  write-pairing-preflight/
+  nic-write-pairing-comparison.json
+  nic-write-pairing-differential/
+```
+
+The exact new boundary is
+`replay/alveo_u250_firesim_rocket_singlecore_nic/candidate/post-fame-fased-write-pairing.mlir`,
+SHA256 `3b8b3bfb42cdbe28351f7945e24ec409b0c579dbd7d00e03c4a6b9d1a7e92643`.
+It retains 189 prior modules, all copied port types and all 1,792 annotations
+with recursive target transfer. All 200 aggregate/scalar wrapper connections
+match, including accepted AW, accepted last W, the external B-fire/runtime-max
+ports, pending diagnostics and the completion pulse. The production helper
+equals the fresh no-NIC helper exactly.
+
+The exact SFC reference is `SatUpDownCounter_1` and the pending-counter/newWReq
+cone in `LatencyPipe` in
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+The counters, original AW/W/B handshake equations, pairing equations and
+recorded clock-gate module match their counterparts in the immutable U250
+build-tree `design/FireSim-generated.sv` after comment/whitespace normalization.
+The Scala oracle is `models/dram/TimingModel.scala:108-114,226-239` and
+`widgets/Lib.scala:71-86`; the FAME scheduling order and qualified channel
+updates are preserved from `MidasTransforms.scala` and `FAMETransform.scala`.
+
+`FASEDWritePairingTest.cpp` exports the actual production helper verbatim;
+`NICFASEDWritePairingCompare.py` lowers that clone with firtool and executes it
+against the original SFC counter instances and original handshake/pairing
+equations in Verilator. Outputs and counter registers match before and after
+every edge over 40,101 cycles: 20,050 stalls, 162 stalled resets, 195 target
+resets, 2,340 AW-ahead pairs, 669 W-ahead pairs, 1,278 simultaneous pairs,
+814 full-saturation cases, 3,198 empty retirements, 1,666 simultaneous inc/dec
+cases and 5,112 observations above a lowered runtime maximum. All sixteen
+runtime limits and all sixteen states of each counter are exercised. Lowering
+the maximum does not clamp existing state; simultaneous inc/dec holds state.
+
+The test executes targetFire-qualified model edges with `clock & targetFire`.
+It pins the SFC host clock/reset/targetFire bindings and retains the original
+gate in `nic-write-pairing-differential/recorded-clock-gate.sv`. It does not
+execute or claim delta-cycle parity for the recorded posedge enable-register
+shim. Full-model admission, MMIO maximum binding and observed target B-fire
+attachment remain outside this boundary. The raw handshake cone is executed;
+the native wrapper handshake mapping is also checked exhaustively by CTest.
+
+Focused CTest passes 151,072 pending-counter/pairing transitions, 256 wrapper
+mapping cases, five target transfers and 23 atomic rejections for each baseline
+and selected Print profile. Reproduce the differential with `--candidate-dir`
+for the fresh NIC replay, `--baseline` for fresh no-NIC pairing MLIR, `--golden`
+and `--immutable` for the paths above, `--export-tool` for
+`goldengate-fased-write-pairing-test`, a fresh absolute `--output-dir`, and
+`--report-json`. The preflight uses iteration 202's no-NIC boundary; the final
+report executes the fresh iteration 203 NIC helper.
+
+`nic-prior-boundaries-comparison.json` confirms all 202 earlier NIC MLIR and
+annotation artifacts are byte-identical to iteration 202; only the two pairing
+artifacts are added. `rocket-output-regression-comparison.json` confirms the
+no-NIC final SV, both headers and both XDC files are unchanged.
+`immutable-rocket-comparison.json` confirms both immutable primary handoff
+hashes and normalized immutable U250 XDC match, including the recorded
+implementation hierarchy rename. Immutable fixtures remain untouched.
+
+The fresh thirteen-target replay uses compiler SHA256
+`6b0f3c91a3539e62c5c84b4a132ecf4776dfa8fe4e98b3feaa0a2a1f93302050`.
+`replay/matrix.json` and `matrix-regression-comparison.json` preserve one
+compiled no-NIC target, six later compiler failures and six unsupported
+partition/QSFP platforms. All archived input hashes, effective platform
+semantics, statuses and structured boundary comparisons match iteration 202;
+only the NIC unsupported diagnostic advances. Eight annotation boundaries
+match, six have the documented native SRAM model-port differences and twelve
+are not reached. All thirteen complete stderr logs were inspected. Partial
+boundary matches are not complete target support. No FireSim manager gate
+was started by this implementation turn.
+
+Mutable iteration 199 replay MLIR was compressed with decompressed SHA256
+verification and a manifest: 556 files, recovering 35,521,786,722 bytes.
+Current candidates and completed SFC goldens were not compressed or modified.
+
+The next smallest step is to bind NIC `FASEDWriteRetirement`, observing the
+response releaser's target `B.valid && B.ready` through the recorded sim
+hierarchy and feeding both pending counters. Compare that feedback and the
+consumed input/annotation transfer against the SFC `LatencyPipe` retirement
+cone before connecting runtime maximum/admission. Control responses/slave-1
+binding, generalized FASED geometry, multiple/wider TracerV profiles, complete
+NIC host memory/stream composition, recorded clock-gate shim behavior and
+partition/QSFP integration remain incomplete.

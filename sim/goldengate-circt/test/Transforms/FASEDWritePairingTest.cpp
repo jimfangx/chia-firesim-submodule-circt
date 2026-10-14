@@ -210,4 +210,32 @@ void rejection(MLIRContext &ctx) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"23 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool profile : {false, true}) { selected=profile; llvm::outs() << (selected ? "selected Print: " : "legacy: "); behavior(ctx);mapping(ctx);rejection(ctx);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(int argc, char **argv) {
+  MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  try {
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production write pairing boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDWritePairingWrapper" ||
+              circuit.getName() == "GGSelectedPrintFASEDWritePairingWrapper",
+              "expected FASED write pairing boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDWritePairing"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      // Preserve the production counter and pre-edge pairing operations.
+      auto helper = cast<FModuleOp>(b.insert(named(circuit,"GGFASEDWritePairing")->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)), "exported write pairing invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2],ec);
+      require(!ec,"cannot export write pairing"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-write-pairing-test [boundary.mlir helper.mlir]");
+    for (bool profile : {false,true}) {
+      selected=profile; behavior(ctx); mapping(ctx); rejection(ctx);
+    }
+  } catch (const std::exception &e) { llvm::errs()<<e.what()<<"\n"; return 1; }
+  return 0;
+}
