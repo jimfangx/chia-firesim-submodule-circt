@@ -96,12 +96,9 @@ const goldengate::ControlMMIORegion regions[]{
     {"SimulationMaster_0", 544, 16}, {"ResetPulseBridgeModule_0", 560, 8},
     {"CPUManagedStreamEngine_0", 568, 4}};
 unsigned samples = 0;
-void checkMap(MLIRContext &context, unsigned width,
-              llvm::ArrayRef<goldengate::ControlMMIORegion> entries) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  require(succeeded(goldengate::addControlAddressDecode(c, width, entries, error)), error);
-  require(succeeded(verify(*root)), "decoder invalid");
-  auto helper = named(c, "GGControlAddressDecode"); Interpreter sim(helper);
+void checkDecoder(FModuleOp helper, unsigned width,
+                  llvm::ArrayRef<goldengate::ControlMMIORegion> entries) {
+  Interpreter sim(helper);
   require(helper.getOps<RegOp>().empty() && helper.getOps<RegResetOp>().empty() &&
       helper.getOps<MemOp>().empty(), "decoder must be combinational");
   auto catalog = helper->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
@@ -135,6 +132,13 @@ void checkMap(MLIRContext &context, unsigned width,
   }
   std::mt19937_64 random(176);
   for (unsigned i = 0; i < 20000; ++i) sample(random() & mask, random() & mask);
+}
+void checkMap(MLIRContext &context, unsigned width,
+              llvm::ArrayRef<goldengate::ControlMMIORegion> entries) {
+  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  require(succeeded(goldengate::addControlAddressDecode(c, width, entries, error)), error);
+  require(succeeded(verify(*root)), "decoder invalid");
+  checkDecoder(named(c, "GGControlAddressDecode"), width, entries);
 }
 void allocation(MLIRContext &context) {
   // FPGATop registration order: master, BridgeIO annotations, LoadMem, stream.
@@ -375,9 +379,67 @@ void rejection(MLIRContext &context) {
     { llvm::raw_string_ostream out(after); root->print(out); } require(before == after, "rejection mutated IR");
   }
 }
+void production(MLIRContext &ctx, llvm::StringRef input, llvm::StringRef output) {
+  auto root = parseSourceFile<ModuleOp>(input, &ctx); require(bool(root), "production parse failed");
+  auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  SmallVector<goldengate::ControlMMIOWidget> widgets;
+  SmallVector<goldengate::ControlMMIORegion> allocated;
+  require(succeeded(goldengate::allocateRocketControlMMIORegions(c, 25, {}, widgets, allocated, error)), error);
+  require(allocated.size() == 12, "NIC catalog must contain twelve widgets");
+  // Exercise the production metadata, including well-typed stale catalogs.
+  for (unsigned mode = 0; mode < 10; ++mode) {
+    OwningOpRef<ModuleOp> bad(cast<ModuleOp>(root->clone()));
+    auto bc = *bad->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+    auto reader = named(bc, "GGCPUStreamRead"), writer = named(bc, "GGCPUStreamWrite");
+    auto counts = named(bc, "GGCPUStreamCountBank");
+    if (mode == 0) named(bc, "GGNICMMIOBank").setName("MissingNICBank");
+    if (mode == 1) writer->removeAttr("goldengate.sinkStreams");
+    if (mode == 2) writer.setName("MissingWriter");
+    if (mode >= 3 && mode <= 5) {
+      auto rows = llvm::to_vector(writer->getAttrOfType<ArrayAttr>("goldengate.sinkStreams"));
+      NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+      if (mode == 3) row.set("index", b.getI64IntegerAttr(1));
+      if (mode == 4) row.set("name", b.getStringAttr("WRONG_from_cpu_stream"));
+      rows[0] = row.getDictionary(&ctx); if (mode == 5) rows.clear();
+      writer->setAttr("goldengate.sinkStreams", b.getArrayAttr(rows));
+    }
+    if (mode == 6) {
+      auto rows = llvm::to_vector(reader->getAttrOfType<ArrayAttr>("goldengate.sourceStreams"));
+      NamedAttrList row(cast<DictionaryAttr>(rows[0])); row.set("name", b.getStringAttr("TRACERVBRIDGEMODULE_0_to_cpu_stream"));
+      rows[0] = row.getDictionary(&ctx); reader->setAttr("goldengate.sourceStreams", b.getArrayAttr(rows));
+    }
+    if (mode >= 7) {
+      auto rows = llvm::to_vector(counts->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      NamedAttrList row(cast<DictionaryAttr>(rows.back()));
+      if (mode == 7) row.set("offset", b.getI32IntegerAttr(4));
+      if (mode == 8) row.set("writeable", b.getBoolAttr(true));
+      rows.back() = row.getDictionary(&ctx); if (mode == 9) rows.pop_back();
+      counts->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+    }
+    auto dump = [](Operation *op) { std::string s; llvm::raw_string_ostream os(s); op->print(os); return s; };
+    auto before = dump(*bad);
+    SmallVector<goldengate::ControlMMIOWidget> ws{{"sentinel", 1}};
+    SmallVector<goldengate::ControlMMIORegion> rs{{"sentinel", 9, 4}};
+    require(failed(goldengate::allocateRocketControlMMIORegions(bc, 25, {}, ws, rs, error)), "invalid NIC catalog accepted");
+    require(before == dump(*bad) && ws.size() == 1 && ws[0].name == "sentinel" &&
+        rs.size() == 1 && rs[0].start == 9, "failed NIC allocation mutated IR or output");
+  }
+  require(succeeded(goldengate::addControlAddressDecode(c, 25, allocated, error)), error);
+  require(succeeded(verify(*root)), "production decoder invalid");
+  auto helper = named(c, "GGControlAddressDecode"); checkDecoder(helper, 25, allocated);
+  auto standalone = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(standalone.getBody());
+  auto sc = b.create<CircuitOp>(c.getLoc(), helper.getNameAttr());
+  b.setInsertionPointToEnd(sc.getBodyBlock()); b.insert(helper->clone());
+  require(succeeded(verify(standalone)), "standalone decoder invalid");
+  std::error_code ec; llvm::raw_fd_ostream os(output, ec); require(!ec, "cannot export decoder");
+  standalone.print(os); os << '\n'; standalone.erase();
+  llvm::outs() << "PASS production NIC allocation: " << samples << " address pairs and 10 atomic catalog rejections\n";
 }
-int main() {
+}
+int main(int argc, char **argv) {
   try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 3) { production(context, argv[1], argv[2]); return 0; }
     allocation(context); registry(context);
     // Nonzero base, holes, unsorted slave indices, and the full address-space
     // endpoint exercise the generic API independently of the U250 catalog.

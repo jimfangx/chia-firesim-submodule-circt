@@ -51,7 +51,9 @@ mlir::LogicalResult deriveRocketControlMMIOCatalog(
     llvm::SmallVectorImpl<ControlMMIOWidget> &widgets, std::string &error);
 // Allocate the complete materialized Rocket platform after CPU stream binding.
 // Require the instantiated Print constructor order and one ordered read-only
-// count word per TracerV/Print DMA source before
+// count word per TracerV/Print source, and (when present) the SimpleNIC source
+// and sink. Validate the complete duplex catalog and register all sources
+// before sinks, as CPUManagedStreamEngine does, before
 // sorting widget regions. CPU bank growth can reorder the small-bank tail.
 // Leave IR and both result lists unchanged on failure.
 mlir::LogicalResult allocateRocketControlMMIORegions(

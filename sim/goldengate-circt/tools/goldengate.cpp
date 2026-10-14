@@ -3769,10 +3769,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsBankAnnotations, error)))
         return fail("FASED histogram materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT FASED histogram bank before control allocation in " << fasedHistogramsBankPath << '\n';
-      // NIC reaches the materialized host banks, but its widget catalog and
-      // three-word duplex stream bank still need generalized global routing.
-      if (!cpuSinks.empty())
-        return fail("NIC global control allocation and platform integration are not implemented");
       // HasWidgets registration order is independent of IR module order. All
       // FASED fragments now exist, so derive its size from their complete
       // registry. Validate the assembled typed MCR port again before binding.
@@ -3798,6 +3794,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlDecodeAnnotations, error)))
         return fail("control decoder annotations: " + error);
       llvm::outs() << "Mapped CIRCT control address decoder in " << controlDecodePath << '\n';
+      // The NIC catalog and address decoder now match the SFC allocation.
+      // Request/response dispatch and platform binding remain separate work.
+      if (!cpuSinks.empty())
+        return fail("NIC global control routing and platform integration are not implemented");
       if (failed(goldengate::addControlWriteRoute(circuit, error)))
         return fail("control write route: " + error);
       if (failed(mlir::verify(*module)))

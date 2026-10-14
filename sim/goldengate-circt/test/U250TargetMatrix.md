@@ -1094,3 +1094,86 @@ FASED maxFlight profiles and six partitioned QSFP profiles remain unsupported.
 NIC reaches the shared LoadMem/local control and materialized widget banks
 before its explicit global allocation/platform rejection. Intermediate boundary
 matches are partial evidence, not complete semantic passes.
+
+## Iteration 180: NIC global MMIO allocation and address decoder
+
+The native Rocket allocation boundary now includes the materialized
+`GGNICMMIOBank`/`GGNICMCRFile` and validates its duplex CPU stream catalog.
+SimpleNIC registers before TracerV/TSI/Clock, preserving its equal-sized tie
+with Clock. `CPUManagedStreamEngine.scala` registers all source counts before
+sink counts; the native allocator checks NIC source 0, TracerV source 1 and
+NIC sink 0 against the three read-only registry words. Missing halves, stale
+names/indices/offsets/permissions or truncated count registries fail atomically.
+The existing Print and no-NIC allocation path retains its registration order.
+
+The production compiler now emits `post-fame-control-address-decode.mlir` and
+its annotations for the NIC target. It then explicitly rejects unsupported
+NIC global request/response routing and platform integration. This is a
+native FIRRTL decoder boundary, not a complete NIC simulator or ABI emission.
+
+Compared exact archived SFC artifacts:
+
+```
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h
+```
+
+RTL SHA256 remains
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`;
+header SHA256 is
+`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`.
+All twelve native region starts, sizes and slave indices match the original
+AW and AR address predicates extracted from SFC `NastiRouter`. The NIC's six
+register addresses are 512–532; source counts are 592/596 and sink count is
+600. All 85 scalar driver addresses lie within their corresponding regions.
+The comparison preserves 107 prior module bodies, 101 copied ports and all
+1,792 annotation records with recursive circuit/copied-port target transfer.
+
+The control decoder CTest passed 123,462 address pairs and its existing
+registry, allocation and IR rejection cases. The new production-input test
+passed 20,664 address pairs and ten atomic rejection cases. It exports the
+actual decoder from the complete production pre-allocation boundary; the
+exported module body matches the fresh compiler's decoder exactly. Isolated
+Verilator execution compares that native RTL with the unchanged SFC AW/AR
+predicate expressions for 1,148,578 address pairs: every pair of byte addresses
+0–1023, 100,000 deterministic random pairs over the 25-bit space, and directed
+unmapped/end-of-region endpoints. One-hot routes, decoded target indices and
+error selection match. Queued transactions and full platform behavior remain
+outside this test.
+
+Evidence lives under:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration180-u250-target-matrix/
+```
+
+`nic-control-allocation-production/comparison.json` records hashes, the twelve
+regions, structured checks and behavioral results. Run
+`test/Transforms/NICControlAllocationCompare.py` with `--before` pointing to
+NIC `post-fame-fased-histograms-bank.mlir`, `--decoder` to NIC
+`post-fame-control-address-decode.mlir`, `--golden` to the archived NIC SV,
+`--export-tool` to `goldengate-control-address-decode-test`, and a fresh
+`--output-dir`, after sourcing the FireSim environment.
+
+`no-nic-rtl-collateral-comparison.json` freshly matches RTL, both constant
+headers and both XDC files byte-for-byte against iteration 179.
+`immutable-rocket-comparison.json` freshly matches the October 1 immutable
+primary FIRRTL/annotations and immutable U250 XDC, with the documented
+implementation hierarchy rename. No immutable fixture was changed.
+
+Fresh standalone replay used all thirteen archived handoffs and each effective
+platform configuration. Compiler SHA256:
+`7420c3bc133018a5eb8d1677bb044f4e7d6cb28e0bfa9b21c281933b36213579`.
+`replay/matrix.json` records one complete compile, six later lowering failures
+and six unsupported partition/QSFP platforms; its nonzero exit remains
+intentional. All seven reached BridgeIO/channel boundaries match SFC.
+Shuttle's model-port boundary matches; the other six retain exactly the prior
+native-SRAM annotation differences. These are partial findings, not target
+parity. NIC now stops after address decoding; the other failure reasons remain
+unchanged. No FireSim manager verification step was started in this turn.
+
+The next smallest step is to generalize the existing native AW/W request
+queues and widget dispatch for the twelve-region NIC catalog, retaining its
+three-word CPU stream bank and comparing accepted transactions against SFC.
+The live build includes pre-existing user ClockBridgeControl/UART registry
+edits; those edits are excluded from this checkpoint.

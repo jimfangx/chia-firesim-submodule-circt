@@ -120,6 +120,13 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
        "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"},
       fased, error))) return failure();
   catalog.push_back(fased);
+  // SimpleNIC's BridgeIO constructor precedes TracerV/TSI/Clock in the
+  // archived Rocket handoff. Preserve the 32-byte tie with Clock.
+  bool nic = llvm::any_of(circuit.getOps<FModuleOp>(), [](FModuleOp m) {
+    return m.getName() == "GGNICMMIOBank";
+  });
+  if (nic && failed(bank("SimpleNICBridgeModule_0", "GGNICMCRFile", {"GGNICMMIOBank"})))
+    return failure();
   if (failed(bank("TracerVBridgeModule_0", "GGTracerVMCRFile", {"GGTracerVTriggerConfig"})) ||
       failed(bank("TSIBridgeModule_0", "GGTSIMMIOBank", {"GGTSIMMIOBank"}, Direction::Out)) ||
       failed(bank("ClockBridgeModule_0", "GGClockBridgeMCRFile", {"GGSingleClockBridge"}))) return failure();
@@ -170,16 +177,23 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
     SmallVectorImpl<ControlMMIOWidget> &widgets,
     SmallVectorImpl<ControlMMIORegion> &regions, std::string &error) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
-  FModuleOp reader, counts, bound;
+  FModuleOp reader, writer, nicBank, counts, bound;
   for (auto m : circuit.getOps<FModuleOp>()) {
     if (m.getName() == "GGCPUStreamRead") reader = m;
+    if (m.getName() == "GGCPUStreamWrite") writer = m;
+    if (m.getName() == "GGNICMMIOBank") nicBank = m;
     if (m.getName() == "GGCPUStreamCountBank") counts = m;
     if (m.getName() == "GGPrintBridgeHostWrapper") bound = m;
   }
   auto sources = reader ? reader->getAttrOfType<ArrayAttr>("goldengate.sourceStreams") : ArrayAttr{};
+  auto sinks = writer ? writer->getAttrOfType<ArrayAttr>("goldengate.sinkStreams") : ArrayAttr{};
+  bool nic = bool(nicBank);
+  if (nic != bool(writer) || (nic && (!sinks || sinks.size() != 1)))
+    return reject("Rocket MMIO allocation requires the complete duplex NIC catalog");
   auto words = counts ? counts->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters") : ArrayAttr{};
-  if (!sources || !words || sources.size() != printHosts.size() + 1 || words.size() != sources.size())
-    return reject("Rocket MMIO allocation requires one count word per TracerV/Print DMA source");
+  if (!sources || !words || sources.size() != printHosts.size() + 1 + unsigned(nic) ||
+      words.size() != sources.size() + (nic ? sinks.size() : 0))
+    return reject("Rocket MMIO allocation requires one count word per registered DMA source and sink");
   if (!printHosts.empty()) {
     auto bindings = bound ? bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr{};
     if (!bindings || bindings.size() != printHosts.size())
@@ -221,8 +235,9 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
         uint64_t(index.getInt()) >= sources.size() || !indices.insert(index.getInt()).second)
       return reject("Rocket MMIO DMA indices must be unique and contiguous");
     auto i = index.getInt();
-    std::string expected = i == 0 ? "TRACERVBRIDGEMODULE_0_to_cpu_stream" :
-        "PRINTBRIDGEMODULE_" + std::to_string(i - 1) + "_to_cpu_stream";
+    std::string expected = nic && i == 0 ? "SIMPLENICBRIDGEMODULE_0_to_cpu_stream" :
+        i == int64_t(nic) ? "TRACERVBRIDGEMODULE_0_to_cpu_stream" :
+        "PRINTBRIDGEMODULE_" + std::to_string(i - 1 - unsigned(nic)) + "_to_cpu_stream";
     auto found = registers.find(expected + "_count");
     auto word = found == registers.end() ? DictionaryAttr{} : found->second;
     auto offset = word ? word.getAs<IntegerAttr>("offset") : IntegerAttr{};
@@ -231,6 +246,23 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
     if (!name || name != expected || !offset || offset.getValue().getBitWidth() > 64 || offset.getInt() != i * 4 ||
         !read || !read.getValue() || !write || write.getValue())
       return reject("Rocket MMIO count register differs from ordered read-only DMA source");
+  }
+  // CPUManagedStreamEngine registers all sources before all sinks; the sink
+  // index belongs to its own address space, while its MMIO word follows sources.
+  if (nic) {
+    auto sink = dyn_cast<DictionaryAttr>(sinks[0]);
+    auto name = sink ? sink.getAs<StringAttr>("name") : StringAttr{};
+    auto index = sink ? sink.getAs<IntegerAttr>("index") : IntegerAttr{};
+    auto found = registers.find("SIMPLENICBRIDGEMODULE_0_from_cpu_stream_count");
+    auto word = found == registers.end() ? DictionaryAttr{} : found->second;
+    auto offset = word ? word.getAs<IntegerAttr>("offset") : IntegerAttr{};
+    auto read = word ? word.getAs<BoolAttr>("readable") : BoolAttr{};
+    auto write = word ? word.getAs<BoolAttr>("writeable") : BoolAttr{};
+    if (!name || name != "SIMPLENICBRIDGEMODULE_0_from_cpu_stream" || !index ||
+        index.getValue().getBitWidth() > 64 || index.getInt() != 0 || !offset ||
+        offset.getValue().getBitWidth() > 64 || offset.getInt() != int64_t(sources.size() * 4) ||
+        !read || !read.getValue() || !write || write.getValue())
+      return reject("Rocket MMIO sink count differs from ordered read-only DMA sink");
   }
   SmallVector<ControlMMIOWidget> catalog;
   SmallVector<ControlMMIORegion> allocated;
