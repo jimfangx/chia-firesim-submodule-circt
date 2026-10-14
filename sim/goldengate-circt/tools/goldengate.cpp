@@ -4490,10 +4490,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsAnnotations, error)))
         return fail("FASED request limits annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock request-limit registers and admission binding in " << fasedRequestLimitsPath << '\n';
-      // NIC runtime maxima now use the same host-clock MCR bank as Rocket.
-      // Latency MMIO is the next independently checked composition boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED latency registers, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
         return fail("FASED latency registers: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED latency registers produced invalid FIRRTL IR");
@@ -4507,6 +4503,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyRegistersAnnotations, error)))
         return fail("FASED latency registers annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock latency registers and timing binding in " << fasedLatencyRegistersPath << '\n';
+      // NIC latency MMIO now drives the full-width timing inputs on host cycles.
+      // The functional-model control word is the next composition boundary.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED functional model register, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDFunctionalModelRegister(circuit, fasedFunctionalModelBank, error)))
         return fail("FASED functional model register: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED functional model register produced invalid FIRRTL IR");
