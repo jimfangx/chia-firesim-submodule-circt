@@ -182,4 +182,30 @@ void rejection(MLIRContext &ctx,bool selected) {
   auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"21 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected:{false,true}){behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(int argc, char **argv) {
+  MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  try {
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production write egress boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDWriteEgressWrapper" ||
+              circuit.getName() == "GGSelectedPrintFASEDWriteEgressWrapper",
+              "expected FASED write egress boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDWriteEgress"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      // Clone the production helper verbatim for a full SFC RTL differential.
+      auto helper = cast<FModuleOp>(b.insert(named(circuit,"GGFASEDWriteEgress")->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)), "exported write egress invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2],ec);
+      require(!ec,"cannot export write egress"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-write-egress-test [boundary.mlir helper.mlir]");
+    for(bool selected:{false,true}) {behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}
+  } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
+  return 0;
+}

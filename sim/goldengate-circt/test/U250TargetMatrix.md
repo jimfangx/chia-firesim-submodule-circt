@@ -2572,3 +2572,82 @@ reset, request priority and the combined read/write token-readiness boundary.
 Timing/control responses, slave-1 binding, wider/multiple TracerV profiles,
 generalized FASED geometry, complete NIC host memory/stream composition and
 partition/QSFP support remain incomplete.
+
+### Iteration 197: execute native NIC write acknowledgment storage/scheduling
+
+The compiler now runs `addFASEDWriteEgress` for the archived NIC constructor.
+It emits the actual native per-ID acknowledgment operations, connects host B
+acceptance and write-token readiness, and retains the read scheduler's shared
+read/write readiness boundary. The NIC rejection moves to the still-unported
+response release, timing/control and platform composition boundary. This is
+partial NIC support, not a successful full NIC compile or runtime claim.
+
+The Scala oracle is `EgressUnit.scala`'s `WriteEgress`: one-bit counters for
+all sixteen IDs, old-counter sampling on request start or host-only retry,
+retry selection of the held ID, simultaneous same-ID arrival/retirement
+cancellation, new-request priority over retirement, and qualified egress reset.
+The held ID captures during reset while valid, haveAck and counters reset.
+`FASEDMemoryTimingModel.scala` qualifies reset with `targetFire`; the model
+response release clock is gated separately, as prescribed by the FAME path
+in `MidasTransforms.scala` and `FAMETransform.scala`.
+
+Evidence is in the mutable generated directory
+`iteration197-u250-target-matrix/`. `nic-write-egress-comparison.json` compares
+`replay/alveo_u250_firesim_rocket_singlecore_nic/candidate/post-fame-fased-write-egress.mlir`
+and its `-all.json` against the actual SFC module and model connections in:
+
+```text
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+The two complete SFC `WriteEgress` modules match. The new comparator exports
+the production helper verbatim using `goldengate-fased-write-egress-test`,
+lowers it through firtool and executes it against the complete SFC sequential
+RTL in Verilator. Only the SFC module symbol is renamed. All nineteen state
+registers and acknowledgment outputs match after initial reset/ID capture:
+40,130 cycles, 10,153 starts, 3,951 retirements, 1,992 chained requests,
+78 reset-time captures, 7,781 host-only retries, 7,782 counter wraps,
+776 same-ID cancellations, 1,221 different-ID simultaneous updates,
+3,118 old-counter samples and 23,374 stalls. All sixteen IDs participate in
+arrivals, cancellation and wrapping. Incoming response metadata is discarded;
+native response user/resp remain zero. There is no uninitialized RAM or
+undefined-RUW restriction in this write differential.
+
+The wrapper preserves 177 prior modules, checks all 196 connections, verifies
+the exact new port types against the no-NIC production boundary and transfers
+all 1,792 annotations recursively. All 190 earlier NIC FIRRTL/annotation
+artifacts match iteration 196; only two write-egress artifacts are added.
+The no-NIC Rocket's final RTL, both headers and both XDC files remain
+byte-identical. Fresh primary immutable handoff hashes and normalized U250
+XDC comparisons also match, including the recorded implementation hierarchy
+rename. Neither immutable fixture was modified. Focused CTest passes 42,768
+write-egress transitions, 64 wrapper mapping cases, five target transfers and
+21 atomic rejections for each baseline/selected Print profile. Manager gates
+remain owned by the external harness and were not started here.
+
+Reproduce the comparator in the sourced environment with `--candidate-dir`
+pointing to the NIC replay, `--baseline` to the no-NIC production write-egress
+MLIR, `--golden` and `--immutable` to the SFC SV files above, `--export-tool`
+to `goldengate-fased-write-egress-test`, a fresh absolute `--output-dir` and
+`--report-json`. The preflight report uses iteration 196's no-NIC helper;
+the final NIC report uses the fresh iteration 197 production boundary.
+
+The fresh thirteen-target replay uses compiler SHA256
+`489ef10be5313f4ec7c6c1fe507df0fae7cca9f0d2f357b5b6e618252c8c6322`.
+`replay/matrix.json` and `matrix-regression-comparison.json` retain one compiled
+no-NIC target, six later compiler failures and six unsupported partition/QSFP
+platforms. Input hashes, effective platform configurations, compile statuses
+and structured boundary comparisons match iteration 196 for all thirteen
+targets. Only the NIC diagnostic advances. Rejections remain implementation
+gaps, not passing comparisons. All seven reached bridge/channel boundaries
+match SFC; Shuttle model-port annotations match, while the other six retain
+the documented native-SRAM differences. Older mutable iteration 192 MLIR
+was gzip-compressed with decompressed SHA256 verification and a manifest,
+recovering 35,214,476,370 bytes; current candidates and goldens are retained.
+
+The next smallest step is to connect native NIC response release and compare
+the targetFire-qualified read/write occupancy and payload forwarding with
+the actual SFC `AXI4Releaser` RTL. Timing/control responses, slave-1 binding,
+generalized FASED geometry, wider/multiple TracerV profiles, complete NIC
+host memory/stream composition and partition/QSFP integration remain incomplete.

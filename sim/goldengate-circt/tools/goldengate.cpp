@@ -4339,11 +4339,9 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedReadSchedulerAnnotations, error)))
         return fail("FASED read scheduler annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED read request scheduling and buffer retirement in " << fasedReadSchedulerPath << '\n';
-      // NIC shares the recorded non-ROB ReadEgress profile: schedule requests
-      // and retire its native per-ID queues before stopping at the remaining
-      // write/timing/control and platform composition boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED write responses, timing/control responses and platform integration are not implemented");
+      // The recorded NIC constructor also shares the 16 one-bit WriteEgress
+      // counters. Connect host B acceptance and target acknowledgment readiness
+      // through the same native operations used by the no-NIC model.
       if (failed(goldengate::addFASEDWriteEgress(circuit, error)))
         return fail("FASED write egress: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED write egress produced invalid FIRRTL IR");
@@ -4357,6 +4355,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteEgressAnnotations, error)))
         return fail("FASED write egress annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED per-ID write acknowledgements and token readiness in " << fasedWriteEgressPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC FASED response release, timing/control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDResponseReleaser(circuit, error)))
         return fail("FASED response releaser: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED response releaser produced invalid FIRRTL IR");
