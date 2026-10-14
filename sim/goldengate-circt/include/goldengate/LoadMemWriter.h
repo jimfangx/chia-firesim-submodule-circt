@@ -4,6 +4,11 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
+// Attach the U250 writer to an explicit, uninstantiated host boundary.
+// This permits the duplex NIC CPU wrapper to share the same LoadMem pipeline.
+mlir::LogicalResult attachLoadMemWriter(circt::firrtl::CircuitOp circuit,
+                                      llvm::StringRef expectedTop,
+                                      std::string &error);
 // Map U250 LoadMemWriter's addr34/data64/maxBurst32 request and burst FSM.
 mlir::LogicalResult addLoadMemWriter(circt::firrtl::CircuitOp circuit,
                                    std::string &error);

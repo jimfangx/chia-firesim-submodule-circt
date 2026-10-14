@@ -1,5 +1,5 @@
 // See LICENSE for license details.
-// Required input invariants: uninstantiated CPU B wrapper, host clock/reset,
+// Required input invariants: explicit uninstantiated host boundary, clock/reset,
 // retained rawAnnotations, fresh LoadMem names. Only U250 addr34/data64 with
 // maxBurst32 is supported, as in the recorded LoadMemWriter oracle.
 // Annotations consumed/produced: none added/removed; copied top port and circuit
@@ -18,11 +18,17 @@ using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addLoadMemWriter(CircuitOp circuit, std::string &error) {
+  return attachLoadMemWriter(circuit, "GGCPUStreamWriteResponseBufferWrapper", error);
+}
+
+LogicalResult goldengate::attachLoadMemWriter(CircuitOp circuit,
+                                            llvm::StringRef expectedTop,
+                                            std::string &error) {
   constexpr llvm::StringLiteral helperName = "GGLoadMemWriter";
   constexpr llvm::StringLiteral wrapperName = "GGLoadMemWriterWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGCPUStreamWriteResponseBufferWrapper")
-    return reject("LoadMem writer requires the CPU B buffer wrapper");
+  if (expectedTop.empty() || circuit.getName() != expectedTop)
+    return reject("LoadMem writer requires the explicit active host boundary");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == helperName || m.getModuleName() == wrapperName)

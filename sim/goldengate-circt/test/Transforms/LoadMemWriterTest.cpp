@@ -19,7 +19,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef n) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == n) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &context, bool nic = false) {
   auto root = parseSourceString<ModuleOp>(R"(module {
     firrtl.circuit "GGCPUStreamWriteResponseBufferWrapper" {
       firrtl.module @GGCPUStreamWriteResponseBufferWrapper(
@@ -27,12 +27,17 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         out %cpu_stream_b_valid: !firrtl.uint<1>, in %other: !firrtl.uint<8>) {}
     } })", &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
+  if (nic) {
+    auto top = named(c, "GGCPUStreamWriteResponseBufferWrapper");
+    top.setName("GGNICCPUStreamControlWrapper"); c.setName(top.getName());
+  }
+  std::string prefix = "~" + c.getName().str();
   c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
       b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
       b.getNamedAttr("targets", b.getArrayAttr({
-        b.getStringAttr("~GGCPUStreamWriteResponseBufferWrapper"),
-        b.getStringAttr("~GGCPUStreamWriteResponseBufferWrapper|GGCPUStreamWriteResponseBufferWrapper>cpu_stream_b_valid"),
-        b.getStringAttr("~GGCPUStreamWriteResponseBufferWrapper|Model>clock")}))})}));
+        b.getStringAttr(prefix),
+        b.getStringAttr(prefix + "|" + c.getName().str() + ">cpu_stream_b_valid"),
+        b.getStringAttr(prefix + "|Model>clock")}))})}));
   return root;
 }
 // Evaluate the actual generated SSA operations and connect drivers. Track
@@ -139,9 +144,10 @@ void behavior(MLIRContext &context) {
       << writes << " beats, " << responses << " responses, " << resetPayload << " payload captures during reset\n";
   require(requests > 500 && bursts > 500 && writes > 10000 && responses > 100 && resetPayload >= 2, "writer coverage insufficient");
 }
-void mapping(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
-  require(succeeded(goldengate::addLoadMemWriter(c,error)),error);
+void mapping(MLIRContext &context, bool nic = false) {
+  auto root = fixture(context, nic); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  require(succeeded(goldengate::attachLoadMemWriter(c, nic ? "GGNICCPUStreamControlWrapper" :
+      "GGCPUStreamWriteResponseBufferWrapper", error)),error);
   auto top = named(c,"GGLoadMemWriterWrapper"), h = named(c,"GGLoadMemWriter");
   require(h.getNumPorts() == 20 && top.getNumPorts() == 22, "writer port geometry differs");
   require(h->getAttrOfType<IntegerAttr>("goldengate.maxBurst").getInt() == 32, "burst metadata differs");
@@ -168,7 +174,7 @@ void mapping(MLIRContext &context) {
       cast<StringAttr>(t[2]).getValue()=="~GGLoadMemWriterWrapper|Model>clock","annotation identity differs");
 }
 void rejection(MLIRContext &context) {
-  for(unsigned bad=0;bad<9;++bad) {
+  for(unsigned bad=0;bad<10;++bad) {
     auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();auto top=named(c,"GGCPUStreamWriteResponseBufferWrapper");OpBuilder b(&context);
     if(bad==0)c.setName("WrongTop");if(bad==1)c->removeAttr("rawAnnotations");
     if(bad==2 || bad==7) { SmallVector<Attribute> names(top.getPortNames().begin(),top.getPortNames().end());
@@ -178,12 +184,24 @@ void rejection(MLIRContext &context) {
     if(bad==5 || bad==6) { b.setInsertionPointToEnd(c.getBodyBlock());b.create<FModuleOp>(c.getLoc(),b.getStringAttr(bad==5?"GGLoadMemWriter":"GGLoadMemWriterWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{}); }
     if(bad==8)top.setName("MissingTop");
     std::string before,after,error;{llvm::raw_string_ostream o(before);root->print(o);}
-    require(failed(goldengate::addLoadMemWriter(c,error)),"unsupported writer boundary accepted");
+    require(failed(goldengate::attachLoadMemWriter(c, bad == 9 ? "" :
+        "GGCPUStreamWriteResponseBufferWrapper", error)),"unsupported writer boundary accepted");
     {llvm::raw_string_ostream o(after);root->print(o);}require(before==after,"rejection mutated IR");
   }
 }
 }
-int main() {
-  try { MLIRContext c;c.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();behavior(c);mapping(c);rejection(c);return 0; }
+int main(int argc, char **argv) {
+  try { MLIRContext c;c.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+    if (argc == 3) {
+      auto production = parseSourceFile<ModuleOp>(argv[1], &c); require(bool(production), "production parse failed");
+      auto source = *production->getOps<CircuitOp>().begin(); auto helper = named(source, "GGLoadMemWriter");
+      OpBuilder b(&c); auto root = ModuleOp::create(source.getLoc());
+      b.setInsertionPointToEnd(root.getBody()); auto standalone = b.create<CircuitOp>(source.getLoc(), b.getStringAttr(helper.getName()));
+      b.setInsertionPointToEnd(standalone.getBodyBlock()); b.insert(helper->clone());
+      require(succeeded(verify(root)), "standalone writer verification failed");
+      std::error_code ec; llvm::raw_fd_ostream os(argv[2], ec); require(!ec, "cannot write standalone writer");
+      root.print(os); os << '\n'; root.erase();
+    } else { behavior(c);mapping(c);mapping(c,true);rejection(c); }
+    return 0; }
   catch(const std::exception &e) { llvm::errs()<<e.what()<<'\n';return 1; }
 }

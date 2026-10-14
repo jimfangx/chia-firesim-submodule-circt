@@ -3390,99 +3390,101 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitAllAnnotations(circuit, nicCPUControlAnnotations, error)))
           return fail("NIC CPU control transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC ordered CPU stream occupancy Nasti control in " << nicCPUControlPath << '\n';
-        return fail("NIC global control allocation and platform integration are not implemented");
+      } else {
+        if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
+          return fail("CPU stream MCRFile transactions: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("CPU stream MCRFile produced invalid FIRRTL IR");
+        llvm::SmallString<256> cpuControlPath(outputDir), cpuControlAnnotations(outputDir);
+        llvm::sys::path::append(cpuControlPath, "post-fame-cpu-stream-control.mlir");
+        llvm::sys::path::append(cpuControlAnnotations, "post-fame-cpu-stream-control-all.json");
+        std::error_code cpuControlError;
+        llvm::raw_fd_ostream cpuControlOut(cpuControlPath, cpuControlError);
+        if (cpuControlError)
+          return fail("cannot write CPU stream MCRFile: " + cpuControlError.message());
+        module->print(cpuControlOut); cpuControlOut << '\n'; cpuControlOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, cpuControlAnnotations, error)))
+          return fail("CPU stream MCRFile annotations: " + error);
+        llvm::outs() << "Mapped CIRCT CPU stream MCRFile transactions in " << cpuControlPath << '\n';
+        if (failed(goldengate::addEmptyCPUStreamWrite(circuit, error)))
+          return fail("empty CPU stream write boundary: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("empty CPU stream write produced invalid FIRRTL IR");
+        llvm::SmallString<256> cpuWritePath(outputDir), cpuWriteAnnotations(outputDir);
+        llvm::sys::path::append(cpuWritePath, "post-fame-cpu-stream-write.mlir");
+        llvm::sys::path::append(cpuWriteAnnotations, "post-fame-cpu-stream-write-all.json");
+        std::error_code cpuWriteError;
+        llvm::raw_fd_ostream cpuWriteOut(cpuWritePath, cpuWriteError);
+        if (cpuWriteError)
+          return fail("cannot write empty CPU stream write boundary: " + cpuWriteError.message());
+        module->print(cpuWriteOut); cpuWriteOut << '\n'; cpuWriteOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteAnnotations, error)))
+          return fail("empty CPU stream write annotations: " + error);
+        llvm::outs() << "Mapped CIRCT empty CPU stream write boundary in " << cpuWritePath << '\n';
+        if (failed(goldengate::addCPUStreamWriteBuffer(circuit, error)))
+          return fail("CPU stream AW/W buffer: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("CPU stream AW/W buffer produced invalid FIRRTL IR");
+        llvm::SmallString<256> cpuWriteBufferPath(outputDir), cpuWriteBufferAnnotations(outputDir);
+        llvm::sys::path::append(cpuWriteBufferPath, "post-fame-cpu-stream-write-buffer.mlir");
+        llvm::sys::path::append(cpuWriteBufferAnnotations, "post-fame-cpu-stream-write-buffer-all.json");
+        std::error_code cpuWriteBufferError;
+        llvm::raw_fd_ostream cpuWriteBufferOut(cpuWriteBufferPath, cpuWriteBufferError);
+        if (cpuWriteBufferError)
+          return fail("cannot write CPU stream AW/W buffer: " + cpuWriteBufferError.message());
+        module->print(cpuWriteBufferOut); cpuWriteBufferOut << '\n'; cpuWriteBufferOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteBufferAnnotations, error)))
+          return fail("CPU stream AW/W buffer annotations: " + error);
+        llvm::outs() << "Buffered CIRCT CPU stream AW/W requests in " << cpuWriteBufferPath << '\n';
+        if (failed(goldengate::addCPUStreamReadBuffer(circuit, error)))
+          return fail("CPU stream AR buffer: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("CPU stream AR buffer produced invalid FIRRTL IR");
+        llvm::SmallString<256> cpuReadBufferPath(outputDir), cpuReadBufferAnnotations(outputDir);
+        llvm::sys::path::append(cpuReadBufferPath, "post-fame-cpu-stream-read-buffer.mlir");
+        llvm::sys::path::append(cpuReadBufferAnnotations, "post-fame-cpu-stream-read-buffer-all.json");
+        std::error_code cpuReadBufferError;
+        llvm::raw_fd_ostream cpuReadBufferOut(cpuReadBufferPath, cpuReadBufferError);
+        if (cpuReadBufferError)
+          return fail("cannot write CPU stream AR buffer: " + cpuReadBufferError.message());
+        module->print(cpuReadBufferOut); cpuReadBufferOut << '\n'; cpuReadBufferOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, cpuReadBufferAnnotations, error)))
+          return fail("CPU stream AR buffer annotations: " + error);
+        llvm::outs() << "Buffered CIRCT CPU stream AR requests in " << cpuReadBufferPath << '\n';
+        if (failed(goldengate::addCPUStreamResponseBuffer(circuit, error)))
+          return fail("CPU stream R response buffer: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("CPU stream R response buffer produced invalid FIRRTL IR");
+        llvm::SmallString<256> cpuResponseBufferPath(outputDir), cpuResponseBufferAnnotations(outputDir);
+        llvm::sys::path::append(cpuResponseBufferPath, "post-fame-cpu-stream-response-buffer.mlir");
+        llvm::sys::path::append(cpuResponseBufferAnnotations, "post-fame-cpu-stream-response-buffer-all.json");
+        std::error_code cpuResponseBufferError;
+        llvm::raw_fd_ostream cpuResponseBufferOut(cpuResponseBufferPath, cpuResponseBufferError);
+        if (cpuResponseBufferError)
+          return fail("cannot write CPU stream R response buffer: " + cpuResponseBufferError.message());
+        module->print(cpuResponseBufferOut); cpuResponseBufferOut << '\n'; cpuResponseBufferOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, cpuResponseBufferAnnotations, error)))
+          return fail("CPU stream R response buffer annotations: " + error);
+        llvm::outs() << "Buffered CIRCT CPU stream R response beats in " << cpuResponseBufferPath << '\n';
+        if (failed(goldengate::addCPUStreamWriteResponseBuffer(circuit, error)))
+          return fail("CPU stream B response buffer: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("CPU stream B response buffer produced invalid FIRRTL IR");
+        llvm::SmallString<256> cpuWriteResponseBufferPath(outputDir), cpuWriteResponseBufferAnnotations(outputDir);
+        llvm::sys::path::append(cpuWriteResponseBufferPath, "post-fame-cpu-stream-write-response-buffer.mlir");
+        llvm::sys::path::append(cpuWriteResponseBufferAnnotations, "post-fame-cpu-stream-write-response-buffer-all.json");
+        std::error_code cpuWriteResponseBufferError;
+        llvm::raw_fd_ostream cpuWriteResponseBufferOut(cpuWriteResponseBufferPath, cpuWriteResponseBufferError);
+        if (cpuWriteResponseBufferError)
+          return fail("cannot write CPU stream B response buffer: " + cpuWriteResponseBufferError.message());
+        module->print(cpuWriteResponseBufferOut); cpuWriteResponseBufferOut << '\n'; cpuWriteResponseBufferOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteResponseBufferAnnotations, error)))
+          return fail("CPU stream B response buffer annotations: " + error);
+        llvm::outs() << "Buffered CIRCT CPU stream B responses in " << cpuWriteResponseBufferPath << '\n';
       }
-      if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
-        return fail("CPU stream MCRFile transactions: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("CPU stream MCRFile produced invalid FIRRTL IR");
-      llvm::SmallString<256> cpuControlPath(outputDir), cpuControlAnnotations(outputDir);
-      llvm::sys::path::append(cpuControlPath, "post-fame-cpu-stream-control.mlir");
-      llvm::sys::path::append(cpuControlAnnotations, "post-fame-cpu-stream-control-all.json");
-      std::error_code cpuControlError;
-      llvm::raw_fd_ostream cpuControlOut(cpuControlPath, cpuControlError);
-      if (cpuControlError)
-        return fail("cannot write CPU stream MCRFile: " + cpuControlError.message());
-      module->print(cpuControlOut); cpuControlOut << '\n'; cpuControlOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, cpuControlAnnotations, error)))
-        return fail("CPU stream MCRFile annotations: " + error);
-      llvm::outs() << "Mapped CIRCT CPU stream MCRFile transactions in " << cpuControlPath << '\n';
-      if (failed(goldengate::addEmptyCPUStreamWrite(circuit, error)))
-        return fail("empty CPU stream write boundary: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("empty CPU stream write produced invalid FIRRTL IR");
-      llvm::SmallString<256> cpuWritePath(outputDir), cpuWriteAnnotations(outputDir);
-      llvm::sys::path::append(cpuWritePath, "post-fame-cpu-stream-write.mlir");
-      llvm::sys::path::append(cpuWriteAnnotations, "post-fame-cpu-stream-write-all.json");
-      std::error_code cpuWriteError;
-      llvm::raw_fd_ostream cpuWriteOut(cpuWritePath, cpuWriteError);
-      if (cpuWriteError)
-        return fail("cannot write empty CPU stream write boundary: " + cpuWriteError.message());
-      module->print(cpuWriteOut); cpuWriteOut << '\n'; cpuWriteOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteAnnotations, error)))
-        return fail("empty CPU stream write annotations: " + error);
-      llvm::outs() << "Mapped CIRCT empty CPU stream write boundary in " << cpuWritePath << '\n';
-      if (failed(goldengate::addCPUStreamWriteBuffer(circuit, error)))
-        return fail("CPU stream AW/W buffer: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("CPU stream AW/W buffer produced invalid FIRRTL IR");
-      llvm::SmallString<256> cpuWriteBufferPath(outputDir), cpuWriteBufferAnnotations(outputDir);
-      llvm::sys::path::append(cpuWriteBufferPath, "post-fame-cpu-stream-write-buffer.mlir");
-      llvm::sys::path::append(cpuWriteBufferAnnotations, "post-fame-cpu-stream-write-buffer-all.json");
-      std::error_code cpuWriteBufferError;
-      llvm::raw_fd_ostream cpuWriteBufferOut(cpuWriteBufferPath, cpuWriteBufferError);
-      if (cpuWriteBufferError)
-        return fail("cannot write CPU stream AW/W buffer: " + cpuWriteBufferError.message());
-      module->print(cpuWriteBufferOut); cpuWriteBufferOut << '\n'; cpuWriteBufferOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteBufferAnnotations, error)))
-        return fail("CPU stream AW/W buffer annotations: " + error);
-      llvm::outs() << "Buffered CIRCT CPU stream AW/W requests in " << cpuWriteBufferPath << '\n';
-      if (failed(goldengate::addCPUStreamReadBuffer(circuit, error)))
-        return fail("CPU stream AR buffer: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("CPU stream AR buffer produced invalid FIRRTL IR");
-      llvm::SmallString<256> cpuReadBufferPath(outputDir), cpuReadBufferAnnotations(outputDir);
-      llvm::sys::path::append(cpuReadBufferPath, "post-fame-cpu-stream-read-buffer.mlir");
-      llvm::sys::path::append(cpuReadBufferAnnotations, "post-fame-cpu-stream-read-buffer-all.json");
-      std::error_code cpuReadBufferError;
-      llvm::raw_fd_ostream cpuReadBufferOut(cpuReadBufferPath, cpuReadBufferError);
-      if (cpuReadBufferError)
-        return fail("cannot write CPU stream AR buffer: " + cpuReadBufferError.message());
-      module->print(cpuReadBufferOut); cpuReadBufferOut << '\n'; cpuReadBufferOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, cpuReadBufferAnnotations, error)))
-        return fail("CPU stream AR buffer annotations: " + error);
-      llvm::outs() << "Buffered CIRCT CPU stream AR requests in " << cpuReadBufferPath << '\n';
-      if (failed(goldengate::addCPUStreamResponseBuffer(circuit, error)))
-        return fail("CPU stream R response buffer: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("CPU stream R response buffer produced invalid FIRRTL IR");
-      llvm::SmallString<256> cpuResponseBufferPath(outputDir), cpuResponseBufferAnnotations(outputDir);
-      llvm::sys::path::append(cpuResponseBufferPath, "post-fame-cpu-stream-response-buffer.mlir");
-      llvm::sys::path::append(cpuResponseBufferAnnotations, "post-fame-cpu-stream-response-buffer-all.json");
-      std::error_code cpuResponseBufferError;
-      llvm::raw_fd_ostream cpuResponseBufferOut(cpuResponseBufferPath, cpuResponseBufferError);
-      if (cpuResponseBufferError)
-        return fail("cannot write CPU stream R response buffer: " + cpuResponseBufferError.message());
-      module->print(cpuResponseBufferOut); cpuResponseBufferOut << '\n'; cpuResponseBufferOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, cpuResponseBufferAnnotations, error)))
-        return fail("CPU stream R response buffer annotations: " + error);
-      llvm::outs() << "Buffered CIRCT CPU stream R response beats in " << cpuResponseBufferPath << '\n';
-      if (failed(goldengate::addCPUStreamWriteResponseBuffer(circuit, error)))
-        return fail("CPU stream B response buffer: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("CPU stream B response buffer produced invalid FIRRTL IR");
-      llvm::SmallString<256> cpuWriteResponseBufferPath(outputDir), cpuWriteResponseBufferAnnotations(outputDir);
-      llvm::sys::path::append(cpuWriteResponseBufferPath, "post-fame-cpu-stream-write-response-buffer.mlir");
-      llvm::sys::path::append(cpuWriteResponseBufferAnnotations, "post-fame-cpu-stream-write-response-buffer-all.json");
-      std::error_code cpuWriteResponseBufferError;
-      llvm::raw_fd_ostream cpuWriteResponseBufferOut(cpuWriteResponseBufferPath, cpuWriteResponseBufferError);
-      if (cpuWriteResponseBufferError)
-        return fail("cannot write CPU stream B response buffer: " + cpuWriteResponseBufferError.message());
-      module->print(cpuWriteResponseBufferOut); cpuWriteResponseBufferOut << '\n'; cpuWriteResponseBufferOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteResponseBufferAnnotations, error)))
-        return fail("CPU stream B response buffer annotations: " + error);
-      llvm::outs() << "Buffered CIRCT CPU stream B responses in " << cpuWriteResponseBufferPath << '\n';
-      if (failed(goldengate::addLoadMemWriter(circuit, error)))
+      // Both CPU transport profiles now enter the same native LoadMem path.
+      if (failed(goldengate::attachLoadMemWriter(circuit, cpuSinks.empty()
+              ? "GGCPUStreamWriteResponseBufferWrapper" : "GGNICCPUStreamControlWrapper", error)))
         return fail("LoadMem writer: " + error);
       if (failed(mlir::verify(*module)))
         return fail("LoadMem writer produced invalid FIRRTL IR");
@@ -3767,6 +3769,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsBankAnnotations, error)))
         return fail("FASED histogram materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT FASED histogram bank before control allocation in " << fasedHistogramsBankPath << '\n';
+      // NIC reaches the materialized host banks, but its widget catalog and
+      // three-word duplex stream bank still need generalized global routing.
+      if (!cpuSinks.empty())
+        return fail("NIC global control allocation and platform integration are not implemented");
       // HasWidgets registration order is independent of IR module order. All
       // FASED fragments now exist, so derive its size from their complete
       // registry. Validate the assembled typed MCR port again before binding.

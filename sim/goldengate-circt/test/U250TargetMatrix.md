@@ -997,3 +997,100 @@ FASED maxFlight profiles and six partitioned QSFP profiles remain gaps. NIC
 reaches the new CPU occupancy transport boundary before its explicit global
 allocation/platform rejection. Partial boundary matches and compile-only
 results are not complete semantic passes.
+
+## Iteration 179: shared native LoadMem path for NIC transport
+
+The NIC CPU control boundary now enters the shared CIRCT LoadMem pipeline.
+`attachLoadMemWriter` binds an explicit active, uninstantiated host top while
+preserving the existing no-NIC entry point and all preflight checks. Empty or
+mismatched identities, missing annotations/clock/reset, instantiated tops and
+colliding helper/port names reject before mutation. The compiler keeps the
+no-NIC CPU transport construction in its own branch, then shares LoadMem writer,
+request queue/arbiter, write MMIO/data FIFO, read requests/data FIFO and MCRFile
+operations with NIC. The NIC replay also reaches native SimulationMaster, TSI,
+BlockDev and FASED bank materialization. It still explicitly rejects immediately
+before global control allocation/platform integration. This does not constitute
+a complete NIC target compile or host memory integration.
+
+The final compiler and writer test build passes. All six focused CTests pass:
+`goldengate-loadmem-writer`, `goldengate-loadmem-requests`,
+`goldengate-loadmem-write-mmio`, `goldengate-loadmem-write-data`,
+`goldengate-loadmem-read-requests` and `goldengate-loadmem-read-data`.
+The writer test covers both active top identities, nested target transfer and
+ten atomic rejection cases. Its export mode clones the actual production
+`GGLoadMemWriter` operations for the RTL differential test.
+
+`test/Transforms/NICLoadMemCompare.py` compares the production NIC attachment
+against these exact SFC artifacts:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+Their SHA256 values are, respectively,
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`
+and `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+Both contain identical cleaned `LoadMemWriter` module operations. The comparison
+retains that SFC module verbatim and lowers the cloned production writer with
+firtool. Native/SFC ports and the NIC widget's addr34/data64/maxBurst32 geometry
+match. All 81 prior module bodies, 60 copied public ports/routes, 18 new writer
+ports and 1,792 transferred annotation records match. Eight shared LoadMem
+helper bodies match the fresh no-NIC replay.
+
+Verilator with assertions enabled matches native and SFC writer outputs before
+and after every edge for 115,918 cycles: 1,662 requests, 2,263 bursts, 41,575 data
+beats, 1,296 responses and 1,025 reset cycles. Directed cases cover all 194
+zero/nonzero requests of lengths 0 through 96, zero-length underflow, burst
+boundaries, multiburst writes and 34-bit address wrap. Reset exercises all four
+FSM stages, followed by 100,000 randomized cycles with independent request,
+data, AW, W and B stalls. Unreset AW/W payloads are compared when valid. This
+isolates writer behavior; full LoadMem host arbitration and NIC platform/runtime
+behavior remain pending.
+
+Evidence lives under:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration179-u250-target-matrix/
+```
+
+`nic-loadmem-production/comparison.json` records the golden/candidate hashes,
+structured checks and behavioral result. Run the comparator with `--before`
+pointing to NIC `post-fame-nic-cpu-control.mlir`, `--writer` to NIC
+`post-fame-loadmem-writer.mlir`, `--control` to NIC
+`post-fame-loadmem-control.mlir`, `--baseline-control` to the no-NIC corresponding
+control boundary, both golden paths above, the built writer test as
+`--export-tool`, and a new `--output-dir`.
+
+`no-nic-rtl-collateral-comparison.json` freshly records that RTL, both constant
+headers and both XDC files are byte-identical to iteration 178.
+`immutable-rocket-comparison.json` freshly matches the immutable October 1
+FIRRTL/annotation handoff and U250 XDC with the recorded implementation hierarchy
+rename. No golden fixture was modified. The live compiler includes the user's
+pre-existing UART registry-sizing edits; they are excluded from this checkpoint.
+
+The harness's iteration 178 CIRCT replacertl, Verilator bare/portable/Rocket UART
+regressions and U250 buildbitstream passed. Hardware infrasetup subsequently
+failed before programming: its FPGA enumeration database was empty and
+`slot_to_bdf` rejected `Less FPGAs available than slots (0 >= 0)`. Complete stdout,
+stderr and manager log `2026-10-14--05-42-27-infrasetup-YKTSVIUHZVDIR91J.log`
+were read. That failure supplies no evidence of an RTL defect or Linux boot.
+No manager verification step or hardware recovery was started in this turn.
+
+Next generalize the native widget catalog/allocation for NIC and its ordered
+three-word CPU stream bank, bind their control slaves, and compare global
+addresses 512/516/520/524/528/532 and 592/596/600 with the NIC SFC driver header.
+Host memory arbitration, driver stream lists, full NIC platform/runtime,
+other target lowering profiles and partitioned QSFP remain gaps.
+
+The fresh thirteen-target replay uses compiler SHA256
+`83cd71aa1bf373ea930d2966454ea24794a4b36c3d1fee2ee363e86c2839cd1f`.
+It completes with one compiled no-NIC Rocket, six lowering failures and six
+unsupported partition profiles, intentionally returning nonzero. All seven
+reached bridge/channel boundaries match SFC; Shuttle model-port annotations
+match and the other six retain the existing SRAM annotation differences.
+Multiple TracerV constructors, BOOM/Shuttle trace payloads, Gemmini/Saturn Rocket
+FASED maxFlight profiles and six partitioned QSFP profiles remain unsupported.
+NIC reaches the shared LoadMem/local control and materialized widget banks
+before its explicit global allocation/platform rejection. Intermediate boundary
+matches are partial evidence, not complete semantic passes.
