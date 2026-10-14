@@ -523,3 +523,84 @@ annotation differences. The matrix exits nonzero and does not claim semantic
 parity for any rejected target. `nic-annotation-transfer.json` additionally
 checks all 1,792 records and exact recursive copied/consumed target transfer
 through both new live read/count wrappers.
+
+## Iteration 173: native incoming NIC AW/W/B transport
+
+`CPUStreamWrite.cpp` ports `CPUManagedStreamEngine.elaborateFromHostCPUStream`
+through FIRRTL operations. The active compiler consumes the ordered incoming
+catalog after the live source-before-sink count bank and emits
+`post-fame-cpu-stream-write.mlir` and its annotations. The NIC sink has index 0,
+base 0, depth 3072, width 64 bytes and an independent 18-bit address window.
+AW completes only on the final W beat; B.valid excludes B.ready, stream.valid
+excludes FIFO readiness, W transfers require B readiness, and only a granted
+sink's nine-bit counter advances. B ID and stream data remain live inputs.
+Valid-qualified beat-size/strobe assertions match the Scala oracle.
+
+The pass validates identities, directions, types, address allocations, helper
+collisions and retained annotations before mutation. It preserves other top
+ports and retargets copied-port annotations to the wrapper while consumed sink
+annotations retain their inner module identity. The real NIC candidate's
+1,792 annotation records match that exact recursive transfer; 53 original
+ports survive and `nic_from_host_stream` is consumed.
+
+Nine focused CTests pass: CPU read, multi-source read, empty write, count bank,
+NIC token queues, packet adapters, CPU queues, catalog and the new write test.
+The write test checks 394,364 SSA cases, 39,104 W transfers and 332 completions,
+including independent counters, all 256 held burst lengths, stalls, address
+misses, resets, all strobe lanes, live 512-bit data and atomic preflight rejects.
+
+`test/Transforms/NICCPUStreamWriteCompare.py` compares the actual archived-input
+candidate helper with original expressions and the clocked write counter
+projected from these exact SFC artifacts:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h
+```
+
+The RTL SHA256 remains
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+The comparison checks SFC's pruned OKAY response value in the original AXI
+response queue before specializing that field in the projection. All seven
+outputs match on every cycle, including invalid-cycle ID/data. Standalone
+Verilator passes 214,188 cycles: all 256 held bursts plus 50,000 randomized
+cycles, 34,194 transfers, 122,102 stalled writes, 14,172 misses and 262 accepted
+completions. Directed bursts hold AW metadata until completion and W data/valid
+until acceptance; the randomized phase also probes arbitrary input changes. Allocation identity/depth/width/base match the SFC header;
+absolute count MMIO address binding is still outside this change.
+
+Evidence is under:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration173-u250-target-matrix/
+```
+
+`write-held-production/comparison.json` records that behavioral comparison, and
+`nic-write-annotation-transfer.json` records the complete annotation transfer.
+The first production candidate uses a snapshot of the initially linked native
+compiler, keeping the comparison independent of a subsequent diagnostic-only
+rebuild. `final-write-candidate-comparison.json` confirms the final compiler
+replay emits byte-identical write-boundary FIRRTL and all annotations, so both
+behavioral and annotation comparisons apply to that final candidate.
+
+The NIC recipe remains an explicit failure after this new boundary:
+`NIC buffered CPU AXI transport, MMIO control binding and platform integration
+are not implemented`. No completed NIC simulator or driver ABI parity is
+claimed. The next smallest step is to attach and compare the existing native
+AW/W ingress and B response buffers on this live NIC write boundary, then bind
+NIC widget and stream-count controls and derive both driver direction lists.
+Other TracerV/FASED and partition/QSFP matrix gaps remain. No FireSim manager
+verification gate was initiated.
+
+The final thirteen-recipe replay uses compiler SHA256
+`a7eff7f24008e13a8893d891de46db704879da663d6c6b9bea19046682277cb8`. `replay/matrix.json` retains one
+compiled target, six lowering failures and six unsupported partition profiles;
+the matrix intentionally exits nonzero. All seven reached bridge-extraction
+boundaries match SFC. Shuttle model-port annotations match; the other six
+retain the existing SRAM annotation differences and do not establish parity.
+`no-nic-rtl-collateral-comparison.json` confirms unchanged non-NIC Rocket RTL
+and driver header. `immutable-rocket-comparison.json` rechecks the exact
+October 1 immutable FIRRTL/annotation inputs and U250 build-tree synthesis and
+implementation XDC, matching constraints after the recorded hierarchy rename
+`target/FireSim_` to `target_FAMETop/FireSim`. Both immutable fixtures remain
+untouched.

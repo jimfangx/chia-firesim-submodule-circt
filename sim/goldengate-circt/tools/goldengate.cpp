@@ -9,6 +9,7 @@
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "mlir/Pass/PassManager.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "goldengate/CPUStreamWrite.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/LabelSRAMModels.h"
 #include "goldengate/SRAMModelChannels.h"
@@ -3278,8 +3279,23 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuCountAnnotations, error)))
         return fail("CPU stream count bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT CPU stream count MMIO bank in " << cpuCountPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC incoming AXI writes and MMIO control binding are not implemented");
+      if (!cpuSinks.empty()) {
+        if (failed(goldengate::addCPUStreamWrite(circuit, cpuSinks, error)))
+          return fail("CPU stream write transport: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("CPU stream write transport produced invalid FIRRTL IR");
+        llvm::SmallString<256> writePath(outputDir), writeAnnotations(outputDir);
+        llvm::sys::path::append(writePath, "post-fame-cpu-stream-write.mlir");
+        llvm::sys::path::append(writeAnnotations, "post-fame-cpu-stream-write-all.json");
+        std::error_code writeError;
+        llvm::raw_fd_ostream writeOut(writePath, writeError);
+        if (writeError) return fail("cannot write CPU stream write transport: " + writeError.message());
+        module->print(writeOut); writeOut << '\n'; writeOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, writeAnnotations, error)))
+          return fail("CPU stream write transport annotations: " + error);
+        llvm::outs() << "Mapped CIRCT CPU stream write transport in " << writePath << '\n';
+        return fail("NIC buffered CPU AXI transport, MMIO control binding and platform integration are not implemented");
+      }
       if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
         return fail("CPU stream MCRFile transactions: " + error);
       if (failed(mlir::verify(*module)))

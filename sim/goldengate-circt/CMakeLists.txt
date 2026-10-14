@@ -166,6 +166,7 @@ add_executable(goldengate-circt
   lib/Transforms/CPUStreamRead.cpp
   lib/Transforms/CPUStreamCountBank.cpp
   lib/Transforms/EmptyCPUStreamWrite.cpp
+  lib/Transforms/CPUStreamWrite.cpp
   lib/Transforms/CPUStreamWriteBuffer.cpp
   lib/Transforms/CPUStreamReadBuffer.cpp
   lib/Transforms/CPUStreamResponseBuffer.cpp
@@ -2060,4 +2061,16 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-cpu-stream-catalog-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-cpu-stream-catalog COMMAND goldengate-cpu-stream-catalog-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-cpu-stream-write-test
+    test/Transforms/CPUStreamWriteTest.cpp lib/Transforms/CPUStreamWrite.cpp)
+  target_compile_features(goldengate-cpu-stream-write-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-cpu-stream-write-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-cpu-stream-write-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-cpu-stream-write-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-cpu-stream-write COMMAND goldengate-cpu-stream-write-test)
 endif()
