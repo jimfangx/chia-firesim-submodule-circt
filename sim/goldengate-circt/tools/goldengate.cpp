@@ -4450,10 +4450,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteRetirementAnnotations, error)))
         return fail("FASED write retirement annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED accepted target B responses to pending write counters in " << fasedWriteRetirementPath << '\n';
-      // NIC now retires both pending counters on the target-visible B handshake.
-      // Runtime admission and the remaining host/platform bindings are pending.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED write admission, control responses and platform integration are not implemented");
       if (failed(goldengate::bindFASEDWriteAdmission(circuit, error)))
         return fail("FASED write admission: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED write admission produced invalid FIRRTL IR");
@@ -4467,6 +4463,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteAdmissionAnnotations, error)))
         return fail("FASED write admission annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED target AW/W readiness to pending write counters in " << fasedWriteAdmissionPath << '\n';
+      // NIC closes AW/W admission independently with the respective full flag.
+      // Read admission and runtime request-limit MMIO remain separate boundaries.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED read admission, request limits, control responses and platform integration are not implemented");
       if (failed(goldengate::bindFASEDReadAdmission(circuit, error)))
         return fail("FASED read admission: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read admission produced invalid FIRRTL IR");

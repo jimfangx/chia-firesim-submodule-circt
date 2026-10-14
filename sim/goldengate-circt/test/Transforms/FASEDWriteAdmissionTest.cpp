@@ -4,9 +4,11 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
+#include <iterator>
 #include <map>
 #include <stdexcept>
 using namespace mlir;
@@ -137,9 +139,82 @@ void rejection(MLIRContext &ctx, bool selected) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");
   llvm::outs()<<"16 atomic rejection cases passed\n";
 }
+unsigned port(FModuleOp m, llvm::StringRef name) {
+  for(unsigned i=0;i<m.getNumPorts();++i)if(m.getPortName(i)==name)return i;
+  throw std::runtime_error("missing production port: "+name.str());
 }
-int main() {
+// Validate the production full-flag sources and both inner/observed ready
+// drivers, then clone the actual NotPrimOps and output connections. The RTL
+// differential feeds this cone from the separately cloned production counters.
+void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
+  auto root=parseSourceFile<ModuleOp>(input,&ctx);
+  require(bool(root)&&succeeded(verify(*root)),"invalid production admission boundary");
+  auto c=*root->getOps<CircuitOp>().begin();
+  require(c.getName()=="GGFASEDWriteAdmissionWrapper","expected admission boundary");
+  auto top=named(c,c.getName());auto instances=top.getOps<InstanceOp>();
+  require(std::distance(instances.begin(),instances.end())==1,"wrong admission instance count");
+  auto sim=*instances.begin();auto inner=named(c,"GGFASEDWriteRetirementWrapper");
+  require(sim.getInstanceName()=="sim"&&sim.getModuleName()==inner.getName(),"wrong admission predecessor");
+  Wiring wires(top);auto requestPort=port(top,"fased_timing_requests");
+  auto requestType=cast<BundleType>(top.getPortType(requestPort));
+  auto oldRequestType=cast<BundleType>(inner.getPortType(port(inner,"fased_timing_requests")));
+  require(top.getNumPorts()==inner.getNumPorts(),"admission changed port count");
+  for(unsigned i=0;i<top.getNumPorts();++i) {
+    require(top.getPortName(i)==inner.getPortName(i)&&top.getPortDirection(i)==inner.getPortDirection(i),"admission changed port identity");
+    if(i!=requestPort)require(top.getPortType(i)==inner.getPortType(i),"admission changed unrelated type");
+  }
+  SmallVector<NotPrimOp> operations;SmallVector<Operation *> connections;
+  for(unsigned i=0;i<3;++i) {
+    auto current=cast<BundleType>(requestType.getElements()[i].type);
+    auto previous=cast<BundleType>(oldRequestType.getElements()[i].type);
+    for(unsigned j=0;j<3;++j) {
+      auto a=current.getElements()[j],z=previous.getElements()[j];
+      require(a.name==z.name&&a.type==z.type&&a.isFlip==(i<2&&j==0?false:z.isFlip),"unexpected admission field type");
+    }
+    if(i==2)continue;
+    std::string channel=i==0?"aw":"w",innerKey="sim.fased_timing_requests."+channel+".ready";
+    auto notOp=wires.drivers.at(innerKey).getDefiningOp<NotPrimOp>();
+    require(bool(notOp)&&key(notOp.getInput())=="sim.fased_pending_writes."+channel+"Full","wrong readiness full flag");
+    auto full=notOp.getInput().getDefiningOp<SubfieldOp>();
+    require(full&&full.getInput()==sim.getResult(port(inner,"fased_pending_writes")),"wrong pending counter source");
+    std::string outerKey="port"+std::to_string(requestPort)+"."+channel+".ready";
+    require(wires.drivers.at(outerKey)==notOp.getResult(),"observed ready differs from accepted ready");
+    Operation *connection=nullptr;
+    for(auto &op:*top.getBodyBlock())if(isa<StrictConnectOp,ConnectOp>(op)&&key(op.getOperand(0))==outerKey) {
+      require(!connection,"duplicate observed ready connection");connection=&op;
+    }
+    require(connection!=nullptr,"missing observed ready connection");
+    operations.push_back(notOp);connections.push_back(connection);
+  }
+  require(std::distance(top.getOps<NotPrimOp>().begin(),top.getOps<NotPrimOp>().end())==2,"extra readiness logic");
+  auto isolated=ModuleOp::create(c.getLoc());OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(isolated.getBody());
+  auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGFASEDWriteAdmissionProbe"));
+  b.setInsertionPointToEnd(exported.getBodyBlock());auto bit=UIntType::get(&ctx,1,false);
+  SmallVector<PortInfo> ports;
+  for(auto n:{"awFull","wFull"})ports.push_back({b.getStringAttr(n),bit,Direction::In});
+  for(auto n:{"awReady","wReady"})ports.push_back({b.getStringAttr(n),bit,Direction::Out});
+  auto probe=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDWriteAdmissionProbe"),
+    ConventionAttr::get(&ctx,Convention::Internal),ports);probe.setPublic();
+  b.setInsertionPointToEnd(probe.getBodyBlock());IRMapping mapping;
+  for(unsigned i=0;i<2;++i) {
+    mapping.map(operations[i].getInput(),probe.getBodyBlock()->getArgument(i));
+    b.clone(*operations[i],mapping);
+    mapping.map(connections[i]->getOperand(0),probe.getBodyBlock()->getArgument(i+2));
+    b.clone(*connections[i],mapping);
+  }
+  require(succeeded(verify(isolated)),"invalid admission probe");
+  std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot export admission probe");
+  isolated.print(out);out<<'\n';out.close();isolated.erase();
+  llvm::outs()<<"Cloned production independent AW/W full-flag inversions and observed-ready connections\n";
+}
+}
+int main(int argc,char **argv) {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try{for(bool selected:{false,true}){behavior(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
+  try{
+    require(argc==1||argc==3,"usage: goldengate-fased-write-admission-test [boundary.mlir probe.mlir]");
+    if(argc==3)exportProduction(ctx,argv[1],argv[2]);
+    else for(bool selected:{false,true}){behavior(ctx,selected);rejection(ctx,selected);}
+  }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

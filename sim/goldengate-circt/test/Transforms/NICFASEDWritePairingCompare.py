@@ -117,7 +117,7 @@ endmodule
     return 'module SatUpDownCounter_1('+header+');'+counter+'endmodule\n'+shell, gate
 
 
-def differential(candidate, cone, gate, export_tool, out, retirement=False):
+def differential(candidate, cone, gate, export_tool, out, retirement=False, admission=None):
     out = out.resolve(); out.mkdir(parents=True, exist_ok=False)
     def run(cmd, name):
         with (out/(name+'.log')).open('w') as log:
@@ -135,6 +135,18 @@ def differential(candidate, cone, gate, export_tool, out, retirement=False):
                          'top.pairComplete': 'pairing.pairComplete', 'top.pending': 'pairing.pending'})
         assert wiring(exported_text, 'GGFASEDWriteRetirementProbe', aggregate=True) == expected
     run(['firtool', exported, '--format=mlir', '--disable-all-randomization', '-o', native], 'firtool')
+    extra_native = []
+    if admission is not None:
+        assert retirement, 'closed admission requires production B retirement'
+        boundary, admission_tool = admission
+        admission_mlir, admission_sv = out/'write-admission.mlir', out/'write-admission.sv'
+        run([admission_tool, boundary, admission_mlir], 'export-admission')
+        admission_text = admission_mlir.read_text().replace('firrtl.module public @', 'firrtl.module @')
+        assert set(modules(admission_text)) == {'GGFASEDWriteAdmissionProbe'}
+        assert wiring(admission_text, 'GGFASEDWriteAdmissionProbe', aggregate=True) == {
+            'top.awReady': ('not', 'top.awFull'), 'top.wReady': ('not', 'top.wFull')}
+        run(['firtool', admission_mlir, '--format=mlir', '--disable-all-randomization', '-o', admission_sv], 'firtool-admission')
+        extra_native.append(admission_sv)
     (out/'oracle.sv').write_text(cone)
     (out/'recorded-clock-gate.sv').write_text(gate)
     tb = r'''module check;
@@ -238,15 +250,38 @@ task step;''')
  $display("accepted_b=%0d stalled_b=%0d valid_backpressure=%0d ready_without_valid=%0d b_contexts=%0d",
  acceptedB,stalledB,bBackpressure,bReadyOnly,bContexts);
  $finish;''')
+    if admission is not None:
+        tb = tb.replace('reg av=0,ar=0,wv=0,wr=0,last=0,bv=0,br=0;',
+                        'reg av=0,wv=0,last=0,bv=0,br=0; wire ar,wr,sAr,sWr;')
+        tb = tb.replace('SFCPairing oracle(', '''GGFASEDWriteAdmissionProbe admission(.awFull(pending_awFull),.wFull(pending_wFull),.awReady(ar),.wReady(wr));
+SFCAdmission admissionOracle(.SatUpDownCounter_1_io_full(sAwFull),.SatUpDownCounter_2_io_full(sWFull),
+ .nastiReqIden_io_out_aw_ready(sAr),.nastiReqIden_io_out_w_ready(sWr));
+SFCPairing oracle(''')
+        tb = tb.replace('.tNasti_io_tNasti_aw_ready(ar)', '.tNasti_io_tNasti_aw_ready(sAr)')
+        tb = tb.replace('.tNasti_io_tNasti_w_ready(wr)', '.tNasti_io_tNasti_w_ready(sWr)')
+        tb = tb.replace(' paired=(w>aw', ''' if(ar!==sAr || wr!==sWr || ar!==(aw<writeMaxReqs) || wr!==(w<writeMaxReqs))
+  $fatal(1,"closed admission readiness mismatch cycle=%0d",cycles);
+ paired=(w>aw''')
+        tb = tb.replace('ar=1;av=1;', 'av=1;').replace('av=0;wr=1;wv=1;', 'av=0;wv=1;')
+        tb = tb.replace('av=rng[8];ar=rng[9];wv=rng[10];wr=rng[11];', 'av=rng[8];wv=rng[10];')
+        # Accepted increments cannot saturate a full counter in the closed loop;
+        # require blocked requests instead, independently for AW and W.
+        tb = tb.replace(' saturation+=targetFire', ' blockedAW+=av&&!ar;blockedW+=wv&&!wr;zeroMax+=writeMaxReqs==0;\n saturation+=targetFire')
+        tb = tb.replace('reg [15:0] limits=0', 'integer blockedAW=0,blockedW=0,zeroMax=0;\nreg [15:0] limits=0')
+        tb = tb.replace('saturation<100||', 'saturation!=0||blockedAW<100||blockedW<100||zeroMax<100||')
+        tb = tb.replace(' $finish;', ''' $display("blocked_aw=%0d blocked_w=%0d zero_max=%0d",blockedAW,blockedW,zeroMax);
+ $finish;''')
     (out/'check.sv').write_text(tb)
     run(['verilator', '--binary', '--assert', '-j', '4', '--timing', '-Wno-fatal',
          '--top-module', 'check', '--Mdir', out/'obj', '-o', 'check',
-         out/'check.sv', native, out/'oracle.sv'], 'verilator')
+         out/'check.sv', native, *extra_native, out/'oracle.sv'], 'verilator')
     run([out/'obj/check'], 'simulation')
     log = (out/'simulation.log').read_text(); assert 'PASS cycles=' in log
     return dict({n: int(v) for n, v in re.findall(r'(\w+)=(\d+)', log)},
                 production_helper_cloned_verbatim=True, original_sfc_counters_and_pairing_executed=True,
                 production_retirement_handshake_and_counter_bindings_executed=retirement,
+                production_admission_operations_and_sfc_ready_assignments_executed=admission is not None,
+                admission_feedback_closed=admission is not None,
                 original_aw_w_b_handshake_equations_executed=True,
                 all_sixteen_limits_and_counter_states_exercised=True,
                 outputs_and_registers_compared_before_and_after_every_edge=True,
