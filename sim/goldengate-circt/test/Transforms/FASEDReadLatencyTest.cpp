@@ -222,4 +222,34 @@ void rejection(MLIRContext &ctx) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"19 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected : {false,true}){selectedPrint=selected;llvm::outs()<<oldRoot()<<"\n";behavior(ctx);mapping(ctx);rejection(ctx);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(int argc, char **argv) {
+  MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  try {
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production read latency boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDReadLatencyWrapper" ||
+              circuit.getName() == "GGSelectedPrintFASEDReadLatencyWrapper",
+              "expected FASED read latency boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDReadLatency10"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      // Export the actual production operations, including queue RAM and
+      // qualified reset, for differential simulation against SFC Queue_16.
+      auto helper = cast<FModuleOp>(b.insert(named(circuit,"GGFASEDReadLatency10")->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)), "exported read latency invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2],ec);
+      require(!ec,"cannot export read latency"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-read-latency-test [boundary.mlir helper.mlir]");
+    for (bool selected : {false,true}) {
+      selectedPrint=selected; llvm::outs()<<oldRoot()<<"\n";
+      behavior(ctx); mapping(ctx); rejection(ctx);
+    }
+  } catch (const std::exception &e) { llvm::errs()<<e.what()<<"\n"; return 1; }
+  return 0;
+}

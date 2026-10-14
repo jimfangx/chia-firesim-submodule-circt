@@ -4385,8 +4385,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedTimingCycleAnnotations, error)))
         return fail("FASED timing cycle annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED timing cycle and latency release-cycle arithmetic in " << fasedTimingCyclePath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC FASED timing completion, control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDReadLatency(circuit, error)))
         return fail("FASED read latency: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read latency produced invalid FIRRTL IR");
@@ -4400,6 +4398,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedReadLatencyAnnotations, error)))
         return fail("FASED read latency annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED ten-entry read latency queue and completion retirement in " << fasedReadLatencyPath << '\n';
+      // NIC and Rocket share the targetFire-qualified ten-entry read queue.
+      // Keep the unsupported boundary after emitting its verified native IR.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED write timing completion, control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDWriteLatency(circuit, error)))
         return fail("FASED write latency: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED write latency produced invalid FIRRTL IR");
