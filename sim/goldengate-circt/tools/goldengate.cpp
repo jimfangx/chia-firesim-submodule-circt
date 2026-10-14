@@ -3901,8 +3901,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, writeArbiterAnnotations, error)))
         return fail("control write arbiter annotations: " + error);
       llvm::outs() << "Arbitrated CIRCT control B responses and exposed write retirement in " << writeArbiterPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC control write tracking and platform integration are not implemented");
       if (failed(goldengate::addControlWriteTracker(circuit, error)))
         return fail("control write tracker: " + error);
       if (failed(mlir::verify(*module)))
@@ -3918,6 +3916,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, writeTrackerAnnotations, error)))
         return fail("control write tracker annotations: " + error);
       llvm::outs() << "Tracked CIRCT control AW transactions and accepted B responses in " << writeTrackerPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC remaining control widget responses and platform integration are not implemented");
       if (failed(goldengate::attachSimulationMasterBank(circuit, simulationMasterBank, error)))
         return fail("SimulationMaster bank: " + error);
       if (failed(mlir::verify(*module)))

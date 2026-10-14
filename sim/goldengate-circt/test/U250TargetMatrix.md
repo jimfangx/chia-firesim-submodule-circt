@@ -1744,3 +1744,100 @@ backpressure, simultaneous enqueue/dequeue and reset against the archived
 SFC `ReorderQueue`. Remaining widget bindings, host memory/stream lists,
 NIC runtime, wider/multiple TracerV profiles, FASED geometry and
 partition/QSFP remain gaps.
+
+## Iteration 187: connect production NIC outstanding AW tracking
+
+The native compiler now invokes `addControlWriteTracker` after production
+NIC B arbitration, verifies its CIRCT FIRRTL operations, and emits
+`post-fame-control-write-tracker.mlir` plus complete annotations. The
+catalog's twelve banks and error endpoint 12 feed thirteen independent
+retirement/tag inputs. AW acceptance captures the twelve-bit master ID and
+four-bit decoded destination; tracker readiness closes the AW routing
+capacity connection. NIC compilation still explicitly fails at remaining
+control widget responses and platform integration.
+
+The exact SFC artifact compared is:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+SHA256: `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICControlWriteTrackerCompare.py` checks all 288 production wrapper
+connections, 230 copied ports, preservation of 122 prior module bodies,
+and recursive transfer of all 1,792 annotation records. It checks 24 SFC
+`FPGATop` bank-allocation connections, all thirteen router B retirement
+and ID expressions, clock/reset, and AW acceptance/capacity expressions.
+The production exporter runs the actual pass on the fresh B-arbiter
+boundary and clones the actual helper operations. Its complete transformed
+circuit and helper body match the native compiler output.
+
+Isolated Verilator comparison preserves the complete archived SFC
+`ReorderQueue` body and passes 100,349 cycles: 39,174 accepts, 11,227 alias
+stalls, 35,705 retirements, 248,058 held matches, 11,430 cycles with both
+enqueue and retirement, and 255 reset cycles. Every retirement endpoint
+is exercised. Directed cases fill all 64 slots, collide different full IDs
+at each six-bit slot address, hold responses without retirement, and retire
+old transactions while the new alias remains stalled at that edge. Readiness
+and all full-ID matches agree with SFC and an independent scoreboard.
+
+SFC removes unused route data; the native four-bit route storage is checked
+against that scoreboard, including writes during reset. Reset initializes
+free bits, while tag/data storage retains the Scala update behavior. The
+native CTest separately checks mismatched retirement still freeing a slot,
+pre-edge assertion predicates, reset-suppressed checks, and simultaneous
+enqueue/dequeue priority. The differential test runs with assertions enabled
+and supplies valid retirement traffic outside reset. It compares the AW
+acceptance and B-retirement helper boundary, not an entire NIC simulator.
+Remaining widget completion, host memory/stream-driver ABI and NIC runtime
+or platform parity are not established by this comparison.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration187-u250-target-matrix/
+```
+
+`nic-control-write-tracker-production/comparison.json` records hashes,
+connection checks and behavioral results. Source the FireSim environment,
+then run `test/Transforms/NICControlWriteTrackerCompare.py` with
+`--write-arbiter` and `--tracker` pointing to fresh production boundaries,
+`--golden` to the archived NIC SV, `--export-tool` to
+`goldengate-control-write-tracker-test`, and a fresh `--output-dir`.
+The fresh tracker candidate SHA256 is
+`cf37fea25b64e8407d4a51ff4bfbc88a04cb27d6298d45c71fe8af1e08e94708`.
+
+`nic-prior-boundaries-comparison.json` freshly matches all sixteen earlier
+NIC decoder, AW/W route/dispatch, widget-write, AR dispatch/tracking and
+R/B-arbitration FIRRTL/annotation artifacts against iteration 186 byte for
+byte. Fresh no-NIC RTL, both constant headers and both XDC files also
+match iteration 186. The October 1 immutable primary inputs and U250 XDC
+match with the recorded implementation hierarchy rename. No immutable
+fixture was changed, and no FireSim manager verification step was started.
+Pre-existing user edits remain outside this checkpoint.
+
+Focused CTest `goldengate-control-write-tracker` passes in 305.03 seconds:
+6,816 collision/retirement/reset cycles across 1, 2, 3, 11, 12, 13, 31 and
+63 regions, including 1,827 cycles and thirteen assertions for the NIC's
+actual allocation. Wrapper wiring, annotation transfer and fourteen atomic
+rejections per geometry pass, as do invalid helper-count checks.
+`ctest.log` and `control-write-tracker-ctest-detail.log` retain the result.
+Python syntax and scoped `git diff --check` also pass.
+
+Fresh replay of all thirteen archived handoffs and effective platform
+configurations used compiler SHA256
+`4616744897650b84e681b829dcc6e35ae616481d0a7dd52bce1022fbd18f5159`.
+`replay/matrix.json` records one complete no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations. Its nonzero
+exit reports these implementation gaps. All seven reached BridgeIO/channel
+boundaries match SFC. Shuttle model-port annotations match; the other six
+retain their prior native-SRAM annotation differences.
+`matrix-regression-comparison.json` checks all thirteen inputs, effective
+platforms, statuses and structured boundary results against iteration 186.
+Only NIC's later unsupported-feature reason advances past write tracking.
+
+The next smallest step is to attach and bind the catalog-selected
+SimulationMaster MMIO bank at NIC slave 9, then compare its register
+allocation, transport and response bindings with the archived SFC bank.
+TSI, BlockDev and FASED responses, host memory/stream lists, NIC runtime,
+wider/multiple TracerV profiles, FASED geometry and partition/QSFP remain gaps.

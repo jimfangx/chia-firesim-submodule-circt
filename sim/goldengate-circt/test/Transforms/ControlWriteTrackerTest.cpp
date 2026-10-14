@@ -204,7 +204,7 @@ void test(MLIRContext &ctx, unsigned slaveCount) {
   sample(true, true, 4095, slaveCount, deq, ids);
   require(std::all_of(free.begin(), free.end(), [](unsigned x) { return x; }), "reset did not free every slot");
   sample(true, true, 4095, 5, deq, ids); // tag/data still write during reset
-  for (unsigned n = 0; n < (slaveCount == 11 ? 1500u : 200u); ++n) {
+  for (unsigned n = 0; n < (slaveCount == 11 || slaveCount == 12 ? 1500u : 200u); ++n) {
     for (unsigned i = 0; i < slaveCount + 1; ++i) { deq[i] = (rng() % 8) == 0; ids[i] = rng() % 4096; }
     sample(n % 97 == 0, rng() & 1, rng() % 4096, rng() % routeSpace, deq, ids);
   }
@@ -233,10 +233,35 @@ void test(MLIRContext &ctx, unsigned slaveCount) {
       << ", targets and fourteen atomic rejections passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+  if (argc == 4) {
+    try {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production input invalid");
+      auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+      require(succeeded(goldengate::addControlWriteTracker(c, error)), error);
+      require(succeeded(verify(*root)), "production write tracker invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot write production tracker"); root->print(out); out << '\n'; out.close();
+      // Clone the actual helper operations; do not reconstruct a test circuit.
+      auto isolated = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr("GGControlWriteTracker"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper = cast<FModuleOp>(b.insert(named(c, "GGControlWriteTracker")->clone())); helper.setPublic();
+      require(succeeded(verify(isolated)), "exported helper invalid");
+      llvm::raw_fd_ostream helperOut(argv[3], ec); require(!ec, "cannot export helper");
+      isolated.print(helperOut); helperOut << '\n'; helperOut.close(); isolated.erase();
+      llvm::outs() << "Production NIC AW tracker and cloned helper verified\n"; return 0;
+    } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  }
+  if (argc != 1) {
+    llvm::errs() << "usage: goldengate-control-write-tracker-test [input.mlir output.mlir helper.mlir]\n";
+    return 1;
+  }
   try {
-    for (unsigned count : {1u, 2u, 3u, 11u, 13u, 31u, 63u}) test(ctx, count);
+    for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 31u, 63u}) test(ctx, count);
     auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin();
     auto before = dump(*root);
     for (unsigned count : {0u, 64u, ~0u}) {
