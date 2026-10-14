@@ -2105,3 +2105,90 @@ The next smallest step is to carry NIC through the native FASED token and
 slave-1 control stages against the same archived SFC target. Host memory/stream
 integration, complete NIC runtime, wider/multiple TracerV profiles, FASED
 geometry and partition/QSFP support remain incomplete.
+
+## Iteration 191: execute native FASED token, counters and ingress for NIC
+
+The NIC compiler path now constructs and verifies five existing CIRCT passes:
+FASED token handling, host outstanding counters and AW/W/AR ingress queues.
+Each stage emits production FIRRTL MLIR and retained annotations. NIC then
+rejects the remaining ingress-credit, timing/control-response and platform
+integration gap. This advances the actual compiler; the complete NIC target
+still fails compilation and has no runtime-support claim.
+
+The inspected Scala oracle is `MidasTransforms.scala`, `FAMETransform.scala`,
+`midas/models/dram/FASEDMemoryTimingModel.scala`, `IngressUnit.scala` and the
+saturating counter in `midas/widgets/Lib.scala`. Token firing requires both
+host handshakes, ingress capacity, read/write egress readiness and settled
+host memory during target reset. Ingress reset excludes its own capacity
+condition; egress reset requires target firing. Host counters use host reset
+and accepted host AXI transactions, independent of target reset. This catalog
+has maxFlight 10, two four-bit counters and ingress depths AW=10, W=16, AR=4.
+
+The actual SFC comparison artifact is:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+Its SHA256 remains
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`test/Transforms/NICFASEDIngressCompare.py` checks all five production
+boundaries, preservation of every earlier module, the complete transfer of
+1,792 annotations, eleven memory channels and 46 payload routes. It checks
+all 256 token/reset combinations and every production wrapper connection.
+The six generated helpers match the no-NIC production helpers exactly.
+The refactored Print comparators retain their original entry points; both
+Print constructor orders still pass the ingress comparison.
+
+The exporter in `FASEDTokenEngineTest.cpp` clones the six actual production
+helpers from `post-fame-fased-ingress-ar.mlir`; exported bodies must match
+before lowering. An isolated Verilator differential compares the three
+queues with SFC `Queue_7`, `Queue_8`, `Queue_9`, and the two host counters with
+SFC `SatUpDownCounter_1`. All 40,061 cycles match, including full/empty queues,
+simultaneous push/pop, host reset and randomized payloads/backpressure.
+Observed coverage is 57,384 accepted pushes, 52,918 pops, 3,090 full stalls,
+6,920 empty stalls and 631 accepted pushes while reset is asserted. AW/AR
+retain all 69 native payload bits and W retains 78; the comparison covers
+the SFC-surviving 64/73/64 bits. The native unit tests exercise all fields.
+This differential checks the queue/counter boundary; coupled host issue,
+egress timing, MMIO and full NIC target execution remain outside it.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration191-u250-target-matrix/
+```
+
+`nic-fased-final-comparison.json` records candidate SHA256
+`fc0c248fa188f99ffbcd3abccee7b70ffb0b243307fd883be09d6b6541e9ff71`.
+Run the comparator in the sourced FireSim environment with `--candidate-dir`
+pointing to the NIC replay candidate, `--baseline` to the no-NIC production
+`post-fame-fased-ingress-ar.mlir`, `--golden` to the SV above, `--export-tool`
+to `goldengate-fased-token-test`, a fresh `--output-dir` and `--report-json`.
+Five focused FASED CTest cases pass in 34.28 seconds; the token test also
+passes after rebuilding the exporter. Python syntax and scoped diff checks
+pass. All 72 earlier NIC MLIR/annotation files and five no-NIC RTL/collateral
+files match iteration 190 byte for byte.
+
+`immutable-fased-comparison.json` compares the complete FASED widget,
+IngressModule, three queues and saturating-counter module with the October 1
+immutable U250 `design/FireSim-generated.sv`: all six headers and bodies match.
+Fresh immutable Rocket handoff and normalized XDC comparisons also match,
+including the recorded implementation-XDC hierarchy rename. Both immutable
+fixtures remain untouched. No manager verification was started.
+
+Fresh replay of all thirteen archived inputs/effective platforms used compiler
+SHA256 `78c432acc5aad4216eea4caad59947a1ddfc62d34b9a2b2f3760ba30d1510f51`.
+`replay/matrix.json` retains one compiled no-NIC target, six later compiler
+failures and six unsupported partition/QSFP configurations. Its nonzero exit
+retains these gaps. All seven reached BridgeIO/channel boundaries match SFC.
+Shuttle model-port annotations match; the other six retain the recorded
+native-SRAM differences. `matrix-regression-comparison.json` matches all
+thirteen input hashes, effective platforms, compile statuses and structured
+boundary comparisons to iteration 190. Only the NIC diagnostic advances.
+
+The next smallest step is to carry NIC through native ingress credits and
+transaction-order queues against the same SFC IngressModule, before host
+issue, egress timing and slave-1 control binding. Complete NIC runtime,
+wider/multiple TracerV profiles, FASED geometry and partition/QSFP support
+remain incomplete.

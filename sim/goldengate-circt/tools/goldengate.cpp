@@ -4196,8 +4196,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevResponseSchedulerAnnotations, error)))
         return fail("BlockDev response scheduler annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev response scheduler in " << blockDevResponseSchedulerPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC FASED control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDTokenEngine(circuit, error)))
         return fail("FASED token engine: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED token engine produced invalid FIRRTL IR");
@@ -4263,6 +4261,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedARAnnotations, error)))
         return fail("FASED AR ingress annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED AR requests in a 4-entry ingress queue in " << fasedARPath << '\n';
+      // NIC uses the same memory constructor and FAME channels. Construct the
+      // token/counter/ingress operations before the remaining integration gap.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED ingress credits, timing/control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDIngressCredits(circuit, error)))
         return fail("FASED ingress credits: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED ingress credits produced invalid FIRRTL IR");

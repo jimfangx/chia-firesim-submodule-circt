@@ -304,8 +304,27 @@ void rejection(MLIRContext &ctx) {
   llvm::outs() << "16 malformed boundaries and repeat pass rejected\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   try { MLIRContext ctx; ctx.getOrLoadDialect<FIRRTLDialect>(); ctx.getOrLoadDialect<circt::hw::HWDialect>();
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production FASED boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDIngressARQueueWrapper", "expected three-queue FASED boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDTokenEngine"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      for (auto name : {"GGFASEDTokenEngine", "GGFASEDHostOutstanding", "GGFASEDIngressAW",
+                        "GGFASEDIngressAWQueue10", "GGFASEDIngressWQueue16", "GGFASEDIngressARQueue4"}) {
+        auto helper = cast<FModuleOp>(b.insert(named(circuit, name)->clone())); helper.setPublic();
+      }
+      require(succeeded(verify(isolated)), "exported FASED helpers invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot export FASED helpers"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-token-test [ingress-ar.mlir helpers.mlir]");
     behavior(ctx); wiring(ctx); wiring(ctx, true);
     behavior(ctx, true); wiring(ctx, true, true); rejection(ctx); return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

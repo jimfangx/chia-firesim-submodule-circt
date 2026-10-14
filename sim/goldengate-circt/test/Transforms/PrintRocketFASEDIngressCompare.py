@@ -43,8 +43,7 @@ def evaluate(tree, inputs):
     return evaluate(tree[1], inputs) or evaluate(tree[2], inputs)
 
 
-def main():
-    evidence, golden = (Path(arg).resolve() for arg in sys.argv[1:])
+def compare(golden, paths, baseline):
     reference = clean(golden.read_text())
     model = equations(module(reference, 'FASEDMemoryTimingModel')[1])
     names = {'hPort_toHost_hValid': 'valid', 'hPort_fromHost_hReady': 'ready',
@@ -81,12 +80,11 @@ def main():
         assert memories and all(int(last) + 1 == depth for _, last in memories)
         leaves = {n: int(msb or 0) + 1 for msb, n in re.findall(r'input(?:\s+\[(\d+):0\])?\s+io_enq_bits_(\w+)', header)}
         shapes.append((ch, depth, width, leaves))
-    baseline = (evidence / 'candidate/post-fame-fased-ingress-ar.mlir').read_text()
     symbols = ['GGFASEDTokenEngine', 'GGFASEDHostOutstanding', 'GGFASEDIngressAW',
                'GGFASEDIngressAWQueue10', 'GGFASEDIngressWQueue16', 'GGFASEDIngressARQueue4']
     reports = []
-    for suffix in ('rocket-fased-ingress', 'rocket-fased-ingress-reverse'):
-        text = (evidence / f'binding.mlir.{suffix}.mlir').read_text()
+    for path in paths:
+        text = path.read_text()
         for symbol in symbols:
             assert native_module(text, symbol) == native_module(baseline, symbol), f'{symbol} operations differ'
         token_wrapper = native_module(text, 'GGFASEDTokenWrapper')
@@ -138,12 +136,19 @@ def main():
                          for other in ('aw', 'w', 'ar') if other != ch}
             assert gates[dest] == frozenset(required)
         assert re.search(r'name = "FASEDMemoryTimingModel_0", size = 128 : i64, slave = 1 : i32, start = 128 : i64', text)
-        reports.append({'artifact': suffix, 'boolean_cases': 256, 'unchanged_native_helpers': len(symbols)})
+        reports.append({'artifact': str(path), 'boolean_cases': 256, 'unchanged_native_helpers': len(symbols)})
     report = {'golden': str(golden), 'constructor_orders': reports,
               'queues': [{'channel': ch, 'depth': d, 'native_payload_bits': w, 'SFC_surviving_bits': sum(leaves.values()),
                           'SFC_surviving_fields': leaves} for ch, d, w, leaves in shapes],
               'host_counter_width': 4, 'host_counter_max': 10, 'FASED_slave': 1,
               'reference_has_print_host': False, 'scope': 'token, host outstanding and ingress queues; later timing/MMIO external'}
+    return report
+
+
+def main():
+    evidence, golden = (Path(arg).resolve() for arg in sys.argv[1:])
+    paths = [evidence / f'binding.mlir.{suffix}.mlir' for suffix in ('rocket-fased-ingress', 'rocket-fased-ingress-reverse')]
+    report = compare(golden, paths, (evidence / 'candidate/post-fame-fased-ingress-ar.mlir').read_text())
     (evidence / 'rocket-fased-ingress-comparison.json').write_text(json.dumps(report, indent=2) + '\n')
     print('PASS FASED token/reset equations, host counters, three ingress queues and native SSA wiring in both Print orders')
 

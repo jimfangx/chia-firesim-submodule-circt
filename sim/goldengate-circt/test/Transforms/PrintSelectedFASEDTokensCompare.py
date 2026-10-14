@@ -40,7 +40,8 @@ def routes(body):
     return nets
 
 
-def compare(before, after, baseline):
+def compare(before, after, baseline, old_name=OLD, top_name=TOP):
+    OLD, TOP = old_name, top_name
     old_text, new_text = before.read_text(), after.read_text()
     def bodies(text): return {m[1]: m[0] for m in re.finditer(r'^    firrtl.module @(\w+)\(.*?^    }', text, re.M | re.S)}
     old, new = bodies(old_text), bodies(new_text)
@@ -115,12 +116,8 @@ def compare(before, after, baseline):
     return dict(before=str(before), after=str(after), unchanged_modules=len(old), copied_ports=len(copied), memory_channels=11, payload_routes=46, boolean_cases=256, annotation_rows=len(updated), wrapper_connections=len(expected))
 
 
-def main():
-    p = argparse.ArgumentParser(description=__doc__)
-    for n in ('before', 'after'): p.add_argument('--' + n, type=Path, action='append', required=True)
-    for n in ('sfc', 'baseline', 'report-json'): p.add_argument('--' + n, type=Path, required=True)
-    a = p.parse_args(); assert len(a.before) == len(a.after)
-    sfc = equations(module(clean(a.sfc.read_text()), 'FASEDMemoryTimingModel')[1])
+def compare_sfc(golden):
+    sfc = equations(module(clean(golden.read_text()), 'FASEDMemoryTimingModel')[1])
     names = {'hPort_toHost_hValid': 'valid', 'hPort_fromHost_hReady': 'ready', 'ingress_io_nastiInputs_hReady': 'capacity', 'writeEgress_io_resp_hValid': 'write', 'readEgress_io_resp_hValid': 'read', 'tResetReady': 'resetReady'}
     assert sfc['tResetReady'] == '~hPort_hBits_reset | host_mem_idle'
     assert terms(sfc['targetFire'], sfc, names) == set(names.values())
@@ -134,6 +131,14 @@ def main():
     assert sfc['model_reset'] == 'hPort_hBits_reset'
     for ch in ('aw', 'w', 'ar'):
         assert sfc['ingress_io_nastiInputs_hBits_' + ch + '_valid'] == 'hPort_hBits_axi4_' + ch + '_ready & hPort_hBits_axi4_' + ch + '_valid'
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__)
+    for n in ('before', 'after'): p.add_argument('--' + n, type=Path, action='append', required=True)
+    for n in ('sfc', 'baseline', 'report-json'): p.add_argument('--' + n, type=Path, required=True)
+    a = p.parse_args(); assert len(a.before) == len(a.after)
+    compare_sfc(a.sfc)
     report = dict(golden=str(a.sfc.resolve()), orders=[compare(x, y, a.baseline.read_text()) for x, y in zip(a.before, a.after)], limitation=__doc__)
     a.report_json.write_text(json.dumps(report, indent=2) + '\n')
     print('PASS shared SFC FASED token/reset equations, eleven channels and 46 payload routes; unchanged allocation/modules and complete annotation archive')
