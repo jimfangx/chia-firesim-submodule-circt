@@ -3856,8 +3856,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlReadsAnnotations, error)))
         return fail("control read annotations: " + error);
       llvm::outs() << "Dispatched CIRCT control AR requests to allocated widgets and the error endpoint in " << controlReadsPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC control responses and platform integration are not implemented");
       if (failed(goldengate::addControlReadTracker(circuit, error)))
         return fail("control read tracker: " + error);
       if (failed(mlir::verify(*module)))
@@ -3873,6 +3871,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, readTrackerAnnotations, error)))
         return fail("control read tracker annotations: " + error);
       llvm::outs() << "Tracked CIRCT control AR transactions and accepted final R beats in " << readTrackerPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC control response arbitration and platform integration are not implemented");
       if (failed(goldengate::addControlReadArbiter(circuit, error)))
         return fail("control read arbiter: " + error);
       if (failed(mlir::verify(*module)))

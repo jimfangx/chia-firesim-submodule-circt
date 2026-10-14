@@ -1460,3 +1460,95 @@ boundary results against iteration 182. Only NIC's later unsupported-feature
 reason advances. `nic-prior-boundaries-comparison.json` confirms all eight
 NIC decoder, queued write-route, dispatch and widget-write MLIR/annotation
 artifacts are byte-identical to those already compared with SFC.
+
+## Iteration 184: connect the production NIC AR response tracker
+
+The native compiler now runs `addControlReadTracker` after NIC AR dispatch,
+verifies the CIRCT FIRRTL operations, and emits
+`post-fame-control-read-tracker.mlir` and complete annotations. The tracker
+uses the twelve-region allocation: eight bank retirements, four explicit
+unbound retirements, and error endpoint 12. Its 64 slots retain twelve-bit
+transaction identity and four-bit route data. The NIC target still explicitly
+fails at missing response arbitration/platform integration.
+
+The exact SFC artifact compared is:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+SHA256: `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICControlReadTrackerCompare.py` checks all 223 production wrapper connections,
+165 copied ports, preservation of 116 prior module bodies, and recursive
+transfer of all 1,792 annotation records. It matches 24 original `FPGATop`
+response allocation connections and thirteen SFC router retirement/tag
+expressions. The exporter runs the actual pass on the production AR boundary
+and clones its dispatch and tracker operations, including assertions; both
+helper bodies and the full transformed circuit match the compiler output.
+
+Isolated Verilator comparison preserves the original SFC `ReorderQueue` body
+and 46 original router expressions. It passes 100,352 cycles with 21,914
+accepted reads, 28,271 stalls, 19,824 final retirements, 21,026 held beats,
+6,516 alias stalls, 3,652 simultaneous accept/retirement cycles and 254 reset
+cycles. All thirteen endpoints, full 64-slot storage, different upper tag
+bits sharing a low-six-bit slot, out-of-order retirement and pending-request
+reset are covered. Reset is clocked before checking initialized free slots;
+two initial testbench reset failures remain as diagnostic logs. SFC and
+CIRCT agreed at those failures; the scoreboard had run before reset took effect.
+
+Normal SFC MMIO response `last` is optimized to one; differential execution
+uses that specialization, while the native wrapper test exercises all eight
+ready/valid/last combinations, including nonfinal normal responses. The error
+endpoint retains burst-last behavior. SFC optimizes away unused route storage;
+the native route payload is independently checked against a scoreboard.
+Arbitration readiness is an explicit boundary. This comparison does not prove
+R/B arbitration, widget completion, host memory arbitration, stream-driver ABI
+or complete NIC runtime/platform behavior.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration184-u250-target-matrix/
+```
+
+`nic-control-read-tracker-production-verified/comparison.json` records hashes,
+structured checks and behavioral results. After sourcing the FireSim
+environment, run `test/Transforms/NICControlReadTrackerCompare.py` with
+`--reads` and `--tracker` pointing to the production boundaries, `--golden`
+to the archived NIC SV, `--export-tool` to `goldengate-control-read-tracker-test`,
+and a fresh `--output-dir`.
+
+`nic-prior-boundaries-comparison.json` freshly matches all ten earlier NIC
+decoder, write-route, write-dispatch, widget-write and AR-dispatch MLIR/annotation
+artifacts against iteration 183 byte-for-byte. Fresh no-NIC RTL, both constant
+headers and both XDC files also match iteration 183. The October 1 immutable
+primary inputs and U250 XDC match with the recorded implementation hierarchy
+rename. No immutable fixture was changed, and no FireSim manager verification
+step was started. Pre-existing user ClockBridgeControl/UART registry edits
+remain outside this checkpoint.
+
+Fresh standalone replay of all thirteen archived handoffs and effective
+platform configurations used compiler SHA256
+`26eda544eb3aa168e4e60a38c7d30da760d662fd588c76a18693793f1f0db81d`.
+`replay/matrix.json` records one complete no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations; its nonzero exit
+reports those implementation gaps. All seven reached BridgeIO/channel
+boundaries match SFC. Shuttle model-port annotations match; the other six
+retain their previous native-SRAM annotation differences.
+`matrix-regression-comparison.json` checks all thirteen inputs, effective
+platforms, statuses and structured boundary results against iteration 183.
+Only NIC's later unsupported-feature reason advances to response arbitration.
+
+Focused CTest `goldengate-control-read-tracker` passes in 745.42 seconds:
+16,443 collision/retirement/reset cycles across 1, 2, 3, 11, 12, 13, 31 and
+63 regions plus empty bindings, all wrapper final-beat truth-table cases,
+target transfer and 31 atomic rejection checks. `ctest.log` and
+`control-read-tracker-ctest-detail.log` retain the result and detailed output.
+The compiler and tracker test targets build successfully; Python syntax and
+`git diff --check` also pass.
+
+The next smallest step is to connect the thirteen-input R arbiter to this
+tracker boundary and compare burst locking, priority, backpressure and final
+retirement against the archived SFC `HellaPeekingArbiter`. Remaining widget
+bindings, write responses, host memory/driver stream lists, NIC runtime,
+wider/multiple TracerV profiles, FASED geometry and partition/QSFP remain gaps.

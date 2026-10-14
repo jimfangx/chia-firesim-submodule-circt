@@ -30,11 +30,21 @@ const std::pair<unsigned, const char *> widgets[]{{2, "tracerv_ctrl"}, {4, "load
 std::vector<std::pair<unsigned, std::string>> boundWidgets(unsigned count) {
   std::vector<std::pair<unsigned, std::string>> result;
   if (count == 11) for (auto [i, n] : widgets) result.emplace_back(i, n);
-  else for (unsigned i = 0; i < count; i += 2)
+  else if (count == 12) {
+    for (auto [i, n] : widgets)
+      result.emplace_back(i == 7 ? 8 : i == 9 ? 11 : i, n);
+    result.emplace_back(7, "nicBridge_ctrl");
+  } else for (unsigned i = 0; i < count; i += 2)
     result.emplace_back(i, "widget_" + std::to_string(i) + "_ctrl");
   return result;
 }
 std::string regionName(unsigned count, unsigned i) {
+  if (count == 12) {
+    const char *names[]{"BlockDevBridgeModule_0", "FASEDMemoryTimingModel_0", "TracerVBridgeModule_0",
+        "TSIBridgeModule_0", "LoadMemWidget_0", "PeekPokeBridgeModule_0", "UARTBridgeModule_0",
+        "SimpleNICBridgeModule_0", "ClockBridgeModule_0", "SimulationMaster_0", "CPUManagedStreamEngine_0", "ResetPulseBridgeModule_0"};
+    return names[i];
+  }
   if (count != 11) return "Widget_" + std::to_string(i);
   const char *names[]{"BlockDevBridgeModule_0", "FASEDMemoryTimingModel_0", "TracerVBridgeModule_0",
       "TSIBridgeModule_0", "LoadMemWidget_0", "PeekPokeBridgeModule_0", "UARTBridgeModule_0",
@@ -83,7 +93,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned count
     decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(catalog));
   }
   if (bad != 6) named(c, oldTop)->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
-  const std::string targetPort = count == 11 ? "clockBridge_ctrl" : "widget_0_ctrl";
+  const std::string targetPort = (count == 11 || count == 12) ? "clockBridge_ctrl" : "widget_0_ctrl";
   std::vector<std::string> refs{"hostReset", "ctrl_read_dispatch_track_tag"};
   if (!bound.empty()) refs.push_back(targetPort + ".r.bits.id");
   for (const auto &ref : refs)
@@ -309,20 +319,47 @@ void test(MLIRContext &ctx, ArrayRef<unsigned> counts) {
   }
   llvm::outs() << "Control read tracker: " << total << " collision/retirement/reset cycles across";
   for (unsigned count : counts) llvm::outs() << ' ' << count;
-  llvm::outs() << " regions and empty bindings; wrapper final-beat wiring, targets and " << rejected + 8 << " atomic rejections passed\n";
+  llvm::outs() << " regions and empty bindings; wrapper final-beat wiring, targets and " << rejected + counts.size() + 1 << " atomic rejections passed\n";
 }
 }
 int main(int argc, char **argv) {
-  SmallVector<unsigned> counts{1U, 2U, 3U, 11U, 13U, 31U, 63U};
+  MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+  if ((argc == 3 || argc == 5) && StringRef(argv[1]) != "--regions") {
+    try {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production input invalid");
+      auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+      require(succeeded(goldengate::addControlReadTracker(c, error)), error);
+      require(succeeded(verify(*root)), "production read tracker invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot write production tracker"); root->print(out); out << '\n'; out.close();
+      if (argc == 5) {
+        // Clone the actual production helpers, including tracker assertions.
+        // No AR or storage expression is rebuilt for the differential test.
+        const char *names[]{"GGControlReadDispatch", "GGControlReadTracker"};
+        for (unsigned i = 0; i < 2; ++i) {
+          auto isolated = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+          b.setInsertionPointToEnd(isolated.getBody());
+          auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr(names[i]));
+          b.setInsertionPointToEnd(exported.getBodyBlock());
+          auto helper = cast<FModuleOp>(b.insert(named(c, names[i])->clone())); helper.setPublic();
+          require(succeeded(verify(isolated)), "exported helper invalid");
+          llvm::raw_fd_ostream helperOut(argv[3 + i], ec); require(!ec, "cannot export helper");
+          isolated.print(helperOut); helperOut << '\n'; helperOut.close(); isolated.erase();
+        }
+      }
+      llvm::outs() << "Production NIC AR tracker and cloned helpers verified\n"; return 0;
+    } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  }
+  SmallVector<unsigned> counts{1U, 2U, 3U, 11U, 12U, 13U, 31U, 63U};
   if (argc != 1) {
     unsigned count = 0;
     if (argc != 3 || StringRef(argv[1]) != "--regions" ||
         StringRef(argv[2]).getAsInteger(10, count) || !count || count > 63) {
-      llvm::errs() << "usage: goldengate-control-read-tracker-test [--regions 1..63]\n";
+      llvm::errs() << "usage: goldengate-control-read-tracker-test [--regions 1..63] or input.mlir output.mlir [dispatch.mlir tracker.mlir]\n";
       return 1;
     }
     counts.assign(1, count);
   }
-  MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try { test(ctx, counts); return 0; } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
