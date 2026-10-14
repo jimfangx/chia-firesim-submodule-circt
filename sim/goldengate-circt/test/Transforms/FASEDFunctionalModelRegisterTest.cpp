@@ -4,6 +4,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
@@ -265,9 +266,66 @@ void rejections(MLIRContext &context) {
   }
 }
 }
-int main() {
+// Export the real bank and real wrapper bindings, not a rebuilt test model.
+unsigned port(FModuleOp m, llvm::StringRef name) {
+  for (unsigned i=0;i<m.getNumPorts();++i) if(m.getPortName(i)==name)return i;
+  throw std::runtime_error("missing production port: "+name.str());
+}
+Value driver(FModuleOp m,Value dest) {
+  Value result;
+  for(auto &op:*m.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==dest) {
+    require(!result,"multiple production drivers");result=op.getOperand(1);
+  }
+  require(bool(result),"missing production driver");return result;
+}
+void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
+  auto root=parseSourceFile<ModuleOp>(input,&ctx);
+  require(bool(root)&&succeeded(verify(*root)),"invalid production functional-model-register boundary");
+  auto c=*root->getOps<CircuitOp>().begin();
+  require(c.getName()=="GGFASEDFunctionalModelRegisterWrapper","wrong production functional-model-register root");
+  auto top=named(c,c.getName()),inner=named(c,"GGFASEDLatencyRegistersWrapper"),bank=named(c,"GGFASEDFunctionalModelRegister");
+  InstanceOp sim,original;
+  for(auto i:top.getOps<InstanceOp>()) {
+    if(i.getInstanceName()=="sim")sim=i;
+    if(i.getInstanceName()=="functionalModelRegister")original=i;
+  }
+  require(sim&&sim.getModuleName()==inner.getName()&&original&&original.getModuleName()==bank.getName(),"wrong production functional-model-register instances");
+  require(bank.getNumPorts()==4,"wrong production bank port count");
+  auto hostClock=top.getBodyBlock()->getArgument(port(top,"hostClock"));
+  auto hostReset=top.getBodyBlock()->getArgument(port(top,"hostReset"));
+  require(driver(top,original.getResult(0))==hostClock&&driver(top,original.getResult(1))==hostReset,"functional model register must use host clock/reset");
+  auto mcr=top.getBodyBlock()->getArgument(port(top,"fased_functional_model_mcr"));
+  require(driver(top,mcr)==original.getResult(3)&&mcr.getType()==bank.getPorts()[3].type,"MCR fragment binding differs");
+  auto isolated=ModuleOp::create(c.getLoc());OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(isolated.getBody());
+  auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGFASEDFunctionalModelRegisterProbe"));
+  b.setInsertionPointToEnd(exported.getBodyBlock());b.insert(bank->clone());
+  auto probe=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDFunctionalModelRegisterProbe"),bank.getConventionAttr(),bank.getPorts());probe.setPublic();
+  b.setInsertionPointToEnd(probe.getBodyBlock());
+  auto mmio=b.create<InstanceOp>(c.getLoc(),bank,"functionalModelRegister");IRMapping map;
+  for(unsigned i=0;i<4;++i)map.map(original.getResult(i),mmio.getResult(i));
+  map.map(hostClock,probe.getBodyBlock()->getArgument(0));
+  map.map(hostReset,probe.getBodyBlock()->getArgument(1));
+  map.map(mcr,probe.getBodyBlock()->getArgument(3));
+  auto dest=sim.getResult(port(inner,"fased_ingress_relaxed"));
+  require(driver(top,dest)==original.getResult(2),"wrong ingress relaxation source");
+  map.map(dest,probe.getBodyBlock()->getArgument(2));
+  unsigned cloned=0;
+  for(auto &op:*top.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&
+      map.contains(op.getOperand(0))&&map.contains(op.getOperand(1))) {
+    b.clone(op,map);++cloned;
+  }
+  require(cloned==4,"expected clock/reset, ingress relaxation and MCR connections");
+  require(succeeded(verify(isolated)),"invalid production functional-model-register probe");
+  std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot export functional-model-register probe");
+  isolated.print(out);out<<'\n';out.close();isolated.erase();
+  llvm::outs()<<"Cloned production functional-model-register bank and four clock/reset/ingress/MCR bindings\n";
+}
+int main(int argc,char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    require(argc==1||argc==3,"usage: goldengate-fased-functional-model-register-test [boundary.mlir probe.mlir]");
+    if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
     for (bool selectedProfile : {false, true}) {
       selected = selectedProfile;
       phases(context); behavior(context); mapping(context); rejections(context);

@@ -4503,10 +4503,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyRegistersAnnotations, error)))
         return fail("FASED latency registers annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock latency registers and timing binding in " << fasedLatencyRegistersPath << '\n';
-      // NIC latency MMIO now drives the full-width timing inputs on host cycles.
-      // The functional-model control word is the next composition boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED functional model register, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDFunctionalModelRegister(circuit, fasedFunctionalModelBank, error)))
         return fail("FASED functional model register: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED functional model register produced invalid FIRRTL IR");
@@ -4520,6 +4516,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelRegisterAnnotations, error)))
         return fail("FASED functional model register annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock functional model register and ingress binding in " << fasedFunctionalModelRegisterPath << '\n';
+      // NIC functional-model MMIO now drives ingress relaxation on host cycles.
+      // Response status registers are the next composition boundary.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED response error registers, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
         return fail("FASED response error registers: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED response error registers produced invalid FIRRTL IR");
