@@ -3294,7 +3294,29 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitAllAnnotations(circuit, writeAnnotations, error)))
           return fail("CPU stream write transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT CPU stream write transport in " << writePath << '\n';
-        return fail("NIC buffered CPU AXI transport, MMIO control binding and platform integration are not implemented");
+        // Preserve independent SFC AXI4Buffer AW/W ingress and B response
+        // timing on the live sink boundary before binding the NIC controls.
+        if (failed(goldengate::addCPUStreamWriteBuffer(circuit, error)))
+          return fail("NIC CPU AW/W buffers: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("NIC CPU AW/W buffers produced invalid FIRRTL IR");
+        if (failed(goldengate::attachCPUStreamWriteResponseBuffer(
+                circuit, "GGCPUStreamWriteBufferWrapper",
+                "GGCPUStreamWriteResponseBufferWrapper", error)))
+          return fail("NIC CPU B buffer: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("NIC CPU B buffer produced invalid FIRRTL IR");
+        llvm::SmallString<256> bufferedPath(outputDir), bufferedAnnotations(outputDir);
+        llvm::sys::path::append(bufferedPath, "post-fame-nic-cpu-write-buffered.mlir");
+        llvm::sys::path::append(bufferedAnnotations, "post-fame-nic-cpu-write-buffered-all.json");
+        std::error_code bufferedError;
+        llvm::raw_fd_ostream bufferedOut(bufferedPath, bufferedError);
+        if (bufferedError) return fail("cannot write NIC buffered CPU transport: " + bufferedError.message());
+        module->print(bufferedOut); bufferedOut << '\n'; bufferedOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, bufferedAnnotations, error)))
+          return fail("NIC buffered CPU transport annotations: " + error);
+        llvm::outs() << "Mapped CIRCT NIC CPU AW/W/B buffers in " << bufferedPath << '\n';
+        return fail("NIC CPU AR/R buffering, MMIO control binding and platform integration are not implemented");
       }
       if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
         return fail("CPU stream MCRFile transactions: " + error);

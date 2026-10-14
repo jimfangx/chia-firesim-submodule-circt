@@ -604,3 +604,77 @@ October 1 immutable FIRRTL/annotation inputs and U250 build-tree synthesis and
 implementation XDC, matching constraints after the recorded hierarchy rename
 `target/FireSim_` to `target_FAMETop/FireSim`. Both immutable fixtures remain
 untouched.
+
+
+## Iteration 174: native live-sink AW/W ingress and B response buffers
+
+The live NIC write path now attaches independent depth-two AW/W queues and the
+native depth-two B queue before reporting the remaining NIC integration gap.
+`CPUStreamWriteBuffer.cpp` accepts the complete live AW address/length and
+512-bit W data input group, retains it in native FIRRTL memories, and routes
+both payload and ready/valid through those queues. The empty-sink allocation
+and unused-field pruning are preserved. Partial fields, wrong widths and
+wrong directions reject before mutation. AW/W targets retain their engine
+module identity; B targets retain their pre-response-buffer identity; copied
+ports move to the active wrapper.
+
+Six focused CTests pass (empty write, write, AW/W buffer, AR buffer, B buffer,
+and NIC CPU queues). The live composition test also checks both directions
+of every new payload wire, all 17 fixture port identities, nine atomic live
+preflight rejects and repeated-call rejection. The final standalone comparison
+uses the actual archived-input compiler candidate and the same attachment APIs;
+all four helper module bodies match the production operations exactly, and
+all 1,792 production annotation records match the expected recursive transfer.
+
+`test/Transforms/NICCPUStreamWriteBufferedCompare.py` retains the original SFC
+`AXI4Buffer_2`, `Queue_55`, `Queue_56`, `Queue_57`, `Queue_59`, and the incoming
+write-engine cone from this exact immutable archive artifact:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+Its SHA256 is
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+The same directory's `FireSim-generated.const.h` supplies allocation checks.
+Read pins on the reference buffer are inactive. Native and SFC AW/W ready,
+B valid/ID/response, and stream valid/data match through 133,558 cycles:
+all 256 burst lengths, six overlapping single-beat requests, 50,000 randomized
+cycles, 50,767 stream transfers, 729 accepted AWs, 375 accepted Bs,
+23,442 W stalls, 340 B stalls and 180 reset cycles. Payload comparisons are
+qualified by valid, since uninitialized queue RAM has no invalid-cycle ABI.
+The unbuffered write-cone comparison also passes independently.
+
+Evidence is in:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration174-u250-target-matrix/
+```
+
+`buffered-production-checked/comparison.json` records the successful buffered
+comparison and full production annotation count. The first two diagnostic
+attempts stopped on synthetic test annotations during lowering and a Verilator
+post-increment testbench bug; the final test omits only the already-checked
+fixture annotations before ordinary lowering and uses an explicit timeout
+increment. No native semantic change was required for either test issue.
+`no-nic-rtl-collateral-comparison.json` confirms unchanged no-NIC Rocket RTL
+and driver header. `immutable-rocket-comparison.json` rechecks the October 1
+immutable handoff inputs and U250 build-tree XDC, with implementation clocks
+matching after the recorded `target/FireSim_` to `target_FAMETop/FireSim` rename.
+
+NIC compilation remains an explicit failure after the new boundary:
+`NIC CPU AR/R buffering, MMIO control binding and platform integration are
+not implemented`. Next attach the AR/R buffers to the multi-source NIC read
+path, compare combined channel stalls, then bind the NIC and stream-count
+MMIO controls and derive both driver direction lists. Complete NIC simulator
+execution and driver ABI parity are still pending. No FireSim manager gate
+was initiated by this implementation turn.
+
+The fresh thirteen-recipe replay completed with compiler SHA256
+`411a232e73cd43d2b29ec76068f3c483458cafd737e0e71533f17f43c8245330`: one compiled no-NIC Rocket target, six lowering
+failures and six unsupported partition profiles. All seven reached bridge
+annotation boundaries match SFC; Shuttle model-port annotations match, while
+the other six retain the existing SRAM annotation differences. The replay
+exits nonzero and does not claim semantic parity for rejected targets. NIC's
+error advances from its prior buffered-transport gap to the explicit AR/R,
+MMIO and platform gap above.

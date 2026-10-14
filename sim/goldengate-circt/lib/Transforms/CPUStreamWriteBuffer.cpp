@@ -1,7 +1,8 @@
 // See LICENSE for license details.
 // FPGATop CPU AXI4Buffer(): independent depth-two AW and W queues, flow=false,
 // pipe=false. Retains the common AW address/length fields from golden Queue_51;
-// W data/last have no users in Rocket's empty incoming CPU stream configuration.
+// Live sinks retain W data and AW address/length; empty-sink boundaries add
+// the unused AW address/length inputs and omit unused W data/last.
 // Requires an uninstantiated active boundary, exact U250 AW/W scalars and raw
 // annotations. Rejects boundary/module collisions before mutation. AW/W targets
 // stay on the inner engine-facing boundary; other copied ports move outward.
@@ -56,10 +57,28 @@ LogicalResult goldengate::attachCPUStreamWriteBuffer(
     if (!found) return reject("CPU AW/W buffers need the exact U250 clock/reset and write interface");
     indices[j] = *found;
   }
+  // Live write transport presents all three additional payload fields. Accept
+  // only the complete, correctly typed group before creating any operations.
+  const llvm::StringRef liveNames[]{"cpu_stream_aw_bits_addr", "cpu_stream_aw_bits_len", "cpu_stream_w_bits_data"};
+  const unsigned liveWidths[]{64, 8, 512};
+  SmallVector<unsigned> liveIndices;
+  for (unsigned j = 0; j < 3; ++j)
+    for (auto [i, p] : llvm::enumerate(inner.getPorts()))
+      if (p.name == liveNames[j]) {
+        if (p.direction != Direction::In || p.type != uint(liveWidths[j]))
+          return reject("CPU AW/W live payload fields need exact input widths");
+        liveIndices.push_back(i);
+      }
+  if (!liveIndices.empty() && liveIndices.size() != 3)
+    return reject("CPU AW/W live payload fields must be complete");
+  bool live = !liveIndices.empty();
+  SmallVector<unsigned> buffered(ArrayRef<unsigned>(indices).drop_front(2));
+  llvm::append_range(buffered, liveIndices);
   for (auto p : inner.getPorts()) {
     auto n = p.name.getValue();
     if ((n.starts_with("cpu_stream_aw_") || n.starts_with("cpu_stream_w_")) &&
-        !llvm::is_contained(ArrayRef<llvm::StringRef>(names), n))
+        !llvm::is_contained(ArrayRef<llvm::StringRef>(names), n) &&
+        !llvm::is_contained(ArrayRef<llvm::StringRef>(liveNames), n))
       return reject("unsupported or already buffered CPU AW/W field");
   }
   bool used = false;
@@ -110,18 +129,22 @@ LogicalResult goldengate::attachCPUStreamWriteBuffer(
   };
   auto awPayload = BundleType::get(context, {{b.getStringAttr("id"), false, uint(16)},
       {b.getStringAttr("addr"), false, uint(64)}, {b.getStringAttr("len"), false, uint(8)}, {b.getStringAttr("size"), false, uint(3)}});
-  auto wPayload = BundleType::get(context, {{b.getStringAttr("strb"), false, uint(64)}});
+  SmallVector<BundleType::BundleElement> wFields{{b.getStringAttr("strb"), false, uint(64)}};
+  if (live) wFields.push_back({b.getStringAttr("data"), false, uint(512)});
+  auto wPayload = BundleType::get(context, wFields);
   auto awQueue = makeQueue(awName, awPayload), wQueue = makeQueue(wName, wPayload);
   SmallVector<PortInfo> ports(inner.getPorts());
-  unsigned addrPort = ports.size(); ports.push_back({b.getStringAttr("cpu_stream_aw_bits_addr"), uint(64), Direction::In});
-  unsigned lenPort = ports.size(); ports.push_back({b.getStringAttr("cpu_stream_aw_bits_len"), uint(8), Direction::In});
+  unsigned addrPort = live ? liveIndices[0] : ports.size();
+  if (!live) ports.push_back({b.getStringAttr("cpu_stream_aw_bits_addr"), uint(64), Direction::In});
+  unsigned lenPort = live ? liveIndices[1] : ports.size();
+  if (!live) ports.push_back({b.getStringAttr("cpu_stream_aw_bits_len"), uint(8), Direction::In});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), aw = b.create<InstanceOp>(loc, awQueue, "awQueue"), w = b.create<InstanceOp>(loc, wQueue, "wQueue");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(i); };
   SmallVector<unsigned> copied;
-  for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (!llvm::is_contained(ArrayRef<unsigned>(indices).drop_front(2), i)) {
+  for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (!llvm::is_contained(buffered, i)) {
     copied.push_back(i);
     b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : outer(i),
         p.direction == Direction::In ? outer(i) : sim.getResult(i));
@@ -139,8 +162,17 @@ LogicalResult goldengate::attachCPUStreamWriteBuffer(
     connect(sim.getResult(indices[idx]), field(field(q.getResult(3), "bits"), name));
   };
   wirePayload(aw, 4, "id"); wirePayload(aw, 5, "size"); wirePayload(w, 8, "strb");
+  if (live) {
+    auto wireLive = [&](InstanceOp q, unsigned port, llvm::StringRef name) {
+      connect(field(field(q.getResult(2), "bits"), name), outer(port));
+      connect(sim.getResult(port), field(field(q.getResult(3), "bits"), name));
+    };
+    wireLive(aw, addrPort, "addr"); wireLive(aw, lenPort, "len");
+    wireLive(w, liveIndices[2], "data");
+  } else {
   connect(field(field(aw.getResult(2), "bits"), "addr"), outer(addrPort));
   connect(field(field(aw.getResult(2), "bits"), "len"), outer(lenPort));
+  }
   std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute attr) -> Attribute {

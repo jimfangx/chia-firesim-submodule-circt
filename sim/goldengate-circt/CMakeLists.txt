@@ -1831,7 +1831,8 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-empty-cpu-stream-write COMMAND goldengate-empty-cpu-stream-write-test)
   add_executable(goldengate-cpu-stream-write-buffer-test
     test/Transforms/CPUStreamWriteBufferTest.cpp
-    lib/Transforms/CPUStreamWriteBuffer.cpp)
+    lib/Transforms/CPUStreamWriteBuffer.cpp
+    lib/Transforms/CPUStreamWriteResponseBuffer.cpp)
   target_compile_features(goldengate-cpu-stream-write-buffer-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-cpu-stream-write-buffer-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-cpu-stream-write-buffer-test PRIVATE

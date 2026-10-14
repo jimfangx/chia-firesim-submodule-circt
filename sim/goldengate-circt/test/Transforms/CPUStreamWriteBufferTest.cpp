@@ -8,6 +8,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "mlir/IR/IRMapping.h"
 #include <array>
 #include <deque>
 #include <map>
@@ -179,6 +180,88 @@ void mapping(MLIRContext &context) {
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations"); require(annos.size()==5,"annotations lost");
   for (auto [i,a] : llvm::enumerate(annos)) require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue().starts_with(i<2 ? "~GGCPUStreamWriteBufferWrapper|GGCPUStreamWriteWrapper>" : "~GGCPUStreamWriteBufferWrapper|GGCPUStreamWriteBufferWrapper>"),"target identity differs");
 }
+// Compose the exact write helper projected from a production boundary with
+// the same AW/W/B attachment APIs as the compiler. Emitted standalone IR is
+// used for differential RTL execution against the archived SFC queues.
+void compose(MLIRContext &context, const char *input, const char *output) {
+  auto root = parseSourceFile<ModuleOp>(input, &context);
+  require(bool(root) && succeeded(verify(*root)), "invalid write helper input");
+  auto c = *root->getOps<CircuitOp>().begin(); auto engine = named(c, "GGCPUStreamWrite");
+  require(engine.getNumPorts() == 17 && engine.getPortName(2) == "stream", "needs single NIC write helper");
+  OpBuilder b(&context); SmallVector<PortInfo> ports(engine.getPorts());
+  ports[0].name = b.getStringAttr("hostClock"); ports[1].name = b.getStringAttr("hostReset");
+  for (unsigned i = 3; i < ports.size(); ++i) ports[i].name = b.getStringAttr("cpu_stream_" + ports[i].name.str());
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  auto top = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGCPUStreamWriteWrapper"), engine.getConventionAttr(), ports);
+  b.setInsertionPointToStart(top.getBodyBlock()); auto sim = b.create<InstanceOp>(c.getLoc(), engine, "write");
+  for (auto [i, p] : llvm::enumerate(ports)) {
+    Value outer = top.getArgument(i), inner = sim.getResult(i);
+    b.create<ConnectOp>(c.getLoc(), p.direction == Direction::In ? inner : outer,
+                       p.direction == Direction::In ? outer : inner);
+  }
+  c.setName("GGCPUStreamWriteWrapper"); SmallVector<Attribute> annotations;
+  for (auto p : ports) annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
+    b.getNamedAttr("target", b.getStringAttr("~GGCPUStreamWriteWrapper|GGCPUStreamWriteWrapper>" + p.name.str()))}));
+  c->setAttr("rawAnnotations", b.getArrayAttr(annotations)); std::string error;
+  for (unsigned bad=0;bad<9;++bad) {
+    OwningOpRef<ModuleOp> copy(cast<ModuleOp>(root->clone()));
+    auto cc=*copy->getOps<CircuitOp>().begin(); auto boundary=named(cc,"GGCPUStreamWriteWrapper");
+    unsigned port=bad%3==0 ? 6 : bad%3==1 ? 7 : 11;
+    if (bad<3) {
+      auto names=llvm::to_vector(boundary.getPortNames());names[port]=b.getStringAttr("missing_live_field");boundary.setPortNames(names);
+    } else if (bad<6) {
+      auto types=llvm::to_vector(boundary.getPortTypes());auto wrong=UIntType::get(&context,2,false);
+      types[port]=TypeAttr::get(wrong);boundary->setAttr("portTypes",b.getArrayAttr(types));boundary.getArgument(port).setType(wrong);
+    } else {
+      SmallVector<bool> directions(boundary.getPortDirections().begin(),boundary.getPortDirections().end());
+      directions[port]=!directions[port];boundary.setPortDirections(directions);
+    }
+    std::string before,after; {llvm::raw_string_ostream out(before);copy->print(out);}
+    require(failed(goldengate::addCPUStreamWriteBuffer(cc,error)),"bad live payload accepted");
+    {llvm::raw_string_ostream out(after);copy->print(out);}require(before==after,"live rejection mutated IR");
+  }
+  require(succeeded(goldengate::addCPUStreamWriteBuffer(c, error)), error);
+  auto buffered = named(c, "GGCPUStreamWriteBufferWrapper");
+  require(buffered.getNumPorts() == ports.size(), "live payload duplicated or dropped");
+  auto w = named(c, "GGCPUStreamWQueue2"); auto mem = *w.getOps<MemOp>().begin();
+  require(cast<BundleType>(mem.getDataType()).getElementType("data") == UIntType::get(&context,512,false), "live W data absent");
+  // Validate both directions of every added live payload connection.
+  InstanceOp aw, wd, wrapped;
+  for (auto i : buffered.getOps<InstanceOp>()) {
+    if (i.getName() == "awQueue") aw=i;
+    if (i.getName() == "wQueue") wd=i;
+    if (i.getName() == "sim") wrapped=i;
+  }
+  Interpreter keys(named(c, "GGCPUStreamAWQueue2")); std::map<std::string,std::string> wires;
+  for (auto conn : buffered.getOps<StrictConnectOp>())
+    require(wires.emplace(keys.key(conn.getDest()),keys.key(conn.getSrc())).second,"duplicate live driver");
+  for (auto [port,name] : {std::pair<unsigned,const char *>{6,"addr"},{7,"len"},{11,"data"}}) {
+    auto q=port==11 ? wd : aw;
+    require(wires.at(keys.key(q.getResult(2))+".bits."+name)==keys.key(buffered.getArgument(port)) &&
+      wires.at(keys.key(wrapped.getResult(port)))==keys.key(q.getResult(3))+".bits."+name,"live payload bypasses queue");
+  }
+  require(succeeded(goldengate::attachCPUStreamWriteResponseBuffer(c,
+    "GGCPUStreamWriteBufferWrapper","GGCPUStreamWriteResponseBufferWrapper",error)),error);
+  require(succeeded(verify(*root)), "buffered composition invalid");
+  auto final = named(c,"GGCPUStreamWriteResponseBufferWrapper");
+  require(final.getNumPorts()==ports.size(),"response attachment changed live port inventory");
+  auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(annos.size()==ports.size(),"composition lost annotations");
+  for (auto [i,a] : llvm::enumerate(annos)) {
+    auto name=ports[i].name.getValue();
+    auto owner = name.starts_with("cpu_stream_aw_") || name.starts_with("cpu_stream_w_") ? "GGCPUStreamWriteWrapper" :
+      name.starts_with("cpu_stream_b_") ? "GGCPUStreamWriteBufferWrapper" : "GGCPUStreamWriteResponseBufferWrapper";
+    require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue()==
+      "~GGCPUStreamWriteResponseBufferWrapper|"+std::string(owner)+">"+name.str(),"live annotation identity differs");
+  }
+  auto before = std::string(); {llvm::raw_string_ostream out(before);root->print(out);}
+  require(failed(goldengate::addCPUStreamWriteBuffer(c,error)),"repeated buffer accepted");
+  auto after = std::string(); {llvm::raw_string_ostream out(after);root->print(out);}
+  require(before==after,"repeat mutated IR");
+  std::error_code ec; llvm::raw_fd_ostream out(output,ec); require(!ec,"cannot write composed IR"); root->print(out);out<<'\n';
+  llvm::outs()<<"PASS live AW/W/B composition, 512-bit payload wires, all 17 target identities, nine atomic live rejects and repeated rejection\n";
+}
 void rejection(MLIRContext &context) {
   for (unsigned bad=0;bad<8;++bad) {
     auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();auto top=named(c,"GGCPUStreamWriteWrapper");OpBuilder b(&context);
@@ -195,7 +278,9 @@ void rejection(MLIRContext &context) {
 int main(int argc, char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-    if (argc == 2) {
+    if (argc == 4 && std::string(argv[1]) == "--compose") {
+      compose(context,argv[2],argv[3]);
+    } else if (argc == 2) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(root) && succeeded(verify(*root)), "invalid expanded queue boundary");
       behavior(*root->getOps<CircuitOp>().begin());
