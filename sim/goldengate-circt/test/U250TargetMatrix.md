@@ -1930,3 +1930,90 @@ MMIO and catalog-selected control stages at slave 3, comparing them against
 the same archived SFC target. BlockDev/FASED responses, host memory/stream
 lists, NIC runtime, wider/multiple TracerV profiles, FASED geometry and
 partition/QSFP support remain incomplete.
+
+## Iteration 189: execute native TSI stages for the NIC catalog
+
+The NIC compiler path now runs the five existing CIRCT TSI passes before
+rejecting the remaining BlockDev/FASED and platform integration boundary.
+They construct the scheduler, two sixteen-word queues, MMIO bank, control
+transport and slave-3 bindings as FIRRTL operations. The catalog allocates
+TSI at byte address 320, with nine registers through 352 in a 64-byte region.
+The no-NIC path continues through the same passes.
+
+The semantic oracle remains `MidasTransforms.scala`, `FAMETransform.scala`
+and `generators/firechip/goldengateimplementations/src/main/scala/TSIBridge.scala`.
+The latter gates target transfers on both host handshakes and remaining
+tokens, resets queues only on host reset or an accepted target reset, and
+gives a software start priority over token decrement. The comparison uses
+the actual archived SFC artifact:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+Its SHA256 is
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`test/Transforms/NICTSICompare.py` checks all five production wrappers,
+recursive annotation retargeting (1,792 annotations), preservation of all
+earlier modules, token predicates and payload connections, queue/MMIO
+connections, the register catalog and all twenty SFC control pins.
+The token check includes the HostPort predicate that excludes each
+channel's own valid/ready signal. The test exporter in
+`TSITokenEngineTest.cpp` clones the four actual native helper modules from
+the bound production boundary; their bodies must match before lowering.
+
+The isolated native assembly matches the complete SFC `TSIBridgeModule`,
+`Queue_19`, `Queue_20` and `MCRFile_8` for 55,818 Verilator cycles.
+Directed coverage includes both queues becoming full, simultaneous input
+enqueue/dequeue, stalled and accepted target resets, host reset, sixteen
+decoded MMIO indices, three AW/W arrival orders and all sixteen strobe
+values. A further 50,000 randomized cycles exercise control response
+backpressure, IDs, address aliases and target traffic. Observed coverage is
+1,856 token fires, 1,367 B stalls, 12,271 R stalls, 2,193 full-input cycles,
+1,344 full-output cycles, 1,603 stalled target-reset cycles and 47 accepted
+target-reset cycles. Five SFC-optimized response constants also match.
+This establishes the local TSI boundary; it does not establish complete NIC
+runtime or platform/driver equivalence.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration189-u250-target-matrix/
+```
+
+`nic-tsi-production/comparison.json` records the production comparison.
+The bound candidate SHA256 is
+`c5360a5e8844c8f08dbf6c7099eabc50ad7654f7b45df567038a277b159f77c9`.
+Run the comparison in the sourced FireSim environment with `--candidate-dir`
+pointing to the NIC replay candidate, `--golden` to the SV above,
+`--export-tool` to `goldengate-tsi-token-test` and a fresh `--output-dir`.
+`immutable-tsi-comparison.json` also matches the entire TSI module against
+the October 1 immutable U250 `design/FireSim-generated.sv` after dependency
+type-name normalization; the two queues and MCRFile have identical ports
+and complete bodies. No immutable fixture was edited.
+
+Focused CTest cases `goldengate-tsi-token`, `goldengate-tsi-word-queues`,
+`goldengate-tsi-mmio` and `goldengate-simulation-master-control` all pass
+in 14.98 seconds. Python syntax and scoped diff checks pass. Twenty-six
+earlier NIC FIRRTL/annotation files and all five no-NIC RTL/collateral files
+match iteration 188 byte for byte. Fresh immutable handoff/XDC comparisons
+also match, using the recorded implementation-XDC hierarchy rename.
+No manager verification was started; pre-existing user edits are excluded.
+
+Fresh replay of all thirteen archived inputs and effective platforms used
+compiler SHA256
+`08e1d1c8abdb9ea7557e9cdc536849bb017c86a369040fc75168e32f25361426`.
+`replay/matrix.json` reports one completed no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations. The matrix's
+nonzero exit retains these implementation gaps. All seven reached
+BridgeIO/channel boundaries match SFC; Shuttle model-port annotations also
+match, while the other six retain the recorded native-SRAM differences.
+`matrix-regression-comparison.json` matches all thirteen input hashes,
+effective platforms, compile statuses and structured boundary comparisons
+to iteration 188. Only the NIC diagnostic advances past TSI binding.
+
+The next smallest step is to carry NIC through native BlockDev token,
+queue, MMIO and slave-0 control stages against the same archived SFC target.
+FASED slave-1 responses, host memory/stream integration, NIC runtime,
+wider/multiple TracerV profiles, FASED geometry and partition/QSFP support
+remain incomplete.

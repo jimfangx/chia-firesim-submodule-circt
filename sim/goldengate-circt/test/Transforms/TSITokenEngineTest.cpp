@@ -213,8 +213,30 @@ void annotationsAndRejection(MLIRContext &ctx) {
   }
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+  // Export the actual production helpers, preserving their operations. This
+  // keeps the differential test independent of the synthetic unit fixture.
+  if (argc == 3) {
+    try {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production boundary invalid");
+      auto c = *root->getOps<CircuitOp>().begin();
+      require(c.getName() == "GGTSIBridgeBoundWrapper", "expected bound TSI boundary");
+      auto isolated = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr("GGTSITokenEngine"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      for (auto name : {"GGTSITokenEngine", "GGTSIWordQueue16", "GGTSIMMIOBank", "GGTSIMCRFile"}) {
+        auto helper = cast<FModuleOp>(b.insert(named(c, name)->clone())); helper.setPublic();
+      }
+      require(succeeded(verify(isolated)), "exported TSI helpers invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot export TSI helpers"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  }
+  if (argc != 1) { llvm::errs() << "usage: goldengate-tsi-token-test [bound.mlir helpers.mlir]\n"; return 1; }
   try { behavior(ctx); wiring(ctx); wiring(ctx, true); annotationsAndRejection(ctx); return 0; }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
