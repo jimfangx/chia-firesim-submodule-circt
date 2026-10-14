@@ -752,3 +752,89 @@ retain the existing SRAM annotation differences. The replay intentionally
 exits nonzero. NIC advances from its AR/R gap to the explicit MMIO/platform gap;
 other target gaps persist. No complete NIC simulator or driver ABI parity is
 claimed, and no FireSim manager verification step was initiated.
+
+## Iteration 176: native decoded NIC MMIO registers
+
+The production NIC path now attaches `GGNICMMIOBank` after its buffered duplex
+CPU transport. Native FIRRTL registers, muxes, slices, concatenation, connects
+and assertions implement the normal-mode SimpleNICBridge configuration bank.
+The five write-only 32-bit configuration registers remain unreset. Their
+updates ignore byte strobes and host reset; target MAC, limiter and pauser
+outputs use the SFC bit slices. The sixth register, `done`, remains an unreset
+one-bit sample of the existing `!tFire` signal. A decoded write overrides the
+sample for that cycle, as `Widget.genROReg` and `MCRIO.bindReg` do in SFC.
+Reads return zero for the five write-only words and zero-extended `done` for
+the sixth word; all read-valid and write-ready signals are constant one.
+Host reset disables only the five write-only read assertions.
+
+The new wrapper consumes seven configuration inputs and the combinational
+done output, retains all other public ports and recursively transfers copied
+annotation targets. `post-fame-nic-mmio.mlir` and its complete annotation
+archive are emitted by the actual compiler, then compilation stops explicitly
+at `NIC Nasti control binding and platform integration are not implemented`.
+The bank's ordered register metadata records local offsets 0/4/8/12/16/20,
+permissions and names; global allocation is still pending.
+
+`test/Transforms/NICMMIOBankTest.cpp` verifies six unreset registers, five
+assertions, permissions, active control/status routes, nested identities and
+29 preflight failures with no IR mutation. Eleven focused CTests pass,
+including NIC token/packet/CPU queues, stream catalog, all four CPU transport
+buffers, multi-source reads, live writes and the new MMIO bank.
+
+`test/Transforms/NICMMIOBankCompare.py` applies the same native attachment to
+the fresh production boundary, requires identical module bodies, checks all
+60 resulting public ports and all wrapper connections, preserves all 75
+prior module bodies and compares all 1,792 annotation records. It checks
+the five native assertion predicates and reset enables against the original
+SFC register-cone guards. The behavioral reference retains actual SFC state
+declarations, combinational assignments and clocked updates from:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+Golden RTL SHA256:
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+The same directory's `FireSim-generated.const.h`, SHA256
+`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`,
+confirms register order and SFC global addresses 512/516/520/524/528/532;
+these addresses are reference requirements, not yet a mapped native decoder.
+Only decoded MCR inputs and the already-compared combinational done signal
+replace SFC boundaries in the standalone reference. Verilator with assertions
+enabled matches all configuration outputs and register read data for 54,097
+cycles: all 64 write masks, 16 strobes and four reset/done combinations,
+followed by 50,000 randomized cycles. Coverage includes 13,538 reset-time
+writes, 1,613 zero-strobe writes, 27,146 done overrides and 26,951 live done
+samples. Uninitialized register values are unspecified and are initialized
+by decoded writes before comparison. This is a unit comparison, not NIC
+simulator/runtime parity.
+
+Evidence is under:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration176-u250-target-matrix/
+```
+
+`mmio-production/comparison.json` records the exact reference and candidate
+hashes and comparison result. `no-nic-rtl-collateral-comparison.json` confirms
+unchanged no-NIC Rocket RTL, driver header, `.const.vh` and both XDC files.
+`immutable-rocket-comparison.json` freshly verifies the October 1 immutable
+FIRRTL/annotation handoff and U250 XDC, including the previously recorded
+implementation hierarchy rename. Both immutable fixtures remain read-only.
+
+Next bind this six-word bank to native Nasti MCRFile transactions, then map
+NIC and the three stream-count registers into the host control allocation.
+Driver stream lists and complete NIC platform/runtime integration remain
+pending, along with other target lowering gaps and partitioned QSFP support.
+No FireSim manager verification step was initiated by this implementation.
+
+The fresh thirteen-recipe replay uses compiler SHA256
+`696f52e0d38bd98033cb7f62699ceb5bdaf66660b6fd122178a77b8da9761916`.
+It completes with one compiled no-NIC Rocket, six lowering failures and six
+unsupported partition profiles, and intentionally exits nonzero. All seven
+reached bridge/channel annotation boundaries match SFC. Shuttle model-port
+annotations match; the other six retain the existing SRAM annotation
+differences. The failures remain: quad-core multiple TracerV constructors;
+BOOM and Shuttle TracerV payload profiles; Gemmini and Saturn Rocket FASED
+maxFlight profiles; NIC Nasti/platform integration; and all six partitioned
+QSFP profiles. Only the NIC failure advances to the new decoded-MMIO boundary.

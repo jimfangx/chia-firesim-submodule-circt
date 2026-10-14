@@ -144,6 +144,7 @@
 #include "goldengate/NICTokenQueues.h"
 #include "goldengate/NICPacketAdapters.h"
 #include "goldengate/NICCPUStreamQueues.h"
+#include "goldengate/NICMMIOBank.h"
 #include "goldengate/TSIMMIOBank.h"
 #include "goldengate/ResetPulseBridge.h"
 #include "goldengate/PeekPokeCycleEngine.h"
@@ -3344,7 +3345,21 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitAllAnnotations(circuit, duplexAnnotations, error)))
           return fail("NIC buffered CPU transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC CPU AW/W/B/AR/R buffers in " << duplexPath << '\n';
-        return fail("NIC MMIO control binding and platform integration are not implemented");
+        if (failed(goldengate::addNICMMIOBank(circuit, error)))
+          return fail("NIC decoded MMIO bank: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("NIC decoded MMIO bank produced invalid FIRRTL IR");
+        llvm::SmallString<256> nicMMIOPath(outputDir), nicMMIOAnnotations(outputDir);
+        llvm::sys::path::append(nicMMIOPath, "post-fame-nic-mmio.mlir");
+        llvm::sys::path::append(nicMMIOAnnotations, "post-fame-nic-mmio-all.json");
+        std::error_code nicMMIOError;
+        llvm::raw_fd_ostream nicMMIOOut(nicMMIOPath, nicMMIOError);
+        if (nicMMIOError) return fail("cannot write NIC decoded MMIO bank: " + nicMMIOError.message());
+        module->print(nicMMIOOut); nicMMIOOut << '\n'; nicMMIOOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, nicMMIOAnnotations, error)))
+          return fail("NIC decoded MMIO annotations: " + error);
+        llvm::outs() << "Mapped CIRCT NIC five configuration registers and sampled done MMIO in " << nicMMIOPath << '\n';
+        return fail("NIC Nasti control binding and platform integration are not implemented");
       }
       if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
         return fail("CPU stream MCRFile transactions: " + error);

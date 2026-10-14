@@ -150,6 +150,7 @@ add_executable(goldengate-circt
   lib/Transforms/NICTokenQueues.cpp
   lib/Transforms/NICPacketAdapters.cpp
   lib/Transforms/NICCPUStreamQueues.cpp
+  lib/Transforms/NICMMIOBank.cpp
   lib/Transforms/TSIMMIOBank.cpp
   lib/Transforms/ControlReadArbiter.cpp
   lib/Transforms/ControlWriteArbiter.cpp
@@ -2064,6 +2065,18 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-cpu-stream-catalog-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-cpu-stream-catalog COMMAND goldengate-cpu-stream-catalog-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-mmio-test
+    test/Transforms/NICMMIOBankTest.cpp lib/Transforms/NICMMIOBank.cpp)
+  target_compile_features(goldengate-nic-mmio-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-mmio-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-mmio-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-mmio-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-mmio COMMAND goldengate-nic-mmio-test)
 endif()
 
 if(BUILD_TESTING)
