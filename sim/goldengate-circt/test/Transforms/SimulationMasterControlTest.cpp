@@ -244,8 +244,41 @@ void test(MLIRContext &ctx, const BindingSpec &spec, unsigned count = 11,
     <<(rejections ? ", 37 atomic rejections" : "")<<" passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  // Replay the actual attached bank and clone the generated bank/transport
+  // operations for differential testing, without rebuilding their logic.
+  if (argc == 5) {
+    try {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production input invalid");
+      auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+      auto write = [&](const char *path) {
+        std::error_code ec; llvm::raw_fd_ostream out(path, ec);
+        require(!ec, "cannot write production boundary"); root->print(out); out << '\n';
+      };
+      require(succeeded(goldengate::mapSimulationMasterControl(c, 25, 12, error)), error);
+      require(succeeded(verify(*root)), "mapped production master invalid"); write(argv[2]);
+      require(succeeded(goldengate::bindSimulationMasterControl(c, error)), error);
+      require(succeeded(verify(*root)), "bound production master invalid"); write(argv[3]);
+      auto isolated = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr("GGSimulationMasterBank"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      for (auto name : {"GGSimulationMasterBank", "GGSimulationMasterMCRFile"}) {
+        auto helper = cast<FModuleOp>(b.insert(named(c, name)->clone())); helper.setPublic();
+      }
+      require(succeeded(verify(isolated)), "exported production helpers invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[4], ec);
+      require(!ec, "cannot export helpers"); isolated.print(out); out << '\n'; out.close(); isolated.erase();
+      llvm::outs() << "Production SimulationMaster transport/binding and cloned helpers verified\n";
+      return 0;
+    } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  }
+  if (argc != 1) {
+    llvm::errs() << "usage: goldengate-simulation-master-control-test [attached.mlir mapped.mlir bound.mlir helpers.mlir]\n";
+    return 1;
+  }
   const BindingSpec specs[]{
     {"GGSimulationMaster", "simulationMaster", "GGSimulationMasterWrapper",
      "SimulationMaster_0", "goldengate.simulationMasterSlave", 8, 3,
@@ -264,13 +297,15 @@ int main() {
     unsigned cases = 0;
     for (const auto &spec : specs) {
       test(ctx,spec); ++cases;
-      for (unsigned count : {1u,2u,3u,11u,13u,31u,63u})
+      for (unsigned count : {1u,2u,3u,11u,12u,13u,31u,63u})
         for (unsigned slot : std::set<unsigned>{0,count/2,count-1}) {
           auto shifted = spec; shifted.slave = slot;
           test(ctx,shifted,count,false); ++cases;
         }
     }
-    llvm::outs()<<cases<<" widget catalog bindings and 148 atomic rejections passed\n";
+    auto nic = specs[0]; nic.slave = 9;
+    test(ctx,nic,12); ++cases;
+    llvm::outs()<<cases<<" widget catalog bindings and 185 atomic rejections passed\n";
     return 0;
   }
   catch (const std::exception &e) { llvm::errs()<<e.what()<<'\n'; return 1; }

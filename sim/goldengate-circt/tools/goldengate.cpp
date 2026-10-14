@@ -3916,8 +3916,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, writeTrackerAnnotations, error)))
         return fail("control write tracker annotations: " + error);
       llvm::outs() << "Tracked CIRCT control AW transactions and accepted B responses in " << writeTrackerPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC remaining control widget responses and platform integration are not implemented");
       if (failed(goldengate::attachSimulationMasterBank(circuit, simulationMasterBank, error)))
         return fail("SimulationMaster bank: " + error);
       if (failed(mlir::verify(*module)))
@@ -3969,7 +3967,9 @@ int main(int argc, char **argv) {
       module->print(masterBoundOut); masterBoundOut << '\n'; masterBoundOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, masterBoundAnnotations, error)))
         return fail("SimulationMaster binding annotations: " + error);
-      llvm::outs() << "Bound CIRCT SimulationMaster requests and responses to control slave 8 in " << masterBoundPath << '\n';
+      llvm::outs() << "Bound CIRCT SimulationMaster requests and responses using the control decoder catalog in " << masterBoundPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC TSI, BlockDev and FASED control responses and platform integration are not implemented");
       if (failed(goldengate::addTSITokenEngine(circuit, error)))
         return fail("TSI token mapping: " + error);
       if (failed(mlir::verify(*module))) return fail("TSI token mapping produced invalid FIRRTL IR");

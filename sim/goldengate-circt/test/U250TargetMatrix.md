@@ -1841,3 +1841,92 @@ SimulationMaster MMIO bank at NIC slave 9, then compare its register
 allocation, transport and response bindings with the archived SFC bank.
 TSI, BlockDev and FASED responses, host memory/stream lists, NIC runtime,
 wider/multiple TracerV profiles, FASED geometry and partition/QSFP remain gaps.
+
+
+## Iteration 188: NIC SimulationMaster attachment, transport and slot-9 binding
+
+The production compiler now lets NIC pass through `attachSimulationMasterBank`,
+`mapSimulationMasterControl` and `bindSimulationMasterControl`. These passes
+construct and connect CIRCT FIRRTL operations; the previous stop before bank
+attachment is removed. NIC stops after the verified bound-master boundary,
+with an explicit remaining TSI/BlockDev/FASED response and platform gap.
+The progress message uses the decoder catalog instead of claiming fixed
+slave 8: the twelve-region NIC catalog selects master slave 9.
+
+The exact reference is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+(SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`).
+`NICSimulationMasterCompare.py` compares the actual production attachment,
+transport and bound FIRRTL/annotation boundaries. It matches addresses
+576/580/584, all twenty surviving SFC control pins, thirty-two native scalar
+bindings and aggregate AR dispatch, host clock/reset, unchanged prior module
+bodies, and recursive transfer of all 1,792 annotations. It separately
+replays the production mapping/binding passes and checks identical modules.
+Its C++ exporter clones the actual bank and transport operations, then
+`firtool` lowers those helpers for an isolated Verilator differential test.
+The reference retains the archived `SimulationMaster` and `MCRFile` bodies.
+
+The behavioral comparison passes 101,967 cycles, including 3,717 writes,
+25,165 reads, 3,030 B stalls, 24,818 R stalls, 48 unused-index writes,
+1,021 resets with pending traffic and 215 zero-strobe writes. Directed
+traffic covers all four decoded indices, three AW/W arrival orders and all
+sixteen strobe values, plus initialization delay and stalled reads. A further
+100,000 randomized cycles cover response backpressure, IDs, address aliases,
+register writes and reset. Five full native response constants match the
+SFC-optimized interface. This proves this local bank/transport boundary,
+not complete NIC simulation or platform/driver equivalence.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration188-u250-target-matrix/
+```
+
+`nic-simulation-master-production/comparison.json` records exact hashes and
+results. Run `test/Transforms/NICSimulationMasterCompare.py` in the sourced
+FireSim environment with `--tracker`, `--attached`, `--control` and `--bound`
+pointing to the four corresponding production boundaries, `--golden` to the
+NIC SV above, `--export-tool` to `goldengate-simulation-master-control-test`,
+and a fresh `--output-dir`. The bound candidate SHA256 is
+`9d931f34908ab2f24029b4d8f0a73ac91b1406bda309b0367dc77c0e292cddd2`.
+
+Focused CTest `goldengate-simulation-master-control` passes 89 catalog
+bindings and 185 atomic rejections, including explicit twelve-region slave-9
+coverage and generic twelve-region coverage for all four supported widgets.
+`goldengate-simulation-master` passes its 4,162 delay/sample/reset/write
+cycles, allocation/split-equivalence checks and atomic rejections. Both
+CTest cases finish in 1.95 seconds; detail is retained in
+`simulation-master-ctest-detail.log`. Python syntax and scoped diff checks
+also pass.
+
+Eighteen earlier NIC FIRRTL/annotation artifacts match iteration 187 byte
+for byte, as do no-NIC RTL, both constant headers and both XDC files.
+`immutable-rocket-comparison.json` freshly matches the October 1 primary
+FIRRTL/annotation handoff hashes and immutable U250 synthesis XDC; its
+implementation XDC matches with the previously recorded hierarchy rename.
+No immutable fixture was edited and no manager verification was started.
+Pre-existing user changes remain outside this checkpoint.
+
+`immutable-simulation-master-comparison.json` also compares the NIC reference
+against the October 1 immutable U250 `design/FireSim-generated.sv`: both
+`SimulationMaster` and `MCRFile` have identical ports and complete bodies
+after comment removal. Thus the bank/transport reference remains the
+recorded immutable compiler oracle; NIC changes its catalog allocation.
+
+Fresh replay of all thirteen archived inputs and effective platform settings
+used compiler SHA256
+`dfb2915705825dedfac5ac9ec2a8dc53abf3d77c7fe538d0b10c00e163a39cb3`.
+`replay/matrix.json` reports one completed no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations; its nonzero
+exit explicitly retains these gaps. All seven reached BridgeIO/channel
+boundaries match SFC. Shuttle model-port annotations match; the other six
+retain their previously recorded native-SRAM differences.
+`matrix-regression-comparison.json` matches all thirteen input hashes,
+effective platforms, statuses and structured boundary results to iteration
+187. Only the NIC diagnostic advances past the SimulationMaster binding.
+
+The next smallest step is to carry NIC through the native TSI token/queue,
+MMIO and catalog-selected control stages at slave 3, comparing them against
+the same archived SFC target. BlockDev/FASED responses, host memory/stream
+lists, NIC runtime, wider/multiple TracerV profiles, FASED geometry and
+partition/QSFP support remain incomplete.
