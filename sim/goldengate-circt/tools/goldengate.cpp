@@ -3826,10 +3826,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlDispatchAnnotations, error)))
         return fail("control dispatch annotations: " + error);
       llvm::outs() << "Dispatched CIRCT control AW/W requests and connected the error endpoint in " << controlDispatchPath << '\n';
-      // NIC request routes now reach all twelve allocated slaves. Binding
-      // their typed MCR banks and integrating responses/platform remains work.
-      if (!cpuSinks.empty())
-        return fail("NIC control widget binding, responses and platform integration are not implemented");
       if (failed(goldengate::bindRocketControlWidgetWrites(circuit, error)))
         return fail("control widget writes: " + error);
       if (failed(mlir::verify(*module)))
@@ -3845,6 +3841,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, widgetWritesAnnotations, error)))
         return fail("control widget write annotations: " + error);
       llvm::outs() << "Bound CIRCT control AW/W requests to Rocket and instantiated Print widgets in " << widgetWritesPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC control read dispatch, responses and platform integration are not implemented");
       if (failed(goldengate::addControlReadDispatch(circuit, error)))
         return fail("control read dispatch: " + error);
       if (failed(mlir::verify(*module)))

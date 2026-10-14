@@ -3,6 +3,7 @@
 // Connect requests and readiness through FIRRTL operations; preserve the
 // independent AW/W routes and the MCRFile's independent request capture.
 #include "goldengate/ControlWidgetWrites.h"
+#include "goldengate/ControlAddressDecode.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 #include <map>
@@ -53,10 +54,16 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
   if (!top || !regions) return reject("Rocket request binding requires an active top and allocation");
   std::set<std::string> allocatedPrints;
+  bool allocatedNIC = false;
   for (auto attr : regions) {
     auto row = dyn_cast<DictionaryAttr>(attr);
     auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
     if (!name) return reject("Rocket request allocation lacks a widget identity");
+    if (name.getValue().starts_with("SimpleNICBridgeModule_")) {
+      if (name.getValue() != "SimpleNICBridgeModule_0" || allocatedNIC)
+        return reject("Rocket request binding supports one normal-mode NIC bank");
+      allocatedNIC = true;
+    }
     if (name.getValue().starts_with("PrintBridgeModule_") &&
         !allocatedPrints.insert(name.getValue().str()).second)
       return reject("Rocket request allocation duplicates a Print bank");
@@ -125,6 +132,60 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
     }
   }
   if (!allocatedPrints.empty()) return reject("Rocket request allocation contains unbound Print banks");
+  if (allocatedNIC) {
+    ControlMMIOWidget registry;
+    const StringRef banks[]{"GGNICMMIOBank"};
+    if (failed(deriveControlMMIOWidget(circuit, "SimpleNICBridgeModule_0",
+            "GGNICMCRFile", banks, registry, error)))
+      return failure();
+    if (registry.registerCount != 6)
+      return reject("Rocket request binding requires the six-word normal-mode NIC bank");
+    auto find = [&](StringRef name) -> FModuleOp {
+      auto it = modules.find(name.str());
+      return it == modules.end() ? FModuleOp{} : it->second;
+    };
+    auto adapter = find("GGNICMCRFile"), owner = top;
+    if (!adapter || adapter.getNumPorts() != 4 || adapter.getPortName(2) != "nasti" ||
+        adapter.getPortDirection(2) != Direction::In)
+      return reject("Rocket NIC request binding requires the instantiated Nasti adapter");
+    // A matching bundle type alone could bind a detached port or another bank.
+    // Follow the production wrapper forwarding to the NIC adapter operand.
+    Value value;
+    for (unsigned p = 0; p < top.getNumPorts(); ++p)
+      if (top.getPortName(p) == "nicBridge_ctrl" &&
+          top.getPortDirection(p) == Direction::In &&
+          top.getPortType(p) == adapter.getPortType(2)) value = top.getArgument(p);
+    bool reachesAdapter = false;
+    std::set<std::pair<Operation *, unsigned>> visited;
+    for (unsigned depth = 0; value && depth < 4096; ++depth) {
+      auto argument = dyn_cast<BlockArgument>(value);
+      if (!argument || !visited.emplace(owner.getOperation(), argument.getArgNumber()).second) break;
+      Value dest; unsigned drivers = 0;
+      for (auto &op : *owner.getBodyBlock()) {
+        if (auto connect = dyn_cast<ConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+        if (auto connect = dyn_cast<StrictConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+      }
+      auto result = dyn_cast_or_null<OpResult>(dest);
+      auto instance = result ? dyn_cast<InstanceOp>(result.getOwner()) : InstanceOp{};
+      if (drivers != 1 || !instance) break;
+      auto child = find(instance.getModuleName());
+      if (!child || result.getResultNumber() >= child.getNumPorts() ||
+          child.getPortDirection(result.getResultNumber()) != Direction::In) break;
+      if (child == adapter) {
+        reachesAdapter = owner.getName() == "GGNICBridgeControlWrapper" &&
+                         instance.getName() == "crFile" && result.getResultNumber() == 2;
+        break;
+      }
+      owner = child; value = owner.getArgument(result.getResultNumber());
+    }
+    if (!reachesAdapter)
+      return reject("Rocket NIC request port does not reach its instantiated NIC bank");
+    widgets.push_back({"SimpleNICBridgeModule_0", "nicBridge_ctrl"});
+  } else if (modules.count("GGNICMCRFile")) {
+    return reject("Rocket request allocation omits the instantiated NIC bank");
+  }
   return bindControlWidgetWrites(circuit, widgets, error);
 }
 

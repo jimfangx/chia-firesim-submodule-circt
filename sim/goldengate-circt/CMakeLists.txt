@@ -1595,7 +1595,8 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-control-read-dispatch COMMAND goldengate-control-read-dispatch-test)
   add_executable(goldengate-control-widget-writes-test
     test/Transforms/ControlWidgetWritesTest.cpp
-    lib/Transforms/ControlWidgetWrites.cpp)
+    lib/Transforms/ControlWidgetWrites.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-control-widget-writes-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-control-widget-writes-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-control-widget-writes-test PRIVATE

@@ -50,37 +50,13 @@ def register_cone(golden):
     return ref.replace('crFile_io_', '').replace('hPort_hBits_', '').replace("{{31'd0}, _T}", "{{31'd0}, nic_done}")
 
 
-def main():
-    p=argparse.ArgumentParser(description=__doc__)
-    for n in ('candidate','control-candidate','golden','compose-tool','output-dir'):
-        p.add_argument('--'+n,type=Path,required=True)
-    a=p.parse_args(); out=a.output_dir.resolve();out.mkdir(parents=True,exist_ok=False)
-    def run(cmd,name):
-        with (out/(name+'.log')).open('w') as log:
-            subprocess.run(list(map(str,cmd)),stdout=log,stderr=subprocess.STDOUT,check=True)
-    run([a.compose_tool,a.candidate,out/'attached.mlir',out/'control.mlir'],'compose')
-    before=modules(a.candidate.read_text()); after=modules(a.control_candidate.read_text())
-    assert after==modules((out/'attached.mlir').read_text()),'composition differs from production compiler'
-    assert set(after)-set(before)=={'GGNICMCRFile','GGNICBridgeControlWrapper'}
-    for n,b in before.items(): assert after[n]==b,'prior module changed: '+n
-    top=after['GGNICBridgeControlWrapper']; prior=native_ports(before['GGNICMMIOWrapper'])
-    current=native_ports(top);assert current[:-1]==prior[:-1] and current[-1][:2]==('in','nicBridge_ctrl')
-    expected={('sim.'+n if d=='in' else 'top.'+n):('top.'+n if d=='in' else 'sim.'+n) for d,n,_ in prior[:-1]}
-    expected.update({'crFile.clock':'top.hostClock','crFile.reset':'top.hostReset',
-                     'crFile.nasti':'top.nicBridge_ctrl','crFile.mcr':'sim.nicBridge_mcr'})
-    assert wiring(top)==expected,'production Nasti/decoded routes differ'
-    def ann(path):return json.loads(path.with_name(path.stem+'-all.json').read_text())
-    assert ann(a.control_candidate)==transfer(ann(a.candidate)),'recursive archive transfer differs'
-    stand=modules((out/'control.mlir').read_text())
-    for n in ('GGNICMMIOBank','GGNICMCRFile'): assert stand[n]==after[n],'standalone helper differs'
-    run(['firtool',out/'control.mlir','--format=mlir','--disable-all-randomization','-o',out/'native.sv'],'firtool')
-    nh,_=module(clean((out/'native.sv').read_text()),'GGNICControlTest'); native=ports(nh)
-    def canon(n):
-        return {'hostClock':'clock','hostReset':'reset'}.get(n,n.removeprefix('nicBridge_ctrl_'))
+def compare_rtl(native_file, golden_file, out, run, top_name="GGNICControlTest", canonical=None):
+    nh,_=module(clean(native_file.read_text()),top_name); native=ports(nh)
+    canon = canonical or (lambda n: {'hostClock':'clock','hostReset':'reset'}.get(n,n.removeprefix('nicBridge_ctrl_')))
     pins={canon(n):s for n,s in native.items()}; assert len(pins)==len(native)
     inputs=[(n,w) for n,(d,w) in pins.items() if d=='input']
     outputs=[(n,w) for n,(d,w) in pins.items() if d=='output']
-    golden=a.golden.read_text();mh,mb=module(clean(golden),'MCRFile_4'); mp=ports(mh)
+    golden=golden_file.read_text();mh,mb=module(clean(golden),'MCRFile_4'); mp=ports(mh)
     # The SFC port list itself establishes optimization of unused Nasti fields.
     assert mp['io_nasti_aw_bits_addr']==['input',25] and mp['io_nasti_aw_bits_id']==['input',12]
     assert 'io_nasti_w_bits_strb' not in mp and 'io_nasti_r_bits_last' not in mp
@@ -101,7 +77,7 @@ def main():
     (out/'sfc-control.sv').write_text('\n'.join(ref)+'\n')
     test=['module check;']+[f'reg [{w-1}:0] {n}=0;' for n,w in inputs]
     test += [f'wire [{w-1}:0] {pre}_{n};' for pre in ('n','s') for n,w in outputs]
-    test+=['GGNICControlTest n('+','.join('.'+n+'('+('n_'+canon(n) if native[n][0]=='output' else canon(n))+')' for n in native)+');',
+    test+=[top_name+' n('+','.join('.'+n+'('+('n_'+canon(n) if native[n][0]=='output' else canon(n))+')' for n in native)+');',
            'SFCNICControl s('+','.join(f'.{n}({"s_"+n if d=="output" else n})' for n,(d,w) in pins.items())+');',
            'integer cycles=0,writes=0,reads=0,bStalls=0,rStalls=0,holes=0,resetPending=0,zeroStrobes=0;',
            'reg initialized=0;', 'task compare;begin']
@@ -141,8 +117,36 @@ def main():
            'if(writes<1000||reads<1000||bStalls<100||rStalls<100||holes!=96||resetPending<100||zeroStrobes<100)$fatal(1,"coverage");',
            '$display("PASS SFC NIC Nasti: cycles=%0d writes=%0d reads=%0d bStalls=%0d rStalls=%0d holes=%0d resetPending=%0d zeroStrobes=%0d orders=3 strobes=16 indices=8 random=100000",cycles,writes,reads,bStalls,rStalls,holes,resetPending,zeroStrobes);$finish;end endmodule']
     (out/'check.sv').write_text('\n'.join(test)+'\n')
-    run(['verilator','--binary','--timing','--assert','-Wno-fatal','--top-module','check','--Mdir',out/'obj','-o','check',out/'check.sv',out/'native.sv',out/'sfc-mcr.sv',out/'sfc-registers.sv',out/'sfc-control.sv'],'verilator')
+    run(['verilator','--binary','--timing','--assert','-Wno-fatal','--top-module','check','--Mdir',out/'obj','-o','check',out/'check.sv',native_file,out/'sfc-mcr.sv',out/'sfc-registers.sv',out/'sfc-control.sv'],'verilator')
     run([out/'obj/check'],'simulation')
+    return constants, (out/'simulation.log').read_text()
+
+
+def main():
+    p=argparse.ArgumentParser(description=__doc__)
+    for n in ('candidate','control-candidate','golden','compose-tool','output-dir'):
+        p.add_argument('--'+n,type=Path,required=True)
+    a=p.parse_args(); out=a.output_dir.resolve();out.mkdir(parents=True,exist_ok=False)
+    def run(cmd,name):
+        with (out/(name+'.log')).open('w') as log:
+            subprocess.run(list(map(str,cmd)),stdout=log,stderr=subprocess.STDOUT,check=True)
+    run([a.compose_tool,a.candidate,out/'attached.mlir',out/'control.mlir'],'compose')
+    before=modules(a.candidate.read_text()); after=modules(a.control_candidate.read_text())
+    assert after==modules((out/'attached.mlir').read_text()),'composition differs from production compiler'
+    assert set(after)-set(before)=={'GGNICMCRFile','GGNICBridgeControlWrapper'}
+    for n,b in before.items(): assert after[n]==b,'prior module changed: '+n
+    top=after['GGNICBridgeControlWrapper']; prior=native_ports(before['GGNICMMIOWrapper'])
+    current=native_ports(top);assert current[:-1]==prior[:-1] and current[-1][:2]==('in','nicBridge_ctrl')
+    expected={('sim.'+n if d=='in' else 'top.'+n):('top.'+n if d=='in' else 'sim.'+n) for d,n,_ in prior[:-1]}
+    expected.update({'crFile.clock':'top.hostClock','crFile.reset':'top.hostReset',
+                     'crFile.nasti':'top.nicBridge_ctrl','crFile.mcr':'sim.nicBridge_mcr'})
+    assert wiring(top)==expected,'production Nasti/decoded routes differ'
+    def ann(path):return json.loads(path.with_name(path.stem+'-all.json').read_text())
+    assert ann(a.control_candidate)==transfer(ann(a.candidate)),'recursive archive transfer differs'
+    stand=modules((out/'control.mlir').read_text())
+    for n in ('GGNICMMIOBank','GGNICMCRFile'): assert stand[n]==after[n],'standalone helper differs'
+    run(['firtool',out/'control.mlir','--format=mlir','--disable-all-randomization','-o',out/'native.sv'],'firtool')
+    constants, simulation = compare_rtl(out/'native.sv', a.golden, out, run)
     def artifact(path):return dict(path=str(path.resolve()),sha256=hashlib.sha256(path.read_bytes()).hexdigest())
     report=dict(golden=artifact(a.golden),candidate=artifact(a.control_candidate),result='matched',
                 unchanged_prior_modules=len(before),production_ports=len(current),annotation_records=len(ann(a.control_candidate)),

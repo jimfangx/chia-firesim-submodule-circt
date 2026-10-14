@@ -19,8 +19,9 @@ mlir::LogicalResult bindControlWidgetWrites(circt::firrtl::CircuitOp circuit,
                                            std::string &error);
 // Rocket request binding adds every instantiated Print bank to the seven
 // early MCR slaves. Require a complete constructor-ordered host registry and
-// decoded Print allocation; leave late-bound Master/FASED/TSI/BlockDev lanes
-// exposed. All identity/type validation precedes mutation.
+// decoded Print allocation. Bind an allocated normal-mode NIC to its actual
+// six-word adapter through the active wrapper hierarchy; leave late-bound
+// Master/FASED/TSI/BlockDev lanes exposed. Identity/type validation precedes mutation.
 mlir::LogicalResult bindRocketControlWidgetWrites(circt::firrtl::CircuitOp circuit,
                                                  std::string &error);
 }

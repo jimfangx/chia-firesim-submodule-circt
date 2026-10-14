@@ -4,6 +4,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <algorithm>
@@ -28,6 +29,7 @@ std::vector<std::string> allocation(unsigned layout) {
     "ResetPulseBridgeModule_0","CPUManagedStreamEngine_0"};
   if(layout==1)names.insert(names.begin()+5,{"PrintBridgeModule_0","PrintBridgeModule_1"});
   if(layout==2)std::reverse(names.begin(),names.end());
+  if(layout==3)names.insert(names.begin()+7,"SimpleNICBridgeModule_0");
   return names;
 }
 unsigned allocatedSlave(unsigned baseline,unsigned layout) {
@@ -44,6 +46,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned layout=0)
     text+=", "+std::string(bad==1&&slave==7?"out":"in")+" %"+port+": "+control;
   }
   if(layout==1)for(auto port:{"print0_ctrl","print1_ctrl"})text+=", in %"+std::string(port)+": "+control;
+  if(layout==3)text+=", in %nicBridge_ctrl: "+control;
   auto names=allocation(layout);
   for(unsigned slave=0;slave<names.size();++slave) {
     const std::pair<const char*,unsigned> fields[]{{"aw_ready",1},{"w_ready",1},{"aw_valid",1},{"aw_bits_addr",25},{"aw_bits_len",8},{"aw_bits_id",12},{"w_valid",1},{"w_bits_data",32},{"w_bits_last",1}};
@@ -94,6 +97,182 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned layout=0)
   }
   if(bad==11)c.setNameAttr(b.getStringAttr("WrongTop"));
   return root;
+}
+OwningOpRef<ModuleOp> nicFixture(MLIRContext &ctx) {
+  auto root=fixture(ctx,0,3);auto c=*root->getOps<CircuitOp>().begin();
+  auto top=*c.getOps<FModuleOp>().begin();OpBuilder b(&ctx);auto loc=c.getLoc();
+  unsigned port=0;while(top.getPortName(port)!="nicBridge_ctrl")++port;
+  auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};
+  auto token=BundleType::get(&ctx,{{b.getStringAttr("ready"),true,uint(1)},
+    {b.getStringAttr("valid"),false,uint(1)},{b.getStringAttr("bits"),false,uint(32)}});
+  auto lanes=FVectorType::get(token,6);
+  auto mcr=BundleType::get(&ctx,{{b.getStringAttr("read"),false,lanes},
+    {b.getStringAttr("write"),true,lanes},{b.getStringAttr("wstrb"),true,uint(4)}});
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  SmallVector<PortInfo> adapterPorts{{b.getStringAttr("clock"),ClockType::get(&ctx),Direction::In},
+    {b.getStringAttr("reset"),uint(1),Direction::In},
+    {b.getStringAttr("nasti"),top.getPortType(port),Direction::In},
+    {b.getStringAttr("mcr"),mcr,Direction::In}};
+  auto adapter=b.create<FModuleOp>(loc,b.getStringAttr("GGNICMCRFile"),top.getConventionAttr(),adapterPorts);
+  auto bank=b.create<FModuleOp>(loc,b.getStringAttr("GGNICMMIOBank"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+  SmallVector<Attribute> rows;
+  for(unsigned i=0;i<6;++i)rows.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("name",b.getStringAttr("register"+std::to_string(i))),
+    b.getNamedAttr("offset",b.getI32IntegerAttr(i*4)),
+    b.getNamedAttr("readable",b.getBoolAttr(i==5)),
+    b.getNamedAttr("writeable",b.getBoolAttr(true))}));
+  bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+  SmallVector<PortInfo> wrapperPorts{{b.getStringAttr("nicBridge_ctrl"),top.getPortType(port),Direction::In}};
+  auto wrapper=b.create<FModuleOp>(loc,b.getStringAttr("GGNICBridgeControlWrapper"),top.getConventionAttr(),wrapperPorts);
+  b.setInsertionPointToStart(wrapper.getBodyBlock());
+  auto cr=b.create<InstanceOp>(loc,adapter,"crFile");
+  b.create<ConnectOp>(loc,cr.getResult(2),wrapper.getArgument(0));
+  b.setInsertionPointToStart(top.getBodyBlock());
+  auto sim=b.create<InstanceOp>(loc,wrapper,"sim");
+  b.create<ConnectOp>(loc,sim.getResult(0),top.getArgument(port));
+  return root;
+}
+void nicTest(MLIRContext &ctx) {
+  for(unsigned bad=0;bad<=10;++bad) {
+    auto root=nicFixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
+    FModuleOp top,decoder,adapter,wrapper,bank;
+    for(auto m:c.getOps<FModuleOp>()) {
+      if(m.getName()==oldTop)top=m;
+      if(m.getName()=="GGControlAddressDecode")decoder=m;
+      if(m.getName()=="GGNICMCRFile")adapter=m;
+      if(m.getName()=="GGNICBridgeControlWrapper")wrapper=m;
+      if(m.getName()=="GGNICMMIOBank")bank=m;
+    }
+    OpBuilder b(&ctx);
+    if(bad==1)(*top.getOps<ConnectOp>().begin()).erase();
+    if(bad==2)(*wrapper.getOps<ConnectOp>().begin()).erase();
+    if(bad==3)(*wrapper.getOps<InstanceOp>().begin()).setName("otherBank");
+    if(bad==4) {
+      auto connect=*top.getOps<ConnectOp>().begin();b.setInsertionPointAfter(connect);
+      b.create<ConnectOp>(connect.getLoc(),connect.getDest(),connect.getSrc());
+    }
+    if(bad==5)bank->removeAttr("goldengate.mmioRegisters");
+    if(bad==6) {
+      SmallVector<Attribute> rows(bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters").begin(),bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters").end());
+      rows.pop_back();bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+    }
+    if(bad==7) {SmallVector<bool> ds(adapter.getPortDirections().begin(),adapter.getPortDirections().end());ds[2]=true;adapter.setPortDirections(ds);}
+    if(bad==8) {SmallVector<bool> ds(adapter.getPortDirections().begin(),adapter.getPortDirections().end());ds[3]=true;adapter.setPortDirections(ds);}
+    if(bad==9||bad==10) {
+      SmallVector<Attribute> rows(decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions").begin(),decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions").end());
+      NamedAttrList row(cast<DictionaryAttr>(rows[7]));row.set("name",b.getStringAttr(bad==9?"SimpleNICBridgeModule_1":"otherWidget"));rows[7]=row.getDictionary(&ctx);
+      decoder->setAttr("goldengate.controlRegions",b.getArrayAttr(rows));
+    }
+    auto before=dump(*root);std::string error;
+    auto result=goldengate::bindRocketControlWidgetWrites(c,error);
+    if(bad) {
+      require(failed(result)&&!error.empty()&&dump(*root)==before,"NIC identity rejection mutated or accepted IR");
+      continue;
+    }
+    require(succeeded(result),error);require(succeeded(verify(*root)),"NIC write binding IR invalid");
+    for(auto m:c.getOps<FModuleOp>())if(m.getName()==newTop) {
+      auto rows=m->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
+      require(rows.size()==8,"NIC write bank not included");
+      auto nic=cast<DictionaryAttr>(rows[7]);
+      require(nic.getAs<StringAttr>("name").getValue()=="SimpleNICBridgeModule_0"&&
+        nic.getAs<StringAttr>("port").getValue()=="nicBridge_ctrl"&&
+        nic.getAs<IntegerAttr>("slave").getInt()==7,"NIC allocated slave differs");
+      unsigned connections=std::distance(m.getOps<StrictConnectOp>().begin(),m.getOps<StrictConnectOp>().end());
+      require(connections==160,"eight banks require 160 scalar request/ready bindings");
+      for(auto p:m.getPorts())if(p.name=="nicBridge_ctrl")
+        require(cast<BundleType>(p.type).getNumElements()==3,"NIC AW/W remains external");
+    }
+  }
+}
+// Isolate the production NIC binding operations, adapter and registers. The
+// accepted dispatch signals are test inputs; no request/ready expression is
+// reconstructed. AR/B/R remain the same explicit external boundary as in IR.
+void exportNICBinding(CircuitOp production, StringRef path) {
+  FModuleOp bound,inner,bank,adapter;
+  for(auto m:production.getOps<FModuleOp>()) {
+    if(m.getName()==newTop)bound=m;
+    if(m.getName()==oldTop)inner=m;
+    if(m.getName()=="GGNICMMIOBank")bank=m;
+    if(m.getName()=="GGNICMCRFile")adapter=m;
+  }
+  require(bound&&inner&&bank&&adapter,"missing production NIC binding modules");
+  require(bank.getNumPorts()==11&&adapter.getNumPorts()==4,"NIC bank shape changed");
+  auto rows=bound->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
+  unsigned slave=63;
+  for(auto attr:rows) {
+    auto row=cast<DictionaryAttr>(attr);
+    if(row.getAs<StringAttr>("name").getValue()=="SimpleNICBridgeModule_0")
+      slave=row.getAs<IntegerAttr>("slave").getInt();
+  }
+  require(slave<63,"NIC binding identity missing");
+  std::string prefix="ctrl_write_dispatch_slave_"+std::to_string(slave)+"_";
+  OpBuilder b(production.getContext());auto loc=production.getLoc();
+  auto root=ModuleOp::create(loc);b.setInsertionPointToEnd(root.getBody());
+  auto c=b.create<CircuitOp>(loc,b.getStringAttr("GGNICControlWriteBindingTest"));
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  auto nativeBank=cast<FModuleOp>(b.insert(bank->clone()));
+  auto nativeAdapter=cast<FModuleOp>(b.insert(adapter->clone()));
+  auto ports=bank.getPorts();ports.pop_back();
+  ports[0].name=b.getStringAttr("hostClock");ports[1].name=b.getStringAttr("hostReset");
+  std::map<unsigned,unsigned> copied;
+  for(unsigned p=0;p<bound.getNumPorts();++p) {
+    auto name=bound.getPortName(p);
+    bool metadata=name.starts_with("ctrl_write_dispatch_master_")&&
+      name!="ctrl_write_dispatch_master_aw_bits_len"&&
+      name!="ctrl_write_dispatch_master_aw_bits_id"&&
+      name!="ctrl_write_dispatch_master_w_bits_data";
+    if(name=="nicBridge_ctrl"||metadata) {
+      copied[p]=ports.size();ports.push_back(bound.getPorts()[p]);
+    }
+  }
+  std::map<unsigned,unsigned> dispatch;
+  for(unsigned p=0;p<inner.getNumPorts();++p)if(inner.getPortName(p).starts_with(prefix)) {
+    auto pin=inner.getPorts()[p];pin.direction=pin.direction==Direction::In?Direction::Out:Direction::In;
+    dispatch[p]=ports.size();ports.push_back(pin);
+  }
+  require(copied.size()==12&&dispatch.size()==9,"NIC slice lost shared metadata or dispatch fields");
+  auto top=b.create<FModuleOp>(loc,b.getStringAttr("GGNICControlWriteBindingTest"),bank.getConventionAttr(),ports);
+  b.setInsertionPointToStart(top.getBodyBlock());
+  auto regs=b.create<InstanceOp>(loc,nativeBank,"nicRegisters");
+  auto cr=b.create<InstanceOp>(loc,nativeAdapter,"crFile");
+  for(unsigned p=0;p<10;++p) {
+    bool input=ports[p].direction==Direction::In;
+    b.create<StrictConnectOp>(loc,input?regs.getResult(p):top.getArgument(p),input?top.getArgument(p):regs.getResult(p));
+  }
+  b.create<StrictConnectOp>(loc,cr.getResult(0),top.getArgument(0));
+  b.create<StrictConnectOp>(loc,cr.getResult(1),top.getArgument(1));
+  b.create<ConnectOp>(loc,cr.getResult(3),regs.getResult(10));
+  InstanceOp sim;for(auto i:bound.getOps<InstanceOp>())if(i.getName()=="sim")sim=i;
+  require(bool(sim),"production binding instance missing");
+  IRMapping mapping;
+  for(auto [p,index]:copied)mapping.map(bound.getArgument(p),top.getArgument(index));
+  for(auto [p,index]:dispatch)mapping.map(sim.getResult(p),top.getArgument(index));
+  for(unsigned p=0;p<inner.getNumPorts();++p)if(inner.getPortName(p)=="nicBridge_ctrl")mapping.map(sim.getResult(p),cr.getResult(2));
+  std::function<Value(Value)> copy=[&](Value v)->Value {
+    if(auto mapped=mapping.lookupOrNull(v))return mapped;
+    auto op=v.getDefiningOp<SubfieldOp>();require(bool(op),"NIC binding slice has an unexpected dependency");
+    copy(op.getInput());b.clone(*op.getOperation(),mapping);return mapping.lookup(v);
+  };
+  std::function<bool(Value)> selected=[&](Value v)->bool {
+    if(auto op=v.getDefiningOp<SubfieldOp>())return selected(op.getInput());
+    if(auto result=dyn_cast<OpResult>(v))return result.getOwner()==sim.getOperation()&&
+      (sim.getPortNameStr(result.getResultNumber())=="nicBridge_ctrl"||
+       sim.getPortNameStr(result.getResultNumber()).starts_with(prefix));
+    return false;
+  };
+  unsigned scalar=0,aggregate=0;
+  for(auto &op:*bound.getBodyBlock()) {
+    Value dest,src;
+    if(auto x=dyn_cast<ConnectOp>(op)){dest=x.getDest();src=x.getSrc();}
+    if(auto x=dyn_cast<StrictConnectOp>(op)){dest=x.getDest();src=x.getSrc();}
+    if(!dest||(!selected(dest)&&!selected(src)))continue;
+    copy(dest);copy(src);b.clone(op,mapping);
+    scalar+=isa<StrictConnectOp>(op);aggregate+=isa<ConnectOp>(op);
+  }
+  require(scalar==20&&aggregate==3,"NIC binding slice is incomplete");
+  require(succeeded(verify(root)),"isolated production NIC binding invalid");
+  std::error_code ec;llvm::raw_fd_ostream out(path,ec);require(!ec,"cannot export binding");root.print(out);out<<'\n';
+  root.erase();
 }
 void test(MLIRContext &ctx,unsigned layout) {
   auto root=fixture(ctx,0,layout);auto c=*root->getOps<CircuitOp>().begin();std::string error;
@@ -226,9 +405,21 @@ void explicitCatalogRejections(MLIRContext &ctx) {
   }
 }
 }
-int main() {
+int main(int argc,char **argv) {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try{for(unsigned layout=0;layout<3;++layout)test(ctx,layout); explicitCatalogRejections(ctx);
-    llvm::outs()<<"Widget writes: 420 exact scalar bindings across baseline, two added Print banks, and reversed allocations; partial targets and 30 atomic rejections passed\n";
+  try{
+    if(argc==3||argc==4) {
+      auto root=parseSourceFile<ModuleOp>(argv[1],&ctx);require(bool(root),"production parse failed");
+      require(succeeded(verify(*root)),"production input invalid");
+      auto c=*root->getOps<CircuitOp>().begin();std::string error;
+      auto result=goldengate::bindRocketControlWidgetWrites(c,error);require(succeeded(result),error);
+      require(succeeded(verify(*root)),"production write binding invalid");
+      std::error_code ec;llvm::raw_fd_ostream out(argv[2],ec);require(!ec,"cannot write production binding");
+      root->print(out);out<<'\n';
+      if(argc==4)exportNICBinding(c,argv[3]);
+      llvm::outs()<<"Production NIC write binding verified\n";return 0;
+    }
+    for(unsigned layout=0;layout<3;++layout)test(ctx,layout); explicitCatalogRejections(ctx);nicTest(ctx);
+    llvm::outs()<<"Widget writes: 420 exact scalar bindings plus 160 NIC bindings; partial targets and 40 atomic rejections passed\n";
     return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}
 }

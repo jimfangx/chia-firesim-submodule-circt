@@ -1274,3 +1274,102 @@ inputs, effective platforms, statuses and all structured boundary results
 against iteration 180. NIC advances to write dispatch; the other failure
 reasons remain unchanged. Its fresh decoder MLIR and annotations are also
 byte-identical to iteration 180's SFC-compared decoder boundary.
+
+## Iteration 182: bind NIC write dispatch to the instantiated MCR bank
+
+The production `bindRocketControlWidgetWrites` pass now includes the allocated
+six-word normal-mode NIC bank. It validates the typed MCR registry and follows
+the active wrapper's whole-bundle forwarding to the actual `crFile` instance
+of `GGNICMCRFile` before changing IR. Detached ports, aliases, duplicate
+forwarding, incorrect adapter directions, missing registries and inconsistent
+NIC allocation identities reject atomically. Both Nasti and MCR adapter ports
+are inputs in the production CIRCT contract.
+
+The pass uses the decoder's allocation rather than assuming baseline slave
+indices: NIC is slave 7, Clock is 8, the three-word CPU stream count bank is
+10, and Reset is 11. Eight banks now receive scalar AW/W requests and return
+readiness internally. Their remaining AR/B/R bundles retain their directions;
+eleven shared AW/W metadata inputs retain the original transaction fields.
+NIC compilation emits `post-fame-control-widget-writes.mlir` and complete
+annotations, then explicitly rejects missing NIC read dispatch, responses and
+platform integration. This is still a failed target compile.
+
+Compared this exact SFC golden artifact:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+SHA256: `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICControlWidgetWritesCompare.py` matches 64 original `FPGATop` AW/W allocation
+connections for all eight bound banks. It checks the exact 330 production
+connections, 154 copied ports, preservation of 113 prior module bodies, and
+recursive transfer of all 1,792 annotation records. The standalone exporter
+clones the actual production NIC bank, adapter, twenty scalar binding
+operations and three remaining bundle connections. Its 36 connections match
+the corresponding production slice; no request expression is rebuilt.
+
+Isolated Verilator execution compares that slice with unchanged SFC
+`MCRFile_4` RTL and the original six-register NIC cone. It passed 103,828
+cycles, including 3,922 accepted AWs, 25,308 reads, 3,716 B backpressure cycles,
+24,709 R backpressure cycles, 96 unmapped-register reads, 1,094 reset cycles
+with pending requests and 229 zero-strobe writes. All three AW/W arrival
+orders, sixteen strobes, eight register indices and 100,000 deterministic
+random cycles were exercised. NIC done and dispatch/read/response interfaces
+are explicit test boundaries; global trackers and platform behavior are not
+covered. The existing direct NIC control comparison also passed the same
+103,828-cycle reference after extracting its RTL comparison into a shared
+function.
+
+Focused CTests passed the existing three binding layouts (420 exact scalar
+connections), the new twelve-region NIC layout (160 scalar connections),
+partial annotation targets and forty atomic rejection cases, plus the NIC
+control test. Initial adapter-direction and exporter metadata-selection
+failures were fixed from production MLIR evidence. Their diagnostic logs are
+retained; the corrected fresh matrix and comparison below use stable binaries.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration182-u250-target-matrix/
+```
+
+`nic-control-widget-writes-production/comparison.json` records the fresh
+candidate/golden hashes and structured/behavioral results. Run the comparison
+after sourcing the FireSim environment, with `--dispatch` and `--candidate`
+pointing to the production NIC dispatch and widget-write MLIR boundaries,
+`--golden` to the archived NIC SV, `--export-tool` to
+`goldengate-control-widget-writes-test`, and a fresh `--output-dir`.
+
+`no-nic-rtl-collateral-comparison.json` freshly matches all five no-NIC RTL,
+constant-header and XDC artifacts byte-for-byte against iteration 181.
+`immutable-rocket-comparison.json` freshly matches the October 1 immutable
+primary FIRRTL/annotations and U250 XDC, with the documented implementation
+hierarchy rename. No immutable fixture was edited.
+
+The next smallest step is to exercise the existing native AR dispatch with
+this eight-bank/twelve-region catalog and compare its accepted read requests
+against the SFC router, retaining NIC's six words and CPU's three count words.
+Response trackers/arbitration, remaining widget bindings, host memory/driver
+stream lists, NIC runtime, other target lowering profiles and partitioned
+QSFP remain gaps. Pre-existing user ClockBridgeControl/UART registry edits
+are excluded from this checkpoint. No FireSim manager verification step was
+started in this turn.
+
+Fresh standalone replay of all thirteen archived handoffs and effective
+platform configurations used compiler SHA256
+`de786fdf748242b5dd81774cd0c87fb5d530e376573e4c0ed1990c028f58b5b1`.
+`replay-final/matrix.json` records one complete no-NIC compile, six later
+lowering failures and six unsupported partition/QSFP configurations; its
+nonzero exit is intentional. All seven reached BridgeIO/channel boundaries
+match SFC. Shuttle model-port annotations match; the other six retain exactly
+the prior native-SRAM annotation differences.
+`matrix-regression-comparison.json` checks unchanged inputs, effective
+platforms, statuses and structured boundary results against iteration 181.
+The six NIC decoder, queued write-route and write-dispatch MLIR/annotation
+artifacts are byte-identical to those already compared with SFC in iterations
+180/181. Only NIC's later unsupported-feature reason advances. The first
+replay overlapped the adapter-direction correction and failed its compiler
+snapshot guard; it is retained as diagnostics, not validation evidence.
+Its large derived artifacts were compressed with verified uncompressed
+SHA256s to preserve disk space. Use `replay-final` for the next comparison.
