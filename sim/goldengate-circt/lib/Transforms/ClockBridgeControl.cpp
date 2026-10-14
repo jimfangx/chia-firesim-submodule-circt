@@ -9,6 +9,7 @@
 // and metadata are deliberately ignored as in the executable Scala oracle.
 // Output: local Nasti slave; global widget allocation/crossbar remain pending.
 #include "goldengate/ClockBridgeControl.h"
+#include "goldengate/NICMMIOBank.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "llvm/ADT/StringSet.h"
@@ -284,6 +285,29 @@ LogicalResult mapBridgeControl(CircuitOp circuit, unsigned addressBits,
 }
 
 } // namespace
+
+// Requires: active, uninstantiated GGNICMMIOWrapper with the normal-mode
+// NIC registry and matching decoded bank. Annotations consumed/produced: none;
+// copied port targets transfer recursively, internal identities are preserved.
+// Mutates: adds an MCRFile and wrapper, replaces the public decoded bank with
+// Nasti. Analyses: registry/bank geometry; hierarchy analyses must be rebuilt.
+// Output: verified local slave semantics; global allocation remains separate.
+LogicalResult goldengate::mapNICBridgeControl(CircuitOp circuit,
+    unsigned addressBits, unsigned idBits, std::string &error) {
+  ControlMMIOWidget registry;
+  const llvm::StringRef modules[]{"GGNICMMIOBank"};
+  if (failed(deriveControlMMIOWidget(circuit, "SimpleNICBridgeModule_0",
+          modules[0], modules, registry, error, Direction::Out)))
+    return failure();
+  if (registry.registerCount > std::numeric_limits<unsigned>::max()) {
+    error = "NIC register count exceeds the supported MCR lane count";
+    return failure();
+  }
+  return mapBridgeControl(circuit, addressBits, idBits,
+      static_cast<unsigned>(registry.registerCount),
+      "GGNICMMIOWrapper", "GGNICBridgeControlWrapper",
+      "GGNICMCRFile", "nicBridge_mcr", "nicBridge_ctrl", error);
+}
 
 LogicalResult goldengate::mapClockBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {

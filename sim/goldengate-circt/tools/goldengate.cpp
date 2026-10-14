@@ -3359,7 +3359,21 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitAllAnnotations(circuit, nicMMIOAnnotations, error)))
           return fail("NIC decoded MMIO annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC five configuration registers and sampled done MMIO in " << nicMMIOPath << '\n';
-        return fail("NIC Nasti control binding and platform integration are not implemented");
+        if (failed(goldengate::mapNICBridgeControl(circuit, 25, 12, error)))
+          return fail("NIC MCRFile transactions: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("NIC MCRFile produced invalid FIRRTL IR");
+        llvm::SmallString<256> nicControlPath(outputDir), nicControlAnnotations(outputDir);
+        llvm::sys::path::append(nicControlPath, "post-fame-nic-control.mlir");
+        llvm::sys::path::append(nicControlAnnotations, "post-fame-nic-control-all.json");
+        std::error_code nicControlError;
+        llvm::raw_fd_ostream nicControlOut(nicControlPath, nicControlError);
+        if (nicControlError) return fail("cannot write NIC control transport: " + nicControlError.message());
+        module->print(nicControlOut); nicControlOut << '\n'; nicControlOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, nicControlAnnotations, error)))
+          return fail("NIC control transport annotations: " + error);
+        llvm::outs() << "Mapped CIRCT NIC Nasti control transactions in " << nicControlPath << '\n';
+        return fail("NIC global control allocation and platform integration are not implemented");
       }
       if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
         return fail("CPU stream MCRFile transactions: " + error);

@@ -838,3 +838,84 @@ differences. The failures remain: quad-core multiple TracerV constructors;
 BOOM and Shuttle TracerV payload profiles; Gemmini and Saturn Rocket FASED
 maxFlight profiles; NIC Nasti/platform integration; and all six partitioned
 QSFP profiles. Only the NIC failure advances to the new decoded-MMIO boundary.
+
+## Iteration 177: native NIC Nasti control transport
+
+The actual NIC compiler path now binds its six-word decoded registry/bank to
+native FIRRTL `GGNICMCRFile` operations through the shared Lib.scala MCRFile
+implementation. The registry determines the word count and three-bit index.
+Independent AW/W capture, held B responses, single outstanding AR/R, captured
+IDs/data, host-reset transaction flags, single-beat assertions and SFC address
+aliasing now drive the previously attached NIC configuration bank. Byte strobes,
+W.last and unused Nasti metadata retain the SFC behavior. Local holes six and
+seven never commit a write; their reads follow SFC's default word-zero mux.
+
+`GGNICBridgeControlWrapper` replaces the public decoded bank with a Nasti slave,
+retains all other public ports and recursively transfers copied annotation
+identities. The compiler emits `post-fame-nic-control.mlir` and
+`post-fame-nic-control-all.json`, then explicitly rejects the next boundary:
+`NIC global control allocation and platform integration are not implemented`.
+This step does not claim a complete NIC target compile or runtime parity.
+
+`test/Transforms/NICControlTest.cpp` checks production routes, six-word geometry,
+four reset flags, five unreset captures, two assertions, recursive targets and
+12 preflight rejections without IR mutation. Its standalone mode clones the
+actual emitted MCRFile and bank bodies. Twelve focused CTests pass, covering
+control transport/decode, all four CPU stream buffer passes, NIC token/packet/
+CPU queues, stream catalog and decoded MMIO. The final standalone composition
+and rejection test also passes after rebuilding the test executable.
+
+`test/Transforms/NICControlCompare.py` reproduces the fresh production attachment,
+requires identical module bodies, preserves all 77 prior module bodies, checks
+all 60 public ports and wrapper connections, and compares all 1,792 recursively
+transferred annotation records. Its behavioral reference retains the actual
+SFC `MCRFile_4` and the six-register cone from:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+Golden SHA256 is
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+Only the previously compared combinational done boundary replaces SFC `!tFire`.
+Verilator with assertions enabled matches the native production helpers for
+103,828 cycles: all eight local indices, three AW/W arrival orders, 16 byte
+strobes, address aliases, write-only read guards, live done under R stalls,
+96 hole writes recovered by reset, and 100,000 randomized cycles. Coverage
+includes 3,922 AW handshakes, 25,308 AR handshakes, 3,716 B stalls, 24,709 R
+stalls, 1,094 resets with pending captures, and 229 zero-strobe W handshakes.
+Uninitialized config/capture values remain unspecified; configuration is
+initialized through the same Nasti transport before comparison. This isolated
+unit comparison does not initiate a FireSim manager verification gate.
+
+Evidence is under:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration177-u250-target-matrix/
+```
+
+`control-production/comparison.json` records the golden/candidate hashes and
+behavioral result. `no-nic-rtl-collateral-comparison.json` freshly confirms
+unchanged no-NIC Rocket RTL, driver header, `.const.vh` and both XDC files.
+`immutable-rocket-comparison.json` freshly checks the October 1 FIRRTL/annotation
+handoff and U250 XDC, including the recorded implementation hierarchy rename.
+Neither immutable fixture was modified.
+
+Next derive the NIC and three stream-count widgets' global allocation from the
+native MMIO registries, compare offsets 512/516/520/524/528/532 and 592/596/600
+against the NIC SFC driver header, and attach their native control decoder.
+Driver stream lists and complete NIC platform/runtime integration remain
+pending, together with the other target lowering gaps and partitioned QSFP.
+
+The fresh thirteen-recipe replay uses compiler SHA256
+`9560ac2c2830f9fb87309d487d1a87d5bd7dc4d593cf3336f15de95b83a2627f`.
+It completes with one compiled no-NIC Rocket, six lowering failures and six
+unsupported partition profiles, intentionally exiting nonzero. All seven
+reached bridge/channel annotation boundaries match SFC. Shuttle model-port
+annotations match; the other six retain the existing SRAM annotation
+differences. Quad-core multiple TracerV, BOOM/Shuttle TracerV payload profiles,
+Gemmini/Saturn Rocket FASED maxFlight profiles and six partitioned QSFP profiles
+remain unsupported. NIC advances specifically to its global control/platform
+allocation gap. Matched intermediate annotations are partial evidence, not
+complete target passes. The live build includes the user's pre-existing UART
+registry-sizing change; that unrelated change is excluded from this checkpoint.

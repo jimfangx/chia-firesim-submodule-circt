@@ -2077,6 +2077,17 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-nic-mmio-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-nic-mmio COMMAND goldengate-nic-mmio-test)
+  add_executable(goldengate-nic-control-test
+    test/Transforms/NICControlTest.cpp lib/Transforms/NICMMIOBank.cpp
+    lib/Transforms/ClockBridgeControl.cpp lib/Transforms/CPUStreamCountBank.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
+  target_compile_features(goldengate-nic-control-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-control-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-control-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-control-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-control COMMAND goldengate-nic-control-test)
 endif()
 
 if(BUILD_TESTING)
