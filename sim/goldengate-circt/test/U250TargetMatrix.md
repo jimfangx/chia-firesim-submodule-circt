@@ -2736,3 +2736,94 @@ with the actual SFC `LatencyPipe` behavior. Timing completion queues, control
 responses/slave-1 binding, generalized FASED geometry, multiple/wider TracerV
 profiles, complete NIC host memory/stream composition and partition/QSFP
 integration remain incomplete.
+
+### Iteration 199: connect native NIC model cycle and release deadlines
+
+The compiler now invokes `addFASEDTimingCycle` for the archived NIC model.
+It emits a native UInt64 counter with targetFire-qualified increment/reset,
+UInt32 runtime read/write latency inputs and modulo-2^64 release deadlines
+with the one-cycle egress offset. The explicit NIC rejection follows this
+boundary and still reports unported timing completion, control responses and
+platform integration. Full NIC compilation/runtime support remains incomplete.
+
+The executable Scala oracle is `TimingModel.scala` 100–102 and
+`LatencyBandwidthPipe.scala` 67/81, with the gated model clock and reset in
+`FASEDMemoryTimingModel.scala` 355–404. `MidasTransforms.scala` and
+`FAMETransform.scala` retain the model-clock/host-token distinction. The
+timer is implemented through existing CIRCT FIRRTL operations; this change
+connects that pass in the actual NIC compiler path.
+
+Evidence is in the mutable generated directory
+`iteration199-u250-target-matrix/`. `nic-timing-cycle-comparison.json` compares
+the actual NIC production
+`replay/alveo_u250_firesim_rocket_singlecore_nic/candidate/post-fame-fased-timing-cycle.mlir`
+and `-all.json` with these exact SFC artifacts:
+
+```text
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+The original SFC `LatencyPipe` counter declaration, update and deadline
+arithmetic cone match the immutable reference, as does `AbstractClockGate`.
+The comparator pins `FASEDMemoryTimingModel` clock/reset/fire binding. It
+clones the actual production native helper verbatim through
+`goldengate-fased-timing-cycle-test`, lowers it with firtool and runs Verilator
+against the original SFC counter/arithmetic cone. Independent latency/reset
+inputs and observed output pins replace only the surrounding model boundary.
+Identical state seeds are deposited with both clocks low to reach UInt64
+wraparound in finite time; the following register updates remain unmodified.
+
+All three outputs match before and after targetFire-qualified edges over
+41,153 cycles: 20,587 stalls, 439 stalled resets, 430 enabled resets, 20,136
+increments, 36 counter wraps, 353 zero-latency and 352 max-latency cases,
+45 deadline underflows, 128 deadline overflows and 20,298 latency changes
+while stalled. The production wrapper preserves 181 modules, checks all
+196 connections, matches the five added port types to the fresh no-NIC
+boundary and transfers all 1,792 annotations recursively.
+
+**Clock-gate limitation:** the initial preflight executed the archived
+`AbstractClockGate` shim literally. Its posedge-sampled enable register
+produced a transient model edge when CE deasserted between host pulses,
+giving SFC cycle 1 versus native cycle 0. The failing test/log are retained in
+`timing-cycle-preflight/` and described in
+`clock-gate-preflight-diagnostic.json`. The final differential compares the
+Scala targetFire-qualified model-edge contract, using `clock & targetFire`;
+it does not claim delta-cycle equivalence of that shim or complete clock-gate
+parity. `recorded-clock-gate.sv` retains the original inspected module.
+
+The 194 earlier NIC FIRRTL/annotation artifacts match iteration 198
+byte-for-byte; only two timing-cycle artifacts are added. No-NIC final RTL,
+both headers and both XDC files remain identical to iteration 198. Fresh
+comparisons match both primary immutable handoff hashes and normalized
+immutable U250 XDC with the recorded implementation hierarchy rename.
+Neither immutable fixture was modified.
+
+Focused CTest passes 21,152 deadline/counter transitions, 16 wrapper mapping
+cases, three target transfers and 19 atomic rejections for each baseline and
+selected Print profile. Reproduce the new comparator with `--candidate-dir`
+pointing to the NIC replay, `--baseline` to the fresh no-NIC timing-cycle MLIR,
+`--golden` and `--immutable` to the SV paths above, `--export-tool` to
+`goldengate-fased-timing-cycle-test`, a fresh absolute `--output-dir` and
+`--report-json`. Preflight v2 uses iteration 198's no-NIC helper; the final
+report executes iteration 199's NIC production helper.
+
+The fresh thirteen-target replay uses compiler SHA256
+`500e71751235d5ef12534c32fbf1fd172c5da9dc32134c82b15bd54918448bdc`.
+`replay/matrix.json` and `matrix-regression-comparison.json` retain one compiled
+no-NIC target, six later compiler failures and six unsupported partition/QSFP
+platforms. All thirteen archived input hashes, effective platform semantics,
+compile statuses and structured boundary comparisons match iteration 198;
+only the NIC diagnostic advances. All seven reached bridge/channel boundaries
+match SFC, while six documented native SRAM model-port differences remain.
+These partial matches do not establish full target support or semantic parity.
+Manager verification steps were not started here. Older mutable iteration 194
+MLIR was compressed with decompressed SHA256 verification and a manifest,
+recovering 35,301,928,500 bytes; current candidates and goldens are retained.
+
+The next smallest step is to connect native NIC `FASEDReadLatency` and compare
+its ten-entry completion queue, release deadlines, target reset and retirement
+against the actual SFC read-pipe RTL. Write latency/AW completion, control
+responses/slave-1 binding, generalized FASED geometry, multiple/wider TracerV
+profiles, complete NIC host memory/stream composition, the recorded clock-gate
+shim behavior and partition/QSFP integration remain incomplete.

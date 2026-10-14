@@ -4370,8 +4370,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseReleaserAnnotations, error)))
         return fail("FASED response releaser annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED target response release and egress request binding in " << fasedResponseReleaserPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC FASED timing/control responses and platform integration are not implemented");
+      // The NIC model shares the targetFire-qualified cycle counter and
+      // runtime latency arithmetic with the no-NIC FASED model.
       if (failed(goldengate::addFASEDTimingCycle(circuit, error)))
         return fail("FASED timing cycle: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED timing cycle produced invalid FIRRTL IR");
@@ -4385,6 +4385,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedTimingCycleAnnotations, error)))
         return fail("FASED timing cycle annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED timing cycle and latency release-cycle arithmetic in " << fasedTimingCyclePath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC FASED timing completion, control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDReadLatency(circuit, error)))
         return fail("FASED read latency: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read latency produced invalid FIRRTL IR");
