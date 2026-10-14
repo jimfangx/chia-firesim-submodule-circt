@@ -1373,3 +1373,90 @@ replay overlapped the adapter-direction correction and failed its compiler
 snapshot guard; it is retained as diagnostics, not validation evidence.
 Its large derived artifacts were compressed with verified uncompressed
 SHA256s to preserve disk space. Use `replay-final` for the next comparison.
+
+## Iteration 183: dispatch NIC control read requests
+
+The production compiler now invokes `addControlReadDispatch` for the NIC
+handoff after binding widget writes. It emits verified
+`post-fame-control-read-dispatch.mlir` and complete annotations before
+explicitly rejecting the remaining NIC response/platform work. Requests
+reach the eight allocated banks, including NIC at slave 7, Clock at 8, CPU
+stream at 10 and Reset at 11. Four unbound banks expose AR interfaces; the
+error endpoint connects internally. The shared pass derives twelve route
+bits and four target bits from the decoder catalog. This is an additional
+native compiler boundary, not a successful NIC target compile.
+
+The exact golden artifact compared is:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+SHA256: `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICControlReadDispatchCompare.py` matches forty original `FPGATop` AR
+allocation connections and all 193 production wrapper connections. It
+checks preservation of 114 earlier module bodies, the 160 copied ports
+(with eight narrowed B/R bundles), and recursive transfer of all 1,792
+annotation records. The exporter runs the actual pass on the production
+widget-write boundary and clones its emitted helper. Both full production
+IR and isolated helper match the compiler's output; no helper expression is
+rebuilt for the comparison.
+
+Isolated Verilator execution against seventy unchanged expressions from
+SFC `NastiRouter` passes 525,984 cases, including 65,641 master accepts and
+196,940 stalls. It covers all thirteen endpoints, all 8,192 slave-ready
+masks under all four valid/capacity combinations, and 100,000 deterministic
+random cases (including multiple route bits). Master ready, slave valid,
+tracker enqueue valid/tag and SFC-retained address/length/ID broadcasts
+agree. The other eight native payload fields also broadcast unchanged to
+all endpoints; target metadata forwards unchanged from its explicit input.
+Decoded route/target and tracker capacity are comparison boundaries. This
+does not test response storage, retirement, burst arbitration or platform
+behavior. The earlier decoder and write-binding artifacts must remain
+unchanged to reuse their recorded SFC evidence.
+
+The focused CTest includes the actual twelve-region NIC allocation, all
+ready masks, multi-route priority, partial annotation targets and the
+existing malformed/repeated-boundary atomic rejection tests. It passes
+alongside the production IR verification and differential comparison.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration183-u250-target-matrix/
+```
+
+`nic-control-read-dispatch-production/comparison.json` records exact hashes,
+structured checks and behavioral results. After sourcing the FireSim
+environment, run `test/Transforms/NICControlReadDispatchCompare.py` with
+`--writes`/`--reads` pointing to those production MLIR boundaries, `--golden`
+to the archived NIC SV, `--export-tool` to
+`goldengate-control-read-dispatch-test`, and a fresh `--output-dir`.
+
+Fresh no-NIC RTL, both constant headers and both XDC files match iteration
+182 byte-for-byte. The October 1 immutable primary inputs and U250 XDC also
+match, with the recorded implementation hierarchy rename. Their fresh
+reports are `no-nic-rtl-collateral-comparison.json` and
+`immutable-rocket-comparison.json`; no immutable fixture was edited.
+
+The next smallest step is to connect the native AR response tracker to this
+production NIC boundary and compare accepted requests and final R-beat
+retirement with SFC's thirteen-bin reorder queue. R/B arbitration, remaining
+widget bindings, host memory/driver stream lists, NIC runtime, other target
+lowering profiles and partitioned QSFP remain gaps. Pre-existing user
+ClockBridgeControl/UART registry edits are excluded from this checkpoint.
+No FireSim manager verification step was started in this turn.
+
+Fresh standalone replay of all thirteen archived handoffs and effective
+platform configurations used compiler SHA256
+`e0f22f09f1527fef09b9e8aecd60fd03ca2e528b7e6089ea4e9cb1ad5f1b38f1`.
+`replay/matrix.json` records one complete no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations; nonzero exit is
+intentional. All seven reached BridgeIO/channel boundaries match SFC.
+Shuttle model-port annotations match; the other six retain exactly the prior
+native-SRAM annotation differences. `matrix-regression-comparison.json`
+checks unchanged inputs, effective platforms, statuses and structured
+boundary results against iteration 182. Only NIC's later unsupported-feature
+reason advances. `nic-prior-boundaries-comparison.json` confirms all eight
+NIC decoder, queued write-route, dispatch and widget-write MLIR/annotation
+artifacts are byte-identical to those already compared with SFC.

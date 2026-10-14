@@ -3840,9 +3840,7 @@ int main(int argc, char **argv) {
       module->print(widgetWritesOut); widgetWritesOut << '\n'; widgetWritesOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, widgetWritesAnnotations, error)))
         return fail("control widget write annotations: " + error);
-      llvm::outs() << "Bound CIRCT control AW/W requests to Rocket and instantiated Print widgets in " << widgetWritesPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC control read dispatch, responses and platform integration are not implemented");
+      llvm::outs() << "Bound CIRCT control AW/W requests to allocated widgets in " << widgetWritesPath << '\n';
       if (failed(goldengate::addControlReadDispatch(circuit, error)))
         return fail("control read dispatch: " + error);
       if (failed(mlir::verify(*module)))
@@ -3857,7 +3855,9 @@ int main(int argc, char **argv) {
       module->print(controlReadsOut); controlReadsOut << '\n'; controlReadsOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlReadsAnnotations, error)))
         return fail("control read annotations: " + error);
-      llvm::outs() << "Dispatched CIRCT control AR requests to seven widgets and the error endpoint in " << controlReadsPath << '\n';
+      llvm::outs() << "Dispatched CIRCT control AR requests to allocated widgets and the error endpoint in " << controlReadsPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC control responses and platform integration are not implemented");
       if (failed(goldengate::addControlReadTracker(circuit, error)))
         return fail("control read tracker: " + error);
       if (failed(mlir::verify(*module)))

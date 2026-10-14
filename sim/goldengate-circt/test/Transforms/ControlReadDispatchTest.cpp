@@ -28,11 +28,18 @@ const std::map<std::string,unsigned> fields{{"addr",25},{"len",8},{"size",3},{"b
 std::vector<std::pair<unsigned,std::string>> boundWidgets(unsigned count,bool empty=false) {
   std::vector<std::pair<unsigned,std::string>> out;
   if(empty)return out;
-  if(count==11)for(auto [i,n]:widgets)out.emplace_back(i,n);
+  if(count==12)out={{2,"tracerv_ctrl"},{4,"loadmem_ctrl"},{5,"peekPokeBridge_ctrl"},
+    {6,"uartBridge_ctrl"},{8,"clockBridge_ctrl"},{11,"resetBridge_ctrl"},
+    {10,"cpuStream_ctrl"},{7,"nicBridge_ctrl"}};
+  else if(count==11)for(auto [i,n]:widgets)out.emplace_back(i,n);
   else for(unsigned i=0;i<count;i+=2)out.emplace_back(i,"widget_"+std::to_string(i)+"_ctrl");
   return out;
 }
 std::string regionName(unsigned count,unsigned i) {
+  if(count==12) {
+    const char *nicNames[]{"BlockDevBridgeModule_0","FASEDMemoryTimingModel_0","TracerVBridgeModule_0","TSIBridgeModule_0","LoadMemWidget_0","PeekPokeBridgeModule_0","UARTBridgeModule_0","SimpleNICBridgeModule_0","ClockBridgeModule_0","SimulationMaster_0","CPUManagedStreamEngine_0","ResetPulseBridgeModule_0"};
+    return nicNames[i];
+  }
   if(count!=11)return "Widget_"+std::to_string(i);
   const char *names[]{"BlockDevBridgeModule_0","FASEDMemoryTimingModel_0","TracerVBridgeModule_0","TSIBridgeModule_0","LoadMemWidget_0","PeekPokeBridgeModule_0","UARTBridgeModule_0","ClockBridgeModule_0","SimulationMaster_0","ResetPulseBridgeModule_0","CPUManagedStreamEngine_0"};
   return names[i];
@@ -152,7 +159,7 @@ unsigned test(MLIRContext &ctx,unsigned count,bool empty=false) {
   // at small geometries. Wide catalogs use walking ready and route bits.
   for(unsigned i=0;i<=count;++i)for(unsigned gates=0;gates<4;++gates) {
     uint64_t route=i==count?0:1ULL<<i;
-    if(count<=11)for(unsigned mask=0;mask<(1U<<(count+1));++mask)sample(route,gates&1,gates&2,mask,false);
+    if(count<=12)for(unsigned mask=0;mask<(1U<<(count+1));++mask)sample(route,gates&1,gates&2,mask,false);
     else for(unsigned j=0;j<=count;++j)sample(route,gates&1,gates&2,1ULL<<j,false);
     sample(route,gates&1,gates&2,~uint64_t(0),true);
     sample(route,gates&1,gates&2,0,true);
@@ -208,10 +215,33 @@ unsigned test(MLIRContext &ctx,unsigned count,bool empty=false) {
   return cases;
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{
+int main(int argc,char **argv){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{
+  if(argc==3||argc==4) {
+    auto root=parseSourceFile<ModuleOp>(argv[1],&ctx);require(bool(root),"production parse failed");
+    require(succeeded(verify(*root)),"production input invalid");
+    auto c=*root->getOps<CircuitOp>().begin();std::string error;
+    require(succeeded(goldengate::addControlReadDispatch(c,error)),error);
+    require(succeeded(verify(*root)),"production AR dispatch invalid");
+    std::error_code ec;llvm::raw_fd_ostream out(argv[2],ec);require(!ec,"cannot write production dispatch");
+    root->print(out);out<<'\n';out.close();
+    if(argc==4) {
+      // Clone the production operation; do not rebuild a test helper.
+      auto isolated=ModuleOp::create(c.getLoc());OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGControlReadDispatch"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper=cast<FModuleOp>(b.insert(named(c,"GGControlReadDispatch")->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)),"exported helper invalid");
+      llvm::raw_fd_ostream helperOut(argv[3],ec);require(!ec,"cannot export production helper");
+      isolated.print(helperOut);helperOut<<'\n';isolated.erase();
+    }
+    llvm::outs()<<"Production AR dispatch and helper verified\n";return 0;
+  }
+  require(argc==1,"usage: test [input.mlir output.mlir [helper.mlir]]");
   unsigned cases=0;
-  for(unsigned count:{1,2,3,11,13,31,63})cases+=test(ctx,count);
+  for(unsigned count:{1,2,3,11,12,13,31,63})cases+=test(ctx,count);
   cases+=test(ctx,3,true);
   for(unsigned bad=1;bad<=28;++bad){auto r=fixture(ctx,bad);auto circuit=*r->getOps<CircuitOp>().begin();auto s=dump(*r);std::string error;require(failed(goldengate::addControlReadDispatch(circuit,error)),"malformed boundary accepted");require(!error.empty()&&dump(*r)==s,"rejection mutated IR or omitted diagnostic");}
-  llvm::outs()<<"Control AR dispatch: "<<cases<<" independent backpressure/route cases across 1/2/3/11/13/31/63 regions and empty bindings; wrapper wiring, targets and 36 atomic rejections passed\n";
+  llvm::outs()<<"Control AR dispatch: "<<cases<<" independent backpressure/route cases across 1/2/3/11/12/13/31/63 regions (including NIC allocation) and empty bindings; wrapper wiring, targets and 37 atomic rejections passed\n";
   return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}}
