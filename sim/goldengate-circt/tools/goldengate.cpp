@@ -4355,8 +4355,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteEgressAnnotations, error)))
         return fail("FASED write egress annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED per-ID write acknowledgements and token readiness in " << fasedWriteEgressPath << '\n';
-      if (!cpuSinks.empty())
-        return fail("NIC FASED response release, timing/control responses and platform integration are not implemented");
+      // NIC and no-NIC models share AXI4Releaser's pipe occupancy queues.
+      // Advance their native state and model reset only on a target token.
       if (failed(goldengate::addFASEDResponseReleaser(circuit, error)))
         return fail("FASED response releaser: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED response releaser produced invalid FIRRTL IR");
@@ -4370,6 +4370,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseReleaserAnnotations, error)))
         return fail("FASED response releaser annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED target response release and egress request binding in " << fasedResponseReleaserPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC FASED timing/control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDTimingCycle(circuit, error)))
         return fail("FASED timing cycle: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED timing cycle produced invalid FIRRTL IR");

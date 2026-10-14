@@ -2651,3 +2651,88 @@ the targetFire-qualified read/write occupancy and payload forwarding with
 the actual SFC `AXI4Releaser` RTL. Timing/control responses, slave-1 binding,
 generalized FASED geometry, wider/multiple TracerV profiles, complete NIC
 host memory/stream composition and partition/QSFP integration remain incomplete.
+
+### Iteration 198: connect native NIC target response release
+
+The compiler now runs `addFASEDResponseReleaser` for the archived NIC model.
+It emits the native read/write occupancy queues and connects target responses,
+egress requests and readiness. State and model reset are qualified by
+`targetFire`; read occupancy retires only on an accepted last beat, and pipe
+replacement retains occupancy. Response payloads remain combinational even
+while invalid. The explicit NIC rejection now follows this boundary and still
+reports unported timing/control responses and platform integration. Full NIC
+compilation and runtime support remain incomplete.
+
+The executable Scala oracle is `Util.scala`'s `AXI4Releaser`, its one-entry
+`Queue(..., pipe = true)` instances, and the model clock/reset connections in
+`FASEDMemoryTimingModel.scala`. `MidasTransforms.scala` and
+`FAMETransform.scala` retain the target-token/host-clock distinction.
+`TimingModel.scala` connects the releaser to target responses and completion
+metadata; timing completion remains the next boundary.
+
+Evidence is in the mutable generated directory
+`iteration198-u250-target-matrix/`. `nic-response-releaser-comparison.json`
+compares the actual NIC production
+`replay/alveo_u250_firesim_rocket_singlecore_nic/candidate/post-fame-fased-response-releaser.mlir`
+and `-all.json` with these exact SFC artifacts:
+
+```text
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+The complete SFC `AXI4Releaser`, `Queue_12` and `Queue_13` modules match the
+immutable reference. The comparator also checks `LatencyPipe` and
+`FASEDMemoryTimingModel` clock/reset and egress binding. It clones the actual
+native helper verbatim through `goldengate-fased-response-releaser-test`, lowers
+it with firtool, and executes it against the complete SFC releaser and both
+queue modules in Verilator. Only the releaser module symbol is renamed; the
+oracle model clock is qualified by `targetFire`, as in the SFC model.
+
+All fourteen SFC-visible outputs and both occupancy registers match before
+and after clock edges: 40,081 cycles, 1,968 read replacements, 7,905 non-last
+beats, 11,847 blocked read requests, 168 occupied stalled resets, 9,492
+combinational acceptances without target fire, 2,034 empty-queue pushes and
+18,880 invalid response-forwarding cases. All sixteen read and write request
+IDs participate. SFC prunes user/resp and unused length ports; native user/resp
+forwarding is additionally checked against the Scala contract, not claimed
+as a comparison against nonexistent SFC pins. There is no uninitialized RAM
+or undefined-RUW restriction in this occupancy differential.
+
+The production wrapper preserves 179 modules, checks all 205 connections,
+matches the exact added port types to the fresh no-NIC boundary and transfers
+all 1,792 annotations recursively. The 192 earlier NIC FIRRTL/annotation
+artifacts match iteration 197 byte-for-byte; only two response-releaser
+artifacts are added. The no-NIC final RTL, both headers and both XDC files
+remain identical to iteration 197. Fresh comparisons also match both primary
+immutable handoff hashes and normalized immutable U250 XDC with the recorded
+implementation hierarchy rename. Neither immutable fixture was modified.
+
+Focused CTest passes 18,192 target-response transitions, 64 wrapper mapping
+cases, seven target transfers and 22 atomic rejections for each baseline and
+selected Print profile. Reproduce the new comparator with `--candidate-dir`
+pointing to the NIC replay, `--baseline` to the fresh no-NIC response-releaser
+MLIR, `--golden` and `--immutable` to the SV paths above, `--export-tool` to
+`goldengate-fased-response-releaser-test`, a fresh absolute `--output-dir` and
+`--report-json`. Preflight uses iteration 197's no-NIC helper; the final report
+executes iteration 198's NIC production helper.
+
+The fresh thirteen-target replay uses compiler SHA256
+`ea92796e66e2c63c410bea8f168f57459c5f439834def6be30dd72b51aa4784c`.
+`replay/matrix.json` and `matrix-regression-comparison.json` retain one compiled
+no-NIC target, six later compiler failures and six unsupported partition/QSFP
+platforms. All thirteen archived input hashes, effective platform semantics,
+compile statuses and structured boundary comparisons match iteration 197;
+only the NIC diagnostic advances. All seven reached bridge/channel boundaries
+match SFC, while six documented native SRAM model-port differences remain.
+These partial matches do not establish full target support or semantic parity.
+Manager verification steps were not started here. Older mutable iteration 193
+MLIR was compressed with decompressed SHA256 verification and a manifest,
+recovering 35,258,192,318 bytes; current candidates and goldens are retained.
+
+The next smallest step is to connect native NIC `FASEDTimingCycle` and compare
+its target-qualified 64-bit cycle count and latency-derived release deadlines
+with the actual SFC `LatencyPipe` behavior. Timing completion queues, control
+responses/slave-1 binding, generalized FASED geometry, multiple/wider TracerV
+profiles, complete NIC host memory/stream composition and partition/QSFP
+integration remain incomplete.
