@@ -1552,3 +1552,95 @@ tracker boundary and compare burst locking, priority, backpressure and final
 retirement against the archived SFC `HellaPeekingArbiter`. Remaining widget
 bindings, write responses, host memory/driver stream lists, NIC runtime,
 wider/multiple TracerV profiles, FASED geometry and partition/QSFP remain gaps.
+
+## Iteration 185: connect the production NIC control R arbiter
+
+The native compiler now invokes `addControlReadArbiter` after the production
+NIC AR tracker, verifies its CIRCT FIRRTL operations, and emits
+`post-fame-control-read-arbiter.mlir` plus complete annotations. The helper
+arbitrates twelve normal response sources plus error source 12, preserves
+round-robin priority and burst locking, and connects final-beat retirement.
+Eight allocated widget R channels are bound; four remaining widget R sources
+stay explicit. Their tracker retirement inputs are now connected to their own
+ready/valid/last and twelve-bit ID. Retained widget B fields remain at the
+replacement boundary. NIC compilation still explicitly fails at missing
+control write responses/platform integration.
+
+The exact SFC artifact compared is:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+SHA256: `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICControlReadArbiterCompare.py` verifies all 292 production wrapper
+connections, 184 copied ports, preservation of 118 prior module bodies,
+and recursive transfer of all 1,792 annotation records. It checks 32 SFC
+`FPGATop` bank-allocation connections, all thirteen router R input bindings,
+retirement/tag expressions, host clock/reset and master R output connections.
+The production exporter runs the actual pass on the fresh tracker boundary
+and clones the actual helper operations. Its full transformed circuit and
+helper body match the compiler output.
+
+Isolated Verilator comparison uses the entire original SFC
+`HellaPeekingArbiter` logic. It passes 156,555 cycles: all 8,192 valid-source
+masks at each of thirteen reachable cursors, 23,416 accepted beats, 129,773
+stalls, 3,337 locked gaps, 1,666 nonfinal beats and 141 reset cycles. All
+thirteen sources are exercised. Selected payloads, ungated readiness,
+round-robin selection, error burst locks, final-beat retirement and reset
+priority agree with SFC and an independent state scoreboard.
+
+Normal SFC responses specialize `last=1`, `resp=0` and `user=0`; error data
+is zero, response is DECERR and user is zero. The differential test preserves
+those specializations. The native CTest also covers unspecialized payloads
+and nonfinal normal responses. This comparison does not establish remaining
+widget completion, write-response tracking, host memory/stream-driver ABI or
+NIC runtime/platform parity.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration185-u250-target-matrix/
+```
+
+`nic-control-read-arbiter-production/comparison.json` records artifact hashes,
+connection checks and behavioral results. Source the FireSim environment,
+then run `test/Transforms/NICControlReadArbiterCompare.py` with `--tracker`
+and `--arbiter` pointing to the fresh production boundaries, `--golden` to
+the archived NIC SV, `--export-tool` to `goldengate-control-read-arbiter-test`,
+and a fresh `--output-dir`.
+
+Focused CTest `goldengate-control-read-arbiter` passes in 91.27 seconds:
+121,756 selection/burst/reset cases across 1, 2, 3, 11, 12, 13, 31 and 63
+regions, including the actual NIC allocation, wrapper wiring, annotation
+transfer and 28 atomic rejections. The compiler and test targets build
+successfully. `ctest.log` and `control-read-arbiter-ctest-detail.log` retain
+the result and detailed output.
+
+`nic-prior-boundaries-comparison.json` freshly matches all twelve NIC decoder,
+write-route, write-dispatch, widget-write, AR-dispatch and AR-tracker
+MLIR/annotation artifacts against iteration 184 byte-for-byte. Fresh no-NIC
+RTL, both constant headers and both XDC files also match iteration 184.
+The October 1 immutable primary inputs and U250 XDC match with the recorded
+implementation hierarchy rename. No immutable fixture was changed, and no
+FireSim manager verification step was started. Pre-existing user edits remain
+outside this checkpoint.
+
+Fresh replay of all thirteen archived handoffs and effective platform
+configurations used compiler SHA256
+`4c9eb51f2a11629adbae34e05d558a532498003bf51ae0d8ee7bd0ca28989601`.
+`replay/matrix.json` records one complete no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations. Its nonzero exit
+reports these implementation gaps. All seven reached BridgeIO/channel
+boundaries match SFC. Shuttle model-port annotations match; the other six
+retain exactly their prior native-SRAM annotation differences.
+`matrix-regression-comparison.json` checks all thirteen inputs, effective
+platforms, statuses and structured boundary results against iteration 184.
+Only NIC's later unsupported-feature reason advances to write responses.
+Python syntax and `git diff --check` also pass.
+
+The next smallest step is to connect the thirteen-input control B arbiter
+and compare response selection, backpressure and retirement against the
+archived SFC `RRArbiter`. Remaining widget bindings, write tracking, host
+memory/stream lists, NIC runtime, wider/multiple TracerV profiles, FASED
+geometry and partition/QSFP remain gaps.

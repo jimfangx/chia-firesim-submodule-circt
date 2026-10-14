@@ -28,12 +28,22 @@ const std::pair<unsigned, const char *> widgets[]{{2, "tracerv_ctrl"}, {4, "load
     {9, "resetBridge_ctrl"}, {10, "cpuStream_ctrl"}};
 std::vector<std::pair<unsigned, std::string>> boundWidgets(unsigned count) {
   std::vector<std::pair<unsigned, std::string>> result;
-  if (count == 11) for (auto [i, n] : widgets) result.emplace_back(i, n);
+  if (count == 12) result = {{2, "tracerv_ctrl"}, {4, "loadmem_ctrl"},
+      {5, "peekPokeBridge_ctrl"}, {6, "uartBridge_ctrl"}, {7, "nicBridge_ctrl"},
+      {8, "clockBridge_ctrl"}, {11, "resetBridge_ctrl"}, {10, "cpuStream_ctrl"}};
+  else if (count == 11) for (auto [i, n] : widgets) result.emplace_back(i, n);
   else for (unsigned i = 0; i < count; i += 2)
     result.emplace_back(i, "widget_" + std::to_string(i) + "_ctrl");
   return result;
 }
 std::string regionName(unsigned count, unsigned i) {
+  if (count == 12) {
+    const char *names[]{"BlockDevBridgeModule_0", "FASEDMemoryTimingModel_0", "TracerVBridgeModule_0",
+        "TSIBridgeModule_0", "LoadMemWidget_0", "PeekPokeBridgeModule_0", "UARTBridgeModule_0",
+        "SimpleNICBridgeModule_0", "ClockBridgeModule_0", "SimulationMaster_0",
+        "CPUManagedStreamEngine_0", "ResetPulseBridgeModule_0"};
+    return names[i];
+  }
   if (count != 11) return "Widget_" + std::to_string(i);
   const char *names[]{"BlockDevBridgeModule_0", "FASEDMemoryTimingModel_0", "TracerVBridgeModule_0",
       "TSIBridgeModule_0", "LoadMemWidget_0", "PeekPokeBridgeModule_0", "UARTBridgeModule_0",
@@ -87,7 +97,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned count
     decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(catalog));
   }
   if (bad != 6) named(c, oldTop)->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
-  const std::string targetPort = count == 11 ? "clockBridge_ctrl" : "widget_0_ctrl";
+  const std::string targetPort = (count == 11 || count == 12) ? "clockBridge_ctrl" : "widget_0_ctrl";
   for (const auto &ref : std::vector<std::string>{"hostReset", "ctrl_error_r_bits_id", targetPort + ".r.bits.id", targetPort + ".b.bits.id", targetPort})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Target")),
         b.getNamedAttr("target", b.getStringAttr("~" + std::string(oldTop) + "|" + oldTop + ">" + ref))}));
@@ -282,8 +292,8 @@ void testCount(MLIRContext &ctx, unsigned count, unsigned &total) {
   total += cases;
 }
 void test(MLIRContext &ctx) {
-  unsigned total = 0, rejected = 7;
-  for (unsigned count : {1u, 2u, 3u, 11u, 13u, 31u, 63u}) testCount(ctx, count, total);
+  unsigned total = 0, rejected = 8;
+  for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 31u, 63u}) testCount(ctx, count, total);
   std::string error;
   for (unsigned bad = 1; bad <= 18; ++bad) {
     auto r = fixture(ctx, bad); auto ci = *r->getOps<CircuitOp>().begin(); auto s = dump(*r);
@@ -293,10 +303,35 @@ void test(MLIRContext &ctx) {
     auto r = fixture(ctx, 0, count); auto ci = *r->getOps<CircuitOp>().begin(); auto s = dump(*r);
     require(failed(goldengate::addControlReadArbiter(ci, error)), "unsupported count accepted"); require(dump(*r) == s, "count rejection mutated IR"); ++rejected;
   }
-  llvm::outs() << "Control read arbiter: " << total << " selection/burst/reset cases across 1,2,3,11,13,31,63 decoded regions; wrapper wiring, targets and " << rejected << " atomic rejections passed\n";
+  llvm::outs() << "Control read arbiter: " << total << " selection/burst/reset cases across 1,2,3,11,12,13,31,63 decoded regions; wrapper wiring, targets and " << rejected << " atomic rejections passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+  if (argc == 4) {
+    try {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production input invalid");
+      auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+      require(succeeded(goldengate::addControlReadArbiter(c, error)), error);
+      require(succeeded(verify(*root)), "production read arbiter invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot write production arbiter"); root->print(out); out << '\n'; out.close();
+      // Export the actual production helper without rebuilding its expressions.
+      auto isolated = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr("GGControlReadArbiter"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper = cast<FModuleOp>(b.insert(named(c, "GGControlReadArbiter")->clone())); helper.setPublic();
+      require(succeeded(verify(isolated)), "exported helper invalid");
+      llvm::raw_fd_ostream helperOut(argv[3], ec); require(!ec, "cannot export helper");
+      isolated.print(helperOut); helperOut << '\n'; helperOut.close(); isolated.erase();
+      llvm::outs() << "Production NIC R arbiter and cloned helper verified\n"; return 0;
+    } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  }
+  if (argc != 1) {
+    llvm::errs() << "usage: goldengate-control-read-arbiter-test [input.mlir output.mlir helper.mlir]\n";
+    return 1;
+  }
   try { test(ctx); return 0; } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }
