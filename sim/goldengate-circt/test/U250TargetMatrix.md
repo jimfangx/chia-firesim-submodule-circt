@@ -3015,3 +3015,101 @@ its accepted AW metadata, flow-through head ID, reset and retirement with SFC
 Control responses/slave-1 binding, generalized FASED geometry, multiple/wider
 TracerV profiles, complete NIC host memory/stream composition, the recorded
 clock-gate shim behavior and partition/QSFP integration remain incomplete.
+
+## Iteration 202: NIC accepted AW metadata queue
+
+The production compiler now runs `addFASEDTimingAWQueue` for the NIC target,
+verifies its CIRCT FIRRTL operations and emits the queue boundary and annotations
+before rejecting the unported pending AW/W counters. The ten-entry flow queue
+captures `AW.fire` and provides its oldest 4-bit ID to write completion. Capacity
+remains an observation; it does not alter AW acceptance. The external completion
+pulse remains explicit until the pending counters are connected. This extends
+the actual compiler path; it does not claim a complete NIC compile.
+
+Evidence is under the standard Rocket generated-source directory:
+
+```text
+iteration202-u250-target-matrix/
+  build.log
+  compiler.sha256
+  ctest.log
+  ctest-details.log
+  nic-timing-aw-queue-comparison.json
+  nic-timing-aw-queue-differential/
+  nic-prior-boundaries-comparison.json
+  rocket-output-regression-comparison.json
+  immutable-rocket-comparison.json
+  replay/matrix.json
+  matrix-regression-comparison.json
+```
+
+The exact new boundary is
+`replay/alveo_u250_firesim_rocket_singlecore_nic/candidate/post-fame-fased-timing-aw-queue.mlir`,
+SHA256 `920814ab0e3ac6ee82170ef2390bb26abb1e84409232ea0f1cbbfbcf1486ad71`.
+Its `-all.json` carries all 1,792 annotations with recursive target transfer.
+The wrapper retains 187 prior modules and all copied port types, and checks all
+199 aggregate/scalar connections. The production helper equals the fresh
+no-NIC helper exactly: three qualified-reset registers and a 10-by-4-bit RAM.
+
+The SFC oracle is `Queue_14` in
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+The queue and recorded clock-gate module match their counterparts in the
+immutable U250 build-tree `design/FireSim-generated.sv` after comment/whitespace
+normalization. The `LatencyPipe` bindings pin accepted AW ID, enqueue on AW.fire,
+dequeue on `newWReq`, and oldest ID into the write-latency queue. The Scala oracle
+is `models/dram/TimingModel.scala:234-254`.
+
+`NICFASEDTimingAWQueueCompare.py` exports the actual production helper verbatim
+through `FASEDTimingAWQueueTest.cpp`, lowers it with firtool, and executes it
+against the original SFC queue RTL in Verilator. Outputs, pointer/full state and
+all initialized RAM entries match before and after every edge over 40,197
+cycles: 919 empty flows, 273 full-queue pops, 19,923 stalls, 192 stalled resets,
+85 reset edges that still write RAM, 1,549 wraps and 3,946 simultaneous
+enqueue/dequeue cases. All sixteen IDs are exercised. A separate invalid
+enqueue executes and rejects the native overflow assertion with the original
+SFC message. RAM writes remain independent of reset; unknown initial RAM data
+is not used as defined reference data.
+
+The differential executes targetFire-qualified model edges with
+`clock & targetFire`, as in the Scala gated-clock contract. It pins the SFC
+clock/reset/targetFire bindings and retains the original gate module in
+`nic-timing-aw-queue-differential/recorded-clock-gate.sv`. It does not execute
+or claim delta-cycle parity for the recorded posedge enable-register shim.
+AW/W counter behavior and full NIC integration remain outside this test.
+
+Focused CTest passes 30,092 transitions, 64 wrapper mapping cases, five target
+transfers and 22 atomic rejections for each baseline/selected Print profile.
+Reproduce the differential with `--candidate-dir` for the fresh NIC replay,
+`--baseline` for fresh no-NIC AW queue MLIR, `--golden` and `--immutable` for the
+paths above, `--export-tool` for `goldengate-fased-timing-aw-queue-test`, a fresh
+absolute `--output-dir`, and `--report-json`. The preflight uses iteration 201's
+no-NIC helper; the final report executes the fresh iteration 202 NIC helper.
+
+All 200 earlier NIC MLIR/annotation artifacts match iteration 201 byte-for-byte;
+only two AW queue artifacts are added. The no-NIC final RTL, both headers and
+both XDC files are identical to iteration 201. Both immutable primary handoff
+hashes and normalized immutable U250 XDC match, including the recorded
+implementation hierarchy rename. Immutable fixtures are unchanged.
+
+Older mutable iteration 197 MLIR was compressed with decompressed SHA256
+verification and a manifest: 554 files, recovering 35,433,638,146 bytes.
+Current candidates and completed SFC goldens were not modified by compression.
+
+The fresh thirteen-target replay uses compiler SHA256
+`8a5ae99e2458fcda5a87562c35dd9200a144cd184571c768b92463184e0e5df3`.
+`replay/matrix.json` and `matrix-regression-comparison.json` retain one compiled
+no-NIC target, six later compiler failures and six unsupported partition/QSFP
+platforms. All thirteen archived input hashes, effective platform semantics,
+statuses and structured boundary comparisons match iteration 201; only the NIC
+unsupported diagnostic advances. Reached bridge/channel boundaries match SFC;
+the six documented native SRAM model-port differences remain. Partial matches
+do not imply full target support. All thirteen stderr logs were inspected.
+No FireSim manager verification step was started here.
+
+The next smallest step is to connect native NIC `FASEDWritePairing` and compare
+the pending AW/W counts, last-W handshake, target B retirement and completion
+pulse with the SFC `LatencyPipe` counter cone. Control responses/slave-1 binding,
+generalized FASED geometry, multiple/wider TracerV profiles, complete NIC host
+memory/stream composition, recorded clock-gate shim behavior and partition/QSFP
+integration remain incomplete.

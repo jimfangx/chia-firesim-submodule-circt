@@ -4411,10 +4411,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteLatencyAnnotations, error)))
         return fail("FASED write latency annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED ten-entry write latency queue and completion boundary in " << fasedWriteLatencyPath << '\n';
-      // NIC and Rocket share this targetFire-qualified deadline queue. The
-      // completion pulse and oldest AW ID still require native AW/W pairing.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED AW/W completion pairing, control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDTimingAWQueue(circuit, error)))
         return fail("FASED timing AW queue: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED timing AW queue produced invalid FIRRTL IR");
@@ -4428,6 +4424,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedTimingAWQueueAnnotations, error)))
         return fail("FASED timing AW queue annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED ten-entry timing AW metadata queue and completion ID binding in " << fasedTimingAWQueuePath << '\n';
+      // NIC and Rocket share the accepted-AW ID queue. Its head now supplies
+      // write completion metadata; pending AW/W counters must supply the pulse.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED pending AW/W completion counters, control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDWritePairing(circuit, error)))
         return fail("FASED write pairing: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED write pairing produced invalid FIRRTL IR");
