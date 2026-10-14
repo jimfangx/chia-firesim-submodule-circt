@@ -3436,3 +3436,90 @@ counter, consumed ready inputs and annotation transfer to SFC before attaching
 runtime request-limit MMIO. Full NIC host/control/platform composition,
 generalized FASED flight counts/geometry, multiple/wider TracerV profiles,
 recorded clock-gate shim behavior and partition/QSFP integration remain pending.
+
+
+## Iteration 206 — NIC AR admission and final-R retirement (2026-10-14)
+
+The native compiler now invokes `bindFASEDReadAdmission` on the archived NIC
+composition and emits `post-fame-fased-read-admission.mlir` plus its complete
+annotation JSON before rejecting runtime request-limit MMIO. This advances an
+actual CIRCT FIRRTL operation boundary. NIC compilation still fails explicitly:
+`NIC FASED request limits, control responses and platform integration are not implemented`.
+No SFC fallback or FireSim manager verification step was started.
+
+The executable Scala oracle is `TimingModel.scala` lines 104–106 and 226–231:
+AR.fire increments pending reads; R.fire && R.last retires one; AR.ready is
+!pendingReads.full. The native helper uses one four-bit host-clocked counter,
+qualified reset/state updates, simultaneous-inc/dec hold, empty saturation,
+full comparison against the live limit and no state clamp when the limit falls.
+Eight internal observation ports carry the actual releaser final-R handshake.
+Both the consumed and observed AR.ready use the same counter result. AW/W and
+request payloads retain their existing connections.
+
+Changed core files are `tools/goldengate.cpp`,
+`test/Transforms/FASEDReadAdmissionTest.cpp`,
+`test/Transforms/NICFASEDReadAdmissionCompare.py`, and this ledger. The C++ test
+now validates the production feedback and eight observation hops, clones the
+actual two final-R AndPrimOps, original counter-input/output connections and
+entire helper body into a native probe, and verifies that probe before export.
+The comparison checks the production composition, recursive annotation transfer
+and exact shared helper body against the fresh no-NIC boundary.
+
+Exact NIC SFC artifact compared:
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+Its `LatencyPipe`, `IdentityModule`, `AXI4Releaser`, `SatUpDownCounter_1` and
+`FASEDMemoryTimingModel` define the tested boundary. The extracted counter,
+AR/final-R equations and recorded clock-gate contract also match the immutable
+U250 build-tree `sfc-golden-2026-10-01/design/FireSim-generated.sv` fixture.
+The SFC counter module, original instance and assignments execute verbatim.
+Only the surrounding shell and proven IdentityModule aliases are collapsed.
+
+Fresh NIC candidate SHA256 `67307836ee73988779f4b05d2aaae865d4838ea83b73d82ca0fe03c57284547d`.
+Comparison retained 185 unaffected modules, checked all
+8 observation hops and 1607
+prior/observation connections, 205 new wrapper
+connections and all 1792 annotation records.
+Both implementations close their own AR readiness back into acceptance.
+The emitted production operations and SFC counter passed 40,231
+Verilator differential cycles with outputs/registers checked before and after
+every edge. All 16 limits, 16 counter states and 32 reset/fire/R-ready/valid/last
+contexts were covered. Observed coverage includes 4323 accepted
+ARs, 2636 accepted final R beats, 4978
+non-final R beats, 11498 blocked ARs, 176
+empty retirements, 549 simultaneous inc/dec cases,
+20268 lowered-limit cases and 184 stalled
+resets. The independent no-NIC preflight passed the same differential.
+An initial stimulus coverage failure (48 empty retirements) was corrected by a
+directed underflow sequence; no behavioral mismatch was observed.
+
+Native compiler/test build and `goldengate-fased-read-admission` CTest passed,
+including 27 atomic rejection cases in each of legacy and selected profiles.
+Three production mutations passed native IR verification and were rejected by
+the export contract: wrong retirement feedback, missing final-beat qualification
+and mismatched observed AR readiness. Focused reports and full logs are in
+`/scratch/jfx/fsim-circt/sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration206-u250-target-matrix` (not a golden fixture).
+
+The compiler SHA256 is `a764aa287ebdae563096e62712488f87aff43dfc2cec5f0a3abe03b031c7457c` and the archive manifest SHA256
+is `0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`. All 13 archived targets replayed with their recorded
+FIRRTL/annotation hashes and effective U250 platforms. Statuses remain one
+compiled, six failed, six unsupported platforms. All complete stderr logs were
+inspected. Boundary records remain eight matched, six SRAM model-port
+mismatches, twelve not reached; these are partial checks, not support claims.
+All 208 earlier NIC MLIR/JSON artifacts are byte-identical to iteration 205;
+only the new read-admission MLIR/JSON pair was added. The no-NIC final RTL,
+C/C++ header, Verilog header and both XDC outputs remain byte-identical.
+Immutable primary SFC handoff hashes and normalized U250 XDC were rechecked.
+
+Mutable iteration 203 replay MLIR was gzip-compressed with a manifest and
+verified decompressed SHA256: 560 files, recovering 35,698,790,037 bytes. Completed
+SFC goldens and current candidates were not compressed or modified.
+
+The next smallest step is NIC request-limit MMIO attachment: compare host-clock
+read/write maxima, reset default 10, full-word readback and low-four-bit admission
+binding against the SFC FASED register cone before moving the guard. Runtime
+limits, control responses, complete NIC host/platform integration, generalized
+FASED geometry/flight counts, wider/multiple TracerV profiles and partition/QSFP
+integration remain pending. This differential excludes completion-queue execution
+and the recorded enable-register shim's delta-cycle behavior. The overall port
+and pending SFC UART-bearing regression baseline remain incomplete.

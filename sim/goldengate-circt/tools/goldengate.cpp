@@ -4463,10 +4463,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteAdmissionAnnotations, error)))
         return fail("FASED write admission annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED target AW/W readiness to pending write counters in " << fasedWriteAdmissionPath << '\n';
-      // NIC closes AW/W admission independently with the respective full flag.
-      // Read admission and runtime request-limit MMIO remain separate boundaries.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED read admission, request limits, control responses and platform integration are not implemented");
       if (failed(goldengate::bindFASEDReadAdmission(circuit, error)))
         return fail("FASED read admission: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read admission produced invalid FIRRTL IR");
@@ -4480,6 +4476,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedReadAdmissionAnnotations, error)))
         return fail("FASED read admission annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED pending reads, final R retirement and AR admission in " << fasedReadAdmissionPath << '\n';
+      // NIC now closes AR admission and retires accepted final R beats.
+      // Runtime request-limit MMIO is the next independently checked boundary.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED request limits, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
         return fail("FASED request limits: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED request limits produced invalid FIRRTL IR");

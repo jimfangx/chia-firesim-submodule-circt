@@ -3,6 +3,7 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
@@ -174,10 +175,112 @@ void rejection(MLIRContext &ctx) {
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");
   llvm::outs()<<"27 atomic rejection cases passed\n";
 }
+
+unsigned port(FModuleOp m, llvm::StringRef name) {
+  for (unsigned i=0;i<m.getNumPorts();++i) if(m.getPortName(i)==name)return i;
+  throw std::runtime_error("missing production port: "+name.str());
 }
-int main() {
+void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
+  auto root=parseSourceFile<ModuleOp>(input,&ctx);
+  require(bool(root)&&succeeded(verify(*root)),"invalid production read-admission boundary");
+  auto c=*root->getOps<CircuitOp>().begin();
+  require(c.getName()=="GGFASEDReadAdmissionWrapper","expected production read-admission boundary");
+  auto top=named(c,c.getName());auto sim=*top.getOps<InstanceOp>().begin();
+  require(sim.getModuleName()==names[0],"wrong production top sim");
+  auto helper=named(c,"GGFASEDReadAdmission");InstanceOp original;
+  for(auto i:top.getOps<InstanceOp>())if(i.getModuleName()==helper.getName())original=i;
+  require(bool(original),"missing production read counter");
+  require(driver(top,original.getResult(4))==sim.getResult(port(named(c,names[0]),"fased_accepted_r_last_fire")),"R retirement feedback differs");
+  require(driver(top,original.getResult(0))==top.getBodyBlock()->getArgument(port(top,"hostClock"))&&
+    driver(top,original.getResult(1))==sim.getResult(port(named(c,names[0]),"fased_model_reset"))&&
+    driver(top,original.getResult(2))==sim.getResult(port(named(c,names[0]),"fased_tfire"))&&
+    driver(top,original.getResult(5))==top.getBodyBlock()->getArgument(port(top,"fased_read_max_reqs")),"clock/reset/fire/maximum binding differs");
+  auto arValid=driver(top,original.getResult(3)).getDefiningOp<SubfieldOp>();
+  auto ar=arValid?arValid.getInput().getDefiningOp<SubfieldOp>():SubfieldOp();
+  require(arValid&&arValid.getFieldName()=="valid"&&ar&&ar.getFieldName()=="ar"&&
+    ar.getInput()==sim.getResult(port(named(c,names[0]),"fased_timing_requests")),"wrong accepted AR source");
+  Value observed;
+  for(unsigned j=0;j<8;++j) {
+    auto m=named(c,names[j]);auto v=driver(m,m.getBodyBlock()->getArgument(port(m,"fased_accepted_r_last_fire")));
+    if(j<7) {
+      auto child=v.getDefiningOp<InstanceOp>();auto next=named(c,names[j+1]);
+      require(child&&child.getInstanceName()=="sim"&&child.getModuleName()==names[j+1]&&
+        v==child.getResult(port(next,"fased_accepted_r_last_fire")),"final-R observation hop differs");
+    }else observed=v;
+  }
+  auto final=observed.getDefiningOp<AndPrimOp>();
+  require(bool(final),"missing final-R handshake");
+  auto handshake=final.getLhs().getDefiningOp<AndPrimOp>();
+  auto last=final.getRhs().getDefiningOp<SubfieldOp>();
+  require(handshake&&last&&last.getFieldName()=="last","missing final-R last qualification");
+  auto ready=handshake.getLhs().getDefiningOp<SubfieldOp>(),valid=handshake.getRhs().getDefiningOp<SubfieldOp>();
+  auto bits=last.getInput().getDefiningOp<SubfieldOp>();
+  require(ready&&valid&&ready.getFieldName()=="ready"&&valid.getFieldName()=="valid"&&
+    ready.getInput()==valid.getInput()&&bits&&bits.getFieldName()=="bits"&&
+    bits.getInput()==ready.getInput(),"wrong production R fields");
+  auto releaser=ready.getInput().getDefiningOp<InstanceOp>();
+  require(releaser&&releaser.getInstanceName()=="releaser"&&releaser.getModuleName()=="GGFASEDResponseReleaser"&&
+    ready.getInput()==releaser.getResult(port(named(c,"GGFASEDResponseReleaser"),"r")),"wrong production R source");
+  Value outerReady;unsigned readyBindings=0;
+  for(auto op:top.getOps<StrictConnectOp>())if(op.getSrc()==original.getResult(6)) {
+    auto field=op.getDest().getDefiningOp<SubfieldOp>();
+    auto channel=field?field.getInput().getDefiningOp<SubfieldOp>():SubfieldOp();
+    require(field&&field.getFieldName()=="ready"&&channel&&channel.getFieldName()=="ar","wrong read-ready destination");
+    Value base=channel.getInput();
+    require(base==top.getBodyBlock()->getArgument(port(top,"fased_timing_requests"))||
+      base==sim.getResult(port(named(c,names[0]),"fased_timing_requests")),"wrong read-ready feedback");
+    if(isa<BlockArgument>(base))outerReady=op.getDest();
+    ++readyBindings;
+  }
+  require(readyBindings==2&&outerReady,"accepted and observed AR ready must share the counter output");
+  auto isolated=ModuleOp::create(c.getLoc());OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(isolated.getBody());
+  auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGFASEDReadAdmissionProbe"));
+  b.setInsertionPointToEnd(exported.getBodyBlock());b.insert(helper->clone());
+  SmallVector<PortInfo> ports;
+  for(auto p:helper.getPorts())if(p.name.getValue()!="rLastFire")ports.push_back(p);
+  auto bit=UIntType::get(&ctx,1,false);
+  for(auto name:{"rReady","rValid","rLast"})ports.push_back({b.getStringAttr(name),bit,Direction::In});
+  auto probe=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDReadAdmissionProbe"),
+    ConventionAttr::get(&ctx,Convention::Internal),ports);probe.setPublic();
+  b.setInsertionPointToEnd(probe.getBodyBlock());
+  auto counter=b.create<InstanceOp>(c.getLoc(),helper,"counter");IRMapping map;
+  for(unsigned i=0;i<helper.getNumPorts();++i)map.map(original.getResult(i),counter.getResult(i));
+  map.map(ready.getResult(),probe.getBodyBlock()->getArgument(port(probe,"rReady")));
+  map.map(valid.getResult(),probe.getBodyBlock()->getArgument(port(probe,"rValid")));
+  map.map(last.getResult(),probe.getBodyBlock()->getArgument(port(probe,"rLast")));
+  b.clone(*handshake,map);Value accepted=b.clone(*final,map)->getResult(0);
+  for(unsigned i=0;i<helper.getNumPorts();++i) {
+    auto name=helper.getPortName(i);Value dest,src;
+    if(helper.getPortDirection(i)==Direction::In) {
+      dest=original.getResult(i);src=driver(top,dest);
+      map.map(src,name=="rLastFire"?accepted:probe.getBodyBlock()->getArgument(port(probe,name)));
+    }else {
+      src=original.getResult(i);
+      if(name=="arReady")dest=outerReady;
+      else for(auto &op:*top.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(1)==src) {
+        require(!dest,"multiple pending-read output bindings");dest=op.getOperand(0);
+      }
+      require(bool(dest),"missing counter output binding");
+      map.map(dest,probe.getBodyBlock()->getArgument(port(probe,name)));
+    }
+    bool copied=false;
+    for(auto &op:*top.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==dest&&op.getOperand(1)==src) {
+      b.clone(op,map);copied=true;
+    }
+    require(copied,"production counter connection not cloned");
+  }
+  require(succeeded(verify(isolated)),"invalid production read-admission probe");
+  std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot export read-admission probe");
+  isolated.print(out);out<<'\n';out.close();isolated.erase();
+  llvm::outs()<<"Cloned production final-R handshake, AR feedback and counter bindings after validating eight observation hops\n";
+}
+}
+int main(int argc,char **argv) {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
   try {
+    require(argc==1||argc==3,"usage: goldengate-fased-read-admission-test [boundary.mlir probe.mlir]");
+    if(argc==3){exportProduction(ctx,argv[1],argv[2]);return 0;}
     const llvm::StringRef selectedNames[]{"GGSelectedPrintFASEDWriteAdmissionWrapper", "GGSelectedPrintFASEDWriteRetirementWrapper",
       "GGSelectedPrintFASEDWritePairingWrapper", "GGSelectedPrintFASEDTimingAWQueueWrapper",
       "GGSelectedPrintFASEDWriteLatencyWrapper", "GGSelectedPrintFASEDReadLatencyWrapper",
