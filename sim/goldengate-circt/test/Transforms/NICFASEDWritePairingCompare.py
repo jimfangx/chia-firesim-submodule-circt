@@ -117,15 +117,23 @@ endmodule
     return 'module SatUpDownCounter_1('+header+');'+counter+'endmodule\n'+shell, gate
 
 
-def differential(candidate, cone, gate, export_tool, out):
+def differential(candidate, cone, gate, export_tool, out, retirement=False):
     out = out.resolve(); out.mkdir(parents=True, exist_ok=False)
     def run(cmd, name):
         with (out/(name+'.log')).open('w') as log:
             subprocess.run(list(map(str, cmd)), stdout=log, stderr=subprocess.STDOUT, check=True)
     exported, native = out/'write-pairing.mlir', out/'write-pairing.sv'
     run([export_tool, candidate, exported], 'export')
-    assert modules(exported.read_text().replace('firrtl.module public @', 'firrtl.module @')) == {
-        HELPER: modules(candidate.read_text())[HELPER]}, 'export rebuilt production helper'
+    exported_text = exported.read_text().replace('firrtl.module public @', 'firrtl.module @')
+    isolated = modules(exported_text)
+    assert isolated[HELPER] == modules(candidate.read_text())[HELPER], 'export rebuilt production helper'
+    assert set(isolated) == ({HELPER, 'GGFASEDWriteRetirementProbe'} if retirement else {HELPER})
+    if retirement:
+        expected = {'pairing.'+n: 'top.'+n for n in
+                    ('clock', 'reset', 'targetFire', 'awFire', 'wLastFire', 'writeMaxReqs')}
+        expected.update({'pairing.bFire': frozenset({'top.bReady', 'top.bValid'}),
+                         'top.pairComplete': 'pairing.pairComplete', 'top.pending': 'pairing.pending'})
+        assert wiring(exported_text, 'GGFASEDWriteRetirementProbe', aggregate=True) == expected
     run(['firtool', exported, '--format=mlir', '--disable-all-randomization', '-o', native], 'firtool')
     (out/'oracle.sv').write_text(cone)
     (out/'recorded-clock-gate.sv').write_text(gate)
@@ -213,6 +221,23 @@ initial begin
  $finish;
 end endmodule
 '''
+    if retirement:
+        tb = tb.replace('GGFASEDWritePairing candidate(.*);',
+                        'GGFASEDWriteRetirementProbe candidate(.bReady(br),.bValid(bv),.*);')
+        tb = tb.replace('candidate.pendingAW', 'candidate.pairing.pendingAW')
+        tb = tb.replace('candidate.pendingW', 'candidate.pairing.pendingW')
+        tb = tb.replace('task step;', '''integer acceptedB=0,stalledB=0,bBackpressure=0,bReadyOnly=0;
+reg [15:0] bContexts=0;
+task step;''')
+        tb = tb.replace('limits[writeMaxReqs]=1;', '''bContexts[{reset,targetFire,br,bv}]=1;
+ acceptedB+=bFire&&targetFire;stalledB+=bFire&&!targetFire;
+ bBackpressure+=bv&&!br;bReadyOnly+=br&&!bv;
+ limits[writeMaxReqs]=1;''')
+        tb = tb.replace(' $finish;', ''' if(bContexts!=16'hffff||acceptedB<100||stalledB<100||bBackpressure<100||bReadyOnly<100)
+  $fatal(1,"missing B retirement coverage");
+ $display("accepted_b=%0d stalled_b=%0d valid_backpressure=%0d ready_without_valid=%0d b_contexts=%0d",
+ acceptedB,stalledB,bBackpressure,bReadyOnly,bContexts);
+ $finish;''')
     (out/'check.sv').write_text(tb)
     run(['verilator', '--binary', '--assert', '-j', '4', '--timing', '-Wno-fatal',
          '--top-module', 'check', '--Mdir', out/'obj', '-o', 'check',
@@ -221,6 +246,7 @@ end endmodule
     log = (out/'simulation.log').read_text(); assert 'PASS cycles=' in log
     return dict({n: int(v) for n, v in re.findall(r'(\w+)=(\d+)', log)},
                 production_helper_cloned_verbatim=True, original_sfc_counters_and_pairing_executed=True,
+                production_retirement_handshake_and_counter_bindings_executed=retirement,
                 original_aw_w_b_handshake_equations_executed=True,
                 all_sixteen_limits_and_counter_states_exercised=True,
                 outputs_and_registers_compared_before_and_after_every_edge=True,
