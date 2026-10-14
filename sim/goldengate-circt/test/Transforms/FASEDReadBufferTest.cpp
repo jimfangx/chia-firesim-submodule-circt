@@ -233,9 +233,30 @@ void rejection(MLIRContext &context, bool selected) {
   llvm::outs()<<"18 atomic rejection cases\n";
 }
 } // namespace
-int main() {
+int main(int argc, char **argv) {
   try {
     MLIRContext context;context.getOrLoadDialect<FIRRTLDialect>();context.getOrLoadDialect<circt::hw::HWDialect>();
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &context);
+      require(bool(root) && succeeded(verify(*root)), "production read buffer boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDReadBufferWrapper" ||
+              circuit.getName() == "GGSelectedPrintFASEDReadBufferWrapper",
+              "expected FASED read buffer boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&context);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDReadBuffer16x8"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      // Clone actual production FIRRTL, including its memory and all control
+      // expressions. No queue state or payload logic is rebuilt for this test.
+      auto helper = cast<FModuleOp>(b.insert(named(circuit, "GGFASEDReadBuffer16x8")->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)), "exported read buffer invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot export read buffer"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-read-buffer-test [read-buffer.mlir helper.mlir]");
     for (bool selected : {false,true}) { behavior(context,selected);rejection(context,selected); } return 0;
   } catch (const std::exception &e) {llvm::errs()<<e.what()<<'\n';return 1;}
 }

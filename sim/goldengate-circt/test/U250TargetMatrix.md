@@ -2419,3 +2419,75 @@ occupancy, synchronous prefetch and data/last behavior. Timing/control
 responses, slave-1 binding, wider/multiple TracerV profiles, generalized FASED
 geometry, complete NIC host memory/stream composition and partition/QSFP
 support remain incomplete.
+
+### Iteration 195: execute native NIC read-response storage
+
+The compiler now executes `addFASEDReadBuffer` on the actual NIC replay and
+emits verified `post-fame-fased-read-buffer.mlir` and its complete annotation
+archive before rejecting the remaining NIC response scheduling, timing/control
+and platform integration. This is the existing CIRCT sixteen-ID, eight-beat
+non-ROB queue, driven by actual host response data/last/ID, host clock and
+qualified egress reset. The no-ROB SFC `ReadEgress` host ready remains constant
+one; its internal queue full signal is not substituted for that ready.
+
+Changes are confined to `tools/goldengate.cpp`, the production-helper export
+mode in `test/Transforms/FASEDReadBufferTest.cpp`, this ledger, and the new
+`test/Transforms/NICFASEDReadBufferCompare.py`. The exporter clones the actual
+production FIRRTL helper, including its RAM and control operations, verbatim.
+The comparison lowers that clone through firtool and compiles it alongside
+the complete actual recorded SFC `MultiQueue` RTL, renaming only its module
+symbol. It does not reconstruct the oracle's sequential state equations.
+
+The exact matrix golden is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+(relative to the outer repository). The complete `ReadEgress` and `MultiQueue`
+headers/bodies also match the immutable
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+Geometry, selector, pointer/full/reset and enqueue/dequeue connections match
+the Scala `EgressUnit.scala` / `widgets/Lib.scala` oracle.
+
+Fresh evidence is under the no-NIC U250 generated directory's
+`iteration195-u250-target-matrix/`. `nic-read-buffer-comparison.json` reports
+40,322 matching clock cycles and 21,910 defined payload comparisons, including
+74 full-queue observations, 142 reset-time writes, 25,034 ID switches,
+5,444 simultaneous enqueue/dequeue cases and 26 pointer wraps. All 48 pointer
+and occupancy registers, the delayed ID, handshake and synchronous prefetch
+state are compared on every edge. Every payload RAM location is initialized
+before payload comparisons; unspecified initial memory and same-address
+read/write payloads are excluded. The run observes 1,310 read/write collisions;
+none produces a valid undefined payload requiring a skipped comparison.
+This is bounded differential evidence for storage, not NIC runtime parity.
+
+The actual NIC wrapper retains 173 earlier modules, all 199 connections and
+1,792 annotation records with exact recursive target transfer. All 186 prior
+NIC FIRRTL/annotation artifacts match iteration 194; only the two read-buffer
+artifacts are added. The working no-NIC Rocket's final RTL, both driver headers
+and both XDC files remain identical. Fresh immutable primary Rocket handoff
+hashes and normalized U250 XDC comparisons also match, including the recorded
+implementation-XDC hierarchy rename. Neither immutable fixture was modified.
+The focused CTest passes 40,000 state/edge samples and 18 atomic rejection
+cases for each baseline and selected Print profile. No manager verification
+was started.
+
+Run the new comparator in the sourced environment with `--candidate-dir`
+pointing to the NIC replay, `--baseline` to the no-NIC production
+`post-fame-fased-read-buffer.mlir`, `--golden` to the SFC SV above,
+`--export-tool` to `goldengate-fased-read-buffer-test`, a fresh absolute
+`--output-dir` and `--report-json`.
+
+Fresh thirteen-target replay uses compiler SHA256
+`05138ec0c31ea704bbf8042255d8ce9209059856e8bd963f4bb2c868cadaeb2a`.
+`replay/matrix.json` and `matrix-regression-comparison.json` retain one compiled
+no-NIC target, six later compiler failures and six unsupported partition/QSFP
+platforms. All thirteen input hashes, effective platforms, compile statuses
+and structured boundary comparisons match iteration 194. All seven reached
+BridgeIO/channel boundaries match SFC; Shuttle model-port annotations match,
+while the other six retain the recorded native-SRAM differences. The replay's
+nonzero exit preserves these gaps. Only the NIC diagnostic advances.
+
+The next smallest step is to execute native NIC read-response request
+scheduling against `ReadEgress`, checking held ID/valid, request priority,
+targetFire, token readiness and final-beat retirement together with this RAM.
+Timing/control responses, slave-1 binding, wider/multiple TracerV profiles,
+generalized FASED geometry, complete NIC host memory/stream composition and
+partition/QSFP support remain incomplete.

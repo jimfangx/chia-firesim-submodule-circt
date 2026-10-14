@@ -4313,11 +4313,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedDeadlockAnnotations, error)))
         return fail("FASED ingress deadlock annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED ingress enqueue deadlock assertions in " << fasedDeadlockPath << '\n';
-      // NIC observes the same actual AW/W enqueue and qualified ingress reset.
-      // Preserve this verified boundary before the remaining response/control
-      // and platform composition work.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED response buffering, timing/control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDReadBuffer(circuit, error)))
         return fail("FASED read buffer: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read buffer produced invalid FIRRTL IR");
@@ -4331,6 +4326,11 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedReadBufferAnnotations, error)))
         return fail("FASED read buffer annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED read responses in sixteen 8-beat ID queues in " << fasedReadBufferPath << '\n';
+      // NIC uses the same non-ROB ReadEgress storage profile and qualified
+      // egress reset. Preserve the native storage boundary before scheduling,
+      // timing/control responses and platform composition are implemented.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED response scheduling, timing/control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDReadScheduler(circuit, error)))
         return fail("FASED read scheduler: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read scheduler produced invalid FIRRTL IR");
