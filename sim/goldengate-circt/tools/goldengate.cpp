@@ -4477,9 +4477,6 @@ int main(int argc, char **argv) {
         return fail("FASED read admission annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED pending reads, final R retirement and AR admission in " << fasedReadAdmissionPath << '\n';
       // NIC now closes AR admission and retires accepted final R beats.
-      // Runtime request-limit MMIO is the next independently checked boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED request limits, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
         return fail("FASED request limits: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED request limits produced invalid FIRRTL IR");
@@ -4493,6 +4490,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsAnnotations, error)))
         return fail("FASED request limits annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock request-limit registers and admission binding in " << fasedRequestLimitsPath << '\n';
+      // NIC runtime maxima now use the same host-clock MCR bank as Rocket.
+      // Latency MMIO is the next independently checked composition boundary.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED latency registers, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
         return fail("FASED latency registers: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED latency registers produced invalid FIRRTL IR");

@@ -3523,3 +3523,92 @@ FASED geometry/flight counts, wider/multiple TracerV profiles and partition/QSFP
 integration remain pending. This differential excludes completion-queue execution
 and the recorded enable-register shim's delta-cycle behavior. The overall port
 and pending SFC UART-bearing regression baseline remain incomplete.
+
+
+## Iteration 207 — NIC request-limit MMIO and admission binding (2026-10-14)
+
+The actual native compiler now invokes `attachFASEDRequestLimits` on the NIC
+composition and emits `post-fame-fased-request-limits.mlir` and complete
+annotation JSON before rejecting latency MMIO. Its explicit remaining guard is
+`NIC FASED latency registers, control responses and platform integration are not implemented`.
+No SFC fallback or FireSim manager verification step was started.
+
+The executable Scala oracle is `SplitTransactionMMRegIO.maxReqRegisters` in
+`TimingModel.scala`, `Widget.attachIO/genAndAttachReg`, and `MCRIO.bindReg` in
+`widgets/Lib.scala`. Host-clock registers reset to 10, accept independent full
+32-bit writes without strobes or target-fire qualification, return full words,
+and drive the low four bits into the existing pending-read/write admission.
+The FAME host reset/clock distinction was checked in `FAMETransform.scala`;
+`MidasTransforms.scala` remains the preserved pass-order oracle.
+
+Changed files are `tools/goldengate.cpp`,
+`test/Transforms/FASEDRequestLimitsTest.cpp`,
+`test/Transforms/NICFASEDRequestLimitsCompare.py`, and this ledger.
+The C++ exporter verifies the real production IR, checks host reset/clock and
+both consumed admission inputs, clones the entire native bank verbatim, and
+clones its five original clock/reset/admission/MCR connections into a probe.
+The comparison executes that emitted probe with firtool and Verilator against
+original SFC register declarations, host-edge updates, readback and low-bit
+assignments. Constant MCR valid/ready outputs, optimized away in SFC RTL, are
+checked against the Scala `bindReg` contract.
+
+Exact archived NIC SFC artifacts compared:
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`;
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h`
+SHA256 `ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`.
+The `FASEDMemoryTimingModel` register cone matches the immutable U250 build-tree
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv` fixture and executes without a semantic mismatch.
+The NIC driver's readable/writeable addresses 136/140 match native FASED base
+128 plus offsets 8/12 (words 2/3). All three retained allocation-region tables
+agree. The immutable build-tree has no corresponding `.const.h`; the driver
+address comparison uses the completed NIC archive header above.
+
+Fresh NIC candidate SHA256 `6f233d2cbcd9258535a81ae9117ec03f10904981d6f3a67e08ab93ad09ff5603`.
+All 195 prior modules and 1792
+annotation records are preserved; 198 wrapper
+connections and 193 copied ports match the expected composition.
+Only the two explicit maximum inputs are consumed. The helper body exactly
+matches the fresh no-NIC boundary. Verilator differential testing passed
+32,849 cycles, checking outputs and registers before and after every
+edge. All 16 strobes, all four independent write-valid masks, and all 16 limits
+on each admission input were exercised. Coverage includes 32,869 writes,
+1,561 zero-strobe writes, 790 reset/write overlaps,
+16,445 upper-bit writes, 12,431 writes during target stalls,
+and 24,692 read-backpressure samples.
+
+Native compiler/test build and `goldengate-fased-request-limits` CTest passed:
+65,536 cycles across legacy/selected profiles and 68 atomic rejection cases.
+The independent no-NIC preflight passed the same RTL differential. Three
+production mutations passed FIRRTL verification and were then rejected:
+model reset instead of host reset, crossed admission maxima, and missing MCR
+connection. An initial collateral check assumed a single region table; it was
+corrected to check agreement across the three actual copies. The failed attempt
+to read an absent immutable header was corrected to use the archived NIC header.
+No RTL behavioral mismatch was observed.
+
+Compiler SHA256 `014e2302e98ce6e89d4fc876258b9e7ec211e76ad57ff6d3b484ae7d40407f21`;
+archive manifest SHA256 `0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+All 13 recorded U250 recipes replayed with their exact input hashes and effective
+platforms, including all six distinct partition configurations. Statuses remain
+one compiled, six failed, six unsupported platforms. Complete stderr logs were
+read. Partial boundary records remain eight matched, six SRAM model-port
+mismatches and twelve not reached; these are not semantic support claims.
+The 210 earlier NIC MLIR/JSON artifacts are byte-identical to iteration 206;
+only the request-limit MLIR/JSON pair was added. No-NIC final SV, C/C++ header,
+Verilog header and both XDC outputs are byte-identical. Immutable primary SFC
+handoff hashes and normalized U250 XDC were rechecked.
+
+Reports and full focused logs are in `/scratch/jfx/fsim-circt/sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration207-u250-target-matrix`.
+Mutable iteration 204 replay MLIR was gzip-compressed with verified decompressed
+SHA256 and a manifest: 561 files, recovering 35,743,183,854 bytes.
+Completed goldens and current candidates were not compressed or modified.
+
+The next smallest step is NIC latency-register attachment: compare host-clock
+read/write latency MMIO defaults, readback and timing-pipe bindings to SFC.
+Control response routing and complete NIC platform integration, generalized
+FASED flight counts/geometry, wider/multiple TracerV profiles and partition/QSFP
+integration remain pending. This differential isolates decoded MCR fragments;
+full control transport, admission-counter execution and complete NIC workloads
+remain separate validation boundaries. The overall port and the pending SFC
+UART-bearing regression baseline remain incomplete.
