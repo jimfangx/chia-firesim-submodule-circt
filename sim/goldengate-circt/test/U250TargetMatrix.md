@@ -2922,3 +2922,96 @@ AW/W pairing, control responses/slave-1 binding, generalized FASED geometry,
 multiple/wider TracerV profiles, complete NIC host memory/stream composition,
 the recorded clock-gate shim behavior and partition/QSFP integration remain
 incomplete.
+
+### Iteration 201: connect native NIC write deadline queue
+
+The actual NIC compiler path now invokes `addFASEDWriteLatency`, verifies the
+native FIRRTL operations and emits `post-fame-fased-write-latency.mlir` and
+`-all.json`. The wrapper consumes the write release deadline and next-write
+ports and connects the shared ten-entry deadline queue to the response
+releaser. Its completion input still requires `newWReq` and the oldest accepted
+AW ID. The NIC rejection is retained immediately before `addFASEDTimingAWQueue`
+and now identifies AW/W completion pairing, control responses and platform
+integration. This is a partial compiler boundary, not complete NIC support.
+
+The executable Scala oracle is `LatencyBandwidthPipe.scala` 61–74 and
+`TimingModel.scala` 234–254, with the host/model clock distinction in
+`FASEDMemoryTimingModel.scala`, `MidasTransforms.scala` and `FAMETransform.scala`.
+The implementation executes the existing CIRCT memory, register, comparison,
+assertion and connection operations; no Scala syntax is translated.
+
+Evidence is in the mutable generated directory
+`iteration201-u250-target-matrix/`. `nic-write-latency-comparison.json` compares
+the fresh production NIC
+`replay/alveo_u250_firesim_rocket_singlecore_nic/candidate/post-fame-fased-write-latency.mlir`
+and `-all.json` against these exact SFC artifacts:
+
+```text
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+The original SFC `Queue_15`, the write release/retirement equations from
+`LatencyPipe` and recorded clock-gate module match the immutable reference
+after whitespace/comment normalization. `NICFASEDWriteLatencyCompare.py`
+exports the production helper verbatim through `FASEDWriteLatencyTest.cpp`,
+lowers it with firtool and executes it against the original queue and release
+equations in Verilator. It pins enqueue to the parent RTL's `newWReq` and
+oldest AW ID contract; the AW/W counters themselves remain outside this test.
+All initialized 64-bit deadlines and 4-bit IDs in both RAM implementations
+are compared on every edge. Uninitialized RAM is not treated as defined data.
+A separate invalid enqueue executes and rejects the native overflow assertion;
+the SFC parent assertion's admission and reset predicate are pinned as well.
+
+All queue handshake/ID outputs, pointers and full state match before and after
+every edge over 40,197 cycles: 145 empty flows, 651 full-queue pops, 20,074
+stalls, 195 stalled resets, 43 enabled reset edges that still write RAM,
+792 pointer wraps, 1,647 simultaneous enqueue/dequeue cases, 22,505 blocked
+head cases, 1,944 equal deadlines and 20,038 maximal deadlines. The production
+wrapper retains 185 prior modules, checks all 198 connections and exact copied
+port types, and recursively transfers all 1,792 annotations. Consumed ports
+retain their inner module identity. The queue helper matches the fresh no-NIC
+production helper exactly.
+
+The clock-gate limitation from iteration 199 remains: this differential
+executes the Scala targetFire-qualified model-edge contract with
+`clock & targetFire`. It pins SFC host clock/reset/targetFire bindings and
+retains the original gate module in
+`nic-write-latency-differential/recorded-clock-gate.sv`, but does not execute
+or claim delta-cycle parity for the recorded posedge enable-register shim.
+Full NIC integration and complete clock-gate semantics remain unproved.
+
+Focused CTest passes 30,093 transitions, 16 wrapper mapping cases, five target
+transfers and 21 atomic rejections for each baseline/selected Print profile.
+The comparator accepts `--candidate-dir` for the NIC replay, `--baseline` for
+fresh no-NIC write-latency MLIR, `--golden` and `--immutable` for the paths above,
+`--export-tool` for `goldengate-fased-write-latency-test`, a fresh absolute
+`--output-dir`, and `--report-json`. An initial preflight uses iteration 200's
+no-NIC helper; the final report executes this iteration's NIC helper.
+
+All 198 earlier NIC FIRRTL/annotation artifacts match iteration 200
+byte-for-byte; only two write-latency artifacts are added. The no-NIC final RTL,
+both headers and both XDC files are identical to iteration 200. Both primary
+immutable handoff hashes and normalized immutable U250 XDC match, including
+the recorded implementation hierarchy rename. Immutable fixtures are unchanged.
+
+The fresh thirteen-target replay uses compiler SHA256
+`4477ca2cdf7e2e6a77659d54744466714818a6f00421be27e0d235f2521d16a6`.
+`replay/matrix.json` and `matrix-regression-comparison.json` retain one compiled
+no-NIC target, six later compiler failures and six unsupported partition/QSFP
+platforms. All thirteen archived input hashes, effective platform semantics,
+statuses and structured boundary comparisons match iteration 200; only the NIC
+unsupported diagnostic advances. Reached bridge/channel boundaries match SFC;
+the six previously documented native SRAM model-port differences remain.
+Partial boundary comparisons do not imply full target support. All thirteen
+stderr logs were inspected. No manager verification step was started here.
+Older mutable iteration 196 MLIR was compressed with decompressed SHA256
+verification and a manifest, recovering 35,389,660,849 bytes without modifying
+current candidates or any golden.
+
+The next smallest step is to connect native NIC `FASEDTimingAWQueue` and compare
+its accepted AW metadata, flow-through head ID, reset and retirement with SFC
+`Queue_14`. Then the pending AW/W counters can supply the completion pulse.
+Control responses/slave-1 binding, generalized FASED geometry, multiple/wider
+TracerV profiles, complete NIC host memory/stream composition, the recorded
+clock-gate shim behavior and partition/QSFP integration remain incomplete.
