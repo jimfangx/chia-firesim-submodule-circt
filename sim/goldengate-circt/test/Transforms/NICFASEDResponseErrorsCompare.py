@@ -6,8 +6,8 @@ Decoded MCR and observed response inputs isolate the status register boundary;
 full control transport, response queues and NIC workloads remain separate.
 SFC optimizes R/B ready away; RTL comparison uses its always-ready boundary.
 The native CTest separately enumerates stalled handshakes and assertion enables.
-Illegal-write predicates/messages match, but SFC prints while CIRCT stops;
-this comparison does not establish identical assertion termination policy.
+Illegal-write guards, diagnostic counts and continuation match the emitted
+SFC host RTL; unrelated host assertions remain separate porting boundaries.
 """
 import argparse
 import hashlib
@@ -55,7 +55,11 @@ def composition(directory, baseline):
 
 
 def oracle(path):
-    host = module(clean(path.read_text()), 'FASEDMemoryTimingModel')[1]
+    raw_host = module(path.read_text(), 'FASEDMemoryTimingModel')[1]
+    # Check raw RTL before removing synthesis/macro guards: do not accidentally
+    # hide a terminating block while extracting the nonfatal diagnostic cone.
+    assert not re.search(r'\$(?:fatal|finish|stop)\b', raw_host), 'SFC FASED termination policy changed'
+    host = clean(raw_host)
     eq = {k: ' '.join(v.split()) for k, v in equations(host).items()}
     shell = '''module SFCResponseErrors(input clock,reset,
 input auto_to_host_dram_out_r_valid,auto_to_host_dram_out_b_valid,
@@ -189,7 +193,23 @@ initial begin
  oracleOnly=$test$plusargs("oracle-only");nativeOnly=$test$plusargs("native-only");
  if($value$plusargs("bad-write=%d",badWrite))begin
   reset=1;mcr_write_0_valid=badWrite[0];mcr_write_1_valid=badWrite[1];
-  #2;clock=1;#2;clock=0;reset=0;#2;clock=1;#2;$finish;
+  // Writes under host reset must be silent. Repeated illegal writes must
+  // diagnose every edge, both lanes must print, and simulation must continue.
+  repeat(2)begin #2;clock=1;#2;clock=0;end
+  reset=0;rValid=1;bValid=1;rResp=2;bResp=3;
+  repeat(3)begin
+   #2;clock=1;#2;clock=0;
+   if(!oracleOnly&&!nativeOnly&&(mcr_read_0_bits!==sR||mcr_read_1_bits!==sB||sR!==32'd2||sB!==32'd2))
+    $fatal(1,"illegal write changed response state or readback");
+  end
+  mcr_write_0_valid=0;mcr_write_1_valid=0;rResp=1;
+  repeat(2)begin #2;clock=1;#2;clock=0;end
+  if(!oracleOnly&&!nativeOnly&&(mcr_read_0_bits!==sR||mcr_read_1_bits!==sB||sR!==32'd1||sB!==32'd1))
+   $fatal(1,"response state stopped updating after illegal writes");
+  reset=1;mcr_write_0_valid=badWrite[0];mcr_write_1_valid=badWrite[1];
+  #2;clock=1;#2;clock=0;
+  if(mcr_read_0_bits!==0||mcr_read_1_bits!==0||sR!==0||sB!==0)$fatal(1,"host reset lost priority");
+  $display("PASS illegal-write mask=%0d continued through reset, three violations and recovery",badWrite);$finish;
  end else begin
  reset=1;step();
  for(integer i=0;i<512;i++)begin
@@ -217,26 +237,26 @@ end endmodule
          '--top-module', 'check', '--Mdir', out/'obj', '-o', 'check', out/'check.sv', native, out/'oracle.sv'], 'verilator')
     run([out/'obj/check'], 'simulation')
     log = (out/'simulation.log').read_text(); assert 'PASS cycles=' in log
-    # Each illegal write mask is diagnosed outside reset. The SFC emits $fwrite;
-    # CIRCT emits a fatal assertion, so compare the register diagnostics, not exits.
+    # Compare each implementation alone and together: both must exit normally,
+    # diagnose exactly three active edges, suppress reset writes and recover.
     for mask in (1,2,3):
-        native_result = run([out/'obj/check', '+native-only', f'+bad-write={mask}'], f'native-write-{mask}', check=False)
-        assert native_result.returncode != 0
-        native_diag = (out/f'native-write-{mask}.log').read_text()
-        assert 'is read only' in native_diag
-        if mask != 3:
-            assert f'Register {"rrespError" if mask == 1 else "brespError"} is read only' in native_diag
-        run([out/'obj/check', '+oracle-only', f'+bad-write={mask}'], f'oracle-write-{mask}')
-        diag = (out/f'oracle-write-{mask}.log').read_text()
-        for index, name in enumerate(('rrespError','brespError')):
-            assert (f'Register {name} is read only' in diag) == bool(mask & (1<<index))
+        for mode in ('native', 'oracle', 'joint'):
+            flags = [] if mode == 'joint' else ['+'+mode+'-only']
+            run([out/'obj/check', *flags, f'+bad-write={mask}'], f'{mode}-write-{mask}')
+            diag = (out/f'{mode}-write-{mask}.log').read_text()
+            assert f'PASS illegal-write mask={mask} continued' in diag
+            for index, name in enumerate(('rrespError','brespError')):
+                expected_count = 3*(2 if mode == 'joint' else 1) if mask & (1<<index) else 0
+                assert diag.count(f'Assertion failed: Register {name} is read only') == expected_count
     return dict({n: int(v) for n, v in re.findall(r'(\w+)=(\d+)', log)},
                 production_bank_cloned_verbatim=True, production_nine_bindings_validated_and_cloned=True,
                 original_sfc_register_updates_readback_and_assertions_executed=True,
                 valid_IR_production_binding_mutations_rejected=len(mutations), read_only_write_masks_diagnosed=3,
                 outputs_and_registers_compared_before_and_after_every_edge=True,
-                illegal_write_termination_policy=dict(sfc='diagnostic then continues', circt='fatal assertion',
-                                                      matched=False, scope='predicates/messages compared; termination parity pending'),
+                illegal_write_termination_policy=dict(sfc='diagnostic then continues', circt='diagnostic then continues',
+                                                      matched=True, repeated_violation_edges=3,
+                                                      execution_modes=['native', 'oracle', 'joint'],
+                                                      reset_suppression_and_post_violation_state_recovery=True),
                 scope='SFC always-ready RTL; native CTest additionally covers ready stalls')
 
 
@@ -254,7 +274,7 @@ def main():
                   SFC_modules=['FASEDMemoryTimingModel'], allocated_register_ABI=allocation(candidate, a.golden),
                   rtl_differential=differential(candidate, cone, a.export_tool, a.output_dir), limitation=__doc__)
     a.report_json.write_text(json.dumps(result, indent=2)+'\n')
-    print('PASS NIC legal response-error state, SFC B capture, read-only MMIO and composition; assertion termination parity pending')
+    print('PASS NIC response-error state, SFC B capture, read-only MMIO, composition and nonfatal illegal-write diagnostics')
 
 
 if __name__ == '__main__': main()

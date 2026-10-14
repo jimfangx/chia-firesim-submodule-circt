@@ -11,7 +11,8 @@
 // Analyses preserved: existing model/channel identity and constructor key.
 // Output invariants: accepted errors capture the current R response code,
 // including the SFC B-error capture behavior; zero-extended readback, host
-// reset priority, assertions on writes outside reset, copied ports unchanged.
+// reset priority, nonfatal diagnostics on writes outside reset, copied ports
+// unchanged. Match the SFC emitted host RTL, which prints without stopping.
 #include "goldengate/FASEDResponseErrors.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -143,9 +144,15 @@ LogicalResult goldengate::materializeFASEDResponseErrors(CircuitOp circuit,
     Value write = slot("write", i), read = slot("read", i);
     connect(field(read, "bits"), b.create<PadPrimOp>(loc, reg, 32));
     connect(field(read, "valid"), one); connect(field(write, "ready"), one);
-    Value permitted = b.create<NotPrimOp>(loc, field(write, "valid"));
-    b.create<AssertOp>(loc, arg(0), permitted, enabled,
-        std::string("Register ") + name + " is read only", ValueRange{}, "");
+    // MCRIO.bindReg's assertions are nonfatal $fwrite diagnostics in the
+    // recorded SFC host RTL. A FIRRTL AssertOp lowers to a fatal assertion,
+    // changing behavior on an illegal write (and hiding the second lane's
+    // diagnostic when both lanes are written). Preserve the emitted policy
+    // with an ordinary FIRRTL print; the backend handles simulation guards.
+    Value violation = b.create<AndPrimOp>(loc, enabled, field(write, "valid"));
+    b.create<PrintFOp>(loc, arg(0), violation,
+        std::string("Assertion failed: Register ") + name + " is read only\n",
+        ValueRange{}, "");
   }
 
   result = bank;

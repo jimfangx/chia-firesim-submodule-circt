@@ -207,15 +207,19 @@ void behavior(MLIRContext &context) {
       }
     };
     check();
-    unsigned asserts = 0;
-    for (auto assertion : sim.module.getOps<AssertOp>()) {
-      // FIRRTL assert operands are clock, predicate, enable.
-      bool fail = sim.eval(assertion->getOperand(2)) && !sim.eval(assertion->getOperand(1));
-      bool write = sim.memo.at(sim.key(sim.arg(8)) + ".write[" + std::to_string(asserts) + "].valid");
-      require(fail == (!reset && write), "read-only assertion/reset mismatch");
-      assertionFailures += fail; ++asserts;
+    unsigned diagnostics = 0;
+    for (auto print : sim.module.getOps<PrintFOp>()) {
+      bool fail = sim.eval(print.getCond());
+      bool write = sim.memo.at(sim.key(sim.arg(8)) + ".write[" + std::to_string(diagnostics) + "].valid");
+      require(fail == (!reset && write), "read-only diagnostic/reset mismatch");
+      require(print.getClock() == sim.arg(0) && print.getSubstitutions().empty() &&
+          print.getFormatString() == std::string("Assertion failed: Register ") +
+              (diagnostics ? "brespError" : "rrespError") + " is read only\n",
+          "read-only diagnostic clock/message mismatch");
+      assertionFailures += fail; ++diagnostics;
     }
-    require(asserts == 2, "missing read-only assertions");
+    require(diagnostics == 2 && sim.module.getOps<AssertOp>().empty() &&
+        sim.module.getOps<StopOp>().empty(), "read-only diagnostics must continue simulation");
     auto next = expected;
     if (reset) next = {0,0};
     else { if (rv && rr && r) next[0] = r; if (bv && br && b) next[1] = r; }
