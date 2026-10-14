@@ -3373,6 +3373,23 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitAllAnnotations(circuit, nicControlAnnotations, error)))
           return fail("NIC control transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC Nasti control transactions in " << nicControlPath << '\n';
+        if (failed(goldengate::attachCPUStreamControl(circuit,
+                "GGNICBridgeControlWrapper", "GGNICCPUStreamControlWrapper",
+                25, 12, error)))
+          return fail("NIC CPU stream MCRFile transactions: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("NIC CPU stream MCRFile produced invalid FIRRTL IR");
+        llvm::SmallString<256> nicCPUControlPath(outputDir), nicCPUControlAnnotations(outputDir);
+        llvm::sys::path::append(nicCPUControlPath, "post-fame-nic-cpu-control.mlir");
+        llvm::sys::path::append(nicCPUControlAnnotations, "post-fame-nic-cpu-control-all.json");
+        std::error_code nicCPUControlError;
+        llvm::raw_fd_ostream nicCPUControlOut(nicCPUControlPath, nicCPUControlError);
+        if (nicCPUControlError)
+          return fail("cannot write NIC CPU control transport: " + nicCPUControlError.message());
+        module->print(nicCPUControlOut); nicCPUControlOut << '\n'; nicCPUControlOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, nicCPUControlAnnotations, error)))
+          return fail("NIC CPU control transport annotations: " + error);
+        llvm::outs() << "Mapped CIRCT NIC ordered CPU stream occupancy Nasti control in " << nicCPUControlPath << '\n';
         return fail("NIC global control allocation and platform integration are not implemented");
       }
       if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))

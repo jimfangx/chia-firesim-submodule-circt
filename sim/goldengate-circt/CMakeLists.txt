@@ -2101,3 +2101,16 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-cpu-stream-write COMMAND goldengate-cpu-stream-write-test)
 endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-cpu-stream-control-test
+    test/Transforms/NICCPUStreamControlTest.cpp lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/CPUStreamCountBank.cpp lib/Transforms/ControlAddressDecode.cpp)
+  target_compile_features(goldengate-nic-cpu-stream-control-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-cpu-stream-control-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-cpu-stream-control-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-cpu-stream-control-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-cpu-stream-control COMMAND goldengate-nic-cpu-stream-control-test)
+endif()

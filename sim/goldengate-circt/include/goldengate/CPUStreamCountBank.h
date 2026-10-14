@@ -19,5 +19,12 @@ struct CPUStreamCountPort {
 mlir::LogicalResult addCPUStreamCountBank(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<CPUStreamCountPort> counts, std::string &error);
+// Attach the implemented occupancy bank after other bridge/CPU wrappers have
+// been composed. Derive word count from its registry and validate its MCR lanes
+// before creating transport or transferring any annotation targets.
+mlir::LogicalResult attachCPUStreamControl(
+    circt::firrtl::CircuitOp circuit, llvm::StringRef expectedTop,
+    llvm::StringRef wrapperName, unsigned addressBits, unsigned idBits,
+    std::string &error);
 }
 #endif

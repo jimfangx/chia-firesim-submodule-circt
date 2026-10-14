@@ -9,6 +9,7 @@
 // and metadata are deliberately ignored as in the executable Scala oracle.
 // Output: local Nasti slave; global widget allocation/crossbar remain pending.
 #include "goldengate/ClockBridgeControl.h"
+#include "goldengate/CPUStreamCountBank.h"
 #include "goldengate/NICMMIOBank.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/PrintBridgePayload.h"
@@ -364,6 +365,26 @@ LogicalResult goldengate::mapCPUStreamControl(CircuitOp circuit,
   }
   return mapBridgeControl(circuit, addressBits, idBits, bankWords,
       "GGCPUStreamCountWrapper", "GGCPUStreamControlWrapper",
+      "GGCPUStreamMCRFile", "cpuStream_mcr", "cpuStream_ctrl", error);
+}
+
+LogicalResult goldengate::attachCPUStreamControl(CircuitOp circuit,
+    StringRef expectedTop, StringRef wrapperName, unsigned addressBits,
+    unsigned idBits, std::string &error) {
+  if (expectedTop.empty() || wrapperName.empty()) {
+    error = "CPU stream control requires explicit nonempty wrapper identities";
+    return failure();
+  }
+  ControlMMIOWidget registry;
+  if (failed(deriveControlMMIOWidget(circuit, "CPUManagedStreamEngine_0",
+      "GGCPUStreamCountBank", {"GGCPUStreamCountBank"}, registry, error,
+      Direction::Out))) return failure();
+  if (registry.registerCount > std::numeric_limits<unsigned>::max()) {
+    error = "CPU stream control registry exceeds representable MCR lanes";
+    return failure();
+  }
+  return mapBridgeControl(circuit, addressBits, idBits,
+      static_cast<unsigned>(registry.registerCount), expectedTop, wrapperName,
       "GGCPUStreamMCRFile", "cpuStream_mcr", "cpuStream_ctrl", error);
 }
 

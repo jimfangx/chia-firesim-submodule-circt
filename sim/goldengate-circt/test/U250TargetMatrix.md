@@ -919,3 +919,81 @@ remain unsupported. NIC advances specifically to its global control/platform
 allocation gap. Matched intermediate annotations are partial evidence, not
 complete target passes. The live build includes the user's pre-existing UART
 registry-sizing change; that unrelated change is excluded from this checkpoint.
+
+## Iteration 178: native NIC CPU stream occupancy control
+
+The production NIC pipeline now attaches the implemented CPU stream count bank
+through native FIRRTL MCRFile operations after its NIC control/CPU DMA wrappers.
+`attachCPUStreamControl` accepts explicit wrapper identities and derives the
+transport geometry from `GGCPUStreamCountBank`'s register registry, validating
+its actual MCR lanes before creating operations or transferring targets. The
+three-word NIC bank uses two-bit indices and retains the shared Scala MCRFile
+AW/W capture, AR/R handling, reset flags, response IDs and local address aliases.
+The new top replaces `cpuStream_mcr` with `cpuStream_ctrl`, preserves other ports
+and recursively transfers copied annotation targets. The compiler emits
+`post-fame-nic-cpu-control.mlir` and `post-fame-nic-cpu-control-all.json`, then
+explicitly rejects the remaining global control allocation/platform boundary.
+This is an incremental local attachment, not a complete NIC target compile.
+
+Four focused CTests pass: shared clock/bridge MCR control, ordered CPU stream
+count bank, NIC control and the new NIC CPU control attachment. The new test
+checks two-bit indices, standalone production cloning, nested annotation
+identity and eleven invalid bindings rejected without IR mutation. Its final
+message-only revision was rebuilt and both fixture/production modes rerun;
+all helper and wrapper module bodies remain identical to the behavioral test.
+
+`test/Transforms/NICCPUStreamControlCompare.py` compares the actual production
+attachment and its cloned count bank/MCRFile against:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h
+```
+
+The RTL golden SHA256 is
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`;
+the driver header SHA256 is
+`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`.
+The reference retains SFC `MCRFile` verbatim and isolates the live occupancy
+inputs at the original CPUManagedStreamEngine queue-count assignments. It
+checks the exact ordered registry: NIC outgoing, TracerV outgoing, NIC incoming,
+12/13/12-bit counts, local offsets 0/4/8 and read-only permissions. SFC global
+addresses 592/596/600 are recorded, not claimed as implemented global routing.
+All 79 prior module bodies, 60 public ports/routes and 1,792 transferred
+annotations match. Verilator with assertions enabled matches for 100,721 cycles:
+25,210 reads, 25,403 read stalls, 1,111 reset cycles, 48 uncommitted hole writes,
+all four indices and low-address aliases, three AW/W arrival orders, sixteen
+strobes and 100,000 randomized cycles. Counts remain live under R backpressure.
+This isolates local occupancy/control behavior; full DMA queue/driver/platform
+integration and illegal read-only write handling are not new behavioral claims.
+
+Evidence is under:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration178-u250-target-matrix/
+```
+
+`cpu-control-production-final/comparison.json` records the candidate/golden
+hashes and structured/behavioral results. Fresh no-NIC RTL, both constant headers
+and both XDC files are byte-identical to iteration 177. Fresh immutable October 1
+FIRRTL/annotation inputs and U250 XDC comparisons match, with the recorded
+implementation hierarchy rename. No golden fixture was modified.
+
+Next generalize the native widget catalog/allocation for the NIC and its
+three-word CPU stream bank, then route their control slaves and compare the
+resulting global addresses against the SFC driver. Complete NIC platform/runtime,
+other target profiles and partitioned QSFP remain pending. The live compiler
+includes the user's pre-existing UART registry-sizing edits; those edits are
+excluded from this checkpoint. FireSim manager gates remain harness-owned.
+
+The fresh thirteen-target replay uses compiler SHA256
+`5b25ac9e0d441aaf180e99b99c9dee3a9bdedbea0f008a98b494f3658130f778`.
+It completes with one compiled no-NIC Rocket, six lowering failures and six
+unsupported partition profiles, intentionally returning nonzero. All seven
+reached bridge/channel boundaries match SFC; Shuttle model-port annotations
+match and the other six retain the existing SRAM annotation differences.
+Multiple TracerV constructors, BOOM/Shuttle trace payloads, Gemmini/Saturn Rocket
+FASED maxFlight profiles and six partitioned QSFP profiles remain gaps. NIC
+reaches the new CPU occupancy transport boundary before its explicit global
+allocation/platform rejection. Partial boundary matches and compile-only
+results are not complete semantic passes.
