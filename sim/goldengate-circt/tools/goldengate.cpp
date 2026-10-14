@@ -3316,7 +3316,35 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitAllAnnotations(circuit, bufferedAnnotations, error)))
           return fail("NIC buffered CPU transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC CPU AW/W/B buffers in " << bufferedPath << '\n';
-        return fail("NIC CPU AR/R buffering, MMIO control binding and platform integration are not implemented");
+        // Read and write requests use independent address windows and counters.
+        // Reuse the native AW address queue with separate AR state; R stores
+        // complete id/data/last/response beats, advancing the selected source
+        // on enqueue even while the host stalls a previously buffered response.
+        // These wrappers preserve all other ports and recursively transfer
+        // copied archive targets while retaining consumed AR/R owners inward.
+        if (failed(goldengate::attachCPUStreamReadBuffer(
+                circuit, "GGCPUStreamWriteResponseBufferWrapper",
+                "GGNICCPUStreamReadBufferWrapper", error)))
+          return fail("NIC CPU AR buffer: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("NIC CPU AR buffer produced invalid FIRRTL IR");
+        if (failed(goldengate::attachCPUStreamResponseBuffer(
+                circuit, "GGNICCPUStreamReadBufferWrapper",
+                "GGNICCPUStreamResponseBufferWrapper", error)))
+          return fail("NIC CPU R buffer: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("NIC CPU R buffer produced invalid FIRRTL IR");
+        llvm::SmallString<256> duplexPath(outputDir), duplexAnnotations(outputDir);
+        llvm::sys::path::append(duplexPath, "post-fame-nic-cpu-buffered.mlir");
+        llvm::sys::path::append(duplexAnnotations, "post-fame-nic-cpu-buffered-all.json");
+        std::error_code duplexError;
+        llvm::raw_fd_ostream duplexOut(duplexPath, duplexError);
+        if (duplexError) return fail("cannot write NIC buffered CPU transport: " + duplexError.message());
+        module->print(duplexOut); duplexOut << '\n'; duplexOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, duplexAnnotations, error)))
+          return fail("NIC buffered CPU transport annotations: " + error);
+        llvm::outs() << "Mapped CIRCT NIC CPU AW/W/B/AR/R buffers in " << duplexPath << '\n';
+        return fail("NIC MMIO control binding and platform integration are not implemented");
       }
       if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
         return fail("CPU stream MCRFile transactions: " + error);

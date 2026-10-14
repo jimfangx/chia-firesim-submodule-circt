@@ -183,7 +183,8 @@ void mapping(MLIRContext &context) {
 // Compose the exact write helper projected from a production boundary with
 // the same AW/W/B attachment APIs as the compiler. Emitted standalone IR is
 // used for differential RTL execution against the archived SFC queues.
-void compose(MLIRContext &context, const char *input, const char *output) {
+void compose(MLIRContext &context, const char *input, const char *output,
+             const char *readInput = nullptr) {
   auto root = parseSourceFile<ModuleOp>(input, &context);
   require(bool(root) && succeeded(verify(*root)), "invalid write helper input");
   auto c = *root->getOps<CircuitOp>().begin(); auto engine = named(c, "GGCPUStreamWrite");
@@ -191,13 +192,39 @@ void compose(MLIRContext &context, const char *input, const char *output) {
   OpBuilder b(&context); SmallVector<PortInfo> ports(engine.getPorts());
   ports[0].name = b.getStringAttr("hostClock"); ports[1].name = b.getStringAttr("hostReset");
   for (unsigned i = 3; i < ports.size(); ++i) ports[i].name = b.getStringAttr("cpu_stream_" + ports[i].name.str());
+  FModuleOp readEngine;
+  unsigned readStart = ports.size();
+  if (readInput) {
+    auto readRoot = parseSourceFile<ModuleOp>(readInput, &context);
+    require(bool(readRoot) && succeeded(verify(*readRoot)), "invalid read helper input");
+    auto readCircuit = *readRoot->getOps<CircuitOp>().begin();
+    auto helper = named(readCircuit, "GGCPUStreamRead");
+    require(helper.getNumPorts() == 16 && helper.getPortName(2) == "stream_0" &&
+      helper.getPortName(3) == "stream_1", "needs NIC and TracerV read helpers");
+    readEngine = cast<FModuleOp>(helper->clone()); c.getBodyBlock()->push_back(readEngine);
+    for (unsigned i = 2; i < helper.getNumPorts(); ++i) {
+      auto p = helper.getPorts()[i];
+      if (i >= 4) p.name = b.getStringAttr("cpu_stream_" + p.name.str());
+      ports.push_back(p);
+    }
+  }
   b.setInsertionPointToEnd(c.getBodyBlock());
   auto top = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGCPUStreamWriteWrapper"), engine.getConventionAttr(), ports);
   b.setInsertionPointToStart(top.getBodyBlock()); auto sim = b.create<InstanceOp>(c.getLoc(), engine, "write");
   for (auto [i, p] : llvm::enumerate(ports)) {
+    if (i >= readStart) break;
     Value outer = top.getArgument(i), inner = sim.getResult(i);
     b.create<ConnectOp>(c.getLoc(), p.direction == Direction::In ? inner : outer,
                        p.direction == Direction::In ? outer : inner);
+  }
+  if (readEngine) {
+    auto read = b.create<InstanceOp>(c.getLoc(), readEngine, "read");
+    for (unsigned i = 0; i < readEngine.getNumPorts(); ++i) {
+      unsigned port = i < 2 ? i : readStart + i - 2;
+      auto p = ports[port]; Value outer = top.getArgument(port), inner = read.getResult(i);
+      b.create<ConnectOp>(c.getLoc(), p.direction == Direction::In ? inner : outer,
+                         p.direction == Direction::In ? outer : inner);
+    }
   }
   c.setName("GGCPUStreamWriteWrapper"); SmallVector<Attribute> annotations;
   for (auto p : ports) annotations.push_back(b.getDictionaryAttr({
@@ -259,6 +286,49 @@ void compose(MLIRContext &context, const char *input, const char *output) {
   require(failed(goldengate::addCPUStreamWriteBuffer(c,error)),"repeated buffer accepted");
   auto after = std::string(); {llvm::raw_string_ostream out(after);root->print(out);}
   require(before==after,"repeat mutated IR");
+  if (readInput) {
+    // Malformed AR and R preflight must not leave half-attached wrappers.
+    auto atomicReject = [&](bool response) {
+      for (unsigned bad = 0; bad < 3; ++bad) {
+        OwningOpRef<ModuleOp> copy(cast<ModuleOp>(root->clone()));
+        auto cc = *copy->getOps<CircuitOp>().begin(); auto boundary = named(cc,cc.getName());
+        unsigned port = readStart + (response ? 11 : 5); // R.data / AR.addr
+        if (bad == 0) {
+          auto names=llvm::to_vector(boundary.getPortNames()); names[port]=b.getStringAttr("missing_field"); boundary.setPortNames(names);
+        } else if (bad == 1) {
+          auto types=llvm::to_vector(boundary.getPortTypes()); auto wrong=UIntType::get(&context,2,false);
+          types[port]=TypeAttr::get(wrong); boundary->setAttr("portTypes",b.getArrayAttr(types)); boundary.getArgument(port).setType(wrong);
+        } else {
+          SmallVector<bool> directions(boundary.getPortDirections().begin(),boundary.getPortDirections().end());
+          directions[port]=!directions[port]; boundary.setPortDirections(directions);
+        }
+        std::string before,after; {llvm::raw_string_ostream out(before);copy->print(out);}
+        auto result = response ? goldengate::attachCPUStreamResponseBuffer(cc,cc.getName(),"RejectedR",error) :
+          goldengate::attachCPUStreamReadBuffer(cc,cc.getName(),"RejectedAR",error);
+        require(failed(result),"malformed AR/R accepted");
+        {llvm::raw_string_ostream out(after);copy->print(out);} require(before==after,"AR/R rejection mutated IR");
+      }
+    };
+    atomicReject(false);
+    require(succeeded(goldengate::attachCPUStreamReadBuffer(c,
+      "GGCPUStreamWriteResponseBufferWrapper","GGNICCPUStreamReadBufferWrapper",error)),error);
+    atomicReject(true);
+    require(succeeded(goldengate::attachCPUStreamResponseBuffer(c,
+      "GGNICCPUStreamReadBufferWrapper","GGNICCPUStreamResponseBufferWrapper",error)),error);
+    require(succeeded(verify(*root)),"duplex buffered composition invalid");
+    auto final = named(c,c.getName()); require(final.getNumPorts()==ports.size(),"duplex ports changed");
+    auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations"); require(annos.size()==ports.size(),"duplex annotations lost");
+    for (auto [i,a] : llvm::enumerate(annos)) {
+      auto name=ports[i].name.getValue();
+      auto owner = name.starts_with("cpu_stream_aw_") || name.starts_with("cpu_stream_w_") ? "GGCPUStreamWriteWrapper" :
+        name.starts_with("cpu_stream_b_") ? "GGCPUStreamWriteBufferWrapper" :
+        name.starts_with("cpu_stream_ar_") ? "GGCPUStreamWriteResponseBufferWrapper" :
+        name.starts_with("cpu_stream_r_") ? "GGNICCPUStreamReadBufferWrapper" : "GGNICCPUStreamResponseBufferWrapper";
+      require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue()==
+        "~GGNICCPUStreamResponseBufferWrapper|"+std::string(owner)+">"+name.str(),"duplex target identity differs");
+    }
+    llvm::outs()<<"PASS live AW/W/B/AR/R composition, all 31 target identities, six atomic AR/R rejects\n";
+  }
   std::error_code ec; llvm::raw_fd_ostream out(output,ec); require(!ec,"cannot write composed IR"); root->print(out);out<<'\n';
   llvm::outs()<<"PASS live AW/W/B composition, 512-bit payload wires, all 17 target identities, nine atomic live rejects and repeated rejection\n";
 }
@@ -280,6 +350,8 @@ int main(int argc, char **argv) {
     MLIRContext context; context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
     if (argc == 4 && std::string(argv[1]) == "--compose") {
       compose(context,argv[2],argv[3]);
+    } else if (argc == 5 && std::string(argv[1]) == "--compose-duplex") {
+      compose(context,argv[2],argv[4],argv[3]);
     } else if (argc == 2) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(root) && succeeded(verify(*root)), "invalid expanded queue boundary");

@@ -2,9 +2,10 @@
 // FPGATop's default AXI4Buffer has a depth-two, non-flowing, non-pipelined AR
 // queue. Golden AXI4Buffer_2 shares Queue_51's AW/AR payload shape. Instantiate
 // the same native helper with independent state, retaining the AR until the
-// inner CPUManagedStreamEngine accepts its final read beat. R/B buffering and
-// the FPGA shell remain subsequent stages. All validation precedes mutation.
-// Requires: uninstantiated AW/W top, exact U250 AR ports, retained annotation
+// inner CPUManagedStreamEngine accepts its final read beat. The shared helper
+// has independent AW and AR instances, including on a live NIC write/read
+// boundary. All validation precedes mutation.
+// Requires: selected uninstantiated top, exact U250 AR ports, retained annotation
 // archive and native depth-two AW/AR helper. No annotations are consumed or
 // produced; copied top targets transfer, consumed AR targets stay on the inner
 // module, and circuit prefixes change recursively. Mutates: adds one wrapper
@@ -68,7 +69,7 @@ LogicalResult goldengate::attachCPUStreamReadBuffer(CircuitOp circuit,
     llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != inputBoundary)
-    return reject("CPU AR buffer requires the active CPU AW/W buffer wrapper");
+    return reject("CPU AR buffer requires the selected active boundary");
   FModuleOp inner, queue;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == wrapperName)

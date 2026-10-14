@@ -10,8 +10,9 @@
 // Mutates: adds one queue and wrapper, updates circuit name and archive.
 // Analyses: none required; prior operations, SSA values and metadata preserved.
 // Output: same public ports, depth-two response storage; all checks precede
-// mutation. The expanded Print caller stages and verifies before publication.
-// B buffering, remaining bridges and complete simulator emission remain later.
+// mutation. Production callers (including NIC with two outgoing streams and a
+// live incoming stream) stage and verify the result before publication.
+// MMIO binding and complete platform emission remain separate stages.
 #include "goldengate/TracerVTokenEngine.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -29,7 +30,7 @@ LogicalResult goldengate::attachCPUStreamResponseBuffer(
     std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
   if (circuit.getName() != inputBoundary)
-    return reject("CPU R buffer requires the active CPU AR buffer wrapper");
+    return reject("CPU R buffer requires the selected active boundary");
   constexpr llvm::StringLiteral queueName = "GGCPUStreamRQueue2";
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
