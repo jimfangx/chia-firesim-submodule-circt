@@ -3794,10 +3794,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlDecodeAnnotations, error)))
         return fail("control decoder annotations: " + error);
       llvm::outs() << "Mapped CIRCT control address decoder in " << controlDecodePath << '\n';
-      // The NIC catalog and address decoder now match the SFC allocation.
-      // Request/response dispatch and platform binding remain separate work.
-      if (!cpuSinks.empty())
-        return fail("NIC global control routing and platform integration are not implemented");
+      // Both simplex and duplex CPU stream catalogs use the same decoded
+      // region count for the AW route queue and per-slave write dispatch.
       if (failed(goldengate::addControlWriteRoute(circuit, error)))
         return fail("control write route: " + error);
       if (failed(mlir::verify(*module)))
@@ -3828,6 +3826,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlDispatchAnnotations, error)))
         return fail("control dispatch annotations: " + error);
       llvm::outs() << "Dispatched CIRCT control AW/W requests and connected the error endpoint in " << controlDispatchPath << '\n';
+      // NIC request routes now reach all twelve allocated slaves. Binding
+      // their typed MCR banks and integrating responses/platform remains work.
+      if (!cpuSinks.empty())
+        return fail("NIC control widget binding, responses and platform integration are not implemented");
       if (failed(goldengate::bindRocketControlWidgetWrites(circuit, error)))
         return fail("control widget writes: " + error);
       if (failed(mlir::verify(*module)))

@@ -91,10 +91,10 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned count=11) {
   annos.push_back(b.getDictionaryAttr({b.getNamedAttr("target",b.getStringAttr("~GGControlDecodeWrapper|Model>state"))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(annos)); return root;
 }
-void behavior(MLIRContext &ctx, unsigned count) {
+void behavior(MLIRContext &ctx, unsigned count, FModuleOp production = {}) {
   auto root=fixture(ctx,count); auto c=*root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addControlWriteRoute(c,error)),error); require(succeeded(verify(*root)),"IR verification failed");
-  Interpreter sim(named(c,"GGControlWriteRoute"),count); std::deque<uint64_t> expected; std::mt19937_64 random(177);
+  Interpreter sim(production ? production : named(c,"GGControlWriteRoute"),count); std::deque<uint64_t> expected; std::mt19937_64 random(177);
   unsigned cycles=0,pushes=0,pops=0,full=0,empty=0,held=0,resets=0,simultaneous=0,zero=0;
   auto cycle=[&](bool reset,bool aw,bool tracker,bool aws,bool w,bool last,bool ws,uint64_t route) {
     sim.memo.clear(); const uint64_t inputs[]{reset,route,aw,tracker,aws,w,last,ws};
@@ -169,4 +169,30 @@ void rejection(MLIRContext &ctx) {
   llvm::outs()<<"Mapping and twelve atomic rejection cases passed\n";
 }
 }
-int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for(unsigned count:{1u,2u,4u,11u,13u,16u,63u}) behavior(ctx,count);for(unsigned count=1;count<=63;++count) mapping(ctx,count);rejection(ctx);return 0;}catch(const std::exception&e){llvm::errs()<<e.what()<<'\n';return 1;}}
+int main(int argc, char **argv){try{
+  MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  if(argc==3) {
+    auto root=parseSourceFile<ModuleOp>(argv[1],&ctx);
+    require(bool(root)&&succeeded(verify(*root)),"invalid production input");
+    auto c=*root->getOps<CircuitOp>().begin();
+    require(c.getName()=="GGControlWriteDispatchWrapper","wrong production boundary");
+    auto route=named(c,"GGControlWriteRoute"), dispatch=named(c,"GGControlWriteDispatch");
+    auto depth=route->getAttrOfType<IntegerAttr>("goldengate.queueDepth").getInt();
+    require(depth==12&&dispatch->getAttrOfType<ArrayAttr>("goldengate.controlRegions").size()==12,"wrong NIC region count");
+    behavior(ctx,depth,route);
+    // Clone the emitted helpers, without rebuilding either implementation.
+    for(auto helper:{route,dispatch}) {
+      OwningOpRef<ModuleOp> isolated(ModuleOp::create(c.getLoc()));
+      OpBuilder b(&ctx);b.setInsertionPointToStart(isolated->getBody());
+      auto circuit=b.create<CircuitOp>(c.getLoc(),helper.getNameAttr());
+      b.setInsertionPointToStart(circuit.getBodyBlock());b.clone(*helper);
+      require(succeeded(verify(*isolated)),"invalid isolated helper");
+      std::error_code ec;llvm::raw_fd_ostream out(std::string(argv[2])+"/"+helper.getName().str()+".mlir",ec);
+      require(!ec,"cannot export production helper");isolated->print(out);out<<'\n';
+    }
+    return 0;
+  }
+  require(argc==1,"expected production input and output directory, or no arguments");
+  for(unsigned count:{1u,2u,4u,11u,12u,13u,16u,63u}) behavior(ctx,count);
+  for(unsigned count=1;count<=63;++count) mapping(ctx,count);rejection(ctx);return 0;
+}catch(const std::exception&e){llvm::errs()<<e.what()<<'\n';return 1;}}

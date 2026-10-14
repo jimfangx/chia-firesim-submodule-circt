@@ -136,4 +136,4 @@ void rejection(MLIRContext &ctx) {
   llvm::outs()<<"Mapping and fourteen atomic rejection cases passed\n";
 }
 }
-int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for(unsigned n:{1,2,11,13,63}){behavior(ctx,n);mapping(ctx,n);}rejection(ctx);return 0;}catch(const std::exception&e){llvm::errs()<<e.what()<<'\n';return 1;}}
+int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for(unsigned n:{1,2,11,12,13,63}){behavior(ctx,n);mapping(ctx,n);}rejection(ctx);return 0;}catch(const std::exception&e){llvm::errs()<<e.what()<<'\n';return 1;}}

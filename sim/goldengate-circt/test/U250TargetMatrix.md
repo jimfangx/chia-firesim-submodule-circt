@@ -1177,3 +1177,100 @@ queues and widget dispatch for the twelve-region NIC catalog, retaining its
 three-word CPU stream bank and comparing accepted transactions against SFC.
 The live build includes pre-existing user ClockBridgeControl/UART registry
 edits; those edits are excluded from this checkpoint.
+
+## Iteration 181: NIC queued AW/W routing and slave dispatch
+
+The production compiler now runs the native `addControlWriteRoute` and
+`addControlWriteDispatch` passes on the twelve-region NIC control catalog.
+The route queue has twelve entries of twelve bits, four-bit wrapping pointers,
+and neither flow nor pipe forwarding. AW acceptance coordinates queue space,
+tracker readiness and the selected slave; accepted W.last consumes the saved
+route. Native dispatch drives all twelve normal AW/W endpoints and connects
+the existing error endpoint. The typed region catalog, including the three
+CPU stream count words, is retained.
+
+The NIC compiler emits `post-fame-control-write-route.mlir` and
+`post-fame-control-write-dispatch.mlir` plus their complete annotations, then
+explicitly rejects NIC widget binding, responses and platform integration.
+Its failed compile remains an implementation gap; this boundary is not a
+complete NIC simulator. The no-NIC compiler path emits identical collateral.
+
+Compared the exact archived SFC artifact:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+SHA256 is `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+The test extracts the original `Queue_60` declarations, memory and clocked
+updates, plus 115 original `NastiRouter` write-cone expressions. Only the
+decoded route, tracker readiness and normal/error slave readiness are test
+boundaries. The queue's AW bit input replaces the equivalent low/high
+address-decoder concatenation with that same twelve-bit route.
+The prior allocation comparison establishes the decoder's SFC region match.
+Normal W.last is optimized out of the SFC widget-facing ports; the test checks
+its native broadcast directly against the input, and compares the retained
+SFC error W.last and queue-dequeue expression.
+
+`ControlWriteRouteTest.cpp` now interprets the actual production queue and
+clones the emitted queue/dispatch helpers for isolated RTL lowering, without
+rebuilding either helper. Its production mode passed 34,100 cycles against
+an independent deque, including reset writes and pointer wrapping. The
+focused CTests passed depth-twelve queue cases, 12,705 twelve-slave dispatch
+cases, existing other widths, mapping checks and 26 atomic rejection cases.
+
+`NICControlWriteRoutingCompare.py` checks exact production wrapper connections
+and recursive annotation transfer: the route boundary preserves 109 prior
+module bodies and 109 copied ports with 125 connections; dispatch preserves
+111 bodies and 115 copied ports with 241 connections. Both retain all 1,792
+annotation records. Exported helper bodies match the compiler output exactly.
+
+Isolated Verilator execution passed 103,801 cycles against the original SFC
+queue and request expressions: 14,037 accepted AWs, 10,527 accepted W.lasts,
+111 full-queue/pop cases, 13,227 empty-queue W cases, 10,272 held burst beats,
+1,173 simultaneous enqueue/dequeue cases and 232 reset writes. All twelve
+normal endpoints and the error endpoint were exercised, including multi-bit
+route priority and independently selected AW/W routes. Payloads, handshake
+coordination and selected valid signals match. Tracker retirement, widget
+responses and complete platform behavior remain outside this test.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration181-u250-target-matrix/
+```
+
+`nic-control-write-routing-production/comparison.json` records structured and
+behavioral checks and artifact hashes. Run the comparison after sourcing the
+FireSim environment, with `--decoder`, `--route` and `--dispatch` pointing to
+the three production NIC MLIR boundaries, `--golden` to the archived NIC SV,
+`--export-tool` to `goldengate-control-write-route-test`, and a fresh
+`--output-dir`. The initial exporter-only failure log is retained separately;
+the exporter now builds its isolated circuit before verification.
+
+`no-nic-rtl-collateral-comparison.json` freshly matches the no-NIC RTL, constant
+headers and both XDC files against iteration 180 byte-for-byte.
+`immutable-rocket-comparison.json` freshly matches October 1 primary
+FIRRTL/annotations and U250 XDC with the documented implementation hierarchy
+rename. Neither immutable fixture was changed.
+
+The next smallest step is to bind the twelve write-dispatch endpoints to the
+typed widget MCR banks, including NIC's six registers and the three-word
+read-only CPU count bank. Then port read dispatch and response coordination
+for this catalog. Host memory arbitration, driver stream lists, full NIC
+platform/runtime, other target lowering profiles and partitioned QSFP remain
+gaps. Pre-existing user ClockBridgeControl/UART edits are excluded from this
+checkpoint. No FireSim manager verification step was started in this turn.
+
+Fresh standalone replay of all thirteen archived handoffs and their effective
+platform configurations used compiler SHA256
+`462b005e0fcc45f6ea197b45716192275875e570e2fb061c5fac80a7a090fe29`.
+`replay/matrix.json` records one complete no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations; nonzero exit is
+intentional. All seven reached BridgeIO/channel boundaries match SFC. Shuttle
+model-port annotations match; the other six retain exactly the prior SRAM
+annotation differences. `matrix-regression-comparison.json` checks unchanged
+inputs, effective platforms, statuses and all structured boundary results
+against iteration 180. NIC advances to write dispatch; the other failure
+reasons remain unchanged. Its fresh decoder MLIR and annotations are also
+byte-identical to iteration 180's SFC-compared decoder boundary.
