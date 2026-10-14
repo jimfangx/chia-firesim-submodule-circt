@@ -2488,6 +2488,87 @@ nonzero exit preserves these gaps. Only the NIC diagnostic advances.
 The next smallest step is to execute native NIC read-response request
 scheduling against `ReadEgress`, checking held ID/valid, request priority,
 targetFire, token readiness and final-beat retirement together with this RAM.
+
+### Iteration 196: execute native NIC read-response scheduling
+
+The actual NIC compiler now executes `addFASEDReadScheduler` and emits verified
+`post-fame-fased-read-scheduler.mlir` and its complete annotation archive.
+The existing CIRCT scheduler consumes the qualified host reset and targetFire,
+holds the unreset four-bit request ID, prioritizes a new request over final-beat
+retirement, addresses synchronous read prefetch and drives read token validity.
+The explicit failure moves to unimplemented NIC write responses, timing/control
+responses and platform integration; NIC compile/runtime support is incomplete.
+
+Changes are confined to `tools/goldengate.cpp`, the production export mode in
+`test/Transforms/FASEDReadSchedulerTest.cpp`, the new
+`test/Transforms/NICFASEDReadSchedulerCompare.py`, and this ledger. The exporter
+clones both actual production FIRRTL helpers, including the queue RAM and every
+scheduler/pointer expression. Its small test top uses the two checked production
+wrappers' connections, including constant host ready for the recorded non-ROB
+profile. The differential compiles those helpers beside complete actual SFC
+`ReadEgress` and `MultiQueue` RTL, renaming only module symbols.
+
+The exact golden is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+(relative to the outer repository), SHA256
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+The complete `ReadEgress`/`MultiQueue` headers and bodies also match immutable
+`sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`.
+The actual FASED reset, request, targetFire and response-ready connections match
+the SFC timing-model boundary. The Scala `EgressUnit.scala` oracle's request
+priority and unreset ID behavior are preserved through FIRRTL operations.
+
+Evidence is under the no-NIC generated directory's
+`iteration196-u250-target-matrix/`. `nic-read-scheduler-comparison.json` reports
+40,338 matching cycles, 22,063 defined active-response payload checks, 9,620
+request starts, 3,627 retirements, 1,818 chained requests, 75 reset-time request
+captures, 23,897 stalls, 315 full-queue observations, 149 reset-time writes,
+6,016 ID changes and 25 pointer wraps. All 48 queue pointer/occupancy registers,
+prefetch ID, active-request state, defined held ID and scheduler/queue coupling
+are compared. RAM is fully initialized before payload checks. Same-address
+read/write payloads and power-on ID/memory are excluded.
+
+The initial differential exposed an undefined-RUW `last` consumption at cycle
+759, followed by different active-valid state at cycle 760. Both RAMs specify
+undefined read/write behavior. The corrected test stalls request retirement
+after each collision until a defined read, while retaining all control checks;
+it observes 1,559 collisions. This is a test-domain restriction, not a compiler
+semantic fix or a claim about undefined last-bit consumption.
+
+The actual scheduler wrapper preserves 175 prior modules, checks all 195
+connections and transfers all 1,792 annotations recursively. The underlying
+queue composition retains its separately checked 199 connections. All 188
+prior NIC FIRRTL/annotation artifacts match iteration 195; only the two
+scheduler artifacts are added. The no-NIC Rocket's final RTL, both headers
+and both XDC outputs remain byte-identical. Fresh primary immutable handoff
+hashes and normalized U250 XDC comparisons match, including the documented
+implementation hierarchy rename. Neither immutable fixture was modified.
+Focused CTest passes 32,768 scheduler edge cases, 32 wrapper mapping cases,
+eight target transfers and 20 atomic rejections for each of the baseline and
+selected Print profiles. No manager verification was started.
+
+Run the comparator in the sourced environment with `--candidate-dir` pointing
+to the NIC replay, `--baseline` to the no-NIC production scheduler MLIR,
+`--golden` and `--immutable` to the two SFC SV files above, `--export-tool` to
+`goldengate-fased-read-scheduler-test`, a fresh absolute `--output-dir`, and
+`--report-json`.
+
+The fresh thirteen-target replay uses compiler SHA256
+`683eb4a40040abdaa4f80f795a9a3ebc49885b779ffa19348ddfcdae697ff3b6`.
+`replay/matrix.json` and `matrix-regression-comparison.json` retain one compiled
+no-NIC target, six later compiler failures and six unsupported partition/QSFP
+platforms. All thirteen input hashes, effective platforms, compile statuses
+and structured boundary comparisons match iteration 195. All seven reached
+BridgeIO/channel boundaries match SFC; Shuttle model-port annotations match,
+while the other six retain the documented native-SRAM differences. Only the
+NIC diagnostic advances. The matrix's nonzero exit preserves these gaps.
+Older mutable replay MLIR from iterations 190 and 191 is compressed with
+decompressed SHA256 verification and manifests; no immutable golden or current
+candidate is compressed or modified by that disk-space maintenance.
+
+The next smallest step is to execute native NIC per-ID write acknowledgement
+storage/scheduling against the actual SFC `WriteEgress` RTL, preserving qualified
+reset, request priority and the combined read/write token-readiness boundary.
 Timing/control responses, slave-1 binding, wider/multiple TracerV profiles,
 generalized FASED geometry, complete NIC host memory/stream composition and
 partition/QSFP support remain incomplete.

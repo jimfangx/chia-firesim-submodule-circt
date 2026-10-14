@@ -173,4 +173,56 @@ void rejection(MLIRContext &ctx,bool selected) {
   auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"20 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected:{false,true}){behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(int argc, char **argv) {
+  MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  try {
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production read scheduler boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDReadSchedulerWrapper" ||
+              circuit.getName() == "GGSelectedPrintFASEDReadSchedulerWrapper",
+              "expected FASED read scheduler boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGNICReadEgress"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      // Export the actual emitted scheduler and RAM/pointer operations. This
+      // test top only composes them using the production wrapper connections.
+      auto scheduler = cast<FModuleOp>(b.insert(named(circuit,"GGFASEDReadScheduler")->clone()));
+      auto buffer = cast<FModuleOp>(b.insert(named(circuit,"GGFASEDReadBuffer16x8")->clone()));
+      SmallVector<PortInfo> ports;
+      auto port = [&](llvm::StringRef name, FModuleOp m, unsigned index) {
+        auto p = m.getPorts()[index]; p.name = b.getStringAttr(name); ports.push_back(p);
+      };
+      port("clock",scheduler,0); port("reset",scheduler,1); port("targetFire",scheduler,2);
+      port("req",scheduler,3); port("resp",scheduler,6);
+      port("enq",buffer,2); port("enqAddr",buffer,4);
+      auto top = b.create<FModuleOp>(circuit.getLoc(),b.getStringAttr("GGNICReadEgress"),
+                                    scheduler.getConventionAttr(),ports);
+      top.setPublic(); b.setInsertionPointToEnd(top.getBodyBlock());
+      auto s = b.create<InstanceOp>(circuit.getLoc(),scheduler,"readScheduler");
+      auto q = b.create<InstanceOp>(circuit.getLoc(),buffer,"readBuffer");
+      auto arg = [&](unsigned i) {return top.getBodyBlock()->getArgument(i);};
+      auto connect = [&](Value d, Value v) {b.create<ConnectOp>(circuit.getLoc(),d,v);};
+      for (unsigned i=0;i<4;++i) connect(s.getResult(i),arg(i));
+      connect(arg(4),s.getResult(6)); connect(s.getResult(4),q.getResult(3));
+      connect(q.getResult(5),s.getResult(5));
+      connect(q.getResult(0),arg(0)); connect(q.getResult(1),arg(1));
+      connect(q.getResult(4),arg(6));
+      auto field = [&](Value v, llvm::StringRef name) {
+        return b.create<SubfieldOp>(circuit.getLoc(),v,name).getResult();
+      };
+      for (auto name : {"valid","bits"}) connect(field(q.getResult(2),name),field(arg(5),name));
+      auto one = b.create<ConstantOp>(circuit.getLoc(),UIntType::get(&ctx,1,false),APInt(1,1));
+      connect(field(arg(5),"ready"),one);
+      require(succeeded(verify(isolated)), "exported read egress invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2],ec);
+      require(!ec,"cannot export read egress"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc==1,"usage: goldengate-fased-read-scheduler-test [scheduler.mlir egress.mlir]");
+    for(bool selected:{false,true}) {behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}
+  } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
+  return 0;
+}
