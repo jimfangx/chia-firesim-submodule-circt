@@ -2047,3 +2047,17 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-nic-cpu-stream-queues COMMAND goldengate-nic-cpu-stream-queues-test)
 endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-cpu-stream-catalog-test
+    test/Transforms/CPUStreamCatalogTest.cpp lib/Transforms/CPUStreamRead.cpp
+    lib/Transforms/CPUStreamCountBank.cpp lib/Transforms/CPUStreamQueue.cpp
+    lib/Transforms/NICCPUStreamQueues.cpp)
+  target_compile_features(goldengate-cpu-stream-catalog-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-cpu-stream-catalog-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-cpu-stream-catalog-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-cpu-stream-catalog-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-cpu-stream-catalog COMMAND goldengate-cpu-stream-catalog-test)
+endif()

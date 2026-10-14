@@ -3206,10 +3206,48 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerQueueAnnotations, error)))
         return fail("TracerV stream queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TracerV CPU stream in " << tracerQueuePath << '\n';
-      SmallVector<goldengate::CPUStreamSourcePort> rocketStreams;
+      if (failed(goldengate::addNICTokenQueues(circuit, error)))
+        return fail("NIC token queues: " + error);
+      if (circuit.getName() == "GGNICTokenQueuesWrapper") {
+        if (failed(mlir::verify(*module))) return fail("NIC token queues produced invalid FIRRTL IR");
+        llvm::SmallString<256> nicPath(outputDir), nicAnnotations(outputDir);
+        llvm::sys::path::append(nicPath, "post-fame-nic-token-queues.mlir");
+        llvm::sys::path::append(nicAnnotations, "post-fame-nic-token-queues-all.json");
+        std::error_code nicError;
+        llvm::raw_fd_ostream nicOut(nicPath, nicError);
+        if (nicError) return fail("cannot write NIC token queues: " + nicError.message());
+        module->print(nicOut); nicOut << '\n'; nicOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, nicAnnotations, error)))
+          return fail("NIC token queue annotations: " + error);
+        if (failed(goldengate::addNICPacketAdapters(circuit, error)))
+          return fail("NIC packet adapters: " + error);
+        if (failed(mlir::verify(*module))) return fail("NIC packet adapters produced invalid FIRRTL IR");
+        llvm::SmallString<256> packetPath(outputDir), packetAnnotations(outputDir);
+        llvm::sys::path::append(packetPath, "post-fame-nic-packet-adapters.mlir");
+        llvm::sys::path::append(packetAnnotations, "post-fame-nic-packet-adapters-all.json");
+        std::error_code packetError;
+        llvm::raw_fd_ostream packetOut(packetPath, packetError);
+        if (packetError) return fail("cannot write NIC packet adapters: " + packetError.message());
+        module->print(packetOut); packetOut << '\n'; packetOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, packetAnnotations, error)))
+          return fail("NIC packet adapter annotations: " + error);
+        if (failed(goldengate::addNICCPUStreamQueues(circuit, error)))
+          return fail("NIC CPU stream queues: " + error);
+        if (failed(mlir::verify(*module))) return fail("NIC CPU stream queues produced invalid FIRRTL IR");
+        llvm::SmallString<256> streamQueuePath(outputDir), streamQueueAnnotations(outputDir);
+        llvm::sys::path::append(streamQueuePath, "post-fame-nic-cpu-stream-queues.mlir");
+        llvm::sys::path::append(streamQueueAnnotations, "post-fame-nic-cpu-stream-queues-all.json");
+        std::error_code streamQueueError;
+        llvm::raw_fd_ostream streamQueueOut(streamQueuePath, streamQueueError);
+        if (streamQueueError) return fail("cannot write NIC CPU stream queues: " + streamQueueError.message());
+        module->print(streamQueueOut); streamQueueOut << '\n'; streamQueueOut.close();
+        if (failed(goldengate::emitAllAnnotations(circuit, streamQueueAnnotations, error)))
+          return fail("NIC CPU stream queue annotations: " + error);
+      }
+      SmallVector<goldengate::CPUStreamSourcePort> rocketStreams, cpuSinks;
       SmallVector<goldengate::CPUStreamCountPort> rocketCounts;
-      if (failed(goldengate::deriveRocketCPUStreamPorts(circuit, rocketStreams, rocketCounts, error)))
-        return fail("Rocket CPU stream catalog: " + error);
+      if (failed(goldengate::deriveCPUStreamPorts(circuit, rocketStreams, cpuSinks, rocketCounts, error)))
+        return fail("CPU stream catalog: " + error);
       if (failed(goldengate::addCPUStreamRead(circuit, rocketStreams, error)))
         return fail("CPU stream read transport: " + error);
       if (failed(mlir::verify(*module)))
@@ -3240,6 +3278,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuCountAnnotations, error)))
         return fail("CPU stream count bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT CPU stream count MMIO bank in " << cpuCountPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC incoming AXI writes and MMIO control binding are not implemented");
       if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
         return fail("CPU stream MCRFile transactions: " + error);
       if (failed(mlir::verify(*module)))
@@ -4594,45 +4634,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuPlatformAnnotations, error)))
         return fail("CPU stream platform annotations: " + error);
       llvm::outs() << "Assembled CIRCT CPU-managed AXI4 slave in " << cpuPlatformPath << '\n';
-      if (failed(goldengate::addNICTokenQueues(circuit, error)))
-        return fail("NIC token queues: " + error);
-      if (circuit.getName() == "GGNICTokenQueuesWrapper") {
-        if (failed(mlir::verify(*module))) return fail("NIC token queues produced invalid FIRRTL IR");
-        llvm::SmallString<256> nicPath(outputDir), nicAnnotations(outputDir);
-        llvm::sys::path::append(nicPath, "post-fame-nic-token-queues.mlir");
-        llvm::sys::path::append(nicAnnotations, "post-fame-nic-token-queues-all.json");
-        std::error_code nicError;
-        llvm::raw_fd_ostream nicOut(nicPath, nicError);
-        if (nicError) return fail("cannot write NIC token queues: " + nicError.message());
-        module->print(nicOut); nicOut << '\n'; nicOut.close();
-        if (failed(goldengate::emitAllAnnotations(circuit, nicAnnotations, error)))
-          return fail("NIC token queue annotations: " + error);
-        if (failed(goldengate::addNICPacketAdapters(circuit, error)))
-          return fail("NIC packet adapters: " + error);
-        if (failed(mlir::verify(*module))) return fail("NIC packet adapters produced invalid FIRRTL IR");
-        llvm::SmallString<256> packetPath(outputDir), packetAnnotations(outputDir);
-        llvm::sys::path::append(packetPath, "post-fame-nic-packet-adapters.mlir");
-        llvm::sys::path::append(packetAnnotations, "post-fame-nic-packet-adapters-all.json");
-        std::error_code packetError;
-        llvm::raw_fd_ostream packetOut(packetPath, packetError);
-        if (packetError) return fail("cannot write NIC packet adapters: " + packetError.message());
-        module->print(packetOut); packetOut << '\n'; packetOut.close();
-        if (failed(goldengate::emitAllAnnotations(circuit, packetAnnotations, error)))
-          return fail("NIC packet adapter annotations: " + error);
-        if (failed(goldengate::addNICCPUStreamQueues(circuit, error)))
-          return fail("NIC CPU stream queues: " + error);
-        if (failed(mlir::verify(*module))) return fail("NIC CPU stream queues produced invalid FIRRTL IR");
-        llvm::SmallString<256> streamQueuePath(outputDir), streamQueueAnnotations(outputDir);
-        llvm::sys::path::append(streamQueuePath, "post-fame-nic-cpu-stream-queues.mlir");
-        llvm::sys::path::append(streamQueueAnnotations, "post-fame-nic-cpu-stream-queues-all.json");
-        std::error_code streamQueueError;
-        llvm::raw_fd_ostream streamQueueOut(streamQueuePath, streamQueueError);
-        if (streamQueueError) return fail("cannot write NIC CPU stream queues: " + streamQueueError.message());
-        module->print(streamQueueOut); streamQueueOut << '\n'; streamQueueOut.close();
-        if (failed(goldengate::emitAllAnnotations(circuit, streamQueueAnnotations, error)))
-          return fail("NIC CPU stream queue annotations: " + error);
-        return fail("NIC CPU stream allocation and MMIO control binding are not implemented");
-      }
       if (failed(goldengate::assembleFPGATopShell(circuit, error)))
         return fail("FPGA top shell: " + error);
       if (failed(mlir::verify(*module))) return fail("FPGA top shell produced invalid FIRRTL IR");

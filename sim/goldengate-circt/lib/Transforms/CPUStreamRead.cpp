@@ -88,6 +88,112 @@ LogicalResult goldengate::deriveRocketCPUStreamPorts(CircuitOp circuit,
   return success();
 }
 
+LogicalResult goldengate::deriveCPUStreamPorts(CircuitOp circuit,
+    SmallVectorImpl<CPUStreamSourcePort> &sources,
+    SmallVectorImpl<CPUStreamSourcePort> &sinks,
+    SmallVectorImpl<CPUStreamCountPort> &counts, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  SmallVector<CPUStreamSourcePort> outgoing, incoming;
+  SmallVector<CPUStreamCountPort> registers;
+  if (failed(deriveRocketCPUStreamPorts(circuit, outgoing, registers, error))) return failure();
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) return reject("CPU stream catalog needs retained bridge annotations");
+  unsigned nics = 0;
+  for (auto a : raw) {
+    auto d = dyn_cast<DictionaryAttr>(a);
+    auto cls = d ? d.getAs<StringAttr>("class") : StringAttr{};
+    auto widget = d ? d.getAs<StringAttr>("widgetClass") : StringAttr{};
+    if (cls == "firesim.lib.bridgeutils.BridgeIOAnnotation" &&
+        widget == "firechip.goldengateimplementations.SimpleNICBridgeModule") {
+      if (d.get("widgetConstructorKey")) return reject("CPU catalog needs constructor-free NIC");
+      ++nics;
+    }
+  }
+  if (nics > 1) return reject("CPU catalog requires distinct bindings for multiple NICs");
+  if (nics) {
+    auto find = [&](StringRef name) -> FModuleOp {
+      for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == name) return m;
+      return {};
+    };
+    auto top = find(circuit.getName()); auto *ctx = circuit.getContext(); OpBuilder b(ctx);
+    auto bit = UIntType::get(ctx, 1), word = UIntType::get(ctx, 512), countType = UIntType::get(ctx, 12);
+    auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
+        {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, word}});
+    auto port = [&](StringRef name, Type type, Direction direction) -> Value {
+      for (auto [i,p] : llvm::enumerate(top.getPorts()))
+        if (p.name == name && p.type == type && p.direction == direction) return top.getArgument(i);
+      return {};
+    };
+    using Path = SmallVector<InstanceOp>;
+    struct Endpoint { FModuleOp queue; Path path; unsigned port = 0; };
+    // Output tracing follows unique drivers. Input tracing follows unique
+    // instance consumers, preserving the full instance path for identity.
+    auto trace = [&](Value value, bool input) -> Endpoint {
+      Path path; SmallVector<Value> seen;
+      while (value && seen.size() < 4096) {
+        if (llvm::is_contained(seen, value)) return {};
+        seen.push_back(value); Value next; unsigned connections = 0;
+        for (auto &op : *value.getParentBlock()) {
+          auto visit = [&](Value dest, Value src) {
+            if ((!input && dest == value) || (input && src == value)) {
+              next = input ? dest : src; ++connections;
+            }
+          };
+          if (auto c = dyn_cast<ConnectOp>(op)) visit(c.getDest(), c.getSrc());
+          if (auto c = dyn_cast<StrictConnectOp>(op)) visit(c.getDest(), c.getSrc());
+        }
+        if (connections) { if (connections != 1) return {}; value = next; }
+        auto inst = value.getDefiningOp<InstanceOp>();
+        if (!inst) { if (connections) continue; return {}; }
+        auto module = find(inst.getModuleName());
+        unsigned i = cast<OpResult>(value).getResultNumber();
+        if (!module || module.getPortDirection(i) != (input ? Direction::In : Direction::Out)) return {};
+        path.push_back(inst);
+        if (module.getName() == "GGNICCPUStreamQueue3072") return {module, path, i};
+        value = module.getArgument(i);
+      }
+      return {};
+    };
+    Path incomingPath, outgoingPath;
+    for (bool input : {false, true}) {
+      StringRef payloadName = input ? "nic_from_host_stream" : "nic_to_host_stream";
+      StringRef countName = input ? "nic_from_host_stream_count" : "nic_to_host_stream_count";
+      StringRef streamName = input ? "SIMPLENICBRIDGEMODULE_0_from_cpu_stream" : "SIMPLENICBRIDGEMODULE_0_to_cpu_stream";
+      auto payload = trace(port(payloadName, token, input ? Direction::In : Direction::Out), input);
+      auto occupancy = trace(port(countName, countType, Direction::Out), false);
+      if (!payload.queue || payload.path != occupancy.path ||
+          payload.port != (input ? 2u : 3u) || occupancy.port != 4)
+        return reject("NIC payload/count must reach the same live directional queue instance");
+      auto queue = payload.queue;
+      auto info = payload.path.back()->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
+      auto depth = info ? info.getAs<IntegerAttr>("depth") : IntegerAttr{};
+      auto width = info ? info.getAs<IntegerAttr>("widthBytes") : IntegerAttr{};
+      if (!info || info.getAs<StringAttr>("name") != streamName ||
+          info.getAs<StringAttr>("direction") != (input ? "fromHostCPU" : "toHostCPU") ||
+          !depth || depth.getInt() != 3072 || !width || width.getInt() != 64 ||
+          queue.getNumPorts() != 5 || queue.getPortType(2) != token ||
+          queue.getPortType(3) != token || queue.getPortType(4) != countType)
+        return reject("NIC CPU catalog instance identity or geometry differs");
+      unsigned memories = 0;
+      for (auto mem : queue.getOps<MemOp>()) {
+        ++memories;
+        if (mem.getDepth() != 3072 || mem.getDataType() != word)
+          return reject("NIC CPU catalog storage differs from allocation");
+      }
+      if (memories != 1) return reject("NIC CPU catalog requires one native queue memory");
+      CPUStreamSourcePort stream{streamName.str(), payloadName.str(), 3072};
+      CPUStreamCountPort count{streamName.str(), countName.str(), 12};
+      if (input) { incoming.push_back(stream); registers.push_back(count); incomingPath = payload.path; }
+      else { outgoing.insert(outgoing.begin(), stream); registers.insert(registers.begin(), count); outgoingPath = payload.path; }
+    }
+    if (incomingPath == outgoingPath) return reject("NIC directions must use independent queue instances");
+  }
+  sources.assign(outgoing.begin(), outgoing.end());
+  sinks.assign(incoming.begin(), incoming.end());
+  counts.assign(registers.begin(), registers.end());
+  return success();
+}
+
 LogicalResult goldengate::addCPUStreamRead(CircuitOp circuit, std::string &error) {
   if (circuit.getName() != "GGTracerVStreamQueueWrapper") {
     error = "CPU stream read requires the TracerV queue wrapper";

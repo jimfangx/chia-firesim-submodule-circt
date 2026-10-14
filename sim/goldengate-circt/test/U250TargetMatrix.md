@@ -430,3 +430,96 @@ reaches CPU stream buffering and still rejects stream allocation/MMIO binding.
 Multiple/non-Rocket TracerV, FASED profiles beyond maxFlight=10, and partition/
 QSFP semantics remain unsupported. Annotation matches do not establish target
 behavioral or ABI parity. No FireSim manager verification gate was initiated.
+
+## Iteration 172: live NIC/TracerV CPU catalog and shared reads
+
+The active compiler now constructs NIC token queues, packet adapters and CPU
+stream queues immediately after the TracerV buffer, before CPU transport
+allocation. `deriveCPUStreamPorts` follows typed wrapper connections and
+checks payload/count identity against the same full queue instance path. It
+reads NIC metadata from instances rather than the shared queue module, checks
+3072×512 storage and independent directions, and preserves IR and all output
+lists on rejection. The existing Rocket-only catalog remains available for
+other callers and validates the retained 6144×512 TracerV queue.
+
+The combined outgoing order is NIC index 0 and TracerV index 1, with 19 address
+selection bits and DMA bases 0 and 524288. Incoming NIC has its own index 0
+in the separate sink list. The actual compiler binds both outgoing streams to
+native AXI AR/R operations and allocates live count words in source-before-sink
+order: outgoing NIC at relative offset 0, TracerV at 4, incoming NIC at 8.
+The three-word count bank is emitted before an explicit failure:
+`NIC incoming AXI writes and MMIO control binding are not implemented`.
+Incoming DMA is enumerated but not bound. Absolute MMIO addresses, complete
+NIC widget controls, platform assembly and driver emission remain unsupported.
+
+Focused CTests passed: CPU read, multi-source read, count bank, NIC token
+queues, NIC packet adapters, NIC CPU queues and the new CPU stream catalog.
+The catalog test traverses nested incoming/outgoing wrappers and verifies
+constructor ordering, read window allocation, count offsets, and atomic
+rejection of swapped occupancy paths, missing/wrong instance metadata and
+wrong stream direction. An initial fixture parse failure was corrected; the
+catalog CTest passed after rebuilding. Existing multi-source read behavioral
+tests exercise held AR bursts and the SFC rule that every source counter
+updates on the shared R handshake, including unselected streams.
+
+`test/Transforms/NICCPUStreamReadCompare.py` extracts the actual candidate's
+`GGCPUStreamRead` module, lowers it with firtool, and compares its RTL against
+the read-expression cone and two original clocked counters projected from:
+
+```
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h
+```
+
+The RTL SHA256 is
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+SFC prunes the constant OKAY response into downstream AXI-buffer queue storage;
+the comparison checks that original storage write value before specializing
+the projected response. Allocation names/depths/bases match the header. The
+header's absolute count addresses are 592, 596 and 600, confirming the relative
+0/4/8 order; native absolute address binding is not claimed.
+
+The standalone Verilator comparison passed 50,000 cycles with independent
+512-bit queue stimuli, both stream grants, unmapped addresses, reset, held AR
+periods and arbitrary address/length changes. Coverage includes 7,738 accepted
+responses (3,849 NIC and 3,889 TracerV), 7,896 stalled responses, 12,478 unmapped
+address cycles and 170 accepted last beats. Ready/valid and response ID/OKAY
+match; payload and last match when R.valid is asserted. SFC's invalid-cycle
+payload/last defaults differ from native zero defaults and are intentionally
+excluded by the AXI validity contract. This proves the read cone, not complete
+NIC simulation or buffered platform timing.
+
+Evidence and complete compiler/lowering/Verilator logs are under:
+
+```
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration172-u250-target-matrix/
+```
+
+`read-production/comparison.json` compares the real archived-input candidate's
+`post-fame-cpu-stream-count.mlir` with those SFC files.
+`nic-candidate-binding-comparison.json` confirms every prior NIC module body
+is retained and both new read/count helper bodies equal the verified catalog
+fixture. `no-nic-rtl-comparison.json` confirms unchanged non-NIC Rocket RTL,
+SHA256 `88b4a4760c0055046e67560e30294622d46bce18e426b373118d7dfbd586712a`.
+`immutable-rocket-comparison.json` rechecks the exact October 1 immutable
+compiler input FIRRTL/annotations and U250 build-tree synthesis/implementation
+XDC. Constraints match after the recorded implementation hierarchy rename
+`target/FireSim_` to `target_FAMETop/FireSim`.
+
+The next smallest step is native incoming NIC AXI AW/W/B transport with
+18-bit window selection, a grant-qualified write counter and depth-3072 FIFO
+backpressure. After that, bind NIC widget controls and source/sink count MMIO
+through the shared control fabric and derive both driver direction lists from
+live allocations. Multiple/non-Rocket TracerV, broader FASED and partition/QSFP
+profiles remain matrix gaps. No FireSim manager verification gate was initiated.
+
+The complete thirteen-recipe replay used compiler SHA256
+`313feb5d9719347f4e83c9d7550bc24580b5ab354ca574a048a79c91cc7e6962`.
+`replay/matrix.json` and `matrix.md` retain one compiled target, six lowering
+failures and six unsupported partition profiles. All seven reached
+bridge-extraction boundaries match SFC annotation identities. Shuttle's
+model-port annotations match; the other six retain the existing SRAM
+annotation differences. The matrix exits nonzero and does not claim semantic
+parity for any rejected target. `nic-annotation-transfer.json` additionally
+checks all 1,792 records and exact recursive copied/consumed target transfer
+through both new live read/count wrappers.

@@ -21,6 +21,16 @@ mlir::LogicalResult deriveRocketCPUStreamPorts(
     circt::firrtl::CircuitOp circuit,
     llvm::SmallVectorImpl<CPUStreamSourcePort> &sources,
     llvm::SmallVectorImpl<CPUStreamCountPort> &counts, std::string &error);
+// Resolve the supported NIC + TracerV catalog from live queue connections.
+// Sink descriptors use the same buffer geometry and a separate ordered list.
+// Sources precede sinks in the count bank. Directional DMA indices are assigned
+// independently; NIC precedes TracerV in SFC bridge constructor order. All
+// output lists and IR remain unchanged on rejection.
+mlir::LogicalResult deriveCPUStreamPorts(
+    circt::firrtl::CircuitOp circuit,
+    llvm::SmallVectorImpl<CPUStreamSourcePort> &sources,
+    llvm::SmallVectorImpl<CPUStreamSourcePort> &sinks,
+    llvm::SmallVectorImpl<CPUStreamCountPort> &counts, std::string &error);
 // Consume Decoupled512 outputs into one AXI AR/R interface. Allocate equal
 // windows using ceilLog2(64 * max(depth)); every stream counter follows the
 // global R handshake, as in CPUManagedStreamEngine. No annotations consumed.

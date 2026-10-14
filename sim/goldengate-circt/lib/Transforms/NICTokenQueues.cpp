@@ -38,8 +38,9 @@ LogicalResult goldengate::addNICTokenQueues(CircuitOp circuit, std::string &erro
   if (!bridge) return success();
   if (bridge.get("widgetConstructorKey"))
     return reject("SimpleNIC requires its constructor-free BridgeIO annotation");
-  if (circuit.getName() != "GGCPUStreamPlatformWrapper")
-    return reject("NIC queues require the active CPU stream platform boundary");
+  if (circuit.getName() != "GGCPUStreamPlatformWrapper" &&
+      circuit.getName() != "GGTracerVStreamQueueWrapper")
+    return reject("NIC queues require the active buffered-stream or CPU platform boundary");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == queueName || m.getModuleName() == wrapperName)
