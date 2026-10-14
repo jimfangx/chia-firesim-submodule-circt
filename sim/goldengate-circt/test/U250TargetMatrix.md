@@ -2342,3 +2342,80 @@ The next smallest step is to execute NIC ingress deadlock assertions against
 the same SFC oracle, then port the remaining response/timing and slave-1
 control binding. Wider/multiple TracerV profiles, FASED geometry, complete NIC
 host memory/stream composition and partition/QSFP support remain incomplete.
+
+## Iteration 194: execute NIC ingress enqueue deadlock assertions
+
+The actual NIC compiler now executes and verifies `addFASEDIngressDeadlock`
+after host issue, emitting `post-fame-fased-ingress-deadlock.mlir` and its
+complete annotation archive. The pass connects the actual AW/W queue enqueue
+valid/ready signals, strict/relaxed policy, credit emptiness and order validity
+through six internal policy ports. Assertions use the host clock and qualified
+ingress reset. The compiler rejects subsequent response buffering,
+timing/control responses and platform composition; NIC runtime remains unsupported.
+
+The Scala references inspected are `MidasTransforms.scala`, `FAMETransform.scala`
+and `models/dram/IngressUnit.scala`. The selected SFC artifact is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICFASEDDeadlockCompare.py` matches all 1,185 production wrapper connections,
+all 1,792 annotation rows, 165 unaffected module bodies and the shared no-NIC
+assertion helper. It retains the 32,768 issue cases and 160 AW/final-W collision
+cases. The selected Print comparator retains its defaults; both constructor
+orders pass after accepting equivalent inline and automatic-local mux lowering.
+
+The native deadlock test exports an unchanged clone of the production helper
+and a second clone exposing its actual predicate/enable operands. The exporter
+does not reconstruct policy or enqueue expressions. An isolated Verilator
+differential compares the lowered operands with recursively extracted actual
+SFC assertion expression cones across all 512 input combinations: 32 W
+failures, 32 AW failures and 256 reset-disabled cases match. The unchanged
+production assertions are clocked in safe cases and two separate deliberate
+failure runs require their exact recorded W/AW diagnostics. This establishes
+boundary assertion behavior; it does not establish complete queue scheduling,
+response/timing/MMIO behavior or NIC simulator execution.
+
+Evidence is in the generated-src target's `iteration194-u250-target-matrix/`:
+`nic-deadlock-comparison.json`, `nic-deadlock-differential/`,
+`print-deadlock-regression.json`, `ctest.log`,
+`immutable-deadlock-comparison.json`, `immutable-rocket-comparison.json`,
+`nic-prior-boundaries-comparison.json`,
+`no-nic-rtl-collateral-comparison.json` and `replay/matrix.json`.
+The production candidate SHA256 is
+`4fa862e1799d3daef35062e0ae4299ec316c6312910a9dbeeee668f662fefeff`.
+Native deadlock CTest passes its 512 behavior cases and 16 atomic rejection
+cases for each baseline/selected constructor. All 184 prior NIC MLIR/annotation
+files and five no-NIC RTL/collateral files match iteration 193 byte for byte.
+
+The complete `IngressModule` header/body in the NIC archive matches the
+October 1 immutable U250 `design/FireSim-generated.sv`, including both
+assertion guards, predicates and messages. Candidate predicate/enable semantics
+also match that immutable oracle across 512 cases. Fresh comparisons of the
+immutable primary Rocket handoff and normalized U250 XDC match, including
+the recorded implementation-XDC hierarchy rename. Neither immutable fixture
+was modified. No manager verification was started.
+
+Run the new comparator in the sourced environment with `--candidate-dir`
+pointing to the NIC replay, `--baseline` to the no-NIC production
+`post-fame-fased-ingress-deadlock.mlir`, `--golden` to the SFC SV above,
+`--export-tool` to `goldengate-fased-ingress-deadlock-test`, a fresh
+`--output-dir` and `--report-json`.
+
+Fresh replay uses the same thirteen archived inputs and their effective
+platform configurations. Compiler SHA256 is
+`9dc55aa553eb79cc937db1de1e05b090fad30d3c6a368bbdc9427ab51c6df9cd`.
+Full matrix results and the comparison to iteration 193 are recorded in
+`replay/matrix.json` and `matrix-regression-comparison.json`.
+The replay retains one compiled no-NIC target, six later compiler failures
+and six unsupported partition/QSFP platforms; its nonzero exit preserves
+these implementation gaps. All seven reached BridgeIO/channel boundaries
+match SFC. Shuttle model-port annotations match; the other six retain the
+recorded native-SRAM differences. All thirteen input hashes, effective
+platforms, compile statuses and structured boundary comparisons match
+iteration 193. Only the NIC unsupported-feature diagnostic advances.
+
+The next smallest step is to execute NIC read-response buffering against
+the SFC `ReadEgress`/`MultiQueue` boundary, checking qualified reset, per-ID
+occupancy, synchronous prefetch and data/last behavior. Timing/control
+responses, slave-1 binding, wider/multiple TracerV profiles, generalized FASED
+geometry, complete NIC host memory/stream composition and partition/QSFP
+support remain incomplete.

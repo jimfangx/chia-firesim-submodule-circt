@@ -130,8 +130,49 @@ void rejection(MLIRContext &ctx, bool selected) {
   llvm::outs()<<"16 atomic rejection cases passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {for (bool selected : {false, true}) {behavior(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
+  try {
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production deadlock boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDIngressIssueWrapper" ||
+              circuit.getName() == "GGSelectedPrintFASEDIngressIssueWrapper",
+              "expected FASED ingress deadlock boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDIngressDeadlock"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper = cast<FModuleOp>(b.insert(named(circuit, "GGFASEDIngressDeadlock")->clone()));
+      helper.setPublic();
+      // Preserve the production assertions verbatim. A second clone exposes
+      // their actual predicate/enable operands for exhaustive RTL comparison;
+      // no policy or enqueue expression is reconstructed by the exporter.
+      auto observed = cast<FModuleOp>(b.insert(helper->clone()));
+      observed.setName("GGFASEDIngressDeadlockObserved");
+      SmallVector<AssertOp> assertions(observed.getOps<AssertOp>());
+      require(assertions.size() == 2, "expected W and AW assertions");
+      unsigned first = observed.getNumPorts();
+      auto bit = UIntType::get(&ctx, 1, false);
+      SmallVector<std::pair<unsigned, PortInfo>> outputs;
+      for (auto name : {"wFailure", "awFailure"})
+        outputs.push_back({first, PortInfo(b.getStringAttr(name), bit, Direction::Out)});
+      observed.insertPorts(outputs);
+      b.setInsertionPointToEnd(observed.getBodyBlock());
+      for (auto [j, assertion] : llvm::enumerate(assertions)) {
+        Value denied = b.create<NotPrimOp>(assertion.getLoc(), assertion.getPredicate());
+        Value failure = b.create<AndPrimOp>(assertion.getLoc(), assertion.getEnable(), denied);
+        b.create<StrictConnectOp>(assertion.getLoc(), observed.getBodyBlock()->getArgument(first + j), failure);
+        assertion.erase();
+      }
+      require(succeeded(verify(isolated)), "exported deadlock predicates invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot export deadlock predicates"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-ingress-deadlock-test [deadlock.mlir helpers.mlir]");
+    for (bool selected : {false, true}) {behavior(ctx,selected);rejection(ctx,selected);}
+  }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

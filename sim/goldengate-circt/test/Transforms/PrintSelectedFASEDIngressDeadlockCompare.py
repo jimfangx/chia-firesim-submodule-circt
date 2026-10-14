@@ -64,7 +64,7 @@ def predicates(text):
     return 512
 
 
-def compare(before, after, baseline):
+def compare(before, after, baseline, chain=CHAIN, rtl_path=None):
     original, text = before.read_text(), after.read_text()
     def bodies(t):
         return {m[1]: m[0] for m in re.finditer(r'^    firrtl.module @(\w+)\(.*?^    }', t, re.M | re.S)}
@@ -73,12 +73,12 @@ def compare(before, after, baseline):
     assert new[HELPER] == native_module(baseline, HELPER), 'shared assertions changed'
     unchanged = 0
     for n, body in old.items():
-        if n not in CHAIN:
+        if n not in chain:
             assert new[n] == body, 'unrelated module changed ' + n
             unchanged += 1
     appended = ('in', CONTEXT, '!firrtl.bundle<relaxed: uint<1>, awEmpty: uint<1>, wEmpty: uint<1>, orderValid: uint<1>>')
     connections = 0
-    for j, n in enumerate(CHAIN):
+    for j, n in enumerate(chain):
         assert native_ports(new[n]) == native_ports(old[n]) + ([appended] if j else [])
         expected = wiring(original, n, aggregate=True)
         if j == 0:
@@ -95,7 +95,7 @@ def compare(before, after, baseline):
                 'ingressDeadlock.wValid': 'top.w_enq.valid', 'ingressDeadlock.wReady': 'top.w_enq.ready'})
         assert wiring(text, n, aggregate=True) == expected, 'policy or prior wiring differs ' + n
         connections += len(expected)
-    gates = wiring(text, CHAIN[5], aggregate=True)
+    gates = wiring(text, chain[5], aggregate=True)
     assert gates['ingressAW.clock'] == 'top.hostClock'
     assert gates['ingressAW.reset'] == 'sim.fased_ingress_reset', 'assertions need qualified ingress reset'
     prior = json.loads(before.with_name(before.stem + '-all.json').read_text())
@@ -103,7 +103,7 @@ def compare(before, after, baseline):
     assert prior == updated, 'annotation archive changed'
     cases = predicates(text)
     issue_count, collisions = issue_cases(text)
-    rtl = clean(after.with_suffix('.sv').read_text())
+    rtl = clean((rtl_path or after.with_suffix('.sv')).read_text())
     header, body = module(rtl, HELPER)
     assert 'always @(posedge clock)' in body
     for message in MESSAGES: assert message in body
@@ -111,8 +111,10 @@ def compare(before, after, baseline):
     assert guarded, 'emitted assertions lost their reset guard'
     for ch in ('w', 'aw'):
         policy = re.search(r'automatic logic (\w+) = relaxed \? ' + ch + r'Empty : ~orderValid;', guarded[1])
-        assert policy, 'emitted strict/relaxed policy differs'
-        assert f'assert(~({ch}Valid & ~{ch}Ready & {policy[1]}))' in guarded[1], 'emitted enqueue predicate differs'
+        # Isolated lowering can inline the mux; whole-circuit lowering may
+        # retain an automatic local. Both observe the same enqueue inputs.
+        mux = policy[1] if policy else f'(relaxed ? {ch}Empty : ~orderValid)'
+        assert f'assert(~({ch}Valid & ~{ch}Ready & {mux}))' in guarded[1], 'emitted enqueue predicate differs'
     return dict(before=str(before), after=str(after), unchanged_modules=unchanged,
                 propagated_internal_ports=6, chain_connections=connections, annotation_rows=len(updated),
                 deadlock_cases=cases, failures_per_channel=32, retained_issue_cases=issue_count,
