@@ -4042,11 +4042,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tsiBoundAnnotations, error)))
         return fail("TSI binding annotations: " + error);
       llvm::outs() << "Bound CIRCT TSI requests and responses to control slave 3 in " << tsiBoundPath << '\n';
-      // The NIC catalog shares the validated five-channel TSI constructor.
-      // Keep its native scheduler, queues and control bank live before the
-      // remaining widget/platform boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC BlockDev and FASED control responses and platform integration are not implemented");
+      // NIC and no-NIC catalogs share the one-tracker BlockDev constructor.
+      // Build its queues, control slave and target-cycle scheduler in both.
       if (failed(goldengate::addBlockDevTokenEngine(circuit, error)))
         return fail("BlockDev token engine: " + error);
       if (failed(mlir::verify(*module))) return fail("BlockDev token engine produced invalid FIRRTL IR");
@@ -4199,6 +4196,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevResponseSchedulerAnnotations, error)))
         return fail("BlockDev response scheduler annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev response scheduler in " << blockDevResponseSchedulerPath << '\n';
+      if (!cpuSinks.empty())
+        return fail("NIC FASED control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDTokenEngine(circuit, error)))
         return fail("FASED token engine: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED token engine produced invalid FIRRTL IR");

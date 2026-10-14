@@ -2017,3 +2017,91 @@ queue, MMIO and slave-0 control stages against the same archived SFC target.
 FASED slave-1 responses, host memory/stream integration, NIC runtime,
 wider/multiple TracerV profiles, FASED geometry and partition/QSFP support
 remain incomplete.
+
+## Iteration 190: execute native BlockDev stages for the NIC catalog
+
+The NIC path now executes the eleven existing CIRCT BlockDev stages through
+response scheduling before rejecting FASED/platform integration. These stages
+construct the token engine, four functional queues, MMIO bank, control slave,
+slave-0 binding, two latency pipes and response scheduler as verified FIRRTL
+operations. The catalog assigns BlockDev byte address 0 in a 128-byte region,
+with 26 register words through byte address 100. The no-NIC path uses the same
+passes and retains identical emitted RTL/collateral.
+
+The inspected semantic oracle remains `MidasTransforms.scala`,
+`FAMETransform.scala` and
+`generators/firechip/goldengateimplementations/src/main/scala/BlockDevBridgeModule.scala`.
+The BlockDev constructor has one tracker, 64 beats per sector, 24-bit target
+cycle/latency state, four functional queues of depths 10/32/32/4 and a
+write-priority response scheduler. Target reset depends on both host
+handshakes, even when queue/timing conditions block target firing; the cycle
+counter resets only on host reset. The comparison uses the actual SFC artifact:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+Its SHA256 is
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`test/Transforms/NICBlockDevCompare.py` verifies all eleven production stages,
+preservation of every earlier module and recursive transfer of all 1,792
+annotations, including the nine BlockDev channels. It checks the complete token
+wrapper connections, MMIO register metadata, queue geometry, timing/control
+connections and twenty SFC control pins; 25 additional assembly connections
+tie the behavioral assembly to the production wrappers. The exporter in
+`BlockDevTokenEngineTest.cpp` clones the nine actual helper modules from the
+production response-scheduler boundary; their bodies must match before lowering.
+
+The isolated native assembly matches the complete SFC `BlockDevBridgeModule`
+and its actual queues, latency pipes and MCRFile for 40,799 Verilator cycles,
+with assertions enabled. Directed coverage includes a 64-beat read, a complete
+sector write, delayed software data/acknowledgement and queue-full target
+reset. Another 40,000 randomized cycles exercise host/target reset, AW/W arrival,
+MMIO address aliases, IDs, strobes and B/R backpressure. Observed coverage is
+10,558 target fires, 65 responses (64 read beats and one write acknowledgement),
+1,898 stalled target-reset cycles, 145 queue-reset cycles with target firing
+blocked, 964 B stalls and 9,948 R stalls. Five SFC-optimized response constants
+also match. This tests the local BlockDev boundary; complete NIC target runtime
+and platform/driver equivalence remain unestablished.
+
+Evidence is under:
+
+```text
+sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration190-u250-target-matrix/
+```
+
+`nic-blockdev-final/comparison.json` records the production comparison and
+candidate SHA256
+`0d369f569d25310e4d39c0de379302861732f72d947decc5ce6107acef2bb6a0`.
+Run the comparison in the sourced FireSim environment with `--candidate-dir`
+pointing to the NIC replay candidate, `--golden` to the SV above, `--export-tool`
+to `goldengate-blockdev-token-test` and a fresh `--output-dir`.
+`immutable-blockdev-comparison.json` also compares the entire SFC BlockDev
+widget and seven dependency instances with the October 1 immutable U250
+`design/FireSim-generated.sv`: all ports and complete module bodies match.
+Neither immutable fixture was edited. Fresh immutable Rocket handoff and
+normalized XDC comparisons also match, with the recorded implementation-XDC
+hierarchy rename.
+
+All ten focused BlockDev CTest cases pass in 236.88 seconds. The refactored
+Rocket/Print comparison still passes both constructor orders against the
+immutable U250 SV. Python syntax and scoped diff checks pass. All 36 earlier
+NIC boundary files and all five no-NIC RTL/collateral files match iteration
+189 byte for byte. No manager verification was started; unrelated user changes
+are excluded from this checkpoint.
+
+Fresh replay of all thirteen archived inputs/effective platforms used compiler
+SHA256 `b8750b1cbe49d659ebaacc0532897da727b2ae09c62002cd617c9980940086de`.
+`replay/matrix.json` retains one completed no-NIC compile, six later lowering
+failures and six unsupported partition/QSFP configurations; its nonzero exit
+retains these gaps. All seven reached BridgeIO/channel boundaries match SFC.
+Shuttle model-port annotations match; the other six retain the recorded
+native-SRAM differences. `matrix-regression-comparison.json` matches all
+thirteen input hashes, effective platforms, compile statuses and structured
+boundary comparisons to iteration 189. Only the NIC rejection advances past
+BlockDev response scheduling.
+
+The next smallest step is to carry NIC through the native FASED token and
+slave-1 control stages against the same archived SFC target. Host memory/stream
+integration, complete NIC runtime, wider/multiple TracerV profiles, FASED
+geometry and partition/QSFP support remain incomplete.

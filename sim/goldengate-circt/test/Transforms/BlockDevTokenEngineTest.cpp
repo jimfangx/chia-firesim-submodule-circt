@@ -447,8 +447,31 @@ void annotationsAndRejection(MLIRContext &ctx) {
   llvm::outs() << "annotation retention/targets and 16 atomic rejection cases passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+  // Clone the live production helpers for the complete SFC-widget differential.
+  if (argc == 3) {
+    try {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production boundary invalid");
+      auto c = *root->getOps<CircuitOp>().begin();
+      require(c.getName() == "GGBlockDevResponseSchedulerWrapper", "expected scheduled BlockDev boundary");
+      auto isolated = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr("GGBlockDevTokenEngine"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      for (auto name : {"GGBlockDevTokenEngine", "GGBlockDevRequestQueue10", "GGBlockDevDataQueue32",
+                        "GGBlockDevWriteAckQueue4", "GGBlockDevMMIOBank", "GGBlockDevMCRFile",
+                        "GGBlockDevWriteLatencyPipe", "GGBlockDevReadLatencyPipe", "GGBlockDevResponseScheduler"}) {
+        auto helper = cast<FModuleOp>(b.insert(named(c, name)->clone())); helper.setPublic();
+      }
+      require(succeeded(verify(isolated)), "exported BlockDev helpers invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot export BlockDev helpers"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
+  }
+  if (argc != 1) { llvm::errs() << "usage: goldengate-blockdev-token-test [scheduled.mlir helpers.mlir]\n"; return 1; }
   try { behavior(ctx); writeTracker(ctx); wiring(ctx); wiring(ctx, true); annotationsAndRejection(ctx); return 0; }
   catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

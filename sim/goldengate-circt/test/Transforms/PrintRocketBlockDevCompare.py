@@ -10,8 +10,7 @@ from PrintRocketMasterCompare import native_module
 from PrintRocketResponsesCompare import wiring
 
 
-def main():
-    evidence, golden = (Path(arg).resolve() for arg in sys.argv[1:])
+def compare(golden, paths, baseline=None, region_count=11):
     reference = clean(golden.read_text())
     header, bank = module(reference, 'BlockDevBridgeModule')
     ref_nets = equations(module(reference, 'FPGATop')[1])
@@ -50,13 +49,11 @@ def main():
     for channel in ('aw', 'ar'):
         ranges = [(0, 128)] + [(int(lo, 16), int(hi, 16)) for lo, hi in re.findall(
             r"25'h([0-9a-f]+) <= io_master_" + channel + r"_bits_addr & io_master_" + channel + r"_bits_addr < 25'h([0-9a-f]+)", router)]
-        assert len(ranges) == 11
+        assert len(ranges) == region_count
         ref_ranges[channel] = ranges[0]
     assert ref_ranges['aw'] == ref_ranges['ar']
-    baseline = (evidence / 'candidate/post-fame-blockdev-response-scheduler.mlir').read_text()
     reports = []
-    for suffix in ('rocket-blockdev', 'rocket-blockdev-reverse'):
-        path = evidence / f'binding.mlir.{suffix}.mlir'
+    for path in paths:
         text = path.read_text()
         bound = native_module(text, 'GGBlockDevBridgeBoundWrapper')
         assert 'goldengate.blockdevSlave = 0 : i32' in bound
@@ -69,7 +66,8 @@ def main():
                        'GGBlockDevDataQueue32', 'GGBlockDevWriteAckQueue4', 'GGBlockDevMCRFile',
                        'GGBlockDevWriteLatencyPipe', 'GGBlockDevReadLatencyPipe', 'GGBlockDevResponseScheduler'):
             native = native_module(text, symbol)
-            assert native == native_module(baseline, symbol), f'{symbol} operations changed'
+            if baseline is not None:
+                assert native == native_module(baseline, symbol), f'{symbol} operations changed'
             if symbol in ('GGBlockDevMMIOBank', 'GGBlockDevTokenEngine', 'GGBlockDevResponseScheduler'):
                 for line in native.splitlines():
                     if match := re.search(r'%(\w+) = firrtl.reg(?:reset)? ', line):
@@ -150,8 +148,15 @@ def main():
         assert ref_nets['BlockDevBridgeModule_0_clock'] == 'clock' and ref_nets['BlockDevBridgeModule_0_reset'] == 'reset'
         reports.append({'artifact': str(path), 'slave': 0, 'base': int(region[2]), 'size': int(region[1]),
                         'registers': names, 'queues_depth_payload_bits': queue_shapes, 'scalar_bindings': 32, 'sfc_pins': pins,
-                        'unchanged_bank_timing_scheduler_queue_adapter_operations': True})
-    result = {'golden': str(golden), 'orders': reports,
+                        'unchanged_bank_timing_scheduler_queue_adapter_operations': True if baseline is not None else None})
+    return reports
+
+
+def main():
+    evidence, golden = (Path(arg).resolve() for arg in sys.argv[1:])
+    baseline = (evidence / 'candidate/post-fame-blockdev-response-scheduler.mlir').read_text()
+    paths = [evidence / f'binding.mlir.{suffix}.mlir' for suffix in ('rocket-blockdev', 'rocket-blockdev-reverse')]
+    result = {'golden': str(golden), 'orders': compare(golden, paths, baseline),
               'limitation': 'SFC disables Print; expanded platform/driver and FPGA execution remain pending'}
     (evidence / 'rocket-blockdev-comparison.json').write_text(json.dumps(result, indent=2) + '\n')
     print('PASS Rocket/Print BlockDev: both orders, 26 words, nine channels, four queues/timing scheduler and 20 SFC control pins')
