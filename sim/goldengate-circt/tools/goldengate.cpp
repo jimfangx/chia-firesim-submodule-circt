@@ -4261,10 +4261,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedARAnnotations, error)))
         return fail("FASED AR ingress annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED AR requests in a 4-entry ingress queue in " << fasedARPath << '\n';
-      // NIC uses the same memory constructor and FAME channels. Construct the
-      // token/counter/ingress operations before the remaining integration gap.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED ingress credits, timing/control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDIngressCredits(circuit, error)))
         return fail("FASED ingress credits: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED ingress credits produced invalid FIRRTL IR");
@@ -4291,6 +4287,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedOrderAnnotations, error)))
         return fail("FASED ingress order annotations: " + error);
       llvm::outs() << "Queued CIRCT FASED transaction order in two 10-entry banks in " << fasedOrderPath << '\n';
+      // NIC shares this recorded FASED constructor. Build its credit and
+      // transaction-order operations before the remaining host issue gap.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED host request issue, timing/control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDIngressIssue(circuit, error)))
         return fail("FASED ingress issue: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED ingress issue produced invalid FIRRTL IR");

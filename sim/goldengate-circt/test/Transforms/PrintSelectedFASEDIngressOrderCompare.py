@@ -71,17 +71,17 @@ def oracle(path):
     assert queue.index('ram[ram_MPORT_addr] <= ram_MPORT_data;') < queue.index('if (reset)')
 
 
-def compare(before, after, baseline):
+def compare(before, after, baseline, old_name=OLD, top=TOP, rtl_path=None):
     old_text, text = before.read_text(), after.read_text()
     def bodies(t):
         return {m[1]: m[0] for m in re.finditer(r'^    firrtl.module @(\w+)\(.*?^    }', t, re.M | re.S)}
-    old, new = bodies(old_text), bodies(text)
-    assert set(new) - set(old) == {TOP, HELPER}
-    for n, body in old.items(): assert new[n] == body, 'prior module changed ' + n
+    previous, new = bodies(old_text), bodies(text)
+    assert set(new) - set(previous) == {top, HELPER}
+    for n, body in previous.items(): assert new[n] == body, 'prior module changed ' + n
     helper = new[HELPER]
     assert helper == native_module(baseline, HELPER), 'shared order operations changed'
-    ports = native_ports(old[OLD])
-    assert native_ports(new[TOP]) == ports + [
+    ports = native_ports(previous[old_name])
+    assert native_ports(new[top]) == ports + [
         ('out', 'fased_ingress_order', '!firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<1>>'),
         ('out', 'fased_ingress_order_ready', '!firrtl.bundle<read: uint<1>, write: uint<1>>')]
     expected = {'sim.' + n if d == 'in' else 'top.' + n:
@@ -95,10 +95,10 @@ def compare(before, after, baseline):
         'top.fased_ingress_order.bits': 'xactionOrder.deq_bits',
         'top.fased_ingress_order_ready.read': 'xactionOrder.enqA_ready',
         'top.fased_ingress_order_ready.write': 'xactionOrder.enqB_ready'})
-    assert wiring(text, TOP, aggregate=True) == expected, 'copied/event/reset wiring differs'
+    assert wiring(text, top, aggregate=True) == expected, 'copied/event/reset wiring differs'
     prior = json.loads(before.with_name(before.stem + '-all.json').read_text())
     updated = json.loads(after.with_name(after.stem + '-all.json').read_text())
-    assert updated == transfer(prior, OLD, TOP, {n for _, n, _ in ports}), 'archive transfer differs'
+    assert updated == transfer(prior, old_name, top, {n for _, n, _ in ports}), 'archive transfer differs'
     memories = [line for line in helper.splitlines() if ' = firrtl.mem ' in line]
     assert len(memories) == 2 and all('depth = 10 : i64' in l and 'data flip: uint<1>' in l and
         'readLatency = 0' in l and 'writeLatency = 1' in l for l in memories)
@@ -134,7 +134,7 @@ def compare(before, after, baseline):
         checks['deqPointer'] = not deq if ready and checks['deq_valid'] else deq
         for n, expected_value in checks.items(): assert evaluate(nets[n], v, nets) == expected_value, (n, v)
         cases += 1
-    rtl = clean(after.with_suffix('.sv').read_text())
+    rtl = clean((rtl_path or after.with_suffix('.sv')).read_text())
     head, body = module(rtl, HELPER)
     assert 'enqA_ready' in head and 'deq_bits' in head
     for name in ('enqPointer', 'deqPointer', 'qA_maybe_full', 'qB_maybe_full'):
@@ -149,7 +149,7 @@ def compare(before, after, baseline):
         assert 'always @(posedge W0_clk)' in ram_body and "if (W0_en & 1'h1)" in ram_body
         assert "assign R0_data = R0_en ? Memory[R0_addr] : 1'bx;" in ram_body
         assert 'reset' not in ram_head and 'reset' not in ram_body
-    return dict(before=str(before), after=str(after), unchanged_modules=len(old), wrapper_connections=len(expected),
+    return dict(before=str(before), after=str(after), unchanged_modules=len(previous), wrapper_connections=len(expected),
                 annotation_rows=len(updated), order_cases=cases, banks=2, bank_depth=10,
                 helper_equal_to_shared_native=True)
 

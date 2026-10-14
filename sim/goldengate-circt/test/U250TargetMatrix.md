@@ -2192,3 +2192,77 @@ transaction-order queues against the same SFC IngressModule, before host
 issue, egress timing and slave-1 control binding. Complete NIC runtime,
 wider/multiple TracerV profiles, FASED geometry and partition/QSFP support
 remain incomplete.
+
+## Iteration 192: execute native ingress credits and transaction ordering for NIC
+
+The NIC compiler now executes and verifies `addFASEDIngressCredits` and
+`addFASEDIngressOrder`, emitting both production MLIR boundaries and their
+complete annotation archives. Its rejection moves to host request issue,
+timing/control responses and platform integration. The shared credit and
+ordering operations remain unchanged; this makes them executable on the
+archived NIC input. Complete NIC compilation and runtime remain unsupported.
+
+The Scala references inspected are `MidasTransforms.scala`, `FAMETransform.scala`,
+`IngressUnit.scala`, `models/dram/Util.scala` and `widgets/Lib.scala`.
+The credit pass implements the two four-bit saturating counters with maximum
+ten, strict/relaxed decrement selection and completed-write detection. The
+ordering pass implements `DualQueue` using two ten-entry one-bit memories,
+bank selection and pointer/reset behavior.
+
+The exact SFC artifact compared is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICFASEDCreditsOrderCompare.py` checks every production wrapper connection
+(193 credit-stage and 196 ordering-stage connections), all 1,792 annotation
+rows, all earlier module bodies, 8,192 credit states and 25,600 ordering
+states. The generated helpers match the no-NIC helpers exactly. Both original
+Print constructor orders pass the refactored comparison entry points.
+
+The exporter clones eight actual production helpers and checks that their
+bodies are preserved. An isolated Verilator differential cycles the two
+credit/order helpers together against SFC `SatUpDownCounter_1`, `DualQueue`
+and `Queue_10`. SFC completion/decrement expressions come from the recorded
+`IngressModule`; completed writes feed its actual ordering queue. All 40,061
+cycles match. Coverage includes 1,852 accepted dual enqueues, 4,277 asymmetric
+dual attempts, 14,705 full stalls, 45 empty stalls, 21 accepted reset pushes,
+6,802 saturation observations and both strict/relaxed policies. Accepted
+queue events are boundary inputs here: full host request issue, ingress
+payload queues, egress timing/MMIO and NIC execution are outside this test.
+SFC's unused `DualQueue.next` lookahead is not exported.
+
+Evidence is in the generated-src target's `iteration192-u250-target-matrix/`:
+`nic-credit-order-comparison.json`, `nic-credit-order-differential/`,
+`print-credit-regression.json`, `print-order-regression.json` and `ctest.log`.
+The production order candidate SHA256 is
+`86f0c34a7e9a6aa63c9d903fdb64f87e1333d91305f2ed310c8e0bbc30392fa4`.
+Run the new comparator in the sourced environment with `--candidate-dir`
+pointing to the NIC replay, `--baseline` to the no-NIC production
+`post-fame-fased-ingress-order.mlir`, `--golden` to the SFC SV above,
+`--export-tool` to `goldengate-fased-token-test`, a fresh `--output-dir`
+and `--report-json`. Native token/credits/order CTests pass in 16.81 seconds;
+the original six-helper exporter also passes. Python syntax and scoped diff
+checks pass. All 178 earlier NIC MLIR/annotation files and five no-NIC
+RTL/collateral files match iteration 191 byte for byte.
+
+`immutable-credits-order-comparison.json` checks complete headers/bodies of
+`IngressModule`, `DualQueue`, `Queue_10` and `SatUpDownCounter_1` against the
+October 1 immutable U250 `design/FireSim-generated.sv`: all four match.
+Fresh immutable Rocket handoff and normalized XDC comparisons also match,
+including the recorded implementation-XDC hierarchy rename. The immutable
+fixtures remain untouched. No manager verification was started.
+
+Fresh replay of all thirteen archived inputs/effective platforms used compiler
+SHA256 `ba7599fc7e992029a1484be0959b179261b07b155f11e3f8fe90e94817ed5b04`.
+`replay/matrix.json` retains one compiled no-NIC target, six later compiler
+failures and six unsupported partition/QSFP configurations. Its nonzero exit
+retains these gaps. All seven reached BridgeIO/channel boundaries match SFC.
+Shuttle model-port annotations match; the other six retain the recorded
+native-SRAM differences. `matrix-regression-comparison.json` matches all
+thirteen input hashes, effective platforms, compile statuses and structured
+boundary comparisons to iteration 191. Only the NIC diagnostic advances.
+
+The next smallest step is to carry NIC through native host request issue,
+comparing strict/relaxed request gating and actual queue/order retirement
+with the same SFC `IngressModule`. Egress timing, slave-1 control binding,
+host memory/stream integration, wider/multiple TracerV profiles, FASED
+geometry and partition/QSFP support remain incomplete.

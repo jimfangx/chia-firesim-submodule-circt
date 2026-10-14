@@ -310,7 +310,9 @@ int main(int argc, char **argv) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
       require(bool(root) && succeeded(verify(*root)), "production FASED boundary invalid");
       auto circuit = *root->getOps<CircuitOp>().begin();
-      require(circuit.getName() == "GGFASEDIngressARQueueWrapper", "expected three-queue FASED boundary");
+      const bool order = circuit.getName() == "GGFASEDIngressOrderWrapper";
+      require(order || circuit.getName() == "GGFASEDIngressARQueueWrapper",
+              "expected FASED ingress AR or order boundary");
       auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
       b.setInsertionPointToEnd(isolated.getBody());
       auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDTokenEngine"));
@@ -319,12 +321,16 @@ int main(int argc, char **argv) {
                         "GGFASEDIngressAWQueue10", "GGFASEDIngressWQueue16", "GGFASEDIngressARQueue4"}) {
         auto helper = cast<FModuleOp>(b.insert(named(circuit, name)->clone())); helper.setPublic();
       }
+      if (order)
+        for (auto name : {"GGFASEDIngressCredits", "GGFASEDIngressOrder20"}) {
+          auto helper = cast<FModuleOp>(b.insert(named(circuit, name)->clone())); helper.setPublic();
+        }
       require(succeeded(verify(isolated)), "exported FASED helpers invalid");
       std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
       require(!ec, "cannot export FASED helpers"); isolated.print(out); out << '\n';
       out.close(); isolated.erase(); return 0;
     }
-    require(argc == 1, "usage: goldengate-fased-token-test [ingress-ar.mlir helpers.mlir]");
+    require(argc == 1, "usage: goldengate-fased-token-test [ingress-{ar,order}.mlir helpers.mlir]");
     behavior(ctx); wiring(ctx); wiring(ctx, true);
     behavior(ctx, true); wiring(ctx, true, true); rejection(ctx); return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

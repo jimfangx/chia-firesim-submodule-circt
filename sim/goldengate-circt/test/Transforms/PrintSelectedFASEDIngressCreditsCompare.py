@@ -54,17 +54,17 @@ def oracle(path):
     assert model['ingress_reset'] == 'reset | hPort_hBits_reset & _ingress_io_nastiInputs_hValid_T_3'
 
 
-def compare(before, after, baseline):
+def compare(before, after, baseline, old_name=OLD, top=TOP, rtl_path=None):
     old_text, text = before.read_text(), after.read_text()
     def bodies(t):
         return {m[1]: m[0] for m in re.finditer(r'^    firrtl.module @(\w+)\(.*?^    }', t, re.M | re.S)}
-    old, new = bodies(old_text), bodies(text)
-    assert set(new) - set(old) == {TOP, HELPER}
-    for n, body in old.items(): assert new[n] == body, 'prior module changed ' + n
+    previous, new = bodies(old_text), bodies(text)
+    assert set(new) - set(previous) == {top, HELPER}
+    for n, body in previous.items(): assert new[n] == body, 'prior module changed ' + n
     assert new[HELPER] == native_module(baseline, HELPER), 'shared credit operations changed'
-    ports = native_ports(old[OLD])
+    ports = native_ports(previous[old_name])
     helper_ports = native_ports(new[HELPER])
-    assert native_ports(new[TOP]) == ports + [('in', 'fased_ingress_relaxed', '!firrtl.uint<1>'),
+    assert native_ports(new[top]) == ports + [('in', 'fased_ingress_relaxed', '!firrtl.uint<1>'),
                                             ('out', 'fased_ingress_credits', helper_ports[-1][2])]
     expected = {'sim.' + n if d == 'in' else 'top.' + n:
                 'top.' + n if d == 'in' else 'sim.' + n for d, n, _ in ports}
@@ -77,10 +77,10 @@ def compare(before, after, baseline):
         'ingressCredits.awDeqFire': frozenset({'top.fased_ingress_aw_deq.valid', 'top.fased_ingress_aw_deq.ready'}),
         'ingressCredits.wLastDeqFire': frozenset({'top.fased_ingress_w_deq.valid', 'top.fased_ingress_w_deq.ready', 'top.fased_ingress_w_deq.bits.last'}),
         'top.fased_ingress_credits': 'ingressCredits.status'})
-    assert wiring(text, TOP, aggregate=True) == expected, 'copied/event/reset wiring differs'
+    assert wiring(text, top, aggregate=True) == expected, 'copied/event/reset wiring differs'
     prior = json.loads(before.with_name(before.stem + '-all.json').read_text())
     updated = json.loads(after.with_name(after.stem + '-all.json').read_text())
-    assert updated == transfer(prior, OLD, TOP, {n for _, n, _ in ports}), 'archive transfer differs'
+    assert updated == transfer(prior, old_name, top, {n for _, n, _ in ports}), 'archive transfer differs'
     nets, _ = expressions(text, HELPER)
     cases = 0
     for aw, w, bits in itertools.product(range(16), range(16), itertools.product((False, True), repeat=5)):
@@ -100,14 +100,14 @@ def compare(before, after, baseline):
     helper = new[HELPER]
     for name in ('awCredits', 'wCredits'):
         assert re.search(r'%' + name + r' = firrtl.regreset %clock, %reset, %\w+ : !firrtl.clock, !firrtl.uint<1>, !firrtl.uint<4>, !firrtl.uint<4>', helper)
-    rtl = clean(after.with_suffix('.sv').read_text())
+    rtl = clean((rtl_path or after.with_suffix('.sv')).read_text())
     head, body = module(rtl, HELPER)
     for name in ('awCredits', 'wCredits'):
         assert re.search(r'reg\s+\[3:0\]\s+' + name + r'\b', body), name
         assert re.search(r'if \(reset\).*?' + name + r" <= 4'h0;", body, re.S)
     for field in ('awValue', 'wValue', 'awEmpty', 'wEmpty', 'writeReqDone'):
         assert 'status_' + field in head
-    return dict(before=str(before), after=str(after), unchanged_modules=len(old),
+    return dict(before=str(before), after=str(after), unchanged_modules=len(previous),
                 wrapper_connections=len(expected), annotation_rows=len(updated), credit_cases=cases,
                 helper_equal_to_shared_native=True, emitted_counter_width=4, maximum=10)
 
