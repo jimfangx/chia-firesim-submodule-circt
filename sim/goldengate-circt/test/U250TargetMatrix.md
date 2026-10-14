@@ -2266,3 +2266,79 @@ comparing strict/relaxed request gating and actual queue/order retirement
 with the same SFC `IngressModule`. Egress timing, slave-1 control binding,
 host memory/stream integration, wider/multiple TracerV profiles, FASED
 geometry and partition/QSFP support remain incomplete.
+
+## Iteration 193: execute NIC host request issue and accepted order retirement
+
+The NIC compiler now executes and verifies `addFASEDIngressIssue`, emitting
+`post-fame-fased-ingress-issue.mlir` and its complete annotation archive before
+rejecting the remaining ingress assertions, timing/control responses and
+platform composition. This connects native strict/relaxed AW/W/AR request
+gates, qualified ingress reset, accepted queue/order retirement and host
+outstanding feedback on the actual archived NIC input. Full NIC compilation
+and runtime remain unsupported.
+
+The Scala references inspected are `MidasTransforms.scala`, `FAMETransform.scala`
+and `models/dram/IngressUnit.scala`. The recorded SFC oracle is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+`NICFASEDIssueCompare.py` checks every production issue-wrapper connection,
+complete recursive annotation transfers, retained module bodies, all 32,768
+combinational cases, and exact equality with the shared no-NIC issue helper.
+The original selected Print comparisons retain their defaults and pass both
+constructor orders.
+
+The production exporter clones nine actual helpers without rebuilding their
+operations. An isolated Verilator differential cycles issue and transaction
+ordering together against actual SFC `IngressModule` equations and its
+write-data register update, coupled to recorded `DualQueue` and `Queue_10`.
+It checks every native payload field for identity and all 21 surviving SFC
+payload fields against their actual queue wires. Directed queue fill and
+randomized direct/coupled operation cover host stalls, strict/relaxed policy,
+read overlap, simultaneous AW/final-W acceptance, reset with accepted traffic,
+and transaction-order retirement. Ingress credit/payload-queue events and host
+status are boundary inputs; this does not establish complete ingress queues,
+response/timing/MMIO behavior, NIC execution or platform parity.
+
+Evidence is in the generated-src target's `iteration193-u250-target-matrix/`:
+`nic-issue-comparison.json`, `nic-issue-differential/`,
+`print-issue-regression.json`, `ctest.log`, `immutable-issue-comparison.json`,
+`immutable-rocket-comparison.json`, `nic-prior-boundaries-comparison.json`,
+`no-nic-rtl-collateral-comparison.json` and `replay/matrix.json`.
+The immutable comparison matches complete headers/bodies of `IngressModule`,
+`DualQueue` and `Queue_10` to the October 1 U250 fixture. Fresh immutable Rocket
+handoff and normalized XDC comparisons match, including the recorded host
+hierarchy rename. Five no-NIC RTL/collateral artifacts remain byte identical
+to iteration 192. The immutable fixtures were not modified. No manager
+verification was started.
+
+The issue comparison matches all 205 wrapper connections, all 1,792 annotation
+rows, 170 retained module bodies and 32,768 combinational cases, including
+160 AW/final-W collisions. All 80,025 differential cycles match, with 436
+AW/final-W collisions, 15 resets with accepted traffic, 26,174 host stalls,
+1,070 overlapping read acceptances, 22,471 full order-queue stalls and 10,208
+accepted order retirements. Both strict and relaxed policies have over 39,000
+cycles. The production issue candidate SHA256 is
+`d23e11cf2f4a2c8e82226c71d2d809783ec9076c4066be03955430edab6ac391`.
+Native issue/token CTests pass in 31.04 seconds. Both Print regressions pass;
+all 182 prior NIC MLIR/annotation files match iteration 192 byte for byte.
+
+Run the new comparator in the sourced environment with `--candidate-dir`
+pointing to the NIC replay, `--baseline` to the no-NIC production
+`post-fame-fased-ingress-issue.mlir`, `--golden` to the SFC SV above,
+`--export-tool` to `goldengate-fased-token-test`, a fresh `--output-dir`
+and `--report-json`.
+
+Fresh replay of all thirteen archived inputs/effective platforms used compiler
+SHA256 `72626ffa0c52f781548bb6baf06141d25bebf22472bfb00114c48c2b1bcb6e82`.
+`replay/matrix.json` retains one compiled no-NIC target, six later compiler
+failures and six unsupported partition/QSFP configurations. Its nonzero exit
+retains these gaps. All seven reached BridgeIO/channel boundaries match SFC.
+Shuttle model-port annotations match; the other six retain the recorded native
+SRAM differences. `matrix-regression-comparison.json` matches all thirteen input
+hashes, effective platforms, compile statuses and structured boundary checks to
+iteration 192. Only the NIC diagnostic advances.
+
+The next smallest step is to execute NIC ingress deadlock assertions against
+the same SFC oracle, then port the remaining response/timing and slave-1
+control binding. Wider/multiple TracerV profiles, FASED geometry, complete NIC
+host memory/stream composition and partition/QSFP support remain incomplete.

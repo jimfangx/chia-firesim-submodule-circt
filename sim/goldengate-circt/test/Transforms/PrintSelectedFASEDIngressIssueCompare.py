@@ -80,30 +80,30 @@ def issue_cases(text):
     return cases, collisions
 
 
-def transaction_transfer(value):
+def transaction_transfer(value, old_name=OLD, top=TOP):
     if isinstance(value, str):
-        prefix = '~' + TOP + '|' + OLD + '>fased_host_transactions.'
+        prefix = '~' + top + '|' + old_name + '>fased_host_transactions.'
         if value.startswith(prefix):
             leaf = value[len(prefix):]
-            if leaf in RESPONSE: return '~' + TOP + '|' + TOP + '>fased_host_responses.' + leaf
-            if leaf in REQUEST: return '~' + TOP + '|' + TOP + '>fased_host_requests.' + REQUEST[leaf]
+            if leaf in RESPONSE: return '~' + top + '|' + top + '>fased_host_responses.' + leaf
+            if leaf in REQUEST: return '~' + top + '|' + top + '>fased_host_requests.' + REQUEST[leaf]
         return value
-    if isinstance(value, list): return [transaction_transfer(x) for x in value]
-    if isinstance(value, dict): return {k: transaction_transfer(x) for k, x in value.items()}
+    if isinstance(value, list): return [transaction_transfer(x, old_name, top) for x in value]
+    if isinstance(value, dict): return {k: transaction_transfer(x, old_name, top) for k, x in value.items()}
     return value
 
 
-def compare(before, after, baseline):
+def compare(before, after, baseline, old_name=OLD, top=TOP, rtl_path=None):
     original, text = before.read_text(), after.read_text()
     def bodies(t):
         return {m[1]: m[0] for m in re.finditer(r'^    firrtl.module @(\w+)\(.*?^    }', t, re.M | re.S)}
     old, new = bodies(original), bodies(text)
-    assert set(new) - set(old) == {TOP, HELPER}
+    assert set(new) - set(old) == {top, HELPER}
     for n, body in old.items(): assert new[n] == body, 'prior module changed ' + n
     assert new[HELPER] == native_module(baseline, HELPER), 'shared issue operations changed'
-    ports = native_ports(old[OLD]); copied = [p for p in ports if p[1] not in CONSUMED]
+    ports = native_ports(old[old_name]); copied = [p for p in ports if p[1] not in CONSUMED]
     helper_ports = {n: t for _, n, t in native_ports(new[HELPER])}
-    assert native_ports(new[TOP]) == copied + [
+    assert native_ports(new[top]) == copied + [
         ('out', 'fased_host_requests', helper_ports['requests']),
         ('in', 'fased_host_responses', '!firrtl.bundle<rReady: uint<1>, rValid: uint<1>, rLast: uint<1>, bReady: uint<1>, bValid: uint<1>>')]
     expected = {'sim.' + n if d == 'in' else 'top.' + n:
@@ -116,12 +116,12 @@ def compare(before, after, baseline):
     for n in ('awEmpty', 'wEmpty'): expected['ingressIssue.' + n] = 'sim.fased_ingress_credits.' + n
     for n in RESPONSE: expected['sim.fased_host_transactions.' + n] = 'top.fased_host_responses.' + n
     for n, leaf in REQUEST.items(): expected['sim.fased_host_transactions.' + n] = 'top.fased_host_requests.' + leaf
-    assert wiring(text, TOP, aggregate=True) == expected, 'selected feedback/reset/request wiring differs'
+    assert wiring(text, top, aggregate=True) == expected, 'selected feedback/reset/request wiring differs'
     prior = json.loads(before.with_name(before.stem + '-all.json').read_text())
     updated = json.loads(after.with_name(after.stem + '-all.json').read_text())
-    assert updated == transaction_transfer(transfer(prior, OLD, TOP, {n for _, n, _ in copied})), 'annotation identity differs'
+    assert updated == transaction_transfer(transfer(prior, old_name, top, {n for _, n, _ in copied}), old_name, top), 'annotation identity differs'
     cases, collisions = issue_cases(text)
-    rtl = clean(after.with_suffix('.sv').read_text())
+    rtl = clean((rtl_path or after.with_suffix('.sv')).read_text())
     header, body = module(rtl, HELPER)
     assert 'always @(posedge clock)' in body and 'do_hwrite_data_reg' in body
     assert re.search(r"if \(reset\).*?do_hwrite_data_reg <= 1'h0;", body, re.S), 'emitted reset differs'
