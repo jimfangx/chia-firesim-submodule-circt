@@ -4516,10 +4516,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelRegisterAnnotations, error)))
         return fail("FASED functional model register annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock functional model register and ingress binding in " << fasedFunctionalModelRegisterPath << '\n';
-      // NIC functional-model MMIO now drives ingress relaxation on host cycles.
-      // Response status registers are the next composition boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED response error registers, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
         return fail("FASED response error registers: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED response error registers produced invalid FIRRTL IR");
@@ -4533,6 +4529,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsAnnotations, error)))
         return fail("FASED response error registers annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock response error registers and response handshake binding in " << fasedResponseErrorsPath << '\n';
+      // NIC response status now observes the existing host R/B handshakes.
+      // Target statistics remain the next independently compared boundary.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED statistics, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDStatistics(circuit, fasedStatisticsBank, error)))
         return fail("FASED transaction and beat counters: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED transaction and beat counters produced invalid FIRRTL IR");

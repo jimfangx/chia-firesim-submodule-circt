@@ -3796,3 +3796,101 @@ regression baseline remain incomplete. Harness iteration 208 passed CIRCT
 replacertl and fresh bare-metal Verilator smoke; those results precede this
 compiler change and do not validate iteration 209. The overall port is
 incomplete.
+
+## Iteration 210: NIC FASED response-error attachment
+
+The production compiler now invokes `attachFASEDResponseErrors` for NIC
+composition, verifies the resulting FIRRTL operations, and emits
+`post-fame-fased-response-errors.mlir` plus complete annotation JSON.
+The next explicit rejection is
+`NIC FASED statistics, control responses and platform integration are not implemented`.
+The Scala oracle is preserved: `FASEDMemoryTimingModel.scala:580-587` uses
+host-clock/reset error registers, captures accepted nonzero R/B errors, and
+captures the R response code for B errors as well. `MCRIO.bindReg` establishes
+the read-only lanes; `MidasTransforms.scala` and `FAMETransform.scala` remain
+the pass-order and host/target reset references. No SFC fallback or FireSim
+manager verification step was started.
+
+Changed files: `tools/goldengate.cpp`,
+`test/Transforms/FASEDResponseErrorsTest.cpp`,
+`test/Transforms/NICFASEDResponseErrorsCompare.py`, and this ledger.
+The native exporter verifies the whole production IR, validates the exact
+host clock/reset and R/B valid/ready/code SSA sources, clones the production
+bank verbatim, and clones all nine observed wrapper connections. Four valid
+FIRRTL wiring mutations are rejected: model reset, crossed response code,
+wrong ready observation, and missing MCR connection. The isolated probe
+exposes observed response and decoded MCR inputs; response queues and the
+control decoder are outside this behavioral comparison.
+
+Exact NIC SFC RTL compared:
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+Exact SFC driver ABI compared:
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h`
+SHA256 `ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`.
+The extracted register declarations, updates, readback and assertion blocks
+also match the immutable U250 build-tree RTL:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`
+SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+SFC readable/writeable address vectors agree with the native read-only
+`rrespError`/`brespError` lanes at offsets 76/80 and addresses 204/208.
+All 3 allocation tables agree on FASED base 128, size 128 and slave 1.
+
+Fresh NIC candidate SHA256 `d46dc187d71f917631b4bac018fd569b2fddcafcd4e1c7430d601e9ac7fb9b70`.
+All 198 prior modules, 1792 annotation records,
+193 copied ports and 202 wrapper connections compare successfully.
+The bank body matches the fresh no-NIC boundary verbatim. The Verilator
+comparison passed 33,281 legal-input cycles, checking outputs and internal
+state before and after every edge. Coverage includes all 16 R/B response-code
+pairs, all four valid pairs and reset/write masks, 11,994 R captures,
+11,923 B captures, 2,951 B captures of a zero R code,
+8,899 B captures of a distinct R code, 9,646 captures with
+the test target-fire flag low, and 25,145 read-backpressure samples.
+This executes SFC's always-ready response boundary; native CTest additionally
+enumerates stalled ready handshakes. Constant MCR valid/ready outputs are
+checked against Scala `bindReg`, since SFC optimizes them away.
+
+All three illegal-write masks produce the expected read-only diagnostics and
+are suppressed during host reset in both implementations. A separate
+**termination-policy mismatch** is observed: SFC's emitted `$fwrite` prints
+and continues, while CIRCT's existing assertion stops simulation. Predicates
+and messages match; termination parity is not claimed. Both retained probe
+reports and `assertion-policy-observation.json` record this difference from
+the complete native/oracle negative-run logs. This is a remaining compiler
+semantic gap, not a passing full assertion comparison.
+
+The native compiler/test build and `goldengate-fased-response-errors` CTest
+passed: 65,536 cycles across legacy/selected profiles, split/combined
+construction, 68 phase rejection checks and 38 boundary rejection checks.
+An independent no-NIC production-boundary preflight passed the same
+33,281-cycle legal RTL differential, four mutation checks and three
+illegal-write diagnostic masks.
+
+Compiler SHA256 `4f34b7e1b55febc58abdff2d130b68941964b6375e2a6df920e40ca65ae52b98`;
+manifest SHA256 `0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+All 13 archived recipes replayed with exact input hashes and effective
+platform configurations, including six distinct partition configurations.
+Complete stderr logs for all 13 were inspected. Statuses remain one compiled,
+six failed and six unsupported platforms. Partial annotation comparisons
+remain eight matched, six SRAM model-port mismatches and twelve not reached;
+these are not complete target support claims. Only NIC's explicit rejection
+advanced. Its 216 prior MLIR/JSON files are byte-identical to iteration 209;
+only the response-error MLIR/JSON pair was added. No-NIC final SV, C/C++ header,
+Verilog header and both XDC files are byte-identical. Immutable primary SFC
+handoff hashes and normalized U250 XDC were rechecked successfully.
+
+Reports, candidates and focused build/export/mutation/Verilator logs:
+`/scratch/jfx/fsim-circt/sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration210-u250-target-matrix`.
+No storage cleanup was needed after the user's recorded cleanup; immutable
+fixtures and previous retained candidates were preserved.
+
+The next smallest change is to match the SFC response-error read-only
+assertion termination behavior, using the retained illegal-write logs as the
+oracle, before attaching NIC target transaction/beat statistics. Full control
+transport, response queues and NIC workloads remain separate validation
+boundaries. Generalized FASED flight/geometry profiles, wider/multiple TracerV,
+partition/QSFP integration and the SFC UART-bearing baseline remain pending.
+Harness iteration 209 passed CIRCT replacertl, fresh smoke, the 90,141-check
+portable Spike suite and the 90,805-check UART-bearing Rocket suite; those
+results precede this change and do not validate iteration 210. The overall
+port remains incomplete.

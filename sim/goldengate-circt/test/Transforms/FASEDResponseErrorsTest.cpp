@@ -4,6 +4,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
@@ -294,9 +295,82 @@ void rejections(MLIRContext &context) {
   }
 }
 }
-int main() {
+// Clone the production bank and its nine observed wrapper connections. The
+// isolated probe exposes the response handshakes; queues remain a separate test.
+unsigned port(FModuleOp m, llvm::StringRef name) {
+  for (unsigned i=0;i<m.getNumPorts();++i) if(m.getPortName(i)==name)return i;
+  throw std::runtime_error("missing production port: "+name.str());
+}
+Value driver(FModuleOp m, Value dest) {
+  Value result;
+  for(auto &op:*m.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==dest) {
+    require(!result,"multiple production drivers");result=op.getOperand(1);
+  }
+  require(bool(result),"missing production driver");return result;
+}
+void exportProduction(MLIRContext &ctx, const char *input, const char *output) {
+  auto root=parseSourceFile<ModuleOp>(input,&ctx);
+  require(bool(root)&&succeeded(verify(*root)),"invalid production response-errors boundary");
+  auto c=*root->getOps<CircuitOp>().begin();
+  require(c.getName()=="GGFASEDResponseErrorsWrapper","wrong production response-errors root");
+  auto top=named(c,c.getName()),inner=named(c,"GGFASEDFunctionalModelRegisterWrapper"),bank=named(c,"GGFASEDResponseErrors");
+  InstanceOp sim,original;
+  for(auto i:top.getOps<InstanceOp>()) {
+    if(i.getInstanceName()=="sim")sim=i;
+    if(i.getInstanceName()=="responseErrors")original=i;
+  }
+  require(sim&&sim.getModuleName()==inner.getName()&&original&&original.getModuleName()==bank.getName(),"wrong production response-errors instances");
+  require(bank.getNumPorts()==9,"wrong production bank port count");
+  SmallVector<Value> sources;
+  auto arg=[&](llvm::StringRef n){return top.getBodyBlock()->getArgument(port(top,n));};
+  require(driver(top,original.getResult(0))==arg("hostClock")&&
+      driver(top,original.getResult(1))==arg("hostReset"),"response errors must use host clock/reset");
+  sources.push_back(arg("hostClock"));sources.push_back(arg("hostReset"));
+  for(unsigned i=2;i<8;++i) {
+    bool write=i==4||i==5||i==7;
+    llvm::StringRef response=write?"fased_host_write_response":"fased_host_read_response";
+    auto source=driver(top,original.getResult(i));
+    auto field=source.getDefiningOp<SubfieldOp>();
+    if(i<6) {
+      bool ready=i==3||i==5;
+      require(field&&field.getFieldName()==(ready?"ready":"valid")&&
+          field.getInput()==(ready?sim.getResult(port(inner,response)):arg(response)),
+          "wrong production response handshake source");
+    } else {
+      auto bits=field?field.getInput().getDefiningOp<SubfieldOp>():SubfieldOp();
+      require(field&&field.getFieldName()=="resp"&&bits&&bits.getFieldName()=="bits"&&
+          bits.getInput()==arg(response),"wrong production response code source");
+    }
+    sources.push_back(source);
+  }
+  auto mcr=arg("fased_response_errors_mcr");
+  require(driver(top,mcr)==original.getResult(8)&&mcr.getType()==bank.getPorts()[8].type,"MCR fragment binding differs");
+  auto isolated=ModuleOp::create(c.getLoc());OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(isolated.getBody());
+  auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGFASEDResponseErrorsProbe"));
+  b.setInsertionPointToEnd(exported.getBodyBlock());b.insert(bank->clone());
+  auto probe=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDResponseErrorsProbe"),bank.getConventionAttr(),bank.getPorts());probe.setPublic();
+  b.setInsertionPointToEnd(probe.getBodyBlock());
+  auto mmio=b.create<InstanceOp>(c.getLoc(),bank,"responseErrors");IRMapping map;
+  for(unsigned i=0;i<9;++i)map.map(original.getResult(i),mmio.getResult(i));
+  for(unsigned i=0;i<8;++i)map.map(sources[i],probe.getBodyBlock()->getArgument(i));
+  map.map(mcr,probe.getBodyBlock()->getArgument(8));
+  unsigned cloned=0;
+  for(auto &op:*top.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&
+      map.contains(op.getOperand(0))&&map.contains(op.getOperand(1))) {
+    b.clone(op,map);++cloned;
+  }
+  require(cloned==9,"expected clock/reset, six response observations and MCR connections");
+  require(succeeded(verify(isolated)),"invalid production response-errors probe");
+  std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot export response-errors probe");
+  isolated.print(out);out<<'\n';out.close();isolated.erase();
+  llvm::outs()<<"Cloned production response-errors bank and nine clock/reset/response/MCR bindings\n";
+}
+int main(int argc,char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+    require(argc==1||argc==3,"usage: goldengate-fased-response-errors-test [boundary.mlir probe.mlir]");
+    if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
     for (bool profileSelected : {false, true}) {
       selected = profileSelected; phases(context);behavior(context);mapping(context);rejections(context);
     }
