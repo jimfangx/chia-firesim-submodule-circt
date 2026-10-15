@@ -253,6 +253,85 @@ void expandedMapping(MLIRContext &context) {
   }
   llvm::outs() << "Expanded Print stream/registry forwarding and seven atomic queue rejections passed\n";
 }
+void multiplicity(MLIRContext &context) {
+  auto printed = [](Operation *op) { std::string s; llvm::raw_string_ostream out(s); op->print(out); return s; };
+  for (unsigned bad = 0; bad < 9; ++bad) {
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin();
+    auto inner = named(c, "GGTracerVBridgeControlWrapper"); OpBuilder b(&context);
+    SmallVector<std::pair<unsigned, PortInfo>> added;
+    for (unsigned bank = 1; bank < 4; ++bank) {
+      std::string name = "tracerv_stream_" + std::to_string(bank);
+      if (bank == 3 && bad == 1) name = "tracerv_stream_4";
+      if (bank == 3 && bad == 2) name = "tracerv_stream_03";
+      Type type = bank == 3 && bad == 3 ? Type(UIntType::get(&context, 511)) : inner.getPortType(2);
+      auto direction = bank == 3 && bad == 4 ? Direction::In : Direction::Out;
+      added.push_back({unsigned(inner.getNumPorts()), {b.getStringAttr(name), type, direction}});
+    }
+    inner.insertPorts(added);
+    if (bad == 5) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGTracerVStreamQueue6144_3"),
+          inner.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (bad == 6) inner.insertPorts({{unsigned(inner.getNumPorts()),
+        {b.getStringAttr("tracerv_stream_count_3"), UIntType::get(&context, 13), Direction::Out}}});
+    if (bad == 7) {
+      b.setInsertionPointToStart(inner.getBodyBlock());
+      b.create<InstanceOp>(c.getLoc(), inner, "used");
+    }
+    auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> ann(raw.begin(), raw.end());
+    for (unsigned bank = 1; bank < 4; ++bank)
+      ann.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
+          b.getNamedAttr("target", b.getStringAttr("~GGTracerVBridgeControlWrapper|GGTracerVBridgeControlWrapper>tracerv_stream_" +
+              std::to_string(bank) + ".bits"))}));
+    c->setAttr("rawAnnotations", b.getArrayAttr(ann));
+    auto before = printed(*root); std::string error;
+    auto result = goldengate::attachTracerVStreamQueue(c, "GGTracerVBridgeControlWrapper",
+        bad == 8 ? "GGTracerVStreamQueue6144_3" : "GGTracerVStreamQueueWrapper", error);
+    if (bad) {
+      require(failed(result) && !error.empty() && printed(*root) == before,
+              "late multi-stream rejection must be atomic");
+      continue;
+    }
+    require(succeeded(result) && succeeded(verify(*root)), error);
+    auto top = named(c, "GGTracerVStreamQueueWrapper");
+    require(top.getNumPorts() == 11, "four independent counts not exported");
+    InstanceOp sim; SmallVector<InstanceOp> queues;
+    for (auto i : top.getOps<InstanceOp>())
+      if (i.getModuleName() == inner.getName()) sim = i; else queues.push_back(i);
+    require(sim && queues.size() == 4, "four queue instances required");
+    for (unsigned bank = 0; bank < 4; ++bank) {
+      std::string suffix = bank ? "_" + std::to_string(bank) : "";
+      auto queue = named(c, "GGTracerVStreamQueue6144" + suffix);
+      auto metadata = queue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
+      require(metadata.getAs<IntegerAttr>("index").getInt() == bank &&
+          metadata.getAs<StringAttr>("name") == "TRACERVBRIDGEMODULE_" + std::to_string(bank) + "_to_cpu_stream",
+          "per-queue allocation identity differs");
+      require(queues[bank].getModuleName() == queue.getName() &&
+          top.getPortName(7 + bank) == "tracerv_stream_count" + suffix, "queue/count ordering differs");
+      unsigned stream = bank ? bank + 3 : 2; bool enq = false, deq = false, count = false, clock = false, reset = false;
+      for (auto conn : top.getOps<ConnectOp>()) {
+        enq |= conn.getDest() == queues[bank].getResult(2) && conn.getSrc() == sim.getResult(stream);
+        deq |= conn.getDest() == top.getArgument(stream) && conn.getSrc() == queues[bank].getResult(3);
+      }
+      for (auto conn : top.getOps<StrictConnectOp>()) {
+        count |= conn.getDest() == top.getArgument(7 + bank) && conn.getSrc() == queues[bank].getResult(4);
+        clock |= conn.getDest() == queues[bank].getResult(0) && conn.getSrc() == top.getArgument(0);
+        reset |= conn.getDest() == queues[bank].getResult(1) && conn.getSrc() == top.getArgument(1);
+      }
+      require(enq && deq && count && clock && reset, "stream bank routing differs");
+      auto rows = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+      auto row = cast<DictionaryAttr>(rows[bank ? bank + 2 : 0]);
+      require(row.getAs<StringAttr>("target") == "~GGTracerVStreamQueueWrapper|GGTracerVBridgeControlWrapper>tracerv_stream" + suffix + ".bits",
+              "producer annotation moved away from its own bank");
+    }
+    auto after = printed(*root);
+    require(failed(goldengate::addTracerVStreamQueue(c, error)) && printed(*root) == after,
+            "repeated multi-stream pass mutated IR");
+  }
+  llvm::outs() << "Four independent TracerV queues, counts, targets and eight atomic late rejections passed\n";
+}
 void rejection(MLIRContext &context) {
   for (unsigned bad = 0; bad < 6; ++bad) {
     auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin();
@@ -279,7 +358,7 @@ void rejection(MLIRContext &context) {
 int main() {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(context); mapping(context); expandedMapping(context); rejection(context);
+    behavior(context); mapping(context); expandedMapping(context); multiplicity(context); rejection(context);
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

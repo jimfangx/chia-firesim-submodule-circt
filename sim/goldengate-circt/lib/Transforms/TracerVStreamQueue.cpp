@@ -6,8 +6,9 @@
 // Consumes: no annotations. Transfers circuit identity and copied port targets;
 // producer stream targets remain on the original module. Produces stream/RAM
 // metadata for later driver/XDC emission (neither emitter runs in this pass).
-// Mutates: creates a queue and wrapper, inserts buffering on tracerv_stream,
-// adds a UInt<13> count output. No cached analyses are used or preserved.
+// Mutates: creates one independent queue per ordered TracerV producer and a
+// wrapper with one UInt<13> count output per queue. No cached analyses are used
+// or preserved.
 // Output: same producer semantics; a buffered stream with synchronous lookahead
 // and a decoded occupancy boundary. CPU AXI transport remains a later stage.
 #include "goldengate/TracerVTokenEngine.h"
@@ -50,12 +51,28 @@ LogicalResult goldengate::attachTracerVStreamQueue(CircuitOp circuit,
     return std::nullopt;
   };
   auto clock = port("hostClock", ClockType::get(context), Direction::In);
-  auto stream = port("tracerv_stream", token, Direction::Out);
   auto reset = port("hostReset", bit, Direction::In);
-  for (auto p : inner.getPorts()) if (p.name == "tracerv_stream_count")
-    return reject("TracerV stream count boundary already exists");
-  if (!clock || !stream || !reset)
+  SmallVector<unsigned> streams;
+  SmallVector<std::string> suffixes;
+  for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
+    auto name = p.name.getValue();
+    if (name.starts_with("tracerv_stream_count"))
+      return reject("TracerV stream count boundary already exists");
+    if (name != "tracerv_stream" && !name.starts_with("tracerv_stream_")) continue;
+    std::string suffix = streams.empty() ? "" : "_" + std::to_string(streams.size());
+    if (name != "tracerv_stream" + suffix || p.type != token || p.direction != Direction::Out)
+      return reject("TracerV stream queues need ordered contiguous 512-bit producers");
+    streams.push_back(i);
+    suffixes.push_back(suffix);
+  }
+  if (!clock || streams.empty() || !reset)
     return reject("TracerV stream queue needs hostClock, hostReset and a 512-bit Decoupled stream");
+  for (auto suffix : suffixes) {
+    std::string helper = queueName.str() + suffix;
+    if (wrapperName == helper) return reject("TracerV queue helper collides with wrapper");
+    for (auto m : circuit.getOps<FModuleLike>())
+      if (m.getModuleName() == helper) return reject("TracerV stream queue helper already exists");
+  }
   bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("TracerV stream queue needs an uninstantiated top");
@@ -66,33 +83,44 @@ LogicalResult goldengate::attachTracerVStreamQueue(CircuitOp circuit,
   Location loc = circuit.getLoc();
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
-  auto queue = createCPUStreamQueue6144(circuit, queueName);
-  queue->setAttr("goldengate.streamParameters", b.getDictionaryAttr({
-      b.getNamedAttr("name", b.getStringAttr("TRACERVBRIDGEMODULE_0_to_cpu_stream")),
-      b.getNamedAttr("index", b.getI64IntegerAttr(0)),
-      b.getNamedAttr("depth", b.getI64IntegerAttr(6144)),
-      b.getNamedAttr("widthBytes", b.getI64IntegerAttr(64))}));
+  SmallVector<FModuleOp> queues;
+  for (auto [bank, suffix] : llvm::enumerate(suffixes)) {
+    auto queue = createCPUStreamQueue6144(circuit, queueName.str() + suffix);
+    queue->setAttr("goldengate.streamParameters", b.getDictionaryAttr({
+        b.getNamedAttr("name", b.getStringAttr("TRACERVBRIDGEMODULE_" + std::to_string(bank) + "_to_cpu_stream")),
+        b.getNamedAttr("index", b.getI64IntegerAttr(bank)),
+        b.getNamedAttr("depth", b.getI64IntegerAttr(6144)),
+        b.getNamedAttr("widthBytes", b.getI64IntegerAttr(64))}));
+    queues.push_back(queue);
+  }
 
   SmallVector<PortInfo> ports;
   SmallVector<unsigned> copied;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) { copied.push_back(i); ports.push_back(p); }
-  ports.push_back({b.getStringAttr("tracerv_stream_count"), UIntType::get(context, 13, false), Direction::Out});
+  for (auto suffix : suffixes)
+    ports.push_back({b.getStringAttr("tracerv_stream_count" + suffix), UIntType::get(context, 13, false), Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim");
-  auto fifo = b.create<InstanceOp>(loc, queue, "TRACERVBRIDGEMODULE_0_to_cpu_stream_outgoingQueueIO_q");
+  SmallVector<InstanceOp> fifos;
+  for (auto [bank, queue] : llvm::enumerate(queues))
+    fifos.push_back(b.create<InstanceOp>(loc, queue,
+        "TRACERVBRIDGEMODULE_" + std::to_string(bank) + "_to_cpu_stream_outgoingQueueIO_q"));
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
-    if (i == *stream) continue;
+    if (llvm::is_contained(streams, i)) continue;
     Value external = wrapper.getBodyBlock()->getArgument(i);
     b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
                              p.direction == Direction::In ? external : sim.getResult(i));
   }
-  connect(fifo.getResult(0), wrapper.getBodyBlock()->getArgument(*clock));
-  connect(fifo.getResult(1), wrapper.getBodyBlock()->getArgument(*reset));
-  b.create<ConnectOp>(loc, fifo.getResult(2), sim.getResult(*stream));
-  b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArgument(*stream), fifo.getResult(3));
-  connect(wrapper.getBodyBlock()->getArgument(copied.size()), fifo.getResult(4));
+  for (auto [bank, stream] : llvm::enumerate(streams)) {
+    auto fifo = fifos[bank];
+    connect(fifo.getResult(0), wrapper.getBodyBlock()->getArgument(*clock));
+    connect(fifo.getResult(1), wrapper.getBodyBlock()->getArgument(*reset));
+    b.create<ConnectOp>(loc, fifo.getResult(2), sim.getResult(stream));
+    b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArgument(stream), fifo.getResult(3));
+    connect(wrapper.getBodyBlock()->getArgument(copied.size() + bank), fifo.getResult(4));
+  }
 
   std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
@@ -104,7 +132,7 @@ LogicalResult goldengate::attachTracerVStreamQueue(CircuitOp circuit,
       std::string suffix = "|" + value.str(); llvm::StringRef ref(suffix);
       if (ref.consume_front(modulePrefix)) {
         auto name = ref.take_front(ref.find_first_of(".["));
-        for (auto i : copied) if (i != *stream && name == inner.getPortName(i)) {
+        for (auto i : copied) if (!llvm::is_contained(streams, i) && name == inner.getPortName(i)) {
           suffix.replace(0, modulePrefix.size(), "|" + wrapperName.str() + ">"); break;
         }
       }

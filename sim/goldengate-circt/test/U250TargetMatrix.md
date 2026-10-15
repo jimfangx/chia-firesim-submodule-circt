@@ -6744,3 +6744,102 @@ compiled separately and the complete focused test executable passed, excluding
 the preexisting UART changes without modifying the shared worktree or active
 compiler binary. `checkpoint-build.log` and `checkpoint-test.log` record this
 additional check.
+
+
+### Iteration 240: independent quad-Rocket TracerV stream storage
+
+The queue attachment pass now validates every ordered `tracerv_stream[_i]`
+producer, count name and helper-module name before creating hardware. It adds
+four independent 6144×512 queues, four UInt<13> counts and distinct ordered
+stream metadata for the quad Rocket boundary. Producer annotation targets stay
+on their original module; copied ports transfer to the new wrapper. Existing
+single-stream helper names and operation order are preserved.
+
+The compiler emits `post-fame-tracerv-stream-queue.mlir` and its retained
+annotations for quad Rocket, then explicitly rejects the unsupported
+multi-stream CPU allocation stage. This is a completed storage boundary, not
+quad-core simulator support. CPU catalog derivation, transport composition,
+count/MMIO allocation, driver ABI and final platform integration still need
+all four streams.
+
+The focused native CTest passes in 18.75 seconds. It checks the existing FIFO
+payload/occupancy behavior (28,303 pushes, 28,213 pops and 343 read/write
+collisions), four queue/count/target routes, eight atomic late rejections and
+repeated-pass rejection. The existing expanded Print boundary checks also pass.
+
+`TracerVQueueMultiplicityCompare.py` extracts and lowers the four actual
+production queue modules, checks the complete wrapper routing and metadata,
+and executes four native/SFC pairs in standalone Verilator. Its exact oracle
+is the four `Queue_50` instances in:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv
+```
+
+The golden SHA256 is
+`deadc7f5a903ceed20047342e4b81dde7f19cc32be914de6f5b910d3d70771d2`.
+Ready/valid, payload (including invalid RAM lookahead), occupancy, full/empty
+behavior, wraparound, independent backpressure and reset-time RAM writes match
+for 50,000 cycles per queue. Each bank reaches full for 257 cycles and wraps
+eight times. Independent transaction scoreboards also match. A crossed fourth
+queue route fails the structural check; a fourth-bank wrap-limit mutation that
+still lowers as valid FIRRTL fails executed RTL comparison at cycle 7,643.
+All 67 prior modules remain unchanged, and all 2,630 annotations match after
+the exact copied-port/circuit target transfer.
+
+Evidence is under `iteration240-u250-target-matrix/` in the active generated
+folder: `ctest.log`, `ctest-detail.log`, `quad-tracerv-queues-final/` (lowered
+queue RTL, testbench, positive/negative execution logs and `comparison.json`),
+and `replay/`. The initial 48,000-cycle run matched all hardware comparisons
+but fell short of the fourth-bank dequeue coverage threshold; extending the
+run to 50,000 cycles satisfies it without weakening the threshold.
+
+To repeat the production queue differential in the sourced FireSim environment:
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/TracerVQueueMultiplicityCompare.py \
+  <iteration240>/replay/alveo_u250_firesim_rocket_quadcore_no_nic/candidate \
+  <outer-repo>/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv \
+  <outer-repo>/.conda-env/riscv-tools/bin/firtool <new-evidence-directory>
+```
+
+Supplied iteration-239 replacertl/provenance, fresh Verilator smoke and both
+long suites passed before this change. No FireSim manager verification gates
+were started by this implementation turn. The next smallest core step is to
+derive the four live payload/count pairs in the CPU stream catalog, preserving
+ordered stream identities and distinct queue paths before transport allocation.
+Other trace widths, FASED profiles, partition/QSFP, SRAM equivalence and boot
+remain open.
+
+For replay space, 589 old iteration-236 MLIR dumps were losslessly compressed
+to adjacent `.mlir.gz`, recovering 37,012,906,617 bytes. The record
+`lossless-storage-cleanup-236.json` verifies original and decompressed SHA256
+before removing originals. Current/prior baselines, JSON, logs, final RTL and
+all immutable fixtures remain unchanged.
+
+All 267 NIC and 256 no-NIC MLIR/annotation artifacts match iteration 239 after
+candidate-path normalization. Ten final RTL/header/XDC files are byte-identical.
+Quad Rocket preserves all 54 preceding MLIR/annotation boundary artifacts.
+Rocket `.sfc.fir` and `.anno.json` hashes match the immutable 2026-10-01 staging
+fixture. Synthesis XDC matches the immutable U250 build-tree
+`design/FireSim-generated.synthesis.xdc` exactly; implementation XDC matches
+`design/FireSim-generated.implementation.xdc` after the documented
+`target/FireSim_` to `target_FAMETop/FireSim` hierarchy rename. Exact paths and
+hashes are retained in `immutable-rocket-comparison.json`, with regression
+results in `production-boundary-regression.json`, `quad-boundary-regression.json`
+and `emitted-regression.json`.
+
+The completed thirteen-target replay records two compiled targets, five
+compiler gaps and six unsupported partition/QSFP platforms. Quad Rocket alone
+advances from queue rejection to explicit multiple-stream CPU allocation
+rejection. All archived input hashes, effective platform semantics and earlier
+boundary checks match iteration 239. Comparison status remains eight matched,
+six mismatched (native SRAM model ports), and twelve not reached; the unresolved
+comparisons are not semantic passes. `replay/matrix.json` and
+`matrix-regression.json` retain the complete results.
+Compiler SHA256 is
+`bc6d6b9f84e7422e52f7788497a0915327b3adbc0edbb4704eb9258505bb93cd`.
+The executable start/end guard and all 495 native-source hashes remained stable
+during replay. `source-inputs-final.json` and `source-replay-stability.json`
+record the comparison-script-only coverage and negative-control refinements;
+all 665 final source/test hashes were verified against the worktree.

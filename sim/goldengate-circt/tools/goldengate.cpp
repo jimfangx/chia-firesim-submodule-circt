@@ -3194,12 +3194,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerControlAnnotations, error)))
         return fail("TracerV MCRFile transaction annotations: " + error);
       llvm::outs() << "Mapped CIRCT TracerV MCRFile transactions in " << tracerControlPath << '\n';
-      // Preserve the completed local-slave boundary until every stream has
-      // its own storage/allocation; buffering only stream zero loses events.
-      for (auto top : circuit.getOps<circt::firrtl::FModuleOp>())
-        if (top.getName() == circuit.getName())
-          for (auto port : top.getPorts()) if (port.name == "tracerv_stream_1")
-            return fail("TracerV stream queue: multiple TracerV stream queues are not implemented");
       if (failed(goldengate::addTracerVStreamQueue(circuit, error)))
         return fail("TracerV stream queue: " + error);
       if (failed(mlir::verify(*module)))
@@ -3215,6 +3209,13 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerQueueAnnotations, error)))
         return fail("TracerV stream queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TracerV CPU stream in " << tracerQueuePath << '\n';
+      // Every producer now has independent storage. Keep the complete queue
+      // boundary until the CPU stream catalog and global allocation support all
+      // banks; deriving only stream zero would leave the others undrained.
+      for (auto top : circuit.getOps<circt::firrtl::FModuleOp>())
+        if (top.getName() == circuit.getName())
+          for (auto port : top.getPorts()) if (port.name == "tracerv_stream_1")
+            return fail("CPU stream allocation: multiple TracerV stream catalog entries are not implemented");
       if (failed(goldengate::addNICTokenQueues(circuit, error)))
         return fail("NIC token queues: " + error);
       if (circuit.getName() == "GGNICTokenQueuesWrapper") {

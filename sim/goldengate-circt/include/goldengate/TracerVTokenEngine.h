@@ -22,10 +22,11 @@ mlir::LogicalResult attachTracerVTokenEngine(circt::firrtl::CircuitOp circuit,
 // unsupported or incompatible boundaries reject before mutating the circuit.
 mlir::LogicalResult addTracerVTriggerConfig(circt::firrtl::CircuitOp circuit,
                                            std::string &error);
-// Buffer the sole Rocket CPU stream with its 6144-entry synchronous-read queue.
+// Buffer each ordered Rocket CPU stream with its own 6144-entry synchronous-read queue.
 mlir::LogicalResult addTracerVStreamQueue(circt::firrtl::CircuitOp circuit,
                                          std::string &error);
-// Attach the shared queue to an expanded boundary. Keep producer stream targets
+// Validate all producers and helper names before attaching independent queues
+// to an expanded boundary. Keep producer stream targets
 // on the inner module, transfer copied targets, and preserve other host modules.
 mlir::LogicalResult attachTracerVStreamQueue(circt::firrtl::CircuitOp circuit,
     llvm::StringRef inputBoundary, llvm::StringRef wrapperName, std::string &error);
