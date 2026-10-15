@@ -5177,3 +5177,99 @@ in `matrix-regression.log`; `matrix-regression.json` records the aggregate
 checks. The matrix exits one because these gaps remain. These local AW/W
 checks do not establish full NIC compilation, emitted platform RTL or runtime
 parity.
+
+## Iteration 223: NIC host-memory B-response routing
+
+The production NIC path now invokes `routeHostMemoryWriteResponses`, verifies
+the CIRCT module and emits `post-fame-host-memory-write-responses.mlir` and
+`-all.json`. The pass builds a combinational FIRRTL response demultiplexer:
+LoadMem selects ID 16; FASED selects IDs 0 through 15 and receives their low
+four bits; IDs 17 through 31 produce neither valid nor ready. Host ready is
+independent of host valid and follows only the selected sink's backpressure.
+AW/W and the remaining AR/R channels are forwarded through the new wrapper.
+NIC stops explicitly at `NIC host memory read arbitration and platform
+integration are not implemented` before the AR arbiter.
+
+The Scala oracle inspected was Golden Gate pass ordering in
+`passes/MidasTransforms.scala`, host-domain and channel firing semantics in
+`passes/fame/FAMETransform.scala`, the shared host-memory crossbar in
+`core/FPGATop.scala`, and ID ranges/response fanout in Rocket Chip's
+`amba/axi4/Xbar.scala`. The native pass retains the prior buffered masters,
+reservation queue and unrelated interfaces, including NIC CPU streams.
+
+`NICHostMemoryWriteResponsesCompare.py` compares production bindings, typed
+ports, all retained module bodies, raw and emitted annotation target transfer,
+CPU stream ports and MMIO regions. It executes the emitted router SSA with
+the native C++ interpreter. Its negative test changes the actual LoadMem
+selector from ID 16 to ID 17 with unchanged FIRRTL types: native verification
+must accept it while both behavior and structured comparison reject it.
+`PrintRocketHostMemoryWriteResponsesCompare.py` now exposes a general binding
+comparison while retaining the Print-specific counts; its SFC contract checks
+all ten B-channel port types as well as the seven response equations.
+
+The native build and focused `goldengate-host-memory-write-responses` CTest
+pass. The test executes 1,024 exhaustive ID/response/valid/sink-ready cases,
+5,120 leaf checks and 480 unmatched-ID cases. It checks eight boundary routes,
+fourteen atomic rejections, seven target identities and retained inner bodies.
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration223-u250-target-matrix/`.
+`build.log`, `ctest.log` and `tool-input-hashes.json` record the build, focused
+test and exact tool inputs. Native compiler SHA256 is
+`da8232f1e84288959840c7df3cd44c7f332adb106a660e20fc81c38d1f58e507`.
+
+Fresh production NIC comparison passes: 219 unchanged prior module bodies,
+123 copied ports, 125 wrapper ports, 131 connections and 1,792 annotation
+records. All 26 CPU-stream ports and twelve MMIO regions remain; SimpleNIC
+retains slave 7 at byte address 512 with size 32. The emitted B helper is
+identical to fresh no-NIC Rocket's helper. The actual NIC boundary SHA256 is
+`ac856185ea07e0b4ce283a2d7961fa0dc1ba4391451f465f6df98e8474391e21`.
+`nic-response-cli.json` records these checks and native execution of its
+1,024 response cases and eight boundary bindings. The ID-17 mutation passes
+CIRCT verification but fails actual SSA execution with `AXI4Xbar B cone
+mismatch` and structural comparison with `shared B router differs`.
+
+The seven B equations and ten typed ports match `AXI4Xbar` in all three
+recorded SFC artifacts:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+  SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`;
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`;
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+
+The corresponding reports are `nic-response-comparison.json`,
+`no-nic-response-comparison.json`, `immutable-response-comparison.json` and
+`golden-response-artifacts.json`. Fresh no-NIC binding comparison also passes
+(205 retained bodies, 118 copied ports), as do both retained Print orders
+(275 retained bodies, 114 copied ports and 21 retained Print modules).
+`production-boundary-regression.json` confirms all 240 earlier NIC and 256
+no-NIC MLIR/JSON files are unchanged, apart from annotation output-directory
+normalization; NIC adds only the two B boundary artifacts. All five no-NIC
+emitted RTL/header/XDC files are byte-identical to iteration 222.
+
+`immutable-rocket-comparison.json` confirms archived no-NIC FIRRTL and
+annotations match the immutable staging handoff. Its synthesis XDC matches
+the immutable U250 build tree exactly; implementation XDC matches after the
+recorded `target/FireSim_` to `target_FAMETop/FireSim` hierarchy substitution.
+These comparisons do not establish full NIC RTL or runtime parity.
+
+The fresh full thirteen-recipe replay finishes with one compiled target,
+six compiler gaps and six unsupported partition/QSFP platforms. All archived
+FIRRTL/annotation hashes and effective platform selections match iteration
+222. All seven reached bridge/channel comparisons match. Saturn Shuttle's
+model-port comparison matches; the other six reached model-port comparisons
+retain their native-SRAM differences and require separate equivalence checks.
+The aggregate comparison counts are eight matched, six mismatched and twelve
+not reached. Full diagnostics are in `matrix-regression.log`, with structured
+results in `replay/matrix.json` and `matrix-regression.json`.
+
+The other compiler gaps remain multiple or non-Rocket TracerV constructors
+(quad-core Rocket, BOOM and Saturn Shuttle), and FASED outstanding profiles
+other than maxFlight=10 (Gemmini and Saturn Rocket). The replay exits one
+because the gaps remain; it is not an all-target success. The next smallest
+NIC porting step is to compose the CIRCT host-memory AR arbiter, preserving
+CPU-stream ports and annotation identities, and compare its arbitration and
+ID mapping against the same SFC crossbar before advancing the R path.
+Manager replacertl, Verilator metasimulation and U250 buildbitstream remain
+owned by the external verification harness; this iteration launches none.

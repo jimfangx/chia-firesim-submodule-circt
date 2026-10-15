@@ -4688,10 +4688,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostMemoryWriteArbiterAnnotations, error)))
         return fail("host memory write arbiter annotations: " + error);
       llvm::outs() << "Arbitrated CIRCT LoadMem and FASED AW/W with a two-entry source queue in " << hostMemoryWriteArbiterPath << '\n';
-      // NIC AW/W arbitration is compared at this boundary; response routing
-      // still needs comparison before integrating the platform interface.
-      if (!cpuSinks.empty())
-        return fail("NIC host memory write responses and platform integration are not implemented");
       if (failed(goldengate::routeHostMemoryWriteResponses(circuit, error)))
         return fail("host memory write responses: " + error);
       if (failed(mlir::verify(*module))) return fail("host memory write responses produced invalid FIRRTL IR");
@@ -4705,6 +4701,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostWriteResponseAnnotations, error)))
         return fail("host memory write response annotations: " + error);
       llvm::outs() << "Routed CIRCT host B responses to LoadMem ID 16 and FASED IDs 0..15 in " << hostWriteResponsePath << '\n';
+      // NIC AW/W/B composition is compared at this boundary; AR/R routing
+      // still needs comparison before integrating the platform interface.
+      if (!cpuSinks.empty())
+        return fail("NIC host memory read arbitration and platform integration are not implemented");
       if (failed(goldengate::addHostMemoryReadArbiter(circuit, error)))
         return fail("host memory read arbiter: " + error);
       if (failed(mlir::verify(*module))) return fail("host memory read arbiter produced invalid FIRRTL IR");
