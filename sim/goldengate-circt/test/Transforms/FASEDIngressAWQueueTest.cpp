@@ -14,6 +14,7 @@
 #include <functional>
 #include <random>
 #include <stdexcept>
+#include <vector>
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
@@ -39,7 +40,7 @@ struct Request {
 struct Interpreter {
   FModuleOp module;
   MemOp ram;
-  std::array<APInt, 10> memory;
+  std::vector<APInt> memory;
   std::map<std::string, Value> drivers;
   std::map<std::string, APInt> memo;
   llvm::DenseMap<Value, APInt> state;
@@ -48,12 +49,12 @@ struct Interpreter {
     return std::to_string(reinterpret_cast<uintptr_t>(v.getAsOpaquePointer()));
   }
   unsigned width(Value v) { return cast<UIntType>(v.getType()).getWidthOrSentinel(); }
-  Interpreter(FModuleOp m) : module(m) {
+  Interpreter(FModuleOp m, unsigned depth) : module(m), memory(depth) {
     for (auto c : m.getOps<StrictConnectOp>())
       require(drivers.emplace(key(c.getDest()), c.getSrc()).second, "multiple drivers");
     require(std::distance(m.getOps<MemOp>().begin(), m.getOps<MemOp>().end()) == 1, "queue needs one memory");
     ram = *m.getOps<MemOp>().begin();
-    require(ram.getDepth() == 10 && ram.getDataType() == UIntType::get(m.getContext(), 69, false) &&
+    require(ram.getDepth() == depth && ram.getDataType() == UIntType::get(m.getContext(), 69, false) &&
         ram.getReadLatency() == 0 && ram.getWriteLatency() == 1 && ram.getRuw() == RUWAttr::Undefined &&
         ram.getNumResults() == 2 && ram.getPortKind(size_t(0)) == MemOp::PortKind::Read &&
         ram.getPortKind(size_t(1)) == MemOp::PortKind::Write, "wrong memory geometry/latency/ports");
@@ -97,7 +98,7 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false, uint64_t maxFlight = 10) {
   std::string text = R"(module {
     firrtl.circuit "GGFASEDHostOutstandingWrapper" {
       firrtl.module @GGFASEDHostOutstandingWrapper(
@@ -134,13 +135,35 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
   for (auto name : {"fased_ingress.hBits.aw.bits.addr", "other", "fased_ingress_reset"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
         b.getNamedAttr("target", b.getStringAttr((selected ? "~GGSelectedPrintFASEDHostOutstandingWrapper|GGSelectedPrintFASEDHostOutstandingWrapper>" : "~GGFASEDHostOutstandingWrapper|GGFASEDHostOutstandingWrapper>") + std::string(name)))}));
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  auto engine = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDTokenEngine"),
+      ConventionAttr::get(&context, Convention::Internal), SmallVector<PortInfo>{});
+  auto edge = b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI64IntegerAttr(maxFlight))});
+  engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge", edge)}));
+  if (variant == 13) engine.erase();
+  if (variant == 14) engine->removeAttr("goldengate.bridgeConstructor");
+  if (variant == 15) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({}));
+  if (variant >= 16 && variant <= 21) {
+    Attribute value = variant == 16 ? Attribute(b.getStringAttr("10")) :
+        variant == 17 ? Attribute(b.getI64IntegerAttr(0)) :
+        variant == 18 ? Attribute(b.getI64IntegerAttr(-1)) :
+        variant == 19 ? Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 10))) :
+        variant == 20 ? Attribute(b.getF64FloatAttr(10)) : Attribute();
+    auto badEdge = value ? b.getDictionaryAttr({b.getNamedAttr("maxFlight", value)}) : b.getDictionaryAttr({});
+    engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge", badEdge)}));
+  }
+  if (variant == 22) {
+    b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDIngressAWQueue" + std::to_string(std::min<uint64_t>(16, maxFlight))),
+        ConventionAttr::get(&context, Convention::Internal), SmallVector<PortInfo>{});
+  }
   if (variant != 12) c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
-void behavior(MLIRContext &context, bool selected = false) {
-  auto root = fixture(context, 0, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void behavior(MLIRContext &context, bool selected, uint64_t maxFlight) {
+  auto root = fixture(context, 0, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDIngressAWQueue(c, error)), error);
   require(succeeded(verify(*root)), "queue IR verification failed");
-  Interpreter sim(named(c, "GGFASEDIngressAWQueue10")); std::deque<APInt> expected;
+  const unsigned depth = std::min<uint64_t>(16, maxFlight);
+  Interpreter sim(named(c, "GGFASEDIngressAWQueue" + std::to_string(depth)), depth); std::deque<APInt> expected;
   std::mt19937_64 random(209);
   unsigned pushes = 0, pops = 0, fullBlocked = 0, emptyBlocked = 0, resetWrites = 0, simultaneous = 0, wraps = 0, cycles = 0;
   auto request = [&]() { Request r; for (unsigned i = 0; i < 11; ++i) r.values[i] = random() & ((uint64_t(1) << widths[i])-1); return r; };
@@ -152,29 +175,29 @@ void behavior(MLIRContext &context, bool selected = false) {
     for (unsigned i = 0; i < 11; ++i) input(sim.arg(2), "bits." + fields[i].str(), widths[i], data.values[i]);
     input(sim.arg(3), "ready", 1, ready);
     bool enqReady = !sim.drive(sim.arg(2), "ready").isZero(), deqValid = !sim.drive(sim.arg(3), "valid").isZero();
-    require(enqReady == (expected.size() < 10) && deqValid == !expected.empty(), "queue occupancy differs");
+    require(enqReady == (expected.size() < depth) && deqValid == !expected.empty(), "queue occupancy differs");
     auto output = [&]() { Request r; for (unsigned i = 0; i < 11; ++i) r.values[i] = sim.drive(sim.arg(3), "bits." + fields[i].str()).getZExtValue(); return r.pack(); };
     if (deqValid) require(output() == expected.front(), "request field order differs");
     unsigned readAddress = sim.drive(sim.ram.getResult(0), "addr").getZExtValue();
-    require(readAddress < 10 && output() == sim.memory.at(readAddress), "async read differs even when invalid");
+    require(readAddress < depth && output() == sim.memory.at(readAddress), "async read differs even when invalid");
     bool push = valid && enqReady, pop = ready && deqValid;
     fullBlocked += !enqReady && valid && ready; emptyBlocked += !deqValid && valid && ready;
     simultaneous += push && pop; pushes += push; pops += pop; resetWrites += reset && push;
     auto oldMemory = sim.memory;
     unsigned address = sim.drive(sim.ram.getResult(1), "addr").getZExtValue();
-    require(address < 10, "enqueue pointer escaped queue depth");
+    require(address < depth, "enqueue pointer escaped queue depth");
     if (pop) expected.pop_front(); if (push) expected.push_back(data.pack()); if (reset) expected.clear();
     if (push) oldMemory.at(address) = data.pack();
     sim.edge(); require(sim.memory == oldMemory, "reset clears RAM or suppresses accepted write"); sim.memo.clear();
     unsigned nextAddress = sim.drive(sim.ram.getResult(1), "addr").getZExtValue();
-    if (!reset && push && address == 9) { require(nextAddress == 0, "non-power-of-two pointer wrap differs"); ++wraps; }
+    if (!reset && push && address == depth - 1) { require(nextAddress == 0, "pointer wrap differs"); ++wraps; }
     require(output() == sim.memory.at(sim.drive(sim.ram.getResult(0), "addr").getZExtValue()), "post-edge asynchronous output differs");
   };
   cycle(true, false, false, request());
   for (unsigned round = 0; round < 12; ++round) {
-    for (unsigned i = 0; i < 15; ++i) cycle(false, true, false, request());
+    for (unsigned i = 0; i < depth + 5; ++i) cycle(false, true, false, request());
     cycle(false, true, true, request()); // Full: accepted pop cannot enable same-cycle push.
-    for (unsigned i = 0; i < 15; ++i) cycle(false, false, true, request());
+    for (unsigned i = 0; i < depth + 5; ++i) cycle(false, false, true, request());
     cycle(false, true, true, request()); // Empty: enqueued word cannot flow through.
   }
   cycle(true, true, true, request());
@@ -182,9 +205,9 @@ void behavior(MLIRContext &context, bool selected = false) {
     bool fill = i % 1500 < 750;
     cycle(i % 997 == 0, fill || bool(random() & 1), !fill || bool(random() & 1), request());
   }
-  require(pushes > 1000 && pops > 1000 && fullBlocked && emptyBlocked && resetWrites && simultaneous && wraps > 100,
-          "queue boundary/reset/non-power-of-two wrap coverage missing");
-  llvm::outs() << "FASED AW ingress queue: " << cycles << " cycles, " << wraps << " wrap events passed\n";
+  require(pushes > 1000 && pops > 1000 && fullBlocked && emptyBlocked && resetWrites && (simultaneous || depth == 1) && wraps > 100,
+          "queue boundary/reset/wrap coverage missing");
+  llvm::outs() << "FASED AW ingress queue depth=" << depth << ": " << cycles << " cycles, " << wraps << " wrap events passed\n";
 }
 struct GateInterpreter {
   FModuleOp module;
@@ -261,8 +284,9 @@ struct GateInterpreter {
     for (auto r : module.getOps<RegOp>()) next[r.getResult()] = eval(drivers.at(key(r.getResult())));
     state = std::move(next);
   }
-};void gates(MLIRContext &context) {
-  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+};
+void gates(MLIRContext &context, bool selected, uint64_t maxFlight) {
+  auto root = fixture(context, 0, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDIngressAWQueue(c, error)), error);
   GateInterpreter sim(named(c, "GGFASEDIngressAW")); auto fifo = *sim.module.getOps<InstanceOp>().begin();
   std::mt19937_64 rng(209);
@@ -288,7 +312,7 @@ struct GateInterpreter {
       }
     }
   }
-  auto top = named(c, "GGFASEDIngressAWWrapper");
+  auto top = named(c, c.getName());
   require(top.getNumPorts() == 8, "wrapper port count differs");
   InstanceOp inner, gate; for (auto i : top.getOps<InstanceOp>()) { if (i.getName()=="sim") inner=i; else gate=i; }
   auto strict = [&](Value d, Value z) { for (auto conn : top.getOps<StrictConnectOp>()) if (conn.getDest()==d && conn.getSrc()==z) return true; return false; };
@@ -299,28 +323,55 @@ struct GateInterpreter {
   for (unsigned i=0; i<4; ++i) require(bulk(arg(4+i),gate.getResult(3+i)), "queue boundary binding differs");
   require(bulk(inner.getResult(0),arg(0)) && bulk(inner.getResult(1),arg(1)) && bulk(arg(2),inner.getResult(3)) && bulk(arg(3),inner.getResult(4)), "copied ports differ");
   auto annos = c->getAttrOfType<ArrayAttr>("rawAnnotations");
-  const llvm::StringRef targets[]{"~GGFASEDIngressAWWrapper|GGFASEDHostOutstandingWrapper>fased_ingress.hBits.aw.bits.addr",
-      "~GGFASEDIngressAWWrapper|GGFASEDIngressAWWrapper>other", "~GGFASEDIngressAWWrapper|GGFASEDIngressAWWrapper>fased_ingress_reset"};
+  const std::string outerName = c.getName().str(), innerName = inner.getModuleName().str();
+  const std::string targets[]{"~" + outerName + "|" + innerName + ">fased_ingress.hBits.aw.bits.addr",
+      "~" + outerName + "|" + outerName + ">other", "~" + outerName + "|" + outerName + ">fased_ingress_reset"};
   require(annos.size()==3,"annotation classes lost");
   for (unsigned i=0; i<3; ++i) require(cast<DictionaryAttr>(annos[i]).getAs<StringAttr>("target").getValue()==targets[i],"target transfer differs");
   llvm::outs() << "256 enqueue gate/payload cases and wrapper/annotation mapping passed\n";
 }
-void rejection(MLIRContext &ctx) {
-  for (unsigned mode = 1; mode <= 12; ++mode) {
-    auto root = fixture(ctx, mode); auto c = *root->getOps<CircuitOp>().begin(); std::string before, after, error;
+void rejection(MLIRContext &ctx, bool selected, uint64_t maxFlight) {
+  for (unsigned mode = 1; mode <= 22; ++mode) {
+    auto root = fixture(ctx, mode, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string before, after, error;
     { llvm::raw_string_ostream out(before); root->print(out); }
     require(failed(goldengate::addFASEDIngressAWQueue(c, error)) && !error.empty(), "malformed boundary accepted");
     { llvm::raw_string_ostream out(after); root->print(out); }
     require(before == after, "rejection mutated circuit");
   }
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto root = fixture(ctx, 0, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDIngressAWQueue(c, error)), error);
   require(failed(goldengate::addFASEDIngressAWQueue(c, error)), "repeated pass accepted");
-  llvm::outs() << "12 atomic preflight rejections and repeated pass rejection passed\n";
+  llvm::outs() << "22 atomic preflight rejections and repeated pass rejection passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { behavior(ctx); behavior(ctx, true); gates(ctx); rejection(ctx); } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
+  try {
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production AW boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      require(circuit.getName() == "GGFASEDIngressAWWrapper" || circuit.getName() == "GGSelectedPrintFASEDIngressAWWrapper",
+              "expected AW ingress boundary");
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDIngressAW"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto gate = named(circuit, "GGFASEDIngressAW");
+      auto instance = *gate.getOps<InstanceOp>().begin();
+      for (auto source : {gate, named(circuit, instance.getModuleName())}) {
+        auto helper = cast<FModuleOp>(b.insert(source->clone())); helper.setPublic();
+      }
+      require(succeeded(verify(isolated)), "exported AW helpers invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot export AW helpers"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-ingress-aw-test [ingress-aw.mlir helpers.mlir]");
+    for (bool selected : {false, true})
+      for (uint64_t maxFlight : {uint64_t(1), uint64_t(2), uint64_t(3), uint64_t(8), uint64_t(10), uint64_t(16), uint64_t(20), uint64_t(INT64_MAX)}) {
+        behavior(ctx, selected, maxFlight); gates(ctx, selected, maxFlight); rejection(ctx, selected, maxFlight);
+      }
+  } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
   return 0;
 }

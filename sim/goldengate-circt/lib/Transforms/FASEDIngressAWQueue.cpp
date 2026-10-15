@@ -1,8 +1,8 @@
 // See LICENSE for license details.
 // Requires: active uninstantiated GGFASEDHostOutstandingWrapper and retained
-// annotations, exact Rocket HostDecoupled request and ingress reset boundaries.
+// annotations, a positive constructor maxFlight and exact request/reset ports.
 // Consumes: fased_ingress; copies its qualified reset and every other port.
-// Produces: a 10-entry AW FIFO with 69-bit payload; W/AR enqueue boundaries and
+// Produces: a min(16, maxFlight)-entry AW FIFO with 69-bit payload; W/AR enqueue boundaries and
 // raw AW dequeue before host ordering/credit policy. Host-clocked async RAM.
 // Enqueue predicates exclude their own queue ready. Reset flushes pointer state
 // but does not clear memory or suppress a pre-edge accepted memory write.
@@ -11,19 +11,31 @@
 // Oracle: IngressUnit.scala 66-69, 81-86, 126-137 and SFC Queue_7.
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDIngressAWQueue(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral queueName = "GGFASEDIngressAWQueue10";
   constexpr llvm::StringLiteral gateName = "GGFASEDIngressAW";
   const bool selected = circuit.getName() == "GGSelectedPrintFASEDHostOutstandingWrapper";
   const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressAWWrapper" : "GGFASEDIngressAWWrapper";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
   if (!selected && circuit.getName() != "GGFASEDHostOutstandingWrapper")
     return reject("FASED AW ingress requires the active host outstanding wrapper");
-  FModuleOp inner;
+  FModuleOp inner, engine;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDTokenEngine") engine = m;
+  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
+  auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
+  auto maxFlight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
+  if (!maxFlight || maxFlight.getValue().getBitWidth() > 64 || maxFlight.getInt() <= 0)
+    return reject("FASED AW ingress needs a positive 64-bit maxFlight constructor");
+  // WithDefaultMemModel supplies 16 write slots, narrowed by the AXI edge.
+  // IngressModuleParameters sets ingressAWQdepth to this effective maxWrites.
+  const uint64_t depth = std::min<uint64_t>(16, maxFlight.getInt());
+  const unsigned pointerWidth = std::max(1u, llvm::Log2_64_Ceil(depth));
+  const std::string queueName = "GGFASEDIngressAWQueue" + std::to_string(depth);
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == queueName || m.getModuleName() == gateName || m.getModuleName() == wrapperName)
       return reject("FASED AW ingress helper or wrapper already exists");
@@ -77,7 +89,7 @@ LogicalResult goldengate::addFASEDIngressAWQueue(CircuitOp circuit, std::string 
   };
   auto mux = [&](Value c, Value yes, Value no) -> Value { return b.create<MuxPrimOp>(loc, c, yes, no); };
   auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
-  Value enqPtr = reg(4, "enq_ptr_value"), deqPtr = reg(4, "deq_ptr_value");
+  Value enqPtr = reg(pointerWidth, "enq_ptr_value"), deqPtr = reg(pointerWidth, "deq_ptr_value");
   Value maybeFull = reg(1, "maybe_full");
   Value equal = b.create<EQPrimOp>(loc, enqPtr, deqPtr);
   Value full = both(equal, maybeFull), empty = both(equal, b.create<NotPrimOp>(loc, maybeFull));
@@ -85,17 +97,17 @@ LogicalResult goldengate::addFASEDIngressAWQueue(CircuitOp circuit, std::string 
   Value push = both(ready, field(arg(2), "valid")), pop = both(valid, field(arg(3), "ready"));
   connect(field(arg(2), "ready"), ready); connect(field(arg(3), "valid"), valid);
   auto increment = [&](Value pointer) -> Value {
-    Value next = b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, pointer, constant(4, 1)), 3, 0);
-    return mux(b.create<EQPrimOp>(loc, pointer, constant(4, 9)), constant(4, 0), next);
+    Value next = b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, pointer, constant(pointerWidth, 1)), pointerWidth - 1, 0);
+    return mux(b.create<EQPrimOp>(loc, pointer, constant(pointerWidth, depth - 1)), constant(pointerWidth, 0), next);
   };
   connect(enqPtr, mux(push, increment(enqPtr), enqPtr));
   connect(deqPtr, mux(pop, increment(deqPtr), deqPtr));
   connect(maybeFull, mux(b.create<XorPrimOp>(loc, push, pop), push, maybeFull));
 
-  SmallVector<Type> memoryTypes{MemOp::getTypeForPort(10, UIntType::get(ctx, 69, false), MemOp::PortKind::Read),
-      MemOp::getTypeForPort(10, UIntType::get(ctx, 69, false), MemOp::PortKind::Write)};
+  SmallVector<Type> memoryTypes{MemOp::getTypeForPort(depth, UIntType::get(ctx, 69, false), MemOp::PortKind::Read),
+      MemOp::getTypeForPort(depth, UIntType::get(ctx, 69, false), MemOp::PortKind::Write)};
   SmallVector<Attribute> memoryNames{b.getStringAttr("read"), b.getStringAttr("write")};
-  auto ram = b.create<MemOp>(loc, memoryTypes, 0, 1, 10,
+  auto ram = b.create<MemOp>(loc, memoryTypes, 0, 1, depth,
       RUWAttr::Undefined, memoryNames, "ram");
   Value reader = ram.getResult(0), writer = ram.getResult(1);
   connect(field(reader, "clk"), arg(0)); connect(field(reader, "en"), constant(1, 1));

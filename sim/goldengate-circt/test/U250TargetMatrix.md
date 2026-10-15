@@ -7561,3 +7561,85 @@ recipes are unchanged (after candidate-directory normalization for boundaries).
 `source-replay-stability.json` verifies all 668 recorded compiler/build inputs
 and the compiler binary stayed unchanged during replay; compiler SHA256 is
 `1341806378127d85d22fdd0046d2dbf19cd431019caffecdf9ed8b943927da04`.
+
+### Iteration 248: derive FASED AW ingress queue capacity
+
+`FASEDIngressAWQueue.cpp` now derives its RAM depth, pointer width and terminal
+wrap value from `min(16, axi4Edge.maxFlight)`, matching the supported default
+`BaseConfig.maxWrites` and `IngressModuleParameters.ingressAWQdepth` in
+`IngressUnit.scala`. The retained `GGFASEDTokenEngine` constructor must contain
+a positive integer edge maximum of at most 64 bits; malformed constructors
+reject before mutation. Custom BaseParams and absent optional edge maxima
+remain outside this specialization. Rocket's ten-entry helper keeps its name
+and operations; Gemmini and Saturn Rocket now emit `GGFASEDIngressAWQueue16`.
+
+The FIFO remains host-clocked, with synchronous writes, asynchronous reads,
+no flow-through or full-queue pipelining, and the qualified ingress reset.
+Reset flushes pointers and `maybe_full` without clearing RAM or suppressing a
+pre-edge accepted write. All eleven payload fields, capacity gates, copied
+ports and annotation identities retain their existing semantics.
+
+The focused test interprets actual FIRRTL memory operations against an
+independent deque at maxFlight 1, 2, 3, 8, 10, 16, 20 and INT64_MAX in both
+ordinary and selected Print wrappers. It checks full/empty blocking, arbitrary
+payloads, simultaneous transfers, wrap, reset writes, asynchronous output even
+when invalid, exact RAM geometry, wrapper clock/reset/port bindings and target
+transfer. Every profile also tests all 256 enqueue gate combinations, 22 atomic
+preflight rejections and repeated-pass rejection. The test's export mode
+isolates the actual AW queue and ingress gate from verified production IR for
+standalone RTL comparison.
+
+Evidence is under `iteration248-u250-target-matrix/`. The immutable October 1
+U250 `design/FireSim-generated.sv` has an identical Rocket `Queue_7` body and
+parent clock/reset/enqueue/dequeue bindings to the October 13 archive
+(`immutable-aw-queue-comparison.json`). `next-credit-order-oracle.json` records
+the remaining Gemmini/Saturn Rocket credit limits: two five-bit counters capped
+at sixteen, followed by a `DualQueue` with sixteen entries in each half. Native
+ingress credits still reject maxFlight 20, and downstream order/issue/deadlock
+passes retain ten-flight assumptions. These are subsequent compiler gaps;
+this change alone does not establish either target's support or behavior.
+
+For replay headroom, 694 iteration-246 MLIR dumps were losslessly gzipped,
+recovering 47,353,389,670 bytes. SHA256 of each original matches decompression
+before removal (`lossless-storage-cleanup-246.json`); active boundaries, JSON,
+logs, final RTL/collateral and immutable fixtures remain. FireSim manager
+verification remains owned by the harness and was not started here.
+
+The native build and `goldengate-fased-ingress-aw` CTest pass (65.55 seconds).
+Across sixteen constructor/wrapper profiles, the interpreted FIRRTL test
+checks 325,792 queue cycles, 4,096 enqueue gate cases and 352 atomic malformed
+boundary rejections, plus sixteen repeated-pass rejections. Rocket's actual
+production AW helper, lowered with firtool, also passes 30,962 standalone
+Verilator cycles against the archived SFC `IngressModule.awQueue` and an
+independent full 69-bit payload queue. This compares all nine fields retained
+in the SFC queue; its unused user/region fields are additionally covered by
+the independent reference. Directed capacity stalls, no-flow/no-pipe behavior,
+reset writes and randomized traffic are included (`aw-queue-comparison.json`).
+
+The same comparison passes at depth sixteen for both Gemmini and Saturn Rocket,
+31,322 cycles each (93,606 standalone RTL differential cycles across the three
+production helpers). Each helper is exported from that recipe's fresh
+`post-fame-fased-ingress-aw.mlir`; each SFC module comes from that recipe's
+archived `design/FireSim-generated.sv`. Their RAM depths and zero/one read/write
+latencies match before behavioral comparison. Reports include exact input
+paths, SHA256 values, parent bindings and run logs. These helper comparisons
+do not claim whole-target metasimulation support.
+
+The fresh thirteen-recipe replay finishes with three compiled Rocket recipes,
+four compiler gaps and six unsupported partition/QSFP platforms. Failures are
+unchanged: BOOM/Shuttle require generalized TracerV constructors/channels;
+Gemmini/Saturn Rocket stop at maxFlight=10 ingress credits. Structured
+comparisons remain eight matches, six existing SRAM-model port mismatches
+and twelve not reached. The matrix exits nonzero; no rejected target or
+model-port mismatch counts as parity.
+
+`matrix-regression.json` confirms archived input hashes, effective platforms,
+compile outcomes, failure messages and structured comparisons are unchanged
+from iteration 247. Every prior MLIR/annotation boundary for each compiled
+Rocket recipe is identical after candidate-path normalization, and all six
+emitted RTL/collateral files per recipe are byte-identical.
+`source-replay-stability.json` confirms 671 compiler/build source inputs
+and the compiler binary stayed unchanged during replay; compiler SHA256 is
+`f4aab94eaf0b72c4b86d95411b53d1fd6b6a691f72b2db3ead5302856cf841f8`. The next smallest port is
+constructor-derived ingress credit widths/limits, followed by order queue
+capacity and downstream issue/deadlock contracts.
