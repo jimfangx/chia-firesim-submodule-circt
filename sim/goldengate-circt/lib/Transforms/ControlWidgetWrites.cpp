@@ -53,7 +53,7 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
   }
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
   if (!top || !regions) return reject("Rocket request binding requires an active top and allocation");
-  std::set<std::string> allocatedPrints;
+  std::set<std::string> allocatedPrints, allocatedTracers;
   bool allocatedNIC = false;
   for (auto attr : regions) {
     auto row = dyn_cast<DictionaryAttr>(attr);
@@ -64,12 +64,82 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
         return reject("Rocket request binding supports one normal-mode NIC bank");
       allocatedNIC = true;
     }
+    if (name.getValue().starts_with("TracerVBridgeModule_") &&
+        !allocatedTracers.insert(name.getValue().str()).second)
+      return reject("Rocket request allocation duplicates a TracerV bank");
     if (name.getValue().starts_with("PrintBridgeModule_") &&
         !allocatedPrints.insert(name.getValue().str()).second)
       return reject("Rocket request allocation duplicates a Print bank");
   }
+  // mapTracerVBridgeControls assigns these symbols in constructor order.
+  // Discover actual adapters, rather than deriving a count from allocation:
+  // an omitted region must not silently drop an instantiated control bank.
+  std::map<unsigned, FModuleOp> tracers;
+  constexpr StringLiteral tracerPrefix = "GGTracerVMCRFile";
+  for (auto module : circuit.getOps<FModuleLike>()) {
+    StringRef name = module.getName();
+    if (!name.starts_with(tracerPrefix)) continue;
+    auto suffix = name.drop_front(tracerPrefix.size()); unsigned index = 0;
+    if (!suffix.empty() && (!suffix.consume_front("_") || suffix.getAsInteger(10, index) ||
+        !index || suffix != std::to_string(index)))
+      return reject("Rocket request binding requires canonical TracerV adapter indices");
+    auto native = dyn_cast<FModuleOp>(module.getOperation());
+    if (!native || index >= 63 || !tracers.emplace(index, native).second)
+      return reject("Rocket request binding requires unique native TracerV adapters");
+  }
+  if (tracers.empty() || tracers.size() != allocatedTracers.size())
+    return reject("Rocket request allocation must identify every instantiated TracerV bank");
   SmallVector<ControlWidgetPort> widgets;
-  for (auto w : widgetPorts) widgets.push_back({w.widget, w.port});
+  for (unsigned i = 0; i < tracers.size(); ++i) {
+    auto suffix = i ? "_" + std::to_string(i) : "";
+    auto widget = "TracerVBridgeModule_" + std::to_string(i);
+    auto port = "tracerv_ctrl" + suffix;
+    auto it = tracers.find(i);
+    if (it == tracers.end() || !allocatedTracers.erase(widget))
+      return reject("Rocket request binding requires contiguous allocated TracerV identities");
+    auto adapter = it->second;
+    if (adapter.getNumPorts() != 4 || adapter.getPortName(2) != "nasti" ||
+        adapter.getPortDirection(2) != Direction::In)
+      return reject("Rocket TracerV request binding requires its Nasti adapter");
+    Value value;
+    for (unsigned p = 0; p < top.getNumPorts(); ++p)
+      if (top.getPortName(p) == port && top.getPortDirection(p) == Direction::In &&
+          top.getPortType(p) == adapter.getPortType(2)) value = top.getArgument(p);
+    // Equal bundle types cannot distinguish banks. Follow single whole-bundle
+    // forwarding to the exact constructor's crFile operand, rejecting aliases,
+    // fanout, detached ports and cycles before creating any wrapper.
+    FModuleOp owner = top; bool reachesAdapter = false;
+    std::set<std::pair<Operation *, unsigned>> visited;
+    for (unsigned depth = 0; value && depth < 4096; ++depth) {
+      auto argument = dyn_cast<BlockArgument>(value);
+      if (!argument || !visited.emplace(owner.getOperation(), argument.getArgNumber()).second) break;
+      Value dest; unsigned drivers = 0;
+      for (auto &op : *owner.getBodyBlock()) {
+        if (auto connect = dyn_cast<ConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+        if (auto connect = dyn_cast<StrictConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+      }
+      auto result = dyn_cast_or_null<OpResult>(dest);
+      auto instance = result ? dyn_cast<InstanceOp>(result.getOwner()) : InstanceOp{};
+      if (drivers != 1 || !instance) break;
+      auto child = modules.find(instance.getModuleName().str());
+      if (child == modules.end() || result.getResultNumber() >= child->second.getNumPorts() ||
+          child->second.getPortDirection(result.getResultNumber()) != Direction::In) break;
+      if (child->second == adapter) {
+        auto wrapper = "GGTracerVBridgeControlWrapper" +
+            (i + 1 == tracers.size() ? "" : "_" + std::to_string(i));
+        reachesAdapter = owner.getName() == wrapper && instance.getName() == "crFile" &&
+                         result.getResultNumber() == 2;
+        break;
+      }
+      owner = child->second; value = owner.getArgument(result.getResultNumber());
+    }
+    if (!reachesAdapter)
+      return reject("Rocket TracerV request port does not reach its instantiated bank");
+    widgets.push_back({widget, port});
+  }
+  for (auto w : ArrayRef(widgetPorts).drop_front()) widgets.push_back({w.widget, w.port});
   if (bound) {
     auto registry = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
     if (!registry || registry.empty() || registry.size() != allocatedPrints.size())

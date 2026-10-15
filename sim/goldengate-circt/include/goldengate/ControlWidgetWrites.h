@@ -17,8 +17,10 @@ mlir::LogicalResult bindControlWidgetWrites(circt::firrtl::CircuitOp circuit,
 // Unimplemented slaves and response arbitration remain explicit boundaries.
 mlir::LogicalResult bindControlWidgetWrites(circt::firrtl::CircuitOp circuit,
                                            std::string &error);
-// Rocket request binding adds every instantiated Print bank to the seven
-// early MCR slaves. Require a complete constructor-ordered host registry and
+// Rocket request binding routes every contiguous instantiated TracerV adapter
+// and every Print bank alongside the other early MCR slaves. Follow each
+// TracerV control port to its own adapter before mutation. Require a complete
+// constructor-ordered Print host registry and
 // decoded Print allocation. Bind an allocated normal-mode NIC to its actual
 // six-word adapter through the active wrapper hierarchy; leave late-bound
 // Master/FASED/TSI/BlockDev lanes exposed. Identity/type validation precedes mutation.

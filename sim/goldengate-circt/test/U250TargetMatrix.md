@@ -7082,3 +7082,126 @@ eight matched, six previously documented SRAM-related model-port mismatches
 and twelve not reached. `matrix-regression.json` records these outcomes.
 Partial matches and the isolated differential tests do not establish final
 quad RTL parity, metasimulation, Linux boot or FPGA support.
+
+## Iteration 243: quad Rocket AW/W routing and bank identity
+
+`bindRocketControlWidgetWrites` now discovers the instantiated native
+TracerV adapters and binds every constructor to its allocated write-dispatch
+lane. Equal bundle types do not identify banks: before creating a wrapper,
+the binder follows each top-level port through single whole-bundle FIRRTL
+connections to that constructor's `crFile` instance. Missing, duplicated,
+noncanonical, swapped or detached identities fail before mutation. The
+single-bank catalog retains its existing order; the quad catalog binds
+`tracerv_ctrl`, `_1`, `_2`, `_3` to slaves 2, 3, 4, 5.
+
+The compiler now emits quad's queued write route, write dispatcher and widget
+request attachment, including their annotation sidecars, before stopping at:
+
+```text
+control widget responses: multiple TracerV response bindings are not implemented
+```
+
+AR dispatch and B/R response collection remain the next boundary. In
+particular, the response catalog in `PrintBridgeMMIO.cpp` still names only
+`TracerVBridgeModule_0`; advancing the write boundary does not establish quad
+platform support or runtime parity.
+
+The SFC oracle is the same immutable quad artifact used in iteration 242:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv
+```
+
+Its SHA256 is
+`deadc7f5a903ceed20047342e4b81dde7f19cc32be914de6f5b910d3d70771d2`.
+`Widget.scala::genCtrlIO` supplies the semantic rule: sorted widget identities
+are zipped to interconnect slaves. The focused comparison checks the actual
+SFC `FPGATop` assignments against the emitted native binding catalog and
+scalar FIRRTL connections. The routing comparison retains the actual
+`NastiRouter` expressions and its `Queue_59` body (14-bit entries, depth 14),
+with decoded routes, tracker readiness and endpoint readiness as explicit
+inputs. These boundaries exclude response collection and complete bridge
+execution.
+
+`QuadTracerVControlWritesCompare.py` matches all 79 surviving SFC allocation
+connections and all 200 native scalar request connections. It preserves 120
+prior module bodies, 155 copied ports and 2,630 recursively transferred
+annotations. SFC removes the read-only CPU count bank's WDATA port; the
+comparison explicitly checks that omission instead of inventing an SFC
+connection. Native forwarding of that unused payload remains checked.
+
+`NICControlWriteRoutingCompare.py --quad` independently lowers the actual
+emitted queue and dispatcher. They match SFC for 104,401 cycles: 13,976
+pushes, 10,608 pops, 101 full-queue pops, 10,263 held W beats, 1,141 simultaneous
+push/pops and 224 reset-cycle writes. All fifteen normal/error endpoints are
+exercised. The original NIC mode also passes for 103,801 cycles and all
+thirteen endpoints. The test retains each SFC queue body and checks geometry;
+it does not synthesize a substitute reference queue.
+
+The native build and four focused CTests pass: control-widget writes,
+write-route queue, write dispatch and Print binding. Single/quad request
+fixtures include 22 atomic identity rejection cases, including swapped
+same-type bank ports. The queue and dispatcher tests now also exercise the
+fourteen-region geometry.
+
+Reproduce these focused comparisons in the sourced FireSim environment
+(each output directory must be new):
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/QuadTracerVControlWritesCompare.py \
+  --dispatch <quad-candidate>/post-fame-control-write-dispatch.mlir \
+  --candidate <quad-candidate>/post-fame-control-widget-writes.mlir \
+  --golden <quad-SFC-design>/FireSim-generated.sv \
+  --export-tool <build>/goldengate-control-widget-writes-test \
+  --output-dir <new-binding-evidence-directory>
+python3 sim/goldengate-circt/test/Transforms/NICControlWriteRoutingCompare.py \
+  --decoder <quad-candidate>/post-fame-control-address-decode.mlir \
+  --route <quad-candidate>/post-fame-control-write-route.mlir \
+  --dispatch <quad-candidate>/post-fame-control-write-dispatch.mlir \
+  --golden <quad-SFC-design>/FireSim-generated.sv \
+  --export-tool <build>/goldengate-control-write-route-test \
+  --output-dir <new-routing-evidence-directory> --quad
+```
+
+Evidence is under `iteration243-u250-target-matrix/` in the active generated
+directory: `quad-write-bindings-final/comparison.json`,
+`quad-write-routing-final/comparison.json`, `nic-write-routing/comparison.json`
+and `ctest.log`. Initial comparison failures are retained: they identified
+SFC's omitted CPU WDATA field, and only the comparison scripts changed after
+the full replay started. No production compiler source changed during replay.
+
+Artifact regression preserves all 267 NIC and 256 no-NIC MLIR/annotation
+files after candidate-path normalization, plus byte-identical RTL, both
+headers and both XDC files for each compiled target. Quad retains all 108
+preceding files and adds exactly three write-path MLIR/annotation pairs.
+The immutable staging FIRRTL/annotation hashes and immutable U250 synthesis
+XDC still match; implementation XDC matches with the already documented
+hierarchy rename. Exact paths and hashes are in
+`production-boundary-regression.json`, `emitted-regression.json`,
+`quad-boundary-regression.json` and `immutable-rocket-comparison.json`.
+
+`source-replay-stability.json` records the unchanged native compiler/build
+inputs and the comparison-only adjustment for the omitted read-only payload.
+To make room for the matrix, 601 old iteration-239 MLIR dumps were losslessly
+compressed, recovering 37,291,083,666 bytes. Original and decompressed hashes
+are recorded in `lossless-storage-cleanup-239.json`. Active and previous
+comparison inputs, JSON, logs, final outputs and immutable fixtures remain
+available.
+
+The complete thirteen-recipe replay retains two compiled targets, five
+implementation gaps and six unsupported partition/QSFP configurations. Its
+nonzero status records those unsupported targets and comparison gaps. Quad
+advances to the response boundary; the other target failures are unchanged.
+All archived input hashes, effective platforms and preceding structured
+checks match iteration 242: eight matched boundaries, six previously
+documented SRAM-related model-port mismatches and twelve not reached.
+`matrix-regression.json` records these counts. The compiler hash matches
+before and after the complete replay. Supplied iteration-242 manager
+replacertl/provenance and fresh Verilator smoke passed, with unchanged-input
+long-suite evidence reused; no manager gates were started in this turn.
+
+The next smallest port is to bind AR and collect B/R for all four TracerV
+constructors using the same allocation identities, then compare the actual
+SFC read/response arbiters before advancing the explicit quad stop. These
+write-path matches do not establish final quad RTL, metasimulation, Linux
+boot or FPGA parity.

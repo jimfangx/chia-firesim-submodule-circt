@@ -171,14 +171,16 @@ void rejection(MLIRContext &ctx) {
 }
 int main(int argc, char **argv){try{
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  if(argc==3) {
+  if(argc==3||argc==4) {
     auto root=parseSourceFile<ModuleOp>(argv[1],&ctx);
     require(bool(root)&&succeeded(verify(*root)),"invalid production input");
     auto c=*root->getOps<CircuitOp>().begin();
     require(c.getName()=="GGControlWriteDispatchWrapper","wrong production boundary");
     auto route=named(c,"GGControlWriteRoute"), dispatch=named(c,"GGControlWriteDispatch");
     auto depth=route->getAttrOfType<IntegerAttr>("goldengate.queueDepth").getInt();
-    require(depth==12&&dispatch->getAttrOfType<ArrayAttr>("goldengate.controlRegions").size()==12,"wrong NIC region count");
+    require(argc==3||StringRef(argv[3])=="--quad","unknown production mode");
+    auto expected=argc==4?14:12;
+    require(depth==expected&&dispatch->getAttrOfType<ArrayAttr>("goldengate.controlRegions").size()==expected,"wrong production region count");
     behavior(ctx,depth,route);
     // Clone the emitted helpers, without rebuilding either implementation.
     for(auto helper:{route,dispatch}) {
@@ -193,6 +195,6 @@ int main(int argc, char **argv){try{
     return 0;
   }
   require(argc==1,"expected production input and output directory, or no arguments");
-  for(unsigned count:{1u,2u,4u,11u,12u,13u,16u,63u}) behavior(ctx,count);
+  for(unsigned count:{1u,2u,4u,11u,12u,13u,14u,16u,63u}) behavior(ctx,count);
   for(unsigned count=1;count<=63;++count) mapping(ctx,count);rejection(ctx);return 0;
 }catch(const std::exception&e){llvm::errs()<<e.what()<<'\n';return 1;}}

@@ -3795,13 +3795,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlDecodeAnnotations, error)))
         return fail("control decoder annotations: " + error);
       llvm::outs() << "Mapped CIRCT control address decoder in " << controlDecodePath << '\n';
-      // All banks now have typed MCR adapters and allocated decode regions.
-      // The later widget request/response binders still select one TracerV
-      // control port; do not let that partial binding omit additional banks.
-      if (llvm::count_if(controlWidgets, [](const auto &widget) {
-            return widget.name.starts_with("TracerVBridgeModule_");
-          }) > 1)
-        return fail("control widget routing: multiple TracerV request/response bindings are not implemented");
       // Both simplex and duplex CPU stream catalogs use the same decoded
       // region count for the AW route queue and per-slave write dispatch.
       if (failed(goldengate::addControlWriteRoute(circuit, error)))
@@ -3849,6 +3842,12 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, widgetWritesAnnotations, error)))
         return fail("control widget write annotations: " + error);
       llvm::outs() << "Bound CIRCT control AW/W requests to allocated widgets in " << widgetWritesPath << '\n';
+      // AW/W now reaches every allocated TracerV bank. Later response
+      // collection still selects only bank zero; retain an explicit boundary.
+      if (llvm::count_if(controlWidgets, [](const auto &widget) {
+            return widget.name.starts_with("TracerVBridgeModule_");
+          }) > 1)
+        return fail("control widget responses: multiple TracerV response bindings are not implemented");
       if (failed(goldengate::addControlReadDispatch(circuit, error)))
         return fail("control read dispatch: " + error);
       if (failed(mlir::verify(*module)))

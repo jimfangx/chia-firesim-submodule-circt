@@ -30,6 +30,7 @@ std::vector<std::string> allocation(unsigned layout) {
   if(layout==1)names.insert(names.begin()+5,{"PrintBridgeModule_0","PrintBridgeModule_1"});
   if(layout==2)std::reverse(names.begin(),names.end());
   if(layout==3)names.insert(names.begin()+7,"SimpleNICBridgeModule_0");
+  if(layout==4)names.insert(names.begin()+3,{"TracerVBridgeModule_1","TracerVBridgeModule_2","TracerVBridgeModule_3"});
   return names;
 }
 unsigned allocatedSlave(unsigned baseline,unsigned layout) {
@@ -47,6 +48,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned layout=0)
   }
   if(layout==1)for(auto port:{"print0_ctrl","print1_ctrl"})text+=", in %"+std::string(port)+": "+control;
   if(layout==3)text+=", in %nicBridge_ctrl: "+control;
+  if(layout==4)for(unsigned i=1;i<4;++i)text+=", in %tracerv_ctrl_"+std::to_string(i)+": "+control;
   auto names=allocation(layout);
   for(unsigned slave=0;slave<names.size();++slave) {
     const std::pair<const char*,unsigned> fields[]{{"aw_ready",1},{"w_ready",1},{"aw_valid",1},{"aw_bits_addr",25},{"aw_bits_len",8},{"aw_bits_id",12},{"w_valid",1},{"w_bits_data",32},{"w_bits_last",1}};
@@ -96,6 +98,29 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned layout=0)
     b.setInsertionPointToStart(parent.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"used");
   }
   if(bad==11)c.setNameAttr(b.getStringAttr("WrongTop"));
+  auto top=*c.getOps<FModuleOp>().begin();
+  for(unsigned i=0;i<(layout==4?4:1);++i) {
+    auto suffix=i?"_"+std::to_string(i):"";
+    auto port="tracerv_ctrl"+suffix;
+    unsigned p=0;while(top.getPortName(p)!=port)++p;
+    b.setInsertionPointToEnd(c.getBodyBlock());
+    SmallVector<PortInfo> adapterPorts{
+      {b.getStringAttr("clock"),ClockType::get(&ctx),Direction::In},
+      {b.getStringAttr("reset"),UIntType::get(&ctx,1,false),Direction::In},
+      {b.getStringAttr("nasti"),top.getPortType(p),Direction::In},
+      {b.getStringAttr("mcr"),UIntType::get(&ctx,1,false),Direction::In}};
+    auto adapter=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGTracerVMCRFile"+suffix),top.getConventionAttr(),adapterPorts);
+    auto wrapperName="GGTracerVBridgeControlWrapper"+
+      (layout==4&&i!=3?"_"+std::to_string(i):"");
+    auto wrapper=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(wrapperName),top.getConventionAttr(),
+      ArrayRef<PortInfo>{{b.getStringAttr(port),top.getPortType(p),Direction::In}});
+    b.setInsertionPointToStart(wrapper.getBodyBlock());
+    auto cr=b.create<InstanceOp>(c.getLoc(),adapter,"crFile");
+    b.create<ConnectOp>(c.getLoc(),cr.getResult(2),wrapper.getArgument(0));
+    b.setInsertionPointToEnd(top.getBodyBlock());
+    auto instance=b.create<InstanceOp>(c.getLoc(),wrapper,"tracer"+std::to_string(i));
+    b.create<ConnectOp>(c.getLoc(),instance.getResult(0),top.getArgument(p));
+  }
   return root;
 }
 OwningOpRef<ModuleOp> nicFixture(MLIRContext &ctx) {
@@ -144,11 +169,14 @@ void nicTest(MLIRContext &ctx) {
       if(m.getName()=="GGNICMMIOBank")bank=m;
     }
     OpBuilder b(&ctx);
-    if(bad==1)(*top.getOps<ConnectOp>().begin()).erase();
+    if(bad==1)for(auto x:llvm::make_early_inc_range(top.getOps<ConnectOp>()))
+      if(auto i=x.getDest().getDefiningOp<InstanceOp>();i&&i.getModuleName()=="GGNICBridgeControlWrapper")x.erase();
     if(bad==2)(*wrapper.getOps<ConnectOp>().begin()).erase();
     if(bad==3)(*wrapper.getOps<InstanceOp>().begin()).setName("otherBank");
     if(bad==4) {
-      auto connect=*top.getOps<ConnectOp>().begin();b.setInsertionPointAfter(connect);
+      ConnectOp connect;for(auto x:top.getOps<ConnectOp>())
+        if(auto i=x.getDest().getDefiningOp<InstanceOp>();i&&i.getModuleName()=="GGNICBridgeControlWrapper")connect=x;
+      b.setInsertionPointAfter(connect);
       b.create<ConnectOp>(connect.getLoc(),connect.getDest(),connect.getSrc());
     }
     if(bad==5)bank->removeAttr("goldengate.mmioRegisters");
@@ -181,6 +209,60 @@ void nicTest(MLIRContext &ctx) {
       require(connections==160,"eight banks require 160 scalar request/ready bindings");
       for(auto p:m.getPorts())if(p.name=="nicBridge_ctrl")
         require(cast<BundleType>(p.type).getNumElements()==3,"NIC AW/W remains external");
+    }
+  }
+}
+// The production catalog must distinguish type-identical TracerV ports.
+void tracerTest(MLIRContext &ctx) {
+  for(unsigned count:{1u,4u})for(unsigned bad=0;bad<=11;++bad) {
+    auto root=fixture(ctx,0,count==4?4:0);auto c=*root->getOps<CircuitOp>().begin();
+    FModuleOp top,decoder,last,wrapper;
+    for(auto m:c.getOps<FModuleOp>()) {
+      if(m.getName()==oldTop)top=m;
+      if(m.getName()=="GGControlAddressDecode")decoder=m;
+      if(m.getName()==(count==4?"GGTracerVMCRFile_3":"GGTracerVMCRFile"))last=m;
+      if(m.getName()=="GGTracerVBridgeControlWrapper")wrapper=m;
+    }
+    auto connections=SmallVector<ConnectOp>(top.getOps<ConnectOp>().begin(),top.getOps<ConnectOp>().end());
+    auto lastConnect=connections.back();OpBuilder b(&ctx);
+    if(bad==1)lastConnect.erase();
+    if(bad==2)(*wrapper.getOps<ConnectOp>().begin()).erase();
+    if(bad==3)(*wrapper.getOps<InstanceOp>().begin()).setName("otherBank");
+    if(bad==4){b.setInsertionPointAfter(lastConnect);b.create<ConnectOp>(c.getLoc(),lastConnect.getDest(),lastConnect.getSrc());}
+    if(bad==5)last.setName(count==4?"GGTracerVMCRFile_4":"GGTracerVMCRFile_1");
+    if(bad==6)last.setName("GGTracerVMCRFile_03");
+    if(bad==7){SmallVector<bool> ds(last.getPortDirections().begin(),last.getPortDirections().end());ds[2]=true;last.setPortDirections(ds);}
+    if(bad==8){SmallVector<Attribute> names(last.getPortNames().begin(),last.getPortNames().end());names[2]=b.getStringAttr("other");last.setPortNames(names);}
+    if(bad==9||bad==10) {
+      auto allocation=decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+      SmallVector<Attribute> rows(allocation.begin(),allocation.end());
+      unsigned index=count==4?5:2;NamedAttrList row(cast<DictionaryAttr>(rows[index]));
+      row.set("name",b.getStringAttr(bad==9?"OtherWidget":"TracerVBridgeModule_9"));rows[index]=row.getDictionary(&ctx);
+      decoder->setAttr("goldengate.controlRegions",b.getArrayAttr(rows));
+    }
+    if(bad==11) {
+      if(count==4) {
+        // Swap two equal-typed ports, retaining one forwarding per argument.
+        auto first=connections.front();auto source=first.getSrc();
+        first.getSrcMutable().assign(lastConnect.getSrc());lastConnect.getSrcMutable().assign(source);
+      } else wrapper.setName("WrongTracerVWrapper");
+    }
+    auto before=dump(*root);std::string error;
+    auto result=goldengate::bindRocketControlWidgetWrites(c,error);
+    if(bad) {
+      require(failed(result)&&!error.empty()&&dump(*root)==before,"TracerV identity rejection mutated or accepted IR");continue;
+    }
+    require(succeeded(result),error);require(succeeded(verify(*root)),"TracerV binding IR invalid");
+    for(auto m:c.getOps<FModuleOp>())if(m.getName()==newTop) {
+      auto rows=m->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
+      require(rows.size()==count+6,"TracerV binding catalog lost a bank");
+      for(unsigned i=0;i<count;++i) {
+        auto row=cast<DictionaryAttr>(rows[i]);auto suffix=i?"_"+std::to_string(i):"";
+        require(row.getAs<StringAttr>("name").getValue()=="TracerVBridgeModule_"+std::to_string(i)&&
+          row.getAs<StringAttr>("port").getValue()=="tracerv_ctrl"+suffix&&
+          row.getAs<IntegerAttr>("slave").getInt()==2+i,"TracerV constructor/slave identity differs");
+      }
+      require(std::distance(m.getOps<StrictConnectOp>().begin(),m.getOps<StrictConnectOp>().end())==20*(count+6),"TracerV scalar bindings incomplete");
     }
   }
 }
@@ -279,8 +361,7 @@ void test(MLIRContext &ctx,unsigned layout) {
   std::vector<std::string> originalTargets;
   for(auto a:c->getAttrOfType<ArrayAttr>("rawAnnotations"))
     originalTargets.push_back(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue().str());
-  require(succeeded(layout ? goldengate::bindControlWidgetWrites(c,error) :
-                            goldengate::bindRocketControlWidgetWrites(c,error)),error);
+  require(succeeded(goldengate::bindControlWidgetWrites(c,error)),error);
   require(succeeded(verify(*root)),"widget write IR invalid");
   FModuleOp top;for(auto m:c.getOps<FModuleOp>())if(m.getName()==newTop)top=m;
   require(bool(top),"wrapper missing");
@@ -417,9 +498,9 @@ int main(int argc,char **argv) {
       std::error_code ec;llvm::raw_fd_ostream out(argv[2],ec);require(!ec,"cannot write production binding");
       root->print(out);out<<'\n';
       if(argc==4)exportNICBinding(c,argv[3]);
-      llvm::outs()<<"Production NIC write binding verified\n";return 0;
+      llvm::outs()<<"Production widget write binding verified\n";return 0;
     }
-    for(unsigned layout=0;layout<3;++layout)test(ctx,layout); explicitCatalogRejections(ctx);nicTest(ctx);
-    llvm::outs()<<"Widget writes: 420 exact scalar bindings plus 160 NIC bindings; partial targets and 40 atomic rejections passed\n";
+    for(unsigned layout=0;layout<3;++layout)test(ctx,layout); explicitCatalogRejections(ctx);nicTest(ctx);tracerTest(ctx);
+    llvm::outs()<<"Widget writes: 420 exact scalar bindings plus NIC and single/quad TracerV catalogs; partial targets and atomic identity rejections passed\n";
     return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}
 }
