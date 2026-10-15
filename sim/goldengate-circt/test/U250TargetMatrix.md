@@ -5992,3 +5992,89 @@ header before enabling bridge driver constructors and final RTL/runtime
 validation. Other TracerV constructors, FASED profiles, partitioned QSFP and
 SRAM equivalence remain pending. This shim milestone does not complete the
 port. Unrelated shared-worktree edits remain outside this checkpoint.
+
+### Iteration 231 — incoming NIC metasim interface headers
+
+The production CLI now applies `prepareMetasimInterfaceHeader` to the actual
+NIC F1Shim after its existing retained boundary. This ports the physical
+interface-header step of Scala `SimulationMapping.generateHeaderAnnos` and
+`FPGATopImp.genHeader/genVHeader` to the NIC pipeline, deriving constants from
+native FIRRTL port types. The compiler emits
+`post-fame-metasim-header-all.json` and the three retained OutputFile bodies
+under `metasim-interface/`. The partial C++ header contains the typed metasim
+configuration; NIC bridge constructors remain pending. Compilation therefore
+still rejects explicitly at `NIC driver header integration is not implemented`.
+The no-NIC driver/header path is unchanged.
+
+`Support/NICMetasimInterfaceCompare.py` compares these production outputs
+against the completed NIC SFC artifacts:
+
+```text
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.vh
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+```
+
+The complete typed configuration matches after whitespace and equivalent C
+string normalization. All twelve usable Verilog constants match; CIRCT omits
+Scala's unused malformed `MEM_HAS_CHANNEL-1` macro. The original FireSim
+identity, optional CPU/FPGA endpoints, memory count and zero target QSFP
+channels are checked. Both candidate and SFC C++ configurations compile
+against the actual `midas/src/main/cc/core/config.h` types with static
+assertions. This is a configuration ABI check, not execution of NIC drivers.
+
+The comparison also checks 31 width/direction relationships against each
+of the NIC RTL above and the immutable U250 RTL:
+
+```text
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+All 62 checks match. This immutable build-tree fixture has no `.const.h` or
+`.const.vh`; its comparison uses the actual RTL ports, without inventing a
+missing header. The initial test assumed a companion C++ header there and
+failed with FileNotFoundError; the corrected comparison records that absence.
+Native `MetasimInterfaceHeaderTest` verifies the complete production MLIR
+before and after preparation, preserves every module body and all 1,795
+existing annotation records, and independently emits the same three files
+and complete 1,797-record annotation archive as the CLI. Normal header and
+F1-shim CTests pass, including varied-width and atomic rejection cases.
+
+Evidence is under the active generated directory's
+`iteration231-u250-target-matrix/`: `nic-metasim/comparison.json`, native and
+C++ ABI logs, `build.log`, `ctest.log`, `inputs.json`, and the complete
+`replay/` directory. Compiler SHA256 is
+`0857ecda77e0c84b00a06f2b7cd53b466bea30007c2fd2f457571b5e99d7e549`.
+
+The thirteen-target replay retains one compiled target, six compiler failures
+and six unsupported partition/QSFP platforms. Archived input hashes,
+effective platforms, earlier comparison results and statuses match iteration
+230; NIC alone advances to its driver-header diagnostic. Seven bridge/channel
+boundaries and Shuttle model ports match; six model-port boundaries retain
+the native-SRAM differences. Aggregate comparisons remain eight matched,
+six mismatched and twelve not reached. These gaps remain failed comparisons.
+`matrix-regression.json` and its log record every recipe and complete stderr.
+
+All 256 earlier NIC and 256 no-NIC MLIR/JSON files match iteration 230 after
+output-directory normalization; only the NIC header archive is new. All five
+final no-NIC RTL/header/XDC artifacts are byte-identical. The archived Rocket
+inputs again match the immutable staging fixture by SHA256; synthesis XDC
+matches the immutable U250 fixture exactly and implementation XDC matches
+after the documented hierarchy rename. Artifact reports retain exact paths.
+
+To make replay space, 584 old iteration-226 MLIR dumps were losslessly
+compressed to adjacent `.mlir.gz`, recovering 36,783,084,286 bytes after
+checking decompressed SHA256. `storage.log` records every file. JSON, RTL,
+logs, active/prior baselines, historical Print and immutable fixtures remain.
+
+Supplied harness iteration 230 passed CIRCT replacertl/provenance and fresh
+Verilator smoke; unchanged-input long-suite evidence was reused from earlier
+passing runs, with the SFC UART-bearing baseline still pending. These gates
+precede this change. No manager verification was started in this iteration.
+
+The next smallest NIC step is to extend `prepareCPUManagedStreamHeader` for
+the validated incoming queue allocation/count/data paths, then add the
+SimpleNIC constructor with allocated MMIO and ordered stream indices from
+the Scala oracle. Complete NIC RTL/runtime validation, other target gaps,
+partitioned QSFP and SRAM equivalence remain pending. This header boundary
+does not complete the port. Unrelated shared-worktree edits are excluded.

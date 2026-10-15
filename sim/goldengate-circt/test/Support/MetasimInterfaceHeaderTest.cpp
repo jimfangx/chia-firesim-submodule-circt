@@ -5,6 +5,7 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
@@ -117,12 +118,16 @@ int main(int argc, char **argv) {
     if (argc == 3) {
       auto boundary = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(boundary), "boundary parse");
+      require(succeeded(verify(*boundary)), "invalid production input IR");
       auto c = *boundary->getOps<CircuitOp>().begin();
       auto result = run(c, "FireSim");
+      require(succeeded(verify(*boundary)), "invalid production header IR");
       for (auto expected : {"AXI4Config{12, 25, 32}", "AXI4Config{16, 34, 64}",
                            "AXI4Config{16, 64, 512}", "FPGATopQSFPConfig{256, 0}"})
         require(StringRef(result).contains(expected), "recorded U250 boundary configuration");
       require(succeeded(goldengate::emitOutputFiles(c, argv[2], "FireSim-generated", error)), error);
+      require(succeeded(goldengate::emitAllAnnotations(
+          c, std::string(argv[2]) + "/metasim-all.json", error)), error);
       llvm::outs() << "Recorded CIRCT U250 boundary: metasim .const.h and .const.vh emitted with original FireSim target name\n";
     }
     return 0;

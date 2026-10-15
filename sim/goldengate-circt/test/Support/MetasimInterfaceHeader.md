@@ -6,6 +6,25 @@ non-default AXI widths, presence macros, safe Verilog include guards, retained
 annotation/body preservation, and atomic rejection of either duplicate header,
 inconsistent interfaces, and missing metadata. The optional boundary invocation
 expects a snapshot before header preparation and an existing output directory.
+That invocation also verifies the complete production IR before and after
+preparation and emits `metasim-all.json` for comparison with the CLI archive.
+
+The incoming-NIC production path emits `post-fame-metasim-header-all.json`
+and the interface fragments under `metasim-interface/`, then rejects the
+remaining driver-header integration gap. These fragments are partial compiler
+outputs; they do not contain the NIC bridge constructors. The preceding shim
+boundary remains available before header preparation.
+
+`NICMetasimInterfaceCompare.py` checks the production annotation prefix and
+the independently re-emitted native archive/collateral, compares the complete
+typed configuration against the archived NIC SFC header, and checks 31 width/direction
+relationships against each SFC RTL interface. It compares all 12 Verilog
+constants with the NIC golden (excluding Scala's malformed unused
+`MEM_HAS_CHANNEL-1`) and compiles both C++ interface configurations
+against the actual `core/config.h` driver types with static assertions.
+The immutable U250 build-tree fixture supplies RTL only; it has no C++ header.
+Invoke it with `--candidate`, `--sfc`, `--immutable-sfc`, `--native-tool`,
+`--cxx` and a fresh `--output-dir`.
 
 The immutable U250 reference is:
 

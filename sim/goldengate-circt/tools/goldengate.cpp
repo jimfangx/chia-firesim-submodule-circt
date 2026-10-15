@@ -4798,11 +4798,28 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, shimAnnotations, error)))
         return fail("F1 shim annotations: " + error);
       llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
-      // Incoming NIC PCIS uses the shared AXI4/Nasti specialization. Retain
-      // this verified hardware/collateral boundary while its metasim and
-      // bridge constructor headers remain a separate integration step.
-      if (!cpuSinks.empty())
-        return fail("NIC metasim and driver header integration is not implemented");
+      if (!cpuSinks.empty()) {
+        // SimulationMapping derives interface constants from the physical
+        // platform ports, independently of the NIC bridge constructors.
+        // Keep this partial header in its own directory until the complete
+        // driver header and RTL are available for publication together.
+        if (failed(goldengate::prepareMetasimInterfaceHeader(
+                circuit, originalTargetName, error)))
+          return fail("NIC metasim interface header: " + error);
+        llvm::SmallString<256> headerAnnotations(outputDir), headerDirectory(outputDir);
+        llvm::sys::path::append(headerAnnotations, "post-fame-metasim-header-all.json");
+        llvm::sys::path::append(headerDirectory, "metasim-interface");
+        if (failed(goldengate::emitAllAnnotations(circuit, headerAnnotations, error)))
+          return fail("NIC metasim interface annotations: " + error);
+        if (auto ec = llvm::sys::fs::create_directories(headerDirectory))
+          return fail("cannot create NIC metasim interface directory: " + ec.message());
+        if (failed(goldengate::emitOutputFiles(
+                circuit, headerDirectory, outputBase, error)))
+          return fail("NIC metasim interface collateral: " + error);
+        llvm::outs() << "Emitted CIRCT NIC metasim interface headers in "
+                     << headerDirectory << '\n';
+        return fail("NIC driver header integration is not implemented");
+      }
       auto prepareDriverHeaders = [&]() -> int {
         if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))
           return fail("Rocket driver headers: " + error);
