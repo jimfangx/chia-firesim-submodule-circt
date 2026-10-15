@@ -4,6 +4,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
@@ -227,12 +228,16 @@ void behavior(MLIRContext &context) {
       require(sim.output(8,"read"+lane+".valid")==1 && sim.output(8,"write"+lane+".ready")==1,"MCR handshake mismatch");
     }};
     check();unsigned assertions=0;
-    for(auto a:sim.module.getOps<AssertOp>()) {
-      bool fail=sim.eval(a->getOperand(2)) && !sim.eval(a->getOperand(1));
+    for(auto a:sim.module.getOps<PrintFOp>()) {
+      bool fail=sim.eval(a.getCond());
       bool write=sim.memo.at(sim.key(sim.arg(8))+".write["+std::to_string(assertions)+"].valid");
-      require(fail==(!hostReset && write),"assertion confused model/host reset");assertionFailures+=fail;++assertions;
+      require(fail==(!hostReset && write),"diagnostic confused model/host reset");
+      require(a.getClock()==sim.arg(0) && a.getSubstitutions().empty() &&
+          a.getFormatString()=="Assertion failed: Register "+names[assertions].str()+" is read only\n",
+          "wrong diagnostic clock/message");assertionFailures+=fail;++assertions;
     }
-    require(assertions==4,"missing read-only assertions");
+    require(assertions==4 && sim.module.getOps<AssertOp>().empty() && sim.module.getOps<StopOp>().empty(),
+        "read-only diagnostics must continue simulation");
     for(unsigned i=0;i<4;++i) {
       bool event=(bits>>(events[i]-1))&1;
       wraps+=fire && !modelReset && event && expected[i]==UINT32_MAX;
@@ -324,9 +329,76 @@ void rejections(MLIRContext &context) {
   }
 }
 }
-int main() {
+// Export the actual production bank and its observed wrapper bindings; do not
+// reconstruct counter equations in the RTL differential test.
+unsigned port(FModuleOp m, llvm::StringRef name) {
+  for(unsigned i=0;i<m.getNumPorts();++i)if(m.getPortName(i)==name)return i;
+  throw std::runtime_error("missing production port: "+name.str());
+}
+Value driver(FModuleOp m, Value dest) {
+  Value result;
+  for(auto &op:*m.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==dest) {
+    require(!result,"multiple production drivers");result=op.getOperand(1);
+  }
+  require(bool(result),"missing production driver");return result;
+}
+void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
+  auto root=parseSourceFile<ModuleOp>(input,&ctx);
+  require(bool(root)&&succeeded(verify(*root)),"invalid production statistics boundary");
+  auto c=*root->getOps<CircuitOp>().begin();
+  require(c.getName()=="GGFASEDStatisticsWrapper","wrong production statistics root");
+  auto top=named(c,c.getName()),inner=named(c,hierarchy[0]),bank=named(c,"GGFASEDStatistics");
+  InstanceOp sim,original;
+  for(auto i:top.getOps<InstanceOp>()) {
+    if(i.getName()=="sim")sim=i;
+    if(i.getName()=="statistics")original=i;
+  }
+  require(sim&&sim.getModuleName()==inner.getName()&&original&&original.getModuleName()==bank.getName(),
+      "wrong production statistics instances");
+  require(bank.getNumPorts()==9,"wrong production statistics bank arity");
+  SmallVector<Value> sources;
+  for(unsigned i=0;i<8;++i) {
+    auto source=driver(top,original.getResult(i));sources.push_back(source);
+    if(i<2)require(source==top.getArgument(port(top,i?"hostReset":"hostClock")),"wrong host clock/reset");
+    else if(i<4)require(source==sim.getResult(port(inner,i==2?"fased_model_reset":"fased_tfire")),
+        "wrong target reset/fire");
+    else if(i<7) {
+      auto both=source.getDefiningOp<AndPrimOp>();require(bool(both),"missing request handshake");
+      for(unsigned j=0;j<2;++j) {
+        auto f=both->getOperand(j).getDefiningOp<SubfieldOp>();
+        auto channel=f?f.getInput().getDefiningOp<SubfieldOp>():SubfieldOp();
+        require(f&&f.getFieldName()==(j?"valid":"ready")&&channel&&
+            channel.getFieldName()==(i==4?"aw":i==5?"ar":"w")&&
+            channel.getInput()==sim.getResult(port(inner,"fased_timing_requests")),"wrong request handshake");
+      }
+    } else require(source==sim.getResult(port(inner,"fased_accepted_r_fire")),"wrong accepted-R observation");
+  }
+  auto mcr=top.getArgument(port(top,"fased_statistics_mcr"));
+  require(driver(top,mcr)==original.getResult(8),"wrong MCR binding");
+  auto isolated=ModuleOp::create(c.getLoc());OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(isolated.getBody());
+  auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGFASEDStatisticsProbe"));
+  b.setInsertionPointToEnd(exported.getBodyBlock());b.insert(bank->clone());
+  auto probe=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDStatisticsProbe"),
+      bank.getConventionAttr(),bank.getPorts());probe.setPublic();
+  b.setInsertionPointToEnd(probe.getBodyBlock());
+  auto instance=b.create<InstanceOp>(c.getLoc(),bank,"statistics");IRMapping map;
+  for(unsigned i=0;i<9;++i)map.map(original.getResult(i),instance.getResult(i));
+  for(unsigned i=0;i<8;++i)map.map(sources[i],probe.getArgument(i));
+  map.map(mcr,probe.getArgument(8));unsigned cloned=0;
+  for(auto &op:*top.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&
+      map.contains(op.getOperand(0))&&map.contains(op.getOperand(1))) {b.clone(op,map);++cloned;}
+  require(cloned==9&&succeeded(verify(isolated)),"invalid production statistics probe bindings");
+  std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot export statistics probe");
+  isolated.print(out);out<<'\n';out.close();isolated.erase();
+  llvm::outs()<<"Cloned production statistics bank and nine validated control/event/MCR bindings\n";
+}
+int main(int argc,char **argv) {
   try {
-    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for (bool profileSelected : {false, true}) {
+    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+    require(argc==1||argc==3,"usage: goldengate-fased-statistics-test [boundary.mlir probe.mlir]");
+    if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
+    for (bool profileSelected : {false, true}) {
       selected = profileSelected; phases(context);behavior(context);mapping(context);rejections(context);
     }
     llvm::outs()<<"FASED statistics: 65536 cycles across legacy/selected profiles, wraps, target-clock/reset bindings, 13 response hierarchy modules, targets and 52 atomic boundary rejections passed\n";

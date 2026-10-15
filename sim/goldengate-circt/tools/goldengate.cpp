@@ -4529,10 +4529,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsAnnotations, error)))
         return fail("FASED response error registers annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host-clock response error registers and response handshake binding in " << fasedResponseErrorsPath << '\n';
-      // NIC response status now observes the existing host R/B handshakes.
-      // Target statistics remain the next independently compared boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED statistics, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDStatistics(circuit, fasedStatisticsBank, error)))
         return fail("FASED transaction and beat counters: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED transaction and beat counters produced invalid FIRRTL IR");
@@ -4546,6 +4542,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsAnnotations, error)))
         return fail("FASED transaction and beat counters annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED target-clock transaction and beat counters and read-only MMIO in " << fasedStatisticsPath << '\n';
+      // Statistics observes existing target handshakes, including accepted R
+      // beats through the response hierarchy. Compare NIC histograms next.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED histograms, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDHistograms(circuit, fasedHistogramsBank, error)))
         return fail("FASED outstanding occupancy histograms: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED outstanding occupancy histograms produced invalid FIRRTL IR");

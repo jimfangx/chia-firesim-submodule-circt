@@ -185,9 +185,11 @@ LogicalResult goldengate::materializeFASEDStatistics(CircuitOp circuit,
     Value write=slot("write",i),read=slot("read",i);
     connect(field(read,"bits"),reg);
     connect(field(read,"valid"),one);connect(field(write,"ready"),one);
-    Value permitted=b.create<NotPrimOp>(loc,field(write,"valid"));
-    b.create<AssertOp>(loc,arg(0),permitted,enabled,
-        "Register "+names[i].str()+" is read only",ValueRange{},"");
+    // The recorded SFC MCRIO.bindReg host RTL diagnoses read-only writes
+    // without terminating simulation. Keep diagnostics on the host clock,
+    // independently of the target-fire/model-reset counter update policy.
+    b.create<PrintFOp>(loc,arg(0),both(enabled,field(write,"valid")),
+        "Assertion failed: Register "+names[i].str()+" is read only\n",ValueRange{},"");
   }
 
   result = bank;

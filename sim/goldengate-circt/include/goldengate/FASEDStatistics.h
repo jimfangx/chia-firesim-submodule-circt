@@ -6,7 +6,8 @@
 namespace goldengate {
 // Materialize the read-only W/R beat and AW/AR transaction bank before control
 // allocation. Local lanes 0-3 retain global words 14-17 (byte offsets 56-68).
-// Counters advance/reset only on targetFire; hostReset suppresses assertions.
+// Counters advance/reset only on targetFire; hostReset suppresses nonfatal
+// read-only-write diagnostics on the independent host clock.
 // Top identity, ports and retained annotations are preserved; result is assigned
 // only on success. Requires a free GGFASEDStatistics symbol.
 mlir::LogicalResult materializeFASEDStatistics(circt::firrtl::CircuitOp circuit,

@@ -3992,3 +3992,118 @@ replacertl and fresh bare-metal smoke with unchanged-input long-suite evidence
 reused; those results precede this change. No FireSim manager verification
 step was started here, and iteration 211 manager validation remains pending.
 The overall port remains incomplete.
+
+
+## Iteration 212: NIC FASED transaction/beat statistics and host diagnostics
+
+The native NIC compiler now attaches `GGFASEDStatisticsWrapper` after the
+response-error boundary, exposing accepted target R beats through the existing
+13-module response chain and binding four read-only counters. The next explicit
+NIC rejection names histograms, control responses and platform integration.
+This moves the actual CIRCT compiler forward; NIC end-to-end compilation still
+fails and is not counted as supported.
+
+`models/dram/TimingModel.scala:151-166` counts accepted W/R beats and AW/AR
+transactions, wrapping at 32 bits. `widgets/Lib.scala:281-297` supplies the
+read-only register contract; the recorded SFC FASED RTL emits host-clock
+`$fwrite` diagnostics without `$fatal`, `$finish` or `$stop`. The native bank
+now uses four `firrtl.printf` operations for those writes, with host-reset
+suppression independent of target fire and model reset. Counter reset/update
+remains gated by target fire. The canonical assertion message is retained;
+SFC's additional Scala source excerpt is not reproduced byte-for-byte.
+`MidasTransforms.scala` / `FAMETransform.scala` were inspected for pass order
+and host/target clock/reset context. Other banks' diagnostic policies remain
+separate oracle comparisons.
+
+Changed files: `include/goldengate/FASEDStatistics.h`,
+`lib/Transforms/FASEDStatistics.cpp`, `tools/goldengate.cpp`,
+`test/Transforms/FASEDStatisticsTest.cpp`,
+`test/Transforms/NICFASEDStatisticsCompare.py`, and this ledger.
+The native exporter verifies the complete production IR and its eight
+clock/reset/fire/event inputs plus MCR output before cloning the bank and
+nine connections verbatim. The comparator checks the original SFC model
+instance's gated clock/reset, counter clocked updates, and independent
+host-clock diagnostic blocks rather than reconstructing Scala behavior.
+
+Exact NIC SFC RTL compared:
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+Its extracted statistics and diagnostic cones match the immutable U250 RTL:
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`
+SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+The same-directory NIC SFC `FireSim-generated.const.h`, SHA256
+`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`,
+agrees with every native allocation-table copy: FASED base 128, size 128,
+slave 1; `totalWriteBeats`, `totalReadBeats`, `totalWrites`, `totalReads`
+read-only offsets 56/60/64/68, addresses 184/188/192/196. The no-NIC archived
+SFC RTL at `u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`,
+and its header, SHA256
+`34a3d08b9cf8b179eb0f951e23e187c37d30ff1ea084aa76058e704f5737a308`,
+match the same cones and register ABI. Neither immutable fixture was modified.
+
+Native compiler/test build and `goldengate-fased-statistics` CTest passed:
+65,536 cycles across legacy/selected profiles, split/combined construction,
+34 phase rejection checks per profile and 52 boundary rejection checks.
+Fresh NIC and no-NIC production-boundary Verilator probes each passed 34,817
+legal-input cycles, including 1,495 counter wraps, 1,058 stalled model resets,
+16,280 host-only resets, 8,873 blocked R beats and 2,080 accepted nonfinal R
+beats. Each additionally passes fifteen illegal-write runs: five masks,
+each native-only, oracle-only and joint. Each active lane diagnoses three
+successive host edges, including target stalls/model reset, and jointly six
+messages; host-reset writes are silent. Counter continuation, recovery and
+subsequent stalled/firing model resets match. All runs exit normally. Each
+probe rejects three valid-IR production wiring mutations after full IR
+verification. Full queues, decoder transport and NIC workload behavior remain
+outside these decoded-MMIO/observed-handshake probes.
+
+The NIC comparison preserves 186 unrelated module bodies, 194 copied ports,
+203 wrapper connections and 1,792 annotation records; thirteen response
+modules retain their existing drivers while exposing accepted R. The bank
+matches fresh no-NIC verbatim. NIC candidate SHA256
+`d78c2ef1bfd69070741356fe7ffbf3ade9aa4460f9c7bba951fe4a3c2a29b8f3`;
+no-NIC statistics candidate SHA256
+`cf42a1badb97c7970c8d0719d2747cc9c00a16b50f16d2ddca64e65d307db3ec`.
+
+Against iteration 211, 218 NIC and 256 no-NIC shared MLIR/JSON files were
+checked after normalizing the candidate-directory annotation. Only statistics
+bank bodies differ in 55 NIC and 77 no-NIC MLIR files; shared JSON records
+and all other operations remain unchanged. NIC adds precisely its statistics
+MLIR and annotation boundaries. Of 1,464 emitted no-NIC RTL modules, only
+`GGFASEDStatistics` changes. Headers and both XDC files are byte-identical;
+no-NIC SV SHA256
+`094eae405f50c93881916d85768712919b8fc6d6e33376c0ee9418f78924eafb`.
+Primary immutable FIRRTL/annotation hashes and normalized U250 XDC also
+match. The first no-NIC comparison attempted a nonexistent adjacent immutable
+header; the retained failure log is followed by successful runs using the
+archived no-NIC header plus the immutable RTL cross-check. A regression-helper
+recipe suffix error was corrected before its successful complete comparison.
+
+Compiler SHA256 `3fb6a525b1b8e3bb4e0b025acb88575127e20fb7bb65b8e2072b224935691fca`;
+manifest SHA256 `0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+All thirteen exact archived inputs and effective platform configurations were
+replayed; complete stderr logs were inspected. Results remain one compiled,
+six failed and six unsupported platforms. Structured annotation comparisons
+remain eight matched, six SRAM model-port mismatches and twelve not reached,
+with unchanged input hashes/statuses/checks. Exit 1 records these gaps.
+NIC now rejects at histograms; other failures retain multiple/wider TracerV,
+FASED maxFlight profile restrictions and partition/QSFP implementation gaps.
+
+Fresh evidence directory:
+`/scratch/jfx/fsim-circt/sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration212-u250-target-matrix`.
+Final reports are `nic-statistics-final-comparison.json`,
+`no_nic-statistics-final-comparison.json`, `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json`, and
+`matrix-regression.json`. Final differential logs/probes use the `-v3` suffix;
+`artifact-regression-v2.log` records the successful complete regression.
+Existing user changes, failed probe logs and earlier candidates were preserved.
+No storage cleanup was needed.
+
+The next smallest porting step is NIC FASED occupancy histograms, with their
+own gated counter/reset and decoded read-only ABI/diagnostic comparison.
+NIC control responses/platform integration, generalized profiles, partition/QSFP
+behavior and the SFC UART-bearing baseline remain pending. Harness iteration
+211 passed actual CIRCT replacertl, fresh bare-metal smoke, 90,141 portable
+Spike checks and 90,805 UART-bearing Rocket checks; those precede this change.
+No manager verification step was started here; iteration 212 manager validation
+remains pending. The overall port remains incomplete.
