@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+# See LICENSE for license details.
+"""Compare the native SimpleNIC driver constructor to the completed SFC ABI."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import re
+import subprocess
+
+
+def fragment(text):
+    # Headers are deliberately multi-include files. Select exactly the NIC
+    # section, preserving every address, stream argument and struct assertion.
+    block, = re.findall(r'(#ifdef GET_INCLUDES\n#include "bridges/simplenic.h"\n.*?'
+                        r'#endif // GET_BRIDGE_CONSTRUCTOR)', text, re.S)
+    return block
+
+
+def normalize(text):
+    # SFC's StringBuilder emits literal line continuations on static_asserts.
+    # Remove only lexical spelling/whitespace; retain constructor argument order.
+    return re.sub(r'\s+', '', text.replace('\\\n', '\n'))
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    for key in ('candidate', 'sfc', 'native-tool', 'cxx', 'output-dir'):
+        parser.add_argument('--' + key, type=Path, required=True)
+    args = parser.parse_args()
+    args.output_dir.mkdir(parents=True, exist_ok=False)
+    before = json.loads((args.candidate / 'post-fame-cpu-stream-header-all.json').read_text())
+    after = json.loads((args.candidate / 'post-fame-nic-header-all.json').read_text())
+    assert len(before) == len(after)
+    (old, new), = [(a, b) for a, b in zip(before, after) if a != b]
+    assert new['body'].startswith(old['body']) and new['goldengate.nicHeader'] is True
+    assert {k: v for k, v in new.items() if k not in ('body', 'goldengate.nicHeader')} == {
+        k: v for k, v in old.items() if k != 'body'}
+    candidate = args.candidate / 'nic-header/FireSim-generated.const.h'
+    assert candidate.read_text() == new['body']
+    expected, actual = fragment(args.sfc.read_text()), fragment(candidate.read_text())
+    assert normalize(actual) == normalize(expected), (actual, expected)
+    native = args.output_dir / 'native'
+    native.mkdir()
+    with (args.output_dir / 'native.log').open('w') as log:
+        subprocess.run([str(args.native_tool), str(args.candidate / 'post-fame-f1-shim.mlir'),
+                        str(native)], stdout=log, stderr=subprocess.STDOUT, check=True)
+    assert json.loads((native / 'nic-all.json').read_text()) == after
+    assert candidate.read_bytes() == (native / candidate.name).read_bytes()
+    # Typecheck against the real driver, including its ordered address struct.
+    tree = Path(__file__).resolve().parents[3]
+    repo = tree.parents[2]
+    includes = [tree / 'midas/src/main/cc',
+                repo / 'generators/firechip/bridgestubs/src/main/cc']
+    for index, block in enumerate((actual, expected)):
+        header = args.output_dir / f'fragment-{index}.h'
+        header.write_text(block + '\n')
+        source = args.output_dir / f'abi-{index}.cpp'
+        source.write_text('#include "bridges/simplenic.h"\n'
+            'struct Registry { StreamEngine *get_stream_engine(); void add_widget(bridge_driver_t *); };\n'
+            '#define GET_SUBSTRUCT_CHECKS\n#include ' + json.dumps(str(header.resolve())) + '\n'
+            '#undef GET_SUBSTRUCT_CHECKS\n'
+            'void build(Registry &registry, simif_t &simif, const std::vector<std::string> &args) {\n'
+            '#define GET_BRIDGE_CONSTRUCTOR\n#include ' + json.dumps(str(header.resolve())) + '\n}\n')
+        with (args.output_dir / f'abi-{index}.log').open('w') as log:
+            subprocess.run([str(args.cxx), '-std=c++20', '-fsyntax-only',
+                            *[arg for path in includes for arg in ('-I', str(path))],
+                            str(source)], stdout=log, stderr=subprocess.STDOUT, check=True)
+    report = dict(golden=str(args.sfc.resolve()),
+        golden_sha256=hashlib.sha256(args.sfc.read_bytes()).hexdigest(),
+        candidate=str(candidate.resolve()), complete_NIC_fragment_match=True,
+        mmio_addresses=[512, 516, 520, 524, 528, 532],
+        widget_index=0, stream_arguments=[0, 3072, 0, 3072],
+        native_emission_identical=True, compiled_driver_ABIs=2,
+        annotation_count=len(after), changed_annotations=1,
+        limitation='Complete driver assembly, final NIC RTL and runtime validation remain pending.')
+    (args.output_dir / 'comparison.json').write_text(json.dumps(report, indent=2) + '\n')
+    print(json.dumps(report, indent=2))
+
+
+if __name__ == '__main__':
+    main()

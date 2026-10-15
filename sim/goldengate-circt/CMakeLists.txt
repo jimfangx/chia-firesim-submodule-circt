@@ -16,6 +16,7 @@ add_executable(goldengate-circt
   lib/Support/UARTHeader.cpp
   lib/Support/TSIHeader.cpp
   lib/Support/BlockDevHeader.cpp
+  lib/Support/NICHeader.cpp
   lib/Analysis/BridgeClockInfo.cpp
   lib/Support/TracerVHeader.cpp
   lib/Support/PrintBridgeHeader.cpp
@@ -837,6 +838,18 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-cpu-managed-stream-header-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-cpu-managed-stream-header COMMAND goldengate-cpu-managed-stream-header-test)
+  add_executable(goldengate-nic-header-test
+    test/Support/NICHeaderTest.cpp lib/Support/NICHeader.cpp
+    lib/Support/CPUManagedStreamHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
+    lib/Support/AnnotationEmission.cpp lib/Transforms/NICMMIOBank.cpp
+    lib/Transforms/CPUStreamQueue.cpp)
+  target_compile_features(goldengate-nic-header-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-header-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-header-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-header-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-header COMMAND goldengate-nic-header-test)
   add_executable(goldengate-tracerv-header-test
     test/Support/TracerVHeaderTest.cpp
     lib/Analysis/BridgeClockInfo.cpp

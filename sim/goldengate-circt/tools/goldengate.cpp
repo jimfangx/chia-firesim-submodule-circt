@@ -29,6 +29,7 @@
 #include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/RocketDriverHeader.h"
 #include "goldengate/CPUManagedStreamHeader.h"
+#include "goldengate/NICHeader.h"
 #include "goldengate/FASEDHeader.h"
 #include "goldengate/XDCEmission.h"
 #include "goldengate/XilinxHostSpecialization.h"
@@ -4830,7 +4831,19 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitOutputFiles(circuit, streamDirectory, outputBase, error)))
           return fail("NIC CPU stream header collateral: " + error);
         llvm::outs() << "Emitted CIRCT incoming/outgoing CPU stream descriptors in " << streamDirectory << '\n';
-        return fail("NIC bridge driver header integration is not implemented");
+        if (failed(goldengate::prepareNICHeader(circuit, error)))
+          return fail("SimpleNIC driver header: " + error);
+        llvm::SmallString<256> nicAnnotations(outputDir), nicDirectory(outputDir);
+        llvm::sys::path::append(nicAnnotations, "post-fame-nic-header-all.json");
+        llvm::sys::path::append(nicDirectory, "nic-header");
+        if (failed(goldengate::emitAllAnnotations(circuit, nicAnnotations, error)))
+          return fail("SimpleNIC driver header annotations: " + error);
+        if (auto ec = llvm::sys::fs::create_directories(nicDirectory))
+          return fail("cannot create SimpleNIC header directory: " + ec.message());
+        if (failed(goldengate::emitOutputFiles(circuit, nicDirectory, outputBase, error)))
+          return fail("SimpleNIC driver header collateral: " + error);
+        llvm::outs() << "Emitted CIRCT SimpleNIC driver constructor in " << nicDirectory << '\n';
+        return fail("NIC complete driver-header assembly and final RTL integration are not implemented");
       }
       auto prepareDriverHeaders = [&]() -> int {
         if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))

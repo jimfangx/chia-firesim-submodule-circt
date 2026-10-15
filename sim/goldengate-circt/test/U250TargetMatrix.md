@@ -6164,3 +6164,87 @@ Complete NIC RTL/runtime checks, other TracerV widths/multiplicity, FASED
 profiles, partitioned QSFP and SRAM equivalence remain open. This collateral
 milestone does not complete the port. Shared changes outside these files are
 excluded from the checkpoint.
+
+### Iteration 233 — allocation-derived SimpleNIC driver constructor
+
+`prepareNICHeader` ports the normal-mode
+`SimpleNICBridgeModule.genHeader` constructor through native FIRRTL analysis.
+It requires the validated duplex CPU stream header and unique live bank,
+decoder, control binding, transport and queue paths. Before emitting collateral,
+it checks the six MMIO register identities/permissions, unreset state and
+write/sample/hold SSA, readback, write-only assertions, MAC/rate/pause packing,
+nonoverlapping control allocation and both live 3072-by-512 stream memories.
+The widget index, MMIO addresses and independent incoming/outgoing stream
+indices come from the allocated regions and ordered shared stream catalogs.
+Creator-local queue indices cannot override driver indices.
+
+The production CLI emits `post-fame-nic-header-all.json` and partial collateral
+under `nic-header/`. It still rejects at `NIC complete driver-header assembly
+and final RTL integration are not implemented`. This advances the collateral
+boundary without claiming a complete NIC driver, final RTL or runtime support.
+
+`Support/NICHeaderCompare.py` compares the complete SimpleNIC header fragment
+against this completed SFC golden:
+
+```text
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h
+```
+
+Golden SHA256 is
+`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`.
+The include, six ordered address fields at 512, 516, 520, 524, 528 and 532,
+all layout assertions, widget index zero, and ordered stream arguments
+`[0, 3072, 0, 3072]` match after whitespace and static-assert line-continuation
+normalization. Both complete constructor fragments compile against the real
+`generators/firechip/bridgestubs/src/main/cc/bridges/simplenic.h` driver ABI.
+
+The focused NIC CTest passes with relocated MMIO at 4096, widget index 3,
+outgoing index 1, incoming index 2, and 82 atomic rejection cases. Both existing
+CPU stream and metasim interface header CTests pass. The independently parsed
+production boundary verifies input/output FIRRTL and preserves every module
+body; its emitted header and complete 1,797-record annotation archive match
+the production CLI exactly. Only the intended OutputFile body/completion
+marker changes, and duplicate invocation rejects without mutation.
+
+Evidence is in the active generated directory's
+`iteration233-u250-target-matrix/`: `nic-header/comparison.json`, native and
+C++ ABI logs, `build-final.log`, `ctest.log`, `ctest-prerequisites.log`,
+`inputs.json`, and `replay/`. Compiler SHA256 is
+`428abad7f941a512469a4cd28ab8effe944eb14ae34983dffb632f78133c372a`.
+
+All 258 earlier NIC and 256 no-NIC MLIR/JSON files match iteration 232 after
+candidate-directory normalization; the NIC header archive is the only new
+boundary. All five final no-NIC RTL/header/XDC files are byte-identical.
+Archived Rocket inputs match the immutable staging fixture by SHA256;
+synthesis XDC matches the immutable U250 build-tree fixture exactly and
+implementation XDC matches after the documented hierarchy rename. Exact
+paths/hashes are in `production-boundary-regression.json`,
+`no-nic-emitted-regression.json` and `immutable-rocket-comparison.json`.
+
+The thirteen-target replay records one compiled target, six compiler gaps
+and six unsupported partition/QSFP platforms. Exact archived inputs,
+effective platforms and previous boundary checks match iteration 232; only
+NIC advances its diagnostic. Aggregate boundary comparisons remain eight
+matched, six mismatched (native SRAM model ports), and twelve not reached.
+`matrix-regression.json` and its log retain every recipe and full stderr.
+The matrix exits nonzero for those implementation gaps; a partial annotation
+or constructor match does not establish support for a rejected target.
+
+For replay space, 702 old iteration-228/229 MLIR dumps were losslessly
+compressed to adjacent `.mlir.gz`, recovering 45,459,914,685 bytes after
+decompressed SHA256 checks. `lossless-storage-cleanup.json` records each
+path, hash and size. JSON, logs, final RTL, current/prior comparison baselines
+and immutable fixtures remain intact.
+
+Supplied harness iteration 232 passed CIRCT replacertl/provenance and fresh
+Verilator smoke, reusing unchanged-input long-suite evidence; the SFC
+UART-bearing baseline remains pending. Those results precede this change.
+No manager verification was started here.
+
+The next smallest NIC step is to remove TracerV header's outgoing-slot-zero
+assumption: the NIC fixture allocates TracerV at outgoing index one while its
+queue-local index remains zero. Then compose the complete NIC driver header
+and final RTL path before requesting runtime coverage through the harness.
+Other target widths/multiplicity, FASED profiles, partitioned QSFP and SRAM
+equivalence remain open. This milestone does not complete the port; unrelated
+shared-worktree edits are excluded.

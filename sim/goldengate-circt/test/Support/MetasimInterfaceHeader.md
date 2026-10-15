@@ -65,4 +65,41 @@ malformed incoming allocation/payload/MMIO rejection. Invoke with
 `--candidate`, `--sfc` (the header), `--native-tool`
 (`goldengate-cpu-managed-stream-header-test`), `--cxx`, and a fresh
 `--output-dir`. The CLI writes this partial collateral in `cpu-stream-header/`;
-SimpleNIC bridge constructors and complete NIC RTL/runtime parity remain open.
+the SimpleNIC constructor follows at the next partial boundary. Complete NIC
+RTL/runtime parity remains open.
+
+
+`NICHeaderTest` tests the normal-mode `SimpleNICBridgeModule.genHeader`
+constructor. The native emitter requires a validated CPU stream header and
+checks unique live bank/control/transport/queue paths, paired read/write
+bindings, nonoverlapping allocated MMIO, all six register names/permissions,
+unreset write/sample/hold behavior, readback, write-only assertions, and MAC,
+rate limiter and pause-field packing. It derives independent incoming/outgoing
+stream indices from their shared transport catalogs and checks their live
+3072-by-512 queue storage. Queue-local indices cannot determine driver indices.
+Only the `.const.h` OutputFile body and `goldengate.nicHeader` marker change;
+validation failures are atomic.
+
+The focused CTest relocates MMIO to 4096, widget index to 3, outgoing stream
+index to 1 and incoming index to 2. It rejects 82 malformed metadata, register,
+queue, allocation, hierarchy and annotation cases. Its optional recorded-input
+invocation is `goldengate-nic-header-test <post-fame-f1-shim.mlir> <existing-output-dir>`;
+it verifies complete production FIRRTL, preserves every module body, and emits
+an independently prepared header and `nic-all.json`.
+
+`NICHeaderCompare.py --candidate <candidate-dir> --sfc <golden-const.h>
+--native-tool <goldengate-nic-header-test> --cxx <c++-compiler>
+--output-dir <fresh-directory>` compares the complete SimpleNIC header fragment
+with SFC, normalizing whitespace and Scala static-assert line continuations.
+It checks the ordered struct layout assertions, all six MMIO addresses and all
+four stream constructor arguments, and compiles both fragments against the
+actual `generators/firechip/bridgestubs/src/main/cc/bridges/simplenic.h` ABI.
+It also compares the independently emitted native archive/header with the CLI
+and proves only the intended annotation changed.
+
+The CLI archives this boundary in `post-fame-nic-header-all.json` and emits
+partial collateral under `nic-header/`. It still rejects complete NIC driver
+assembly and final RTL integration. In particular, the existing TracerV driver
+emitter assumes outgoing slot zero, whereas the NIC SFC fixture places TracerV
+at slot one. The NIC constructor match does not establish a working combined
+NIC driver or runtime equivalence.
