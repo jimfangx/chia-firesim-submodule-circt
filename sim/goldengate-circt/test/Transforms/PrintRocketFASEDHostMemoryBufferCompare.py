@@ -27,7 +27,7 @@ FIELDS = [dict(id=4, qos=4, prot=3, cache=4, lock=1, burst=2, size=3, len=8, add
 CHANNELS = [('aw', 0), ('w', 1), ('b', 2), ('ar', 0), ('r', 3)]
 
 
-def sfc_contract(path):
+def sfc_contract(path, queue_names=SFC_QUEUES):
     text = clean(path.read_text())
     header, body = module(text, 'AXI4Buffer_1')
     eq = {k: ' '.join(v.split()) for k, v in equations(body).items()}
@@ -39,12 +39,27 @@ def sfc_contract(path):
             expected['auto_' + side + '_' + key.replace('.', '_')] = [
                 'output' if outward == (side == 'out') else 'input', 34 if key.endswith('.addr') else width]
     assert rtl_ports(header) == expected
+    # Match the buffer's production placement after address translation,
+    # including response directions and the actual host clock/reset.
+    _, top = module(text, 'FPGATop')
+    top_eq = {k: ' '.join(v.split()) for k, v in equations(top).items()}
+    assert top_eq['axi4buf_1_clock'] == 'clock' and top_eq['axi4buf_1_reset'] == 'reset'
+    translated_routes = 0
+    for key, (outward, _) in routes()[1].items():
+        if key == 'b.ready':
+            continue  # SFC removes this always-ready response input.
+        field = key.replace('.', '_')
+        buffer = 'axi4buf_1_auto_in_' + field
+        translation = 'axi4AddrOffset_auto_out_' + field
+        dest, source = (buffer, translation) if outward else (translation, buffer)
+        assert top_eq[dest] == source, (dest, source)
+        translated_routes += 1
     instances, compared = [], 0
     for ch, index in CHANNELS:
         request = ch not in ('b', 'r')
         producer, consumer = ('in', 'out') if request else ('out', 'in')
         inst = ('nodeOut_' if request else 'nodeIn_') + ch + '_deq_q'
-        instances.append((SFC_QUEUES[index], inst))
+        instances.append((queue_names[index], inst))
         assert eq[inst + '_clock'] == 'clock' and eq[inst + '_reset'] == 'reset'
         assert eq[inst + '_io_enq_valid'] == f'auto_{producer}_{ch}_valid'
         assert eq[f'auto_{producer}_{ch}_ready'] == inst + '_io_enq_ready'
@@ -56,14 +71,14 @@ def sfc_contract(path):
             assert eq[f'auto_{consumer}_{ch}_bits_{field}'] == inst + '_io_deq_bits_' + field
             compared += 2
     assert re.findall(r'\b(Queue_\d+) (\w+) \(', body) == instances
-    for name, fields in zip(SFC_QUEUES, FIELDS):
+    for index, (name, fields) in enumerate(zip(queue_names, FIELDS)):
         _, queue = module(text, name)
         qe = {k: ' '.join(v.split()) for k, v in equations(queue).items()}
         assert qe['ptr_match'] == 'enq_ptr_value == deq_ptr_value'
         assert qe['empty'] == 'ptr_match & ~maybe_full' and qe['full'] == 'ptr_match & maybe_full'
         assert qe['io_enq_ready'] == '~full' and qe['io_deq_valid'] == '~empty'
         assert qe['do_enq'] == 'io_enq_ready & io_enq_valid'
-        pop = 'io_deq_valid' if name == 'Queue_31' else 'do_deq'
+        pop = 'io_deq_valid' if index == 2 else 'do_deq'
         if pop == 'do_deq':
             assert qe[pop] == 'io_deq_ready & io_deq_valid'
         assert f'end else if (do_enq != {pop}) begin' in queue and 'maybe_full <= do_enq;' in queue
@@ -77,27 +92,31 @@ def sfc_contract(path):
             assert qe['ram_' + field + '_MPORT_addr'] == 'enq_ptr_value'
             assert qe['ram_' + field + '_MPORT_data'] == 'io_enq_bits_' + field
             assert qe['ram_' + field + '_io_deq_bits_MPORT_addr'] == 'deq_ptr_value'
+            assert qe['ram_' + field + '_io_deq_bits_MPORT_en'] == "1'h1"
             assert qe['ram_' + field + '_io_deq_bits_MPORT_data'] == f'ram_{field}[ram_{field}_io_deq_bits_MPORT_addr]'
             assert qe['io_deq_bits_' + field] == 'ram_' + field + '_io_deq_bits_MPORT_data'
             assert queue.index(f'ram_{field}[ram_{field}_MPORT_addr] <=') < queue.index('if (reset) begin')
+        assert 'always @(posedge clock) begin' in queue
     return dict(ports=len(expected), channels=5, payload_routes=compared, depth=2,
                 flow=False, pipe=False, payload_widths=[sum(f.values()) for f in FIELDS],
-                asynchronous_reads=True, reset_independent_RAM_writes=True)
+                asynchronous_reads=True, reset_independent_RAM_writes=True,
+                translated_memory_routes=translated_routes, host_clock_and_reset=True)
 
 
-def compare(before_path, after_path, baseline):
+def compare_binding(before_path, after_path, baseline):
     before, after = before_path.read_text(), after_path.read_text()
     pattern = r'^    firrtl.module @(\w+)(\(.*?^    })'
     prior, result = (dict(re.findall(pattern, t, re.M | re.S)) for t in (before, after))
-    assert len(prior) == 265 and set(result) - set(prior) == {HELPER, *QUEUES}
+    assert set(result) == set(prior) | {HELPER, *QUEUES}
+    assert not set(prior) & {HELPER, *QUEUES}
     assert all(result[n] == body for n, body in prior.items() if n != TOP)
     old, new = native_module(before, TOP), native_module(after, TOP)
-    assert native_ports(old) == native_ports(new) and len(native_ports(new)) == 110
+    assert native_ports(old) == native_ports(new)
     nets = wiring(old)
     assert nets.pop('top.fased_host_mem') == 'translation.out'
     nets.update({'memory_buffer.in': 'translation.out', 'top.fased_host_mem': 'memory_buffer.out',
                  'memory_buffer.clock': 'top.hostClock', 'memory_buffer.reset': 'top.hostReset'})
-    assert wiring(new) == nets and len(nets) == 119
+    assert wiring(new) == nets
     assert before.splitlines()[1] == after.splitlines()[1], 'annotation archive changed'
     assert re.findall(r' = firrtl.instance (\w+) @(\w+)\b', new) == [
         ('sim', 'GGFASEDHostMemoryWrapper'), ('translation', 'GGFASEDAddressTranslation'),
@@ -130,11 +149,18 @@ def compare(before_path, after_path, baseline):
             'depth = 2 : i64', 'readLatency = 0 : i32', 'writeLatency = 1 : i32',
             f'data: uint<{sum(fields.values())}>'])
         assert queue.count('firrtl.regreset ') == 3
-    assert len([n for n in prior if n.startswith('GGPrintBridge')]) == 21
-    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=264,
-                preserved_ports=110, wrapper_connections=119, helper_connections=84,
+    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(prior)-1,
+                preserved_ports=len(native_ports(new)), wrapper_connections=len(nets), helper_connections=84,
                 annotation_archive_unchanged=True, shared_native_queue_and_helper_match=True,
-                preserved_Print_modules=21)
+                preserved_Print_modules=len([n for n in prior if n.startswith('GGPrintBridge')]))
+
+
+def compare(before_path, after_path, baseline):
+    report = compare_binding(before_path, after_path, baseline)
+    assert report['unchanged_module_bodies'] == 264
+    assert report['preserved_ports'] == 110 and report['wrapper_connections'] == 119
+    assert report['preserved_Print_modules'] == 21
+    return report
 
 
 def main():
