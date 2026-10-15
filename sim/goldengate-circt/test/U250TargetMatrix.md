@@ -6843,3 +6843,121 @@ The executable start/end guard and all 495 native-source hashes remained stable
 during replay. `source-inputs-final.json` and `source-replay-stability.json`
 record the comparison-script-only coverage and negative-control refinements;
 all 665 final source/test hashes were verified against the worktree.
+
+
+### Iteration 241: derive and drain every quad-Rocket CPU stream
+
+`deriveRocketCPUStreamPorts` now discovers every canonical numbered TracerV
+payload/count pair in constructor order, independent of physical port order.
+Its read-only preflight follows unique drivers through wrapper instances,
+checks each pair's complete queue path, rejects aliases between producers,
+and verifies bank name/index, 6144×512 native storage and UInt<13> count type.
+Missing, sparse, noncanonical, duplicate or mistyped ports fail before any
+output descriptors are published. The NIC catalog keeps its source before
+all TracerV sources and its incoming count after all source counts.
+
+The production compiler now sends the full four-entry catalog through the
+existing native CPU read transport and count bank. Quad Rocket emits both
+`post-fame-cpu-stream-read.mlir` and `post-fame-cpu-stream-count.mlir`, with
+retained annotation sidecars. It then explicitly rejects the unimplemented
+multiple-TracerV global control binding. No bank is silently ignored, and
+this partial boundary does not establish quad platform or driver support.
+
+The exact SFC references are:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.const.h
+```
+
+The RTL SHA256 remains
+`deadc7f5a903ceed20047342e4b81dde7f19cc32be914de6f5b910d3d70771d2`.
+`Transforms/QuadTracerVCPUReadCompare.py` checks the actual production
+read/count wrappers: all 57 and 54 connections, respectively, retention of
+all preceding 72/74 module bodies, ordered identities, typed ports, and exact
+annotation target transfer. Crossed fourth payload/count routes are detected.
+The four DMA bases match the SFC header: 0, 524288, 1048576 and 1572864,
+with depth 6144 and width 64 bytes each. Local count offsets are 0, 4, 8 and
+12. The header's global addresses 752, 756, 760 and 764 are recorded reference
+requirements; the new boundary does not implement their global allocation.
+
+The comparison lowers the actual native read helper and projects the four
+original counter updates and read-cone expressions from SFC's
+`CPUManagedStreamEngine`. Standalone Verilator matches 50,000 cycles:
+8,318 transfers (2,159/2,103/2,001/2,055 per stream), 8,157 stalled valid
+cycles, 8,404 address misses and 193 last-beat handshakes. Stimulus includes
+independent queue payloads/valids, varying IDs/addresses/burst lengths,
+held requests and resets. Invalid-cycle R payload/last are excluded, as in
+the existing NIC comparison. A missing fourth-stream ready in native RTL
+fails the executed differential at cycle 328. The actual native count bank
+also matches all four SFC zero-extension expressions over all 8,192 UInt<13>
+values per bank, with independent count values and read-only handshakes.
+
+The native catalog test covers four TracerV streams alone and following a
+NIC, verifies read/count composition, and checks 17 atomic rejection cases,
+including malformed fourth-bank metadata/storage, crossed/missing/duplicate
+drivers and sparse/noncanonical/mistyped payload/count ports. The focused
+catalog, multi-read and count-bank CTests all pass. The final catalog test
+passes after extending the malformed-port cases; the production compiler
+binary remains unchanged during replay.
+
+Evidence is in `iteration241-u250-target-matrix/` below the active generated
+folder: `build.log`, `ctest.log`, `catalog-test-final.log`,
+`quad-cpu-streams-final/` (lowered RTL, positive and negative simulation logs,
+`comparison.json`), `replay/`, and the artifact/matrix regression JSONs.
+The production compiler SHA256 is
+`2db3846463df5420bb6ce9b4c78d8763910f444e6c93cc3eac6ebf11c80bbd08`.
+The shared preexisting ClockBridge/UART edits are unchanged from iteration
+240 and are excluded from this checkpoint.
+
+To repeat the focused production comparison in the sourced FireSim environment:
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/QuadTracerVCPUReadCompare.py \
+  --candidate <iteration241>/replay/alveo_u250_firesim_rocket_quadcore_no_nic/candidate/post-fame-cpu-stream-count.mlir \
+  --golden <quad-SFC-design>/FireSim-generated.sv \
+  --header <quad-SFC-design>/FireSim-generated.const.h \
+  --output-dir <new-evidence-directory>
+```
+
+Supplied iteration-240 replacertl/provenance and fresh Verilator smoke passed;
+long-suite evidence was explicitly reused for unchanged inputs. This turn
+starts no FireSim manager verification gates. The next smallest core step
+is global control/MMIO binding for four TracerV control banks and the four
+count words, comparing nonoverlapping addresses and driver/header ABI with
+this SFC quad fixture. Remaining target/profile, partition/QSFP, SRAM
+comparison, metasim and boot gaps remain open.
+
+All 267 NIC and 256 no-NIC MLIR/annotation artifacts match iteration 240
+after candidate-path normalization. Ten emitted RTL/header/XDC files remain
+byte-identical. Quad Rocket preserves all 56 preceding MLIR/annotation
+artifacts and adds only the two read/count boundaries and their sidecars.
+Rocket input FIRRTL/annotation hashes still match the immutable 2026-10-01
+staging fixture. Synthesis XDC matches the immutable U250 build-tree
+`design/FireSim-generated.synthesis.xdc` exactly; implementation XDC matches
+`design/FireSim-generated.implementation.xdc` after the documented
+`target/FireSim_` to `target_FAMETop/FireSim` hierarchy rename. Exact paths
+and hashes are recorded in `immutable-rocket-comparison.json`.
+
+Replay storage was recovered by losslessly compressing 599 old
+iteration-237 MLIR dumps to adjacent `.mlir.gz`, recovering
+37,105,285,884 bytes. `lossless-storage-cleanup-237.json` records
+original/decompressed SHA256 checks before originals were removed. Logs,
+JSON, final RTL, active/prior comparison inputs and immutable fixtures were
+preserved.
+
+The next allocation gap is concrete: `allocateRocketControlMMIORegions` in
+`ControlAddressDecode.cpp` still expects one TracerV source and interprets
+later source indices as Print streams. It must use the instantiated bridge
+catalog to recognize all four TracerV counts and allocate the corresponding
+control widgets before the production stop can move forward.
+
+The complete thirteen-recipe replay finishes with two compiled targets, five
+implementation gaps and six unsupported partition/QSFP platforms. Quad moves
+from catalog rejection to global control binding rejection. All archived
+input hashes, effective platform configurations and earlier structured
+boundary comparisons match iteration 240: eight matched, six model-port
+mismatches associated with the previously documented native SRAM lowering,
+and twelve not reached. These partial matches do not imply final RTL parity.
+`matrix-regression.json` records all thirteen rows and the unchanged compiler
+hash; `source-replay-stability.json` verifies the stable production sources.

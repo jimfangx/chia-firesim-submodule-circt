@@ -19,7 +19,7 @@ static FModuleOp named(CircuitOp c, llvm::StringRef name) {
   throw std::runtime_error("missing module " + name.str());
 }
 static std::string dump(Operation *op) { std::string s; llvm::raw_string_ostream out(s); op->print(out); return s; }
-static OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
+static OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned banks = 1, bool nic = true) {
   auto root = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGNICPacketAdaptersWrapper" {
     firrtl.module @GGNICPacketAdaptersWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
       in %nic_from_host_stream: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<512>>,
@@ -30,22 +30,35 @@ static OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
   } })", &ctx);
   require(bool(root), "parse"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
   auto top = named(c,c.getName());
-  auto queue = goldengate::createCPUStreamQueue6144(c,"GGTracerVStreamQueue6144");
-  queue->setAttr("goldengate.streamParameters", b.getDictionaryAttr({
-      b.getNamedAttr("name",b.getStringAttr("TRACERVBRIDGEMODULE_0_to_cpu_stream")),
-      b.getNamedAttr("depth",b.getI64IntegerAttr(6144)), b.getNamedAttr("widthBytes",b.getI64IntegerAttr(64)),
-      b.getNamedAttr("index",b.getI64IntegerAttr(0))}));
+  auto token = top.getPortType(4);
+  for (unsigned i = 1; i < banks; ++i) {
+    auto suffix = "_" + std::to_string(i);
+    unsigned n = top.getNumPorts();
+    top.insertPorts({{n, PortInfo(b.getStringAttr("tracerv_stream" + suffix), token, Direction::Out)},
+        {n, PortInfo(b.getStringAttr("tracerv_stream_count" + suffix), UIntType::get(&ctx,13), Direction::Out)}});
+  }
   b.setInsertionPointToEnd(top.getBodyBlock());
   b.create<ConnectOp>(c.getLoc(),top.getArgument(3),top.getArgument(2));
-  auto q = b.create<InstanceOp>(c.getLoc(),queue,"tracer_queue");
-  for (unsigned i=0;i<2;++i) b.create<StrictConnectOp>(c.getLoc(),q.getResult(i),top.getArgument(i));
-  b.create<ConnectOp>(c.getLoc(),q.getResult(2),top.getArgument(2));
-  b.create<ConnectOp>(c.getLoc(),top.getArgument(4),q.getResult(3));
-  b.create<StrictConnectOp>(c.getLoc(),top.getArgument(5),q.getResult(4));
+  for (unsigned i = 0; i < banks; ++i) {
+    auto suffix = i ? "_" + std::to_string(i) : "";
+    auto queue = goldengate::createCPUStreamQueue6144(c,"GGTracerVStreamQueue6144" + suffix);
+    queue->setAttr("goldengate.streamParameters", b.getDictionaryAttr({
+        b.getNamedAttr("name",b.getStringAttr("TRACERVBRIDGEMODULE_" + std::to_string(i) + "_to_cpu_stream")),
+        b.getNamedAttr("depth",b.getI64IntegerAttr(6144)), b.getNamedAttr("widthBytes",b.getI64IntegerAttr(64)),
+        b.getNamedAttr("index",b.getI64IntegerAttr(i))}));
+    b.setInsertionPointToEnd(top.getBodyBlock());
+    auto q = b.create<InstanceOp>(c.getLoc(),queue,"tracer_queue" + suffix);
+    for (unsigned j=0;j<2;++j) b.create<StrictConnectOp>(c.getLoc(),q.getResult(j),top.getArgument(j));
+    b.create<ConnectOp>(c.getLoc(),q.getResult(2),top.getArgument(2));
+    unsigned port = 4 + 2*i;
+    b.create<ConnectOp>(c.getLoc(),top.getArgument(port),q.getResult(3));
+    b.create<StrictConnectOp>(c.getLoc(),top.getArgument(port+1),q.getResult(4));
+  }
   c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({
       b.getNamedAttr("class",b.getStringAttr("firesim.lib.bridgeutils.BridgeIOAnnotation")),
       b.getNamedAttr("widgetClass",b.getStringAttr("firechip.goldengateimplementations.SimpleNICBridgeModule"))})}));
-  std::string error; require(succeeded(goldengate::addNICCPUStreamQueues(c,error)),error);
+  if (!nic) c->setAttr("rawAnnotations",b.getArrayAttr({}));
+  std::string error; if (nic) require(succeeded(goldengate::addNICCPUStreamQueues(c,error)),error);
   // Exercise incoming and outgoing discovery across an additional wrapper.
   top = named(c,c.getName()); b.setInsertionPointToEnd(c.getBodyBlock());
   auto outer = b.create<FModuleOp>(c.getLoc(),b.getStringAttr("CatalogTop"),top.getConventionAttr(),top.getPorts());
@@ -99,8 +112,65 @@ int main(int argc, char **argv) {
     auto regs=named(c,"GGCPUStreamCountBank")->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
     require(regs.size()==3,"count words");
     for(unsigned i=0;i<3;++i) require(cast<DictionaryAttr>(regs[i]).getAs<IntegerAttr>("offset").getInt()==4*i,"count offset");
+    // Four independent queues, both alone and following a NIC constructor.
+    for (bool nic : {false, true}) {
+      auto quad = fixture(ctx,4,nic); auto qc = *quad->getOps<CircuitOp>().begin();
+      SmallVector<CPUStreamSourcePort> qs, qk; SmallVector<CPUStreamCountPort> qr;
+      before = dump(quad->getOperation());
+      require(succeeded(goldengate::deriveCPUStreamPorts(qc,qs,qk,qr,error)),error);
+      require(dump(quad->getOperation())==before && qs.size()==4+nic &&
+          qk.size()==unsigned(nic) && qr.size()==4+2*nic,"quad catalog sizes/read-only");
+      for(unsigned i=0;i<4;++i) require(qs[i+nic].streamName=="TRACERVBRIDGEMODULE_"+
+          std::to_string(i)+"_to_cpu_stream" && qr[i+nic].streamName==qs[i+nic].streamName,
+          "quad constructor/count order");
+      require(succeeded(goldengate::addCPUStreamRead(qc,qs,error)),error);
+      require(succeeded(goldengate::addCPUStreamCountBank(qc,qr,error)),error);
+      require(succeeded(verify(*quad)),"quad read/count composition");
+      auto allocations=named(qc,"GGCPUStreamRead")->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+      for(unsigned i=0;i<qs.size();++i) require(cast<DictionaryAttr>(allocations[i]).getAs<IntegerAttr>(
+          "bufferBaseAddress").getInt()==int64_t(i)*524288,"quad read windows");
+      auto words=named(qc,"GGCPUStreamCountBank")->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+      for(unsigned i=0;i<qr.size();++i) require(cast<DictionaryAttr>(words[i]).getAs<IntegerAttr>(
+          "offset").getInt()==4*i,"quad count offsets");
+    }
+    // A bad final bank must not publish the first three descriptors.
+    for(unsigned mode=0;mode<13;++mode) {
+      auto bad=fixture(ctx,4,false); auto bc=*bad->getOps<CircuitOp>().begin();
+      auto inner=named(bc,"GGNICPacketAdaptersWrapper");
+      auto queue=named(bc,"GGTracerVStreamQueue6144_3"); OpBuilder b(&ctx);
+      if(mode<4) { NamedAttrList attrs(queue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters"));
+        if(mode==0) attrs.set("index",b.getI64IntegerAttr(2));
+        if(mode==1) attrs.set("name",b.getStringAttr("TRACERVBRIDGEMODULE_2_to_cpu_stream"));
+        if(mode==2) attrs.set("depth",b.getI64IntegerAttr(3072));
+        if(mode==3) attrs.set("widthBytes",b.getI64IntegerAttr(32));
+        queue->setAttr("goldengate.streamParameters",attrs.getDictionary(&ctx));
+      }
+      if(mode==4) { for(auto m:queue.getOps<MemOp>()) m->setAttr("depth",b.getI64IntegerAttr(3072)); }
+      InstanceOp previous;
+      for(auto inst:inner.getOps<InstanceOp>()) if(inst.getName()=="tracer_queue_2") previous=inst;
+      for(auto op:llvm::make_early_inc_range(inner.getOps<StrictConnectOp>()))
+        if(op.getDest()==inner.getArgument(11)) {
+          if(mode==5) op->setOperand(1,previous.getResult(4));
+          if(mode==6) op.erase();
+          if(mode==7) { b.setInsertionPointAfter(op); b.create<StrictConnectOp>(bc.getLoc(),op.getDest(),op.getSrc()); }
+        }
+      if(mode==8) for(auto op:inner.getOps<ConnectOp>())
+        if(op.getDest()==inner.getArgument(10)) op->setOperand(1,previous.getResult(3));
+      if(mode>=9) {
+        auto outer=named(bc,bc.getName()); unsigned n=outer.getNumPorts();
+        auto suffix=mode==10 ? "_5" : mode==11 ? "_03" : "_4";
+        auto type=mode==12 ? Type(UIntType::get(&ctx,1)) : outer.getPortType(4);
+        outer.insertPorts({{n,PortInfo(b.getStringAttr(std::string("tracerv_stream")+suffix),type,Direction::Out)}});
+        if(mode!=9) outer.insertPorts({{n+1,PortInfo(b.getStringAttr(std::string("tracerv_stream_count")+suffix),
+            UIntType::get(&ctx,13),Direction::Out)}});
+      }
+      before=dump(bad->getOperation());
+      require(failed(goldengate::deriveCPUStreamPorts(bc,sources,sinks,counts,error)) &&
+          dump(bad->getOperation())==before && sources.size()==2 && sinks.size()==1 && counts.size()==3,
+          "atomic malformed fourth bank rejection");
+    }
     if(argc==2) { c->removeAttr("rawAnnotations"); std::error_code ec; llvm::raw_fd_ostream out(argv[1],ec); require(!ec,"dump"); root->print(out);out<<'\n'; }
-    llvm::outs()<<"PASS live NIC/TracerV stream catalog, independent directions, atomic rejects, read windows and count order\n";
+    llvm::outs()<<"PASS live NIC/TracerV catalogs, four independent queues, 17 atomic rejects, read windows and count order\n";
     return 0;
   } catch(const std::exception &e) { llvm::errs()<<e.what()<<'\n';return 1; }
 }

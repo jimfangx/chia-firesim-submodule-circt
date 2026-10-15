@@ -13,8 +13,9 @@ struct CPUStreamSourcePort {
   std::string portName;
   unsigned depth;
 };
-// Resolve the recorded Rocket outgoing queue through active wrapper connects.
-// Payload and count must reach the same 6144x512 TracerV queue instance. This
+// Resolve all numbered Rocket outgoing queues in constructor order through
+// active wrapper connects. Each payload/count pair must reach its own live
+// 6144x512 TracerV queue, with matching bank identity and storage. This
 // read-only preflight preserves both output lists on failure; Print streams
 // are appended in their host constructor order by mapPrintBridgeCPUStreams.
 mlir::LogicalResult deriveRocketCPUStreamPorts(

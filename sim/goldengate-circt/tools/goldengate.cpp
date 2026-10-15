@@ -3209,13 +3209,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerQueueAnnotations, error)))
         return fail("TracerV stream queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TracerV CPU stream in " << tracerQueuePath << '\n';
-      // Every producer now has independent storage. Keep the complete queue
-      // boundary until the CPU stream catalog and global allocation support all
-      // banks; deriving only stream zero would leave the others undrained.
-      for (auto top : circuit.getOps<circt::firrtl::FModuleOp>())
-        if (top.getName() == circuit.getName())
-          for (auto port : top.getPorts()) if (port.name == "tracerv_stream_1")
-            return fail("CPU stream allocation: multiple TracerV stream catalog entries are not implemented");
       if (failed(goldengate::addNICTokenQueues(circuit, error)))
         return fail("NIC token queues: " + error);
       if (circuit.getName() == "GGNICTokenQueuesWrapper") {
@@ -3288,6 +3281,12 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuCountAnnotations, error)))
         return fail("CPU stream count bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT CPU stream count MMIO bank in " << cpuCountPath << '\n';
+      // The catalog/read/count boundary now drains every producer. Global
+      // control addresses and driver collateral still require multi-bank binding.
+      if (llvm::count_if(rocketStreams, [](const auto &stream) {
+            return StringRef(stream.streamName).starts_with("TRACERVBRIDGEMODULE_");
+          }) > 1)
+        return fail("CPU stream control allocation: multiple TracerV stream control bindings are not implemented");
       if (!cpuSinks.empty()) {
         if (failed(goldengate::addCPUStreamWrite(circuit, cpuSinks, error)))
           return fail("CPU stream write transport: " + error);

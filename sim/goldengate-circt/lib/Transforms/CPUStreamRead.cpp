@@ -32,12 +32,32 @@ LogicalResult goldengate::deriveRocketCPUStreamPorts(CircuitOp circuit,
   auto bit = UIntType::get(ctx, 1), word = UIntType::get(ctx, 512);
   auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
       {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, word}});
-  Value data, count;
+  // Preserve constructor order, regardless of the order of top-level ports.
+  // Every canonical producer must have a count; never silently drain only zero.
+  SmallVector<Value> data(top.getNumPorts()), count(top.getNumPorts());
+  unsigned banks = 0, countBanks = 0;
   for (auto [i, p] : llvm::enumerate(top.getPorts())) {
-    if (p.name == "tracerv_stream" && p.type == token && p.direction == Direction::Out) data = top.getArgument(i);
-    if (p.name == "tracerv_stream_count" && p.type == UIntType::get(ctx, 13) && p.direction == Direction::Out) count = top.getArgument(i);
+    StringRef portName = p.name.getValue();
+    bool isCount = portName.starts_with("tracerv_stream_count");
+    StringRef base = isCount ? "tracerv_stream_count" : "tracerv_stream";
+    if (!portName.starts_with(base)) continue;
+    StringRef suffix = portName.drop_front(base.size());
+    unsigned index = 0;
+    if (!suffix.empty() && (!suffix.consume_front("_") || suffix.empty() ||
+        suffix.getAsInteger(10, index) || index == 0 || suffix != std::to_string(index)))
+      return reject("Rocket CPU catalog has a noncanonical TracerV port");
+    if (index >= data.size()) return reject("Rocket CPU catalog has a sparse TracerV index");
+    auto &ports = isCount ? count : data;
+    if (ports[index] || p.direction != Direction::Out ||
+        p.type != (isCount ? Type(UIntType::get(ctx, 13)) : Type(token)))
+      return reject("Rocket CPU catalog has duplicate or mistyped TracerV ports");
+    ports[index] = top.getArgument(i);
+    (isCount ? countBanks : banks)++;
   }
-  if (!data || !count) return reject("Rocket CPU stream catalog needs buffered TracerV payload/count ports");
+  if (!banks || banks != countBanks)
+    return reject("Rocket CPU stream catalog needs paired buffered TracerV payload/count ports");
+  for (unsigned i = 0; i < banks; ++i)
+    if (!data[i] || !count[i]) return reject("Rocket CPU catalog has a missing TracerV payload/count pair");
   using Path = SmallVector<InstanceOp>;
   struct Endpoint { FModuleOp queue; Path path; unsigned port = 0; };
   auto trace = [&](Value value) -> Endpoint {
@@ -57,34 +77,47 @@ LogicalResult goldengate::deriveRocketCPUStreamPorts(CircuitOp circuit,
       unsigned port = cast<OpResult>(value).getResultNumber();
       if (module.getPortDirection(port) != Direction::Out) return {};
       path.push_back(inst);
-      if (module.getName() == "GGTracerVStreamQueue6144") return {module, path, port};
+      if (module.getName() == "GGTracerVStreamQueue6144" ||
+          module.getName().starts_with("GGTracerVStreamQueue6144_")) return {module, path, port};
       value = module.getArgument(port);
     }
     return {};
   };
-  auto payload = trace(data), occupancy = trace(count);
-  if (!payload.queue || !occupancy.queue || payload.path != occupancy.path ||
-      payload.port != 3 || occupancy.port != 4)
-    return reject("Rocket CPU payload/count must forward the same live TracerV queue instance");
-  auto queue = payload.queue;
-  auto info = queue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
-  auto name = info ? info.getAs<StringAttr>("name") : StringAttr{};
-  auto depth = info ? info.getAs<IntegerAttr>("depth") : IntegerAttr{};
-  auto width = info ? info.getAs<IntegerAttr>("widthBytes") : IntegerAttr{};
-  auto index = info ? info.getAs<IntegerAttr>("index") : IntegerAttr{};
-  if (!name || name.getValue() != "TRACERVBRIDGEMODULE_0_to_cpu_stream" ||
-      !depth || depth.getInt() != 6144 || !width || width.getInt() != 64 || !index || index.getInt() != 0 ||
-      queue.getNumPorts() != 5 || queue.getPortType(3) != token || queue.getPortType(4) != UIntType::get(ctx, 13))
-    return reject("Rocket CPU catalog queue identity or geometry differs");
-  unsigned memories = 0;
-  for (auto mem : queue.getOps<MemOp>()) {
-    ++memories;
-    if (mem.getDepth() != 6144 || mem.getDataType() != word)
-      return reject("Rocket CPU catalog queue storage differs from allocation");
+  SmallVector<CPUStreamSourcePort> outgoing;
+  SmallVector<CPUStreamCountPort> registers;
+  SmallVector<Path> queuePaths;
+  for (unsigned i = 0; i < banks; ++i) {
+    auto payload = trace(data[i]), occupancy = trace(count[i]);
+    if (!payload.queue || !occupancy.queue || payload.path != occupancy.path ||
+        payload.port != 3 || occupancy.port != 4)
+      return reject("Rocket CPU payload/count must forward the same live TracerV queue instance");
+    if (llvm::is_contained(queuePaths, payload.path))
+      return reject("Rocket CPU catalog producers alias one queue instance");
+    queuePaths.push_back(payload.path);
+    auto queue = payload.queue;
+    std::string suffix = i ? "_" + std::to_string(i) : "";
+    std::string streamName = "TRACERVBRIDGEMODULE_" + std::to_string(i) + "_to_cpu_stream";
+    auto info = queue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
+    auto name = info ? info.getAs<StringAttr>("name") : StringAttr{};
+    auto depth = info ? info.getAs<IntegerAttr>("depth") : IntegerAttr{};
+    auto width = info ? info.getAs<IntegerAttr>("widthBytes") : IntegerAttr{};
+    auto index = info ? info.getAs<IntegerAttr>("index") : IntegerAttr{};
+    if (!name || name.getValue() != streamName || queue.getName() != "GGTracerVStreamQueue6144" + suffix ||
+        !depth || depth.getInt() != 6144 || !width || width.getInt() != 64 || !index || index.getInt() != i ||
+        queue.getNumPorts() != 5 || queue.getPortType(3) != token || queue.getPortType(4) != UIntType::get(ctx, 13))
+      return reject("Rocket CPU catalog queue identity or geometry differs");
+    unsigned memories = 0;
+    for (auto mem : queue.getOps<MemOp>()) {
+      ++memories;
+      if (mem.getDepth() != 6144 || mem.getDataType() != word)
+        return reject("Rocket CPU catalog queue storage differs from allocation");
+    }
+    if (memories != 1) return reject("Rocket CPU catalog requires one native queue memory");
+    outgoing.push_back({streamName, "tracerv_stream" + suffix, 6144});
+    registers.push_back({streamName, "tracerv_stream_count" + suffix, 13});
   }
-  if (memories != 1) return reject("Rocket CPU catalog requires one native queue memory");
-  sources.assign({{name.getValue().str(), "tracerv_stream", 6144}});
-  counts.assign({{name.getValue().str(), "tracerv_stream_count", 13}});
+  sources.assign(outgoing.begin(), outgoing.end());
+  counts.assign(registers.begin(), registers.end());
   return success();
 }
 
