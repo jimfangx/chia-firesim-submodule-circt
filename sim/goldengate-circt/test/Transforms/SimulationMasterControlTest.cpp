@@ -246,6 +246,14 @@ void test(MLIRContext &ctx, const BindingSpec &spec, unsigned count = 11,
 }
 int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  // Verify production routing mutations without lowering retained FireSim
+  // annotations through stock firtool's unrelated annotation handlers.
+  if (argc == 3 && StringRef(argv[1]) == "--verify-ir") {
+    auto root = parseSourceFile<ModuleOp>(argv[2], &ctx);
+    if (!root || failed(verify(*root))) return 1;
+    llvm::outs() << "Production boundary parsed and verified by CIRCT\n";
+    return 0;
+  }
   // Replay the actual attached bank and clone the generated bank/transport
   // operations for differential testing, without rebuilding their logic.
   if (argc == 5) {
@@ -276,7 +284,7 @@ int main(int argc, char **argv) {
     } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
   }
   if (argc != 1) {
-    llvm::errs() << "usage: goldengate-simulation-master-control-test [attached.mlir mapped.mlir bound.mlir helpers.mlir]\n";
+    llvm::errs() << "usage: goldengate-simulation-master-control-test [--verify-ir boundary.mlir | attached.mlir mapped.mlir bound.mlir helpers.mlir]\n";
     return 1;
   }
   const BindingSpec specs[]{
@@ -305,6 +313,9 @@ int main(int argc, char **argv) {
     }
     auto nic = specs[0]; nic.slave = 9;
     test(ctx,nic,12); ++cases;
+    // The production NIC catalog has twelve regions and places FASED at
+    // slot one, which is not an endpoint or midpoint in the shifted cases.
+    test(ctx,specs[3],12,false); ++cases;
     llvm::outs()<<cases<<" widget catalog bindings and 185 atomic rejections passed\n";
     return 0;
   }

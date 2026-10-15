@@ -4593,11 +4593,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedControlAnnotations, error)))
         return fail("FASED MCRFile control annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED MCRFile transactions in " << fasedControlPath << '\n';
-      // The NIC bank uses the same registry-sized Lib.scala MCRFile. Its
-      // independent AW/W capture and held responses are materialized above;
-      // connecting that slave into the NIC platform is a separate boundary.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED control slave binding and platform integration are not implemented");
       if (failed(goldengate::bindFASEDBridgeControl(circuit, error)))
         return fail("FASED control slave binding: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED control slave binding produced invalid FIRRTL IR");
@@ -4610,7 +4605,12 @@ int main(int argc, char **argv) {
       module->print(fasedBoundOut); fasedBoundOut << '\n'; fasedBoundOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedBoundAnnotations, error)))
         return fail("FASED control binding annotations: " + error);
-      llvm::outs() << "Bound CIRCT FASED requests and responses to control slave 1 in " << fasedBoundPath << '\n';
+      llvm::outs() << "Bound CIRCT FASED requests and responses to its catalog-selected control slave in " << fasedBoundPath << '\n';
+      // NIC uses the same catalog-selected five-channel FASED slave binding.
+      // Its host control master and remaining platform assembly are separate
+      // boundaries and must be compared before enabling them here.
+      if (!cpuSinks.empty())
+        return fail("NIC host control master and platform integration are not implemented");
       if (failed(goldengate::bindControlMaster(circuit, error)))
         return fail("host control master binding: " + error);
       if (failed(mlir::verify(*module))) return fail("host control master binding produced invalid FIRRTL IR");
