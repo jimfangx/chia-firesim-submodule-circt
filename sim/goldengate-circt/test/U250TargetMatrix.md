@@ -6541,3 +6541,100 @@ compressed to adjacent `.mlir.gz`, recovering 36,875,613,500 bytes.
 `lossless-storage-cleanup-233.json` records original/decompressed SHA256 checks.
 Current/prior comparison baselines, JSON, logs, final RTL and immutable fixtures
 were retained.
+
+## Iteration 238: independent quad-Rocket TracerV trigger banks
+
+`TracerVTriggerConfig.cpp` now resolves every ordered TracerV BridgeIO target
+to its own native engine and builds one private 15-word configuration bank
+per engine. Each bank retains the Scala `TracerVBridge.scala` host-clock PC,
+instruction and cycle trigger updates, delayed limit registers, reset values,
+selector behavior and coincident-start priority. The trace-valid observation
+is masked by that engine's target reset, independently of token acceptance.
+The wrapper preserves each engine's own control, trace and decoded MCR routes.
+
+All constructors, observation fields, ports, unique engine instances and
+control connections are checked before mutation. Every canonical bank is
+staged privately; imported definitions require complete operation/metadata
+equivalence, including the fourth bank, before any bank is committed. A bad
+last bank therefore cannot leave three partially attached banks. Existing
+single-bridge names and operation order remain intact. The native compiler
+emits the completed four-bank boundary, then rejects the following unsupported
+multi-bank MCRFile stage explicitly; quad-core is not yet a compiled simulator.
+
+The new `TracerVTriggerMultiplicityCompare.py` lowers each of the four actual
+quad-core banks independently with the pinned firtool and compares its emitted
+RTL to `TracerVBridgeModule` in the exact SFC artifact:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv
+```
+
+All 442,368 register-state/output comparisons pass over 4,096 cases per bank,
+covering 22 registers, all fifteen write slots, both readable words, reset,
+PC/instruction masks, limit boundaries, selector cases and host-clock updates
+with target token handshakes stalled. Four distinct trace/control/MCR routes
+match, a crossed fourth-bank control mutation is rejected, all 53 other native
+modules are unchanged, and all 2,630 annotations retain their non-target data
+and unchanged clock map. Re-running `TracerVMultiplicityCompare.py` also
+passes all 24,576 SFC token-output checks, 48 channels, four ordered constructors
+from `post-bridge-extraction.json`, four clocks from
+`post-find-default-clocks.json`, and instance identity from
+`post-sim-mapping.fir` in the same golden directory.
+
+The expanded `goldengate-tracerv-token` CTest passes 111,520 trigger-configuration
+comparisons across single and four-bank fixtures, last-bank catalog reuse and
+six late atomic rejections. Existing 130,720 token packet/next-state checks,
+4,096 independent four-bridge stall/arrival cases and channel identity checks
+also pass. The compiler and test executable build successfully. These checks
+establish this trigger boundary, not quad-core MMIO/stream integration or boot.
+
+Evidence is in `iteration238-u250-target-matrix/` under the active generated
+folder: `ctest.log`, `quad-tracerv-trigger/comparison.json`,
+`quad-tracerv/comparison.json`, the separately lowered bank/engine RTL,
+`source-inputs.json` and `source-regression.json`. To repeat the new comparison
+in the sourced FireSim environment:
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/TracerVTriggerMultiplicityCompare.py \
+  <iteration238>/replay/alveo_u250_firesim_rocket_quadcore_no_nic/candidate \
+  <outer-repo>/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design \
+  <outer-repo>/.conda-env/riscv-tools/bin/firtool <new-evidence-directory>
+```
+
+For replay space, 586 old iteration-234 MLIR dumps were losslessly compressed
+to adjacent `.mlir.gz`, recovering 36,875,613,500 bytes. The record
+`lossless-storage-cleanup-234.json` checks original and decompressed hashes
+before removing originals. Current/prior baselines, JSON, logs, final RTL and
+immutable fixtures were retained.
+
+All 267 NIC and 256 no-NIC MLIR/annotation artifacts match iteration 237 after
+candidate-path normalization, and ten final RTL/header/XDC files remain
+byte-identical. The archived Rocket `.sfc.fir` and `.anno.json` inputs still
+match the immutable 2026-10-01 staging fixture. `design/FireSim-generated.synthesis.xdc`
+matches the immutable 2026-10-01 U250 build-tree artifact exactly;
+`design/FireSim-generated.implementation.xdc` matches after the documented
+`target/FireSim_` to `target_FAMETop/FireSim` hierarchy rename. These results
+are recorded in `production-boundary-regression.json`, `emitted-regression.json`
+and `immutable-rocket-comparison.json`.
+
+Supplied iteration-237 replacertl/provenance and fresh Verilator smoke passed
+before this change; no manager verification gates were started here. The next
+smallest compiler step is mapping all four decoded TracerV banks through
+MCRFile transactions, followed by independent stream storage and driver ABI
+integration. Other trace widths, FASED profiles, partition/QSFP, NIC runtime,
+SRAM equivalence and target boot remain open. Unrelated shared-worktree changes
+are excluded from the checkpoint.
+
+The full thirteen-target replay completes with two compiled targets, five
+compiler gaps and six unsupported partition/QSFP platforms. It returns nonzero
+for these gaps. The only diagnostic advance from iteration 237 is quad-core
+Rocket passing trigger-bank construction and reaching multi-bank MMIO. All
+archived input hashes, effective platform semantics and previous boundary
+checks match. Earlier comparison status remains eight matched, six mismatched
+(native SRAM model ports) and twelve not reached; these gaps are not passing
+semantic comparisons. `replay/matrix.json`, `matrix-regression.json`,
+`source-replay-stability.json` and `inputs.json` retain the completed evidence.
+Compiler SHA256 is
+`83d77ba648d733a4b4a839141c2eebca89dbc8a79c8fe671f5d212388c3be7a2`;
+the matrix executable hash guard and all 495 native-source hashes remain
+unchanged through replay.

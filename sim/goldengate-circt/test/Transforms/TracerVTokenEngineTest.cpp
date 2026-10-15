@@ -284,9 +284,7 @@ void multipleBridges(MLIRContext &ctx) {
       }
     }
   }
-  auto snapshot = print(*root);
-  require(failed(goldengate::addTracerVTriggerConfig(c, error)) && print(*root) == snapshot &&
-      error == "multiple TracerV trigger configurations are not implemented", "multi-trigger boundary must reject atomically");
+  require(succeeded(goldengate::addTracerVTriggerConfig(c, error)) && succeeded(verify(*root)), error);
   for (unsigned mode = 0; mode < 4; ++mode) {
     auto bad = fixture(ctx, 1, 1, 4); auto bc = *bad->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
     auto attrs = bc->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> changed(attrs.begin(), attrs.end());
@@ -308,8 +306,9 @@ void multipleBridges(MLIRContext &ctx) {
   }
   llvm::outs() << "4096 four-bridge stall/arrival comparisons, 48 channel identities and four late atomic rejections passed\n";
 }
-void triggerConfiguration(MLIRContext &ctx) {
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void triggerConfiguration(MLIRContext &ctx, unsigned bridge = 0, unsigned bridges = 1) {
+  std::string suffix = bridge ? "_" + std::to_string(bridge) : "";
+  auto root = fixture(ctx, 1, 1, bridges); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addTracerVTokenEngine(c, error)), error);
   auto before = c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(succeeded(goldengate::addTracerVTriggerConfig(c, error)), error);
@@ -318,7 +317,7 @@ void triggerConfiguration(MLIRContext &ctx) {
   require(raw.size() == before.size(), "trigger stage lost annotations");
   for (unsigned i = 0; i < raw.size(); ++i) require(cast<DictionaryAttr>(raw[i]).get("class") == cast<DictionaryAttr>(before[i]).get("class"), "trigger stage changed class");
   for (auto n : {"widgetConstructorKey", "channelMapping"}) require(cast<DictionaryAttr>(raw[0]).get(n) == cast<DictionaryAttr>(before[0]).get(n), "trigger stage changed constructor/mapping");
-  Interpreter sim(named(c, "GGTracerVTriggerConfig"));
+  Interpreter sim(named(c, "GGTracerVTriggerConfig" + suffix));
   const std::string names[]{"initDone", "traceEnable", "hostTriggerPCStartHigh", "hostTriggerPCStartLow",
       "hostTriggerPCEndHigh", "hostTriggerPCEndLow", "hostTriggerCycleCountStartHigh", "hostTriggerCycleCountStartLow",
       "hostTriggerCycleCountEndHigh", "hostTriggerCycleCountEndLow", "hostTriggerStartInst", "hostTriggerStartInstMask",
@@ -329,7 +328,7 @@ void triggerConfiguration(MLIRContext &ctx) {
   require(regs.size() == 22 && sim.module.getOps<RegOp>().empty(), "trigger state/reset policy mismatch");
   auto read = [&](const std::string &n) { return sim.state.lookup(regs.at(n)).getZExtValue(); };
   auto set = [&](const std::string &n, uint64_t v) { sim.state[regs.at(n)] = APInt(sim.width(regs.at(n)), v); };
-  std::mt19937_64 random(158); unsigned samples = 0;
+  std::mt19937_64 random(158 + bridge); unsigned samples = 0;
   auto check = [&](uint64_t cycle, bool reset, bool valid, uint64_t pc, uint32_t insn, bool writes) {
     std::map<std::string, uint64_t> old, expected;
     for (auto [name, v] : regs) old[name] = sim.state.lookup(v).getZExtValue();
@@ -388,9 +387,9 @@ void triggerConfiguration(MLIRContext &ctx) {
     check(i, i % 127 == 0, random() & 1, random() & ((uint64_t(1) << 40) - 1), random(), i % 7 == 0);
   }
   auto inner = named(c, "GGTracerVTokenWrapper"); Interpreter tap(inner); InstanceOp tracer;
-  for (auto i : inner.getOps<InstanceOp>()) if (i.getModuleName() == "GGTracerVTokenEngine") tracer = i;
-  unsigned observedPort = inner.getNumPorts() - 1;
-  require(inner.getPortName(observedPort) == "tracerv_trace", "missing trace observation port");
+  for (auto i : inner.getOps<InstanceOp>()) if (i.getModuleName() == "GGTracerVTokenEngine" + suffix) tracer = i;
+  unsigned observedPort = inner.getNumPorts() - bridges + bridge;
+  require(inner.getPortName(observedPort) == "tracerv_trace" + suffix, "missing trace observation port");
   for (unsigned flags = 0; flags < 4; ++flags) {
     tap.memo.clear(); tap.put(tracer.getResult(2), "hBits.tiletrace_reset", flags & 1);
     tap.put(tracer.getResult(2), "hBits.tiletrace_trace_retiredinsns_0_valid", (flags >> 1) & 1);
@@ -401,7 +400,7 @@ void triggerConfiguration(MLIRContext &ctx) {
             tap.output(tap.arg(observedPort), "insn").getZExtValue() == 0x12345678, "observation payload mismatch");
   }
   auto outer = named(c, "GGTracerVTriggerWrapper");
-  require(outer.getNumPorts() == 5 && outer.getPortName(4) == "tracerv_mcr", "wrong configuration wrapper boundary");
+  require(outer.getNumPorts() == 3 + 2 * bridges && outer.getPortName(3 + bridges + bridge) == "tracerv_mcr" + suffix, "wrong configuration wrapper boundary");
   auto metadata = sim.module->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
   require(metadata.size() == 15, "wrong MMIO metadata count");
   for (unsigned i = 0; i < 15; ++i) {
@@ -409,7 +408,7 @@ void triggerConfiguration(MLIRContext &ctx) {
     require(d.getAs<StringAttr>("name") == names[i] && d.getAs<IntegerAttr>("offset").getInt() == 4 * i &&
             d.getAs<BoolAttr>("readable").getValue() == (i < 2) && d.getAs<BoolAttr>("writeable").getValue(), "MMIO metadata mismatch");
   }
-  auto copied = goldengate::resolveAnnotationTarget(c, cast<DictionaryAttr>(raw[13]).getAs<StringAttr>("target").getValue(), error);
+  auto copied = goldengate::resolveAnnotationTarget(c, cast<DictionaryAttr>(raw[13 * bridges]).getAs<StringAttr>("target").getValue(), error);
   require(copied && copied->module.getModuleName() == "GGTracerVTriggerWrapper", "trigger copied-port target not transferred");
   auto snapshot = print(*root);
   require(failed(goldengate::addTracerVTriggerConfig(c, error)) && print(*root) == snapshot, "repeated trigger stage mutated IR");
@@ -497,13 +496,69 @@ void triggerBankReuse(MLIRContext &ctx) {
   }
   llvm::outs() << "Native trigger bank reuse and six atomic hardware/metadata collision rejections passed\n";
 }
+void multipleTriggerBanks(MLIRContext &ctx) {
+  auto oracle = fixture(ctx, 1, 1, 4); auto oc = *oracle->getOps<CircuitOp>().begin();
+  std::string error;
+  require(succeeded(goldengate::addTracerVTokenEngine(oc, error)), error);
+  require(succeeded(goldengate::addTracerVTriggerConfig(oc, error)), error);
+  for (unsigned mode = 0; mode < 7; ++mode) {
+    auto root = fixture(ctx, 1, 1, 4); auto c = *root->getOps<CircuitOp>().begin();
+    require(succeeded(goldengate::addTracerVTokenEngine(c, error)), error);
+    OpBuilder b(&ctx); auto top = named(c, "GGTracerVTokenWrapper");
+    if (mode < 2) {
+      // Reject the last catalog bank after the first three have been staged.
+      auto bank = cast<FModuleOp>(named(oc, "GGTracerVTriggerConfig_3")->clone());
+      c.getBodyBlock()->push_back(bank);
+      if (mode == 1) {
+        auto reg = *bank.getOps<RegResetOp>().begin(); b.setInsertionPoint(reg);
+        reg->setOperand(2, b.create<ConstantOp>(reg.getLoc(), UIntType::get(&ctx, 1), APInt(1, 1)));
+      }
+    }
+    if (mode == 2) top.insertPorts({{top.getNumPorts(), PortInfo(b.getStringAttr("tracerv_mcr_3"), UIntType::get(&ctx, 1), Direction::Out)}});
+    if (mode == 3) {
+      auto rows = c->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> changed(rows.begin(), rows.end());
+      NamedAttrList last(cast<DictionaryAttr>(rows[39]));
+      last.set("target", cast<DictionaryAttr>(rows[0]).get("target")); changed[39] = last.getDictionary(&ctx);
+      c->setAttr("rawAnnotations", b.getArrayAttr(changed));
+    }
+    if (mode == 4) {
+      InstanceOp first;
+      for (auto inst : top.getOps<InstanceOp>()) if (inst.getModuleName() == "GGTracerVTokenEngine") first = inst;
+      for (auto conn : top.getOps<ConnectOp>())
+        if (auto arg = dyn_cast<BlockArgument>(conn.getDest()); arg && top.getPortName(arg.getArgNumber()) == "tracerv_control_3")
+          conn->setOperand(1, first.getResult(3));
+    }
+    if (mode == 5) {
+      auto bank = cast<FModuleOp>(named(oc, "GGTracerVTriggerConfig_3")->clone());
+      // Same type and constructor with a wrong final-port identity is unsafe.
+      SmallVector<Attribute> names(bank.getPortNames().begin(), bank.getPortNames().end());
+      names[4] = b.getStringAttr("otherMCR"); bank.setPortNames(names);
+      c.getBodyBlock()->push_back(bank);
+    }
+    if (mode == 6) {
+      auto engine = named(c, "GGTracerVTokenEngine_3");
+      b.setInsertionPointToEnd(top.getBodyBlock()); b.create<InstanceOp>(top.getLoc(), engine, "duplicate");
+    }
+    auto snapshot = print(*root); auto result = goldengate::addTracerVTriggerConfig(c, error);
+    if (mode == 0) {
+      require(succeeded(result) && succeeded(verify(*root)), error);
+      unsigned banks = 0;
+      for (auto m : c.getOps<FModuleOp>()) banks += m.getName().starts_with("GGTracerVTriggerConfig");
+      require(banks == 4, "late equivalent bank duplicated");
+    } else require(failed(result) && !error.empty() && print(*root) == snapshot, "late trigger rejection changed circuit");
+  }
+  llvm::outs() << "Four independent trigger banks, last-bank reuse and six late atomic rejections passed\n";
+}
+
 } // namespace
 int main() {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     behavior(ctx);
     for (unsigned n = 0; n < 4; ++n) behavior(ctx, n, 4);
-    wiring(ctx); multipleBridges(ctx); annotationsAndRejection(ctx); triggerConfiguration(ctx); triggerBankReuse(ctx);
+    wiring(ctx); multipleBridges(ctx); annotationsAndRejection(ctx); triggerConfiguration(ctx);
+    for (unsigned n = 0; n < 4; ++n) triggerConfiguration(ctx, n, 4);
+    triggerBankReuse(ctx); multipleTriggerBanks(ctx);
     llvm::outs() << "TracerV identity, target transfer and atomic rejection passed\n"; return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // TracerVBridge.scala: MMIO configuration and host-cycle trigger state.
 #include "goldengate/TracerVTokenEngine.h"
+#include "goldengate/TargetUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OperationSupport.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -14,25 +15,49 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGTracerVTokenWrapper")
     return reject("TracerV trigger configuration requires the active token wrapper");
-  FModuleOp inner, engine; FModuleLike existingBank;
+  FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getName() == wrapperName)
       return reject("TracerV trigger wrapper already exists");
-    if (m.getName() == bankName) existingBank = m;
     if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
-    if (m.getName() == "GGTracerVTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!inner || !engine || !raw) return reject("TracerV trigger configuration needs the native engine and retained annotations");
-  unsigned tracerCount = 0;
+  if (!inner || !raw) return reject("TracerV trigger configuration needs the native engine and retained annotations");
+  struct BridgePlan {
+    DictionaryAttr key;
+    FModuleOp engine, bank;
+    FModuleLike existingBank;
+    InstanceOp tracer;
+    unsigned controlPort = 0, observationPort = 0;
+    std::string bankName, controlName, observationName, mcrName, instanceName;
+  };
+  SmallVector<BridgePlan> plans;
   for (auto attr : raw) {
     auto annotation = dyn_cast<DictionaryAttr>(attr);
-    if (annotation && annotation.getAs<StringAttr>("class") == "firesim.lib.bridgeutils.BridgeIOAnnotation" &&
-        annotation.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.TracerVBridgeModule")
-      ++tracerCount;
+    if (!annotation || annotation.getAs<StringAttr>("class") != "firesim.lib.bridgeutils.BridgeIOAnnotation" ||
+        annotation.getAs<StringAttr>("widgetClass") != "firechip.goldengateimplementations.TracerVBridgeModule")
+      continue;
+    auto target = annotation.getAs<StringAttr>("target");
+    auto resolved = target ? resolveAnnotationTarget(circuit, target.getValue(), error) : std::nullopt;
+    if (!resolved || resolved->port != 2 || resolved->groundPortName != "hPort" ||
+        !isa<FModuleOp>(resolved->module.getOperation()))
+      return reject("TracerV trigger configuration needs a native engine HostPort target");
+    BridgePlan plan;
+    plan.engine = cast<FModuleOp>(resolved->module.getOperation());
+    for (auto &prior : plans) if (prior.engine == plan.engine)
+      return reject("TracerV trigger configurations cannot share an engine");
+    plan.key = annotation.getAs<DictionaryAttr>("widgetConstructorKey");
+    if (!plan.key || plan.key != plan.engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"))
+      return reject("TracerV trigger constructor differs from its engine");
+    std::string suffix = plans.empty() ? "" : "_" + std::to_string(plans.size());
+    plan.bankName = bankName.str() + suffix;
+    plan.controlName = "tracerv_control" + suffix;
+    plan.observationName = "tracerv_trace" + suffix;
+    plan.mcrName = "tracerv_mcr" + suffix;
+    plan.instanceName = "tracervRegisters" + suffix;
+    plans.push_back(std::move(plan));
   }
-  if (tracerCount != 1)
-    return reject("multiple TracerV trigger configurations are not implemented");
+  if (plans.empty()) return reject("TracerV trigger configuration needs a TracerVBridgeModule constructor");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   auto bit = uint(1);
@@ -41,36 +66,56 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
       {b.getStringAttr("tCycle"), false, uint(64)}});
   auto trace = BundleType::get(ctx, {{b.getStringAttr("valid"), false, bit},
       {b.getStringAttr("iaddr"), false, uint(40)}, {b.getStringAttr("insn"), false, uint(32)}});
-  std::optional<unsigned> clock, reset, controlPort;
+  std::optional<unsigned> clock, reset;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
-    if (p.name == "tracerv_mcr" || p.name == "tracerv_trace") return reject("TracerV trigger boundary already exists");
     if (p.name == "hostClock" && p.direction == Direction::In && isa<ClockType>(p.type)) clock = i;
     if (p.name == "hostReset" && p.direction == Direction::In && p.type == bit) reset = i;
-    if (p.name == "tracerv_control" && p.direction == Direction::Out && p.type == control) controlPort = i;
   }
-  auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
-  auto checkWidth = [&](llvm::StringRef name, int64_t w) {
-    auto attr = key ? key.getAs<IntegerAttr>(name) : IntegerAttr(); return attr && attr.getInt() == w;
-  };
-  if (!clock || !reset || !controlPort || !key ||
-      key.getAs<StringAttr>("class") != "firechip.bridgeinterfaces.TraceBundleWidths" ||
-      !checkWidth("retireWidth", 1) || !checkWidth("iaddrWidth", 40) || !checkWidth("insnWidth", 32) ||
-      !checkWidth("causeWidth", 64) || !checkWidth("tvalWidth", 40))
-    return reject("TracerV trigger configuration requires the Rocket constructor and exact engine control boundary");
-  auto hPort = engine.getNumPorts() == 5 ? dyn_cast<BundleType>(engine.getPortType(2)) : BundleType();
-  auto hb = hPort && hPort.getElement("hBits") ? dyn_cast<BundleType>(hPort.getElement("hBits")->type) : BundleType();
+  if (!clock || !reset) return reject("TracerV trigger configuration needs host clock and reset");
   const llvm::StringRef observed[]{"tiletrace_reset", "tiletrace_trace_retiredinsns_0_valid",
       "tiletrace_trace_retiredinsns_0_iaddr", "tiletrace_trace_retiredinsns_0_insn"};
   const unsigned observedWidths[]{1, 1, 40, 32};
-  if (!hb) return reject("TracerV token engine has no trace payload");
-  for (unsigned i = 0; i < 4; ++i) {
-    auto f = hb.getElement(observed[i]);
-    if (!f || f->isFlip || f->type != uint(observedWidths[i])) return reject("TracerV observation needs the exact Rocket trace fields");
+  for (auto &plan : plans) {
+    auto key = plan.key;
+    auto checkWidth = [&](llvm::StringRef name, int64_t w) {
+      auto attr = key.getAs<IntegerAttr>(name); return attr && attr.getInt() == w;
+    };
+    std::optional<unsigned> controlPort;
+    for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
+      if (p.name == plan.mcrName || p.name == plan.observationName)
+        return reject("TracerV trigger boundary already exists");
+      if (p.name == plan.controlName && p.direction == Direction::Out && p.type == control) controlPort = i;
+    }
+    if (!controlPort || key.getAs<StringAttr>("class") != "firechip.bridgeinterfaces.TraceBundleWidths" ||
+        !checkWidth("retireWidth", 1) || !checkWidth("iaddrWidth", 40) || !checkWidth("insnWidth", 32) ||
+        !checkWidth("causeWidth", 64) || !checkWidth("tvalWidth", 40))
+      return reject("TracerV trigger configuration requires the Rocket constructor and exact engine control boundary");
+    plan.controlPort = *controlPort;
+    auto engine = plan.engine;
+    if (engine.getNumPorts() != 5 || engine.getPortType(3) != control || engine.getPortDirection(3) != Direction::Out)
+      return reject("TracerV token engine has an incompatible control port");
+    auto hPort = engine.getNumPorts() == 5 ? dyn_cast<BundleType>(engine.getPortType(2)) : BundleType();
+    auto hb = hPort && hPort.getElement("hBits") ? dyn_cast<BundleType>(hPort.getElement("hBits")->type) : BundleType();
+    if (!hb) return reject("TracerV token engine has no trace payload");
+    for (unsigned i = 0; i < 4; ++i) {
+      auto f = hb.getElement(observed[i]);
+      if (!f || f->isFlip || f->type != uint(observedWidths[i]))
+        return reject("TracerV observation needs the exact Rocket trace fields");
+    }
+    unsigned instances = 0;
+    for (auto i : inner.getOps<InstanceOp>()) if (i.getModuleName() == engine.getName()) { plan.tracer = i; ++instances; }
+    if (instances != 1) return reject("TracerV trigger mapping needs a unique engine in an uninstantiated top");
+    // Bind the constructor-selected engine to its own existing control port.
+    bool connected = false;
+    for (auto op : inner.getOps<ConnectOp>())
+      connected |= op.getDest() == inner.getBodyBlock()->getArgument(*controlPort) &&
+                   op.getSrc() == plan.tracer.getResult(3);
+    if (!connected) return reject("TracerV trigger control is connected to another engine");
+    for (auto m : circuit.getOps<FModuleLike>()) if (m.getName() == plan.bankName) plan.existingBank = m;
   }
-  InstanceOp tracer; unsigned instances = 0; bool used = false;
-  for (auto i : inner.getOps<InstanceOp>()) if (i.getModuleName() == engine.getName()) { tracer = i; ++instances; }
+  bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
-  if (instances != 1 || used) return reject("TracerV trigger mapping needs a unique engine in an uninstantiated top");
+  if (used) return reject("TracerV trigger mapping needs a unique engine in an uninstantiated top");
 
   auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
   auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
@@ -79,118 +124,136 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   auto words = FVectorType::get(word, 15);
   auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
       {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
-  // Generate the canonical bank privately. A catalog definition may be reused
-  // only when ports, metadata and all hardware operations match, not by name.
-  b.clearInsertionPoint();
-  SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-      {b.getStringAttr("reset"), bit, Direction::In}, {b.getStringAttr("trace"), trace, Direction::In},
-      {b.getStringAttr("control"), control, Direction::In}, {b.getStringAttr("mcr"), mcr, Direction::Out}};
-  auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName), ConventionAttr::get(ctx, Convention::Internal), bankPorts);
-  OwningOpRef<FModuleOp> stagedBank(bank);
-  bank->setAttr("goldengate.bridgeConstructor", key);
-  const llvm::StringRef names[]{"initDone", "traceEnable", "hostTriggerPCStartHigh", "hostTriggerPCStartLow",
-      "hostTriggerPCEndHigh", "hostTriggerPCEndLow", "hostTriggerCycleCountStartHigh", "hostTriggerCycleCountStartLow",
-      "hostTriggerCycleCountEndHigh", "hostTriggerCycleCountEndLow", "hostTriggerStartInst", "hostTriggerStartInstMask",
-      "hostTriggerEndInst", "hostTriggerEndInstMask", "triggerSelector"};
-  const unsigned widths[]{1, 1, 8, 32, 8, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32};
-  SmallVector<Attribute> registers;
-  for (unsigned i = 0; i < 15; ++i)
-    registers.push_back(b.getDictionaryAttr({b.getNamedAttr("name", b.getStringAttr(names[i])),
-        b.getNamedAttr("offset", b.getI32IntegerAttr(4 * i)), b.getNamedAttr("readable", b.getBoolAttr(i < 2)),
-        b.getNamedAttr("writeable", b.getBoolAttr(true))}));
-  bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(registers));
-  b.setInsertionPointToStart(bank.getBodyBlock());
-  auto arg = [&](unsigned i) { return bank.getBodyBlock()->getArgument(i); };
-  auto constant = [&](unsigned w, uint64_t value) -> Value { return b.create<ConstantOp>(loc, uint(w), APInt(w, value)); };
-  auto slot = [&](llvm::StringRef group, unsigned i) -> Value { return b.create<SubindexOp>(loc, field(arg(4), group), i); };
-  auto mux = [&](Value pred, Value yes, Value no) -> Value { return b.create<MuxPrimOp>(loc, pred, yes, no); };
-  auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
-  auto eq = [&](Value a, Value c) -> Value { return b.create<EQPrimOp>(loc, a, c); };
-  auto reg = [&](llvm::StringRef name, unsigned w, uint64_t initial = 0) -> Value {
-    return b.create<RegResetOp>(loc, uint(w), arg(0), arg(1), constant(w, initial), name).getResult();
-  };
-  SmallVector<Value> config;
-  Value enabled = b.create<NotPrimOp>(loc, arg(1)), one = constant(1, 1), zeroWord = constant(32, 0);
-  for (unsigned i = 0; i < 15; ++i) {
-    Value r = reg(names[i], widths[i], i == 1 ? 1 : 0), write = slot("write", i), read = slot("read", i);
-    Value data = b.create<BitsPrimOp>(loc, field(write, "bits"), widths[i] - 1, 0);
-    connect(r, mux(field(write, "valid"), data, r)); config.push_back(r);
-    connect(field(read, "bits"), i < 2 ? b.create<PadPrimOp>(loc, r, 32).getResult() : zeroWord);
-    connect(field(read, "valid"), one); connect(field(write, "ready"), one);
-    if (i >= 2) b.create<AssertOp>(loc, arg(0), b.create<NotPrimOp>(loc, field(read, "ready")), enabled,
-        "TracerV trigger register is write only", ValueRange{}, "");
-  }
-  Value pcStart = reg("triggerPCStart", 40), pcEnd = reg("triggerPCEnd", 40);
-  Value cycleStart = reg("triggerCycleCountStart", 64), cycleEnd = reg("triggerCycleCountEnd", 64);
-  connect(pcStart, b.create<CatPrimOp>(loc, config[2], config[3]));
-  connect(pcEnd, b.create<CatPrimOp>(loc, config[4], config[5]));
-  connect(cycleStart, b.create<CatPrimOp>(loc, config[6], config[7]));
-  connect(cycleEnd, b.create<CatPrimOp>(loc, config[8], config[9]));
-  Value cycleVal = reg("triggerCycleCountVal", 1), pcVal = reg("triggerPCValVec_0", 1), insnVal = reg("triggerInstValVec_0", 1);
-  connect(cycleVal, both(b.create<GEQPrimOp>(loc, field(arg(3), "tCycle"), cycleStart),
-      b.create<LEQPrimOp>(loc, field(arg(3), "tCycle"), cycleEnd)));
-  Value pc = field(arg(2), "iaddr"), valid = field(arg(2), "valid");
-  // Start takes priority if start and end coincide. No HostPort handshake gate.
-  connect(pcVal, mux(valid, mux(eq(pcStart, pc), one, mux(both(eq(pcEnd, pc), pcVal), constant(1, 0), pcVal)), pcVal));
-  auto insnMatch = [&](unsigned pattern, unsigned mask) -> Value {
-    Value diff = b.create<XorPrimOp>(loc, config[pattern], field(arg(2), "insn"));
-    return eq(both(diff, config[mask]), zeroWord);
-  };
-  connect(insnVal, mux(valid, mux(insnMatch(10, 11), one, mux(insnMatch(12, 13), constant(1, 0), insnVal)), insnVal));
-  Value trigger = constant(1, 0);
-  Value selections[]{one, cycleVal, pcVal, insnVal};
-  for (int i = 3; i >= 0; --i) trigger = mux(eq(config[14], constant(32, i)), selections[i], trigger);
-  connect(field(arg(3), "initDone"), config[0]); connect(field(arg(3), "traceEnable"), config[1]);
-  connect(field(arg(3), "trigger"), trigger);
+  SmallVector<OwningOpRef<FModuleOp>> stagedBanks;
+  for (auto &plan : plans) {
+    auto key = plan.key;
+    // Generate the canonical bank privately. A catalog definition may be reused
+    // only when ports, metadata and all hardware operations match, not by name.
+    b.clearInsertionPoint();
+    SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+        {b.getStringAttr("reset"), bit, Direction::In}, {b.getStringAttr("trace"), trace, Direction::In},
+        {b.getStringAttr("control"), control, Direction::In}, {b.getStringAttr("mcr"), mcr, Direction::Out}};
+    auto bank = b.create<FModuleOp>(loc, b.getStringAttr(plan.bankName), ConventionAttr::get(ctx, Convention::Internal), bankPorts);
+    stagedBanks.emplace_back(bank);
+    bank->setAttr("goldengate.bridgeConstructor", key);
+    const llvm::StringRef names[]{"initDone", "traceEnable", "hostTriggerPCStartHigh", "hostTriggerPCStartLow",
+        "hostTriggerPCEndHigh", "hostTriggerPCEndLow", "hostTriggerCycleCountStartHigh", "hostTriggerCycleCountStartLow",
+        "hostTriggerCycleCountEndHigh", "hostTriggerCycleCountEndLow", "hostTriggerStartInst", "hostTriggerStartInstMask",
+        "hostTriggerEndInst", "hostTriggerEndInstMask", "triggerSelector"};
+    const unsigned widths[]{1, 1, 8, 32, 8, 32, 32, 32, 32, 32, 32, 32, 32, 32, 32};
+    SmallVector<Attribute> registers;
+    for (unsigned i = 0; i < 15; ++i)
+      registers.push_back(b.getDictionaryAttr({b.getNamedAttr("name", b.getStringAttr(names[i])),
+          b.getNamedAttr("offset", b.getI32IntegerAttr(4 * i)), b.getNamedAttr("readable", b.getBoolAttr(i < 2)),
+          b.getNamedAttr("writeable", b.getBoolAttr(true))}));
+    bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(registers));
+    b.setInsertionPointToStart(bank.getBodyBlock());
+    auto arg = [&](unsigned i) { return bank.getBodyBlock()->getArgument(i); };
+    auto constant = [&](unsigned w, uint64_t value) -> Value { return b.create<ConstantOp>(loc, uint(w), APInt(w, value)); };
+    auto slot = [&](llvm::StringRef group, unsigned i) -> Value { return b.create<SubindexOp>(loc, field(arg(4), group), i); };
+    auto mux = [&](Value pred, Value yes, Value no) -> Value { return b.create<MuxPrimOp>(loc, pred, yes, no); };
+    auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
+    auto eq = [&](Value a, Value c) -> Value { return b.create<EQPrimOp>(loc, a, c); };
+    auto reg = [&](llvm::StringRef name, unsigned w, uint64_t initial = 0) -> Value {
+      return b.create<RegResetOp>(loc, uint(w), arg(0), arg(1), constant(w, initial), name).getResult();
+    };
+    SmallVector<Value> config;
+    Value enabled = b.create<NotPrimOp>(loc, arg(1)), one = constant(1, 1), zeroWord = constant(32, 0);
+    for (unsigned i = 0; i < 15; ++i) {
+      Value r = reg(names[i], widths[i], i == 1 ? 1 : 0), write = slot("write", i), read = slot("read", i);
+      Value data = b.create<BitsPrimOp>(loc, field(write, "bits"), widths[i] - 1, 0);
+      connect(r, mux(field(write, "valid"), data, r)); config.push_back(r);
+      connect(field(read, "bits"), i < 2 ? b.create<PadPrimOp>(loc, r, 32).getResult() : zeroWord);
+      connect(field(read, "valid"), one); connect(field(write, "ready"), one);
+      if (i >= 2) b.create<AssertOp>(loc, arg(0), b.create<NotPrimOp>(loc, field(read, "ready")), enabled,
+          "TracerV trigger register is write only", ValueRange{}, "");
+    }
+    Value pcStart = reg("triggerPCStart", 40), pcEnd = reg("triggerPCEnd", 40);
+    Value cycleStart = reg("triggerCycleCountStart", 64), cycleEnd = reg("triggerCycleCountEnd", 64);
+    connect(pcStart, b.create<CatPrimOp>(loc, config[2], config[3]));
+    connect(pcEnd, b.create<CatPrimOp>(loc, config[4], config[5]));
+    connect(cycleStart, b.create<CatPrimOp>(loc, config[6], config[7]));
+    connect(cycleEnd, b.create<CatPrimOp>(loc, config[8], config[9]));
+    Value cycleVal = reg("triggerCycleCountVal", 1), pcVal = reg("triggerPCValVec_0", 1), insnVal = reg("triggerInstValVec_0", 1);
+    connect(cycleVal, both(b.create<GEQPrimOp>(loc, field(arg(3), "tCycle"), cycleStart),
+        b.create<LEQPrimOp>(loc, field(arg(3), "tCycle"), cycleEnd)));
+    Value pc = field(arg(2), "iaddr"), valid = field(arg(2), "valid");
+    // Start takes priority if start and end coincide. No HostPort handshake gate.
+    connect(pcVal, mux(valid, mux(eq(pcStart, pc), one, mux(both(eq(pcEnd, pc), pcVal), constant(1, 0), pcVal)), pcVal));
+    auto insnMatch = [&](unsigned pattern, unsigned mask) -> Value {
+      Value diff = b.create<XorPrimOp>(loc, config[pattern], field(arg(2), "insn"));
+      return eq(both(diff, config[mask]), zeroWord);
+    };
+    connect(insnVal, mux(valid, mux(insnMatch(10, 11), one, mux(insnMatch(12, 13), constant(1, 0), insnVal)), insnVal));
+    Value trigger = constant(1, 0);
+    Value selections[]{one, cycleVal, pcVal, insnVal};
+    for (int i = 3; i >= 0; --i) trigger = mux(eq(config[14], constant(32, i)), selections[i], trigger);
+    connect(field(arg(3), "initDone"), config[0]); connect(field(arg(3), "traceEnable"), config[1]);
+    connect(field(arg(3), "trigger"), trigger);
 
-  if (existingBank) {
-    if (!isa<FModuleOp>(existingBank.getOperation()))
-      return reject("existing TracerV trigger bank is not a native module");
-    bank.setPortLocationsAttr(existingBank.getPortLocationsAttr());
-    // CIRCT's textual parser supplies an empty parameters attribute that the
-    // native builder omits. Normalize this empty default only; nonempty
-    // parameters, annotations and all hardware must still compare exactly.
-    if (auto parameters = existingBank->getAttrOfType<ArrayAttr>("parameters"); parameters && parameters.empty())
-      bank->setAttr("parameters", parameters);
-    if (!OperationEquivalence::isEquivalentTo(bank, existingBank,
-            OperationEquivalence::IgnoreLocations))
-      return reject("existing TracerV trigger bank differs from native configuration");
-    bank = cast<FModuleOp>(existingBank.getOperation());
-  } else {
-    circuit.getBodyBlock()->push_back(stagedBank.release());
+    auto existingBank = plan.existingBank;
+    if (existingBank) {
+      if (!isa<FModuleOp>(existingBank.getOperation()))
+        return reject("existing TracerV trigger bank is not a native module");
+      bank.setPortLocationsAttr(existingBank.getPortLocationsAttr());
+      // CIRCT's textual parser supplies an empty parameters attribute that the
+      // native builder omits. Normalize this empty default only; nonempty
+      // parameters, annotations and all hardware must still compare exactly.
+      if (auto parameters = existingBank->getAttrOfType<ArrayAttr>("parameters"); parameters && parameters.empty())
+        bank->setAttr("parameters", parameters);
+      if (!OperationEquivalence::isEquivalentTo(bank, existingBank,
+              OperationEquivalence::IgnoreLocations))
+        return reject("existing TracerV trigger bank differs from native configuration");
+      bank = cast<FModuleOp>(existingBank.getOperation());
+    }
+    plan.bank = bank;
+
   }
+  // Commit only after every bank, including the last catalog entry, passes.
+  for (auto [i, plan] : llvm::enumerate(plans)) if (!plan.existingBank)
+    circuit.getBodyBlock()->push_back(stagedBanks[i].release());
 
   // All unsupported boundaries reject before mutation. Observe the masked trace
   // independently of HostPort fire: the Scala PC/insn state runs on host clocks.
-  unsigned observationPort = inner.getNumPorts();
-  inner.insertPorts({{observationPort, PortInfo(b.getStringAttr("tracerv_trace"), trace, Direction::Out)}});
-  b.setInsertionPointToEnd(inner.getBodyBlock());
-  Value payload = field(tracer.getResult(2), "hBits");
-  Value observation = inner.getBodyBlock()->getArgument(observationPort);
-  connect(field(observation, "valid"), b.create<AndPrimOp>(loc, field(payload, observed[1]),
-      b.create<NotPrimOp>(loc, field(payload, observed[0]))));
-  connect(field(observation, "iaddr"), field(payload, observed[2]));
-  connect(field(observation, "insn"), field(payload, observed[3]));
+  for (auto &plan : plans) {
+    plan.observationPort = inner.getNumPorts();
+    inner.insertPorts({{plan.observationPort, PortInfo(b.getStringAttr(plan.observationName), trace, Direction::Out)}});
+    b.setInsertionPointToEnd(inner.getBodyBlock());
+    Value payload = field(plan.tracer.getResult(2), "hBits");
+    Value observation = inner.getBodyBlock()->getArgument(plan.observationPort);
+    connect(field(observation, "valid"), b.create<AndPrimOp>(loc, field(payload, observed[1]),
+        b.create<NotPrimOp>(loc, field(payload, observed[0]))));
+    connect(field(observation, "iaddr"), field(payload, observed[2]));
+    connect(field(observation, "insn"), field(payload, observed[3]));
+  }
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
-  for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (i != *controlPort && i != observationPort) {
-    copied.push_back(i); ports.push_back(p);
+  for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
+    bool consumed = llvm::any_of(plans, [&](const BridgePlan &plan) {
+      return i == plan.controlPort || i == plan.observationPort;
+    });
+    if (!consumed) { copied.push_back(i); ports.push_back(p); }
   }
-  ports.push_back({b.getStringAttr("tracerv_mcr"), mcr, Direction::Out});
+  for (auto &plan : plans) ports.push_back({b.getStringAttr(plan.mcrName), mcr, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
-  auto sim = b.create<InstanceOp>(loc, inner, "sim"), triggerConfig = b.create<InstanceOp>(loc, bank, "tracervRegisters");
+  auto sim = b.create<InstanceOp>(loc, inner, "sim");
+  SmallVector<InstanceOp> configs;
+  for (auto &plan : plans) configs.push_back(b.create<InstanceOp>(loc, plan.bank, plan.instanceName));
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   for (auto [j, i] : llvm::enumerate(copied)) {
     auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
     b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
                              p.direction == Direction::In ? external : sim.getResult(i));
   }
-  connect(triggerConfig.getResult(0), outer(*clock)); connect(triggerConfig.getResult(1), outer(*reset));
-  b.create<ConnectOp>(loc, triggerConfig.getResult(2), sim.getResult(observationPort));
-  b.create<ConnectOp>(loc, triggerConfig.getResult(3), sim.getResult(*controlPort));
-  b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArguments().back(), triggerConfig.getResult(4));
+  for (auto [i, plan] : llvm::enumerate(plans)) {
+    auto config = configs[i];
+    connect(config.getResult(0), outer(*clock)); connect(config.getResult(1), outer(*reset));
+    b.create<ConnectOp>(loc, config.getResult(2), sim.getResult(plan.observationPort));
+    b.create<ConnectOp>(loc, config.getResult(3), sim.getResult(plan.controlPort));
+    b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArgument(copied.size() + i), config.getResult(4));
+  }
 
   std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
