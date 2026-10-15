@@ -4819,6 +4819,7 @@ int main(int argc, char **argv) {
           return fail("NIC metasim interface collateral: " + error);
         llvm::outs() << "Emitted CIRCT NIC metasim interface headers in "
                      << headerDirectory << '\n';
+        auto interfaceAnnotations = circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
         if (failed(goldengate::prepareCPUManagedStreamHeader(circuit, error)))
           return fail("NIC CPU managed stream header: " + error);
         llvm::SmallString<256> streamAnnotations(outputDir), streamDirectory(outputDir);
@@ -4855,7 +4856,23 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitOutputFiles(circuit, traceDirectory, outputBase, error)))
           return fail("NIC TracerV driver header collateral: " + error);
         llvm::outs() << "Emitted CIRCT TracerV shared-stream constructor in " << traceDirectory << '\n';
-        return fail("NIC complete driver-header assembly and final RTL integration are not implemented");
+        // Compose all widgets from the unextended physical interface header.
+        // Each native emitter validates the same allocated CIRCT operations;
+        // the composer publishes only after every widget succeeds on a clone.
+        circuit->setAttr("rawAnnotations", interfaceAnnotations);
+        if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))
+          return fail("NIC complete driver headers: " + error);
+        llvm::SmallString<256> driverAnnotations(outputDir), driverDirectory(outputDir);
+        llvm::sys::path::append(driverAnnotations, "post-fame-driver-header-all.json");
+        llvm::sys::path::append(driverDirectory, "driver-header");
+        if (failed(goldengate::emitAllAnnotations(circuit, driverAnnotations, error)))
+          return fail("NIC complete driver header annotations: " + error);
+        if (auto ec = llvm::sys::fs::create_directories(driverDirectory))
+          return fail("cannot create NIC complete driver header directory: " + ec.message());
+        if (failed(goldengate::emitOutputFiles(circuit, driverDirectory, outputBase, error)))
+          return fail("NIC complete driver header collateral: " + error);
+        llvm::outs() << "Emitted CIRCT complete NIC driver header in " << driverDirectory << '\n';
+        return fail("NIC final RTL integration is not implemented");
       }
       auto prepareDriverHeaders = [&]() -> int {
         if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))

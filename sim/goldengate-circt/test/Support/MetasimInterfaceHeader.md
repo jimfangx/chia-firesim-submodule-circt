@@ -10,10 +10,27 @@ That invocation also verifies the complete production IR before and after
 preparation and emits `metasim-all.json` for comparison with the CLI archive.
 
 The incoming-NIC production path emits `post-fame-metasim-header-all.json`
-and the interface fragments under `metasim-interface/`, then rejects the
-remaining driver-header integration gap. These fragments are partial compiler
-outputs; they do not contain the NIC bridge constructors. The preceding shim
-boundary remains available before header preparation.
+and the interface fragments under `metasim-interface/`. These fragments are
+partial compiler outputs; they do not contain the NIC bridge constructors.
+The preceding shim boundary remains available before header preparation.
+
+The subsequent transactional composer emits the complete NIC catalog under
+`driver-header/FireSim-generated.const.h` and archives
+`post-fame-driver-header-all.json`. It starts with the unextended interface
+header and validates every widget on a private CIRCT clone. SimpleNIC requires
+matching retained bridge identity and native hardware, and its constructor is
+prepared after CPU stream allocation validation. No header is committed on an
+early, NIC, or final FASED failure. Final NIC RTL publication remains guarded.
+
+`NICDriverHeaderCompare.py` compares all twelve constructors, registration
+phases, fixed-layout checks and target configuration with the completed NIC
+SFC header. It independently replays the composer through
+`goldengate-print-binding-test --rocket-native-driver-headers`, exercises
+twelve atomic rejections, verifies CIRCT IR and annotation/module preservation,
+and compiles both complete headers against the actual registry and driver
+declarations. Invoke with `--candidate`, `--sfc` (the archived NIC `.const.h`),
+`--native-tool`, `--cxx`, and a fresh `--output-dir`. This collateral comparison
+does not establish NIC runtime or final RTL equivalence.
 
 `NICMetasimInterfaceCompare.py` checks the production annotation prefix and
 the independently re-emitted native archive/collateral, compares the complete

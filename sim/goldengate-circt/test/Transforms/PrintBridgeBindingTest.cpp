@@ -2601,21 +2601,28 @@ void rocketNativeDriverHeaders(CircuitOp c, ModuleOp root, StringRef directory) 
   }
   c->setAttr("rawAnnotations", b.getArrayAttr(retained));
   require(succeeded(goldengate::prepareMetasimInterfaceHeader(c, "FireSim", error)), error);
-  for (unsigned bad = 0; bad < 7; ++bad) {
+  bool hasNIC = false;
+  for (auto m : c.getOps<FModuleOp>()) if (m.getName() == "GGNICMMIOBank") hasNIC = true;
+  for (unsigned bad = 0; bad < (hasNIC ? 11U : 7U); ++bad) {
     OwningOpRef<ModuleOp> test(cast<ModuleOp>(root->clone())); auto nc = *test->getOps<CircuitOp>().begin();
     if (bad == 0) nc.setName("FPGATop");
     else if (bad == 1) named(nc, "GGSingleClockBridge")->removeAttr("goldengate.mmioRegisters");
     else if (bad == 2) named(nc, "GGFASEDTokenEngine")->removeAttr("goldengate.bridgeConstructor");
     else if (bad == 3) nc->removeAttr("rawAnnotations");
+    else if (bad == 8) named(nc, "GGNICMMIOBank")->removeAttr("goldengate.mmioRegisters");
+    else if (bad == 9) named(nc, "GGCPUStreamWrite")->removeAttr("goldengate.sinkStreams");
     else {
       auto raw = nc->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> rows;
       for (auto row : raw) {
         auto d = cast<DictionaryAttr>(row);
+        if (bad == 10 && d.getAs<StringAttr>("class") == goldengate::AnnotationClasses::BridgeIO &&
+            d.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.SimpleNICBridgeModule") continue;
         auto suffix = d.getAs<StringAttr>("fileSuffix");
         if (suffix && suffix == ".const.h") {
           if (bad == 4) continue;
           if (bad == 5) rows.push_back(row);
           if (bad == 6) {NamedAttrList marked(d); marked.set("goldengate.cpuManagedStreamHeader", b.getBoolAttr(true)); row = marked.getDictionary(ctx);}
+          if (bad == 7) {NamedAttrList marked(d); marked.set("goldengate.nicHeader", b.getBoolAttr(true)); row = marked.getDictionary(ctx);}
         }
         rows.push_back(row);
       }
@@ -2625,10 +2632,20 @@ void rocketNativeDriverHeaders(CircuitOp c, ModuleOp root, StringRef directory) 
     require(failed(goldengate::prepareRocketDriverHeaders(nc, error)) && !error.empty() && dump(*test) == saved,
         "native driver transaction rejection " + std::to_string(bad));
     if (bad == 2) require(error.find("FASED") != std::string::npos, "expected final-emitter failure");
+    if (bad == 7 || bad == 8 || bad == 10) require(error.find("SimpleNIC") != std::string::npos, "expected NIC-emitter failure");
   }
   auto original = c->getAttrOfType<ArrayAttr>("rawAnnotations"); auto hardware = dump(root);
   require(succeeded(goldengate::prepareRocketDriverHeaders(c, error)), error);
   auto updated = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(original.size() == updated.size(), "composition changed archive count");
+  unsigned changed = 0;
+  for (auto [before, after] : llvm::zip(original, updated)) {
+    if (before == after) continue;
+    ++changed;
+    require(cast<DictionaryAttr>(before).getAs<StringAttr>("fileSuffix") == ".const.h",
+        "composition changed an unrelated archive record");
+  }
+  require(changed == 1 && succeeded(verify(root)), "composition changed unrelated annotations or IR validity");
   c->setAttr("rawAnnotations", original); require(dump(root) == hardware, "composition changed hardware"); c->setAttr("rawAnnotations", updated);
   for (auto row : original) {
     auto d = cast<DictionaryAttr>(row);
@@ -2638,7 +2655,9 @@ void rocketNativeDriverHeaders(CircuitOp c, ModuleOp root, StringRef directory) 
   auto saved = dump(root);
   require(failed(goldengate::prepareRocketDriverHeaders(c, error)) && dump(root) == saved, "duplicate native header transaction");
   require(succeeded(goldengate::emitOutputFiles(c, directory, "FireSim-generated", error)), error);
-  llvm::outs() << "PASS native Rocket transactional driver composition, eight atomic rejections and preserved hardware/archive\n";
+  require(succeeded(goldengate::emitAllAnnotations(c, (directory + "/driver-all.json").str(), error)), error);
+  llvm::outs() << "PASS native Rocket transactional driver composition, " << (hasNIC ? 12 : 8)
+               << " atomic rejections and preserved hardware/archive\n";
 }
 
 void rocketAllocatedHeader(Fixture &f, StringRef output) {

@@ -6318,3 +6318,71 @@ Aggregate comparisons remain eight matched, six mismatched (native SRAM
 model ports), and twelve not reached. `matrix-regression.json` and its log
 retain these results and each complete target diagnostic. The additional
 NIC TracerV boundary is a partial ABI match, not a newly supported target.
+
+### Iteration 235: complete NIC driver header composition
+
+`prepareRocketDriverHeaders` now composes the SimpleNIC constructor after
+validating the shared incoming/outgoing CPU stream catalog. Native NIC hardware
+and retained BridgeIO identity must agree. All widget emitters operate on a
+private CIRCT clone and publish only the completed header annotation after the
+last FASED check succeeds. This extends the existing native operation-based
+driver composition, following `FPGATop.genHeader`, widget constructors and the
+CPU stream engine's ordered descriptors. The NIC CLI preserves its earlier
+partial boundaries and now emits `post-fame-driver-header-all.json` and
+`driver-header/FireSim-generated.const.h`. It still rejects final RTL publication
+with `NIC final RTL integration is not implemented`.
+
+The exact completed SFC artifact compared is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h`
+(relative to the outer repository), SHA256
+`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`.
+All twelve constructors match their SFC registration phases and complete ordered
+arguments after lexical normalization. All 95 fixed-layout assertions and the
+complete target configuration match. Both complete headers compile against the
+actual C++ registry and bridge declarations under every driver include phase.
+This does not establish runtime or final NIC RTL equivalence.
+
+`NICDriverHeaderCompare.py` independently parses the production shim boundary,
+replays native composition, and verifies identical CLI/native headers and all
+1,797 archive records. Only the intended header record changes. The native test
+verifies CIRCT IR and module/archive preservation and twelve atomic rejections,
+including missing NIC hardware metadata, missing bridge identity, missing CPU
+catalog and late FASED failure. The no-NIC production replay passes its eight
+atomic rejection cases. Print binding, SimpleNIC header and TracerV header CTests
+all pass.
+
+All 260 earlier NIC and 256 no-NIC MLIR/JSON artifacts match iteration 234 after
+candidate-directory normalization; the complete driver archive is the sole new
+NIC boundary. The five final no-NIC RTL/header/XDC outputs remain byte-identical.
+Rocket FIRRTL/annotation input hashes match the immutable staging fixture.
+`design/FireSim-generated.synthesis.xdc` matches the immutable 2026-10-01 U250
+build-tree fixture exactly; `design/FireSim-generated.implementation.xdc` matches
+with the established hierarchy rename. Evidence is in the active generated
+directory's `iteration235-u250-target-matrix/`: `driver-header/comparison.json`,
+native/C++ ABI logs, `no-nic-native.log`, `ctest.log`, `build-final.log`,
+`source-inputs.json`, `inputs.json`, `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json`, and `replay/`.
+Compiler SHA256 is
+`095aff9fb14227178a5a72ddba36eeba09e597c3dc44fa1ff6e5e914fe2710b6`.
+
+For replay space, 486 old iteration-229 MLIR dumps were losslessly compressed
+to adjacent `.mlir.gz`, recovering 28,700,087,090 bytes after decompressed SHA256
+checks. `lossless-storage-cleanup.json` records all paths, sizes and hashes.
+Current/prior baselines, logs, JSON, final RTL and immutable goldens were retained.
+
+Supplied harness iteration 234 passed CIRCT replacertl/provenance and fresh
+Verilator smoke, reusing unchanged-input long-suite evidence. Its SFC UART-bearing
+baseline remains pending. Those results precede this change; no manager gates
+were started here. The next smallest step is final NIC RTL integration through
+the existing shim and lowering path, followed by harness-owned NIC runtime
+coverage. Other target widths/multiplicity, FASED profiles, partitioned QSFP and
+SRAM equivalence remain open. Unrelated shared-worktree edits are excluded.
+
+The thirteen-target replay completed with one compiled target, six compiler
+gaps and six unsupported partition/QSFP platforms, correctly returning nonzero.
+`matrix-regression.json` and its log confirm identical archived input hashes,
+effective platforms, statuses and earlier structured boundary checks against
+iteration 234. Only the NIC diagnostic advances to the final RTL guard.
+Aggregate comparisons remain eight matched, six mismatched (native SRAM model
+ports), and twelve not reached. Complete NIC collateral is an ABI milestone,
+not a newly supported runtime target.

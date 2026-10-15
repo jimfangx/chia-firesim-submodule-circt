@@ -397,6 +397,7 @@ if(BUILD_TESTING)
     lib/Support/UARTHeader.cpp
     lib/Support/TSIHeader.cpp
     lib/Support/BlockDevHeader.cpp
+    lib/Support/NICHeader.cpp
     lib/Analysis/BridgeClockInfo.cpp
     lib/Support/TracerVHeader.cpp
     lib/Support/FASEDHeader.cpp

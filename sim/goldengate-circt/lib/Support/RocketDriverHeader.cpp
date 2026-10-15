@@ -15,6 +15,7 @@
 #include "goldengate/UARTHeader.h"
 #include "goldengate/TSIHeader.h"
 #include "goldengate/BlockDevHeader.h"
+#include "goldengate/NICHeader.h"
 #include "goldengate/TracerVHeader.h"
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/FASEDHeader.h"
@@ -47,12 +48,18 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
   }
   FModuleOp printWrapper;
   for (auto m : staged->getOps<FModuleOp>()) if (m.getName() == "GGPrintBridgeHostWrapper") printWrapper = m;
-  bool hasPrint = bool(printWrapper);
+  bool hasPrint = bool(printWrapper), hasNIC = false, hasNICBank = false;
+  for (auto m : staged->getOps<FModuleOp>()) if (m.getName() == "GGNICMMIOBank") hasNICBank = true;
   for (auto row : raw) {
     auto d = dyn_cast<DictionaryAttr>(row);
     if (d && d.getAs<StringAttr>("class") == AnnotationClasses::BridgeIO &&
         d.getAs<StringAttr>("widgetClass") == AnnotationClasses::PrintBridgeModule) hasPrint = true;
+    if (d && d.getAs<StringAttr>("class") == AnnotationClasses::BridgeIO &&
+        d.getAs<StringAttr>("widgetClass") ==
+            "firechip.goldengateimplementations.SimpleNICBridgeModule") hasNIC = true;
   }
+  if (hasNIC != hasNICBank)
+    return reject("SimpleNIC driver header needs matching native hardware and retained bridge identity");
   if (!hasPrint) {
     if (failed(prepareCPUManagedStreamHeader(*staged, error))) return failure();
   } else {
@@ -98,6 +105,13 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
     }
     if (!found) return reject("Rocket Print driver interface header is missing");
     staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(updated));
+  }
+  // SimpleNIC constructor stream indices belong to the shared CPU catalog.
+  // Validate that catalog before publishing the NIC fragment, in the same
+  // transaction as every other widget. The emitter checks the actual live
+  // duplex transports, bank allocation and retained bridge identity.
+  if (hasNIC && failed(prepareNICHeader(*staged, error))) {
+    error = "SimpleNIC driver header: " + error; return failure();
   }
   // This final emitter can still reject a stale memory allocation. Even such
   // a late failure must leave the original interface header and archive intact.
