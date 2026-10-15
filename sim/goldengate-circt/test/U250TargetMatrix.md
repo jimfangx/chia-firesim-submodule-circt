@@ -5905,3 +5905,90 @@ TracerV constructors, other FASED outstanding profiles, partitioned QSFP
 semantics and SRAM equivalence remain pending. New verification remains
 harness-owned; this boundary milestone does not establish port completion.
 Unrelated shared-worktree edits remain outside this checkpoint.
+
+### Iteration 230 — incoming NIC U250 F1 shim
+
+The production CLI now invokes `assembleF1Shim` for the incoming-NIC target
+after its verified FPGA shell. This reuses the native FIRRTL-operation
+implementation of Scala `F1Shim.scala`: PCIS forwarding, independent host
+AW/AR request-ID counters, inactive physical QSFP lanes, memory forwarding,
+DDR defines and XDC circuit paths. `MidasTransforms.scala` places this
+platform specialization after FAME and SimulationMapping; target scheduling
+and all existing model/bridge bodies remain intact. NIC now stops explicitly
+at `NIC metasim and driver header integration is not implemented`, after
+emitting the actual shim IR/archive. The no-NIC header ordering is unchanged.
+
+`F1ShimTest.cpp --platform-boundary` parses and verifies this production IR,
+checks its two synchronous 12-bit counters, unique platform child and retained
+host-clock source, and emits the shim with an external FPGATop declaration
+for focused lowering. Its collateral checks reject five invalid output sets
+before writes. Normal `goldengate-f1-shim` CTest passes, including the twelve
+existing atomic transform rejections. Native compiler/test rebuild passes.
+
+`Transforms/NICF1ShimCompare.py` compares the production FPGA-top/shim
+boundaries, verifies all 235 earlier module bodies are unchanged, and checks
+the complete recursive annotation transfer (1,793 records become 1,795 with
+DDR/XDC records). There is exactly one retained source,
+`~F1Shim|FPGATop>clock`; the new shim body also equals the production no-NIC
+shim. Lowered ports and every unconditional route match both these SFC files:
+
+```text
+/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv
+/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv
+```
+
+The NIC RTL SHA256 is
+`bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`.
+Both comparisons match all 143 public port leaves and 129 combinational
+routes. The actual native counter-operation DAG matches SFC's synchronous
+reset/accepted-request recurrence over 30,000 host cycles: three reset
+cycles, 31,508 independent counter stalls and two wraps per counter. Four
+counter mutations (reset value, increment, truncation and accepted-request
+enable) are rejected. Both companion `FireSim-generated.defines.vh` files
+match emitted DDR collateral byte for byte. Native annotation re-emission
+also matches the CLI archive exactly. These focused checks externalize the
+retained FPGATop only for testing; they do not establish complete NIC RTL or
+runtime equivalence.
+
+Evidence is under the active generated directory's
+`iteration230-u250-target-matrix/`: `nic-shim/comparison.json`,
+`immutable-shim/comparison.json`, their native/lowering logs, `build.log`,
+`ctest.log` and `inputs.json`. Compiler SHA256 is
+`004daf313d5c22e1577780476cebb255b8053687a49af6e597b7bd49960faded`.
+
+Fresh replay of all thirteen archived pre-MIDAS inputs retains one compiled
+target, six compiler failures and six unsupported partition/QSFP platforms.
+Earlier input hashes, effective platforms, statuses and boundary comparisons
+match iteration 229; NIC alone advances to the header diagnostic. Seven
+bridge/channel boundaries and Saturn Shuttle model ports match; six reached
+model-port comparisons retain native-SRAM differences. Aggregate annotation
+comparisons remain eight matched, six mismatched and twelve not reached.
+`replay/matrix.json`, `matrix-regression.json` and `matrix-regression.log`
+record each recipe and its complete stderr. Replay exits one for these
+implementation gaps; regression checks exit zero.
+
+`production-boundary-regression.json` confirms all 254 earlier NIC and 256
+no-NIC MLIR/JSON files match iteration 229 after output-directory normalization;
+only the NIC shim IR/archive are new. All five no-NIC emitted RTL/header/XDC
+artifacts are byte-identical to iteration 229. The immutable Rocket comparison
+again checks archived input hashes against the staging fixture, exact
+synthesis XDC, and implementation XDC after the recorded hierarchy rename.
+
+To make comparison space, 585 old iteration-225 MLIR dumps were losslessly
+compressed to adjacent `.mlir.gz` files, recovering 36,828,624,680 bytes.
+Decompressed SHA256 was checked before each original was removed. The
+adjacent `iteration230-u250-target-matrix-storage.log` records every file.
+JSON, logs, final RTL, prior baseline 229, the active build, historical Print
+fixtures and all immutable references remain intact.
+
+Supplied harness iteration 229 passed CIRCT replacertl/provenance, fresh
+Verilator smoke and both fresh long Rocket suites. Portable checks total
+90,141 against Spike; Rocket checks total 90,805 with the SFC UART-bearing
+baseline still pending. Those results precede this change; no manager
+verification was started here.
+
+The next smallest NIC step is to emit and compare its metasim interface
+header before enabling bridge driver constructors and final RTL/runtime
+validation. Other TracerV constructors, FASED profiles, partitioned QSFP and
+SRAM equivalence remain pending. This shim milestone does not complete the
+port. Unrelated shared-worktree edits remain outside this checkpoint.

@@ -4779,18 +4779,14 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fpgaTopAnnotations, error)))
         return fail("FPGA top shell annotations: " + error);
       llvm::outs() << "Assembled CIRCT FPGATop clock/reset and three AXI4 interfaces in " << fpgaTopPath << '\n';
-      // The incoming NIC stream uses the same U250 shell ABI. Keep its
-      // verified shell/annotation boundary available for comparison while
-      // F1 shim and driver/header integration remain an explicit next step.
-      if (!cpuSinks.empty())
-        return fail("NIC F1 shim and header integration is not implemented");
       if (failed(goldengate::assembleF1Shim(circuit, error)))
         return fail("U250 F1 shim: " + error);
       if (failed(mlir::verify(*module))) return fail("U250 F1 shim produced invalid FIRRTL IR");
       // Scala SimulationMapping generates the platform header before AutoILA
       // appends internal probe/Clock export ports. Capture that same boundary;
       // the metasim interface describes physical ports, not debug routes.
-      if (failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error)))
+      if (cpuSinks.empty() &&
+          failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error)))
         return fail("metasim interface header: " + error);
       llvm::SmallString<256> shimPath(outputDir), shimAnnotations(outputDir);
       llvm::sys::path::append(shimPath, "post-fame-f1-shim.mlir");
@@ -4802,6 +4798,11 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, shimAnnotations, error)))
         return fail("F1 shim annotations: " + error);
       llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
+      // Incoming NIC PCIS uses the shared AXI4/Nasti specialization. Retain
+      // this verified hardware/collateral boundary while its metasim and
+      // bridge constructor headers remain a separate integration step.
+      if (!cpuSinks.empty())
+        return fail("NIC metasim and driver header integration is not implemented");
       auto prepareDriverHeaders = [&]() -> int {
         if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))
           return fail("Rocket driver headers: " + error);

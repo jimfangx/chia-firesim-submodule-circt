@@ -57,12 +57,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
   }
   return root;
 }
-void applyShim(CircuitOp c) {
-  std::string error;
-  std::map<std::string,std::string> bodies;for(auto m:c.getOps<FModuleOp>())bodies[m.getName().str()]=dump(m);
-  auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");
-  require(succeeded(goldengate::assembleF1Shim(c,error)),error);
-  require(succeeded(verify(c)),"invalid shim IR");
+void checkShim(CircuitOp c,unsigned oldAnnotations) {
   auto shim=top(c,"F1Shim");
   require(c.getName()=="F1Shim"&&shim.getNumPorts()==8,"shim schema");
   unsigned regs=0;
@@ -74,8 +69,7 @@ void applyShim(CircuitOp c) {
   require(regs==2&&shim.getOps<MemOp>().empty()&&shim.getOps<RegOp>().empty(),"only two synchronous reset counters");
   unsigned instances=0;for(auto i:shim.getOps<InstanceOp>()){require(i.getModuleName()=="FPGATop","shim child");++instances;}
   require(instances==1,"unique platform child");
-  for(auto [n,s]:bodies)require(dump(top(c,n))==s,"retained body changed");
-  auto ann=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(ann.size()==raw.size()+2,"DDR/XDC path annotation count");
+  auto ann=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(ann&&ann.size()==oldAnnotations+2,"DDR/XDC path annotation count");
   auto output=cast<DictionaryAttr>(ann[ann.size()-2]);
   require(output.getAs<StringAttr>("class").getValue()==goldengate::AnnotationClasses::OutputFile&&
           output.getAs<StringAttr>("fileSuffix").getValue()==".defines.vh"&&!output.get("target"),"DDR output annotation schema");
@@ -85,6 +79,15 @@ void applyShim(CircuitOp c) {
           paths.getAs<StringAttr>("postLinkPath").getValue()=="firesim_top","U250 XDC paths");
   unsigned sources=0;for(auto a:ann){auto d=cast<DictionaryAttr>(a);if(d.getAs<StringAttr>("class").getValue()==goldengate::AnnotationClasses::HostClockSource){require(d.getAs<StringAttr>("target").getValue()=="~F1Shim|FPGATop>clock","retained host clock identity");++sources;}}
   require(sources==1,"host source count");
+}
+void applyShim(CircuitOp c) {
+  std::string error;
+  std::map<std::string,std::string> bodies;for(auto m:c.getOps<FModuleOp>())bodies[m.getName().str()]=dump(m);
+  auto count=c->getAttrOfType<ArrayAttr>("rawAnnotations").size();
+  require(succeeded(goldengate::assembleF1Shim(c,error)),error);
+  require(succeeded(verify(c)),"invalid shim IR");
+  checkShim(c,count);
+  for(auto [n,s]:bodies)require(dump(top(c,n))==s,"retained body changed");
 }
 void emitCollateral(CircuitOp c,StringRef boundary) {
   auto directory=llvm::sys::path::parent_path(boundary);
@@ -127,6 +130,15 @@ void writeStub(CircuitOp c,StringRef name) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    if(argc==4&&StringRef(argv[1])=="--platform-boundary") {
+      auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"production boundary parse");
+      require(succeeded(verify(*real)),"invalid production shim IR");
+      auto c=*real->getOps<CircuitOp>().begin();
+      auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw&&raw.size()>=2,"missing production annotations");
+      checkShim(c,raw.size()-2);writeStub(c,argv[3]);emitCollateral(c,argv[3]);
+      llvm::outs()<<"Production F1Shim: two synchronous host counters, unique retained platform/source and DDR/XDC collateral\n";
+      return 0;
+    }
     if(argc==4&&StringRef(argv[1])=="--emit-collateral") {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"collateral boundary parse");
       auto c=*real->getOps<CircuitOp>().begin();
