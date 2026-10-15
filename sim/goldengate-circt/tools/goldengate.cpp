@@ -4636,10 +4636,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostMemoryAnnotations, error)))
         return fail("FASED host memory annotations: " + error);
       llvm::outs() << "Assembled CIRCT FASED host memory master in " << hostMemoryPath << '\n';
-      // Address translation and the remaining NIC platform integration need
-      // their own boundary comparisons before enabling subsequent transforms.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED address translation and platform integration are not implemented");
       if (failed(goldengate::addFASEDAddressTranslation(circuit, error)))
         return fail("FASED address translation: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED address translation produced invalid FIRRTL IR");
@@ -4653,6 +4649,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, translationAnnotations, error)))
         return fail("FASED address translation annotations: " + error);
       llvm::outs() << "Translated CIRCT FASED addresses and host-clock bounds assertions in " << translationPath << '\n';
+      // NIC address translation has its own SFC boundary comparison; later
+      // memory scheduling still needs comparison before platform integration.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED read deinterleaving and platform integration are not implemented");
       if (failed(goldengate::addFASEDReadDeinterleaver(circuit, error)))
         return fail("FASED read deinterleaver: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read deinterleaver produced invalid FIRRTL IR");

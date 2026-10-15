@@ -96,7 +96,7 @@ def helper_semantics(text):
               'offset = -2147483648 : i64, virtualBase = 2147483648 : i64, virtualBound = 19327352831 : i64}')
     assert region in body.splitlines()[0]
     nets, checks = expressions(text, HELPER)
-    assert nets == routes()[0] and len(nets) == 37
+    assert nets == routes()[0] and len(nets) == 37, "actual address translation SSA routes differ"
     assert len(checks) == 4
     expected = []
     for op, limit, ending in [('leq', BOUND, ' exceeds region bound.'),
@@ -128,50 +128,61 @@ def helper_semantics(text):
     return cases
 
 
-def compare(before_path, after_path, baseline):
+def compare_binding(before_path, after_path, baseline=None):
     before, after = before_path.read_text(), after_path.read_text()
     pattern = r'^    firrtl.module @(\w+)(\(.*?^    })'
     prior, result = (dict(re.findall(pattern, text, re.M | re.S)) for text in (before, after))
-    assert len(prior) == 261 and set(result) - set(prior) == {HELPER, NEW}
+    assert set(result) - set(prior) == {HELPER, NEW}
     assert all(result.get(name) == body for name, body in prior.items()), 'existing module body changed'
     old, new = native_module(before, OLD), native_module(after, NEW)
     copied = [(d, n, t) for d, n, t in native_ports(old) if n != 'fased_host_mem']
-    assert len(copied) == 109
     out_type = memory_type().replace('addr: uint<35>', 'addr: uint<34>')
     assert native_ports(new) == copied + [('out', 'fased_host_mem', out_type)]
     nets = {('sim.' if d == 'in' else 'top.') + n: ('top.' if d == 'in' else 'sim.') + n for d, n, _ in copied}
     nets.update({'translation.clock': 'top.hostClock', 'translation.reset': 'top.hostReset',
                  'translation.in': 'sim.fased_host_mem', 'top.fased_host_mem': 'translation.out'})
-    assert wiring(new) == nets and len(nets) == 113
+    assert wiring(new) == nets, "actual address translation wrapper wiring differs"
     assert len(re.findall(r' = firrtl.instance sim @' + OLD + r'\b', new)) == 1
     assert len(re.findall(r' = firrtl.instance translation @' + HELPER + r'\b', new)) == 1
     assert not re.search(r'firrtl.(?:reg|regreset|mem)\b', new)
     vectors = helper_semantics(after)
-    assert native_module(after, HELPER) == native_module(baseline, HELPER), 'shared helper semantics changed'
-    print_modules = [name for name in prior if name.startswith('GGPrintBridge')]
-    assert len(print_modules) == 21
-    regions = re.search(r'goldengate.controlRegions = \[(.*?)\]', after)[1]
-    print_regions = re.findall(r'name = "(PrintBridgeModule_\d+)", size = (\d+) : i64, slave = (\d+) : i32, start = (\d+) : i64', regions)
-    assert print_regions == [('PrintBridgeModule_0', '32', '8', '544'), ('PrintBridgeModule_1', '32', '9', '576')]
+    if baseline is not None:
+        assert native_module(after, HELPER) == native_module(baseline, HELPER), 'shared helper semantics changed'
     header = before.splitlines()[1]
     probes = re.findall(r'\{class = "test.TranslationBoundary", target = "([^"]+)"}', after.splitlines()[1])
-    assert probes and 'class = "test.TranslationBoundary"' not in header
+    assert 'class = "test.TranslationBoundary"' not in header
     original_probes = ['~' + OLD + '|' + OLD + '>' + ref for ref in (
         'ctrl.aw.bits.addr', 'hostReset', 'fased_host_mem.aw.bits.addr',
         'fased_host_mem.ar.bits.addr', 'fased_host_mem.r.bits.data', 'fased_host_mem')]
     original_probes.append('~' + OLD)
-    assert len(probes) == 7, 'missing boundary identity probes'
+    assert not probes or len(probes) == 7, 'incomplete boundary identity probes'
     end = header.rfind(']} {')
     assert end >= 0
-    header = header[:end] + ', ' + ', '.join('{class = "test.TranslationBoundary", target = "' + target + '"}' for target in original_probes) + header[end:]
+    if probes:
+        header = header[:end] + ', ' + ', '.join('{class = "test.TranslationBoundary", target = "' + target + '"}' for target in original_probes) + header[end:]
     header = transfer(header, OLD, NEW, [(d, n) for d, n, _ in copied])
     assert after.splitlines()[1] == header, 'annotation archive transfer differs'
     return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(prior),
                 copied_ports=len(copied), wrapper_connections=len(nets), helper_passthrough_connections=35,
                 translated_addresses=2, assertions=4, semantic_vectors=vectors,
-                retained_Print_modules=len(print_modules), retained_Print_regions=print_regions,
                 annotation_archive_transfer=True, annotation_identity_probes=len(probes),
-                shared_helper_match=True)
+                shared_helper_match=baseline is not None)
+
+
+def compare(before_path, after_path, baseline):
+    report = compare_binding(before_path, after_path, baseline)
+    before, after = before_path.read_text(), after_path.read_text()
+    pattern = r'^    firrtl.module @(\w+)(\(.*?^    })'
+    prior = dict(re.findall(pattern, before, re.M | re.S))
+    assert report['unchanged_module_bodies'] == 261 and report['copied_ports'] == 109
+    assert report['wrapper_connections'] == 113 and report['annotation_identity_probes'] == 7
+    print_modules = [name for name in prior if name.startswith('GGPrintBridge')]
+    assert len(print_modules) == 21
+    regions = re.search(r'goldengate.controlRegions = \[(.*?)\]', after)[1]
+    print_regions = re.findall(r'name = "(PrintBridgeModule_\d+)", size = (\d+) : i64, slave = (\d+) : i32, start = (\d+) : i64', regions)
+    assert print_regions == [('PrintBridgeModule_0', '32', '8', '544'), ('PrintBridgeModule_1', '32', '9', '576')]
+    report.update(retained_Print_modules=len(print_modules), retained_Print_regions=print_regions)
+    return report
 
 
 def main():
