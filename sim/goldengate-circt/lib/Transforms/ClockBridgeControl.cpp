@@ -340,9 +340,63 @@ LogicalResult goldengate::mapPeekPokeBridgeControl(CircuitOp circuit,
 
 LogicalResult goldengate::mapTracerVBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
-  return mapBridgeControl(circuit, addressBits, idBits, 15,
-      "GGTracerVTriggerWrapper", "GGTracerVBridgeControlWrapper",
-      "GGTracerVMCRFile", "tracerv_mcr", "tracerv_ctrl", error);
+  // Required input invariants: active, uninstantiated trigger wrapper; one
+  // contiguous decoded port per ordered TracerV bank, as produced by
+  // addTracerVTriggerConfig. Each slave has independent AW/W/AR and response
+  // state, matching one Widget.genCRFile instance per Scala bridge.
+  // Annotations consumed/produced: none. Copied port targets transfer through
+  // each wrapper; internal model/channel/clock identities remain unchanged.
+  // IR mutations: add one MCRFile and wrapper per bank. All names, widths,
+  // directions, host controls and consumed targets are checked before mutation.
+  // Analyses required/preserved: none; hierarchy analyses must be rebuilt.
+  // Output invariants: every decoded bank has its own local Nasti slave;
+  // global allocation, arbitration and CPU stream storage remain later stages.
+  if (circuit.getName() != "GGTracerVTriggerWrapper") {
+    error = "TracerV MCRFile control needs the active trigger wrapper";
+    return failure();
+  }
+  FModuleOp top;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == circuit.getName()) top = m;
+  if (!top) {
+    error = "TracerV MCRFile control requires a top module";
+    return failure();
+  }
+  SmallVector<std::string> banks;
+  for (auto p : top.getPorts())
+    if (p.name.getValue().starts_with("tracerv_mcr"))
+      banks.push_back(p.name.str());
+  if (banks.empty()) {
+    error = "TracerV MCRFile control requires decoded banks";
+    return failure();
+  }
+  struct Plan { std::string bank, control, adapter, wrapper; };
+  SmallVector<Plan> plans;
+  for (unsigned i = 0; i < banks.size(); ++i) {
+    std::string suffix = i ? "_" + std::to_string(i) : "";
+    if (banks[i] != "tracerv_mcr" + suffix) {
+      error = "TracerV decoded banks must retain contiguous bridge order";
+      return failure();
+    }
+    plans.push_back({banks[i], "tracerv_ctrl" + suffix,
+        "GGTracerVMCRFile" + suffix,
+        "GGTracerVBridgeControlWrapper" +
+            (i + 1 == banks.size() ? "" : "_" + std::to_string(i))});
+  }
+  // Preflight every bank against the original boundary. A malformed last bank
+  // must not leave earlier banks partially mapped. Wrapping a bank preserves
+  // all other ports and their types, so these checks remain true at each step.
+  for (auto &p : plans)
+    if (failed(mapBridgeControl(circuit, addressBits, idBits, 15,
+            "", p.wrapper, p.adapter, p.bank, p.control, error, {}, top, true)))
+      return failure();
+  for (auto &p : plans) {
+    std::string input = circuit.getName().str();
+    if (failed(mapBridgeControl(circuit, addressBits, idBits, 15,
+            input, p.wrapper, p.adapter, p.bank, p.control, error)))
+      return failure();
+  }
+  return success();
 }
 
 LogicalResult goldengate::mapCPUStreamControl(CircuitOp circuit,

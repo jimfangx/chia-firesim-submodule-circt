@@ -3179,12 +3179,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerConfigAnnotations, error)))
         return fail("TracerV trigger configuration annotations: " + error);
       llvm::outs() << "Mapped CIRCT TracerV trigger configuration in " << tracerConfigPath << '\n';
-      // The next stage still owns one decoded bank. Preserve the completed
-      // multi-bank boundary for comparison, without partially mapping MMIO.
-      for (auto top : circuit.getOps<circt::firrtl::FModuleOp>())
-        if (top.getName() == circuit.getName())
-          for (auto port : top.getPorts()) if (port.name == "tracerv_mcr_1")
-            return fail("TracerV MCRFile transactions: multiple TracerV MMIO banks are not implemented");
       if (failed(goldengate::mapTracerVBridgeControl(circuit, 25, 12, error)))
         return fail("TracerV MCRFile transactions: " + error);
       if (failed(mlir::verify(*module)))
@@ -3200,6 +3194,12 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerControlAnnotations, error)))
         return fail("TracerV MCRFile transaction annotations: " + error);
       llvm::outs() << "Mapped CIRCT TracerV MCRFile transactions in " << tracerControlPath << '\n';
+      // Preserve the completed local-slave boundary until every stream has
+      // its own storage/allocation; buffering only stream zero loses events.
+      for (auto top : circuit.getOps<circt::firrtl::FModuleOp>())
+        if (top.getName() == circuit.getName())
+          for (auto port : top.getPorts()) if (port.name == "tracerv_stream_1")
+            return fail("TracerV stream queue: multiple TracerV stream queues are not implemented");
       if (failed(goldengate::addTracerVStreamQueue(circuit, error)))
         return fail("TracerV stream queue: " + error);
       if (failed(mlir::verify(*module)))

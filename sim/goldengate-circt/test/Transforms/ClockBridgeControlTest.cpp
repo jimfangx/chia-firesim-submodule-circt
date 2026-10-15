@@ -61,6 +61,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0,
   }
   return root;
 }
+void addTracerBanks(CircuitOp c) {
+  auto top = named(c, "GGTracerVTriggerWrapper"); OpBuilder b(c.getContext());
+  for (unsigned i = 1; i < 4; ++i)
+    top.insertPorts({{top.getNumPorts(), PortInfo(b.getStringAttr(
+        "tracerv_mcr_" + std::to_string(i)), top.getPortType(3), Direction::Out)}});
+}
 LogicalResult mapControl(CircuitOp c, unsigned bridge, unsigned addressBits,
                          unsigned idBits, std::string &error) {
   if (bridge == 7) return goldengate::mapTSIBridgeControl(c,addressBits,idBits,error);
@@ -119,15 +125,17 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx, unsigned bridge, unsigned tsiWords = 9) {
+void behavior(MLIRContext &ctx, unsigned bridge, unsigned tsiWords = 9,
+              bool multipleTracerBanks = false, unsigned tracerBank = 0) {
   unsigned bankWords = bridge == 7 ? tsiWords : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
   unsigned indexBits = llvm::Log2_64_Ceil(bankWords);
   unsigned indexMask = (1U << indexBits) - 1;
   std::string prefix = bridge == 7 ? "GGTSI" : bridge == 6 ? "GGSimulationMaster" : bridge == 5 ? "GGLoadMem" : bridge == 4 ? "GGCPUStream" : bridge == 1 ? "GGResetPulseBridge" : bridge == 2 ? "GGPeekPoke" : bridge == 3 ? "GGTracerV" : "GGClockBridge";
   auto root=fixture(ctx,0,bridge,tsiWords); auto c=*root->getOps<CircuitOp>().begin(); std::string error;
+  if (multipleTracerBanks) addTracerBanks(c);
   require(succeeded(mapControl(c,bridge,25,12,error)),error);
   require(succeeded(verify(*root)),"IR verification failed");
-  auto adapter=named(c,prefix+"MCRFile"), wrapper=named(c,prefix+(bridge == 2 || bridge == 3 || bridge == 7 ? "BridgeControlWrapper" : "ControlWrapper"));
+  auto adapter=named(c,prefix+"MCRFile"+(multipleTracerBanks && tracerBank ? "_"+std::to_string(tracerBank) : "")), wrapper=named(c,prefix+(bridge == 2 || bridge == 3 || bridge == 7 ? "BridgeControlWrapper" : "ControlWrapper"));
   require(wrapper.getPortName(3)==(bridge == 7 ? "tsiBridge_ctrl" : bridge == 6 ? "simulationMaster_ctrl" : bridge == 5 ? "loadmem_ctrl" : bridge == 4 ? "cpuStream_ctrl" : bridge == 1 ? "resetBridge_ctrl" : bridge == 2 ? "peekPokeBridge_ctrl" : bridge == 3 ? "tracerv_ctrl" : "clockBridge_ctrl") && wrapper.getPortDirection(3)==Direction::In,"slave boundary missing");
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(cast<DictionaryAttr>(annos[0]).getAs<StringAttr>("target").getValue()=="~"+wrapper.getName().str()+"|"+wrapper.getName().str()+">data","copied target was not transferred");
@@ -159,7 +167,7 @@ void behavior(MLIRContext &ctx, unsigned bridge, unsigned tsiWords = 9) {
   // queue separately; writes commit once, then B holds until consumption.
   bool haveAW=false,haveW=false,haveAR=false,done=false;
   uint64_t writeWord=0,readWord=0,writeID=0,readID=0,writeData=0;
-  std::mt19937_64 rng(148); unsigned readTransfers=0,writeTransfers=0,awFirst=0,wFirst=0;
+  std::mt19937_64 rng(148 + tracerBank); unsigned readTransfers=0,writeTransfers=0,awFirst=0,wFirst=0;
   std::vector<bool> seenRead(indexMask+1),seenWrite(indexMask+1);
   for (unsigned cycle=0;cycle<15000;++cycle) {
     sim.memo.clear(); bool reset=cycle<2 || cycle%137==0;
@@ -429,6 +437,47 @@ void tsiMapping(MLIRContext &ctx) {
   }
   llvm::outs()<<"TSI: aggregate control/bank bindings, six nested target transfers, 30 atomic boundary rejections and repeated-pass rejection passed\n";
 }
+// Preflight the last bank before constructing any of the first three slaves.
+void tracerMultiplicity(MLIRContext &ctx) {
+  auto printed=[](ModuleOp m) { std::string s; llvm::raw_string_ostream out(s); m.print(out); return s; };
+  OpBuilder b(&ctx);
+  for (unsigned bad = 0; bad < 8; ++bad) {
+    auto root=fixture(ctx,0,3); auto c=*root->getOps<CircuitOp>().begin();
+    addTracerBanks(c); auto top=named(c,"GGTracerVTriggerWrapper");
+    if (bad == 0) {
+      auto types=llvm::to_vector(top.getPortTypes()); types.back()=TypeAttr::get(UIntType::get(&ctx,1));
+      top.setPortTypes(types);
+    }
+    if (bad == 1) { auto names=llvm::to_vector(top.getPortNames()); names.back()=b.getStringAttr("tracerv_mcr_4"); top.setPortNames(names); }
+    if (bad == 2 || bad == 3) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      b.create<FModuleOp>(c.getLoc(),b.getStringAttr(bad == 2 ? "GGTracerVMCRFile_3" : "GGTracerVBridgeControlWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
+    }
+    if (bad == 4) top.insertPorts({{top.getNumPorts(),PortInfo(b.getStringAttr("tracerv_ctrl_3"),UIntType::get(&ctx,1),Direction::In)}});
+    if (bad == 5) c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({
+        b.getNamedAttr("target",b.getStringAttr("~GGTracerVTriggerWrapper|GGTracerVTriggerWrapper>tracerv_mcr_3.read[0].bits"))})}));
+    if (bad == 6) top.insertPorts({{top.getNumPorts(),PortInfo(b.getStringAttr("tracerv_mcr_extra"),top.getPortType(3),Direction::Out)}});
+    auto before=printed(*root); std::string error;
+    require(failed(goldengate::mapTracerVBridgeControl(c,25,bad == 7 ? 0 : 12,error)),"invalid fourth TracerV bank accepted");
+    require(before==printed(*root),"late TracerV rejection mutated IR");
+  }
+  auto root=fixture(ctx,0,3); auto c=*root->getOps<CircuitOp>().begin(); addTracerBanks(c); std::string error;
+  require(succeeded(goldengate::mapTracerVBridgeControl(c,25,12,error)),error);
+  require(succeeded(verify(*root)),"four TracerV slaves produced invalid IR");
+  auto outer=named(c,"GGTracerVBridgeControlWrapper");
+  for (unsigned i=0;i<4;++i) {
+    auto suffix=i ? "_"+std::to_string(i) : "";
+    require(outer.getPortName(3+i)=="tracerv_ctrl"+suffix && outer.getPortDirection(3+i)==Direction::In,"ordered slave missing");
+    auto wrapper=named(c,"GGTracerVBridgeControlWrapper"+(i==3 ? "" : "_"+std::to_string(i)));
+    auto adapter=named(c,"GGTracerVMCRFile"+suffix); unsigned bound=0;
+    for(auto inst:wrapper.getOps<InstanceOp>()) if(inst.getModuleName()==adapter.getName()) ++bound;
+    require(bound==1,"slave adapter not instantiated independently");
+  }
+  auto before=printed(*root);
+  require(failed(goldengate::mapTracerVBridgeControl(c,25,12,error)),"repeated TracerV mapping accepted");
+  require(before==printed(*root),"repeated TracerV mapping mutated IR");
+  llvm::outs()<<"TracerV: four independent slaves, eight late atomic rejections and repeated-pass rejection passed\n";
+}
 void rejection(MLIRContext &ctx, unsigned bridge) {
   for(unsigned bad=0;bad<5;++bad){
     auto root=fixture(ctx,bad<3 ? bad : 0,bridge);auto c=*root->getOps<CircuitOp>().begin();
@@ -443,7 +492,7 @@ void rejection(MLIRContext &ctx, unsigned bridge) {
 }
 }
 int main(){
-  try {MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();countBank(ctx);loadMemMapping(ctx);tsiMapping(ctx);for(unsigned bridge : {0U,1U,2U,3U,4U,5U,6U,7U}) {behavior(ctx,bridge);rejection(ctx,bridge);}
+  try {MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();tracerMultiplicity(ctx);for(unsigned bank=0;bank<4;++bank) behavior(ctx,3,0,true,bank);countBank(ctx);loadMemMapping(ctx);tsiMapping(ctx);for(unsigned bridge : {0U,1U,2U,3U,4U,5U,6U,7U}) {behavior(ctx,bridge);rejection(ctx,bridge);}
     for(unsigned count : {1U,16U,17U}) behavior(ctx,7,count);}
   catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}return 0;
 }

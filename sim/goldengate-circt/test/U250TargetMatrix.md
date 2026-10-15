@@ -6638,3 +6638,109 @@ Compiler SHA256 is
 `83d77ba648d733a4b4a839141c2eebca89dbc8a79c8fe671f5d212388c3be7a2`;
 the matrix executable hash guard and all 495 native-source hashes remain
 unchanged through replay.
+
+## Iteration 239: independent quad-Rocket TracerV MCRFile slaves
+
+`ClockBridgeControl.cpp` maps every ordered `tracerv_mcr[_i]` bank to its own
+native MCRFile adapter and control port. The four adapters retain independent
+AW/W/AR capture, response flags, IDs, indices and write data, following
+`midas/widgets/Lib.scala` and one `Widget.genCRFile` per SFC TracerV bridge.
+Each fifteen-word bank keeps address bits 5:2 and the oracle's index-fifteen
+read alias/uncommitted-write behavior. Intermediate wrappers preserve all
+other ports and connections; the final wrapper keeps the established canonical
+name. Single-bridge names and hardware remain unchanged.
+
+All banks are preflighted before creating hardware: contiguous bridge order,
+complete decoded types/directions, host controls, consumed target references,
+and every planned module/control-port name. A malformed fourth bank leaves
+no earlier bank partially mapped. The expanded `goldengate-clock-bridge-control`
+CTest passes eight late atomic rejections, repeated-pass rejection, four
+independent slave instances, and 15,000 transaction-model cycles per adapter
+with stalls, reset and all sixteen local indices. The existing control tests
+also pass; CTest completes in 200.61 seconds. Preexisting shared UART changes
+were preserved and are excluded from this iteration's checkpoint.
+
+The new `TracerVControlMultiplicityCompare.py` lowers each actual production
+adapter separately with the pinned firtool, then executes four independent
+native/SFC pairs in Verilator. The exact oracle is `MCRFile_6`, instantiated
+by `TracerVBridgeModule`, from:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv
+```
+
+The artifact SHA256 is
+`deadc7f5a903ceed20047342e4b81dde7f19cc32be914de6f5b910d3d70771d2`.
+All surviving SFC outputs match for 24,000 cycles per slave, with independent
+requests/resets and 15,633 completed reads plus 6,530 write responses in total.
+Every slave exercises all sixteen read and write indices. The SFC RTL folds
+constant ready/valid and write-only read lanes; the comparison specializes those
+same inputs explicitly. Unreset response payloads are compared when valid.
+A crossed fourth-bank route fails the structured composition check, and a
+same-width address-bit shift that still lowers as valid IR fails the executed
+RTL differential. These negative controls establish that the comparison detects
+routing and transaction errors.
+
+All 59 previous native modules remain unchanged; exactly four adapters and
+four wrappers are added, with distinct control/MCR bindings. All 2,630 retained
+annotations match after the four exact copied-port/circuit target transfers.
+The compiler emits `post-fame-tracerv-control.mlir` and
+`post-fame-tracerv-control-all.json`, then explicitly rejects the next
+unsupported multiple-stream queue stage. Quad-core remains an incomplete
+simulator; this result establishes only its local control-slave boundary.
+
+All 267 NIC and 256 no-NIC MLIR/annotation artifacts match iteration 238 after
+candidate-path normalization. Ten final RTL/header/XDC files remain
+byte-identical. Rocket `.sfc.fir` and `.anno.json` inputs match the immutable
+2026-10-01 staging fixture; `design/FireSim-generated.synthesis.xdc` matches
+the immutable 2026-10-01 U250 build-tree artifact exactly, and
+`design/FireSim-generated.implementation.xdc` matches after the documented
+`target/FireSim_` to `target_FAMETop/FireSim` hierarchy rename.
+
+Evidence is in `iteration239-u250-target-matrix/` under the active generated
+folder: `ctest.log`, `quad-tracerv-control-checked/comparison.json`, the lowered
+adapter RTL and positive/negative simulation logs,
+`production-boundary-regression.json`, `emitted-regression.json`,
+`immutable-rocket-comparison.json`, and source/input snapshots. To repeat the
+new comparison in the sourced FireSim environment:
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/TracerVControlMultiplicityCompare.py \
+  <iteration239>/replay/alveo_u250_firesim_rocket_quadcore_no_nic/candidate \
+  <outer-repo>/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv \
+  <outer-repo>/.conda-env/riscv-tools/bin/firtool <new-evidence-directory>
+```
+
+Supplied iteration-238 replacertl/provenance and fresh Verilator smoke passed
+before this change; no manager verification gates were started here. The next
+smallest core step is independent TracerV stream storage for all four producers,
+followed by global control allocation and stream/driver ABI integration.
+Other trace widths, FASED profiles, partition/QSFP, NIC runtime, SRAM equivalence
+and target boot remain open.
+
+For replay space, 586 old iteration-235 MLIR dumps were losslessly compressed
+to adjacent `.mlir.gz`, recovering 36,875,613,500 bytes. The record
+`lossless-storage-cleanup-235.json` checks original and decompressed SHA256
+before removing originals. Current/prior comparison baselines, JSON, logs,
+final RTL and immutable fixtures were retained.
+
+The thirteen-target replay completes with two compiled targets, five compiler
+gaps and six unsupported partition/QSFP platforms, returning nonzero for these
+gaps. Quad-core alone advances from the multiple-MMIO rejection to the
+multiple-stream-queue rejection. All archived input hashes, effective platform
+semantics and earlier boundary checks match iteration 238. Prior comparison
+status remains eight matched, six mismatched (native SRAM model ports), and
+twelve not reached. These unresolved comparisons are not semantic passes.
+`replay/matrix.json` and `matrix-regression.json` retain the results.
+Compiler SHA256 is
+`93d6c9a579527dc0d65b51532a6e2bc4f297f0f7776b950ff95be791f46341a6`;
+the executable start/end guard and all 495 native-source hashes remain
+unchanged during replay. `source-inputs-final.json` and
+`source-replay-stability.json` explicitly record the comparison-script-only
+update that added the executed address-decoding negative control.
+
+The exact checkpoint versions of `ClockBridgeControl.cpp` and its test were
+compiled separately and the complete focused test executable passed, excluding
+the preexisting UART changes without modifying the shared worktree or active
+compiler binary. `checkpoint-build.log` and `checkpoint-test.log` record this
+additional check.
