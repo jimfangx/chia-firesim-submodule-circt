@@ -4621,10 +4621,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlMasterAnnotations, error)))
         return fail("host control master annotations: " + error);
       llvm::outs() << "Assembled CIRCT host control master in " << controlMasterPath << '\n';
-      // NIC host-memory and remaining platform assembly still require their
-      // own comparisons before enabling the following boundaries.
-      if (!cpuSinks.empty())
-        return fail("NIC host memory binding and platform integration are not implemented");
+      // NIC shares FASED's local 35/64/4-bit NASTI-to-AXI adaptation.
+      // Keep its streaming ports while assembling the memory master.
       if (failed(goldengate::bindFASEDHostMemory(circuit, error)))
         return fail("FASED host memory binding: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED host memory binding produced invalid FIRRTL IR");
@@ -4638,6 +4636,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostMemoryAnnotations, error)))
         return fail("FASED host memory annotations: " + error);
       llvm::outs() << "Assembled CIRCT FASED host memory master in " << hostMemoryPath << '\n';
+      // Address translation and the remaining NIC platform integration need
+      // their own boundary comparisons before enabling subsequent transforms.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED address translation and platform integration are not implemented");
       if (failed(goldengate::addFASEDAddressTranslation(circuit, error)))
         return fail("FASED address translation: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED address translation produced invalid FIRRTL IR");

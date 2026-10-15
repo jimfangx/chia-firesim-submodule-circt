@@ -113,23 +113,22 @@ def sfc_contract(path, fields):
     return declared, sorted(optimized), checked
 
 
-def compare(before_path, after_path, baseline):
+def compare_binding(before_path, after_path, baseline=None):
     before, after = before_path.read_text(), after_path.read_text()
     pattern = r'^    firrtl.module @(\w+)(\(.*?^    })'
     prior, result = (dict(re.findall(pattern, text, re.M | re.S)) for text in (before, after))
-    assert len(prior) == 260 and set(result) - set(prior) == {NEW}
+    assert set(result) - set(prior) == {NEW}
     assert all(result.get(name) == body for name, body in prior.items()), 'existing module body changed'
     old, new = native_module(before, OLD), native_module(after, NEW)
     old_ports = native_ports(old)
-    assert len(old_ports) == 112 and CONSUMED <= {n for _, n, _ in old_ports}
+    assert CONSUMED <= {n for _, n, _ in old_ports}
     copied = [(d, n, t) for d, n, t in old_ports if n not in CONSUMED]
-    assert len(copied) == 109
     assert native_ports(new) == copied + [('out', 'fased_host_mem', memory_type())]
     routes, mapped, fields = memory_routes()
     nets = {('sim.' if d == 'in' else 'top.') + n: ('top.' if d == 'in' else 'sim.') + n
             for d, n, _ in copied}
     nets.update(routes)
-    assert len(routes) == 39 and len(nets) == 148 and memory_wiring(new) == nets
+    assert len(routes) == 39 and memory_wiring(new) == nets, 'actual host memory SSA wiring differs'
     assert len(re.findall(r' = firrtl.instance sim @' + OLD + r'\b', new)) == 1
     assert not re.search(r'firrtl.(?:reg|regreset|mem)\b', new), 'assembly duplicated state'
     if baseline is not None:
@@ -139,7 +138,6 @@ def compare(before_path, after_path, baseline):
         assert all(shared_nets.get(key) == value for key, value in routes.items())
     header = before.splitlines()[1]
     probes = []
-    assert after.splitlines()[1].count('class = "test.HostMemoryBoundary"') == 8, 'missing identity probes'
     if 'class = "test.HostMemoryBoundary"' in after.splitlines()[1]:
         probes = ['~' + OLD + '|' + OLD + '>' + ref for ref in (
             'ctrl.aw.bits.addr', 'fased_host_requests.aw.bits.addr',
@@ -155,17 +153,26 @@ def compare(before_path, after_path, baseline):
                         '~' + OLD + '|' + NEW + '>' + new_ref, header)
     header = transfer(header, OLD, NEW, [(d, n) for d, n, _ in copied])
     assert after.splitlines()[1] == header, 'annotation archive transfer differs'
-    print_modules = [name for name in prior if name.startswith('GGPrintBridge')]
+    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(prior),
+                copied_ports=len(copied), consumed_ports=sorted(CONSUMED), AXI_leaves=len(fields),
+                invalid_response_users=2, wrapper_connections=len(nets), memory_connections=routes,
+                annotation_archive_transfer=True, annotation_identity_probes=len(probes),
+                shared_baseline_compared=baseline is not None)
+
+
+def compare(before_path, after_path, baseline):
+    report = compare_binding(before_path, after_path, baseline)
+    assert report['unchanged_module_bodies'] == 260
+    assert report['copied_ports'] == 109 and report['wrapper_connections'] == 148
+    assert report['annotation_identity_probes'] == 8, 'missing identity probes'
+    before, after = before_path.read_text(), after_path.read_text()
+    print_modules = re.findall(r'^    firrtl.module @(GGPrintBridge\w+)\(', before, re.M)
     assert len(print_modules) == 21 and 'GGPrintBridgeHostQueued' in print_modules
     regions = re.search(r'goldengate.controlRegions = \[(.*?)\]', after)[1]
     print_regions = re.findall(r'name = "(PrintBridgeModule_\d+)", size = (\d+) : i64, slave = (\d+) : i32, start = (\d+) : i64', regions)
     assert print_regions == [('PrintBridgeModule_0', '32', '8', '544'), ('PrintBridgeModule_1', '32', '9', '576')]
-    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(prior),
-                copied_ports=len(copied), consumed_ports=sorted(CONSUMED), AXI_leaves=len(fields),
-                invalid_response_users=2, wrapper_connections=len(nets), memory_connections=routes,
-                retained_Print_modules=len(print_modules), retained_Print_regions=print_regions,
-                annotation_archive_transfer=True, annotation_identity_probes=len(probes),
-                shared_baseline_compared=baseline is not None)
+    report.update(retained_Print_modules=len(print_modules), retained_Print_regions=print_regions)
+    return report
 
 
 def main():
