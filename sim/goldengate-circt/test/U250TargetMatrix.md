@@ -6453,3 +6453,91 @@ harness-owned runtime coverage. The next smallest core step is removing the
 multiple-TracerV-constructor restriction exposed by archived quad-core Rocket.
 Other TracerV widths, FASED outstanding profiles, partition/QSFP and SRAM model
 equivalence remain open. Unrelated shared-worktree changes are excluded.
+
+## Iteration 237: preserve independent quad-Rocket TracerV token engines
+
+`TracerVTokenEngine.cpp` now maps every supported Rocket TracerV constructor
+in annotation order to its own native FIRRTL module, instance, register state,
+control/stream boundary and twelve channels. All constructors, channel endpoints
+and generated names are checked before mutation. This ports the per-bridge
+HostPort connection helpers in `FPGATop.scala` and the independent token state
+in `TracerVBridge.scala`; the `MidasTransforms.scala` and `FAMETransform.scala`
+host clock/reset and stage ordering remain intact. Single-bridge names and
+operations are preserved.
+
+The archived quad-core Rocket now emits `post-fame-tracerv-token.mlir` and
+`post-fame-tracerv-token-all.json` with four distinct engines and 48 channels.
+The following trigger stage rejects multiple banks atomically with
+`multiple TracerV trigger configurations are not implemented`; it must not
+silently configure only the first bridge. Quad-core remains a failed target.
+
+Exact SFC references are under the outer repository's
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/`:
+
+- `post-bridge-extraction.json`: all four ordered constructors and channel maps
+  match; all 2,630 candidate annotation records are retained with the intended
+  target changes and added host channel endpoints.
+- `post-find-default-clocks.json`: all four bridge clock records match; the
+  candidate channel clock map survives the attachment unchanged.
+- `post-sim-mapping.fir`: four ordered SFC TracerV instances are confirmed.
+- `FireSim-generated.sv`: SFC aggregate handshake terms and surviving payload
+  routes match. Each of the four actual native modules is independently lowered
+  with the pinned firtool and compared with SFC on 1,024 Boolean input/state
+  combinations, random 40-bit PCs and 64-bit cycle counters. All 24,576 output
+  comparisons pass, including credits/debits and 512-bit packets. Three
+  corrupted bridge-target/channel-map/endpoint controls are rejected.
+
+The native `goldengate-tracerv-token` CTest passes 130,720 packet/next-state
+comparisons across the single and four-bridge engines, 4,096 independent
+four-bridge arrival/stall vectors, 48 channel identity checks and four late
+atomic rejections. Existing single-bridge helper, trigger configuration and
+trigger-bank reuse tests also pass. These tests cover token-engine semantics;
+quad-core trigger MMIO and stream storage have not been implemented.
+
+The complete thirteen-target replay returns nonzero as expected: two targets
+compile, five reach compiler gaps, and six reject unsupported partition/QSFP
+platforms. Archived input hashes, effective platforms and earlier boundary
+checks match iteration 236. The only diagnostic advance is quad-core from
+multiple token engines to multiple trigger banks. Earlier comparisons remain
+eight matched, six mismatched (native SRAM model ports) and twelve not reached.
+All 267 NIC and 256 no-NIC MLIR/JSON artifacts match iteration 236 after candidate
+path normalization. Ten final RTL/header/XDC files remain byte-identical.
+
+The Rocket `.sfc.fir` and `.anno.json` inputs still match the immutable
+`firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01` staging
+fixture. `FireSim-generated.synthesis.xdc` matches the immutable U250 build-tree
+reference exactly; `.implementation.xdc` matches after the documented
+`target/FireSim_` to `target_FAMETop/FireSim` hierarchy rename.
+
+Evidence is in `iteration237-u250-target-matrix/` under the active generated
+folder: `replay/matrix.json`, `matrix-regression.json`,
+`quad-tracerv/comparison.json`, `quad-tracerv.log`, `ctest.log`,
+`ctest-details.log`, `production-boundary-regression.json`,
+`emitted-regression.json`, `immutable-rocket-comparison.json`,
+`source-inputs.json`, `source-regression.json` and `inputs.json`. The comparison
+can be repeated in the sourced FireSim environment with:
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/TracerVMultiplicityCompare.py \
+  <iteration237>/replay/alveo_u250_firesim_rocket_quadcore_no_nic/candidate \
+  <outer-repo>/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design \
+  <outer-repo>/.conda-env/riscv-tools/bin/firtool <new-evidence-directory>
+```
+
+Compiler SHA256 is
+`8a61123d4399df8b15ae874f43fbf6f2a522e32c6ff24e7e741eb1e86169993e`;
+the matrix's start/end executable hash guard passes. The initial source snapshot
+preceded a test-fixture API correction and formatting; both snapshots and the
+explicit test-only delta are retained. Native compiler inputs were unchanged
+during replay. Supplied iteration-236 replacertl/provenance and fresh Verilator
+smoke results precede this change; no manager verification gates were started
+here. The next smallest core step is four independent TracerV trigger banks,
+followed by their MMIO and stream storage integration. Other trace widths,
+FASED profiles, partition/QSFP, NIC runtime and SRAM equivalence remain open.
+Unrelated shared-worktree changes are excluded.
+
+To retain replay space, 586 old iteration-233 MLIR dumps were losslessly
+compressed to adjacent `.mlir.gz`, recovering 36,875,613,500 bytes.
+`lossless-storage-cleanup-233.json` records original/decompressed SHA256 checks.
+Current/prior comparison baselines, JSON, logs, final RTL and immutable fixtures
+were retained.

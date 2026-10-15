@@ -26,7 +26,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned latency = 1) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned latency = 1, unsigned bridges = 1) {
   auto root = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGPeekPokeBridgeControlWrapper" {
     firrtl.module @GGPeekPokeBridgeControlWrapper() {}
   } })", &ctx);
@@ -37,12 +37,17 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned la
   auto uint = [&](unsigned w) { return UIntType::get(&ctx, w, false); };
   SmallVector<PortInfo> ports{{b.getStringAttr("hostClock"), ClockType::get(&ctx), Direction::In},
                             {b.getStringAttr("hostReset"), uint(1), Direction::In}};
-  NamedAttrList mapping;
-  for (unsigned j = 0; j < 12; ++j) {
-    auto type = BundleType::get(&ctx, {{b.getStringAttr("ready"), true, uint(1)},
-        {b.getStringAttr("valid"), false, uint(1)}, {b.getStringAttr("bits"), false, uint(widths[j])}});
-    ports.push_back({b.getStringAttr("token" + std::to_string(j)), type, j < 10 ? Direction::Out : Direction::In});
-    mapping.set(locals[j], b.getStringAttr("tracerv_" + locals[j].str()));
+  SmallVector<DictionaryAttr> mappings;
+  for (unsigned bridge = 0; bridge < bridges; ++bridge) {
+    NamedAttrList mapping;
+    std::string suffix = bridge ? "_" + std::to_string(bridge) : "";
+    for (unsigned j = 0; j < 12; ++j) {
+      auto type = BundleType::get(&ctx, {{b.getStringAttr("ready"), true, uint(1)},
+          {b.getStringAttr("valid"), false, uint(1)}, {b.getStringAttr("bits"), false, uint(widths[j])}});
+      ports.push_back({b.getStringAttr("token" + suffix + "_" + std::to_string(j)), type, j < 10 ? Direction::Out : Direction::In});
+      mapping.set(locals[j], b.getStringAttr("tracerv" + suffix + "_" + locals[j].str()));
+    }
+    mappings.push_back(mapping.getDictionary(&ctx));
   }
   ports.push_back({b.getStringAttr("other"), uint(8), Direction::Out});
   b.create<FModuleOp>(c.getLoc(), b.getStringAttr(c.getName()), ConventionAttr::get(&ctx, Convention::Internal), ports);
@@ -52,17 +57,21 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned la
       b.getNamedAttr("retireWidth", b.getI64IntegerAttr(retire)), b.getNamedAttr("iaddrWidth", b.getI64IntegerAttr(40)),
       b.getNamedAttr("insnWidth", b.getI64IntegerAttr(32)), b.getNamedAttr("causeWidth", b.getI64IntegerAttr(64)),
       b.getNamedAttr("tvalWidth", b.getI64IntegerAttr(40))});
-  SmallVector<Attribute> all{dict({str("class", "firesim.lib.bridgeutils.BridgeIOAnnotation"),
-      str("widgetClass", "firechip.goldengateimplementations.TracerVBridgeModule"),
-      str("target", "~FireSim|FireSim>tracerv"), b.getNamedAttr("widgetConstructorKey", key),
-      b.getNamedAttr("channelMapping", mapping.getDictionary(&ctx))})};
-  for (unsigned j = 0; j < 12; ++j)
-    all.push_back(dict({str("class", "midas.passes.fame.FAMEChannelConnectionAnnotation"),
-        str("globalName", "tracerv_" + locals[j].str()),
-        b.getNamedAttr("channelInfo", dict({str("class", "midas.passes.fame.PipeChannel"),
-            b.getNamedAttr("latency", b.getI64IntegerAttr(latency))})),
-        b.getNamedAttr(j < 10 ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(
-            "~GGPeekPokeBridgeControlWrapper|GGPeekPokeBridgeControlWrapper>token" + std::to_string(j) + ".bits")}))}));
+  SmallVector<Attribute> all;
+  for (unsigned bridge = 0; bridge < bridges; ++bridge) {
+    std::string suffix = bridge ? "_" + std::to_string(bridge) : "";
+    all.push_back(dict({str("class", "firesim.lib.bridgeutils.BridgeIOAnnotation"),
+        str("widgetClass", "firechip.goldengateimplementations.TracerVBridgeModule"),
+        str("target", "~FireSim|FireSim>tracerv"), b.getNamedAttr("widgetConstructorKey", key),
+        b.getNamedAttr("channelMapping", mappings[bridge])}));
+    for (unsigned j = 0; j < 12; ++j)
+      all.push_back(dict({str("class", "midas.passes.fame.FAMEChannelConnectionAnnotation"),
+          str("globalName", "tracerv" + suffix + "_" + locals[j].str()),
+          b.getNamedAttr("channelInfo", dict({str("class", "midas.passes.fame.PipeChannel"),
+              b.getNamedAttr("latency", b.getI64IntegerAttr(latency))})),
+          b.getNamedAttr(j < 10 ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(
+              "~GGPeekPokeBridgeControlWrapper|GGPeekPokeBridgeControlWrapper>token" + suffix + "_" + std::to_string(j) + ".bits")}))}));
+  }
   all.push_back(dict({str("class", "test.Annotation"), str("target", "~GGPeekPokeBridgeControlWrapper|GGPeekPokeBridgeControlWrapper>other")}));
   c->setAttr("rawAnnotations", b.getArrayAttr(all)); return root;
 }
@@ -113,11 +122,11 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void behavior(MLIRContext &ctx, unsigned bridgeNumber = 0, unsigned bridges = 1) {
+  auto root = fixture(ctx, 1, 1, bridges); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addTracerVTokenEngine(c, error)), error);
   require(succeeded(verify(*root)), "engine/wrapper invalid IR");
-  Interpreter sim(named(c, "GGTracerVTokenEngine"));
+  Interpreter sim(named(c, "GGTracerVTokenEngine" + (bridgeNumber ? "_" + std::to_string(bridgeNumber) : "")));
   std::map<std::string, Value> regs;
   for (auto r : sim.module.getOps<RegResetOp>()) regs[r.getName().str()] = r.getResult();
   require(regs.size() == 3 && sim.module.getOps<RegOp>().empty(), "wrong reset policy");
@@ -220,6 +229,84 @@ void annotationsAndRejection(MLIRContext &ctx) {
     auto saved = print(*bad);
     require(failed(goldengate::addTracerVTokenEngine(bc, error)) && !error.empty() && print(*bad) == saved, "unsupported boundary mutated IR");
   }
+}
+void multipleBridges(MLIRContext &ctx) {
+  auto root = fixture(ctx, 1, 1, 4); auto c = *root->getOps<CircuitOp>().begin();
+  auto before = c->getAttrOfType<ArrayAttr>("rawAnnotations"); std::string error;
+  require(succeeded(goldengate::addTracerVTokenEngine(c, error)) && succeeded(verify(*root)), error);
+  auto wrapper = named(c, "GGTracerVTokenWrapper");
+  require(wrapper.getNumPorts() == 11, "four bridges need independent control/stream ports");
+  SmallVector<InstanceOp> tracers; InstanceOp inner;
+  for (auto inst : wrapper.getOps<InstanceOp>()) {
+    if (inst.getName() == "sim") inner = inst; else tracers.push_back(inst);
+  }
+  require(inner && tracers.size() == 4, "four bridge instances were not preserved");
+  auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(raw.size() == before.size(), "multiple bridge annotation loss");
+  for (unsigned n = 0; n < 4; ++n) {
+    std::string suffix = n ? "_" + std::to_string(n) : "";
+    auto bridge = cast<DictionaryAttr>(raw[13 * n]);
+    auto old = cast<DictionaryAttr>(before[13 * n]);
+    for (auto key : {"widgetConstructorKey", "channelMapping"})
+      require(bridge.get(key) == old.get(key), "multiple bridge constructor identity changed");
+    auto target = goldengate::resolveAnnotationTarget(c, bridge.getAs<StringAttr>("target").getValue(), error);
+    require(target && target->module == named(c, "GGTracerVTokenEngine" + suffix), "multiple bridge identity aliased");
+    require(tracers[n].getModuleName() == target->module.getModuleName(), "constructor ordering lost");
+    for (unsigned j = 0; j < 12; ++j) {
+      auto channel = cast<DictionaryAttr>(raw[13 * n + j + 1]);
+      auto targets = channel.getAs<ArrayAttr>(j < 10 ? "sinks" : "sources");
+      auto endpoint = goldengate::resolveAnnotationTarget(c, cast<StringAttr>(targets[0]).getValue(), error);
+      require(endpoint && endpoint->module == target->module, "channel connected to another bridge");
+    }
+  }
+  // Random independent arrivals and bridge stalls must never couple the four
+  // helpers. Exclude each endpoint's own predicate, just as FPGATop does.
+  Interpreter sim(wrapper); std::mt19937_64 random(237);
+  for (unsigned sample = 0; sample < 4096; ++sample) {
+    unsigned masks[4], readies[4], consume[4], produce[4]; sim.memo.clear();
+    for (unsigned n = 0; n < 4; ++n) {
+      masks[n] = random() & 1023; readies[n] = random() & 3;
+      consume[n] = random() & 1; produce[n] = random() & 1;
+      for (unsigned j = 0; j < 12; ++j)
+        sim.put(inner.getResult(2 + 12 * n + j), j < 10 ? "valid" : "ready",
+            j < 10 ? (masks[n] >> j) & 1 : (readies[n] >> (j - 10)) & 1);
+      sim.put(tracers[n].getResult(2), "toHost.hReady", consume[n]);
+      sim.put(tracers[n].getResult(2), "fromHost.hValid", produce[n]);
+    }
+    for (unsigned n = 0; n < 4; ++n) {
+      require(sim.output(tracers[n].getResult(2), "toHost.hValid").getBoolValue() == (masks[n] == 1023), "cross-bridge input coupling");
+      require(sim.output(tracers[n].getResult(2), "fromHost.hReady").getBoolValue() == (readies[n] == 3), "cross-bridge output coupling");
+      for (unsigned j = 0; j < 12; ++j) {
+        unsigned observed = j < 10 ? masks[n] : readies[n], all = j < 10 ? 1023 : 3;
+        unsigned own = 1 << (j < 10 ? j : j - 10), gate = j < 10 ? consume[n] : produce[n];
+        require(sim.output(inner.getResult(2 + 12 * n + j), j < 10 ? "ready" : "valid").getBoolValue() ==
+            (gate && (observed | own) == all), "multiple bridge helper predicate mismatch");
+      }
+    }
+  }
+  auto snapshot = print(*root);
+  require(failed(goldengate::addTracerVTriggerConfig(c, error)) && print(*root) == snapshot &&
+      error == "multiple TracerV trigger configurations are not implemented", "multi-trigger boundary must reject atomically");
+  for (unsigned mode = 0; mode < 4; ++mode) {
+    auto bad = fixture(ctx, 1, 1, 4); auto bc = *bad->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+    auto attrs = bc->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> changed(attrs.begin(), attrs.end());
+    NamedAttrList last(cast<DictionaryAttr>(attrs[39]));
+    if (mode == 0) {
+      NamedAttrList key(cast<DictionaryAttr>(last.get("widgetConstructorKey")));
+      key.set("retireWidth", b.getI64IntegerAttr(2)); last.set("widgetConstructorKey", key.getDictionary(&ctx));
+    }
+    if (mode == 1) last.set("channelMapping", cast<DictionaryAttr>(attrs[0]).get("channelMapping"));
+    changed[39] = last.getDictionary(&ctx); bc->setAttr("rawAnnotations", b.getArrayAttr(changed));
+    auto top = named(bc, "GGPeekPokeBridgeControlWrapper");
+    if (mode == 2) top.insertPorts({{top.getNumPorts(), PortInfo(b.getStringAttr("tracerv_stream_3"), UIntType::get(&ctx, 1), Direction::Out)}});
+    if (mode == 3) {
+      b.setInsertionPointToEnd(bc.getBodyBlock());
+      b.create<FModuleOp>(bc.getLoc(), b.getStringAttr("GGTracerVTokenEngine_3"), top.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    auto saved = print(*bad);
+    require(failed(goldengate::addTracerVTokenEngine(bc, error)) && print(*bad) == saved, "late bridge rejection partially mutated circuit");
+  }
+  llvm::outs() << "4096 four-bridge stall/arrival comparisons, 48 channel identities and four late atomic rejections passed\n";
 }
 void triggerConfiguration(MLIRContext &ctx) {
   auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
@@ -414,7 +501,9 @@ void triggerBankReuse(MLIRContext &ctx) {
 int main() {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(ctx); wiring(ctx); annotationsAndRejection(ctx); triggerConfiguration(ctx); triggerBankReuse(ctx);
+    behavior(ctx);
+    for (unsigned n = 0; n < 4; ++n) behavior(ctx, n, 4);
+    wiring(ctx); multipleBridges(ctx); annotationsAndRejection(ctx); triggerConfiguration(ctx); triggerBankReuse(ctx);
     llvm::outs() << "TracerV identity, target transfer and atomic rejection passed\n"; return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

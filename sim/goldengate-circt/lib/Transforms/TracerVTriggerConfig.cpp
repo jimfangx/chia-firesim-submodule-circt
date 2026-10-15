@@ -24,6 +24,15 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!inner || !engine || !raw) return reject("TracerV trigger configuration needs the native engine and retained annotations");
+  unsigned tracerCount = 0;
+  for (auto attr : raw) {
+    auto annotation = dyn_cast<DictionaryAttr>(attr);
+    if (annotation && annotation.getAs<StringAttr>("class") == "firesim.lib.bridgeutils.BridgeIOAnnotation" &&
+        annotation.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.TracerVBridgeModule")
+      ++tracerCount;
+  }
+  if (tracerCount != 1)
+    return reject("multiple TracerV trigger configurations are not implemented");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   auto bit = uint(1);
