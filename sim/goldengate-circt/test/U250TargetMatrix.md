@@ -4324,3 +4324,109 @@ also match. `production-boundary-regression.json`,
 `no-nic-emitted-regression.json`, `immutable-rocket-comparison.json`,
 `matrix-regression.json`, `tool-input-hashes.json` and `native-test.log` retain
 these checks. Existing user edits remain outside this checkpoint.
+
+## Iteration 215: NIC FASED local MCRFile transport
+
+The production compiler now invokes `mapFASEDBridgeControl` on the NIC
+`GGFASEDMMIOWrapper`, validates the resulting adapter/fragment register count
+against the allocated widget, verifies the full IR, and emits
+`post-fame-fased-control.mlir` and `post-fame-fased-control-all.json`. This
+attaches the existing CIRCT implementation of Scala `Lib.scala` MCRFile to
+the real NIC bank. The following slave/platform boundary still rejects with
+`NIC FASED control slave binding and platform integration are not implemented`.
+This is local transport progress, not successful NIC compilation or runtime.
+
+The Scala oracle inspected this turn was `MidasTransforms.scala`'s
+InferModelPorts/FAMETransform/SimulationMapping ordering,
+`FAMETransform.scala`'s host clock/reset and target/channel renames,
+`Widget.scala:genCRFile`, and `Lib.scala:MCRFile`. The adapter retains separate
+AW/W capture, held B/R flags and captured IDs, live read data, five-bit local
+`addr[6:2]` selection, zero legacy MCR strobes, and handshake/reset-qualified
+AW/AR single-beat assertions. It has four reset transaction flags and five
+unreset payload/index registers. The NIC wrapper preserves 202 prior module
+bodies, 190 copied typed ports and 1,792 annotation records; all 194 actual
+connections and recursive annotation transfers pass. The no-NIC equivalent
+preserves 188 modules, 185 copied ports, 1,676 annotations and 189 connections.
+Both wrappers introduce no extra state beyond the one shared MCRFile.
+
+`FASEDControlTest.cpp` can now export an exact clone of the production adapter
+for isolated lowering; it does not rebuild a test implementation. The new
+`NICFASEDControlCompare.py` compares the full attachment, state equations,
+typed ports, annotation transfer, 21 register offsets/permissions and allocated
+128-byte region at base 128/slave 1, then executes the cloned adapter against
+the actual archived SFC `MCRFile_5` RTL. The golden artifacts are:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+  (SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`)
+  and its `FireSim-generated.const.h` driver ABI.
+- The corresponding `alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  (SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`)
+  and its driver header, both in that same archive.
+- The immutable October 1 U250 build-tree fixture's `design/FireSim-generated.sv`
+  at `/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+  (SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`).
+  That fixture has no driver header; the ABI comparison explicitly supplies
+  the separately archived no-NIC SFC header above.
+
+All three fresh production/SFC RTL differentials pass 24,898 isolated
+Verilator cycles each: 3,904 reads, 365 writes, 248 AW-first transactions,
+218 W-first transactions, 8,690 read-stall cycles and 1,528 write-stall cycles.
+Directed and randomized traffic covers all 32 valid/invalid indices, high
+address aliases/byte offsets, concurrent read/write requests, reset
+cancellation, live bank read-data changes during stalls and ignored W metadata.
+SFC has optimized constant bank handshakes, zero histogram bins 8/13 and
+two-bit error words 19/20; the test specializes only those bank inputs.
+The decoded register state machines and NIC platform remain outside this
+transport differential. A valid FIRRTL mutation shifting local selection to
+`addr[7:3]` lowers successfully and is caught at cycle 8 in all three probes.
+
+The native compiler/test build and focused FASED control CTest pass. The CTest
+covers 96,000 interpreted cycles over 1-, 21-, 32- and 33-word banks, register
+backpressure, AW/W reordering, reset, assertion qualification, six nested
+target transfers, 27 atomic boundary rejections and repeated-pass rejection.
+`ctest-details.log` contains its successful complete output; a redundant
+direct invocation was stopped after that CTest passed.
+
+Evidence directory:
+`/scratch/jfx/fsim-circt/sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration215-u250-target-matrix`.
+`nic-control-probe/comparison.json`, `no-nic-control-probe/comparison.json`,
+and `immutable-control-probe/comparison.json` retain the structured checks,
+actual cloned/lowered RTL, SFC oracle, testbench, passing execution and failing
+mutation logs. Preliminary checks on iteration 214's no-NIC adapter are kept
+separately and are not the fresh NIC evidence.
+
+The next smallest porting step is to bind NIC FASED AW/W/AR requests and B/R
+responses through the catalog-selected control slave, comparing the actual
+dispatcher/arbiter connections with SFC `NastiRouter`/`FPGATop`. NIC platform
+and runtime, generalized memory/TracerV profiles, partition/QSFP behavior,
+SRAM model-port differences and the SFC UART-bearing baseline remain pending.
+Harness iteration 214 passed actual CIRCT replacertl/provenance and fresh
+bare-metal smoke; its long-suite results reused unchanged-input evidence.
+Those checks precede this change. No FireSim manager verification step was
+started here, and iteration 215 manager validation remains pending. The
+overall compiler port is incomplete.
+
+Fresh all-13 replay is complete in `iteration215-u250-target-matrix/replay/`.
+Compiler SHA256 is
+`4ef2cd4dc3c1fbac4394b11583a668a86375abe0d831675440c1ca610b91f2cc`;
+archive manifest SHA256 is
+`0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+All archived input hashes and effective platform configurations match
+iteration 214. Results remain one compiled, six failed and six unsupported
+platforms; annotation comparisons remain eight matched, six SRAM model-port
+mismatches and twelve not reached. Complete per-recipe stderr was inspected.
+Only the NIC rejection advances to control slave binding. All other failure
+messages and boundary comparison checks are unchanged. These rejections and
+the matrix's exit 1 remain implementation gaps, not parity.
+
+`artifact-regression.log` records a passing complete regression. All 224
+shared NIC and 256 shared no-NIC MLIR/JSON files match iteration 214 after
+normalizing only the candidate-directory annotation. NIC adds precisely the
+two control boundary files. No-NIC final RTL, both headers and both XDC files
+remain byte-identical; SV SHA256
+`866b0e02cc633b969f0945f987b5577ecd6bb578301cb7a1e6aba6eb056a60da`.
+The primary immutable handoff FIRRTL/annotations and normalized immutable
+U250 XDC also match. `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json`,
+`matrix-regression.json` and `tool-input-hashes.json` retain these checks.
+Existing user edits remain outside this checkpoint.

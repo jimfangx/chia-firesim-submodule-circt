@@ -4570,9 +4570,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedMMIOAnnotations, error)))
         return fail("FASED MMIO bank annotations: " + error);
       llvm::outs() << "Assembled CIRCT FASED 21-word MMIO bank in " << fasedMMIOPath << '\n';
-      // NIC control responses and platform integration need separate parity.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED control responses and platform integration are not implemented");
       if (failed(goldengate::mapFASEDBridgeControl(circuit, 25, 12, error)))
         return fail("FASED MCRFile control: " + error);
       goldengate::ControlMMIOWidget mappedFASED;
@@ -4596,6 +4593,11 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedControlAnnotations, error)))
         return fail("FASED MCRFile control annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED MCRFile transactions in " << fasedControlPath << '\n';
+      // The NIC bank uses the same registry-sized Lib.scala MCRFile. Its
+      // independent AW/W capture and held responses are materialized above;
+      // connecting that slave into the NIC platform is a separate boundary.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED control slave binding and platform integration are not implemented");
       if (failed(goldengate::bindFASEDBridgeControl(circuit, error)))
         return fail("FASED control slave binding: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED control slave binding produced invalid FIRRTL IR");

@@ -307,8 +307,29 @@ void mapping(MLIRContext &ctx) {
   llvm::outs()<<"FASED: aggregate control/bank bindings, six nested target transfers, 27 atomic boundary rejections and repeated-pass rejection passed\n";
 }
 }
-int main() {
+// Lower the actual production adapter in isolation for an RTL comparison.
+// Clone every operation and typed port; do not reconstruct a test MCRFile.
+void exportProduction(MLIRContext &ctx, const char *input, const char *output) {
+  auto root = parseSourceFile<ModuleOp>(input, &ctx);
+  require(bool(root) && succeeded(verify(*root)), "invalid production control boundary");
+  auto c = *root->getOps<CircuitOp>().begin();
+  require(c.getName() == "GGFASEDBridgeControlWrapper", "wrong production control root");
+  auto adapter = named(c, "GGFASEDMCRFile");
+  auto isolated = ModuleOp::create(c.getLoc());
+  OpBuilder b(&ctx); b.setInsertionPointToEnd(isolated.getBody());
+  auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr(adapter.getName()));
+  auto clone = cast<FModuleOp>(adapter->clone());
+  exported.getBodyBlock()->push_back(clone); clone.setPublic();
+  require(succeeded(verify(isolated)), "invalid cloned production adapter");
+  std::error_code ec; llvm::raw_fd_ostream out(output, ec);
+  require(!ec, "cannot export production adapter");
+  isolated.print(out); out << '\n'; out.close(); isolated.erase();
+  llvm::outs() << "Cloned production FASED MCRFile operations and typed ports\n";
+}
+int main(int argc, char **argv) {
   try { MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+    require(argc == 1 || argc == 3, "usage: goldengate-fased-control-test [boundary.mlir adapter.mlir]");
+    if (argc == 3) { exportProduction(ctx, argv[1], argv[2]); return 0; }
     mapping(ctx);
     for (unsigned count : {1,21,32,33}) behavior(ctx,count);
   } catch(const std::exception &e) { llvm::errs()<<e.what()<<'\n'; return 1; }
