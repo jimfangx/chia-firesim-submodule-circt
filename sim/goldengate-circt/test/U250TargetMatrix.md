@@ -7205,3 +7205,127 @@ constructors using the same allocation identities, then compare the actual
 SFC read/response arbiters before advancing the explicit quad stop. These
 write-path matches do not establish final quad RTL, metasimulation, Linux
 boot or FPGA parity.
+
+
+## Iteration 244: quad Rocket AR and response collection
+
+The native compiler carries all four allocated TracerV banks through AR
+request dispatch, R burst arbitration, B arbitration and both 64-slot
+transaction trackers. The explicit multi-TracerV response stop is removed.
+Each constructor retains its own lane at slaves 2, 3, 4 and 5 in the
+fourteen-region catalog, with a fifteenth error endpoint.
+
+`ControlReadTracker.cpp` now validates the live FIRRTL instance connections
+before adding retirement logic. The AW/W and AR catalogs must agree, and
+exactly one whole AR connection must connect each named bank to its decoded
+slave. Missing, duplicate, sliced or swapped connections fail before IR
+mutation. A negative fixture swaps bank names in both otherwise matching
+catalogs; the connected operations still expose the wrong identity.
+
+The semantic oracle is `junctions/nasti.scala`: AW retires on accepted B,
+AR retires on accepted final R, and R arbitration holds a burst until its
+last beat. Differential comparisons use the actual emitted native helpers
+and the corresponding module bodies and expressions from:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv
+```
+
+The immutable source SHA256 remains
+`deadc7f5a903ceed20047342e4b81dde7f19cc32be914de6f5b910d3d70771d2`.
+The five `NICControl{ReadDispatch,ReadTracker,ReadArbiter,WriteArbiter,WriteTracker}Compare.py`
+comparisons accept `--quad` for this geometry and retain their NIC mode.
+They validate prior module bodies, copied ports, FIRRTL connections and
+recursively transferred annotation records before behavioral comparison.
+The AR comparison also checks all fifty surviving SFC bank assignments.
+Normal SFC MMIO R responses specialize last/response/user fields; generic
+native fixtures separately exercise arbitrary payload and burst fields.
+SFC removes unused route storage; tracker comparisons additionally check
+native route data against a scoreboard.
+
+
+| Quad boundary | Passing differential coverage |
+| --- | --- |
+| AR dispatch | 2,066,080 cases; all fifteen endpoints |
+| R arbitration | 541,587 cycles; all 32,768 masks at all fifteen reachable cursors |
+| B arbitration | 1,098,726 cycles; all masks at all sixteen initial states and both ready values |
+| AR tracker | 100,356 cycles; final-beat retirement, held beats, aliases, simultaneous enqueue/retire and reset |
+| AW tracker | 100,353 cycles; B retirement, held matches, aliases, simultaneous enqueue/retire and reset |
+
+Evidence is under `iteration244-u250-target-matrix/`:
+`quad-read-dispatch-compare/comparison.json`,
+`quad-control-{read,write}-arbiter-production/comparison.json` and
+`quad-control-{read,write}-tracker-production-verified/comparison.json`.
+NIC comparison modes also pass; the rebuilt read-tracker exporter preserves
+the earlier passing production IR and both helpers byte-for-byte, including
+the new live-connection validation. That result is recorded in
+`nic-control-read-tracker-production/new-validation-export-comparison.json`.
+
+Reproduce with the same archived quad SV and native export binaries in the
+sourced FireSim environment. For AR dispatch, supply `--writes` and `--reads`
+from `post-fame-control-widget-writes.mlir` and
+`post-fame-control-read-dispatch.mlir`. For AR tracking supply `--reads` and
+`--tracker` from read-dispatch/read-tracker. R arbitration takes `--tracker`
+and `--arbiter` from read-tracker/read-arbiter; B arbitration takes `--read-arbiter`
+and `--write-arbiter` from read-arbiter/write-arbiter. AW tracking takes `--write-arbiter`
+and `--tracker` from write-arbiter/write-tracker. Each command also takes
+`--golden`, `--export-tool`, `--output-dir` and `--quad`; the output directory
+must be new. The export tool is the corresponding native control test
+executable.
+
+
+The quad replay now reaches driver-header generation, where it fails with:
+
+```text
+Rocket driver headers: TracerV driver header: ambiguous TracerV bridge identity
+```
+
+`TracerVHeader.cpp` still selects one trace annotation instead of resolving
+one record per live constructor. The archived quad
+`design/FireSim-generated.const.h` contains four `tracerv_t` constructors,
+with MMIO bases 256, 320, 384 and 448. Its SHA256 is
+`2e902991e63d8784d3f5ed6ccea02040d4904121c2cd22aa403480239d3568d3`.
+`quad-driver-header-gap.json` records the observed mismatch and exact files.
+The next smallest port is to resolve each constructor's MMIO, source-stream
+and clock identities and emit all four driver records before attempting
+final quad RTL comparisons or asking the harness to exercise quad runtime.
+
+Artifact regression preserves all 267 NIC and 256 no-NIC MLIR/annotation
+files after candidate-path normalization and keeps each target's RTL, both
+headers and both XDC files byte-identical. Quad preserves all 114 previous
+files and adds 140 MLIR/annotation artifacts through host specialization.
+The immutable staging inputs and U250 XDC comparisons also retain their
+previous matches. Reports are `production-boundary-regression.json`,
+`emitted-regression.json`, `quad-boundary-regression.json` and
+`immutable-rocket-comparison.json`.
+
+To retain comparison artifacts while making room for the full matrix,
+607 iteration-240 and 599 iteration-241 MLIR dumps were losslessly gzipped,
+recovering 37,383,630,989 and 37,569,668,807 bytes respectively. Each original
+hash was verified against decompression before removing its uncompressed
+copy; manifests are `lossless-storage-cleanup-{240,241}.json`. JSON, logs,
+final outputs, active comparison inputs and immutable fixtures are retained.
+Tracker comparison production exports are likewise losslessly compressed,
+with separate storage manifests in this iteration's evidence directory.
+These partial control-path matches do not establish final quad platform,
+metasimulation, Linux boot or FPGA parity.
+
+The complete thirteen-target replay retains two compiled targets, five
+compiler gaps and six unsupported partition/QSFP platforms. Its only changed
+failure is quad's advancement to driver headers. All archived input hashes,
+effective platforms and earlier comparison results remain unchanged: eight
+boundary matches, six previously recorded SRAM-model port mismatches and
+twelve comparisons not reached. `matrix-regression.json` records this
+inventory; compiler gaps and mismatches remain failures.
+`source-replay-stability.json` verifies that all 668 recorded source inputs
+were unchanged during replay and that the replay used the current compiler
+binary, SHA256
+`60fba89f0fe020cd700588578105d181a534e19efcf955b91bed6ca577438035`.
+
+The rebuilt native control tests all pass: AR dispatch, AR tracking, R
+arbitration, B arbitration and AW tracking, including the fourteen-region
+quad geometry and read-tracker malformed-connection fixtures. The separate
+Print-binding regression also passes. Logs are `build-retry.log`,
+`ctest.log`, `print-build.log` and `print-ctest.log`; the five control tests
+complete in 869.74 seconds. FireSim manager verification remains owned by
+the harness and was not started by this implementation iteration.

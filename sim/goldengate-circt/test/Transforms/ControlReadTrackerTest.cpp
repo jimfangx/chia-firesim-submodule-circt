@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/ControlReadTracker.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
@@ -100,6 +101,53 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned count
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Target")),
         b.getNamedAttr("target", b.getStringAttr("~" + std::string(oldTop) + "|" + oldTop + ">" + ref))}));
   if (bad != 7) c->setAttr("rawAnnotations", b.getArrayAttr(annos));
+  if (!bound.empty()) {
+    // The tracker consumes a real dispatch boundary, including request-bank
+    // identity. Matching catalogs alone must not make swapped AR lanes valid.
+    auto top = named(c, oldTop);
+    auto arType = cast<FIRRTLBaseType>(parseType("!firrtl." + token(
+        "bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>"), &ctx));
+    auto response = cast<BundleType>(top.getPortType(10));
+    auto controlType = BundleType::get(&ctx, {
+        response.getElement(0), {b.getStringAttr("ar"), false, arType}, response.getElement(1)});
+    SmallVector<PortInfo> widgetPorts, dispatchPorts;
+    for (auto [slave, name] : bound) {
+      widgetPorts.push_back({b.getStringAttr(name), controlType, Direction::In});
+      dispatchPorts.push_back({b.getStringAttr("slave_" + std::to_string(slave) + "_ar"), arType, Direction::Out});
+    }
+    b.setInsertionPointToEnd(c.getBodyBlock());
+    auto requests = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGControlWidgetWriteWrapper"),
+        ConventionAttr::get(&ctx, Convention::Internal), widgetPorts);
+    if (bad == 26) {
+      // Both catalogs agree on the wrong ports. Only the live AR connections
+      // distinguish this from a consistent constructor-to-slave assignment.
+      auto first = cast<DictionaryAttr>(rows[0]), second = cast<DictionaryAttr>(rows[1]);
+      NamedAttrList a(first), z(second);
+      a.set("port", second.getAs<StringAttr>("port")); z.set("port", first.getAs<StringAttr>("port"));
+      rows[0] = a.getDictionary(&ctx); rows[1] = z.getDictionary(&ctx);
+      top->setAttr("goldengate.controlReadBindings", b.getArrayAttr(rows));
+    }
+    requests->setAttr("goldengate.controlWriteBindings", b.getArrayAttr(bad == 23 ? SmallVector<Attribute>{} : rows));
+    auto dispatch = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGControlReadDispatch"),
+        ConventionAttr::get(&ctx, Convention::Internal), dispatchPorts);
+    b.setInsertionPointToStart(top.getBodyBlock());
+    auto sim = b.create<InstanceOp>(c.getLoc(), requests, "sim");
+    auto arb = b.create<InstanceOp>(c.getLoc(), dispatch, "controlReadDispatch");
+    if (bad == 25) b.create<InstanceOp>(c.getLoc(), dispatch, "alias");
+    for (unsigned j = 0; j < bound.size(); ++j) {
+      auto dest = b.create<SubfieldOp>(c.getLoc(), sim.getResult(j), "ar").getResult();
+      if (bad == 20 && j == 0) continue;
+      auto src = arb.getResult(bad == 19 && j == 0 ? 1 : j);
+      b.create<ConnectOp>(c.getLoc(), dest, src);
+      if (bad == 21 && j == 0) b.create<ConnectOp>(c.getLoc(), dest, src);
+      if (bad == 22 && j == 0) {
+        auto valid = b.create<SubfieldOp>(c.getLoc(), dest, "valid");
+        auto value = b.create<ConstantOp>(c.getLoc(), UIntType::get(&ctx, 1, false), APInt(1, 0));
+        b.create<StrictConnectOp>(c.getLoc(), valid.getResult(), value.getResult());
+      }
+    }
+    if (bad == 24) requests.setName("DetachedRequests");
+  }
   if (bad == 8) c.setNameAttr(b.getStringAttr("WrongTop"));
   if (bad == 9) {
     b.setInsertionPointToEnd(c.getBodyBlock());
@@ -309,7 +357,7 @@ void test(MLIRContext &ctx, ArrayRef<unsigned> counts) {
     require(failed(goldengate::addControlReadTracker(c, error)), "malformed boundary accepted");
     require(dump(*r) == before, "rejection mutated IR"); ++rejected;
   };
-  for (unsigned bad = 1; bad <= 18; ++bad) reject(fixture(ctx, bad));
+  for (unsigned bad = 1; bad <= 26; ++bad) reject(fixture(ctx, bad));
   reject(fixture(ctx, 0, 0)); reject(fixture(ctx, 0, 64));
   for (auto key : {"name", "slave"}) {
     auto r = fixture(ctx); auto c = *r->getOps<CircuitOp>().begin(); auto d = named(c, "GGControlAddressDecode");
@@ -351,7 +399,7 @@ int main(int argc, char **argv) {
       llvm::outs() << "Production NIC AR tracker and cloned helpers verified\n"; return 0;
     } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
   }
-  SmallVector<unsigned> counts{1U, 2U, 3U, 11U, 12U, 13U, 31U, 63U};
+  SmallVector<unsigned> counts{1U, 2U, 3U, 11U, 12U, 13U, 14U, 31U, 63U};
   if (argc != 1) {
     unsigned count = 0;
     if (argc != 3 || StringRef(argv[1]) != "--regions" ||

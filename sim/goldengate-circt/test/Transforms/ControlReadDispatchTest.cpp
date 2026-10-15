@@ -240,8 +240,8 @@ int main(int argc,char **argv){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,cir
   }
   require(argc==1,"usage: test [input.mlir output.mlir [helper.mlir]]");
   unsigned cases=0;
-  for(unsigned count:{1,2,3,11,12,13,31,63})cases+=test(ctx,count);
+  for(unsigned count:{1,2,3,11,12,13,14,31,63})cases+=test(ctx,count);
   cases+=test(ctx,3,true);
   for(unsigned bad=1;bad<=28;++bad){auto r=fixture(ctx,bad);auto circuit=*r->getOps<CircuitOp>().begin();auto s=dump(*r);std::string error;require(failed(goldengate::addControlReadDispatch(circuit,error)),"malformed boundary accepted");require(!error.empty()&&dump(*r)==s,"rejection mutated IR or omitted diagnostic");}
-  llvm::outs()<<"Control AR dispatch: "<<cases<<" independent backpressure/route cases across 1/2/3/11/12/13/31/63 regions (including NIC allocation) and empty bindings; wrapper wiring, targets and 37 atomic rejections passed\n";
+  llvm::outs()<<"Control AR dispatch: "<<cases<<" independent backpressure/route cases across 1/2/3/11/12/13/14/31/63 regions (including NIC allocation) and empty bindings; wrapper wiring, targets and 38 atomic rejections passed\n";
   return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}}

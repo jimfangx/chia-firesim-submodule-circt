@@ -102,6 +102,61 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
       return reject("control read tracker widget response bundle differs");
     widgets[slave.getInt()] = port.getValue().str();
   }
+  // Equal response bundle types cannot identify the bank that accepted AR.
+  // Check the actual dispatch connections before using this catalog to retire
+  // transactions. In particular, swapping two TracerV rows must not silently
+  // turn an R response from one constructor into another slave's retirement.
+  if (!bindings.empty()) {
+    InstanceOp requests, dispatch;
+    unsigned requestInstances = 0, dispatchInstances = 0;
+    for (auto instance : inner.getOps<InstanceOp>()) {
+      if (instance.getModuleName() == "GGControlWidgetWriteWrapper") {
+        requests = instance; ++requestInstances;
+      }
+      if (instance.getModuleName() == "GGControlReadDispatch") {
+        dispatch = instance; ++dispatchInstances;
+      }
+    }
+    if (requestInstances != 1 || dispatchInstances != 1)
+      return reject("control read tracker requires the live widget and AR dispatcher instances");
+    FModuleOp requestModule;
+    for (auto module : circuit.getOps<FModuleOp>())
+      if (module.getName() == requests.getModuleName()) requestModule = module;
+    if (!requestModule || requestModule->getAttr("goldengate.controlWriteBindings") != bindings)
+      return reject("control read tracker AR and AW/W bank identities differ");
+    auto instancePort = [](InstanceOp instance, StringRef name) -> Value {
+      for (unsigned p = 0; p < instance.getNumResults(); ++p)
+        if (instance.getPortName(p) == name) return instance.getResult(p);
+      return {};
+    };
+    auto path = [](Value value) {
+      SmallVector<StringRef> fields;
+      while (auto field = value.getDefiningOp<SubfieldOp>()) {
+        fields.push_back(field.getFieldName()); value = field.getInput();
+      }
+      return std::make_pair(value, fields);
+    };
+    for (auto [slave, name] : widgets) {
+      Value bank = instancePort(requests, name);
+      Value source = instancePort(dispatch, "slave_" + std::to_string(slave) + "_ar");
+      unsigned connections = 0;
+      bool correct = bool(bank) && bool(source);
+      for (auto &operation : *inner.getBodyBlock()) {
+        Value dest, src;
+        if (auto connect = dyn_cast<ConnectOp>(operation)) {
+          dest = connect.getDest(); src = connect.getSrc();
+        } else if (auto connect = dyn_cast<StrictConnectOp>(operation)) {
+          dest = connect.getDest(); src = connect.getSrc();
+        } else continue;
+        auto [root, fields] = path(dest);
+        if (root != bank || fields.empty() || fields.back() != "ar") continue;
+        ++connections;
+        correct &= fields.size() == 1 && src == source;
+      }
+      if (!correct || connections != 1)
+        return reject("control read tracker bank differs from its connected AR request slave");
+    }
+  }
   const std::set<std::string> consumed{"ctrl_read_dispatch_tracker_ready",
       "ctrl_read_dispatch_track_valid", "ctrl_read_dispatch_track_tag", "ctrl_read_dispatch_track_target"};
   auto hp = controlTransactionTrackerPorts(ctx, slaveCount);

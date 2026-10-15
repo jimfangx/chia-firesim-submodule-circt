@@ -293,7 +293,7 @@ void testCount(MLIRContext &ctx, unsigned count, unsigned &total) {
 }
 void test(MLIRContext &ctx) {
   unsigned total = 0, rejected = 8;
-  for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 31u, 63u}) testCount(ctx, count, total);
+  for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 14u, 31u, 63u}) testCount(ctx, count, total);
   std::string error;
   for (unsigned bad = 1; bad <= 18; ++bad) {
     auto r = fixture(ctx, bad); auto ci = *r->getOps<CircuitOp>().begin(); auto s = dump(*r);
@@ -303,7 +303,7 @@ void test(MLIRContext &ctx) {
     auto r = fixture(ctx, 0, count); auto ci = *r->getOps<CircuitOp>().begin(); auto s = dump(*r);
     require(failed(goldengate::addControlReadArbiter(ci, error)), "unsupported count accepted"); require(dump(*r) == s, "count rejection mutated IR"); ++rejected;
   }
-  llvm::outs() << "Control read arbiter: " << total << " selection/burst/reset cases across 1,2,3,11,12,13,31,63 decoded regions; wrapper wiring, targets and " << rejected << " atomic rejections passed\n";
+  llvm::outs() << "Control read arbiter: " << total << " selection/burst/reset cases across 1,2,3,11,12,13,14,31,63 decoded regions; wrapper wiring, targets and " << rejected << " atomic rejections passed\n";
 }
 }
 int main(int argc, char **argv) {

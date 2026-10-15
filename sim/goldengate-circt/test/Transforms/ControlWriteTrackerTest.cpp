@@ -261,7 +261,7 @@ int main(int argc, char **argv) {
     return 1;
   }
   try {
-    for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 31u, 63u}) test(ctx, count);
+    for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 14u, 31u, 63u}) test(ctx, count);
     auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin();
     auto before = dump(*root);
     for (unsigned count : {0u, 64u, ~0u}) {

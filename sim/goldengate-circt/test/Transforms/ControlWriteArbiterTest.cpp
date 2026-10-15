@@ -266,7 +266,7 @@ void testCount(MLIRContext &ctx, unsigned count, unsigned &total) {
 }
 void test(MLIRContext &ctx) {
   unsigned total = 0, rejected = 0;
-  for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 31u, 63u}) testCount(ctx, count, total);
+  for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 14u, 31u, 63u}) testCount(ctx, count, total);
   std::string error;
   for (unsigned bad = 1; bad <= 16; ++bad) {
     auto r = fixture(ctx, bad); auto ci = *r->getOps<CircuitOp>().begin(); auto s = dump(*r);
@@ -277,7 +277,7 @@ void test(MLIRContext &ctx) {
     require(failed(goldengate::addControlWriteArbiter(ci, error)), "invalid catalog count accepted");
     require(dump(*r) == before, "invalid catalog count mutated IR"); ++rejected;
   }
-  llvm::outs() << "Control write arbiter: " << total << " selection/acceptance/hold cases at 1,2,3,11,12,13,31,63 slaves, targets and "
+  llvm::outs() << "Control write arbiter: " << total << " selection/acceptance/hold cases at 1,2,3,11,12,13,14,31,63 slaves, targets and "
                << rejected + 8 << " atomic rejections passed\n";
 }
 }

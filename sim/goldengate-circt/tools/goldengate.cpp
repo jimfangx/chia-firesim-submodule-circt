@@ -3842,12 +3842,9 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, widgetWritesAnnotations, error)))
         return fail("control widget write annotations: " + error);
       llvm::outs() << "Bound CIRCT control AW/W requests to allocated widgets in " << widgetWritesPath << '\n';
-      // AW/W now reaches every allocated TracerV bank. Later response
-      // collection still selects only bank zero; retain an explicit boundary.
-      if (llvm::count_if(controlWidgets, [](const auto &widget) {
-            return widget.name.starts_with("TracerVBridgeModule_");
-          }) > 1)
-        return fail("control widget responses: multiple TracerV response bindings are not implemented");
+      // Carry the complete allocated bank catalog into AR dispatch and B/R
+      // collection. TracerV constructors have independent response lanes;
+      // neither the bank count nor its slave index is fixed to bank zero.
       if (failed(goldengate::addControlReadDispatch(circuit, error)))
         return fail("control read dispatch: " + error);
       if (failed(mlir::verify(*module)))
