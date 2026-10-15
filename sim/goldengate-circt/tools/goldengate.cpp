@@ -4727,10 +4727,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostReadResponseAnnotations, error)))
         return fail("host memory read response annotations: " + error);
       llvm::outs() << "Routed CIRCT host R responses to LoadMem ID16 and FASED IDs0..15 in " << hostReadResponsePath << '\n';
-      // NIC AW/W/B/AR/R composition is compared at this boundary; output
-      // buffering still needs comparison before platform integration.
-      if (!cpuSinks.empty())
-        return fail("NIC host memory output buffering and platform integration are not implemented");
       if (failed(goldengate::addHostMemoryOutputBuffer(circuit, error)))
         return fail("host memory output buffer: " + error);
       if (failed(mlir::verify(*module))) return fail("host memory output buffer produced invalid FIRRTL IR");
@@ -4744,6 +4740,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostOutputBufferAnnotations, error)))
         return fail("host memory output buffer annotations: " + error);
       llvm::outs() << "Buffered CIRCT host memory output with five two-entry queues in " << hostOutputBufferPath << '\n';
+      // NIC host-memory routing and output queues are compared here; platform
+      // specialization and CPU stream integration remain a separate boundary.
+      if (!cpuSinks.empty())
+        return fail("NIC host memory platform specialization and CPU stream integration are not implemented");
       if (failed(goldengate::specializeHostMemoryPort(circuit, error)))
         return fail("host memory platform port: " + error);
       if (failed(mlir::verify(*module))) return fail("host memory platform port produced invalid FIRRTL IR");
