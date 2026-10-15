@@ -5594,3 +5594,104 @@ starts no manager action; new replacertl, Verilator and U250 verification
 remain harness-owned. Local output-buffer evidence does not establish final
 NIC platform/runtime parity or completion of the compiler port. Unrelated
 shared-worktree edits remain outside this checkpoint.
+
+### Iteration 227 — compose production NIC host-memory platform IDs
+
+`tools/goldengate.cpp` now invokes the native `specializeHostMemoryPort` pass
+for the buffered NIC boundary. It emits and verifies
+`post-fame-host-memory-platform.mlir` and its complete annotation archive
+before stopping with `NIC CPU stream platform integration is not implemented`.
+The pass constructs FIRRTL modules, instances, connections, `pad` and `bits`
+operations: AW/AR IDs zero-extend from five to sixteen bits, B/R IDs truncate
+to bits 4:0, and the remaining payload/handshake leaves pass through. There
+is no validity gating or added state. Scala oracle sources remain unchanged.
+Inspection covered `passes/MidasTransforms.scala`, `passes/fame/FAMETransform.scala`
+and `core/FPGATop.scala`'s host-memory width check and `io <> bundle` connection.
+
+`NICHostMemoryPortCompare.py` checks the actual production composition and
+recursive annotation transfer, then invokes the C++ interpreter on its emitted
+adapter SSA. `PrintRocketHostMemoryPortCompare.py` exposes the shared binding
+comparison while retaining strict historical Print counts. The native test
+interpreter now evaluates `firrtl.not`, so a type-correct request-ID inversion
+is rejected for incorrect behavior, rather than an unsupported operation.
+The second mutation changes response slicing from 4:0 to 5:1. Both mutants
+pass CIRCT verification, fail actual SSA behavior with
+`platform memory ID/handshake/payload mismatch`, and fail structural comparison.
+A local SFC copy with the same incorrect B-response slice is also rejected.
+No golden fixture is modified.
+
+Native build and focused `goldengate-host-memory-port` CTest pass. The fixture
+and actual production NIC adapter each pass 262,144 cases, covering all 65,536
+response IDs, all 32 request IDs and four valid/ready combinations, totaling
+9,699,328 leaf checks each. Twelve atomic rejection cases, ordinary/strict
+clock/reset bindings, prior module bodies and copied/consumed target identity
+checks also pass. Production composition retains 230 prior module bodies,
+118 public ports, 117 copied ports and 119 wrapper connections. All 1,792
+annotations, 26 CPU-stream ports and twelve MMIO regions remain; SimpleNIC
+stays slave 7 at byte address 512, size 32. The depth-ten token queue and
+depth-3,072 CPU-stream queue remain. Fresh no-NIC composition passes with
+216 prior bodies, 113 ports and 114 connections. Both historical Print
+composition orders pass with 286 prior bodies, 109 ports, 110 connections
+and 21 Print modules.
+
+All 37 typed `mem_0` ports and all 37 leaf equations match these exact SFC RTL
+artifacts, including request extension, response truncation and handshake
+independence:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+  SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`;
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`;
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration227-u250-target-matrix/`.
+`build.log`, `behavior-build.log`, `ctest.log`, `tool-input-hashes.json`,
+`sfc-platform-contracts.json`, `nic-platform-cli.json`, its behavior log,
+`nic-platform-mutations/`, `nic-platform-composition.json`,
+`fresh-no-nic-platform-comparison.json` and `print-platform-comparison.json`
+record these checks. Compiler SHA256 is
+`a64c591c6a4750e843d48c4cf2dce52e94830c424b715a565be8ca524c963511`;
+production NIC platform boundary SHA256 is
+`6b868dd1be8f69d7af7f08e85e2823760ae299a23e0ee81b3637d9de5eab95a7`.
+
+`production-boundary-regression.json` confirms all 248 earlier NIC and 256
+no-NIC MLIR/JSON files match iteration 226 after output-directory normalization;
+only the two NIC platform artifacts are added. All five emitted no-NIC
+RTL/header/XDC files are byte-identical to iteration 226.
+`immutable-rocket-comparison.json` confirms the archived no-NIC FIRRTL and
+annotation input hashes match the immutable staging fixture. Synthesis XDC
+matches the immutable U250 reference exactly; implementation XDC matches
+after the recorded hierarchy substitution.
+
+The full thirteen-recipe replay retains one compiled target, six compiler
+failures and six distinct unsupported partition/QSFP platforms. All archived
+input hashes, effective platforms, statuses and earlier boundary comparison
+checks match iteration 226; only NIC's next-gap diagnostic advances. Seven
+reached bridge/channel boundaries match. Saturn Shuttle's model ports match;
+the other six reached model-port boundaries retain native-SRAM differences
+requiring separate equivalence checks. Aggregate counts are eight matched,
+six mismatched and twelve not reached. `replay/matrix.json`,
+`matrix-regression.json` and complete per-recipe stderr in
+`matrix-regression.log` record these results. Replay exits one for the
+remaining implementation gaps; the regression comparison exits zero.
+
+To make replay space, 580 old iteration-222 MLIR dumps were losslessly
+compressed to adjacent `.mlir.gz` files. Decompressed SHA256 was verified
+before removing each original, recovering 36,599,297,621 bytes. Logs, JSON,
+RTL, iteration 226, historical Print fixtures, the active build and immutable
+fixtures were preserved. `storage.log` records the operation.
+
+The next smallest NIC step is to extend `CPUStreamPort.cpp` for the incoming
+NIC CPU stream and its 512-bit W data, compare the aggregate slave interface
+against SFC, and preserve existing buffered stream semantics. Final NIC
+RTL/runtime, non-Rocket and multiple TracerV constructors, additional FASED
+outstanding profiles, partitioned QSFP semantics and SRAM equivalence remain
+pending. Harness iteration 226 passed CIRCT replacertl/provenance and fresh
+Verilator smoke; unchanged-input long-suite evidence was reused, with the SFC
+UART-bearing baseline still pending. Those gates precede this change. No
+manager verification was started here; new replacertl, Verilator and U250
+verification remain harness-owned. Local platform evidence does not establish
+full NIC runtime parity or completion of the port. Unrelated shared-worktree
+edits remain outside this checkpoint.

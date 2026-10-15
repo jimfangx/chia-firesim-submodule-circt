@@ -80,6 +80,7 @@ struct Interpreter {
     if(drivers.count(n))result=eval(drivers.at(n));
     else if(auto bits=v.getDefiningOp<BitsPrimOp>())result=eval(bits.getInput()).lshr(bits.getLo()).trunc(w);
     else if(auto pad=v.getDefiningOp<PadPrimOp>())result=eval(pad.getInput()).zextOrTrunc(w);
+    else if(auto invert=v.getDefiningOp<NotPrimOp>())result=~eval(invert.getInput());
     else result=inputs.at(n);
     result=result.zextOrTrunc(w);memo.insert_or_assign(n,result);return result;
   }
@@ -137,7 +138,7 @@ int main(int argc,char **argv) {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"expanded parse failed");
       require(succeeded(verify(*real)),"expanded boundary invalid");
       auto rc=*real->getOps<CircuitOp>().begin();bindings(rc);behavior(rc);
-      llvm::outs()<<"PASS expanded Print/Rocket host memory platform port\n";return 0;
+      llvm::outs()<<"PASS expanded production host memory platform port\n";return 0;
     }
     for(unsigned forms=1;forms<4;++forms) {
       auto mixed=fixture(ctx);auto mc=*mixed->getOps<CircuitOp>().begin();

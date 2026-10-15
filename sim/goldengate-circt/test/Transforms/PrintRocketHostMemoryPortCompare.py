@@ -50,7 +50,7 @@ def sfc_contract(path):
                 conversion_independent_of_valid_ready=True)
 
 
-def compare(before_path, after_path, baseline):
+def compare_binding(before_path, after_path, baseline, target_probe=False):
     before, after = before_path.read_text(), after_path.read_text()
     def modules(text):
         matches = list(re.finditer(r'^    firrtl.module @(\w+)\(.*?^    }', text, re.M | re.S))
@@ -58,40 +58,47 @@ def compare(before_path, after_path, baseline):
         assert len(result) == len(matches), 'duplicate module'
         return result
     old, new = modules(before), modules(after)
-    assert len(old) == 286 and len(new) == 288
+    assert len(new) == len(old) + 2
     for name, body in old.items():
         assert new[name] == body, 'changed prior module ' + name
     assert set(new) - set(old) == {TOP, HELPER}
     copied = [p for p in native_ports(old[OLD]) if p[1] != 'host_mem']
     host = next(p for p in native_ports(old[OLD]) if p[1] == 'host_mem')
-    assert len(copied) == 108 and host[0] == 'out'
+    assert host[0] == 'out'
     assert native_ports(new[TOP]) == copied + [('out', 'mem_0', host[2].replace('id: uint<5>', 'id: uint<16>'))]
     expected = {('sim.' + n if d == 'in' else 'top.' + n):
                 ('top.' + n if d == 'in' else 'sim.' + n) for d, n, _ in copied}
     expected.update({'memory_port.in': 'sim.host_mem', 'top.mem_0': 'memory_port.out'})
-    assert wiring(new[TOP]) == expected and len(expected) == 110
+    assert wiring(new[TOP]) == expected
     assert re.findall(r' = firrtl.instance (\w+) @(\w+)\b', new[TOP]) == [
         ('sim', OLD), ('memory_port', HELPER)]
     assert new[HELPER] == native_module(baseline, HELPER), 'shared native adapter differs'
-    assert len([n for n in old if n.startswith('GGPrintBridge')]) == 21
-    # Only the test's nested target probe is added to the archived annotations.
+    # Historical Print tests add a nested target probe; production does not.
     line = after.splitlines()[1]
     probe = re.search(r', \{class = "test.HostMemoryPortTargets", nested = \{targets = \[([^]]+)\]\}\}', line)
-    assert probe, 'missing recursive target probe'
-    targets = re.findall(r'"([^"]+)"', probe[1])
-    assert targets == [f'~{TOP}|{TOP}>hostClock', f'~{TOP}|{TOP}>hostReset',
-                       f'~{TOP}|{OLD}>host_mem', f'~{TOP}|{OLD}>host_mem.aw.bits.id',
-                       f'~{TOP}|{OLD}>host_mem.r.bits.id']
-    line = line[:probe.start()] + line[probe.end():]
+    assert bool(probe) == target_probe, 'unexpected recursive target probe'
+    if probe:
+        targets = re.findall(r'"([^"]+)"', probe[1])
+        assert targets == [f'~{TOP}|{TOP}>hostClock', f'~{TOP}|{TOP}>hostReset',
+                           f'~{TOP}|{OLD}>host_mem', f'~{TOP}|{OLD}>host_mem.aw.bits.id',
+                           f'~{TOP}|{OLD}>host_mem.r.bits.id']
+        line = line[:probe.start()] + line[probe.end():]
     original = before.splitlines()[1].replace('firrtl.circuit "' + OLD + '"', 'firrtl.circuit "' + TOP + '"')
     original = original.replace('~' + OLD + '|', '~' + TOP + '|').replace('"~' + OLD + '"', '"~' + TOP + '"')
     for _, n, _ in copied:
         original = re.sub(r'\|' + OLD + '>' + re.escape(n) + r'(?=[.\["\\])', '|' + TOP + '>' + n, original)
     assert line == original, 'recursive annotation archive transfer differs'
-    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=286,
-                public_ports=109, copied_ports=108, wrapper_connections=110,
-                identical_native_helpers=1, preserved_Print_modules=21,
+    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(old),
+                public_ports=len(native_ports(new[TOP])), copied_ports=len(copied), wrapper_connections=len(expected),
+                identical_native_helpers=1, preserved_Print_modules=len([n for n in old if n.startswith('GGPrintBridge')]),
                 recursive_copied_and_consumed_target_transfer=True)
+
+
+def compare(before_path, after_path, baseline):
+    report = compare_binding(before_path, after_path, baseline, target_probe=True)
+    assert (report['unchanged_module_bodies'], report['public_ports'], report['copied_ports'],
+            report['wrapper_connections'], report['preserved_Print_modules']) == (286, 109, 108, 110, 21)
+    return report
 
 
 def main():
