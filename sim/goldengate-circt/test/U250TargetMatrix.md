@@ -7895,3 +7895,9 @@ values, sixteen-entry AW queues and both original SFC deadlock assertions for
 Gemmini and Saturn Rocket. Preserve observation of actual enqueue valid/ready
 and qualified-reset assertion disabling when removing the four-bit/Queue10
 restriction. Manager verification remains owned by the external harness.
+
+After all comparisons, the 126 iteration-250 quad-Rocket MLIR dumps were also
+SHA256-verified and losslessly gzipped, recovering another 12,238,149,982 bytes
+(`lossless-storage-cleanup-250-quad.json`). Their JSON/RTL/collateral and all
+current iteration-251 boundaries remain uncompressed; the regression report
+also recognizes the historical gzip paths. Final free space is 24 GiB.
