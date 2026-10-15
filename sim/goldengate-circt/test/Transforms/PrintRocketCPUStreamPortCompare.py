@@ -44,7 +44,8 @@ def axi_type():
                                           for c, fs in CHANNELS) + '>'
 
 
-def sfc_contract(path):
+def sfc_contract(path, incoming=False):
+    unused = UNUSED - ({"w_bits_data"} if incoming else set())
     text = clean(path.read_text()); header, body = module(text, 'FPGATop')
     expected = {'cpu_managed_axi4_' + n: ['input' if d == 'in' else 'output', w]
                 for n, (d, w) in leaves().items()}
@@ -52,13 +53,13 @@ def sfc_contract(path):
     assert actual == expected and len(actual) == 37, 'SFC CPU platform ABI differs'
     nets = equations(body)
     for n, (d, _) in leaves().items():
-        if n in UNUSED: continue
+        if n in unused: continue
         external, buffered = 'cpu_managed_axi4_' + n, 'axi4buf_2_auto_in_' + n
         assert nets[buffered if d == 'in' else external] == (external if d == 'in' else buffered), n
-    for n in UNUSED:
+    for n in unused:
         assert not any(re.search(r'\bcpu_managed_axi4_' + n + r'\b', v) for v in nets.values()), n
     return dict(module='FPGATop', slave_address_bits=64, slave_data_bits=512, slave_id_bits=16,
-                external_leaves=37, buffered_identity_routes=25, unused_input_fields=sorted(UNUSED))
+                external_leaves=37, buffered_identity_routes=26 if incoming else 25, unused_input_fields=sorted(unused))
 
 
 def compare(before_path, after_path, baseline):

@@ -1,10 +1,10 @@
 // See LICENSE for license details.
 // Oracle: FPGATop.cpuManagedAXI4NodeTuple and cpu_managed_axi4 IO <> node.out.
 // Required boundary: selected uninstantiated platform or selected/expanded Print B
-// wrapper. All 25 CPU scalars forward uniquely to the retained child or B queue.
-// Required engines: buffered outgoing CPU streams, zero incoming streams.
+// wrapper. CPU scalars forward uniquely to the retained child or B queue.
+// Required engines: buffered outgoing streams; zero or one incoming NIC stream.
 // Mutation: aggregate 64/512/16 AXI4 slave plus combinational leaf adapter.
-// Unused AW/AR metadata and W data/last inputs have no users in this profile.
+// AW/AR metadata and W last are unused; W data is live for the NIC writer.
 // No state, buffering, ID adaptation, or protocol gating is added here.
 // Annotations: none consumed/produced. Copied targets transfer; CPU scalar
 // identities stay on the retained inner module. Existing bodies are preserved.
@@ -38,22 +38,25 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
     auto n=m.getModuleName();if(n==newName||n==helperName)return reject("CPU stream platform adapter already exists");
     auto f=dyn_cast<FModuleOp>(m.getOperation());if(!f)continue;
     if(n==oldName)inner=f;if(n=="GGCPUStreamRead")read=f;
-    // Catalog composition preserves the empty writer's module identity. Its
+    // Catalog composition preserves the writer's module identity. Its
     // stream contract, rather than its generated name, identifies this engine.
     if(auto count=f->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount")) {
-      if(write||count.getInt()!=0)return reject("CPU stream platform adapter requires one zero-sink writer");
+      if(write||count.getInt()<0||count.getInt()>1)return reject("CPU stream platform adapter requires one writer with zero or one sink");
       write=f;
     }
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto addr=read?read->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits"):IntegerAttr();
   auto sinks=write?write->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount"):IntegerAttr();
-  if(circuit.getName()!=oldName||!inner||!raw||!addr||addr.getInt()!=19||!sinks||sinks.getInt()!=0)
-    return reject("CPU stream platform adapter requires the recorded buffered outgoing-only Rocket boundary and annotations");
+  bool incoming = sinks && sinks.getInt() == 1;
+  auto writeAddr=write?write->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits"):IntegerAttr();
+  if(circuit.getName()!=oldName||!inner||!raw||!addr||addr.getInt()!=19||!sinks||
+      (incoming && (print || !writeAddr || writeAddr.getInt()!=18)))
+    return reject("CPU stream platform adapter requires the recorded buffered Rocket/NIC boundary and annotations");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};
   struct Leaf {StringRef name;unsigned width;Direction direction;};
-  const Leaf leaves[]{
+  SmallVector<Leaf> leaves{
     {"ar_ready",1,Direction::Out},{"ar_valid",1,Direction::In},
     {"ar_bits_id",16,Direction::In},{"ar_bits_addr",64,Direction::In},
     {"ar_bits_len",8,Direction::In},{"ar_bits_size",3,Direction::In},
@@ -66,10 +69,11 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
     {"w_bits_strb",64,Direction::In},{"b_valid",1,Direction::Out},
     {"b_bits_id",16,Direction::Out},{"b_bits_resp",2,Direction::Out},
     {"b_ready",1,Direction::In},{"aw_bits_addr",64,Direction::In},{"aw_bits_len",8,Direction::In}};
+  if(incoming)leaves.push_back({"w_bits_data",512,Direction::In});
   std::map<std::string,unsigned> old,consumed,copied;
   for(auto [i,p]:llvm::enumerate(inner.getPorts())) {
     auto n=p.name.getValue();old[n.str()]=i;
-    if(n=="cpu_managed_axi4"||n.contains("from_cpu_stream"))return reject("CPU stream platform boundary already exists or has incoming streams");
+    if(n=="cpu_managed_axi4"||n.contains("from_cpu_stream"))return reject("CPU stream platform boundary already exists or has unconsumed incoming streams");
     if(n.starts_with("cpu_stream_")) {
       bool found=false;
       for(auto leaf:leaves)if(n=="cpu_stream_"+leaf.name.str()&&p.type==uint(leaf.width)&&p.direction==leaf.direction){found=true;consumed[n.str()]=i;break;}
@@ -77,7 +81,7 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
     }
   }
   if(consumed.size()!=std::size(leaves)||!old.count("hostClock")||!old.count("hostReset")||(!selected && !old.count("mem_0")))
-    return reject("CPU stream platform adapter requires all 25 CPU scalar fields, host clock/reset and profile memory");
+    return reject("CPU stream platform adapter requires all profile CPU scalar fields, host clock/reset and memory");
   auto cp=inner.getPorts()[old.at("hostClock")],rp=inner.getPorts()[old.at("hostReset")];
   if(cp.type!=ClockType::get(ctx)||cp.direction!=Direction::In||rp.type!=uint(1)||rp.direction!=Direction::In)
     return reject("CPU stream platform adapter requires host clock/reset inputs");

@@ -5695,3 +5695,103 @@ manager verification was started here; new replacertl, Verilator and U250
 verification remain harness-owned. Local platform evidence does not establish
 full NIC runtime parity or completion of the port. Unrelated shared-worktree
 edits remain outside this checkpoint.
+
+### Iteration 228 — compose the incoming NIC CPU AXI slave
+
+`CPUStreamPort.cpp` now assembles the production NIC CPU stream platform
+through FIRRTL modules, instances, subfields and connections. It accepts
+one incoming stream with the recorded eighteen-bit writer address space,
+adds the 512-bit W data route, and retains the nineteen-bit outgoing stream
+contract. All 26 active scalar fields forward unconditionally. The 37-leaf
+64/512/16-bit external AXI slave keeps eleven unused inputs: ten AW/AR
+metadata fields and WLAST. No state or handshake conditions are added.
+Inspection of `MidasTransforms.scala`, `FAMETransform.scala`,
+`FPGATop.scala` and `CPUManagedStreamEngine.scala` confirms the platform
+bulk connection, direct W payload assignment and AWLEN-based final-beat
+counter. WLAST does not control the SFC writer.
+
+`tools/goldengate.cpp` now emits and verifies the NIC
+`post-fame-cpu-stream-platform.mlir` and complete annotation archive before
+stopping at `NIC FPGA top shell integration is not implemented`.
+`NICCPUStreamPortCompare.py` checks the actual emitted boundary, all copied
+and consumed ports, exact aggregate connections, recursively transferred
+annotations and unchanged prior bodies. The shared SFC CPU-port comparison
+accepts the incoming profile while preserving historical Print/no-NIC checks.
+
+The native build and focused `goldengate-cpu-stream-port` CTest pass.
+Twenty atomic rejection cases preserve the input IR; positive zero/one-sink
+profiles and catalog writer identity pass. Native checks of the emitted NIC
+adapter prove all 26 routes are width-preserving identity connections for
+every payload bit, independent of valid/ready. The two type-correct mutants
+route W data from R data and AW address from AR address. Both pass native
+CIRCT verification using `goldengate-simulation-master-control-test --verify-ir`,
+then fail native CPU behavior and structured comparison. A locally mutated
+SFC W-data assignment is also rejected; no golden was changed.
+
+The production comparison retains 232 prior NIC modules, 92 copied ports,
+93 public ports, 119 wrapper connections and all 1,792 annotations. Twelve
+MMIO regions, the depth-ten NIC token queue and depth-3,072 CPU queue remain.
+Fresh no-NIC composition retains 218 prior modules, 89 public ports and all
+1,676 annotations. Both historical Print composition orders retain 297 prior
+modules and pass their existing port, binding and annotation checks.
+
+The exact compared SFC RTL artifacts are:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`,
+  SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`:
+  all 37 typed CPU AXI fields and 26 buffered identity routes match;
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`:
+  all 37 fields, 25 routes and twelve unused inputs match;
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`:
+  the same 37-field, 25-route zero-sink contract matches.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration228-u250-target-matrix/`.
+`build-retry.log`, `ctest.log`, `nic-cpu-platform.json`, its behavior log,
+`nic-cpu-platform-mutations-verified/`, `no-nic-cpu-platform.json`,
+`sfc-cpu-contracts.json`, `sfc-contract-mutation.json` and
+`print-platform-comparison.json` record these checks. Compiler SHA256 is
+`cb03dba10bd7b3b572e5de98a569bc99c38f56012fdf16da40dfda69b3fd1d8e`;
+the fresh production NIC CPU platform boundary SHA256 is
+`86bd161ba3f1a40c18949360e8dde5da78a3ac865e052534a8e24bb0b38de520`.
+
+`production-boundary-regression.json` confirms all 250 earlier NIC and 256
+no-NIC MLIR/JSON files match iteration 227 after output-directory normalization;
+only the two new NIC CPU platform artifacts are added. All five emitted
+no-NIC RTL/header/XDC files are byte-identical to iteration 227.
+`immutable-rocket-comparison.json` confirms both archived no-NIC input hashes
+match the immutable staging fixture, synthesis XDC matches the immutable
+U250 reference exactly, and implementation XDC matches after the recorded
+hierarchy substitution.
+
+The full thirteen-recipe replay retains one compiled target, six compiler
+failures and six distinct unsupported partition/QSFP platforms. All archived
+input hashes, effective platforms, statuses and earlier boundary checks match
+iteration 227; NIC alone advances to the FPGA shell diagnostic. Seven reached
+bridge/channel boundaries match. Saturn Shuttle model ports match; the other
+six reached model-port boundaries retain native-SRAM differences requiring
+separate equivalence checks. Aggregate comparisons remain eight matched, six
+mismatched and twelve not reached. `replay/matrix.json`,
+`matrix-regression.json` and `matrix-regression.log` record every row and
+complete per-recipe stderr. Replay exits one for those implementation gaps;
+the regression comparison exits zero.
+
+To make replay space, 581 old iteration-223 MLIR dumps were losslessly
+compressed to adjacent `.mlir.gz` files. Decompressed SHA256 was verified
+before removing each original, recovering 36,645,153,753 bytes. Logs, JSON,
+RTL, iteration 227, historical Print fixtures, the active build and immutable
+fixtures were preserved. `storage.log` records the operation.
+
+The next smallest NIC step is to compose and compare the FPGA top shell,
+including its host clock/reset and five public platform interfaces, before
+advancing to F1 shim/header emission. NIC final RTL/runtime, non-Rocket and
+multiple TracerV constructors, other FASED outstanding profiles, partitioned
+QSFP semantics and SRAM equivalence remain pending. Harness iteration 227
+passed CIRCT replacertl/provenance and fresh Verilator smoke; unchanged-input
+long-suite evidence was reused, with the SFC UART-bearing baseline pending.
+Those gates precede this change. No manager verification was started here;
+new replacertl, Verilator and U250 verification remain harness-owned. Local
+boundary checks do not establish full NIC runtime parity or port completion.
+Unrelated shared-worktree edits remain outside this checkpoint.

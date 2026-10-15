@@ -16,20 +16,31 @@ namespace {
 void require(bool v,StringRef s){if(!v)throw std::runtime_error(s.str());}
 std::string dump(Operation *m){std::string s;llvm::raw_string_ostream os(s);m->print(os);return s;}
 FModuleOp top(CircuitOp c,StringRef n){for(auto m:c.getOps<FModuleOp>())if(m.getName()==n)return m;throw std::runtime_error("missing module");}
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool incoming = false) {
   // Recorded pre-assembly scalar boundary, including AW address/len retained
   // by Queue_51 and the full 512-bit R payload. FPGATop provides 12 additional
   // external input fields whose payload has no consumers for zero sinkParams.
-  auto root=parseSourceString<ModuleOp>(R"mlir(module { firrtl.circuit "GGHostMemoryPlatformWrapper" {
+  std::string text=R"mlir(module { firrtl.circuit "GGHostMemoryPlatformWrapper" {
     firrtl.module @GGHostMemoryPlatformWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %diagnostic: !firrtl.uint<4>, out %mem_0: !firrtl.uint<1>, out %cpu_stream_ar_ready: !firrtl.uint<1>, in %cpu_stream_ar_valid: !firrtl.uint<1>, in %cpu_stream_ar_bits_id: !firrtl.uint<16>, in %cpu_stream_ar_bits_addr: !firrtl.uint<64>, in %cpu_stream_ar_bits_len: !firrtl.uint<8>, in %cpu_stream_ar_bits_size: !firrtl.uint<3>, in %cpu_stream_r_ready: !firrtl.uint<1>, out %cpu_stream_r_valid: !firrtl.uint<1>, out %cpu_stream_r_bits_id: !firrtl.uint<16>, out %cpu_stream_r_bits_data: !firrtl.uint<512>, out %cpu_stream_r_bits_last: !firrtl.uint<1>, out %cpu_stream_r_bits_resp: !firrtl.uint<2>, out %cpu_stream_aw_ready: !firrtl.uint<1>, in %cpu_stream_aw_valid: !firrtl.uint<1>, in %cpu_stream_aw_bits_id: !firrtl.uint<16>, in %cpu_stream_aw_bits_size: !firrtl.uint<3>, out %cpu_stream_w_ready: !firrtl.uint<1>, in %cpu_stream_w_valid: !firrtl.uint<1>, in %cpu_stream_w_bits_strb: !firrtl.uint<64>, out %cpu_stream_b_valid: !firrtl.uint<1>, out %cpu_stream_b_bits_id: !firrtl.uint<16>, out %cpu_stream_b_bits_resp: !firrtl.uint<2>, in %cpu_stream_b_ready: !firrtl.uint<1>, in %cpu_stream_aw_bits_addr: !firrtl.uint<64>, in %cpu_stream_aw_bits_len: !firrtl.uint<8>) {}
     firrtl.module @GGCPUStreamRead() attributes {goldengate.streamAddressSpaceBits = 19 : i64} {}
     firrtl.module @GGEmptyCPUStreamWrite() attributes {goldengate.fromHostCPUStreamCount = 0 : i32} {}
     firrtl.module @GGHostMemoryPortAdapter() {}
-  } })mlir",&ctx);require(bool(root),"fixture parse");
+  } })mlir";
+  if(incoming) {
+    auto position=text.find(") {}\n    firrtl.module @GGCPUStreamRead");
+    text.insert(position, ", in %cpu_stream_w_bits_data: !firrtl.uint<512>");
+    auto at=text.find("goldengate.fromHostCPUStreamCount = 0 : i32");
+    text.replace(at, std::string("goldengate.fromHostCPUStreamCount = 0 : i32").size(),
+                 "goldengate.fromHostCPUStreamCount = 1 : i32, goldengate.streamAddressSpaceBits = 18 : i64");
+  }
+  auto root=parseSourceString<ModuleOp>(text,&ctx);require(bool(root),"fixture parse");
   auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);auto m=top(c,"GGHostMemoryPlatformWrapper");
   SmallVector<Attribute> annotations;
   for(auto n:{"diagnostic","hostReset","mem_0","cpu_stream_ar_bits_id","cpu_stream_r_bits_data"})
     annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Target")),b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~GGHostMemoryPlatformWrapper|GGHostMemoryPlatformWrapper>"+std::string(n))}))}));
+  if(incoming)annotations.push_back(b.getDictionaryAttr({
+    b.getNamedAttr("class",b.getStringAttr("test.IncomingTarget")),
+    b.getNamedAttr("target",b.getStringAttr("~GGHostMemoryPlatformWrapper|GGHostMemoryPlatformWrapper>cpu_stream_w_bits_data"))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(annotations));
   b.setInsertionPointToEnd(c.getBodyBlock());
   auto child=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGHostMemoryReadResponseWrapper"),ConventionAttr::get(&ctx,Convention::Internal),m.getPorts());
@@ -66,7 +77,7 @@ void bindings(CircuitOp c, StringRef wrapper = "GGCPUStreamPlatformWrapper",
       require(found,"missing copied port");
     }
   }
-  require(consumed==25&&got.at("cpu_port.cpu_managed_axi4")=="cpu_managed_axi4"&&got.size()==copied+26,"aggregate/wrapper binding");
+  require(consumed==top(c,"GGCPUStreamPortAdapter").getNumPorts()-1&&got.at("cpu_port.cpu_managed_axi4")=="cpu_managed_axi4"&&got.size()==copied+consumed+1,"aggregate/wrapper binding");
   require(m.getNumPorts()==copied+1,"top port count");
 }
 void behavior(CircuitOp c) {
@@ -88,14 +99,15 @@ void behavior(CircuitOp c) {
       bool input=p.direction==Direction::In;auto dest=input?ext:n,src=input?n:ext;
       require(drivers.at(dest)==src,"CPU leaf must be an unconditional identity connection");
   }
-  require(drivers.size()==25,"all 25 CPU leaves required");
+  bool incoming = m.getNumPorts() == 27;
+  require(drivers.size()==(incoming?26:25),"all profile CPU leaves required");
   unsigned unused=0;
   for(auto [n,w]:inputs)if(StringRef(n).starts_with("cpu_managed_axi4.")) {
     bool used=false;for(auto [d,s]:drivers)used|=s==n;
     if(!used){++unused;require(StringRef(n).contains(".burst")||StringRef(n).contains(".lock")||StringRef(n).contains(".cache")||StringRef(n).contains(".prot")||StringRef(n).contains(".qos")||n=="cpu_managed_axi4.w.bits.data"||n=="cpu_managed_axi4.w.bits.last","unexpected unused input");}
   }
-  require(unused==12,"recorded unused metadata/data/last fields");
-  llvm::outs()<<"25 unconditional identity leaf connections; 12 unused external fields, including 512-bit W data\n";
+  require(unused==(incoming?11:12),"recorded unused metadata/data/last fields");
+  llvm::outs()<<drivers.size()<<" unconditional identity leaf connections; "<<unused<<" unused external fields\n";
 }
 } // namespace
 int main(int argc,char **argv) {
@@ -132,6 +144,32 @@ int main(int argc,char **argv) {
       else {auto names=t.getPortNamesAttr();SmallVector<Attribute> ns(names.begin(),names.end());for(auto &n:ns)if(cast<StringAttr>(n).getValue()=="cpu_stream_ar_valid")n=b.getStringAttr("cpu_stream_unknown");t.setPortNamesAttr(b.getArrayAttr(ns));}
       auto s=dump(*test);require(failed(goldengate::assembleCPUStreamPort(tc,error))&&!error.empty(),"invalid boundary accepted");require(s==dump(*test),"rejection mutated IR");
     }
+    // Incoming NIC W data must be carried without introducing a handshake
+    // condition; every retained body and the buffered writer stay untouched.
+    auto nic=fixture(ctx,true);auto nc=*nic->getOps<CircuitOp>().begin();
+    std::map<std::string,std::string> nicBefore;
+    for(auto m:nc.getOps<FModuleOp>())nicBefore[m.getName().str()]=dump(m);
+    require(succeeded(goldengate::assembleCPUStreamPort(nc,error)),error);
+    require(succeeded(verify(*nic)),"invalid NIC CPU platform");bindings(nc);behavior(nc);
+    for(auto [n,s]:nicBefore)require(dump(top(nc,n))==s,"NIC body changed");
+    require(cast<DictionaryAttr>(nc->getAttrOfType<ArrayAttr>("rawAnnotations")[5]).getAs<StringAttr>("target").getValue()==
+        "~GGCPUStreamPlatformWrapper|GGHostMemoryPlatformWrapper>cpu_stream_w_bits_data","incoming consumed target lost");
+    for(unsigned mode=0;mode<5;++mode) {
+      auto bad=fixture(ctx,true);auto bc=*bad->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
+      auto writer=top(bc,"GGEmptyCPUStreamWrite");
+      if(mode==0)writer->setAttr("goldengate.fromHostCPUStreamCount",b.getI32IntegerAttr(2));
+      if(mode==1)writer->removeAttr("goldengate.streamAddressSpaceBits");
+      if(mode==2)writer->setAttr("goldengate.streamAddressSpaceBits",b.getI64IntegerAttr(19));
+      if(mode>=3)for(auto conn:top(bc,"GGHostMemoryPlatformWrapper").getOps<ConnectOp>())
+        if(path(top(bc,"GGHostMemoryPlatformWrapper"),conn.getDest())=="sim.cpu_stream_w_bits_data") {
+          if(mode==3)conn.erase();
+          else {b.setInsertionPoint(conn);b.create<StrictConnectOp>(conn.getLoc(),conn.getDest(),conn.getSrc());}
+          break;
+        }
+      auto before=dump(*bad);
+      require(failed(goldengate::assembleCPUStreamPort(bc,error)),"invalid NIC profile accepted");
+      require(before==dump(*bad),"NIC rejection mutated IR");
+    }
     // Catalog names and strict forwarding have the same semantic contract.
     auto catalog=fixture(ctx);auto cc=*catalog->getOps<CircuitOp>().begin();OpBuilder cb(&ctx);
     top(cc,"GGEmptyCPUStreamWrite").setName("CatalogRocket_GGEmptyCPUStreamWrite");
@@ -140,8 +178,15 @@ int main(int argc,char **argv) {
     }
     require(succeeded(goldengate::assembleCPUStreamPort(cc,error))&&succeeded(verify(*catalog)),"catalog writer/strict forwarding rejected");bindings(cc);behavior(cc);
     auto s=dump(*root);require(failed(goldengate::assembleCPUStreamPort(c,error)),"repeat accepted");require(s==dump(*root),"repeat mutated IR");
-    llvm::outs()<<"15 atomic rejections; old bodies, aggregate bindings and copied/consumed targets preserved\n";
-    if(argc>=2 && StringRef(argv[1])!="--print-platform"){std::error_code ec;llvm::raw_fd_ostream os(argv[1],ec);require(!ec,"cannot write helper");os<<"module { firrtl.circuit \"GGCPUStreamPortAdapter\" {\n";top(c,"GGCPUStreamPortAdapter")->print(os);os<<"\n} }\n";}
+    llvm::outs()<<"20 atomic rejections; old bodies, aggregate bindings and copied/consumed targets preserved\n";
+    if(argc>=2 && !StringRef(argv[1]).starts_with("--")){std::error_code ec;llvm::raw_fd_ostream os(argv[1],ec);require(!ec,"cannot write helper");os<<"module { firrtl.circuit \"GGCPUStreamPortAdapter\" {\n";top(c,"GGCPUStreamPortAdapter")->print(os);os<<"\n} }\n";}
+    if(argc==3 && StringRef(argv[1])=="--platform-boundary") {
+      auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"platform boundary parse");
+      require(succeeded(verify(*real)),"platform boundary invalid");
+      auto rc=*real->getOps<CircuitOp>().begin();bindings(rc);behavior(rc);
+      llvm::outs()<<"PASS production CPU platform identity for every payload bit: "<<argv[2]<<"\n";
+      return 0;
+    }
     if(argc==4 && StringRef(argv[1])=="--print-platform") {
       for (int i=2;i<4;++i) {
         auto real=parseSourceFile<ModuleOp>(argv[i],&ctx);require(bool(real),"Print platform parse");

@@ -4753,10 +4753,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostPlatformAnnotations, error)))
         return fail("host memory platform annotations: " + error);
       llvm::outs() << "Adapted CIRCT host memory to the sixteen-bit mem_0 ID interface in " << hostPlatformPath << '\n';
-      // NIC host memory now reaches the compared platform interface; its CPU
-      // stream slave still needs composition before assembling the FPGA shell.
-      if (!cpuSinks.empty())
-        return fail("NIC CPU stream platform integration is not implemented");
       if (failed(goldengate::assembleCPUStreamPort(circuit, error)))
         return fail("CPU stream platform port: " + error);
       if (failed(mlir::verify(*module))) return fail("CPU stream platform port produced invalid FIRRTL IR");
@@ -4770,6 +4766,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuPlatformAnnotations, error)))
         return fail("CPU stream platform annotations: " + error);
       llvm::outs() << "Assembled CIRCT CPU-managed AXI4 slave in " << cpuPlatformPath << '\n';
+      // The NIC CPU slave is composed; its FPGA shell and collateral still
+      // need comparison before this target can enter simulator RTL emission.
+      if (!cpuSinks.empty())
+        return fail("NIC FPGA top shell integration is not implemented");
       if (failed(goldengate::assembleFPGATopShell(circuit, error)))
         return fail("FPGA top shell: " + error);
       if (failed(mlir::verify(*module))) return fail("FPGA top shell produced invalid FIRRTL IR");
