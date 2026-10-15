@@ -78,17 +78,24 @@ def sfc_contract(path):
                    "state__1<=1'h0;", 'elseif(idle)beginstate__1<=winner__1;'):
         assert update in state, update
     ports = rtl_ports(header)
-    for n, d, w in [('auto_anon_out_ar_bits_id', 'output', 5),
-                    ('auto_anon_in_1_ar_bits_id', 'input', 4),
-                    ('auto_anon_in_0_ar_bits_addr', 'input', 34),
-                    ('auto_anon_out_ar_bits_addr', 'output', 34)]:
-        assert ports[n] == [d, w], (n, ports[n])
-    return dict(equations=len(want), state_update_anchors=7, host_ID_bits=5,
+    typed = {}
+    for prefix, direction, id_bits in [('auto_anon_in_1_ar', 'input', 4),
+                                       ('auto_anon_out_ar', 'output', 5)]:
+        typed[prefix + '_ready'] = ['output' if direction == 'input' else 'input', 1]
+        typed[prefix + '_valid'] = [direction, 1]
+        for field, width in [('id', id_bits), ('addr', 34), ('len', 8), ('size', 3),
+                             ('burst', 2), ('lock', 1), ('cache', 4), ('prot', 3), ('qos', 4)]:
+            typed[prefix + '_bits_' + field] = [direction, width]
+    typed.update({'auto_anon_in_0_ar_ready': ['output', 1],
+                  'auto_anon_in_0_ar_valid': ['input', 1],
+                  'auto_anon_in_0_ar_bits_addr': ['input', 34]})
+    assert {n: p for n, p in ports.items() if '_ar_' in n} == typed, 'SFC AR port types differ'
+    return dict(equations=len(want), typed_ports=len(typed), state_update_anchors=7, host_ID_bits=5,
                 FASED_ID_bits=4, LoadMem_ID=16, locked_during_stalls=True,
                 priority_rotates_on_idle_selection=True)
 
 
-def compare(before_path, after_path, baseline):
+def compare_binding(before_path, after_path, baseline):
     before, after = before_path.read_text(), after_path.read_text()
     def modules(text):
         found = list(re.finditer(r'^    firrtl.module @(\w+)\(.*?^    }', text, re.M | re.S))
@@ -96,18 +103,18 @@ def compare(before_path, after_path, baseline):
         assert len(result) == len(found), 'duplicate module definitions'
         return result
     old_modules, new_modules = modules(before), modules(after)
-    assert len(old_modules) == 277
+    assert not set(old_modules) & {TOP, HELPER}, "AR arbitration boundary already exists"
     for n, body in old_modules.items(): assert body == new_modules[n], 'changed prior body ' + n
-    assert set(new_modules) - set(old_modules) == {TOP, HELPER}
+    assert set(new_modules) == set(old_modules) | {TOP, HELPER}
     wrapper = new_modules[TOP]; old_ports = native_ports(old_modules[OLD])
     copied = [p for p in old_ports if p[1] not in CONSUMED]; ports = native_ports(wrapper)
-    assert len(copied) == 111 and ports[:111] == copied and len(ports) == 113
+    assert ports[:len(copied)] == copied and len(ports) == len(copied) + 2
     old_rest = next(t for _, n, t in old_ports if n == 'fased_host_mem')
     rest = '!firrtl.bundle<r flip: ' + old_rest.split(', r flip: ', 1)[1]
     address = old_rest.removeprefix('!firrtl.bundle<ar: ').split(', r flip: ', 1)[0]
     old_write = next(t for _, n, t in old_ports if n == 'host_mem_write')
     master = old_write[:-1] + ', ar: ' + address.replace('id: uint<4>', 'id: uint<5>') + '>'
-    assert ports[111:] == [('out', 'fased_host_mem', rest), ('out', 'host_mem', master)]
+    assert ports[len(copied):] == [('out', 'fased_host_mem', rest), ('out', 'host_mem', master)]
     nets = {('sim.' if d == 'in' else 'top.') + n: ('top.' if d == 'in' else 'sim.') + n for d, n, _ in copied}
     nets.update({'top.host_mem.aw': 'sim.host_mem_write.aw', 'top.host_mem.w': 'sim.host_mem_write.w',
                  'sim.host_mem_write.b': 'top.host_mem.b', 'read_arbiter.clock': 'top.hostClock',
@@ -125,10 +132,18 @@ def compare(before_path, after_path, baseline):
     archive = re.sub(r'\|' + OLD + r'>fased_host_mem\.r(?=[.\["\\])', '|' + TOP + '>fased_host_mem.r', archive)
     archive = re.sub(r'\|' + OLD + r'>host_mem_write\.', '|' + TOP + '>host_mem.', archive)
     assert archive == after.splitlines()[1], 'nested archive target transfer differs'
-    assert len([n for n in old_modules if n.startswith('GGPrintBridge')]) == 21
-    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=277,
-                copied_ports=111, top_ports=113, wrapper_connections=len(nets), identical_native_helpers=1,
-                preserved_Print_modules=21, nested_archive_targets_preserved=True)
+    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(old_modules),
+                copied_ports=len(copied), top_ports=len(ports), wrapper_connections=len(nets), identical_native_helpers=1,
+                preserved_Print_modules=len([n for n in old_modules if n.startswith('GGPrintBridge')]),
+                nested_archive_targets_preserved=True)
+
+
+def compare(before_path, after_path, baseline):
+    report = compare_binding(before_path, after_path, baseline)
+    assert report['unchanged_module_bodies'] == 277
+    assert report['copied_ports'] == 111 and report['top_ports'] == 113
+    assert report['wrapper_connections'] == 122 and report['preserved_Print_modules'] == 21
+    return report
 
 
 def main():
