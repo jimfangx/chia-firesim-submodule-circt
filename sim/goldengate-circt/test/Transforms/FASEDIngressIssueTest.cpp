@@ -9,6 +9,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
 #include <map>
 #include <functional>
 #include <random>
@@ -21,7 +22,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false,uint64_t maxFlight=10) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressOrderWrapper\" { firrtl.module @GGFASEDIngressOrderWrapper() {} } }",&ctx);require(bool(root),"fixture parse");
   auto c=*root->getOps<CircuitOp>().begin();
   if(selected)c.setName("GGSelectedPrintFASEDIngressOrderWrapper");
@@ -31,7 +32,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=fal
   auto address=bundle({{"user",1},{"id",4},{"region",4},{"qos",4},{"prot",3},{"cache",4},{"lock",1},{"burst",2},{"size",3},{"len",8},{"addr",35}});
   auto data=bundle({{"user",1},{"strb",8},{"id",4},{"last",1},{"data",64}});
   auto token=[&](FIRRTLBaseType t){return BundleType::get(&ctx,{{b.getStringAttr("ready"),mode!=15,bit},{b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,t}});};
-  auto status=bundle({{"awValue",4},{"wValue",4},{"awEmpty",1},{"wEmpty",1},{"writeReqDone",1}});
+  unsigned cw=llvm::Log2_64_Ceil(std::min<uint64_t>(16,maxFlight)+1);
+  if(mode==30)++cw;
+  auto status=bundle({{"awValue",cw},{"wValue",cw},{"awEmpty",1},{"wEmpty",1},{"writeReqDone",1}});
   auto transactions=bundle({{"arReady",1},{"arValid",1},{"rReady",1},{"rValid",1},{"rLast",1},{"awReady",1},{"awValid",1},{"bReady",1},{"bValid",1}});
   const llvm::StringRef names[]{"hostClock","fased_ingress_reset","fased_ingress_relaxed","fased_host_mem_idle","fased_host_read_inflight","fased_ingress_credits","fased_ingress_order","fased_ingress_aw_deq","fased_ingress_w_deq","fased_ingress_ar_deq","fased_host_transactions"};
   const Type types[]{ClockType::get(&ctx),bit,bit,bit,bit,status,token(bit),token(address),token(data),token(address),transactions};SmallVector<PortInfo> ports;
@@ -40,7 +43,13 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=fal
   if(mode==12)ports[0].type=bit;if(mode==13)ports[1].direction=Direction::In;if(mode==14)ports[7].type=token(data);
   if(mode==16||mode==17)ports[11].name=b.getStringAttr(mode==16?"fased_host_requests":"fased_host_responses");
   auto top=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ports);
-  if(mode!=18){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});if(mode!=19)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(mode==20?8:10))}))}));}
+  if(mode!=18){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});if(mode!=19)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(mode==20?0:(mode==26?-1:maxFlight)))}))}));}
+  if(mode>=27 && mode<=29) {
+    auto engine=named(c,"GGFASEDTokenEngine");
+    Attribute value=mode==27?Attribute(b.getStringAttr("16")):Attribute(b.getIntegerAttr(b.getIntegerType(128),APInt(128,16)));
+    auto edge=mode==29?b.getDictionaryAttr({}):b.getDictionaryAttr({b.getNamedAttr("maxFlight",value)});
+    engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",edge)}));
+  }
   if(mode==21||mode==22)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==21?"GGFASEDIngressIssue":selected?"GGSelectedPrintFASEDIngressIssueWrapper":"GGFASEDIngressIssueWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==23){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"used");}if(mode==24)c.setName("other");
   SmallVector<Attribute> raw;
@@ -148,12 +157,16 @@ void behavior(MLIRContext &ctx,bool selected) {
   }
   require(priority&&stalls,"priority/stall coverage missing");llvm::outs()<<cases<<" issue transitions/payload cases, "<<priority<<" AW/final-W collisions passed\n";
 }
-void mapping(MLIRContext &ctx,bool selected){
-  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDIngressIssue(c,error)),error);
+void mapping(MLIRContext &ctx,bool selected,uint64_t maxFlight){
+  auto root=fixture(ctx,0,selected,maxFlight);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDIngressIssue(c,error)),error);require(succeeded(verify(*root)),"invalid width-dependent wrapper IR");
   Interpreter wired(named(c,selected?"GGSelectedPrintFASEDIngressIssueWrapper":"GGFASEDIngressIssueWrapper"));InstanceOp inner,issue;for(auto i:wired.module.getOps<InstanceOp>())if(i.getName()=="sim")inner=i;else issue=i;
   require(wired.module.getNumPorts()==9,"wrapper port contract differs");
   require(wired.drivers.at(wired.key(issue.getResult(0)))==wired.arg(0),"host clock differs");
-  for(unsigned flags=0;flags<256;++flags){wired.memo.clear();auto f=[&](unsigned i){return bool(flags>>i&1);};
+  const unsigned cw=llvm::Log2_64_Ceil(std::min<uint64_t>(16,maxFlight)+1);
+  auto status=cast<BundleType>(wired.arg(5).getType());
+  for(unsigned j=0;j<2;++j)require(*cast<UIntType>(status.getElements()[j].type).getWidth()==cw,"constructor-sized credit width differs");
+  for(unsigned flags=0;flags<256;++flags){wired.memo.clear();
+    for(auto n:{"awValue","wValue"}){unsigned value=flags&((1u<<cw)-1);wired.put(inner.getResult(5),n,value);require(wired.output(wired.arg(5),n,cw).getZExtValue()==value,"credit value forwarding truncated");}auto f=[&](unsigned i){return bool(flags>>i&1);};
     wired.put(inner.getResult(1),"",f(0));wired.put(wired.arg(2),"",f(1));wired.put(inner.getResult(3),"",f(2));wired.put(inner.getResult(4),"",f(3));wired.put(inner.getResult(5),"awEmpty",f(4));wired.put(inner.getResult(5),"wEmpty",f(5));
     for(unsigned j=1;j<=6;++j)require(wired.output(issue.getResult(j),"").getBoolValue()==f(j-1),"policy/reset input differs");
     for(auto [q,j]:{std::pair<unsigned,unsigned>{6,7},{7,8},{8,9},{9,10}}){wired.put(inner.getResult(q),"valid",f(6));wired.put(issue.getResult(j),"ready",f(7));require(wired.output(issue.getResult(j),"valid").getBoolValue()==f(6)&&wired.output(inner.getResult(q),"ready").getBoolValue()==f(7),"queue/order binding differs");}
@@ -177,8 +190,20 @@ void mapping(MLIRContext &ctx,bool selected){
   llvm::outs()<<"256 wrapper binding cases passed\n";
 }
 void rejection(MLIRContext &ctx,bool selected){
-  for(unsigned mode=1;mode<=25;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDIngressIssue(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
-  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;require(succeeded(goldengate::addFASEDIngressIssue(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDIngressIssue(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"26 atomic rejection cases passed\n";
+  for(unsigned mode=1;mode<=30;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDIngressIssue(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;require(succeeded(goldengate::addFASEDIngressIssue(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDIngressIssue(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"31 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{for(bool selected:{false,true}){behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+int main(int argc,char **argv){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();try{
+  if(argc==3) {
+    auto root=parseSourceFile<ModuleOp>(argv[1],&ctx);require(bool(root)&&succeeded(verify(*root)),"production issue boundary invalid");
+    auto circuit=*root->getOps<CircuitOp>().begin();auto wrapper=named(circuit,circuit.getName());FModuleOp helper;
+    for(auto i:wrapper.getOps<InstanceOp>())if(i.getName()=="ingressIssue")helper=named(circuit,i.getModuleName());
+    require(bool(helper),"production issue helper missing");
+    auto isolated=ModuleOp::create(circuit.getLoc());OpBuilder b(&ctx);b.setInsertionPointToEnd(isolated.getBody());
+    auto exported=b.create<CircuitOp>(circuit.getLoc(),helper.getNameAttr());b.setInsertionPointToEnd(exported.getBodyBlock());
+    cast<FModuleOp>(b.insert(helper->clone())).setPublic();require(succeeded(verify(isolated)),"exported helper invalid");
+    std::error_code ec;llvm::raw_fd_ostream out(argv[2],ec);require(!ec,"cannot export issue helper");isolated.print(out);out<<'\n';out.close();isolated.erase();return 0;
+  }
+  require(argc==1,"usage: goldengate-fased-ingress-issue-test [ingress-issue.mlir helper.mlir]");
+  for(bool selected:{false,true}){behavior(ctx,selected);for(uint64_t flight:{uint64_t(1),uint64_t(2),uint64_t(3),uint64_t(8),uint64_t(10),uint64_t(16),uint64_t(20),uint64_t(INT64_MAX)})mapping(ctx,selected,flight);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

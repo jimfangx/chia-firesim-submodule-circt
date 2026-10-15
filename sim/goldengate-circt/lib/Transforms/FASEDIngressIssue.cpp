@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Oracle: IngressUnit.scala host issue policy and do_hwrite_data_reg.
-// Requires uninstantiated order wrapper and exact Rocket queues/status/host
+// Requires uninstantiated order wrapper and exact queues/status/host
 // handshake boundaries. All validation precedes mutation.
 // Consumes raw AW/W/AR dequeue, order dequeue and host transaction boundary.
 // Produces gated host requests, connects actual acceptance to queue retirement,
@@ -10,6 +10,7 @@
 // Qualified ingress reset clears that register, but never suppresses requests.
 #include "goldengate/FASEDIngressIssue.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -31,7 +32,12 @@ LogicalResult goldengate::addFASEDIngressIssue(CircuitOp circuit,std::string &er
   auto key=engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
   auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
   auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
-  if(!flight||flight.getInt()!=10)return reject("FASED ingress issue supports recorded maxFlight=10 profile");
+  if(!flight || flight.getType().getIntOrFloatBitWidth()>64 || flight.getInt()<=0)
+    return reject("FASED ingress issue needs positive maxFlight representable in 64 bits");
+  // FASEDMemoryTimingModelConfig caps maxWrites at the default sixteen.
+  // SatUpDownCounter exposes log2Ceil(maxWrites + 1) credit value bits;
+  // host issue itself depends only on the counters' empty flags.
+  const unsigned countWidth=llvm::Log2_64_Ceil(std::min<int64_t>(16,flight.getInt())+1);
   auto *context=circuit.getContext();OpBuilder b(context);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(context,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> fields){
@@ -40,7 +46,7 @@ LogicalResult goldengate::addFASEDIngressIssue(CircuitOp circuit,std::string &er
   auto address=bundle({{"user",1},{"id",4},{"region",4},{"qos",4},{"prot",3},{"cache",4},{"lock",1},{"burst",2},{"size",3},{"len",8},{"addr",35}});
   auto data=bundle({{"user",1},{"strb",8},{"id",4},{"last",1},{"data",64}});
   auto token=[&](FIRRTLBaseType t){return BundleType::get(context,{{b.getStringAttr("ready"),true,bit},{b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,t}});};
-  auto status=bundle({{"awValue",4},{"wValue",4},{"awEmpty",1},{"wEmpty",1},{"writeReqDone",1}});
+  auto status=bundle({{"awValue",countWidth},{"wValue",countWidth},{"awEmpty",1},{"wEmpty",1},{"writeReqDone",1}});
   auto transactions=bundle({{"arReady",1},{"arValid",1},{"rReady",1},{"rValid",1},{"rLast",1},{"awReady",1},{"awValid",1},{"bReady",1},{"bValid",1}});
   const llvm::StringRef required[]{"hostClock","fased_ingress_reset","fased_ingress_relaxed","fased_host_mem_idle","fased_host_read_inflight","fased_ingress_credits","fased_ingress_order","fased_ingress_aw_deq","fased_ingress_w_deq","fased_ingress_ar_deq","fased_host_transactions"};
   const Type types[]{ClockType::get(context),bit,bit,bit,bit,status,token(bit),token(address),token(data),token(address),transactions};unsigned indices[11];

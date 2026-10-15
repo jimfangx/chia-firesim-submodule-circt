@@ -7814,3 +7814,84 @@ identical. `diagnostic-replay/result.json` records this check and the final
 671-source stability snapshot. Duplicate diagnostic MLIR dumps are preserved
 as SHA256-verified gzip files. The full matrix results above retain their
 original compiler hash, distinct from this final diagnostic-only rebuild.
+
+
+### Iteration 251: derive the ingress issue credit-status contract
+
+`FASEDIngressIssue.cpp` derives credit-value widths from
+`ceil(log2(min(16, axi4Edge.maxFlight) + 1))`, following
+`FASEDMemoryTimingModelConfig.maxWrites`, the default FASED BaseParams and
+`SatUpDownCounter`. Constructors must contain a positive integer maximum of
+at most 64 bits, and the exact derived status type is checked before mutation.
+Rocket retains four-bit values; Gemmini and Saturn Rocket use five bits.
+Missing optional maxima and custom BaseParams remain outside this specialization.
+
+Host issue still depends on credit-empty flags rather than credit values.
+The CIRCT FIRRTL operations retain strict/relaxed request gating, accepted AW/AR
+order retirement, complete payload forwarding, reset-independent request
+presentation and accepted-AW priority over accepted final W. The ordinary and
+selected Print wrappers preserve the full constructor-sized status bundle and
+annotation transfer. No helper symbol or operation changes for Rocket.
+
+The native compiler and focused test executables build successfully.
+`goldengate-fased-ingress-issue` CTest passes in 23.55 seconds: 131,072 issue-state
+transitions/payload cases, 4,096 wrapper binding cases across maxFlight 1, 2, 3,
+8, 10, 16, 20 and INT64_MAX in both wrapper forms, and 62 atomic rejection
+cases. The expanded tests check every credit-value pattern through the copied
+status boundary and reject zero, negative, non-integer, missing, over-wide and
+incorrect-status constructors. The selected Print integration test passes with
+unchanged allocated headers/SSA and nine atomic rejection cases; its invalid
+constructor fixture now uses zero because eight is supported.
+
+Evidence is under `iteration251-u250-target-matrix/`. A focused export mode
+clones the helper actually instantiated by each verified fresh production
+`post-fame-fased-ingress-issue.mlir` wrapper. Firtool lowers that helper for
+standalone Verilator comparison with the actual SFC IngressModule issue cone.
+`compare-issue.py` lifts the recorded SFC equations and synchronous reset block
+verbatim, exposes their existing queue/status boundary wires, and checks the
+21 shared SFC payload assignments. An independent reference also checks every
+native payload field, request/ready predicate, order retirement and write-data
+state transition. This is an isolated boundary comparison, not integrated
+FireSim metasimulation or proof of complete model parity.
+
+The immutable October 1 U250 build-tree `design/FireSim-generated.sv` and
+October 13 archived Rocket, Gemmini and Saturn Rocket
+`design/FireSim-generated.sv` each match for 193,840 cycles, totaling 775,360.
+Each comparison exhausts every input mask from both possible prior write-data
+states, then runs 30,000 randomized cycles. It includes 440 accepted-AW/final-W
+collisions and 14,085 accepted requests during reset per reference; reset
+clears state without suppressing presented requests. All four exported native
+helpers are byte-identical. `issue-comparison.json` and each
+`issue-*/comparison.json` record exact golden/candidate paths, SHA256 values,
+credit widths, SFC equations, payload mappings and execution results.
+
+The full thirteen-recipe replay retains three compiled Rocket recipes, four
+compiler gaps and six unsupported partition/QSFP platforms. Gemmini and Saturn
+Rocket now emit ingress issue boundaries and stop at `FASED deadlock checks
+need exact policy, credits, order and enqueue boundaries`. BOOM and Shuttle
+retain their TracerV constructor/channel failures. Structured comparisons
+remain eight matches, six existing SRAM-model port mismatches and twelve not
+reached. The matrix exits nonzero; these gaps and mismatches are not parity.
+
+`rocket-regression.json` and `matrix-regression.json` confirm all 779 prior
+Rocket MLIR/JSON boundary files match iteration 250 after candidate-path
+normalization; all six emitted RTL/collateral files per compiled recipe are
+byte-identical. Archived inputs, effective platforms, statuses and structured
+comparisons remain the same, with exactly two failures advancing from issue
+to deadlock checking. `source-replay-stability.json` records the compiler hash
+and verifies all 671 captured compiler/build source inputs and the binary
+remained unchanged through replay. The compiler SHA256 is
+`458ef90aadf53efbc98f7add3858c8574394f58f2fc44964414310ef96e12f5f`.
+
+For replay headroom, 707 iteration-249 MLIR dumps were losslessly gzipped,
+recovering 48,084,665,541 bytes. Each decompressed SHA256 was verified before
+removing its raw duplicate (`lossless-storage-cleanup-249.json`). Current and
+iteration-250 boundaries, logs, JSON, final emissions and immutable fixtures
+remain available.
+
+The next smallest port is the deadlock pass's derived credit-status type and
+AW queue identity/geometry. `next-deadlock-oracle.json` records five-bit credit
+values, sixteen-entry AW queues and both original SFC deadlock assertions for
+Gemmini and Saturn Rocket. Preserve observation of actual enqueue valid/ready
+and qualified-reset assertion disabling when removing the four-bit/Queue10
+restriction. Manager verification remains owned by the external harness.
