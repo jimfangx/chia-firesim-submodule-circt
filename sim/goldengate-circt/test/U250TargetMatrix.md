@@ -7643,3 +7643,81 @@ and the compiler binary stayed unchanged during replay; compiler SHA256 is
 `f4aab94eaf0b72c4b86d95411b53d1fd6b6a691f72b2db3ead5302856cf841f8`. The next smallest port is
 constructor-derived ingress credit widths/limits, followed by order queue
 capacity and downstream issue/deadlock contracts.
+
+### Iteration 249: derive FASED ingress credit counter widths and limits
+
+`FASEDIngressCredits.cpp` now uses `min(16, axi4Edge.maxFlight)` for its
+saturation limit and `ceil(log2(maxWrites + 1))` for both counter registers,
+arithmetic truncations, constants and exposed status fields. This follows
+`BaseConfig.maxWrites`, `IngressUnit.scala` and `widgets/Lib.scala`'s
+`SatUpDownCounter`. Positive integer edge maxima of at most 64 bits are
+required before mutation; custom BaseParams and absent optional maxima
+remain outside the supported default-constructor specialization.
+
+The pass retains host-clocked, qualified-reset state, pre-edge combinational
+write completion even during reset, simultaneous increment/decrement holds,
+strict-mode paired retirement and relaxed-mode accepted AW/final-W retirement.
+The ordinary and selected Print wrappers preserve copied ports and annotation
+targets. At Rocket's limit ten the operations and types are unchanged;
+Gemmini and Saturn Rocket's limit sixteen requires five-bit counters/status.
+
+The focused interpreter checks every representable pair of counter states
+against all 64 reset/ordering/enqueue/dequeue combinations at maxFlight 1, 2,
+3, 8, 10, 16, 20 and INT64_MAX in both wrappers. This includes out-of-range
+states above the saturation limit, exact status widths and all wrapper
+handshake combinations: 463,360 transitions, 8,192 wrapper cases and 52 atomic
+malformed/repeated-pass rejections. Its export mode clones the actual credit
+helper from verified production IR into an isolated verified circuit for RTL
+comparison.
+
+Evidence is under `iteration249-u250-target-matrix/`. The immutable October 1
+U250 `design/FireSim-generated.sv` has identical Rocket credit-counter module
+bodies, parent clock/reset/enqueue/retirement/limit bindings and combinational
+write-completion expressions to the October 13 archive
+(`immutable-credit-comparison.json`). Both remain read-only.
+
+For replay headroom, 704 iteration-247 MLIR dumps were losslessly gzipped,
+recovering 47,917,815,104 bytes. Each original SHA256 matched decompression
+before removal (`lossless-storage-cleanup-247.json`); iteration-248 boundaries,
+JSON, logs, final RTL/collateral and immutable fixtures remain. FireSim manager
+verification remains owned by the harness and was not started here.
+
+The full native build and `goldengate-fased-ingress-credits` CTest pass (32.01
+seconds). Each of the three fresh production helpers is exported from that
+recipe's `post-fame-fased-ingress-credits.mlir` and lowered with firtool. Its
+standalone Verilator comparison uses the actual SFC `IngressModule` counter
+instances, maximum/clock/reset/increment/retirement bindings and completion
+expressions, plus an independent counter reference. Rocket passes 32,225
+cycles at width four/limit ten; Gemmini and Saturn Rocket each pass 33,125
+cycles at width five/limit sixteen (98,475 cycles total). Directed tests cover
+saturation, empty retirement, simultaneous increment/decrement, strict paired
+completion, relaxed host retirement and completion during reset; randomized
+traffic follows (`credit-comparison.json`). Exact golden/candidate paths,
+SHA256 values, bindings and run logs are recorded per recipe. These isolated
+helper comparisons do not establish whole-target metasimulation parity.
+
+`next-order-oracle.json` records the next constructor gap directly from each
+SFC `IngressModule.xaction_order`: Rocket's two ten-entry banks provide twenty
+slots, while Gemmini and Saturn Rocket each need two sixteen-entry banks
+(thirty-two slots). `FASEDIngressOrder.cpp` still requires maxFlight ten and
+four-bit credit status. Generalizing its capacity, pointer wrap and status
+contract is the next smallest port, followed by the remaining issue/deadlock
+constructor restrictions.
+
+The fresh thirteen-recipe replay finishes with three compiled Rocket recipes,
+four compiler gaps and six unsupported partition/QSFP platforms. Gemmini and
+Saturn Rocket advance from the credit-counter restriction to
+`FASED ingress order supports recorded maxFlight=10 profile`; BOOM and Shuttle
+retain their TracerV constructor/channel gap. Structured comparisons remain
+eight matches, six existing SRAM-model port mismatches and twelve not reached.
+The matrix exits nonzero; no rejected target or mismatch counts as parity.
+
+`matrix-regression.json` confirms identical archived inputs, effective platforms,
+compile statuses and structured comparison results against iteration 248,
+with exactly the two ingress-credit failures advancing to ingress ordering.
+All 779 prior Rocket MLIR/JSON boundaries match after candidate-path
+normalization, and all six emitted RTL/collateral files per compiled recipe
+are byte-identical. `source-replay-stability.json` confirms all 671 captured
+compiler/build source inputs and the compiler binary stayed unchanged during
+replay; compiler SHA256 is
+`64c04b052beec7acd58c2fca09e28e7734d36c5f847524cb75c3db4bfa8606e7`.

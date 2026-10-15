@@ -21,7 +21,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false, uint64_t maxFlight=10) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressARQueueWrapper\" { firrtl.module @GGFASEDIngressARQueueWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse"); auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
@@ -51,7 +51,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=f
   auto inner=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ports);
   if(mode!=13){
     auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),ConventionAttr::get(&ctx,Convention::Internal),SmallVector<PortInfo>{});
-    if(mode!=14)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(mode==15?8:10))}))}));
+    if(mode!=14) {
+      Attribute flight = b.getI64IntegerAttr(mode==15 ? 0 : maxFlight);
+      if(mode==21)flight=b.getI64IntegerAttr(-1);
+      if(mode==22)flight=b.getStringAttr("20");
+      if(mode==23)flight=b.getIntegerAttr(b.getIntegerType(128), APInt(128,20));
+      auto edge = b.getDictionaryAttr(mode==24 ? ArrayRef<NamedAttribute>{} : ArrayRef<NamedAttribute>{b.getNamedAttr("maxFlight",flight)});
+      engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr(mode==25 ? ArrayRef<NamedAttribute>{} : ArrayRef<NamedAttribute>{b.getNamedAttr("axi4Edge",edge)}));
+    }
   }
   if(mode==16||mode==17)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==16?"GGFASEDIngressCredits":"GGFASEDIngressCreditsWrapper"),ConventionAttr::get(&ctx,Convention::Internal),SmallVector<PortInfo>{});
   if(mode==18){b.setInsertionPointToStart(inner.getBodyBlock());b.create<InstanceOp>(c.getLoc(),inner,"used");}
@@ -159,15 +166,21 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx, bool selected=false) {
-  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx, bool selected, uint64_t maxFlight) {
+  auto root=fixture(ctx,0,selected,maxFlight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDIngressCredits(c,error)),error);
   require(succeeded(verify(*root)),"invalid credit IR");
   Interpreter sim(named(c,"GGFASEDIngressCredits"));SmallVector<Value> regs;
   for(auto r:sim.module.getOps<RegResetOp>())regs.push_back(r.getResult());
   require(regs.size()==2,"counter state missing");unsigned cases=0;
-  for(unsigned aw=0;aw<16;++aw)for(unsigned w=0;w<16;++w)for(unsigned flags=0;flags<64;++flags){
-    sim.memo.clear();sim.state[regs[0]]=APInt(4,aw);sim.state[regs[1]]=APInt(4,w);
+  const unsigned limit=std::min<uint64_t>(16,maxFlight);
+  unsigned width=1;while((uint64_t(1)<<width)<=limit)++width;
+  for(auto r:regs)require(sim.width(r)==width,"constructor-derived counter width differs");
+  auto status=cast<BundleType>(sim.arg(7).getType());
+  require(cast<UIntType>(status.getElementType("awValue")).getWidth()==width &&
+          cast<UIntType>(status.getElementType("wValue")).getWidth()==width,"credit status width differs");
+  for(unsigned aw=0;aw<(1u<<width);++aw)for(unsigned w=0;w<(1u<<width);++w)for(unsigned flags=0;flags<64;++flags){
+    sim.memo.clear();sim.state[regs[0]]=APInt(width,aw);sim.state[regs[1]]=APInt(width,w);
     auto f=[&](unsigned i){return bool(flags>>i&1);};
     sim.put(sim.arg(1),"",f(0));sim.put(sim.arg(2),"",f(1));
     for(unsigned i=3;i<=6;++i)sim.put(sim.arg(i),"",f(i-1));
@@ -177,7 +190,7 @@ void behavior(MLIRContext &ctx, bool selected=false) {
       require(sim.output(sim.arg(7),n).getZExtValue()==v,"credit status differs");
     auto next=[&](unsigned n,bool inc,bool dec){
       if(f(0))return 0u;if(inc==dec)return n;
-      return inc ? (n<10?n+1:n) : (n?n-1:n);
+      return inc ? (n<limit?n+1:n) : (n?n-1:n);
     };
     sim.edge();
     require(sim.state[regs[0]].getZExtValue()==next(aw,f(3),f(1)?f(4):done),"AW credit differs");
@@ -217,8 +230,8 @@ void behavior(MLIRContext &ctx, bool selected=false) {
   }
   llvm::outs()<<cases<<" credit transitions and 512 wrapper cases passed\n";
 }
-void rejection(MLIRContext &ctx, bool selected=false){
-  for(unsigned mode=1;mode<=20;++mode){
+void rejection(MLIRContext &ctx, bool selected){
+  for(unsigned mode=1;mode<=25;++mode){
     auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
     {llvm::raw_string_ostream out(before);root->print(out);}
     require(failed(goldengate::addFASEDIngressCredits(c,error))&&!error.empty(),"malformed boundary accepted");
@@ -229,9 +242,32 @@ void rejection(MLIRContext &ctx, bool selected=false){
   {llvm::raw_string_ostream out(before);root->print(out);}
   require(failed(goldengate::addFASEDIngressCredits(c,error)),"repeat accepted");
   {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");
-  llvm::outs()<<"21 atomic rejection cases passed\n";
+  llvm::outs()<<"26 atomic rejection cases passed\n";
 }
 }
-int main(){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try{behavior(ctx);rejection(ctx);behavior(ctx,true);rejection(ctx,true);}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;
+int main(int argc, char **argv) {
+  MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  try {
+    if(argc==3) {
+      auto root=parseSourceFile<ModuleOp>(argv[1],&ctx);
+      require(bool(root) && succeeded(verify(*root)),"production credit boundary invalid");
+      auto circuit=*root->getOps<CircuitOp>().begin();
+      require(circuit.getName()=="GGFASEDIngressCreditsWrapper" || circuit.getName()=="GGSelectedPrintFASEDIngressCreditsWrapper","expected credit ingress boundary");
+      auto isolated=ModuleOp::create(circuit.getLoc());OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported=b.create<CircuitOp>(circuit.getLoc(),b.getStringAttr("GGFASEDIngressCredits"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper=cast<FModuleOp>(b.insert(named(circuit,"GGFASEDIngressCredits")->clone()));helper.setPublic();
+      require(succeeded(verify(isolated)),"exported credit helper invalid");
+      std::error_code ec;llvm::raw_fd_ostream out(argv[2],ec);require(!ec,"cannot export credit helper");
+      isolated.print(out);out<<'\n';out.close();isolated.erase();return 0;
+    }
+    require(argc==1,"usage: goldengate-fased-ingress-credits-test [ingress-credits.mlir helper.mlir]");
+    for(bool selected:{false,true}) {
+      for(uint64_t maxFlight:{uint64_t(1),uint64_t(2),uint64_t(3),uint64_t(8),uint64_t(10),uint64_t(16),uint64_t(20),uint64_t(INT64_MAX)})
+        behavior(ctx,selected,maxFlight);
+      rejection(ctx,selected);
+    }
+  } catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
+  return 0;
 }

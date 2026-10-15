@@ -1,15 +1,16 @@
 // See LICENSE for license details.
 // Oracle: IngressUnit.scala wCredits/awCredits/write_req_done and Lib.scala.
 // Requires: uninstantiated AR ingress wrapper, exact enqueue pulses/dequeue
-// channels, qualified ingress reset, retained annotations, maxFlight=10.
+// channels, qualified ingress reset, retained annotations, positive constructor maxFlight.
 // Preserves all existing ports; adds relaxed ordering input and credit status.
 // Host issue gates and transaction-order FIFO are subsequent transforms. Their
 // accepted AW/final-W dequeue handshakes feed the relaxed retirement rules.
-// Two host-clocked four-bit counters saturate at ten; strict mode consumes
+// Two host-clocked counters saturate at min(16, maxFlight); strict mode consumes
 // both credits on a completed write. Completion uses pre-edge counter values
 // and remains combinational during reset, matching the SFC ordering enqueue.
 #include "goldengate/FASEDIngressCredits.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -33,11 +34,15 @@ LogicalResult goldengate::addFASEDIngressCredits(CircuitOp circuit, std::string 
   auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getInt() != 10)
-    return reject("FASED ingress credits support the recorded maxFlight=10 profile");
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
+    return reject("FASED ingress credits need a positive 64-bit maxFlight constructor");
+  // WithDefaultMemModel supplies sixteen write slots, narrowed by the AXI
+  // edge. SatUpDownCounter includes the saturation value in its state width.
+  const uint64_t maxWrites = std::min<uint64_t>(16, flight.getInt());
+  const unsigned countWidth = llvm::Log2_64_Ceil(maxWrites + 1);
   auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(context, w, false); };
-  auto bit = uint(1), countType = uint(4);
+  auto bit = uint(1), countType = uint(countWidth);
   auto bundle = [&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> fields) {
     SmallVector<BundleType::BundleElement> elements;
     for (auto [n,w] : fields) elements.push_back({b.getStringAttr(n), false, uint(w)});
@@ -80,7 +85,7 @@ LogicalResult goldengate::addFASEDIngressCredits(CircuitOp circuit, std::string 
   auto helper=b.create<FModuleOp>(loc,b.getStringAttr(helperName),ConventionAttr::get(context,Convention::Internal),hp);
   b.setInsertionPointToStart(helper.getBodyBlock());
   auto arg=[&](unsigned i){return helper.getBodyBlock()->getArgument(i);};
-  auto constant=[&](unsigned n)->Value {return b.create<ConstantOp>(loc,countType,APInt(4,n));};
+  auto constant=[&](unsigned n)->Value {return b.create<ConstantOp>(loc,countType,APInt(countWidth,n));};
   auto connect=[&](Value d,Value s){b.create<StrictConnectOp>(loc,d,s);};
   auto field=[&](Value v,llvm::StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};
   auto both=[&](Value a,Value z)->Value{return b.create<AndPrimOp>(loc,a,z);};
@@ -93,10 +98,10 @@ LogicalResult goldengate::addFASEDIngressCredits(CircuitOp circuit, std::string 
   Value done=either(either(both(b.create<LTPrimOp>(loc,w,aw),arg(3)),
                           both(b.create<LTPrimOp>(loc,aw,w),arg(4))),both(arg(3),arg(4)));
   auto update=[&](Value value,Value inc,Value dec,Value empty){
-    Value full=b.create<GEQPrimOp>(loc,value,constant(10));
+    Value full=b.create<GEQPrimOp>(loc,value,constant(maxWrites));
     Value up=both(both(inc,neg(dec)),neg(full)), down=both(both(neg(inc),dec),neg(empty));
-    Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,value,constant(1)),3,0);
-    Value minus=b.create<BitsPrimOp>(loc,b.create<SubPrimOp>(loc,value,constant(1)),3,0);
+    Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,value,constant(1)),countWidth-1,0);
+    Value minus=b.create<BitsPrimOp>(loc,b.create<SubPrimOp>(loc,value,constant(1)),countWidth-1,0);
     connect(value,mux(up,plus,mux(down,minus,value)));
   };
   update(aw,arg(4),mux(arg(2),arg(5),done),awEmpty);
