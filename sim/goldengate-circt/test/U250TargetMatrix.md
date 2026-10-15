@@ -6386,3 +6386,70 @@ iteration 234. Only the NIC diagnostic advances to the final RTL guard.
 Aggregate comparisons remain eight matched, six mismatched (native SRAM model
 ports), and twelve not reached. Complete NIC collateral is an ABI milestone,
 not a newly supported runtime target.
+
+## Iteration 236: publish final NIC RTL through the common CIRCT pipeline
+
+The NIC compiler path now restores its physical interface annotation archive
+after emitting diagnostic headers and continues through the existing native
+host-clock wiring, Xilinx specialization, hierarchy normalization, XDC and
+simulator RTL lowering. The common driver composer publishes the complete
+header alongside that RTL. This follows the oracle's SimulationMapping then
+HostSpecialization ordering in `MidasTransforms.scala`, retaining the host reset
+and clock-gate semantics from `FAMETransform.scala`.
+
+All thirteen archived inputs were replayed with their effective platform
+configurations. Rocket single-core NIC and no-NIC now compile; five compiler
+gaps and six unsupported partition/QSFP platforms remain. The matrix correctly
+returns nonzero. Only NIC advances from rejected to compiled. Earlier structured
+checks remain eight matched, six mismatched (native SRAM model ports), and
+twelve not reached; final RTL publication does not resolve those differences.
+
+The exact final SFC artifacts compared are under
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/`
+(relative to the outer repository): `FireSim-generated.sv`, `.const.h`,
+`.const.vh`, `.implementation.xdc`, `.synthesis.xdc` and `.defines.vh`.
+`NICFinalRTLCompare.py` finds matching typed F1Shim/FPGATop interfaces (143/121
+leaves), all 129 shim routes, all twelve constructors, 95 fixed-layout checks,
+target configuration and twelve metasim constants. Synthesis XDC and DDR defines
+match exactly. Implementation XDC matches after the established
+`target/FireSim_` to `target_FAMETop/FireSim` rename, and its generated-clock
+destination resolves through live emitted instances to BUFGCE. The complete
+published header equals both its diagnostic copy and its final OutputFile
+annotation. The three corrupted interface/clock-instance/constructor controls
+are rejected; the no-NIC candidate is also rejected as a NIC candidate.
+
+Full NIC Verilator lint passes with the existing `BUFGCE.v` simulation model
+and emitted `plusarg_reader.v`. Eight host-clock/Xilinx/hierarchy/XDC and NIC
+control/packet/queue/header CTests pass. Independent native header replay
+preserves all 1,797 annotation records except the intended header body, passes
+twelve atomic rejection checks, and compiles both complete C++ driver ABIs.
+These checks do not establish NIC runtime or SRAM behavioral equivalence.
+
+All 261 earlier NIC and 256 no-NIC MLIR/JSON artifacts match iteration 235 after
+candidate-directory normalization. Six NIC clock/specialization/hierarchy/XDC
+boundaries are newly reached. Five final no-NIC RTL/header/XDC files remain
+byte-identical. Rocket inputs still match the immutable 2026-10-01 staging
+fixture, and both XDC files match the immutable U250 build-tree reference with
+the documented implementation hierarchy rename.
+
+Evidence is in `iteration236-u250-target-matrix/` under the active generated
+directory: `replay/matrix.json`, `matrix-regression.json`,
+`final-rtl-comparison.json`, `driver-header/comparison.json`, `nic-lint.log`,
+`ctest.log`, `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json`,
+`source-inputs.json` and `inputs.json`. Compiler SHA256 is
+`73bd46eec5644453bec55226ad5f618ee5641419a4825b891a897f51ad73cbf3`.
+
+For replay space, 92 remaining iteration-231 and 586 iteration-232 MLIR dumps
+were losslessly compressed to adjacent `.mlir.gz`, recovering 43,349,971,841
+bytes. `lossless-storage-cleanup.json` and `lossless-storage-cleanup-232.json`
+record decompressed SHA256 checks before removing the originals. Current/prior
+baselines, logs, JSON, final RTL and immutable goldens were retained.
+
+Supplied iteration-235 harness results passed replacertl/provenance and fresh
+Verilator smoke, reusing unchanged-input long-suite evidence. They precede this
+change. No manager gates were started here; newly compiled NIC still needs
+harness-owned runtime coverage. The next smallest core step is removing the
+multiple-TracerV-constructor restriction exposed by archived quad-core Rocket.
+Other TracerV widths, FASED outstanding profiles, partition/QSFP and SRAM model
+equivalence remain open. Unrelated shared-worktree changes are excluded.

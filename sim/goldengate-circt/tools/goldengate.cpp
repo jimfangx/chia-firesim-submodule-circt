@@ -4872,7 +4872,11 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitOutputFiles(circuit, driverDirectory, outputBase, error)))
           return fail("NIC complete driver header collateral: " + error);
         llvm::outs() << "Emitted CIRCT complete NIC driver header in " << driverDirectory << '\n';
-        return fail("NIC final RTL integration is not implemented");
+        // The common host-clock, hierarchy and RTL pipeline prepares headers
+        // after host specialization. Resume from the physical interface archive
+        // so those native emitters see their original inputs, rather than the
+        // already completed diagnostic header above.
+        circuit->setAttr("rawAnnotations", interfaceAnnotations);
       }
       auto prepareDriverHeaders = [&]() -> int {
         if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))

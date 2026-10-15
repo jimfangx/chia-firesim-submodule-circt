@@ -20,7 +20,19 @@ The subsequent transactional composer emits the complete NIC catalog under
 header and validates every widget on a private CIRCT clone. SimpleNIC requires
 matching retained bridge identity and native hardware, and its constructor is
 prepared after CPU stream allocation validation. No header is committed on an
-early, NIC, or final FASED failure. Final NIC RTL publication remains guarded.
+early, NIC, or final FASED failure. The NIC path then restores the unextended
+interface archive and enters the common host-clock, Xilinx specialization,
+hierarchy normalization, XDC and native CIRCT RTL lowering pipeline. The common
+header preparation publishes the complete catalog beside the final RTL.
+
+`NICFinalRTLCompare.py --candidate <candidate-dir> --golden <SFC-design-dir>
+--output <comparison.json>` checks the fully emitted design. It compares both
+typed platform interfaces, all shim routes, all twelve driver constructors,
+fixed-layout checks, target configuration, interface constants and DDR/XDC
+collateral. Each generated-clock destination must also resolve through live
+emitted instances to a Xilinx BUFGCE. The single documented target hierarchy
+rename is normalized for the XDC comparison. These integration checks do not
+establish NIC runtime or native SRAM model equivalence.
 
 `NICDriverHeaderCompare.py` compares all twelve constructors, registration
 phases, fixed-layout checks and target configuration with the completed NIC
@@ -115,8 +127,8 @@ It also compares the independently emitted native archive/header with the CLI
 and proves only the intended annotation changed.
 
 The CLI archives this boundary in `post-fame-nic-header-all.json` and emits
-partial collateral under `nic-header/`. It still rejects complete NIC driver
-assembly and final RTL integration. The NIC constructor match does not
+partial collateral under `nic-header/`. Complete NIC driver assembly and final
+RTL integration now follow this partial boundary. The NIC constructor match does not
 establish a working combined NIC driver or runtime equivalence.
 
 TracerV now resolves its shared CPU stream index by catalog identity rather
@@ -139,6 +151,6 @@ words/layout assertions, stream index/depth, retirement width and rational
 clock; both fragments compile against the actual TracerV driver declaration.
 
 The NIC CLI emits this partial boundary under `tracerv-header/` and archives
-`post-fame-tracerv-header-all.json`. Remaining driver sections and final NIC
-RTL integration are still explicitly rejected. A matching constructor does
+`post-fame-tracerv-header-all.json`. Complete driver sections and final NIC
+RTL integration now follow this partial boundary. A matching constructor does
 not establish NIC RTL or runtime parity.
