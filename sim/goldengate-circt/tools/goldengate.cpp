@@ -3281,12 +3281,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuCountAnnotations, error)))
         return fail("CPU stream count bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT CPU stream count MMIO bank in " << cpuCountPath << '\n';
-      // The catalog/read/count boundary now drains every producer. Global
-      // control addresses and driver collateral still require multi-bank binding.
-      if (llvm::count_if(rocketStreams, [](const auto &stream) {
-            return StringRef(stream.streamName).starts_with("TRACERVBRIDGEMODULE_");
-          }) > 1)
-        return fail("CPU stream control allocation: multiple TracerV stream control bindings are not implemented");
       if (!cpuSinks.empty()) {
         if (failed(goldengate::addCPUStreamWrite(circuit, cpuSinks, error)))
           return fail("CPU stream write transport: " + error);
@@ -3801,6 +3795,13 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlDecodeAnnotations, error)))
         return fail("control decoder annotations: " + error);
       llvm::outs() << "Mapped CIRCT control address decoder in " << controlDecodePath << '\n';
+      // All banks now have typed MCR adapters and allocated decode regions.
+      // The later widget request/response binders still select one TracerV
+      // control port; do not let that partial binding omit additional banks.
+      if (llvm::count_if(controlWidgets, [](const auto &widget) {
+            return widget.name.starts_with("TracerVBridgeModule_");
+          }) > 1)
+        return fail("control widget routing: multiple TracerV request/response bindings are not implemented");
       // Both simplex and duplex CPU stream catalogs use the same decoded
       // region count for the AW route queue and per-slave write dispatch.
       if (failed(goldengate::addControlWriteRoute(circuit, error)))

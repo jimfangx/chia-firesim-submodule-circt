@@ -6961,3 +6961,124 @@ mismatches associated with the previously documented native SRAM lowering,
 and twelve not reached. These partial matches do not imply final RTL parity.
 `matrix-regression.json` records all thirteen rows and the unchanged compiler
 hash; `source-replay-stability.json` verifies the stable production sources.
+
+### Iteration 242: allocate every quad-Rocket TracerV control bank
+
+`ControlAddressDecode.cpp` now discovers the contiguous native TracerV
+configuration/MCR pairs in constructor order, validates all fifteen register
+lanes in each pair, and registers a separate widget for each bank. CPU source
+and occupancy metadata must identify every TracerV before any Print streams.
+Allocation remains read-only and independent of module/metadata traversal
+order. Missing, malformed, orphaned or inconsistent fourth banks fail before
+changing the IR or caller outputs.
+
+The production compiler now emits quad Rocket's four-word CPU MCR adapter,
+LoadMem and FASED control helpers, allocated MMIO catalog and native FIRRTL
+address decoder. It stops explicitly before the subsequent request/response
+binders, which still select only `tracerv_ctrl` and `TracerVBridgeModule_0`:
+
+```text
+control widget routing: multiple TracerV request/response bindings are not implemented
+```
+
+This is a partial control-boundary port, not complete quad platform support.
+The next smallest step is to route all four typed TracerV control ports through
+the queued write/read dispatchers and response arbiters, preserving the
+constructor indices and global addresses established here.
+
+The exact SFC oracle files are:
+
+```text
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv
+automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.const.h
+```
+
+The RTL SHA256 is
+`deadc7f5a903ceed20047342e4b81dde7f19cc32be914de6f5b910d3d70771d2`;
+the header SHA256 is
+`2e902991e63d8784d3f5ed6ccea02040d4904121c2cd22aa403480239d3568d3`.
+The Scala references are `Widget.scala`'s registration/size sort and
+`Lib.scala`'s `MCRFile`, within the unchanged Midas/FAME transform ordering.
+
+`QuadTracerVCPUControlCompare.py` checks the actual production
+`post-fame-cpu-stream-count.mlir` to `post-fame-cpu-stream-control.mlir`
+attachment, preserved module bodies, typed ports and annotation transfer.
+It compares the isolated adapter with the exact SFC `MCRFile_13` body and
+checks the four queue-count bindings in `CPUManagedStreamEngine` and driver
+addresses 752/756/760/764. Verilator matches over 100,353 cycles: 25,214 read
+handshakes, 24,841 stalled response cycles and 1,013 reset cycles. Directed
+reads cover every word and low address bit with changing counts while
+responses are held. Counts are isolated inputs; this test does not establish
+queue integration, global control routing or driver execution.
+
+`QuadTracerVControlAllocationCompare.py` compares the actual
+`post-fame-fased-histograms-bank.mlir` to
+`post-fame-control-address-decode.mlir` boundary. All fourteen regions match
+SFC's `NastiRouter` expressions; the four TracerV regions start at
+256/320/384/448 and occupy 64 bytes each. All sixty TracerV register addresses
+match the header, alongside the four CPU count addresses. The attachment
+preserves 114 preceding module bodies, 102 copied ports and all 2,630
+annotation records with the specified wrapper retargeting.
+
+The native production test covers 20,832 address pairs, shuffled module and
+metadata order, and fifteen atomic rejection cases for malformed fourth
+banks. The independently lowered decoder matches the exact SFC AW/AR
+expressions for 1,148,578 address pairs, including every byte in the 1 KiB
+control range crossed with every other byte and 100,000 random full-width
+pairs. A compiled RTL mutant shifting the fourth bank boundary from 448 to
+452 is rejected at AR address 448. These tests establish allocation and
+local decoding, not queued transaction routing or complete widget behavior.
+
+Reproduce the focused production comparisons in the sourced FireSim
+environment (the tools are built in `<build>`, and each output directory
+must be new):
+
+```sh
+python3 sim/goldengate-circt/test/Transforms/QuadTracerVControlAllocationCompare.py \
+  --before <quad-candidate>/post-fame-fased-histograms-bank.mlir \
+  --decoder <quad-candidate>/post-fame-control-address-decode.mlir \
+  --golden <quad-SFC-design>/FireSim-generated.sv \
+  --export-tool <build>/goldengate-control-address-decode-test \
+  --output-dir <new-allocation-evidence-directory>
+python3 sim/goldengate-circt/test/Transforms/QuadTracerVCPUControlCompare.py \
+  --candidate <quad-candidate>/post-fame-cpu-stream-count.mlir \
+  --control-candidate <quad-candidate>/post-fame-cpu-stream-control.mlir \
+  --golden <quad-SFC-design>/FireSim-generated.sv \
+  --compose-tool <build>/goldengate-nic-cpu-stream-control-test \
+  --output-dir <new-count-control-evidence-directory>
+```
+
+Evidence is under `iteration242-u250-target-matrix/` in the active generated
+directory. The native compiler build and focused control-decoder, CPU-control
+and Print-binding CTests pass (3/3). Supplied iteration-241 manager compile,
+provenance and fresh Verilator smoke passed; long-suite evidence was reused
+for unchanged inputs. This turn starts no FireSim manager verification gates.
+
+All 267 NIC and 256 no-NIC MLIR/annotation artifacts match iteration 241
+after candidate-path normalization, and ten emitted RTL/header/XDC files
+remain byte-identical. Quad preserves all sixty preceding MLIR/annotation
+artifacts and adds 24 subsequent boundaries with their annotation sidecars.
+The immutable 2026-10-01 staging FIRRTL/annotation inputs match the replay
+inputs. The immutable U250 synthesis XDC matches exactly; implementation XDC
+matches after the previously documented `target/FireSim_` to
+`target_FAMETop/FireSim` hierarchy rename. Paths and hashes are recorded in
+`immutable-rocket-comparison.json`.
+
+The build inputs and production sources remain unchanged throughout replay;
+`source-replay-stability.json` records the sole comparison-script adjustment
+to accept firtool's generic integer width when constructing the boundary
+mutant. To make space for the matrix replay, 599 old iteration-238 MLIR dumps
+were losslessly compressed to adjacent `.mlir.gz`, recovering
+37,197,874,892 bytes. Original and decompressed SHA256 checks are recorded in
+`lossless-storage-cleanup-238.json`. Logs, JSON, final RTL, active/prior
+comparison inputs and immutable fixtures were preserved.
+
+The complete thirteen-recipe replay retains two compiled targets, five
+implementation gaps and six unsupported partition/QSFP platforms. Quad
+advances from the CPU-count boundary to global MMIO decoding; it remains
+an implementation gap. All archived input hashes, effective platform
+configurations and preceding structured comparisons match iteration 241:
+eight matched, six previously documented SRAM-related model-port mismatches
+and twelve not reached. `matrix-regression.json` records these outcomes.
+Partial matches and the isolated differential tests do not establish final
+quad RTL parity, metasimulation, Linux boot or FPGA support.

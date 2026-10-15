@@ -10,8 +10,43 @@
 #include <set>
 #include <algorithm>
 #include <functional>
+#include <map>
 using namespace mlir;
 using namespace circt::firrtl;
+
+namespace {
+// These symbols are assigned in BridgeIO constructor order by the native
+// TracerV trigger/control passes. Do not infer the number of widgets from the
+// CPU stream list: a stale list could otherwise hide an entire control bank.
+LogicalResult tracerVBanks(CircuitOp circuit, SmallVectorImpl<FModuleOp> &banks,
+                          std::string &error) {
+  std::map<unsigned, FModuleOp> configs, adapters;
+  auto reject = [&]() {
+    error = "Rocket control catalog requires contiguous paired TracerV configuration/MCR banks";
+    return failure();
+  };
+  for (auto module : circuit.getOps<FModuleLike>()) {
+    StringRef name = module.getName();
+    for (auto prefix : {StringRef("GGTracerVTriggerConfig"), StringRef("GGTracerVMCRFile")}) {
+      if (!name.starts_with(prefix)) continue;
+      auto suffix = name.drop_front(prefix.size()); unsigned index = 0;
+      if (!suffix.empty() && (!suffix.consume_front("_") || suffix.getAsInteger(10, index) ||
+          !index || suffix != std::to_string(index))) return reject();
+      auto native = dyn_cast<FModuleOp>(module.getOperation());
+      auto &entries = prefix == "GGTracerVTriggerConfig" ? configs : adapters;
+      if (!native || index >= 63 || !entries.emplace(index, native).second) return reject();
+    }
+  }
+  if (configs.empty() || configs.size() != adapters.size()) return reject();
+  SmallVector<FModuleOp> ordered;
+  for (unsigned i = 0; i < configs.size(); ++i) {
+    if (!configs.count(i) || !adapters.count(i)) return reject();
+    ordered.push_back(configs.at(i));
+  }
+  banks.assign(ordered.begin(), ordered.end());
+  return success();
+}
+}
 
 LogicalResult goldengate::deriveControlMMIORegistry(CircuitOp circuit,
     StringRef widgetName, ArrayRef<StringRef> registerModules,
@@ -127,13 +162,24 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
   });
   if (nic && failed(bank("SimpleNICBridgeModule_0", "GGNICMCRFile", {"GGNICMMIOBank"})))
     return failure();
-  if (failed(bank("TracerVBridgeModule_0", "GGTracerVMCRFile", {"GGTracerVTriggerConfig"})) ||
-      failed(bank("TSIBridgeModule_0", "GGTSIMMIOBank", {"GGTSIMMIOBank"}, Direction::Out)) ||
+  SmallVector<FModuleOp> tracers;
+  if (failed(tracerVBanks(circuit, tracers, error))) return failure();
+  OpBuilder b(circuit.getContext());
+  for (auto [i, config] : llvm::enumerate(tracers)) {
+    auto name = b.getStringAttr("TracerVBridgeModule_" + std::to_string(i));
+    auto mcr = b.getStringAttr("GGTracerVMCRFile" + (i ? "_" + std::to_string(i) : ""));
+    if (failed(bank(name.getValue(), mcr.getValue(), {config.getName()}))) return failure();
+    if (catalog.back().registerCount != 15) {
+      error = "Rocket control catalog requires fifteen implemented TracerV configuration words";
+      return failure();
+    }
+  }
+  if (failed(bank("TSIBridgeModule_0", "GGTSIMMIOBank", {"GGTSIMMIOBank"}, Direction::Out)) ||
       failed(bank("ClockBridgeModule_0", "GGClockBridgeMCRFile", {"GGSingleClockBridge"}))) return failure();
   // PrintSynthesis.scala appends BridgeIO annotations to the original bridges.
   // Equal-sized Print/Clock banks must retain this registration order after
   // HasWidgets sorts by size; module traversal order is irrelevant.
-  OpBuilder b(circuit.getContext()); llvm::StringSet<> seen, configs, mcrs;
+  llvm::StringSet<> seen, configs, mcrs;
   for (auto [slot, item] : llvm::enumerate(printHosts)) {
     FModuleOp host = item;
     auto info = host ? host->getAttrOfType<DictionaryAttr>("goldengate.printHost") : DictionaryAttr{};
@@ -177,6 +223,11 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
     SmallVectorImpl<ControlMMIOWidget> &widgets,
     SmallVectorImpl<ControlMMIORegion> &regions, std::string &error) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  SmallVector<ControlMMIOWidget> catalog;
+  if (failed(deriveRocketControlMMIOCatalog(circuit, printHosts, catalog, error))) return failure();
+  auto tracerCount = llvm::count_if(catalog, [](const auto &widget) {
+    return widget.name.starts_with("TracerVBridgeModule_");
+  });
   FModuleOp reader, writer, nicBank, counts, bound;
   for (auto m : circuit.getOps<FModuleOp>()) {
     if (m.getName() == "GGCPUStreamRead") reader = m;
@@ -191,7 +242,7 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
   if (nic != bool(writer) || (nic && (!sinks || sinks.size() != 1)))
     return reject("Rocket MMIO allocation requires the complete duplex NIC catalog");
   auto words = counts ? counts->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters") : ArrayAttr{};
-  if (!sources || !words || sources.size() != printHosts.size() + 1 + unsigned(nic) ||
+  if (!sources || !words || sources.size() != printHosts.size() + tracerCount + unsigned(nic) ||
       words.size() != sources.size() + (nic ? sinks.size() : 0))
     return reject("Rocket MMIO allocation requires one count word per registered DMA source and sink");
   if (!printHosts.empty()) {
@@ -236,8 +287,9 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
       return reject("Rocket MMIO DMA indices must be unique and contiguous");
     auto i = index.getInt();
     std::string expected = nic && i == 0 ? "SIMPLENICBRIDGEMODULE_0_to_cpu_stream" :
-        i == int64_t(nic) ? "TRACERVBRIDGEMODULE_0_to_cpu_stream" :
-        "PRINTBRIDGEMODULE_" + std::to_string(i - 1 - unsigned(nic)) + "_to_cpu_stream";
+        i < int64_t(unsigned(nic) + tracerCount) ?
+        "TRACERVBRIDGEMODULE_" + std::to_string(i - unsigned(nic)) + "_to_cpu_stream" :
+        "PRINTBRIDGEMODULE_" + std::to_string(i - tracerCount - unsigned(nic)) + "_to_cpu_stream";
     auto found = registers.find(expected + "_count");
     auto word = found == registers.end() ? DictionaryAttr{} : found->second;
     auto offset = word ? word.getAs<IntegerAttr>("offset") : IntegerAttr{};
@@ -264,10 +316,8 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
         !read || !read.getValue() || !write || write.getValue())
       return reject("Rocket MMIO sink count differs from ordered read-only DMA sink");
   }
-  SmallVector<ControlMMIOWidget> catalog;
   SmallVector<ControlMMIORegion> allocated;
-  if (failed(deriveRocketControlMMIOCatalog(circuit, printHosts, catalog, error)) ||
-      failed(allocateControlMMIORegions(addressBits, catalog, allocated, error))) return failure();
+  if (failed(allocateControlMMIORegions(addressBits, catalog, allocated, error))) return failure();
   widgets.assign(catalog.begin(), catalog.end());
   regions.assign(allocated.begin(), allocated.end());
   return success();

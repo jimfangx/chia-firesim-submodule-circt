@@ -379,6 +379,95 @@ void rejection(MLIRContext &context) {
     { llvm::raw_string_ostream out(after); root->print(out); } require(before == after, "rejection mutated IR");
   }
 }
+void productionQuad(MLIRContext &ctx, llvm::StringRef input, llvm::StringRef output) {
+  auto root = parseSourceFile<ModuleOp>(input, &ctx); require(bool(root), "quad parse failed");
+  auto c = *root->getOps<CircuitOp>().begin(); std::string error; OpBuilder b(&ctx);
+  auto dump = [](Operation *op) { std::string s; llvm::raw_string_ostream os(s); op->print(os); return s; };
+  SmallVector<goldengate::ControlMMIOWidget> widgets;
+  SmallVector<goldengate::ControlMMIORegion> regions;
+  auto before = dump(*root);
+  require(succeeded(goldengate::allocateRocketControlMMIORegions(c, 25, {}, widgets, regions, error)), error);
+  require(before == dump(*root) && widgets.size() == 14 && regions.size() == 14, "quad allocation mutated IR or omitted widgets");
+  for (unsigned i = 0; i < 4; ++i) {
+    auto name = "TracerVBridgeModule_" + std::to_string(i);
+    auto found = llvm::find_if(regions, [&](const auto &r) { return r.name == name; });
+    require(found != regions.end() && found->start == 256 + i * 64 && found->size == 64,
+            "quad TracerV regions differ from SFC");
+  }
+  auto cpu = llvm::find_if(regions, [](const auto &r) { return r.name == "CPUManagedStreamEngine_0"; });
+  require(cpu != regions.end() && cpu->start == 752 && cpu->size == 16, "quad count addresses differ from SFC");
+  // Module and registry row traversal order must not define constructor order.
+  {
+    OwningOpRef<ModuleOp> shuffled(cast<ModuleOp>(root->clone()));
+    auto sc = *shuffled->getOps<CircuitOp>().begin();
+    for (auto m : llvm::make_early_inc_range(sc.getOps<FModuleOp>()))
+      if (m.getName().starts_with("GGTracerV")) m->moveBefore(&sc.getBodyBlock()->front());
+    for (auto key : {"goldengate.sourceStreams", "goldengate.mmioRegisters"}) {
+      auto m = named(sc, StringRef(key) == "goldengate.sourceStreams" ? "GGCPUStreamRead" : "GGCPUStreamCountBank");
+      auto rows = llvm::to_vector(m->getAttrOfType<ArrayAttr>(key));
+      std::reverse(rows.begin(), rows.end()); m->setAttr(key, b.getArrayAttr(rows));
+    }
+    SmallVector<goldengate::ControlMMIORegion> rs;
+    require(succeeded(goldengate::allocateRocketControlMMIORegions(sc, 25, {}, widgets, rs, error)), error);
+    for (auto [i, r] : llvm::enumerate(rs))
+      require(r.name == regions[i].name && r.start == regions[i].start && r.size == regions[i].size,
+              "quad allocation depends on traversal order");
+  }
+  for (unsigned mode = 0; mode < 15; ++mode) {
+    OwningOpRef<ModuleOp> bad(cast<ModuleOp>(root->clone()));
+    auto bc = *bad->getOps<CircuitOp>().begin();
+    auto config = named(bc, "GGTracerVTriggerConfig_3"), adapter = named(bc, "GGTracerVMCRFile_3");
+    if (mode < 4) (mode % 2 ? adapter : config).setName(mode < 2 ? "MissingBank" : "GGTracerVTriggerConfig_03");
+    if (mode == 4 || mode == 5) {
+      auto rows = llvm::to_vector(config->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      if (mode == 4) rows.pop_back();
+      else { NamedAttrList row(cast<DictionaryAttr>(rows.back())); row.set("offset", b.getI32IntegerAttr(0)); rows.back() = row.getDictionary(&ctx); }
+      config->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+    }
+    if (mode == 6) {
+      auto types = llvm::to_vector(adapter.getPortTypes()); types.back() = TypeAttr::get(UIntType::get(&ctx, 32));
+      adapter->setAttr("portTypes", b.getArrayAttr(types));
+    }
+    if (mode == 7) {
+      b.setInsertionPointToEnd(bc.getBodyBlock());
+      b.create<FModuleOp>(bc.getLoc(), b.getStringAttr("GGTracerVMCRFile_4"), adapter.getConventionAttr(), ArrayRef<PortInfo>{});
+    }
+    if (mode >= 8 && mode <= 10) {
+      auto reader = named(bc, "GGCPUStreamRead"); auto rows = llvm::to_vector(reader->getAttrOfType<ArrayAttr>("goldengate.sourceStreams"));
+      NamedAttrList row(cast<DictionaryAttr>(rows.back()));
+      if (mode == 8) row.set("name", b.getStringAttr("PRINTBRIDGEMODULE_2_to_cpu_stream"));
+      if (mode == 9) row.set("index", b.getI64IntegerAttr(2));
+      rows.back() = row.getDictionary(&ctx); if (mode == 10) rows.pop_back();
+      reader->setAttr("goldengate.sourceStreams", b.getArrayAttr(rows));
+    }
+    if (mode >= 11) {
+      auto counts = named(bc, "GGCPUStreamCountBank"); auto rows = llvm::to_vector(counts->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      NamedAttrList row(cast<DictionaryAttr>(rows.back()));
+      if (mode == 11) row.set("name", b.getStringAttr("TRACERVBRIDGEMODULE_2_to_cpu_stream_count"));
+      if (mode == 12) row.set("offset", b.getI32IntegerAttr(8));
+      if (mode == 13) row.set("writeable", b.getBoolAttr(true));
+      rows.back() = row.getDictionary(&ctx); if (mode == 14) rows.pop_back();
+      counts->setAttr("goldengate.mmioRegisters", b.getArrayAttr(rows));
+    }
+    auto snapshot = dump(*bad);
+    SmallVector<goldengate::ControlMMIOWidget> ws{{"sentinel", 1}};
+    SmallVector<goldengate::ControlMMIORegion> rs{{"sentinel", 9, 4}};
+    require(failed(goldengate::allocateRocketControlMMIORegions(bc, 25, {}, ws, rs, error)), "invalid fourth bank accepted");
+    require(snapshot == dump(*bad) && ws.size() == 1 && ws[0].name == "sentinel" && rs.size() == 1 && rs[0].start == 9,
+            "quad rejection mutated IR or output");
+  }
+  require(succeeded(goldengate::addControlAddressDecode(c, 25, regions, error)), error);
+  require(succeeded(verify(*root)), "quad decoder invalid");
+  auto helper = named(c, "GGControlAddressDecode"); checkDecoder(helper, 25, regions);
+  auto standalone = ModuleOp::create(c.getLoc()); b.setInsertionPointToEnd(standalone.getBody());
+  auto sc = b.create<CircuitOp>(c.getLoc(), helper.getNameAttr());
+  b.setInsertionPointToEnd(sc.getBodyBlock()); b.insert(helper->clone());
+  require(succeeded(verify(standalone)), "quad standalone decoder invalid");
+  std::error_code ec; llvm::raw_fd_ostream os(output, ec); require(!ec, "cannot export quad decoder");
+  standalone.print(os); os << '\n'; standalone.erase();
+  llvm::outs() << "PASS production quad allocation: 14 widgets, four TracerV regions, count base 752, " << samples
+               << " address pairs and 15 atomic fourth-bank rejections\n";
+}
 void production(MLIRContext &ctx, llvm::StringRef input, llvm::StringRef output) {
   auto root = parseSourceFile<ModuleOp>(input, &ctx); require(bool(root), "production parse failed");
   auto c = *root->getOps<CircuitOp>().begin(); std::string error;
@@ -439,6 +528,7 @@ void production(MLIRContext &ctx, llvm::StringRef input, llvm::StringRef output)
 }
 int main(int argc, char **argv) {
   try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 4 && StringRef(argv[3]) == "--quad") { productionQuad(context, argv[1], argv[2]); return 0; }
     if (argc == 3) { production(context, argv[1], argv[2]); return 0; }
     allocation(context); registry(context);
     // Nonzero base, holes, unsorted slave indices, and the full address-space

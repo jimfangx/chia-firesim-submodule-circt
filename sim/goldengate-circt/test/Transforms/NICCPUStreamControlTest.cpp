@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/CPUStreamCountBank.h"
+#include "goldengate/ClockBridgeControl.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -69,22 +70,24 @@ void rejected(MLIRContext &ctx) {
 }
 int main(int argc,char **argv){try {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  auto root=argc==4?parseSourceFile<ModuleOp>(argv[1],&ctx):fixture(ctx);require(bool(root),"input parse failed");
+  bool quad=argc==5 && StringRef(argv[4])=="--quad";
+  auto root=(argc==4 || quad)?parseSourceFile<ModuleOp>(argv[1],&ctx):fixture(ctx);require(bool(root),"input parse failed");
   auto c=*root->getOps<CircuitOp>().begin();std::string error;
-  require(succeeded(goldengate::attachCPUStreamControl(c,"GGNICBridgeControlWrapper","GGNICCPUStreamControlWrapper",25,12,error)),error);
+  require(succeeded(quad ? goldengate::mapCPUStreamControl(c,25,12,error) :
+    goldengate::attachCPUStreamControl(c,"GGNICBridgeControlWrapper","GGNICCPUStreamControlWrapper",25,12,error)),error);
   require(succeeded(verify(*root)),"production verification failed");
   auto adapter=named(c,"GGCPUStreamMCRFile");unsigned indices=0;
   for(auto r:adapter.getOps<RegOp>())if(r.getName()=="wIndex"||r.getName()=="rIndex"){
     require(cast<UIntType>(r.getResult().getType()).getWidth()==2,"three-word index differs");++indices;}
   require(indices==2,"missing indices");
-  if(argc==4){write(*root,argv[2]);standalone(c,argv[3]);}else{
+  if(argc==4 || quad){write(*root,argv[2]);standalone(c,argv[3]);}else{
     auto targets=cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<ArrayAttr>("targets");
     require(cast<StringAttr>(targets[0])=="~GGNICCPUStreamControlWrapper","circuit transfer differs");
     require(cast<StringAttr>(targets[1])=="~GGNICCPUStreamControlWrapper|GGNICCPUStreamControlWrapper>hostReset","copied target differs");
     require(cast<StringAttr>(targets[2])=="~GGNICCPUStreamControlWrapper|GGCPUStreamCountBank>count_0","internal target differs");
     standalone(c,{});rejected(ctx);
   }
-  llvm::outs()<<"PASS NIC CPU stream registry-sized control and production cloning";
-  if(argc!=4)llvm::outs()<<", annotation identities and 11 atomic rejection cases";
+  llvm::outs()<<"PASS "<<(quad ? "quad" : "NIC")<<" CPU stream registry-sized control and production cloning";
+  if(argc!=4 && !quad)llvm::outs()<<", annotation identities and 11 atomic rejection cases";
   llvm::outs()<<'\n';return 0;
 }catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}}

@@ -41,7 +41,10 @@ mlir::LogicalResult deriveControlMMIOWidget(circt::firrtl::CircuitOp circuit,
     std::string &error, circt::firrtl::Direction mcrDirection = circt::firrtl::Direction::In);
 // Rocket platform registration order from FPGATop.scala: SimulationMaster,
 // original bridges, synthesized Print bridges, LoadMem, then CPU streams.
-// Derive every size from implemented FIRRTL register banks. Print hosts are
+// Derive every size from implemented FIRRTL register banks. TracerV banks
+// must form contiguous configuration/MCR pairs in native constructor order;
+// each contributes its own fifteen-word widget, independent of module order.
+// Print hosts are
 // supplied in constructor order; their queued metadata identifies each bank.
 // This pre-binding catalog does not imply CPU stream or control attachment.
 // Leave the result and IR unchanged on failure; names borrow MLIR attributes.
