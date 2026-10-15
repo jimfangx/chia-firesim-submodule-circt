@@ -7329,3 +7329,91 @@ Print-binding regression also passes. Logs are `build-retry.log`,
 `ctest.log`, `print-build.log` and `print-ctest.log`; the five control tests
 complete in 869.74 seconds. FireSim manager verification remains owned by
 the harness and was not started by this implementation iteration.
+
+### Iteration 245: emit every native Rocket TracerV constructor
+
+The Scala oracle is `TracerVBridgeModule.genHeader` in
+`generators/firechip/goldengateimplementations/src/main/scala/TracerVBridge.scala`:
+each widget emits its allocated MMIO words, widget number, shared CPU stream
+index, queue depth, retirement width and rational clock. The compiler's
+`MidasTransforms.scala` and `FAMETransform.scala` ordering and channel semantics
+remain the executable oracle.
+
+`TracerVHeader.cpp` now resolves every retained TracerV BridgeIO target to a
+distinct, uniquely live native engine HostPort. Contiguous native engine
+ordinals select the corresponding trigger bank, queue and control/source port
+contracts. Widget numbers and shared stream indices are resolved independently
+from the allocated control and CPU transport catalogs. Each constructor retains
+the existing fifteen-word register, memory geometry, address grant and clock
+checks. All snippets are accumulated before one annotation update, so a bad
+later constructor cannot publish a partial header. This remains a Rocket trace
+width specialization and relies on the native engine/port naming contracts.
+
+The focused native test passes for 2, 4 and 6 constructors with identical width
+keys, reversed annotation order, different rational clocks, shifted widget
+numbers and rotated shared stream slots. It preserves hardware and unrelated
+annotations; all 52 rejection cases preserve the complete input IR. CTest
+`goldengate-tracerv-header` passes in 0.43 seconds. The boundary exporter now
+accepts the quad production boundary's already prepared physical interface
+header instead of trying to add it twice.
+
+Evidence is under `iteration245-u250-target-matrix/`. The exact quad SFC oracle
+is `u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.const.h`,
+SHA256 `2e902991e63d8784d3f5ed6ccea02040d4904121c2cd22aa403480239d3568d3`.
+`quad-tracerv-header-retry/comparison.json` matches all four complete TracerV
+fragments, including layout assertions, bases 256/320/384/448, widget and stream
+slots 0/1/2/3, depth 6144, retirement width 1 and clock metadata. Both fragments
+typecheck against the real C++ driver. The NIC comparison also passes, keeping
+TracerV at shared stream slot 1 (`nic-tracerv-header/comparison.json`).
+
+The fresh quad compiler replay now emits SystemVerilog and complete collateral.
+`quad-complete-collateral/comparison.json` compares all fourteen constructors
+(including all four TracerV records), 136 fixed-layout assertions and TargetConfig
+with SFC. Both complete headers pass C++20 syntax checks against the real driver
+and registry declarations. Native exporter fragments also match the production
+header. Synthesis XDC and platform defines match byte-for-byte. All common
+Verilog interface macros have identical values; CIRCT omits SFC's invalid
+`MEM_HAS_CHANNEL-1` macro and uses different comments.
+
+Quad implementation XDC differs in hierarchy: native numbered
+`GGTracerVBridgeControlWrapper_N` modules stop the existing assembly inliner,
+retaining sixteen extra `sim` instances. This is recorded as a hierarchy
+difference, not hidden by the earlier single-core rename. Every instance in
+each SFC and CIRCT XDC path resolves through its respective emitted RTL to
+`BUFGCE`; clock names, divide ratio and setup/hold constraints then match.
+The complete traversals are in `quad-complete-collateral/clock-paths.json`.
+The next smallest compiler step is to extend host hierarchy normalization to
+the numbered native wrapper contracts while preserving explicit XDC references
+and native inner symbols, then recheck the quad clock path and collateral.
+
+`production-boundary-regression.json` preserves all 256 no-NIC, 267 NIC and
+254 prior quad MLIR/annotation files after candidate-path normalization. Quad
+adds final hierarchy and XDC boundary files. Both single-core variants retain
+byte-identical final RTL, both headers and both XDC files, recorded separately
+in `{nonic,nic}-emitted-regression.json`. `immutable-rocket-comparison.json`
+rechecks the October 1 staging FIRRTL/annotation handoff byte-for-byte and the
+immutable U250 synthesis/implementation XDC with the previously recorded
+single-core hierarchy rename.
+
+Storage cleanup losslessly compressed 622 iteration-242 MLIR dumps, verifying
+each original SHA256 against decompression before removing its uncompressed
+copy. It recovered 39,914,758,959 bytes; the manifest is
+`lossless-storage-cleanup-242.json`. Immutable fixtures, JSON, final RTL,
+collateral and active iteration-244 comparison boundaries were preserved.
+The same verified procedure compressed 630 iteration-243 dumps and recovered
+40,294,529,743 more bytes (`lossless-storage-cleanup-243.json`), leaving 54 GiB
+available after the complete replay.
+These header and constraint comparisons do not establish quad RTL behavioral,
+metasimulation, Linux boot or FPGA parity. FireSim manager verification remains
+owned by the harness and was not started here.
+
+The complete thirteen-target replay has three compiled recipes, four compiler
+gaps and six unsupported partition/QSFP platforms. Quad's previous ambiguous
+TracerV header error is the only changed compile result. All archived input
+hashes, effective platform selections and boundary checks remain unchanged:
+eight matches, six recorded SRAM-model port mismatches and twelve comparisons
+not reached. `matrix-regression.json` records the inventory; the matrix exits
+nonzero because these gaps and mismatches remain failures.
+`source-replay-stability.json` verifies all 668 tracked source inputs and the
+compiler binary remained unchanged during replay; compiler SHA256 is
+`bd8653aa3225a529498609bd4e9de2a13e77eb5406bac23fecdb30a8934acf0a`.

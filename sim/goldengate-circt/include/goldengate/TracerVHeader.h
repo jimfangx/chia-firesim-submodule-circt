@@ -4,7 +4,8 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
-// Append the TracerV ABI checked against live trigger registers, stream and clock.
+// Atomically append every TracerV constructor, checked against its live trigger
+// registers, queue, shared CPU stream allocation and rational clock identity.
 mlir::LogicalResult prepareTracerVHeader(
     circt::firrtl::CircuitOp circuit, std::string &error);
 }

@@ -217,6 +217,98 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned drive
   if (bad == 31) annos.push_back(output);
   c->setAttr("rawAnnotations",b.getArrayAttr(annos)); return root;
 }
+// Exercise independent constructor identities even when the shared transport
+// order differs from construction order and all constructor width keys match.
+OwningOpRef<ModuleOp> multipleFixture(MLIRContext &ctx, unsigned count, unsigned bad = 0) {
+  auto root = fixture(ctx, 0, count - 1);
+  auto c = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&ctx);
+  auto top = named(c, c.getName());
+  auto engine = named(c, "GGTracerVTokenEngine");
+  auto bank = named(c, "GGTracerVTriggerConfig");
+  auto queue = named(c, "GGTracerVStreamQueue6144");
+  auto transport = named(c, "GGCPUStreamRead");
+  auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
+  SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  DictionaryAttr bridge;
+  unsigned clockIndex = 0;
+  NamedAttrList clocks;
+  for (auto [i, attr] : llvm::enumerate(raw)) {
+    auto d = cast<DictionaryAttr>(attr);
+    if (d.getAs<StringAttr>("class") == goldengate::AnnotationClasses::BridgeIO) bridge = d;
+    if (d.getAs<StringAttr>("class") == goldengate::AnnotationClasses::ChannelClockInfo) {
+      clockIndex = i; clocks = NamedAttrList(d.getAs<DictionaryAttr>("infoMap"));
+    }
+  }
+  auto catalog = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+  SmallVector<Attribute> sources(catalog.begin(), catalog.end());
+  auto decoder = named(c, "GGControlAddressDecode");
+  auto firstRegion = cast<DictionaryAttr>(decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions")[0]);
+  SmallVector<Attribute> regions{firstRegion};
+  auto writes = named(c, "GGControlWidgetWriteWrapper");
+  auto firstBinding = cast<DictionaryAttr>(writes->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings")[0]);
+  SmallVector<Attribute> bindings{firstBinding};
+  for (unsigned i = 1; i < count; ++i) {
+    auto suffix = "_" + std::to_string(i);
+    auto clone = [&](FModuleOp original) {
+      b.setInsertionPointToEnd(c.getBodyBlock());
+      auto m = cast<FModuleOp>(b.clone(*original));
+      m->setAttr("sym_name", b.getStringAttr(original.getName().str() + suffix));
+      b.setInsertionPointToStart(top.getBodyBlock());
+      if (bad != 1 || i != count - 1) b.create<InstanceOp>(c.getLoc(), m, m.getName());
+      return m;
+    };
+    auto nextEngine = clone(engine), nextBank = clone(bank), nextQueue = clone(queue);
+    NamedAttrList params(nextQueue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters"));
+    auto streamName = b.getStringAttr("TRACERVBRIDGEMODULE_" + std::to_string(2 + i) + "_to_cpu_stream");
+    params.set("index", b.getI64IntegerAttr(bad == 2 && i == count - 1 ? 0 : i));
+    params.set("name", streamName);
+    nextQueue->setAttr("goldengate.streamParameters", params.getDictionary(&ctx));
+    NamedAttrList source(cast<DictionaryAttr>(sources[i - 1]));
+    source.set("name", streamName);
+    source.set("port", b.getStringAttr("tracerv_stream" + suffix));
+    source.set("depth", b.getI64IntegerAttr(6144));
+    sources[i - 1] = source.getDictionary(&ctx);
+    NamedAttrList row(firstRegion);
+    row.set("name", b.getStringAttr("TracerVBridgeModule_" + std::to_string(2 + i)));
+    row.set("start", b.getI64IntegerAttr(1024 + 64 * i));
+    row.set("slave", b.getI32IntegerAttr(i)); regions.push_back(row.getDictionary(&ctx));
+    NamedAttrList binding(firstBinding);
+    binding.set("name", row.get("name"));
+    binding.set("slave", b.getI32IntegerAttr(i));
+    binding.set("port", b.getStringAttr("tracerv_ctrl" + suffix));
+    bindings.push_back(binding.getDictionary(&ctx));
+    NamedAttrList next(bridge), mapping;
+    NamedAttrList clock(bridge.getAs<DictionaryAttr>("clockInfo"));
+    clock.set("name", b.getStringAttr("domain" + suffix));
+    clock.set("multiplier", b.getI64IntegerAttr(i + 1));
+    for (auto item : bridge.getAs<DictionaryAttr>("channelMapping")) {
+      auto channel = b.getStringAttr(cast<StringAttr>(item.getValue()).getValue().str() + suffix);
+      mapping.set(item.getName(), channel);
+      clocks.set(channel.getValue(), clock.getDictionary(&ctx));
+    }
+    next.set("channelMapping", mapping.getDictionary(&ctx));
+    next.set("clockInfo", clock.getDictionary(&ctx));
+    next.set("target", b.getStringAttr("~" + c.getName().str() + "|" + nextEngine.getName().str() + ">hPort"));
+    if (bad == 3 && i == count - 1) next.set("target", bridge.get("target"));
+    if (bad == 4 && i == count - 1) next.erase("clockInfo");
+    // Insert in reverse order to ensure identity resolution is independent of
+    // retained annotation order. Failure of the last bank must publish nothing.
+    annotations.insert(annotations.begin(), next.getDictionary(&ctx)); ++clockIndex;
+    if (bad == 5 && i == count - 1) nextBank->removeAttr("goldengate.mmioRegisters");
+    if (bad == 6 && i == count - 1) sources[i - 1] = sources.back();
+    if (bad == 7 && i == count - 1) bindings.pop_back();
+  }
+  NamedAttrList clockRecord(cast<DictionaryAttr>(annotations[clockIndex]));
+  clockRecord.set("infoMap", clocks.getDictionary(&ctx));
+  annotations[clockIndex] = clockRecord.getDictionary(&ctx);
+  c->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  transport->setAttr("goldengate.sourceStreams", b.getArrayAttr(sources));
+  decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(regions));
+  writes->setAttr("goldengate.controlWriteBindings", b.getArrayAttr(bindings));
+  named(c, "GGControlReadDispatchWrapper")->setAttr("goldengate.controlReadBindings", b.getArrayAttr(bindings));
+  return root;
+}
 std::string run(CircuitOp c) {
   SmallVector<std::string> modules;
   for (auto m : c.getOps<FModuleLike>()) modules.push_back(dump(m.getOperation()));
@@ -240,8 +332,8 @@ std::string run(CircuitOp c) {
 }
 int main(int argc, char **argv) {
   try {
-    require(argc == 1 || argc == 3 || (argc == 4 && StringRef(argv[3]) == "--nic"),
-      "usage: TracerVHeaderTest [boundary.mlir output-directory [--nic]]");
+    require(argc == 1 || argc == 3 || (argc == 4 && (StringRef(argv[3]) == "--nic" || StringRef(argv[3]) == "--quad")),
+      "usage: TracerVHeaderTest [boundary.mlir output-directory [--nic|--quad]]");
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
     auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); auto body = run(c);
     for (auto text : {".initDone = 1024", ".traceEnable = 1028", ".triggerSelector = 1080",
@@ -262,13 +354,35 @@ int main(int argc, char **argv) {
       require(failed(goldengate::prepareTracerVHeader(nc,error)) && !error.empty() && dump(*negative) == before,
         "invalid boundary accepted or mutated: " + std::to_string(bad));
     }
-    llvm::outs() << "TracerV header: varied base/index/clock, fifteen words, stream geometry; preserved hardware/annotations; 45 atomic rejections passed\n";
+    for (unsigned count : {2U, 4U, 6U}) {
+      auto multiple = multipleFixture(ctx, count);
+      auto header = run(*multiple->getOps<CircuitOp>().begin());
+      for (unsigned i = 0; i < count; ++i) {
+        auto slot = i ? i - 1 : count - 1;
+        require(StringRef(header).contains(".initDone = " + std::to_string(1024 + 64 * i)), "lost trace bank address");
+        require(StringRef(header).contains("},\n  " + std::to_string(2 + i) + ",\n  args,\n  " +
+          std::to_string(slot) + ",\n  6144,\n  1,\n"), "lost per-constructor widget/stream identity");
+        if (i) require(StringRef(header).contains("ClockInfo{\"domain_" + std::to_string(i) + "\", " +
+          std::to_string(i + 1) + "U, 2U}"), "lost per-constructor rational clock");
+      }
+    }
+    for (unsigned bad = 1; bad <= 7; ++bad) {
+      auto negative = multipleFixture(ctx, 4, bad);
+      auto nc = *negative->getOps<CircuitOp>().begin(); before = dump(*negative);
+      require(failed(goldengate::prepareTracerVHeader(nc, error)) && !error.empty() && dump(*negative) == before,
+        "invalid later constructor accepted or mutated: " + std::to_string(bad));
+    }
+    llvm::outs() << "TracerV header: varied base/index/clock, fifteen words, stream geometry; preserved hardware/annotations; 2/4/6 constructors with independent clocks and reordered streams; 52 atomic rejections passed\n";
     if (argc >= 3) {
-      bool nic = argc == 4;
+      bool nic = argc == 4 && StringRef(argv[3]) == "--nic";
+      bool quad = argc == 4 && StringRef(argv[3]) == "--quad";
       auto boundary = parseSourceFile<ModuleOp>(argv[1],&ctx); require(bool(boundary),"boundary parse");
       auto bc = *boundary->getOps<CircuitOp>().begin();
       require(succeeded(verify(*boundary)),"invalid recorded input IR");
-      require(succeeded(goldengate::prepareMetasimInterfaceHeader(bc,"FireSim",error)),error);
+      // The quad production boundary already carries the physical interface
+      // header; the older single-core diagnostic boundary predates it.
+      if (!quad)
+        require(succeeded(goldengate::prepareMetasimInterfaceHeader(bc,"FireSim",error)),error);
       if (nic) {
         require(succeeded(goldengate::prepareCPUManagedStreamHeader(bc,error)),error);
         require(succeeded(goldengate::prepareNICHeader(bc,error)),error);
@@ -286,6 +400,11 @@ int main(int argc, char **argv) {
       for (auto text : {".initDone = 256", ".traceEnable = 260", ".triggerSelector = 312",
           nic ? "},\n  0,\n  args,\n  1,\n  6144,\n  1,\n" : "},\n  0,\n  args,\n  0,\n  6144,\n  1,\n"})
         require(StringRef(body).contains(text),"recorded U250 TracerV ABI differs");
+      if (quad) for (unsigned i = 1; i < 4; ++i) {
+        require(StringRef(body).contains(".initDone = " + std::to_string(256 + 64 * i)), "quad trace MMIO differs");
+        require(StringRef(body).contains("},\n  " + std::to_string(i) + ",\n  args,\n  " +
+          std::to_string(i) + ",\n  6144,\n  1,\n"), "quad trace stream differs");
+      }
       require(StringRef(body).contains("ClockInfo{\"uart_clock,clock_1000.0MHz,harnessbinder_clock,reference\", 1U, 1U}"),
         "recorded TracerV clock ABI differs");
       require(succeeded(verify(*boundary)),"header emission changed IR validity");
