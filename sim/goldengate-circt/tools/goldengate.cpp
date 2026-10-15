@@ -4843,6 +4843,18 @@ int main(int argc, char **argv) {
         if (failed(goldengate::emitOutputFiles(circuit, nicDirectory, outputBase, error)))
           return fail("SimpleNIC driver header collateral: " + error);
         llvm::outs() << "Emitted CIRCT SimpleNIC driver constructor in " << nicDirectory << '\n';
+        if (failed(goldengate::prepareTracerVHeader(circuit, error)))
+          return fail("NIC TracerV driver header: " + error);
+        llvm::SmallString<256> traceAnnotations(outputDir), traceDirectory(outputDir);
+        llvm::sys::path::append(traceAnnotations, "post-fame-tracerv-header-all.json");
+        llvm::sys::path::append(traceDirectory, "tracerv-header");
+        if (failed(goldengate::emitAllAnnotations(circuit, traceAnnotations, error)))
+          return fail("NIC TracerV header annotations: " + error);
+        if (auto ec = llvm::sys::fs::create_directories(traceDirectory))
+          return fail("cannot create NIC TracerV header directory: " + ec.message());
+        if (failed(goldengate::emitOutputFiles(circuit, traceDirectory, outputBase, error)))
+          return fail("NIC TracerV driver header collateral: " + error);
+        llvm::outs() << "Emitted CIRCT TracerV shared-stream constructor in " << traceDirectory << '\n';
         return fail("NIC complete driver-header assembly and final RTL integration are not implemented");
       }
       auto prepareDriverHeaders = [&]() -> int {

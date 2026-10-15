@@ -16,6 +16,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
 #include <cstdint>
@@ -169,22 +170,44 @@ LogicalResult goldengate::prepareTracerVHeader(
   auto streamName = stream ? stream.getAs<StringAttr>("name") : StringAttr();
   auto space = transport->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits");
   auto sources = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
-  // TracerV retains slot zero when expanded Print queues follow it. AXI
-  // scalar ports follow all ordered source ports, not just the TracerV port.
+  // The queue's local index is independent of the shared CPU allocation:
+  // SimpleNIC precedes TracerV in the NIC recipe, while Print queues follow it.
+  // Resolve the driver index by identity, then check its actual transport port.
   if (!sources || sources.empty() || sources.size() > INT32_MAX / 4)
     return reject("TracerV requires an ordered CPU stream catalog");
   unsigned sourceCount = sources.size(), addressPort = sourceCount + 5;
-  auto first = dyn_cast<DictionaryAttr>(sources[0]);
-  auto sourcePort = first ? first.getAs<StringAttr>("port") : StringAttr();
+  std::optional<unsigned> driverIndex;
+  llvm::StringSet<> sourceNames, sourcePorts;
+  for (auto [i, attr] : llvm::enumerate(sources)) {
+    auto entry = dyn_cast<DictionaryAttr>(attr);
+    auto name = entry ? entry.getAs<StringAttr>("name") : StringAttr();
+    auto port = entry ? entry.getAs<StringAttr>("port") : StringAttr();
+    auto slot = entry ? entry.getAs<IntegerAttr>("index") : IntegerAttr();
+    auto capacity = entry ? entry.getAs<IntegerAttr>("depth") : IntegerAttr();
+    auto width = entry ? entry.getAs<IntegerAttr>("widthBytes") : IntegerAttr();
+    auto base = entry ? entry.getAs<IntegerAttr>("bufferBaseAddress") : IntegerAttr();
+    if (!name || name.getValue().empty() || !port || port.getValue().empty() ||
+        !sourceNames.insert(name.getValue()).second || !sourcePorts.insert(port.getValue()).second ||
+        !slot || slot.getInt() != int64_t(i) || !capacity || capacity.getInt() <= 0 ||
+        capacity.getInt() > (1 << 19) / 64 || !width || width.getInt() != 64 ||
+        !base || base.getInt() != int64_t(i) * (1 << 19))
+      return reject("TracerV CPU stream catalog has inconsistent identities or allocation");
+    if (name == streamName || port == "tracerv_stream") {
+      if (driverIndex || name != streamName || port != "tracerv_stream" || capacity != depth || width != bytes)
+        return reject("TracerV CPU stream identity or geometry differs from its queue");
+      driverIndex = i;
+    }
+  }
+  if (!driverIndex) return reject("TracerV is missing from the shared CPU stream catalog");
+  unsigned streamPort = 2 + *driverIndex;
   if (!index || index.getInt() != 0 || !depth || depth.getInt() != 6144 || !bytes || bytes.getInt() != 64 ||
       !streamName || streamName.getValue() != "TRACERVBRIDGEMODULE_" + std::to_string(widgetIndex) + "_to_cpu_stream" ||
       !space || space.getInt() != 19 || queue.getNumPorts() != 5 ||
       fieldType(queue.getPortType(2),"bits") != uint(512) || fieldType(queue.getPortType(3),"bits") != uint(512) ||
-      !first || first.getAs<StringAttr>("name") != streamName ||
-      !sourcePort || sourcePort.getValue() != "tracerv_stream" ||
       transport.getNumPorts() != sourceCount + 14 ||
-      transport.getPortName(2) != (sourceCount == 1 ? "stream" : "stream_0") ||
-      fieldType(transport.getPortType(2),"bits") != uint(512))
+      transport.getPortName(streamPort) != (sourceCount == 1 ? "stream" : "stream_" + std::to_string(*driverIndex)) ||
+      transport.getPortDirection(streamPort) != Direction::In ||
+      fieldType(transport.getPortType(streamPort),"bits") != uint(512))
     return reject("TracerV stream index, name, capacity or CPU transport differs from its driver");
   if (transport.getPortName(addressPort) != "ar_bits_addr" || transport.getPortType(addressPort) != uint(64) ||
       transport.getPortDirection(addressPort) != Direction::In || transport.getPortType(sourceCount + 11) != uint(512))
@@ -293,7 +316,7 @@ LogicalResult goldengate::prepareTracerVHeader(
       "#endif // TRACERVBRIDGEMODULE_checks\n#ifdef GET_BRIDGE_CONSTRUCTOR\n"
       "registry.add_widget(new tracerv_t(\n  simif,\n  *registry.get_stream_engine(),\nTRACERVBRIDGEMODULE_struct{\n";
   for (unsigned i = 0; i < 15; ++i) out << "    ." << words[i] << " = " << addresses[i] << ",\n";
-  out << "},\n  " << widgetIndex << ",\n  args,\n  " << index.getInt() << ",\n  " << depth.getInt()
+  out << "},\n  " << widgetIndex << ",\n  args,\n  " << *driverIndex << ",\n  " << depth.getInt()
       << ",\n  " << key.getAs<IntegerAttr>("retireWidth").getInt() << ",\n  ClockInfo{\"";
   // Escape arbitrary clock names as C++ bytes, including quote and backslash.
   for (unsigned char ch : clockName.getValue()) {

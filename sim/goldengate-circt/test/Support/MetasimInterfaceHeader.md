@@ -99,7 +99,29 @@ and proves only the intended annotation changed.
 
 The CLI archives this boundary in `post-fame-nic-header-all.json` and emits
 partial collateral under `nic-header/`. It still rejects complete NIC driver
-assembly and final RTL integration. In particular, the existing TracerV driver
-emitter assumes outgoing slot zero, whereas the NIC SFC fixture places TracerV
-at slot one. The NIC constructor match does not establish a working combined
-NIC driver or runtime equivalence.
+assembly and final RTL integration. The NIC constructor match does not
+establish a working combined NIC driver or runtime equivalence.
+
+TracerV now resolves its shared CPU stream index by catalog identity rather
+than using the producer queue's local index. The NIC recipe assigns outgoing
+index one to TracerV while that queue's local index remains zero. The emitter
+checks unique catalog names/ports, ordinal indices, queue geometry, address
+windows, the selected typed transport port and every native address grant.
+It preserves the existing single-stream constructor and rejects malformed or
+ambiguous allocations before changing the OutputFile annotation.
+
+The focused TracerV CTest covers shared indices one and two, relocated widget
+and MMIO allocations, rational clocks and 45 atomic rejection cases. Its
+production mode is `goldengate-tracerv-header-test <post-fame-f1-shim.mlir>
+<existing-output-dir> --nic`: it verifies input/output CIRCT IR, preserves
+all module bodies and unrelated annotations, and rejects a duplicate call
+without mutation. `TracerVHeaderCompare.py` takes the same five named
+arguments as `NICHeaderCompare.py`, selecting this native tool instead.
+It compares the complete TracerV fragment with SFC, including fifteen MMIO
+words/layout assertions, stream index/depth, retirement width and rational
+clock; both fragments compile against the actual TracerV driver declaration.
+
+The NIC CLI emits this partial boundary under `tracerv-header/` and archives
+`post-fame-tracerv-header-all.json`. Remaining driver sections and final NIC
+RTL integration are still explicitly rejected. A matching constructor does
+not establish NIC RTL or runtime parity.

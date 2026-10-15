@@ -5,6 +5,8 @@
 #include "goldengate/BlockDevMMIOBank.h"
 #include "goldengate/BlockDevHeader.h"
 #include "goldengate/TracerVHeader.h"
+#include "goldengate/CPUManagedStreamHeader.h"
+#include "goldengate/NICHeader.h"
 #include "goldengate/TracerVTokenEngine.h"
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/TSIHeader.h"
@@ -18,6 +20,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/Parser/Parser.h"
+#include "mlir/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
 using namespace mlir;
@@ -80,7 +83,7 @@ OwningOpRef<ModuleOp> tokenFixture(MLIRContext &ctx, unsigned retire = 1, unsign
 }
 // Real token, trigger, stream queue and CPU transport transforms; only the
 // allocation graph is synthetic. Optional boundary mode exercises the complete compiler IR.
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned driverIndex = 0) {
   auto root = tokenFixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addTracerVTokenEngine(c,error)),error);
   require(succeeded(goldengate::addTracerVTriggerConfig(c,error)),error);
@@ -107,9 +110,41 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
   NamedAttrList sourceParams(sourceQueue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters"));
   sourceParams.set("name",b.getStringAttr("TRACERVBRIDGEMODULE_2_to_cpu_stream"));
   sourceQueue->setAttr("goldengate.streamParameters",sourceParams.getDictionary(&ctx));
-  require(succeeded(goldengate::addCPUStreamRead(qc,
-      {{"TRACERVBRIDGEMODULE_2_to_cpu_stream", "tracerv_stream", 6144}}, error)),error);
+  auto streamTop = named(qc,qc.getName());
+  SmallVector<goldengate::CPUStreamSourcePort> sources;
+  for (unsigned i = 0; i < driverIndex; ++i) {
+    std::string port = "other_stream_" + std::to_string(i);
+    streamTop.insertPorts({{streamTop.getNumPorts(), PortInfo(b.getStringAttr(port),
+        streamTop.getPortType(2), Direction::Out)}});
+    sources.push_back({"OTHER_" + std::to_string(i),port,3072});
+  }
+  sources.push_back({"TRACERVBRIDGEMODULE_2_to_cpu_stream", "tracerv_stream", 6144});
+  require(succeeded(goldengate::addCPUStreamRead(qc,sources,error)),error);
   b.setInsertionPointToEnd(c.getBodyBlock()); auto transport = cast<FModuleOp>(b.clone(*named(qc,"GGCPUStreamRead")));
+  if (bad >= 35 && bad <= 43) {
+    auto catalog = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+    SmallVector<Attribute> entries(catalog.begin(),catalog.end());
+    NamedAttrList row(cast<DictionaryAttr>(entries[driverIndex]));
+    if (bad == 35) row.erase("index");
+    if (bad == 36) row.set("index",b.getI64IntegerAttr(driverIndex + 1));
+    if (bad == 37) row.set("name",b.getStringAttr("missing"));
+    if (bad == 38) row.set("port",b.getStringAttr("wrong"));
+    if (bad == 39) row.set("depth",b.getI64IntegerAttr(6143));
+    if (bad == 40) row.set("widthBytes",b.getI64IntegerAttr(32));
+    if (bad == 41) row.set("bufferBaseAddress",b.getI64IntegerAttr(0));
+    entries[driverIndex] = row.getDictionary(&ctx);
+    if (bad == 42) { NamedAttrList other(cast<DictionaryAttr>(entries[0]));
+      other.set("name",row.get("name")); entries[0] = other.getDictionary(&ctx); }
+    if (bad == 43) { NamedAttrList other(cast<DictionaryAttr>(entries[0]));
+      other.set("index",b.getI64IntegerAttr(1)); entries[0] = other.getDictionary(&ctx); }
+    transport->setAttr("goldengate.sourceStreams",b.getArrayAttr(entries));
+  }
+  if (bad == 44) {
+    SmallVector<PortInfo> ports(transport.getPorts());
+    ports[2 + driverIndex].name = b.getStringAttr("wrong_stream_port");
+    transport.setPortNamesAttr(b.getArrayAttr(llvm::map_to_vector(ports,
+        [&](const PortInfo &p) -> Attribute { return p.name; })));
+  }
   if (bad == 5) transport->setAttr("goldengate.streamAddressSpaceBits",b.getI64IntegerAttr(18));
   auto decoder = b.create<FModuleOp>(loc,b.getStringAttr("GGControlAddressDecode"),top.getConventionAttr(),ArrayRef<PortInfo>{
     {b.getStringAttr("aw_addr"),uint(25),Direction::In}});
@@ -205,7 +240,8 @@ std::string run(CircuitOp c) {
 }
 int main(int argc, char **argv) {
   try {
-    require(argc == 1 || argc == 3,"usage: TracerVHeaderTest [boundary.mlir output-directory]");
+    require(argc == 1 || argc == 3 || (argc == 4 && StringRef(argv[3]) == "--nic"),
+      "usage: TracerVHeaderTest [boundary.mlir output-directory [--nic]]");
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
     auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); auto body = run(c);
     for (auto text : {".initDone = 1024", ".traceEnable = 1028", ".triggerSelector = 1080",
@@ -215,16 +251,28 @@ int main(int argc, char **argv) {
       require(StringRef(body).contains(text),"TracerV allocation/stream/clock ABI differs");
     std::string error, before = dump(*root);
     require(failed(goldengate::prepareTracerVHeader(c,error)) && dump(*root) == before,"duplicate constructor changed IR");
-    for (unsigned bad = 1; bad <= 34; ++bad) {
-      auto negative = fixture(ctx,bad); auto nc = *negative->getOps<CircuitOp>().begin(); before = dump(*negative);
+    for (unsigned slot : {1U,2U}) {
+      auto shared = fixture(ctx,0,slot); auto sharedCircuit = *shared->getOps<CircuitOp>().begin();
+      auto header = run(sharedCircuit);
+      require(StringRef(header).contains("},\n  2,\n  args,\n  " + std::to_string(slot) + ",\n  6144,\n  1,\n"),
+        "shared stream index was confused with the queue-local index");
+    }
+    for (unsigned bad = 1; bad <= 44; ++bad) {
+      auto negative = fixture(ctx,bad,bad >= 35 ? 1 : 0); auto nc = *negative->getOps<CircuitOp>().begin(); before = dump(*negative);
       require(failed(goldengate::prepareTracerVHeader(nc,error)) && !error.empty() && dump(*negative) == before,
         "invalid boundary accepted or mutated: " + std::to_string(bad));
     }
-    llvm::outs() << "TracerV header: varied base/index/clock, fifteen words, stream geometry; preserved hardware/annotations; 35 atomic rejections passed\n";
-    if (argc == 3) {
+    llvm::outs() << "TracerV header: varied base/index/clock, fifteen words, stream geometry; preserved hardware/annotations; 45 atomic rejections passed\n";
+    if (argc >= 3) {
+      bool nic = argc == 4;
       auto boundary = parseSourceFile<ModuleOp>(argv[1],&ctx); require(bool(boundary),"boundary parse");
       auto bc = *boundary->getOps<CircuitOp>().begin();
+      require(succeeded(verify(*boundary)),"invalid recorded input IR");
       require(succeeded(goldengate::prepareMetasimInterfaceHeader(bc,"FireSim",error)),error);
+      if (nic) {
+        require(succeeded(goldengate::prepareCPUManagedStreamHeader(bc,error)),error);
+        require(succeeded(goldengate::prepareNICHeader(bc,error)),error);
+      } else {
       require(succeeded(goldengate::prepareSimulationMasterHeader(bc,error)),error);
       require(succeeded(goldengate::prepareClockBridgeHeader(bc,error)),error);
       require(succeeded(goldengate::prepareResetPulseHeader(bc,error)),error);
@@ -232,12 +280,21 @@ int main(int argc, char **argv) {
       require(succeeded(goldengate::preparePeekPokeHeader(bc,error)),error);
       require(succeeded(goldengate::prepareUARTHeader(bc,error)),error);
       require(succeeded(goldengate::prepareTSIHeader(bc,error)),error);
-      require(succeeded(goldengate::prepareBlockDevHeader(bc,error)),error); body = run(bc);
+      require(succeeded(goldengate::prepareBlockDevHeader(bc,error)),error);
+      }
+      body = run(bc);
       for (auto text : {".initDone = 256", ".traceEnable = 260", ".triggerSelector = 312",
-          "},\n  0,\n  args,\n  0,\n  6144,\n  1,\n  ClockInfo{\"uart_clock,clock_1000.0MHz,harnessbinder_clock,reference\", 1U, 1U}"})
+          nic ? "},\n  0,\n  args,\n  1,\n  6144,\n  1,\n" : "},\n  0,\n  args,\n  0,\n  6144,\n  1,\n"})
         require(StringRef(body).contains(text),"recorded U250 TracerV ABI differs");
+      require(StringRef(body).contains("ClockInfo{\"uart_clock,clock_1000.0MHz,harnessbinder_clock,reference\", 1U, 1U}"),
+        "recorded TracerV clock ABI differs");
+      require(succeeded(verify(*boundary)),"header emission changed IR validity");
+      require(succeeded(goldengate::emitAllAnnotations(bc,std::string(argv[2]) + "/tracerv-all.json",error)),error);
+      before = dump(*boundary);
+      require(failed(goldengate::prepareTracerVHeader(bc,error)) && dump(*boundary) == before,
+        "recorded duplicate changed IR");
       require(succeeded(goldengate::emitOutputFiles(bc,argv[2],"FireSim-generated",error)),error);
-      llvm::outs() << "Recorded U250 boundary: TracerV constructor composed with nine existing header sections\n";
+      llvm::outs() << "Recorded U250 boundary: TracerV stream allocation, verified IR, unchanged hardware/annotations and atomic duplicate rejection\n";
     }
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }

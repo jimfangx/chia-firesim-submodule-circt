@@ -852,6 +852,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-nic-header COMMAND goldengate-nic-header-test)
   add_executable(goldengate-tracerv-header-test
     test/Support/TracerVHeaderTest.cpp
+    lib/Support/CPUManagedStreamHeader.cpp lib/Support/NICHeader.cpp
     lib/Analysis/BridgeClockInfo.cpp
     lib/Support/TracerVHeader.cpp lib/Support/BlockDevHeader.cpp
     lib/Support/TSIHeader.cpp lib/Support/UARTHeader.cpp

@@ -6248,3 +6248,73 @@ and final RTL path before requesting runtime coverage through the harness.
 Other target widths/multiplicity, FASED profiles, partitioned QSFP and SRAM
 equivalence remain open. This milestone does not complete the port; unrelated
 shared-worktree edits are excluded.
+
+### Iteration 234: TracerV uses its shared CPU stream allocation
+
+`prepareTracerVHeader` now resolves the outgoing stream by widget/port identity
+in `GGCPUStreamRead`'s ordered catalog. The producer queue's local index zero
+is retained; the driver receives the catalog index instead. This ports
+`StreamToHostCPU`'s allocator and `FPGATop`'s vector-index invariant together
+with `TracerVBridgeModule.genHeader`. Catalog indices/address windows, unique
+names/ports, queue geometry and the selected typed transport port are checked
+before the sole OutputFile mutation. Every native address grant remains
+checked. The NIC CLI archives `post-fame-tracerv-header-all.json` and emits a
+partial `tracerv-header/FireSim-generated.const.h`, then retains its explicit
+complete-driver/final-RTL guard.
+
+The completed golden is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.const.h`
+(relative to the outer repository), SHA256
+`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`.
+The complete TracerV fragment matches after lexical normalization, including
+fifteen struct-layout assertions and MMIO addresses 256 through 312, widget
+zero, shared stream one, queue depth 6144, retirement width one and the
+reference rational clock 1/1. Both candidate and SFC fragments compile against
+the actual TracerV C++ driver declaration.
+
+The focused TracerV CTest exercises shared slots one and two, relocated MMIO
+and widget indices, rational clocks and 45 atomic rejection cases. CPU stream
+and SimpleNIC header CTests also pass. An independently parsed production
+boundary verifies input/output CIRCT IR, preserves all module bodies and
+unrelated annotations, and atomically rejects duplicate header preparation.
+Its complete 1,797-record annotation archive and emitted header equal the CLI.
+Only the intended OutputFile body/completion marker changes.
+
+All 259 earlier NIC and 256 no-NIC MLIR/JSON artifacts match iteration 233
+with candidate-directory normalization; the TracerV archive is the only new
+boundary. All five final no-NIC RTL/header/XDC artifacts are byte-identical.
+The archived Rocket inputs retain exact SHA256 matches to the immutable
+staging fixture. Synthesis XDC matches the immutable U250 build-tree fixture
+exactly; implementation XDC matches with the established hierarchy rename.
+Evidence is in the active generated directory's
+`iteration234-u250-target-matrix/`: `tracerv-header/comparison.json`, native
+and C++ ABI logs, `ctest.log`, `build.log`, `inputs.json`,
+`production-boundary-regression.json`, `no-nic-emitted-regression.json`,
+`immutable-rocket-comparison.json`, and `replay/`.
+Compiler SHA256 is
+`471deb553d628915e842b47e846acfe5a30dad2ae4fb01f0769ce03e50c08973`.
+
+For replay space, 1,164 old iteration-219/230 MLIR dumps were losslessly
+compressed to adjacent `.mlir.gz`, recovering 73,292,282,085 bytes after
+checking decompressed SHA256. Both `lossless-storage-cleanup*.json` manifests
+record all paths, sizes and hashes. Current/prior baselines, JSON, logs,
+final RTL and immutable fixtures were preserved.
+
+Supplied harness iteration 233 passed CIRCT replacertl/provenance and fresh
+Verilator smoke, reusing unchanged-input long-suite evidence; the SFC
+UART-bearing baseline remains pending. Those results predate this change.
+No manager verification was started here. Matching this constructor does
+not establish complete NIC compilation or runtime equivalence. The next
+smallest step is atomic composition of all NIC driver sections, followed by
+final NIC RTL integration and harness-owned runtime coverage. Other target
+widths/multiplicity, FASED profiles, partitioned QSFP and SRAM equivalence
+remain open. Unrelated shared-worktree changes are excluded.
+
+The full thirteen-target replay completed with one compiled target, six
+compiler gaps and six unsupported partition/QSFP platforms. It correctly
+exits nonzero for these gaps. Input hashes, effective platforms, statuses,
+diagnostics and earlier boundary checks match iteration 233 exactly.
+Aggregate comparisons remain eight matched, six mismatched (native SRAM
+model ports), and twelve not reached. `matrix-regression.json` and its log
+retain these results and each complete target diagnostic. The additional
+NIC TracerV boundary is a partial ABI match, not a newly supported target.
