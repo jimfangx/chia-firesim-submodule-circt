@@ -7490,3 +7490,74 @@ mismatches remain failures. `matrix-regression.json` records the comparison.
 `source-replay-stability.json` verifies that all 668 recorded source inputs and
 the compiler binary stayed unchanged during replay; compiler SHA256 is
 `d5d26284a53a70fdb0b47aa1496dbc91f03e76f56daa4e38794df1c6ef2d0273`.
+
+### Iteration 247: derive FASED host outstanding limits and widths
+
+`FASEDHostOutstanding.cpp` now caps the retained constructor's positive
+`axi4Edge.maxFlight` by the supported default-memory platform's 16 read and
+write slots, then derives the counter width as `ceil(log2(limit + 1))`.
+`WithDefaultMemModel` in `FASEDTargetConfigs.scala`, `BaseConfig.maxReads` /
+`maxWrites`, `FASEDMemoryTimingModel.scala:329-340` and `SatUpDownCounter` in
+`widgets/Lib.scala` are the oracle. This remains a default-BaseParams
+specialization; custom limits and absent optional edge maxima are not ported.
+The existing host clock/reset, AR/AW acceptance, R-last/B retirement, simultaneous
+handshake hold and idle/read-inflight semantics are preserved. Invalid,
+nonpositive or wider-than-64-bit constructor integers reject before mutation.
+
+The focused CTest passes in 178.25 seconds. Both ordinary and selected Print
+wrappers exercise maxFlight 1, 8, 10, 16, 20 and INT64_MAX, including every
+encoded counter-state pair. The recorded 10/20-flight profiles exhaust all
+handshake/reset combinations; the other profiles sample those combinations.
+There are 2,778,384 checked transitions, 98,304 wrapper wiring cases, fifteen
+atomic malformed-input rejections per wrapper and repeated-pass rejection.
+The test can also isolate the actual counter helper from verified production
+IR for RTL comparison.
+
+Evidence is under `iteration247-u250-target-matrix/`. The production helpers
+from `post-fame-fased-host-outstanding.mlir` were exported and lowered with
+firtool, then executed against the exact `SatUpDownCounter_1` modules extracted
+from these SFC artifacts under `automation/chia_firesim_circt/golden/u250-sfc-20261013/`:
+
+- `alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+- `alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+- `alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+
+All three standalone Verilator differentials pass 10,162 cycles, checking
+counts, idle/read-inflight, fill past capacity, simultaneous transfers, drain
+through empty, partial R bursts, stalls and host reset. Gemmini and Saturn
+Rocket match five-bit counters capped at 16; Rocket retains four-bit counters
+capped at 10. `host-counter-comparison.json` records exact source hashes, SFC
+parent bindings and run logs. The counter body and host clock/reset/handshake/
+maximum bindings in the immutable October 1 U250 `design/FireSim-generated.sv`
+also match the October 13 Rocket golden (`immutable-host-counter-comparison.json`).
+This checks the isolated host counters, not full target metasimulation.
+
+Both newly advanced targets now reject at the existing ten-flight ingress-credit
+specialization. A separate structured comparison identifies an earlier remaining
+geometry difference: each SFC `IngressModule.awQueue` has sixteen entries,
+while the native `GGFASEDIngressAWQueue10` still has ten. The W/AR SFC depths
+are sixteen/four. `next-ingress-queue-oracle.json` records the exact SFC module
+bindings, RAM geometry and candidate memory operations. The next smallest
+compiler step is to derive AW queue depth from the same capped write limit,
+validate its fill/drain/wrap behavior, and then port the ingress-credit/order
+capacities. The downstream mismatch is not counted as target parity.
+
+For replay headroom, 693 iteration-245 MLIR dumps were losslessly gzipped,
+recovering 47,251,777,452 bytes. Each original SHA256 matches decompression
+before removal (`lossless-storage-cleanup-245.json`); active comparison
+boundaries, logs, JSON, final RTL/collateral and immutable fixtures remain.
+FireSim manager verification remains owned by the harness and was not started.
+
+The complete fresh thirteen-target replay retains three compiled recipes,
+four compiler gaps and six unsupported partition/QSFP platforms. Gemmini and
+Saturn Rocket advancing from host counters to ingress credits are the only
+changed failures. Archived input hashes, effective platform selections and
+structured boundary comparisons are unchanged: eight matches, six existing
+SRAM-model port mismatches and twelve comparisons not reached. The matrix
+exits nonzero; these gaps and mismatches remain failures.
+`matrix-regression.json` also verifies every prior MLIR/annotation boundary and
+all six emitted RTL/collateral files for each of the three compiled Rocket
+recipes are unchanged (after candidate-directory normalization for boundaries).
+`source-replay-stability.json` verifies all 668 recorded compiler/build inputs
+and the compiler binary stayed unchanged during replay; compiler SHA256 is
+`1341806378127d85d22fdd0046d2dbf19cd431019caffecdf9ed8b943927da04`.

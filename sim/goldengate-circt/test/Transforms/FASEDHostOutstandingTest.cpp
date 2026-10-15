@@ -10,6 +10,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
 #include <map>
 #include <functional>
 #include <random>
@@ -22,7 +23,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0, bool selected = false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0, bool selected = false, int64_t maxFlight = 10) {
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDTokenWrapper\" { firrtl.module @GGFASEDTokenWrapper() {} } }", &ctx);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
@@ -41,8 +42,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0, bool selected
   auto inner = b.create<FModuleOp>(c.getLoc(), b.getStringAttr(c.getName()), ConventionAttr::get(&ctx, Convention::Internal), ports);
   if (mode != 5) {
     auto engine = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDTokenEngine"), ConventionAttr::get(&ctx, Convention::Internal), SmallVector<PortInfo>{});
-    if (mode != 6) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
-        b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI64IntegerAttr(mode == 7 ? 8 : 10))}))}));
+    if (mode != 6) {
+      Attribute flight = b.getI64IntegerAttr(mode == 7 ? 0 : mode == 12 ? -1 : maxFlight);
+      if (mode == 13) flight = b.getStringAttr("20");
+      if (mode == 14) flight = b.getIntegerAttr(b.getIntegerType(129), APInt(129, 20));
+      auto fields = mode == 15 ? DictionaryAttr::get(&ctx) :
+          b.getDictionaryAttr({b.getNamedAttr("maxFlight", flight)});
+      engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge", fields)}));
+    }
   }
   if (mode == 8) b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDHostOutstanding"), ConventionAttr::get(&ctx, Convention::Internal), SmallVector<PortInfo>{});
   if (mode == 9) { b.setInsertionPointToStart(inner.getBodyBlock()); b.create<InstanceOp>(c.getLoc(), inner, "used"); }
@@ -135,19 +142,26 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx, bool selected) {
+void behavior(MLIRContext &ctx, bool selected, int64_t maxFlight) {
+  const unsigned limit = std::min<int64_t>(16, maxFlight);
+  const unsigned width = llvm::Log2_64_Ceil(limit + 1);
+  const unsigned encodedStates = 1u << width;
   const std::string old = selected ? "GGSelectedPrintFASEDTokenWrapper" : "GGFASEDTokenWrapper";
   const std::string top = selected ? "GGSelectedPrintFASEDHostOutstandingWrapper" : "GGFASEDHostOutstandingWrapper";
-  auto root = fixture(ctx, 0, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto root = fixture(ctx, 0, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDHostOutstanding(c, error)), error);
   require(succeeded(verify(*root)), "invalid FASED host outstanding IR");
   Interpreter sim(named(c, "GGFASEDHostOutstanding")); unsigned cases = 0;
   SmallVector<Value> state; for (auto r : sim.module.getOps<RegResetOp>()) state.push_back(r.getResult());
   require(state.size() == 2, "host counter state missing");
+  for (auto value : state) require(sim.width(value) == width, "counter width differs from log2Up(min(16,maxFlight)+1)");
   const llvm::StringRef inputs[]{"arReady","arValid","rReady","rValid","rLast","awReady","awValid","bReady","bValid"};
-  for (unsigned reads = 0; reads < 16; ++reads) for (unsigned writes = 0; writes < 16; ++writes)
-    for (unsigned flags = 0; flags < 1024; ++flags) {
-      sim.memo.clear(); sim.state[state[0]] = APInt(4, reads); sim.state[state[1]] = APInt(4, writes);
+  // Exhaust the recorded 10/20-flight profiles; the additional width/cap
+  // probes sample handshake combinations over every encoded counter state.
+  const unsigned flagStep = maxFlight == 10 || maxFlight == 20 ? 1 : 31;
+  for (unsigned reads = 0; reads < encodedStates; ++reads) for (unsigned writes = 0; writes < encodedStates; ++writes)
+    for (unsigned flags = 0; flags < 1024; flags += flagStep) {
+      sim.memo.clear(); sim.state[state[0]] = APInt(width, reads); sim.state[state[1]] = APInt(width, writes);
       auto f = [&](unsigned i) { return (flags >> i) & 1; };
       sim.put(sim.arg(1), "", f(9)); for (unsigned i = 0; i < 9; ++i) sim.put(sim.arg(2), inputs[i], f(i));
       require(sim.output(sim.arg(3), "").getBoolValue() == (!reads && !writes), "idle differs");
@@ -155,7 +169,7 @@ void behavior(MLIRContext &ctx, bool selected) {
       auto next = [&](unsigned n, bool inc, bool dec) {
         if (f(9)) return 0u;
         if (inc == dec) return n;
-        if (inc && n < 10) return n + 1;
+        if (inc && n < limit) return n + 1;
         if (dec && n > 0) return n - 1;
         return n;
       };
@@ -190,10 +204,10 @@ void behavior(MLIRContext &ctx, bool selected) {
   auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(raw.size() == 7, "annotation classes lost");
   for (unsigned i = 0; i < 7; ++i) require(cast<DictionaryAttr>(raw[i]).getAs<StringAttr>("target").getValue() == targets[i], "annotation target differs");
-  llvm::outs() << cases << " host counter transitions and 8192 boundary cases passed\n";
+  llvm::outs() << "maxFlight=" << maxFlight << " limit=" << limit << " width=" << width << ": " << cases << " host counter transitions and 8192 boundary cases passed\n";
 }
 void rejection(MLIRContext &ctx, bool selected) {
-  for (unsigned mode = 1; mode <= 11; ++mode) {
+  for (unsigned mode = 1; mode <= 15; ++mode) {
     auto root = fixture(ctx, mode, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string before, after, error;
     { llvm::raw_string_ostream out(before); root->print(out); }
     require(failed(goldengate::addFASEDHostOutstanding(c, error)) && !error.empty(), "malformed boundary accepted");
@@ -203,11 +217,35 @@ void rejection(MLIRContext &ctx, bool selected) {
   auto root = fixture(ctx, 0, selected); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDHostOutstanding(c, error)), error);
   require(failed(goldengate::addFASEDHostOutstanding(c, error)), "repeated pass accepted");
-  llvm::outs() << "11 atomic preflight rejections and repeated pass rejection passed\n";
+  llvm::outs() << "15 atomic preflight rejections and repeated pass rejection passed\n";
 }
 }
-int main() {
+int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-  try { for (bool selected : {false, true}) { behavior(ctx, selected); rejection(ctx, selected); } } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
+  try {
+    // Export the actual helper from a verified production boundary for RTL
+    // differential execution against archived SFC SatUpDownCounter instances.
+    if (argc == 3) {
+      auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
+      require(bool(root) && succeeded(verify(*root)), "production FASED boundary invalid");
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDHostOutstanding"));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper = cast<FModuleOp>(b.insert(named(circuit, "GGFASEDHostOutstanding")->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)), "exported host counters invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
+      require(!ec, "cannot export host counters"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
+    require(argc == 1, "usage: goldengate-fased-host-outstanding-test [production.mlir helper.mlir]");
+    for (bool selected : {false, true}) {
+      for (int64_t flight : {int64_t(1), int64_t(8), int64_t(10), int64_t(16), int64_t(20), INT64_MAX})
+        behavior(ctx, selected, flight);
+      rejection(ctx, selected);
+    }
+  } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
   return 0;
 }

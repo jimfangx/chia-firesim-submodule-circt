@@ -1,16 +1,20 @@
 // See LICENSE for license details.
 // Requires: active uninstantiated GGFASEDTokenWrapper, retained annotations,
-// exact host clock/reset/readiness and the Rocket constructor maxFlight=10.
+// exact host clock/reset/readiness and a positive constructor maxFlight.
 // Consumes: readiness.hostMemIdle; preserves read/write egress readiness.
 // Produces: two host-clocked saturating counters, host idle/read inflight and
 // explicit host AXI handshake boundary for subsequent ingress/egress wiring.
 // Transfers: circuit/copied-port targets and consumed readiness leaf targets.
 // Mutates: hierarchy and ports; preserves constructor/channel/clock metadata.
 // Oracle: FASEDMemoryTimingModel.scala 329-340 and widgets/Lib.scala counter.
-// The recorded BaseParams(16,16) capped by edge.maxFlight=10 is the supported
-// profile. Target reset and targetFire never gate or clear host transactions.
+// The supported default-memory platform uses BaseParams(16,16), capped by
+// edge.maxFlight (BaseConfig.maxReads/maxWrites). Custom BaseParams are not
+// represented by this boundary. Target reset and targetFire never gate or
+// clear host transactions.
 #include "goldengate/FASEDHostOutstanding.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -34,10 +38,14 @@ LogicalResult goldengate::addFASEDHostOutstanding(CircuitOp circuit, std::string
   auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto maxFlight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!maxFlight || maxFlight.getInt() != 10)
-    return reject("FASED host outstanding currently supports the recorded maxFlight=10 profile");
+  if (!maxFlight || maxFlight.getValue().getBitWidth() > 64 || maxFlight.getInt() <= 0)
+    return reject("FASED host outstanding needs a positive 64-bit maxFlight constructor");
+  // WithDefaultMemModel supplies 16 read and write slots. Cap before computing
+  // n+1 so even a large edge maximum cannot overflow the counter width.
+  const uint64_t limit = std::min<uint64_t>(16, maxFlight.getInt());
+  const unsigned countWidth = llvm::Log2_64_Ceil(limit + 1);
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
-  auto bit = UIntType::get(ctx, 1, false), countType = UIntType::get(ctx, 4, false);
+  auto bit = UIntType::get(ctx, 1, false), countType = UIntType::get(ctx, countWidth, false);
   auto readiness = BundleType::get(ctx, {{b.getStringAttr("readValid"), false, bit},
       {b.getStringAttr("writeValid"), false, bit}, {b.getStringAttr("hostMemIdle"), false, bit}});
   const llvm::StringRef required[]{"hostClock", "hostReset", "fased_readiness"};
@@ -71,7 +79,7 @@ LogicalResult goldengate::addFASEDHostOutstanding(CircuitOp circuit, std::string
   auto arg = [&](unsigned i) { return helper.getBodyBlock()->getArgument(i); };
   auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
   auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
-  auto constant = [&](uint64_t n) -> Value { return b.create<ConstantOp>(loc, countType, APInt(4, n)); };
+  auto constant = [&](uint64_t n) -> Value { return b.create<ConstantOp>(loc, countType, APInt(countWidth, n)); };
   auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
   auto neg = [&](Value v) -> Value { return b.create<NotPrimOp>(loc, v); };
   auto mux = [&](Value c, Value yes, Value no) -> Value { return b.create<MuxPrimOp>(loc, c, yes, no); };
@@ -81,11 +89,11 @@ LogicalResult goldengate::addFASEDHostOutstanding(CircuitOp circuit, std::string
   Value readEmpty = b.create<EQPrimOp>(loc, reads, constant(0));
   Value writeEmpty = b.create<EQPrimOp>(loc, writes, constant(0));
   auto update = [&](Value count, Value inc, Value dec, Value empty) {
-    Value full = b.create<GEQPrimOp>(loc, count, constant(10));
+    Value full = b.create<GEQPrimOp>(loc, count, constant(limit));
     Value up = both(both(inc, neg(dec)), neg(full));
     Value down = both(both(neg(inc), dec), neg(empty));
-    Value plus = b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, count, constant(1)), 3, 0);
-    Value minus = b.create<BitsPrimOp>(loc, b.create<SubPrimOp>(loc, count, constant(1)), 3, 0);
+    Value plus = b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, count, constant(1)), countWidth - 1, 0);
+    Value minus = b.create<BitsPrimOp>(loc, b.create<SubPrimOp>(loc, count, constant(1)), countWidth - 1, 0);
     connect(count, mux(up, plus, mux(down, minus, count)));
   };
   update(reads, both(t("arReady"), t("arValid")), both(both(t("rReady"), t("rValid")), t("rLast")), readEmpty);
