@@ -74,7 +74,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0) {
   sp.set("name",b.getStringAttr("trace\"stream\\domain"));
   if (bad == 1) sp.set("depth",b.getI64IntegerAttr(6143));
   if (bad == 2) sp.set("widthBytes",b.getI64IntegerAttr(32));
-  if (bad == 3) sp.set("index",b.getI64IntegerAttr(1));
+  if (bad == 3) sp.set("index",b.getI64IntegerAttr(-1));
   if (bad == 4) sp.set("name",b.getStringAttr(""));
   queue->setAttr("goldengate.streamParameters",sp.getDictionary(&ctx));
   auto sources = read->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
@@ -292,6 +292,12 @@ int main(int argc, char **argv) {
     require(StringRef(body).contains("GET_MANAGED_STREAM_CONSTRUCTOR") && !StringRef(body).contains("_struct"),"constructor guard/substruct differs");
     std::string before = dump(*root), error;
     require(failed(goldengate::prepareCPUManagedStreamHeader(c,error)) && dump(*root) == before,"duplicate constructor mutated IR");
+    auto localIndex = fixture(ctx); auto lc = *localIndex->getOps<CircuitOp>().begin();
+    OpBuilder localBuilder(&ctx); auto localQueue = named(lc,"GGTracerVStreamQueue6144");
+    NamedAttrList localInfo(localQueue->getAttrOfType<DictionaryAttr>("goldengate.streamParameters"));
+    localInfo.set("index",localBuilder.getI64IntegerAttr(77));
+    localQueue->setAttr("goldengate.streamParameters",localInfo.getDictionary(&ctx));
+    require(StringRef(run(lc)).contains("0ULL, 2048ULL, 6144U, 64U)"),"creator-local index replaced transport order");
     for (unsigned bad = 1; bad <= 32; ++bad) {
       auto negative = fixture(ctx,bad); auto nc = *negative->getOps<CircuitOp>().begin(); before = dump(*negative);
       require(failed(goldengate::prepareCPUManagedStreamHeader(nc,error)) && !error.empty() && dump(*negative) == before,
@@ -323,10 +329,60 @@ int main(int argc, char **argv) {
     llvm::outs() << "CPU managed stream header: single/ordered multi-stream descriptors, distinct/shared queue definitions, escaped names; 66 atomic rejections passed\n";
     if (argc == 3) {
       auto boundary = parseSourceFile<ModuleOp>(argv[1],&ctx); require(bool(boundary),"boundary parse");
+      require(succeeded(verify(*boundary)),"recorded input IR invalid");
       auto bc = *boundary->getOps<CircuitOp>().begin();
       require(succeeded(goldengate::prepareMetasimInterfaceHeader(bc,"FireSim",error)),error); body = run(bc);
-      require(StringRef(body).contains("std::string(\"TRACERVBRIDGEMODULE_0_to_cpu_stream\"), 0ULL, 568ULL, 6144U, 64U)"),"recorded U250 descriptor differs");
+      bool nic = StringRef(body).contains("SIMPLENICBRIDGEMODULE_0_from_cpu_stream");
+      require(StringRef(body).contains(nic ?
+          "std::string(\"TRACERVBRIDGEMODULE_0_to_cpu_stream\"), 524288ULL, 596ULL, 6144U, 64U)" :
+          "std::string(\"TRACERVBRIDGEMODULE_0_to_cpu_stream\"), 0ULL, 568ULL, 6144U, 64U)"),"recorded U250 descriptor differs");
+      if (nic) {
+        require(StringRef(body).contains("std::string(\"SIMPLENICBRIDGEMODULE_0_from_cpu_stream\"), 0ULL, 600ULL, 3072U, 64U)"),
+            "recorded incoming queue descriptor differs");
+        auto raw = bc->getAttrOfType<ArrayAttr>("rawAnnotations");
+        SmallVector<Attribute> unprepared(raw.begin(),raw.end());
+        for (auto &attr : unprepared) {
+          auto row = cast<DictionaryAttr>(attr);
+          if (row.get("goldengate.cpuManagedStreamHeader")) {
+            NamedAttrList copy(row); copy.erase("goldengate.cpuManagedStreamHeader"); attr = copy.getDictionary(&ctx);
+          }
+        }
+        OpBuilder b(&ctx); bc->setAttr("rawAnnotations", b.getArrayAttr(unprepared));
+        auto writer = named(bc,"GGCPUStreamWrite"), bank = named(bc,"GGCPUStreamCountBank");
+        auto reject = [&](FModuleOp mutated) {
+          auto old = dump(mutated.getOperation()); auto archive = bc->getAttrOfType<ArrayAttr>("rawAnnotations");
+          require(failed(goldengate::prepareCPUManagedStreamHeader(bc,error)) && !error.empty() &&
+              archive == bc->getAttrOfType<ArrayAttr>("rawAnnotations") && dump(mutated.getOperation()) == old,
+              "invalid incoming descriptor accepted or mutated");
+        };
+        auto rows = writer->getAttrOfType<ArrayAttr>("goldengate.sinkStreams");
+        for (StringRef key : {"name", "port", "index", "depth", "widthBytes", "bufferBaseAddress"}) {
+          NamedAttrList changed(cast<DictionaryAttr>(rows[0])); changed.erase(key);
+          writer->setAttr("goldengate.sinkStreams", b.getArrayAttr({changed.getDictionary(&ctx)})); reject(writer);
+        }
+        writer->setAttr("goldengate.sinkStreams", rows);
+        auto space = writer->getAttr("goldengate.streamAddressSpaceBits");
+        writer->setAttr("goldengate.streamAddressSpaceBits",b.getI64IntegerAttr(19)); reject(writer);
+        writer->setAttr("goldengate.streamAddressSpaceBits",space);
+        for (auto conn : writer.getOps<StrictConnectOp>()) {
+          auto field = conn.getDest().getDefiningOp<SubfieldOp>();
+          if (!field || field.getInput() != writer.getArgument(2) ||
+              (field.getFieldName() != "valid" && field.getFieldName() != "bits")) continue;
+          auto old = conn.getSrc(); b.setInsertionPoint(conn);
+          auto zero = b.create<ConstantOp>(conn.getLoc(),cast<UIntType>(old.getType()),APInt(field.getFieldName() == "bits" ? 512 : 1,0));
+          conn->setOperand(1,zero.getResult()); reject(writer); conn->setOperand(1,old); zero.erase();
+        }
+        auto words = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+        SmallVector<Attribute> changed(words.begin(),words.end()); NamedAttrList last(cast<DictionaryAttr>(changed.back()));
+        last.set("offset",b.getI32IntegerAttr(4)); changed.back()=last.getDictionary(&ctx);
+        bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(changed)); reject(bank);
+        bank->setAttr("goldengate.mmioRegisters",words);
+        bc->setAttr("rawAnnotations",raw);
+        llvm::outs() << "Recorded NIC incoming allocation: 10 atomic rejections passed\n";
+      }
+      require(succeeded(verify(*boundary)),"recorded output IR invalid");
       require(succeeded(goldengate::emitOutputFiles(bc,argv[2],"FireSim-generated",error)),error);
+      require(succeeded(goldengate::emitAllAnnotations(bc,std::string(argv[2])+"/cpu-stream-all.json",error)),error);
       llvm::outs() << "Recorded U250 boundary: CPU-managed stream constructor emitted\n";
     }
     return 0;

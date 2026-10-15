@@ -53,3 +53,16 @@ the driver submake. Checking the missing-header make graph and Verilator lint
 does not replace harness-owned replacertl and metasim verification. The harness
 must use a fresh output directory or archive the mutable legacy header first,
 then require both the new CIRCT header and its copied top-level counterpart.
+
+`NICCPUStreamHeaderCompare.py` checks the subsequent NIC CPU stream header
+boundary. It compares the complete managed-stream constructor, including
+incoming/outgoing vector order, names, independent DMA bases, count MMIO
+addresses, queue capacities and beat widths, with the archived NIC SFC
+`.const.h`. Both constructors compile against the actual FireSim
+`CPUManagedStreamWidget` declaration. The native test also checks full MLIR
+verification, module-body preservation, one-annotation-only mutation, and
+malformed incoming allocation/payload/MMIO rejection. Invoke with
+`--candidate`, `--sfc` (the header), `--native-tool`
+(`goldengate-cpu-managed-stream-header-test`), `--cxx`, and a fresh
+`--output-dir`. The CLI writes this partial collateral in `cpu-stream-header/`;
+SimpleNIC bridge constructors and complete NIC RTL/runtime parity remain open.

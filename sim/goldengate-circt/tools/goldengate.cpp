@@ -4818,7 +4818,19 @@ int main(int argc, char **argv) {
           return fail("NIC metasim interface collateral: " + error);
         llvm::outs() << "Emitted CIRCT NIC metasim interface headers in "
                      << headerDirectory << '\n';
-        return fail("NIC driver header integration is not implemented");
+        if (failed(goldengate::prepareCPUManagedStreamHeader(circuit, error)))
+          return fail("NIC CPU managed stream header: " + error);
+        llvm::SmallString<256> streamAnnotations(outputDir), streamDirectory(outputDir);
+        llvm::sys::path::append(streamAnnotations, "post-fame-cpu-stream-header-all.json");
+        llvm::sys::path::append(streamDirectory, "cpu-stream-header");
+        if (failed(goldengate::emitAllAnnotations(circuit, streamAnnotations, error)))
+          return fail("NIC CPU stream header annotations: " + error);
+        if (auto ec = llvm::sys::fs::create_directories(streamDirectory))
+          return fail("cannot create NIC CPU stream header directory: " + ec.message());
+        if (failed(goldengate::emitOutputFiles(circuit, streamDirectory, outputBase, error)))
+          return fail("NIC CPU stream header collateral: " + error);
+        llvm::outs() << "Emitted CIRCT incoming/outgoing CPU stream descriptors in " << streamDirectory << '\n';
+        return fail("NIC bridge driver header integration is not implemented");
       }
       auto prepareDriverHeaders = [&]() -> int {
         if (failed(goldengate::prepareRocketDriverHeaders(circuit, error)))

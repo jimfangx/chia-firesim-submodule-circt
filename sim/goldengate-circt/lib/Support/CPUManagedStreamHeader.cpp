@@ -1,8 +1,8 @@
 // See LICENSE for license details.
 // Oracle: CPUManagedStreamEngine.genHeader and Widget.genConstructor.
-// Required input: unique live outgoing-only CPU transport, stream queue/count
+// Required input: unique live CPU read/write transport, stream queue/count
 // bank and allocated read/write control bindings. Outgoing order is the native
-// transport allocation order; incoming streams remain unsupported.
+// transport allocation order; count MMIO allocates outgoing before incoming.
 // Annotations read: sole .const.h OutputFile; none consumed. Produces one
 // managed-stream constructor and a completion marker in that annotation only.
 // Analyses required: InstanceGraph plus SSA/instance forwarding of count/data.
@@ -230,24 +230,31 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
   auto sources = transport ? transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams") : ArrayAttr();
   auto space = transport ? transport->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits") : IntegerAttr();
   auto sinks = incoming ? incoming->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount") : IntegerAttr();
+  auto sinkAllocations = incoming ? incoming->getAttrOfType<ArrayAttr>("goldengate.sinkStreams") : ArrayAttr();
+  auto sinkSpace = incoming ? incoming->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits") : IntegerAttr();
   bool needsIncoming = !selected || bufferedSelected;
   if (!transport || (needsIncoming && !incoming) || !sources || sources.empty() || sources.size() > INT32_MAX / 4 ||
-      !space || space.getInt() < 6 || space.getInt() > 30 || (needsIncoming && (!sinks || sinks.getInt() != 0)))
-    return reject("CPU stream descriptors need ordered outgoing allocations and no incoming streams");
-  unsigned n = sources.size(), mcrPort = n + 2, addressPort = n + 5;
-  if (transport.getNumPorts() != n + 14 || bank.getNumPorts() != n + 3 ||
+      !space || space.getInt() < 6 || space.getInt() > 30 || (needsIncoming && (!sinks || sinks.getInt() < 0 || sinks.getInt() > INT32_MAX / 4)))
+    return reject("CPU stream descriptors need ordered outgoing allocations and an incoming engine");
+  unsigned n = sources.size(), incomingCount = needsIncoming ? sinks.getInt() : 0;
+  if (incomingCount && (selected || !sinkAllocations || sinkAllocations.size() != incomingCount ||
+      !sinkSpace || sinkSpace.getInt() < 6 || sinkSpace.getInt() > 30 ||
+      incoming.getNumPorts() != incomingCount + 16))
+    return reject("CPU incoming descriptors need ordered write allocations and typed ports");
+  unsigned total = n + incomingCount, mcrPort = total + 2, addressPort = n + 5;
+  if (transport.getNumPorts() != n + 14 || bank.getNumPorts() != total + 3 ||
       transport.getPortName(addressPort) != "ar_bits_addr" ||
       transport.getPortType(addressPort) != uint(64) || transport.getPortDirection(addressPort) != Direction::In ||
       transport.getPortType(n + 11) != uint(512) || bank.getPortName(mcrPort) != "mcr" ||
       bank.getPortType(0) != ClockType::get(circuit.getContext()) || bank.getPortType(1) != uint(1) ||
-      uint64_t(size.getInt()) < 4ULL * n)
+      uint64_t(size.getInt()) < 4ULL * total)
     return reject("CPU stream transport/count ports or MMIO region differ from allocation");
-  for (unsigned i = 0; i < n + 3; ++i)
+  for (unsigned i = 0; i < total + 3; ++i)
     if (bank.getPortDirection(i) != (i == mcrPort ? Direction::Out : Direction::In))
       return reject("CPU stream count bank directions differ");
   for (StringRef group : {"read", "write"}) {
     auto slots = dyn_cast_or_null<FVectorType>(fieldType(bank.getPortType(mcrPort), group));
-    if (!slots || slots.getNumElements() != n || fieldType(slots.getElementType(), "bits") != uint(32))
+    if (!slots || slots.getNumElements() != total || fieldType(slots.getElementType(), "bits") != uint(32))
       return reject("CPU stream counts require one 32-bit MCR slot per allocation");
   }
   auto arg = [&](FModuleOp m, unsigned i) { return m.getBodyBlock()->getArgument(i); };
@@ -315,6 +322,7 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
       if (auto a = dyn_cast<BlockArgument>(value)) {
         auto module = dyn_cast<FModuleOp>(a.getOwner()->getParentOp());
         if (!module || module.getPortDirection(a.getArgNumber()) != Direction::In || path.empty()) return {};
+        namedPort |= module.getPortName(a.getArgNumber()) == sourcePort;
         auto inst = path.pop_back_val();
         if (inst.getModuleName() != module.getName()) return {};
         value = inst.getResult(a.getArgNumber()); continue;
@@ -327,6 +335,7 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
       if (module.getPortDirection(port) != Direction::Out) return {};
       namedPort |= module.getPortName(port) == sourcePort;
       path.push_back(inst);
+      if (module == incoming && (member == "bits" || member == "valid")) return {module, path, port, namedPort};
       if (module.getNumPorts() == 5 && !module.getOps<MemOp>().empty()) {
         if (!sourcePort.empty() && member != "bits") return {};
         return {module, path, port, namedPort};
@@ -344,12 +353,19 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
         g && g.getFieldName() == groupName && g.getInput() == arg(bank, mcrPort);
   };
   auto registers = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
-  if (!registers || registers.size() != n) return reject("CPU stream count allocation size differs");
+  if (!registers || registers.size() != total) return reject("CPU stream count allocation size differs");
   llvm::StringSet<> names, ports;
   SmallVector<Endpoint> queues;
   SmallVector<DictionaryAttr> allocations;
-  uint64_t maxDepth = 0, windowBytes = uint64_t(1) << space.getInt();
-  for (auto [i, attr] : llvm::enumerate(sources)) {
+  uint64_t maxDepth = 0, maxIncomingDepth = 0;
+  SmallVector<Attribute> ordered(sources.begin(), sources.end());
+  if (incomingCount) ordered.append(sinkAllocations.begin(), sinkAllocations.end());
+  for (auto [i, attr] : llvm::enumerate(ordered)) {
+    bool fromHost = i >= n;
+    unsigned localIndex = fromHost ? i - n : i, directionCount = fromHost ? incomingCount : n;
+    auto engine = fromHost ? incoming : transport;
+    unsigned windowBits = fromHost ? sinkSpace.getInt() : space.getInt();
+    uint64_t windowBytes = uint64_t(1) << windowBits;
     auto source = dyn_cast<DictionaryAttr>(attr);
     auto name = source ? source.getAs<StringAttr>("name") : StringAttr();
     auto port = source ? source.getAs<StringAttr>("port") : StringAttr();
@@ -359,24 +375,31 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     auto base = source ? source.getAs<IntegerAttr>("bufferBaseAddress") : IntegerAttr();
     if (!name || name.getValue().empty() || name.getValue().contains('\0') || !names.insert(name.getValue()).second ||
         !port || port.getValue().empty() || port.getValue().contains('\0') || !ports.insert(port.getValue()).second ||
-        !index || index.getInt() != int64_t(i) || !depth || depth.getInt() <= 0 || depth.getInt() > INT32_MAX / 64 ||
-        !bytes || bytes.getInt() != 64 || !base || base.getInt() != int64_t(i * windowBytes) || base.getInt() > INT32_MAX ||
-        transport.getPortName(i + 2) != (n == 1 ? "stream" : "stream_" + std::to_string(i)) ||
-        transport.getPortDirection(i + 2) != Direction::In || fieldType(transport.getPortType(i + 2), "bits") != uint(512))
+        !index || index.getInt() != int64_t(localIndex) || !depth || depth.getInt() <= 0 || depth.getInt() > INT32_MAX / 64 ||
+        !bytes || bytes.getInt() != 64 || !base || base.getInt() != int64_t(localIndex * windowBytes) || base.getInt() > INT32_MAX ||
+        engine.getPortName(localIndex + 2) != (directionCount == 1 ? "stream" : "stream_" + std::to_string(localIndex)) ||
+        engine.getPortDirection(localIndex + 2) != (fromHost ? Direction::Out : Direction::In) ||
+        fieldType(engine.getPortType(localIndex + 2), "bits") != uint(512))
       return reject("CPU stream identity, order, capacity or DMA base differs from native allocation");
-    maxDepth = std::max(maxDepth, uint64_t(depth.getInt()));
-    auto data = trace(arg(transport, i + 2), transportPath, port.getValue(), "bits");
+    auto &maximum = fromHost ? maxIncomingDepth : maxDepth;
+    maximum = std::max(maximum, uint64_t(depth.getInt()));
     auto count = trace(arg(bank, i + 2), bankPath);
-    if (!data.queue || !count.queue || !data.namedPort || data.port != 3 || count.port != 4 || data.path != count.path)
-      return reject("CPU stream count and read transport must forward the same live queue instance");
-    for (auto &old : queues) if (old.path == data.path)
-      return reject("CPU outgoing allocations cannot share one queue instance");
-    auto queue = data.queue;
+    Endpoint data;
+    if (fromHost) {
+      if (count.queue) data = trace(arg(count.queue, 2), count.path, port.getValue(), "bits");
+    } else data = trace(arg(transport, localIndex + 2), transportPath, port.getValue(), "bits");
+    bool sameData = fromHost ? data.queue == incoming && data.port == localIndex + 2 &&
+        data.path == uniquePath(incoming) : data.port == 3 && data.path == count.path;
+    if (!data.queue || !count.queue || !data.namedPort || count.port != 4 || !sameData)
+      return reject("CPU stream count and transport must forward the same live queue instance");
+    for (auto &old : queues) if (old.path == count.path)
+      return reject("CPU stream allocations cannot share one queue instance");
+    auto queue = count.queue;
     unsigned countBits = llvm::Log2_64_Ceil(uint64_t(depth.getInt()) + 1);
     if (queue.getPortType(0) != ClockType::get(circuit.getContext()) || queue.getPortType(1) != uint(1) ||
         fieldType(queue.getPortType(2), "bits") != uint(512) || fieldType(queue.getPortType(3), "bits") != uint(512) ||
         queue.getPortType(4) != uint(countBits) || bank.getPortType(i + 2) != uint(countBits) ||
-        bank.getPortName(i + 2) != (n == 1 ? "count" : "count_" + std::to_string(i)))
+        bank.getPortName(i + 2) != (total == 1 ? "count" : "count_" + std::to_string(i)))
       return reject("CPU stream descriptor width differs from native queue/count ports");
     for (unsigned p = 0; p < 5; ++p)
       if (queue.getPortDirection(p) != (p < 3 ? Direction::In : Direction::Out))
@@ -387,11 +410,18 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     if (legacy) {
       if (legacy.getAs<StringAttr>("name") != name)
         return reject("CPU queue identity differs from transport allocation");
-      for (StringRef key : {"index", "depth", "widthBytes"}) {
+      for (StringRef key : {"depth", "widthBytes"}) {
         auto actual = legacy.getAs<IntegerAttr>(key);
         if (!actual || actual.getInt() != source.getAs<IntegerAttr>(key).getInt())
           return reject("CPU queue identity differs from transport allocation");
       }
+    }
+    // Queue creation precedes the shared stream catalog. Its legacy index is
+    // local to that creator (TracerV starts at zero even when NIC is first).
+    // Driver order comes from the transport allocation and live DMA selector.
+    if (legacy && legacy.get("index")) {
+      auto local = legacy.getAs<IntegerAttr>("index");
+      if (!local || local.getInt() < 0) return reject("malformed legacy queue index");
     }
     unsigned memories = 0;
     for (auto mem : queue.getOps<MemOp>()) {
@@ -401,46 +431,95 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
       ++memories;
     }
     if (memories != 1) return reject("CPU stream needs one native queue memory");
-    unsigned grants = 0; Value grant;
-    for (auto eq : transport.getOps<EQPrimOp>()) {
-      auto bits = eq.getLhs().getDefiningOp<BitsPrimOp>();
-      if (!bits || bits.getInput() != arg(transport, addressPort)) continue;
-      auto selector = eq.getRhs().getDefiningOp<ConstantOp>();
-      if (bits.getHi() != 63 || bits.getLo() != space.getInt() || !selector || selector.getValue().getLimitedValue() >= n)
-        return reject("CPU stream DMA address grant differs from ordered windows");
-      if (selector.getValue().getLimitedValue() == i) { ++grants; grant = eq.getResult(); }
-    }
-    if (grants != 1) return reject("CPU stream needs one DMA address grant per allocation");
-    // Check that this selector actually controls this queue's dequeue handshake.
-    // An unused equality or swapped selector cannot authorize its descriptor.
-    unsigned readyDrivers = 0;
-    for (auto c : transport.getOps<StrictConnectOp>()) {
-      auto field = c.getDest().getDefiningOp<SubfieldOp>();
-      if (!field || field.getFieldName() != "ready" || field.getInput() != arg(transport, i + 2)) continue;
-      auto outer = c.getSrc().getDefiningOp<AndPrimOp>();
-      auto inner = outer ? outer.getRhs().getDefiningOp<AndPrimOp>() : AndPrimOp();
-      if (!outer || outer.getLhs() != grant || !inner || inner.getLhs() != arg(transport, n + 3) ||
-          inner.getRhs() != arg(transport, n + 8))
-        return reject("CPU stream dequeue handshake differs from its DMA selector");
-      ++readyDrivers;
-    }
-    if (readyDrivers != 1) return reject("CPU stream dequeue ready has missing or ambiguous drivers");
-    unsigned payloads = 0;
-    auto isPayload = [&](Value value) {
-      auto field = value.getDefiningOp<SubfieldOp>();
-      return field && field.getFieldName() == "bits" && field.getInput() == arg(transport, i + 2);
-    };
-    for (auto c : transport.getOps<StrictConnectOp>()) if (c.getDest() == arg(transport, n + 11)) {
-      if (n == 1) { if (isPayload(c.getSrc())) ++payloads; }
-      else {
-        Value value = c.getSrc();
-        while (auto mux = value.getDefiningOp<MuxPrimOp>()) {
-          if (mux.getSel() == grant && isPayload(mux.getHigh())) ++payloads;
-          value = mux.getLow();
+    if (fromHost) {
+      // The instance catalog identifies the bridge-facing queue, while SSA
+      // tracing above proves its count and payload refer to the same storage.
+      auto instanceInfo = count.path.back()->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
+      if (!instanceInfo || instanceInfo.getAs<StringAttr>("name") != name ||
+          instanceInfo.getAs<StringAttr>("direction") != "fromHostCPU" ||
+          instanceInfo.getAs<IntegerAttr>("depth") != depth || instanceInfo.getAs<IntegerAttr>("widthBytes") != bytes)
+        return reject("CPU incoming queue identity differs from write allocation");
+      auto valid = trace(arg(queue, 2), count.path, port.getValue(), "valid");
+      if (valid.queue != incoming || valid.path != data.path || valid.port != data.port || !valid.namedPort)
+        return reject("CPU incoming queue valid differs from its write transport");
+      unsigned axi = incomingCount + 2;
+      for (auto [offset, width] : {std::make_pair(3U,64U), {8U,512U}})
+        if (incoming.getPortType(axi + offset) != uint(width) ||
+            incoming.getPortDirection(axi + offset) != Direction::In)
+          return reject("CPU incoming AXI address or payload type differs");
+      Value grant; unsigned grants = 0;
+      for (auto eq : incoming.getOps<EQPrimOp>()) {
+        auto bits = eq.getLhs().getDefiningOp<BitsPrimOp>();
+        if (!bits || bits.getInput() != arg(incoming, axi + 3)) continue;
+        auto selector = eq.getRhs().getDefiningOp<ConstantOp>();
+        if (bits.getHi() != 63 || bits.getLo() != windowBits || !selector ||
+            selector.getValue().getLimitedValue() >= incomingCount)
+          return reject("CPU incoming DMA address grant differs from ordered windows");
+        if (selector.getValue().getLimitedValue() == localIndex) { grant = eq; ++grants; }
+      }
+      if (grants != 1) return reject("CPU incoming allocation needs one DMA selector");
+      unsigned payloads = 0, valids = 0;
+      for (auto connect : incoming.getOps<StrictConnectOp>()) {
+        auto field = connect.getDest().getDefiningOp<SubfieldOp>();
+        if (!field || field.getInput() != arg(incoming, localIndex + 2)) continue;
+        if (field.getFieldName() == "bits") {
+          if (connect.getSrc() != arg(incoming, axi + 8))
+            return reject("CPU incoming payload differs from W data");
+          ++payloads;
+        }
+        if (field.getFieldName() == "valid") {
+          auto outer = connect.getSrc().getDefiningOp<AndPrimOp>();
+          auto middle = outer ? outer.getRhs().getDefiningOp<AndPrimOp>() : AndPrimOp();
+          auto inner = middle ? middle.getRhs().getDefiningOp<AndPrimOp>() : AndPrimOp();
+          if (!outer || outer.getLhs() != grant || !middle || middle.getLhs() != arg(incoming, axi + 1) ||
+              !inner || inner.getLhs() != arg(incoming, axi + 7) || inner.getRhs() != arg(incoming, axi + 10))
+            return reject("CPU incoming enqueue differs from grant-qualified AW/W/B handshake");
+          ++valids;
         }
       }
+      if (payloads != 1 || valids != 1) return reject("CPU incoming stream has ambiguous payload or valid drivers");
+    } else {
+      unsigned grants = 0; Value grant;
+      for (auto eq : transport.getOps<EQPrimOp>()) {
+        auto bits = eq.getLhs().getDefiningOp<BitsPrimOp>();
+        if (!bits || bits.getInput() != arg(transport, addressPort)) continue;
+        auto selector = eq.getRhs().getDefiningOp<ConstantOp>();
+        if (bits.getHi() != 63 || bits.getLo() != space.getInt() || !selector || selector.getValue().getLimitedValue() >= n)
+          return reject("CPU stream DMA address grant differs from ordered windows");
+        if (selector.getValue().getLimitedValue() == i) { ++grants; grant = eq.getResult(); }
+      }
+      if (grants != 1) return reject("CPU stream needs one DMA address grant per allocation");
+      // Check that this selector actually controls this queue's dequeue handshake.
+      // An unused equality or swapped selector cannot authorize its descriptor.
+      unsigned readyDrivers = 0;
+      for (auto c : transport.getOps<StrictConnectOp>()) {
+        auto field = c.getDest().getDefiningOp<SubfieldOp>();
+        if (!field || field.getFieldName() != "ready" || field.getInput() != arg(transport, i + 2)) continue;
+        auto outer = c.getSrc().getDefiningOp<AndPrimOp>();
+        auto inner = outer ? outer.getRhs().getDefiningOp<AndPrimOp>() : AndPrimOp();
+        if (!outer || outer.getLhs() != grant || !inner || inner.getLhs() != arg(transport, n + 3) ||
+            inner.getRhs() != arg(transport, n + 8))
+          return reject("CPU stream dequeue handshake differs from its DMA selector");
+        ++readyDrivers;
+      }
+      if (readyDrivers != 1) return reject("CPU stream dequeue ready has missing or ambiguous drivers");
+      unsigned payloads = 0;
+      auto isPayload = [&](Value value) {
+        auto field = value.getDefiningOp<SubfieldOp>();
+        return field && field.getFieldName() == "bits" && field.getInput() == arg(transport, i + 2);
+      };
+      for (auto c : transport.getOps<StrictConnectOp>()) if (c.getDest() == arg(transport, n + 11)) {
+        if (n == 1) { if (isPayload(c.getSrc())) ++payloads; }
+        else {
+          Value value = c.getSrc();
+          while (auto mux = value.getDefiningOp<MuxPrimOp>()) {
+            if (mux.getSel() == grant && isPayload(mux.getHigh())) ++payloads;
+            value = mux.getLow();
+          }
+        }
+      }
+      if (payloads != 1) return reject("CPU stream read payload differs from its DMA selector");
     }
-    if (payloads != 1) return reject("CPU stream read payload differs from its DMA selector");
     auto word = dyn_cast<DictionaryAttr>(registers[i]);
     auto offset = word ? word.getAs<IntegerAttr>("offset") : IntegerAttr();
     auto readable = word ? word.getAs<BoolAttr>("readable") : BoolAttr();
@@ -472,18 +551,20 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
     }
     if (readsCount != 1 || valids != 1 || readies != 1 || assertions != 1)
       return reject("CPU stream count has missing or ambiguous MMIO drivers");
-    queues.push_back(data); allocations.push_back(source);
+    queues.push_back(count); allocations.push_back(source);
   }
   if (llvm::Log2_64_Ceil(64 * maxDepth) != unsigned(space.getInt()))
     return reject("CPU stream DMA window differs from maximum outgoing capacity");
+  if (incomingCount && llvm::Log2_64_Ceil(64 * maxIncomingDepth) != unsigned(sinkSpace.getInt()))
+    return reject("CPU incoming DMA window differs from maximum incoming capacity");
   for (auto &endpoint : queues) {
     unsigned allocated = llvm::count_if(queues, [&](const auto &q) { return q.queue == endpoint.queue; });
     auto *node = graph.lookup(endpoint.queue.getNameAttr());
     if (countPaths(node, allocated + 1) != allocated)
-      return reject("CPU queue has live instances outside the outgoing allocation");
+      return reject("CPU queue has live instances outside the CPU stream allocation");
   }
   // Empty incoming vectors are meaningful ABI state; check the actual transport.
-  if (needsIncoming) for (StringRef port : {"aw_ready", "w_ready", "b_valid"}) {
+  if (needsIncoming && !incomingCount) for (StringRef port : {"aw_ready", "w_ready", "b_valid"}) {
     std::optional<unsigned> n;
     for (auto [i, p] : llvm::enumerate(incoming.getPorts())) if (p.name == port) n = i;
     if (!n || incoming.getPortType(*n) != uint(1) || incoming.getPortDirection(*n) != Direction::Out)
@@ -500,20 +581,28 @@ LogicalResult goldengate::prepareCPUManagedStreamHeader(
   out << "\n#ifdef GET_INCLUDES\n#include \"bridges/cpu_managed_stream.h\"\n#endif // GET_INCLUDES\n"
          "#ifdef GET_MANAGED_STREAM_CONSTRUCTOR\nregistry.add_widget(new CPUManagedStreamWidget(\n"
          "  simif,\n  " << widgetIndex << ",\n  args,\n"
-         "  std::vector<CPUManagedStreams::StreamParameters>{},\n"
-         "  std::vector<CPUManagedStreams::StreamParameters>{\n";
-  for (auto [i, source] : llvm::enumerate(allocations)) {
-    out << "    CPUManagedStreams::StreamParameters(std::string(\"";
-    for (unsigned char ch : source.getAs<StringAttr>("name").getValue()) {
-      if (ch == '"' || ch == '\\') out << '\\' << char(ch);
-      else if (ch >= 32 && ch < 127) out << char(ch);
-      else out << '\\' << char('0' + ((ch >> 6) & 7)) << char('0' + ((ch >> 3) & 7)) << char('0' + (ch & 7));
+         "  std::vector<CPUManagedStreams::StreamParameters>{";
+  auto emit = [&](unsigned begin, unsigned end) {
+    if (begin == end) { out << "}"; return; }
+    out << '\n';
+    for (unsigned i = begin; i < end; ++i) {
+      auto source = allocations[i];
+      out << "    CPUManagedStreams::StreamParameters(std::string(\"";
+      for (unsigned char ch : source.getAs<StringAttr>("name").getValue()) {
+        if (ch == '"' || ch == '\\') out << '\\' << char(ch);
+        else if (ch >= 32 && ch < 127) out << char(ch);
+        else out << '\\' << char('0' + ((ch >> 6) & 7)) << char('0' + ((ch >> 3) & 7)) << char('0' + (ch & 7));
+      }
+      out << "\"), " << source.getAs<IntegerAttr>("bufferBaseAddress").getInt() << "ULL, "
+          << start.getInt() + 4 * i << "ULL, " << source.getAs<IntegerAttr>("depth").getInt()
+          << "U, " << source.getAs<IntegerAttr>("widthBytes").getInt() << "U)" << (i + 1 == end ? "\n" : ",\n");
     }
-    out << "\"), " << source.getAs<IntegerAttr>("bufferBaseAddress").getInt() << "ULL, "
-        << start.getInt() + 4 * i << "ULL, " << source.getAs<IntegerAttr>("depth").getInt()
-        << "U, " << source.getAs<IntegerAttr>("widthBytes").getInt() << "U)" << (i + 1 == n ? "\n" : ",\n");
-  }
-  out << "  }\n));\n#endif // GET_MANAGED_STREAM_CONSTRUCTOR\n";
+    out << "  }";
+  };
+  emit(n, total);
+  out << ",\n  std::vector<CPUManagedStreams::StreamParameters>{";
+  emit(0, n);
+  out << "\n));\n#endif // GET_MANAGED_STREAM_CONSTRUCTOR\n";
   out.flush(); OpBuilder b(circuit.getContext()); NamedAttrList updated(output);
   updated.set("body", b.getStringAttr(previous.getValue().str() + snippet));
   updated.set("goldengate.cpuManagedStreamHeader", b.getBoolAttr(true));

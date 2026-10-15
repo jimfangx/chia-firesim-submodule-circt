@@ -5,7 +5,7 @@
 #include <string>
 namespace goldengate {
 enum class CPUStreamHeaderBoundary { Complete, SelectedOutgoing };
-// Complete validates the empty incoming AXI engine as well as outgoing queues.
+// Complete validates incoming/outgoing queue allocations, payloads and count MMIO.
 // SelectedOutgoing validates the completed selected control master, whose CPU
 // write transport has not yet been assembled; it must have no incoming engine
 // or write ports. This emits allocation collateral for that partial boundary.
