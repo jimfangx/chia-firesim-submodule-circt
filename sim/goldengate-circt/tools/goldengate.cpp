@@ -4766,10 +4766,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, cpuPlatformAnnotations, error)))
         return fail("CPU stream platform annotations: " + error);
       llvm::outs() << "Assembled CIRCT CPU-managed AXI4 slave in " << cpuPlatformPath << '\n';
-      // The NIC CPU slave is composed; its FPGA shell and collateral still
-      // need comparison before this target can enter simulator RTL emission.
-      if (!cpuSinks.empty())
-        return fail("NIC FPGA top shell integration is not implemented");
       if (failed(goldengate::assembleFPGATopShell(circuit, error)))
         return fail("FPGA top shell: " + error);
       if (failed(mlir::verify(*module))) return fail("FPGA top shell produced invalid FIRRTL IR");
@@ -4783,6 +4779,11 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fpgaTopAnnotations, error)))
         return fail("FPGA top shell annotations: " + error);
       llvm::outs() << "Assembled CIRCT FPGATop clock/reset and three AXI4 interfaces in " << fpgaTopPath << '\n';
+      // The incoming NIC stream uses the same U250 shell ABI. Keep its
+      // verified shell/annotation boundary available for comparison while
+      // F1 shim and driver/header integration remain an explicit next step.
+      if (!cpuSinks.empty())
+        return fail("NIC F1 shim and header integration is not implemented");
       if (failed(goldengate::assembleF1Shim(circuit, error)))
         return fail("U250 F1 shim: " + error);
       if (failed(mlir::verify(*module))) return fail("U250 F1 shim produced invalid FIRRTL IR");

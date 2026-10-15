@@ -67,6 +67,12 @@ void check(CircuitOp c,unsigned oldCount,StringRef boundary="GGCPUStreamPlatform
     ++instances;
   }
   require(instances==1,"shell must contain exactly one retained child");
+  unsigned operations=0;
+  for(auto &op:*m.getBodyBlock()) {
+    require(isa<InstanceOp,ConnectOp>(op),"shell must contain only its instance and five identity connections");
+    ++operations;
+  }
+  require(operations==6,"shell must contain only its instance and five identity connections");
   require(m.getOps<RegOp>().empty()&&m.getOps<RegResetOp>().empty()&&m.getOps<MemOp>().empty()&&m.getOps<SubfieldOp>().empty(),"shell adds no state or field adaptation");
   std::map<std::string,std::string> got;
   for(auto conn:m.getOps<ConnectOp>())require(got.emplace(path(m,conn.getDest()),path(m,conn.getSrc())).second,"duplicate shell driver");
@@ -82,13 +88,14 @@ void check(CircuitOp c,unsigned oldCount,StringRef boundary="GGCPUStreamPlatform
   auto ann=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(ann.size()==oldCount+1,"annotation count");
   auto src=cast<DictionaryAttr>(ann[ann.size()-1]);
   require(src.getAs<StringAttr>("class").getValue()==goldengate::AnnotationClasses::HostClockSource&&src.getAs<StringAttr>("target").getValue()=="~FPGATop|FPGATop>clock","host clock source contract");
-  unsigned clock=0,reset=0;
+  unsigned clock=0,reset=0,sources=0;
   for(auto a:ann) {
     auto d=cast<DictionaryAttr>(a);auto cls=d.getAs<StringAttr>("class").getValue();
     if(cls==goldengate::AnnotationClasses::HostClock){require(d.getAs<StringAttr>("target").getValue()=="~FPGATop|FPGATop>clock","clock transfer");++clock;}
     if(cls==goldengate::AnnotationClasses::HostReset){require(d.getAs<StringAttr>("target").getValue()=="~FPGATop|FPGATop>reset","reset transfer");++reset;}
+    if(cls==goldengate::AnnotationClasses::HostClockSource)++sources;
   }
-  require(clock==1&&reset==1,"unique FAME host identities");
+  require(clock==1&&reset==1&&sources==1,"unique FAME host identities and clock source");
 }
 void apply(CircuitOp c,bool print=false) {
   auto count=c->getAttrOfType<ArrayAttr>("rawAnnotations").size();std::string error;
@@ -112,6 +119,19 @@ void writeStub(CircuitOp c,StringRef name) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    // Inspect the actual production boundary without applying the pass again
+    // or synthesizing FAME identities. Exact aggregate SSA identities prove
+    // all payload/handshake bits forward independently of their values.
+    if(argc>=3&&StringRef(argv[1])=="--platform-boundary") {
+      auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"production shell parse");
+      require(succeeded(verify(*real)),"invalid production shell IR");
+      auto rc=*real->getOps<CircuitOp>().begin();
+      auto raw=rc->getAttrOfType<ArrayAttr>("rawAnnotations");require(raw&&raw.size(),"missing annotation archive");
+      check(rc,raw.size()-1);
+      if(argc==4)writeStub(rc,argv[3]);
+      llvm::outs()<<"Production shell: five unconditional aggregate identities, no added state/clock logic, unique host clock/reset/source\n";
+      return 0;
+    }
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();apply(c);
     auto ann=c->getAttrOfType<ArrayAttr>("rawAnnotations");
     require(cast<DictionaryAttr>(ann[2]).getAs<StringAttr>("target").getValue()=="~FPGATop|FPGATop>ctrl.aw.bits.addr","aggregate reference transfer");
