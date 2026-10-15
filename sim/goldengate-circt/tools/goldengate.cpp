@@ -4555,10 +4555,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsAnnotations, error)))
         return fail("FASED outstanding occupancy histograms annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED target-clock occupancy histograms and read-only MMIO in " << fasedHistogramsPath << '\n';
-      // Histogram observations use the existing pre-edge read/AW occupancies.
-      // NIC control responses and platform integration need separate parity.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED control responses and platform integration are not implemented");
+      // The same six decoded register fragments implement the recorded NIC
+      // and no-NIC FASED profile. Assemble their lanes before control transport.
       if (failed(goldengate::addFASEDMMIOBank(circuit, error)))
         return fail("FASED MMIO bank: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED MMIO bank produced invalid FIRRTL IR");
@@ -4572,6 +4570,9 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedMMIOAnnotations, error)))
         return fail("FASED MMIO bank annotations: " + error);
       llvm::outs() << "Assembled CIRCT FASED 21-word MMIO bank in " << fasedMMIOPath << '\n';
+      // NIC control responses and platform integration need separate parity.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED control responses and platform integration are not implemented");
       if (failed(goldengate::mapFASEDBridgeControl(circuit, 25, 12, error)))
         return fail("FASED MCRFile control: " + error);
       goldengate::ControlMMIOWidget mappedFASED;

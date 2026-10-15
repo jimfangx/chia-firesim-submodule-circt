@@ -4224,3 +4224,103 @@ bare-metal smoke, 90,141 portable Spike checks and 90,805 UART-bearing Rocket
 checks; those precede this change. No manager verification step was started
 here; iteration 213 manager validation remains pending. The overall port
 remains incomplete.
+
+### Iteration 214: NIC FASED aggregate MMIO lanes
+
+The actual NIC compiler path now calls `addFASEDMMIOBank` after the six FASED
+register fragments. It emits and verifies `post-fame-fased-mmio.mlir` and
+`post-fame-fased-mmio-all.json` before the explicit control-response/platform
+rejection. This is an executable FIRRTL wrapper containing the 21 ordered
+read/write token lanes and six write-strobe connections. The no-NIC path uses
+the same existing pass. No Scala oracle or immutable fixture was modified.
+`MidasTransforms.scala`, `FAMETransform.scala`, `Widget.attachIO/attach`, and
+`FASEDMemoryTimingModel.attachIO/attach` were inspected for pass ordering,
+host/target scheduling and the actual register-allocation semantics.
+
+Changed files: `tools/goldengate.cpp`,
+`test/Transforms/FASEDMMIOBankTest.cpp`,
+`test/Transforms/NICFASEDMMIOBankCompare.py`, and this ledger. The native test
+can verify the complete production boundary and clone its actual routing
+operations into an isolated probe, replacing only the inner simulation's six
+fragment ports with independent inputs. It preserves FIRRTL bundle flips and
+introduces no substitute register-bank implementation or control decoder.
+
+The exact NIC SFC artifacts compared are
+`/scratch/jfx/fsim-circt/automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+(SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`)
+and adjacent `FireSim-generated.const.h`
+(`ea7517e1fed9d0062601d89b9d8d51a3af4639dd5be6dd9cc8a05d91a9bc1563`).
+All 21 word names, read bindings, five writable words, read-only diagnostics,
+two optimized zero histogram lanes and driver addresses agree with SFC
+`FASEDMemoryTimingModel`/`MCRFile_5`: offsets 0–80, base 128, size 128, slave 1.
+Both response-error readbacks use the oracle's two-bit zero extension.
+The no-NIC archive's corresponding SV/header hashes are
+`2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702` and
+`34a3d08b9cf8b179eb0f951e23e187c37d30ff1ea084aa76058e704f5737a308`;
+the same checks pass there. The immutable U250 build-tree reference's
+`design/FireSim-generated.sv` at
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+(`20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`)
+also passes the RTL map/permission checks. That build tree contains no header;
+its address check explicitly uses the separately archived no-NIC SFC header.
+
+The native build and MMIO CTest passed: legacy/selected profiles, three lane
+orders each, 59 annotation targets and 188 atomic rejection cases. Fresh NIC
+and no-NIC production probes each passed 11,058 isolated Verilator samples:
+all-zero/all-one inputs, walking-one/walking-zero over 1,432 independent input
+bits, then 8,192 randomized samples. Every data bit, valid/ready direction and
+all six four-bit strobe routes are checked independently. A valid FIRRTL
+mutation swapping aggregate lanes zero/one in both read and write vectors
+lowers successfully and fails at sample 2, word 0 in each probe. This is a
+combinational carrier check; register updates, Nasti control transport and
+NIC runtime are outside this test's scope.
+
+The NIC assembly preserves 201 prior module bodies, 190 copied typed ports,
+238 connections and 1,792 recursively transferred annotation records. The
+no-NIC assembly preserves 187 prior modules, 185 copied ports, 233 connections
+and 1,676 annotation records. Each wrapper introduces exactly 48 aggregate
+routes, no state, and exactly the expected global register metadata.
+
+Evidence directory:
+`/scratch/jfx/fsim-circt/sims/firesim/sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration214-u250-target-matrix`.
+`nic-mmio-probe/comparison.json`, `no-nic-mmio-probe/comparison.json`, and
+`immutable-fased-mmio-comparison.json` retain structured map/permission,
+allocation, routing and annotation checks. Each probe directory retains its
+actual cloned/lowered circuit, testbench, normal execution and failing mutation
+logs. Preliminary checks on iteration 213's no-NIC boundary are retained in
+`previous-no-nic-probe` and `mutation-probe`; the fresh probes are the current
+iteration's execution evidence. `build.log` and `ctest.log` record native checks.
+
+The next smallest porting step is NIC FASED MCRFile control responses and
+binding, comparing decoded index behavior, backpressure, IDs, burst/last and
+reset semantics against SFC `MCRFile_5`. NIC runtime/platform integration,
+generalized profiles, partition/QSFP behavior and the SFC UART-bearing baseline
+remain pending. Harness iteration 213 passed actual CIRCT replacertl, fresh
+bare-metal smoke, 90,141 portable Spike checks and 90,805 UART-bearing Rocket
+checks; those precede this change. No manager verification step was started
+here; iteration 214 manager validation remains pending. The overall port is
+incomplete.
+
+The fresh thirteen-recipe replay used compiler SHA256
+`b721e63918af7aa36081a865b5f512ff94850d8568086f45b460fdd28700e204` and
+manifest SHA256
+`0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+All archived input hashes and effective platform configurations match iteration
+213. Results remain one compiled, six failed and six unsupported platforms;
+annotation comparisons remain eight matched, six SRAM model-port mismatches
+and twelve not reached. Complete per-recipe stderr logs were inspected. All
+failure messages and boundary comparison checks are unchanged. NIC reaches its
+two new MMIO artifacts before its existing rejection; rejected targets remain
+implementation gaps. The standalone matrix's exit 1 reflects those gaps.
+
+`artifact-regression.log` records a passing complete regression. All 222 shared
+NIC and 256 shared no-NIC MLIR/JSON files match iteration 213 after normalizing
+only the candidate-directory annotation. NIC adds precisely its two MMIO
+boundary files. No-NIC final RTL, both headers and both XDC files remain
+byte-identical; SV SHA256
+`866b0e02cc633b969f0945f987b5577ecd6bb578301cb7a1e6aba6eb056a60da`.
+Primary immutable handoff FIRRTL/annotation hashes and normalized U250 XDC
+also match. `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json`,
+`matrix-regression.json`, `tool-input-hashes.json` and `native-test.log` retain
+these checks. Existing user edits remain outside this checkpoint.

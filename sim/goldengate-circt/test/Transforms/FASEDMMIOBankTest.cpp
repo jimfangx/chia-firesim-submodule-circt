@@ -3,6 +3,7 @@
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
@@ -188,7 +189,53 @@ void rejection(MLIRContext &ctx,bool selected) {
   }
 }
 }
-int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+// Isolate the actual production routing operations, preserving bundle flips.
+// Replace only the inner simulation's six fragment ports with probe inputs;
+// no register-bank state or MMIO transport is reconstructed by this exporter.
+void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
+  auto root=parseSourceFile<ModuleOp>(input,&ctx);
+  require(bool(root)&&succeeded(verify(*root)),"invalid production MMIO boundary");
+  auto c=*root->getOps<CircuitOp>().begin();
+  require(c.getName()=="GGFASEDMMIOWrapper","wrong production MMIO root");
+  auto top=named(c,c.getName()),inner=named(c,"GGFASEDHistogramsWrapper");
+  InstanceOp sim;
+  for(auto i:top.getOps<InstanceOp>()) {require(!sim,"unexpected second MMIO instance");sim=i;}
+  require(sim&&sim.getModuleName()==inner.getName(),"wrong production MMIO instance");
+  SmallVector<PortInfo> ports;SmallVector<Value> sources;OpBuilder b(&ctx);
+  for(auto name:fragments) {
+    bool found=false;
+    for(auto [i,p]:llvm::enumerate(inner.getPorts()))if(p.name==name) {
+      require(p.direction==Direction::Out,"wrong fragment direction");
+      ports.push_back({p.name,p.type,Direction::In});sources.push_back(sim.getResult(i));found=true;
+    }
+    require(found,"missing fragment");
+  }
+  for(auto [i,p]:llvm::enumerate(top.getPorts()))if(p.name=="fasedBridge_mcr") {
+    require(p.direction==Direction::Out,"wrong aggregate direction");
+    ports.push_back(p);sources.push_back(top.getArgument(i));
+  }
+  require(ports.size()==7,"missing aggregate");
+  auto isolated=ModuleOp::create(c.getLoc());b.setInsertionPointToEnd(isolated.getBody());
+  auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGFASEDMMIOProbe"));
+  b.setInsertionPointToEnd(exported.getBodyBlock());
+  auto probe=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDMMIOProbe"),top.getConventionAttr(),ports);
+  probe.setPublic();b.setInsertionPointToEnd(probe.getBodyBlock());IRMapping map;
+  for(unsigned i=0;i<7;++i)map.map(sources[i],probe.getArgument(i));
+  unsigned connections=0;
+  for(auto &op:*top.getBodyBlock()) {
+    if(isa<InstanceOp>(op))continue;
+    require(isa<SubfieldOp,SubindexOp,ConnectOp,StrictConnectOp>(op),"unexpected MMIO operation");
+    if(!llvm::all_of(op.getOperands(),[&](Value v){return map.contains(v);}))continue;
+    b.clone(op,map);connections+=isa<ConnectOp,StrictConnectOp>(op);
+  }
+  require(connections==48&&succeeded(verify(isolated)),"invalid production MMIO probe routing");
+  std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot export MMIO probe");
+  isolated.print(out);out<<'\n';out.close();isolated.erase();
+  llvm::outs()<<"Cloned 48 production fragment/aggregate routes with original bundle flips\n";
+}
+int main(int argc,char **argv){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  require(argc==1||argc==3,"usage: goldengate-fased-mmio-bank-test [boundary.mlir probe.mlir]");
+  if(argc==3){exportProduction(ctx,argv[1],argv[2]);return 0;}
   for(bool selected:{false,true}) {for(unsigned order=0;order<3;++order)mapping(ctx,order,selected);rejection(ctx,selected);}
   llvm::outs()<<"FASED MMIO bank: legacy/selected profiles, three lane orders each, 21 lanes, six strobe routes, 59 annotation targets and 188 atomic rejections passed\n";return 0;
 }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}}
