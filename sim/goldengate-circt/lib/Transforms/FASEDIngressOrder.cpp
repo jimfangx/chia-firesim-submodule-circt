@@ -1,19 +1,19 @@
 // See LICENSE for license details.
 // Oracle: IngressUnit.scala xaction_order, Util.scala DualQueue, SFC Queue_10.
 // Requires active uninstantiated credit wrapper, qualified queue reset,
-// accepted AR pulse, completed-write status and recorded maxFlight=10 profile.
+// accepted AR pulse, completed-write status and positive constructor maxFlight.
 // Preserves all ports/annotations; adds transaction-order dequeue and enqueue
 // readiness. Read=true and write=false, read precedes write on dual enqueue.
 // Host issue policy will consume the dequeue. Enqueue readiness is observable
 // but does not gate already accepted requests, matching the Scala ingress.
-// Two 10-entry asynchronous one-bit RAM banks; reset flushes pointers only.
+// Two min(16,maxFlight)-entry asynchronous one-bit RAM banks; reset flushes pointers only.
 #include "goldengate/FASEDIngressOrder.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDIngressOrder(CircuitOp circuit,std::string &error) {
-  constexpr llvm::StringLiteral helperName="GGFASEDIngressOrder20";
   const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressCreditsWrapper";
   const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressOrderWrapper"
                                              : "GGFASEDIngressOrderWrapper";
@@ -22,7 +22,7 @@ LogicalResult goldengate::addFASEDIngressOrder(CircuitOp circuit,std::string &er
     return reject("FASED ingress order needs the active credit wrapper");
   FModuleOp inner,engine;
   for(auto m:circuit.getOps<FModuleLike>()){
-    if(m.getModuleName()==helperName||m.getModuleName()==wrapperName)
+    if(m.getModuleName()==wrapperName)
       return reject("FASED ingress order helper or wrapper already exists");
     if(m.getModuleName()==circuit.getName())inner=dyn_cast<FModuleOp>(m.getOperation());
     if(m.getModuleName()=="GGFASEDTokenEngine")engine=dyn_cast<FModuleOp>(m.getOperation());
@@ -32,11 +32,21 @@ LogicalResult goldengate::addFASEDIngressOrder(CircuitOp circuit,std::string &er
   auto key=engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
   auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
   auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
-  if(!flight||flight.getInt()!=10)return reject("FASED ingress order supports recorded maxFlight=10 profile");
+  if(!flight || flight.getValue().getBitWidth()>64 || flight.getInt()<=0)
+    return reject("FASED ingress order needs a positive 64-bit maxFlight constructor");
+  // WithDefaultMemModel supplies sixteen slots each for reads and writes;
+  // FASEDMemoryTimingModelConfig narrows both by the AXI edge. DualQueue splits
+  // their sum evenly between banks. Counter status includes the saturation value.
+  const unsigned depth=std::min<uint64_t>(16,flight.getInt());
+  const unsigned pointerWidth=std::max(1u,llvm::Log2_64_Ceil(depth));
+  const unsigned countWidth=llvm::Log2_64_Ceil(depth+1);
+  const std::string helperName="GGFASEDIngressOrder"+std::to_string(2*depth);
+  for(auto m:circuit.getOps<FModuleLike>())if(m.getModuleName()==helperName)
+    return reject("FASED ingress order helper already exists");
   auto *context=circuit.getContext();OpBuilder b(context);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(context,w,false);};auto bit=uint(1);
-  auto status=BundleType::get(context,{{b.getStringAttr("awValue"),false,uint(4)},
-      {b.getStringAttr("wValue"),false,uint(4)},{b.getStringAttr("awEmpty"),false,bit},
+  auto status=BundleType::get(context,{{b.getStringAttr("awValue"),false,uint(countWidth)},
+      {b.getStringAttr("wValue"),false,uint(countWidth)},{b.getStringAttr("awEmpty"),false,bit},
       {b.getStringAttr("wEmpty"),false,bit},{b.getStringAttr("writeReqDone"),false,bit}});
   const llvm::StringRef required[]{"hostClock","fased_ingress_reset","fased_ingress_ar_enq_fire","fased_ingress_credits"};
   const Type types[]{ClockType::get(context),bit,bit,status};unsigned indices[4];
@@ -70,19 +80,19 @@ LogicalResult goldengate::addFASEDIngressOrder(CircuitOp circuit,std::string &er
   Value swap=b.create<XorPrimOp>(loc,enqPointer,neg(arg(2)));
   struct Bank {Value ready,valid,data;};
   auto bank=[&](llvm::StringRef name,Value valid,Value data,Value ready){
-    Value ep=reg(4,(name+"_enq_ptr_value").str()),dp=reg(4,(name+"_deq_ptr_value").str());
+    Value ep=reg(pointerWidth,(name+"_enq_ptr_value").str()),dp=reg(pointerWidth,(name+"_deq_ptr_value").str());
     Value mf=reg(1,(name+"_maybe_full").str());Value equal=b.create<EQPrimOp>(loc,ep,dp);
     Value er=neg(both(equal,mf)),dv=neg(both(equal,neg(mf)));
     Value push=both(er,valid),pop=both(dv,ready);
     auto inc=[&](Value v)->Value{
-      Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,v,constant(4,1)),3,0);
-      return mux(b.create<EQPrimOp>(loc,v,constant(4,9)),constant(4,0),plus);
+      Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,v,constant(pointerWidth,1)),pointerWidth-1,0);
+      return mux(b.create<EQPrimOp>(loc,v,constant(pointerWidth,depth-1)),constant(pointerWidth,0),plus);
     };
     connect(ep,mux(push,inc(ep),ep));connect(dp,mux(pop,inc(dp),dp));
     connect(mf,mux(b.create<XorPrimOp>(loc,push,pop),push,mf));
-    SmallVector<Type> mt{MemOp::getTypeForPort(10,bit,MemOp::PortKind::Read),MemOp::getTypeForPort(10,bit,MemOp::PortKind::Write)};
+    SmallVector<Type> mt{MemOp::getTypeForPort(depth,bit,MemOp::PortKind::Read),MemOp::getTypeForPort(depth,bit,MemOp::PortKind::Write)};
     SmallVector<Attribute> mn{b.getStringAttr("read"),b.getStringAttr("write")};
-    auto ram=b.create<MemOp>(loc,mt,0,1,10,RUWAttr::Undefined,mn,(name+"_ram").str());
+    auto ram=b.create<MemOp>(loc,mt,0,1,depth,RUWAttr::Undefined,mn,(name+"_ram").str());
     auto rd=ram.getResult(0),wr=ram.getResult(1);
     connect(field(rd,"clk"),arg(0));connect(field(rd,"en"),constant(1,1));connect(field(rd,"addr"),dp);
     connect(field(wr,"clk"),arg(0));connect(field(wr,"en"),push);connect(field(wr,"mask"),constant(1,1));

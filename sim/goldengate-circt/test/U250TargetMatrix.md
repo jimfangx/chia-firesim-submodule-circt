@@ -7721,3 +7721,96 @@ are byte-identical. `source-replay-stability.json` confirms all 671 captured
 compiler/build source inputs and the compiler binary stayed unchanged during
 replay; compiler SHA256 is
 `64c04b052beec7acd58c2fca09e28e7734d36c5f847524cb75c3db4bfa8606e7`.
+
+### Iteration 250: derive FASED transaction-order bank capacity
+
+`FASEDIngressOrder.cpp` now derives each transaction-order bank's depth from
+`min(16, axi4Edge.maxFlight)`, following `FASEDMemoryTimingModelConfig`,
+`IngressUnit.xaction_order` and `Util.DualQueue`. The two banks therefore hold
+twenty entries for Rocket and thirty-two for Gemmini and Saturn Rocket.
+Pointer widths, increment truncation and wrap limits follow the derived depth;
+credit-status fields use `ceil(log2(depth + 1))`. Positive integer maxima of
+at most 64 bits are validated before mutation. Custom BaseParams and absent
+optional maxima remain outside the default-constructor specialization.
+
+The pass retains read-before-write routing on dual enqueue, independent bank
+backpressure, alternating dequeue, no empty flow-through/full pipe-through,
+and host-clocked state with qualified reset. Reset flushes selectors/pointers
+and occupancy, while accepted RAM writes still occur during reset. Ordinary
+and selected Print wrappers retain their ports and annotation target mapping.
+`PrintBridgeMMIO.cpp` transfers the helper actually instantiated by the staged
+wrapper, allowing the new thirty-two-entry helper without moving unrelated
+staged helpers. Rocket's existing helper symbol and operations are preserved.
+
+The native compiler and both focused test executables build successfully.
+`goldengate-fased-ingress-order` CTest passes in 54.88 seconds: maxFlight 1, 2,
+3, 8, 10, 16, 20 and INT64_MAX in both wrappers, 330,896 bank-order cycles,
+2,048 wrapper binding cases and 96 atomic malformed/repeated-pass rejections.
+The selected Print integration test also passes with unchanged allocated
+headers/SSA and nine atomic rejection cases. Its invalid-constructor fixture
+now uses zero because eight is a supported capacity.
+
+Evidence is under `iteration250-u250-target-matrix/`. The focused export mode
+clones the actual helper instantiated by each fresh production order wrapper
+from verified `post-fame-fased-ingress-order.mlir`. Firtool lowers that isolated
+helper for standalone Verilator comparison against the actual SFC `DualQueue`
+and its queue-bank module, plus an independent bank-deque reference. The
+immutable October 1 U250 `design/FireSim-generated.sv` and October 13 archived
+Rocket `design/FireSim-generated.sv` each match for 31,917 directed/randomized
+cycles at two ten-entry banks. These are isolated helper comparisons; the
+FireSim manager verification sequence remains owned by the harness.
+
+Gemmini and Saturn Rocket each match their October 13 SFC
+`design/FireSim-generated.sv` at two sixteen-entry banks for 32,817 cycles;
+the four SFC/CIRCT/reference comparisons total 129,468 cycles. The stimulus
+covers full/empty boundaries, simultaneous enqueue/dequeue, partial dual
+acceptance, repeated pointer wraps and enqueue during reset. Exact artifact
+paths, SHA256 values, parent clock/reset/acceptance bindings and results are
+recorded in `order-comparison.json` and each `order-*/comparison.json`.
+The actual SFC RTL, rather than a newly written approximation, supplies the
+hardware oracle. The independent SV reference consumes and checks each
+popped bit; otherwise Verilator eliminates an unused assigned pop result.
+
+The full thirteen-recipe replay finishes with three compiled Rocket recipes,
+four compiler gaps and six unsupported partition/QSFP platforms. Gemmini and
+Saturn Rocket now stop at `FASED ingress issue supports recorded maxFlight=10
+profile`; BOOM and Shuttle retain their TracerV constructor/channel gap.
+Structured comparisons remain eight matches, six existing SRAM-model port
+mismatches and twelve not reached. The matrix exits nonzero; these failures
+and mismatches are not counted as parity.
+
+`matrix-regression.json` confirms the archived inputs, effective platforms,
+compile statuses and structured comparisons agree with iteration 249, with
+exactly the two ingress-order failures advancing to ingress issue. All 779
+prior Rocket MLIR/JSON boundaries match after candidate-path normalization,
+and all six emitted RTL/collateral files per compiled recipe are byte-identical.
+`source-replay-stability.json` confirms 671 captured compiler/build source
+inputs and the native binary stayed unchanged throughout this full replay;
+its compiler SHA256 is
+`44a187567101b2ffbbd7a50f0138d665e8572734ad25d4e888d5f7ff0f9e8a55`.
+
+For replay headroom, 704 iteration-248 MLIR dumps were losslessly gzipped,
+recovering 47,917,869,076 bytes. Each decompressed SHA256 was verified before
+removing its raw duplicate (`lossless-storage-cleanup-248.json`). Iteration-249
+comparison inputs, current production boundaries, logs, JSON, final emissions
+and all immutable fixtures remain available.
+
+The next smallest port is the constructor-derived credit-status contract in
+`FASEDIngressIssue.cpp`: SFC has the same host request gating and accepted
+AW/AR order retirement across these three profiles. Generalize that pass's
+maxFlight validation/status width, preserving reset-independent request
+presentation and AW-over-final-W priority, then check the downstream ingress
+deadlock contract and remaining queue-depth restrictions.
+
+After the full replay, `tools/goldengate.cpp`'s stale "two 10-entry banks"
+message was corrected to "two constructor-sized banks". This was the only
+subsequent compiler source difference, checked by reversing that exact string
+replacement against the captured source hash. The rebuilt final compiler
+(SHA256 `921a44ea88c1aebfe819e05ac65037466e488106d46abb99a1d8a70c9b739b40`)
+replays the same archived Gemmini input to the same expected issue-policy
+failure. All 177 boundary files match the full replay after candidate-path
+normalization; stdout differs only in the corrected message and stderr is
+identical. `diagnostic-replay/result.json` records this check and the final
+671-source stability snapshot. Duplicate diagnostic MLIR dumps are preserved
+as SHA256-verified gzip files. The full matrix results above retain their
+original compiler hash, distinct from this final diagnostic-only rebuild.

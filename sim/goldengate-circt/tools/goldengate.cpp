@@ -4290,7 +4290,7 @@ int main(int argc, char **argv) {
       module->print(fasedOrderOut); fasedOrderOut << '\n'; fasedOrderOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedOrderAnnotations, error)))
         return fail("FASED ingress order annotations: " + error);
-      llvm::outs() << "Queued CIRCT FASED transaction order in two 10-entry banks in " << fasedOrderPath << '\n';
+      llvm::outs() << "Queued CIRCT FASED transaction order in two constructor-sized banks in " << fasedOrderPath << '\n';
       if (failed(goldengate::addFASEDIngressIssue(circuit, error)))
         return fail("FASED ingress issue: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED ingress issue produced invalid FIRRTL IR");

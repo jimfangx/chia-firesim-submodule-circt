@@ -2412,9 +2412,16 @@ LogicalResult goldengate::mapPrintBridgeFASEDIngressOrder(CircuitOp circuit,
     error = "selected Print FASED ingress order produced invalid FIRRTL IR";
     return failure();
   }
+  // The bank capacity determines the helper symbol. Move the helper actually
+  // instantiated by the new wrapper, retaining any pre-existing staged modules.
+  StringRef helperName;
+  for (auto m : staged->getOps<FModuleOp>())
+    if (m.getName() == "GGSelectedPrintFASEDIngressOrderWrapper")
+      for (auto i : m.getOps<InstanceOp>())
+        if (i.getName() == "xactionOrder") helperName = i.getModuleName();
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
-      if (m.getName() == "GGFASEDIngressOrder20" ||
+      if (m.getName() == helperName ||
           m.getName() == "GGSelectedPrintFASEDIngressOrderWrapper")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));
