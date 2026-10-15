@@ -7417,3 +7417,76 @@ nonzero because these gaps and mismatches remain failures.
 `source-replay-stability.json` verifies all 668 tracked source inputs and the
 compiler binary remained unchanged during replay; compiler SHA256 is
 `bd8653aa3225a529498609bd4e9de2a13e77eb5406bac23fecdb30a8934acf0a`.
+
+### Iteration 246: normalize numbered native host wrappers
+
+The previous quad compile exposed sixteen extra assembly levels because
+`normalizeHostHierarchy` recognized `GG*Wrapper` but stopped at repeated
+`GGTracerVBridgeControlWrapper_2`. The native CIRCT inliner now also recognizes
+a nonempty decimal suffix after `Wrapper_`. It retains the existing unique-use,
+`sim` forwarding, explicit XDC reference and native inner-symbol checks, and
+publishes changes atomically. Unrelated suffixes remain hierarchical. The
+Scala `SimulationMapping.scala` linking behavior and the ordering in
+`MidasTransforms.scala` and `FAMETransform.scala` remain the oracle.
+
+The host-hierarchy fixture exercises plain and numbered depth-1/3/98 chains,
+including zero/multiple-digit suffixes, protected identities, assertion naming,
+idempotence and atomic rejection. Five malformed/unrelated suffixes are
+preserved. All three focused CTests pass: `goldengate-host-hierarchy`,
+`goldengate-xdc-emission` and `goldengate-metasim-interface-header`. Standalone
+Verilator execution compares the original numbered 98-wrapper fixture with
+its normalized state path for 4,096 host slots and 3,103 enabled edges; all
+state checks pass. These tests do not invoke FireSim manager metasimulation.
+
+Evidence is under `iteration246-u250-target-matrix/`. Replaying the real quad
+`post-xilinx-host-specialization.mlir` inlines 100 wrappers, sixteen more than
+before. Only the retained `FPGATop` body changes; its ports and the other 1,937
+retained module bodies match the previous emitted RTL after source-comment
+and whitespace normalization. Fatal-warning Verilator lint passes. The exact
+SFC golden is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv`,
+SHA256 `deadc7f5a903ceed20047342e4b81dde7f19cc32be914de6f5b910d3d70771d2`,
+with adjacent implementation and synthesis XDC. Every clock-path instance
+resolves in each emitted RTL to `BUFGCE/O`. Both SFC and candidate now have
+four instance hops from FPGATop, with one `sim`, and identical gate clock and
+enable expressions. Implementation XDC matches after the established
+`target/FireSim_` to `target_FAMETop/FireSim` rename; synthesis XDC matches
+byte-for-byte. See `quad-hierarchy-comparison.json`.
+
+Fresh production output matches the isolated normalized RTL and XDC. The quad
+SFC `design/FireSim-generated.const.h`, SHA256
+`2e902991e63d8784d3f5ed6ccea02040d4904121c2cd22aa403480239d3568d3`,
+matches all fourteen normalized constructors, 136 fixed-layout assertions and
+TargetConfig. The candidate header is byte-identical to iteration 245's
+typechecked header; those C++20 checks were not repeated. Both single-core
+recipes retain all six final generated files byte-for-byte. Their 256 no-NIC
+and 267 NIC boundary files also match, as do 254 quad boundaries; only quad's
+final normalized hierarchy and XDC annotation boundaries change. Reports are
+`production-regression.json` and `immutable-rocket-comparison.json`. The latter
+rechecks the immutable October 1 staging FIRRTL/annotation inputs byte-for-byte
+and both immutable U250 XDC files with the same established hierarchy rename.
+
+To retain matrix headroom, 713 iteration-244 MLIR dumps were losslessly gzipped,
+recovering 47,660,967,396 bytes. Each original SHA256 matches decompression
+before removal; `lossless-storage-cleanup-244.json` records all paths. JSON,
+logs, final outputs, active comparison boundaries and immutable fixtures remain.
+
+The next smallest compiler step is the FASED outstanding-counter specialization
+blocking Gemmini and Saturn Rocket. Their archived constructors use maxFlight
+20, while the native pass requires 10. The Scala oracle caps each read/write
+limit by both BaseParams and the edge maximum: the recorded 16/16 BaseParams
+therefore require limits of 16 and five-bit saturating counters, rather than
+limits of 20. Port those limits and widths with focused handshake/reset tests
+before addressing subsequent exposed gaps. This hierarchy change does not
+establish quad target behavior, Linux boot or FPGA parity; FireSim manager
+verification remains owned by the harness and was not started here.
+
+The complete thirteen-target replay retains three compiled recipes, four
+compiler gaps and six unsupported partition/QSFP platforms. All archived input
+hashes, effective platforms, compile results and structured boundary checks
+match iteration 245: eight matches, six existing SRAM-model port mismatches
+and twelve comparisons not reached. The matrix exits nonzero; these gaps and
+mismatches remain failures. `matrix-regression.json` records the comparison.
+`source-replay-stability.json` verifies that all 668 recorded source inputs and
+the compiler binary stayed unchanged during replay; compiler SHA256 is
+`d5d26284a53a70fdb0b47aa1496dbc91f03e76f56daa4e38794df1c6ef2d0273`.

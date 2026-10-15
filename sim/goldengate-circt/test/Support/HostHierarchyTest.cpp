@@ -21,11 +21,16 @@ void require(bool ok, StringRef reason) {
 std::string dump(Operation *op) {
   std::string text; llvm::raw_string_ostream out(text); op->print(out); return text;
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned depth) {
+std::string stageName(unsigned i, bool numbered) {
+  return "GGStage" + std::to_string(i) + "Wrapper" +
+      (numbered ? "_" + std::to_string(i - 1) : "");
+}
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned depth,
+                            bool numbered = false, StringRef suffix = {}) {
   std::string text = "module { firrtl.circuit \"FPGATop\" {\n";
   auto name = [&](unsigned i) {
     return i == 0 ? std::string("FPGATop") :
-        "GGStage" + std::to_string(i) + "Wrapper";
+        stageName(i, numbered) + suffix.str();
   };
   for (unsigned i = 0; i <= depth; ++i) {
     text += "firrtl.module " + std::string(i ? "private " : "") + "@" + name(i) +
@@ -67,8 +72,9 @@ int main(int argc, char **argv) {
     ctx.loadDialect<FIRRTLDialect, circt::chirrtl::CHIRRTLDialect,
                     circt::hw::HWDialect>();
     std::string error; unsigned count;
+    for (bool numbered : {false, true}) {
     for (unsigned depth : {1u, 3u, 98u}) {
-      auto root = fixture(ctx, depth);
+      auto root = fixture(ctx, depth, numbered);
       auto c = *root->getOps<CircuitOp>().begin();
       FModuleOp target;
       for (auto m : c.getOps<FModuleOp>()) if (m.getName() == "Target") target = m;
@@ -107,7 +113,7 @@ int main(int argc, char **argv) {
     }
     // Preserve explicitly referenced XDC roots, including aggregate/reference
     // metadata: the writer must resolve the retained operation after inlining.
-    auto referenced = fixture(ctx, 4);
+    auto referenced = fixture(ctx, 4, numbered);
     auto rc = *referenced->getOps<CircuitOp>().begin();
     OpBuilder b(&ctx);
     auto raw = rc->getAttrOfType<ArrayAttr>("rawAnnotations");
@@ -116,7 +122,8 @@ int main(int argc, char **argv) {
       b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::InternalXDC)),
       b.getNamedAttr("destinationFile", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::XDCSynthesis))})),
       b.getNamedAttr("formatString", b.getStringAttr("reference:{}")),
-      b.getNamedAttr("argumentList", b.getArrayAttr({b.getStringAttr("~FPGATop|GGStage2Wrapper>in")}))}));
+      b.getNamedAttr("argumentList", b.getArrayAttr({b.getStringAttr(
+          "~FPGATop|" + stageName(2, numbered) + ">in")}))}));
     rc->setAttr("rawAnnotations", b.getArrayAttr(annotations));
     require(succeeded(goldengate::normalizeHostHierarchy(*referenced, "/tmp/host-hierarchy-test.sv", count, error)) && count == 2, "explicit XDC root was inlined");
     require(succeeded(goldengate::prepareXDCOutput(rc, error)), error);
@@ -129,11 +136,11 @@ int main(int argc, char **argv) {
     // Inner symbols are identities in a module's namespace. A host wrapper
     // carrying one is a retained boundary, even without a serialized XDC use.
     for (bool portSymbol : {false, true}) {
-      auto symbolic = fixture(ctx, 4);
+      auto symbolic = fixture(ctx, 4, numbered);
       auto circuit = *symbolic->getOps<CircuitOp>().begin();
       FModuleOp boundary;
       for (auto module : circuit.getOps<FModuleOp>())
-        if (module.getName() == "GGStage2Wrapper") boundary = module;
+        if (module.getName() == stageName(2, numbered)) boundary = module;
       if (portSymbol)
         boundary.setPortSymbol(1, "retained_input");
       else {
@@ -146,7 +153,7 @@ int main(int argc, char **argv) {
           "/tmp/host-hierarchy-test.sv", count, error)), error);
       bool retained = false;
       for (auto module : circuit.getOps<FModuleOp>())
-        if (module.getName() == "GGStage2Wrapper") {
+        if (module.getName() == stageName(2, numbered)) {
           retained = portSymbol ? module.getPortSymbolAttr(1).getSymName() == "retained_input"
               : (*module.getOps<InstanceOp>().begin()).getInnerSymAttr().getSymName() == "retained_instance";
         }
@@ -154,7 +161,7 @@ int main(int argc, char **argv) {
     }
     // Shared construction wrappers are ambiguous: reject rather than clone
     // the helper state into a different number of instances.
-    auto shared = fixture(ctx, 3); auto sc = *shared->getOps<CircuitOp>().begin();
+    auto shared = fixture(ctx, 3, numbered); auto sc = *shared->getOps<CircuitOp>().begin();
     FModuleOp sharedTop;
     for (auto m : sc.getOps<FModuleOp>()) if (m.getName() == "FPGATop") sharedTop = m;
     auto sim = *sharedTop.getOps<InstanceOp>().begin();
@@ -163,12 +170,20 @@ int main(int argc, char **argv) {
     auto sharedBefore = dump(*shared);
     require(failed(goldengate::normalizeHostHierarchy(*shared, "/tmp/host-hierarchy-test.sv", count, error)) && dump(*shared) == sharedBefore, "shared wrapper rejection mutated source");
     // A malformed boundary rejects atomically.
-    auto invalid = fixture(ctx, 3); auto c = *invalid->getOps<CircuitOp>().begin();
+    auto invalid = fixture(ctx, 3, numbered); auto c = *invalid->getOps<CircuitOp>().begin();
     c->removeAttr("rawAnnotations"); auto before = dump(*invalid);
     require(failed(goldengate::normalizeHostHierarchy(*invalid, "/tmp/host-hierarchy-test.sv", count, error)) && dump(*invalid) == before, "rejection mutated source");
-    llvm::outs() << "Host hierarchy depth 1/3/98, anonymous assertion controls/names, named assertion collisions, target preservation, bounded names, XDC references, port/instance symbol identities, idempotence and atomic rejections passed\n";
+    }
+    for (StringRef suffix : {"_", "_target", "_0target", "_0_extra", "__0"}) {
+      auto unrelated = fixture(ctx, 3, false, suffix);
+      auto before = dump(*unrelated);
+      require(succeeded(goldengate::normalizeHostHierarchy(*unrelated,
+          "/tmp/host-hierarchy-test.sv", count, error)) && count == 0 &&
+          dump(*unrelated) == before, "unrelated wrapper suffix was inlined");
+    }
+    llvm::outs() << "Host hierarchy plain/numbered depth 1/3/98, suffix discrimination, anonymous assertion controls/names, named assertion collisions, target preservation, bounded names, XDC references, port/instance symbol identities, idempotence and atomic rejections passed\n";
     if (argc == 4) {
-      auto baseline = fixture(ctx, 98);
+      auto baseline = fixture(ctx, 98, true);
       require(succeeded(goldengate::emitSimulatorRTL(*baseline, "fixture", std::string(argv[3]) + "/baseline.sv", error)), error);
       require(succeeded(goldengate::normalizeHostHierarchy(*baseline, std::string(argv[3]) + "/collapsed.sv", count, error)), error);
       require(succeeded(goldengate::emitSimulatorRTL(*baseline, "fixture", std::string(argv[3]) + "/collapsed.sv", error)), error);

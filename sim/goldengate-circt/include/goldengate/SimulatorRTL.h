@@ -8,6 +8,8 @@ namespace goldengate {
 // Collapse the single-use host assembly wrapper chain after driver analysis,
 // before XDC path resolution. Target/bridge/SRAM modules and boundaries owning
 // inner symbols or explicit XDC references stay hierarchical.
+// Assembly module names are GG*Wrapper, optionally followed by _<decimal>;
+// only modules forwarding through a unique `sim` instance are candidates.
 // Native CIRCT inlining maintains connections, annotations and inner symbols.
 // Anonymous side effects remain unnamed; named declarations retain uniqueness.
 // The serialized archive remains historical; inline blackboxes are attached

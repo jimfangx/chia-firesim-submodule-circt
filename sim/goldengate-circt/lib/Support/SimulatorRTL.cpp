@@ -418,8 +418,18 @@ LogicalResult goldengate::normalizeHostHierarchy(ModuleOp source,
       }
     if (!sim) break;
     auto child = dyn_cast_or_null<FModuleOp>(symbols.lookup(sim.getModuleName()));
-    if (!child || !child.getName().starts_with("GG") ||
-        !child.getName().ends_with("Wrapper")) break;
+    if (!child || !child.getName().starts_with("GG")) break;
+    auto wrapperName = child.getName();
+    if (!wrapperName.ends_with("Wrapper")) {
+      // Repeated bridge attachments use Namespace's decimal suffix, e.g.
+      // GGTracerVBridgeControlWrapper_0. These are the same assembly boundary
+      // contract; unrelated suffixes must not turn target modules into wrappers.
+      auto numbered = wrapperName.rsplit('_');
+      if (!numbered.first.ends_with("Wrapper") || numbered.second.empty() ||
+          !llvm::all_of(numbered.second,
+                        [](char c) { return c >= '0' && c <= '9'; }))
+        break;
+    }
     // Retain the innermost simulation boundary (channel/target wrapper).
     // Only assembly modules that themselves forward through `sim` qualify.
     bool forwards = false;

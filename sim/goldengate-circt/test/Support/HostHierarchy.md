@@ -46,3 +46,43 @@ native fixture's scope constructor pass. These focused checks do not run the
 FireSim manager or a simulation. The harness still owns the fresh driver,
 metasim workloads, and subsequent FPGA gates. After this regression is cleared,
 the next compiler feature remains selected SRAM integration with Print hosts.
+
+# Numbered host assembly wrappers
+
+Iteration 246 extends the same native CIRCT inlining policy to `GG*Wrapper_N`
+modules, with a nonempty decimal suffix. Quad Rocket's repeated TracerV
+control wrappers use this convention; the former exact `Wrapper` suffix
+check stopped at `GGTracerVBridgeControlWrapper_2` and left sixteen additional
+`sim` levels. Single-use and forwarding checks, explicit XDC roots and native
+inner-symbol boundaries still apply. Other suffixes remain hierarchical.
+
+The native fixture now exercises plain and numbered chains at depths 1, 3 and
+98, including suffix zero and multiple digits, target bodies, assertion names
+and controls, namespace collisions, XDC references, port/instance symbols,
+idempotence and atomic rejections. Five unrelated suffix cases remain unchanged.
+Its optional RTL export uses the numbered 98-wrapper chain. Comparing that
+original RTL with its normalized output in a standalone Verilator test passes
+4,096 host slots with 3,103 enabled clock edges, with assertions and VPI enabled.
+
+Evidence is in the mutable U250 generated-source tree's
+`iteration246-u250-target-matrix/`. Re-emitting iteration 245's actual quad
+`post-xilinx-host-specialization.mlir` removes 100 wrappers. Comparison with
+the previous candidate's emitted RTL removes sixteen assembly modules and
+changes only the retained `FPGATop` body; all other 1,937 retained module bodies
+and FPGATop ports match after source-comment/whitespace normalization. Fatal-
+warning Verilator lint passes with the existing BUFGCE and plusarg models.
+
+The exact SFC oracle is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_quadcore_no_nic/design/FireSim-generated.sv`
+and its adjacent `.implementation.xdc` and `.synthesis.xdc`. Every generated-
+clock path component resolves through the respective emitted RTL to `BUFGCE/O`.
+Both SFC and the candidate now have four instance hops from FPGATop, including
+one `sim`. Implementation XDC matches after the established
+`target/FireSim_` to `target_FAMETop/FireSim` instance-name substitution; the
+clock name, divider and setup/hold constraints match. The resolved gate input
+and enable also match: `hostClock` and
+`clockBridge_clocks_0_enabled & targetCycleFinishing & ~hostReset`.
+Synthesis XDC matches byte-for-byte. `quad-hierarchy-comparison.json` records
+the traversal and RTL comparisons. These checks and the small sequential
+fixture do not establish quad target behavior or FPGA synthesis success;
+the FireSim manager gates remain owned by the harness.
