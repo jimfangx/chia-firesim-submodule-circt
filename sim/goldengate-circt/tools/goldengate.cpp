@@ -4649,10 +4649,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, translationAnnotations, error)))
         return fail("FASED address translation annotations: " + error);
       llvm::outs() << "Translated CIRCT FASED addresses and host-clock bounds assertions in " << translationPath << '\n';
-      // NIC address translation has its own SFC boundary comparison; later
-      // memory scheduling still needs comparison before platform integration.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED read deinterleaving and platform integration are not implemented");
       if (failed(goldengate::addFASEDReadDeinterleaver(circuit, error)))
         return fail("FASED read deinterleaver: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED read deinterleaver produced invalid FIRRTL IR");
@@ -4666,6 +4662,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, deinterleaveAnnotations, error)))
         return fail("FASED read deinterleaver annotations: " + error);
       llvm::outs() << "Deinterleaved CIRCT FASED responses with sixteen eight-beat queues in " << deinterleavePath << '\n';
+      // NIC's local response queues have an SFC boundary comparison; host
+      // memory buffering still needs comparison before platform integration.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED host memory buffering and platform integration are not implemented");
       if (failed(goldengate::addFASEDHostMemoryBuffer(circuit, error)))
         return fail("FASED host memory buffer: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED host memory buffer produced invalid FIRRTL IR");

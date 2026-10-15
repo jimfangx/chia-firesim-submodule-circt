@@ -23,7 +23,7 @@ HELPER = 'GGFASEDReadDeinterleaver'
 QUEUE = 'GGFASEDDeinterleaveQueue8'
 
 
-def sfc_contract(path):
+def sfc_contract(path, queue_name="Queue_34"):
     text = clean(path.read_text())
     header, body = module(text, 'AXI4Deinterleaver')
     eq = {k: ' '.join(v.split()) for k, v in equations(body).items()}
@@ -43,7 +43,7 @@ def sfc_contract(path):
             passthrough += 1
     assert rtl_ports(header) == expected and len(expected) == 73
     assert passthrough == 30
-    assert re.findall(r'Queue_34 qs_queue_(\d+) \(', body) == [str(i) for i in range(16)]
+    assert re.findall(re.escape(queue_name) + r' qs_queue_(\d+) \(', body) == [str(i) for i in range(16)]
     assert eq['auto_anon_in_r_valid'] == 'locked'
     assert eq['enq_OH'] == "16'h1 << auto_anon_out_r_bits_id"
     assert eq['deq_OH'] == "16'h1 << deq_id"
@@ -89,7 +89,7 @@ def sfc_contract(path):
         prior = '_winner_T' + b
     assert eq['_winner_T_13'] == "{_winner_T_11, 1'h0}"
     assert eq['_winner_T_14'] == '~_winner_T_13' and eq['winner'] == '_GEN_114 & _winner_T_14'
-    _, queue = module(text, 'Queue_34')
+    _, queue = module(text, queue_name)
     qe = {k: ' '.join(v.split()) for k, v in equations(queue).items()}
     for field, width in [('id', 4), ('data', 64), ('resp', 2), ('last', 1)]:
         decl = r'reg\s+' + (r'\[' + str(width - 1) + r':0\]\s+' if width > 1 else '') + 'ram_' + field + r' \[0:7\];'
@@ -107,19 +107,19 @@ def sfc_contract(path):
                 next_count_lowest_ID_arbitration=True, accepted_last_lock=True)
 
 
-def compare(before_path, after_path, baseline):
+def compare_binding(before_path, after_path, baseline):
     before, after = before_path.read_text(), after_path.read_text()
     pattern = r'^    firrtl.module @(\w+)(\(.*?^    })'
     prior, result = (dict(re.findall(pattern, t, re.M | re.S)) for t in (before, after))
-    assert len(prior) == 263 and set(result) - set(prior) == {HELPER, QUEUE}
+    assert set(result) - set(prior) == {HELPER, QUEUE} and set(prior) <= set(result)
     assert all(result[n] == body for n, body in prior.items() if n != TOP)
     old, new = native_module(before, TOP), native_module(after, TOP)
-    assert native_ports(old) == native_ports(new) and len(native_ports(new)) == 110
+    assert native_ports(old) == native_ports(new)
     nets = wiring(old)
     assert nets.pop('translation.in') == 'sim.fased_host_mem'
     nets.update({'deinterleaver.in': 'sim.fased_host_mem', 'translation.in': 'deinterleaver.out',
                  'deinterleaver.clock': 'top.hostClock', 'deinterleaver.reset': 'top.hostReset'})
-    assert wiring(new) == nets and len(nets) == 116
+    assert wiring(new) == nets
     assert before.splitlines()[1] == after.splitlines()[1], 'annotation archive changed'
     assert re.findall(r' = firrtl.instance (\w+) @(\w+)\b', new) == [
         ('sim', 'GGFASEDHostMemoryWrapper'), ('translation', 'GGFASEDAddressTranslation'),
@@ -131,10 +131,20 @@ def compare(before_path, after_path, baseline):
         assert native_module(after, name) == native_module(baseline, name), 'shared semantics changed: ' + name
     assert re.findall(r' = firrtl.instance qs_queue_(\d+) @' + QUEUE, helper) == [str(i) for i in range(16)]
     assert helper.count('firrtl.assert ') == 32
+    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(prior)-1,
+                preserved_ports=len(native_ports(new)), wrapper_connections=len(nets),
+                annotation_archive_unchanged=True, shared_native_queue_and_helper_match=True)
+
+
+def compare(before_path, after_path, baseline):
+    report = compare_binding(before_path, after_path, baseline)
+    assert report['unchanged_module_bodies'] == 262
+    assert report['preserved_ports'] == 110 and report['wrapper_connections'] == 116
+    prior = dict(re.findall(r'^    firrtl.module @(\w+)(\(.*?^    })',
+                            before_path.read_text(), re.M | re.S))
     assert len([n for n in prior if n.startswith('GGPrintBridge')]) == 21
-    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=262,
-                preserved_ports=110, wrapper_connections=116, annotation_archive_unchanged=True,
-                shared_native_queue_and_helper_match=True, preserved_Print_modules=21)
+    report['preserved_Print_modules'] = 21
+    return report
 
 
 def main():

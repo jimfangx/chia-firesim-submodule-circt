@@ -4841,3 +4841,117 @@ also match. `production-boundary-regression.json`,
 The new comparison CLI also passes (`nic-translation-cli.json` and `.log`).
 Manifest SHA256 remains
 `0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+
+## Iteration 220: NIC local FASED response deinterleaving
+
+The production NIC path now invokes `addFASEDReadDeinterleaver` after address
+translation, verifies the full CIRCT module and emits
+`post-fame-fased-read-deinterleaver.mlir` and `-all.json`. The native pass
+inserts sixteen eight-beat response queues between FASED and translation.
+It preserves all existing module bodies except the internal memory connection
+in `GGFASEDAddressTranslationWrapper`, and retains its ports and annotations.
+NIC still stops explicitly at `NIC FASED host memory buffering and platform
+integration are not implemented`; this is a partial compiler boundary.
+
+The Scala oracle inspected was the Golden Gate/FAME ordering in
+`passes/MidasTransforms.scala`, channel firing and host clock/reset handling
+in `passes/fame/FAMETransform.scala`, the memory chain in `core/FPGATop.scala`
+and `rocket-chip/src/main/scala/amba/axi4/Deinterleaver.scala`. AW, W, B and
+AR pass through. R responses demultiplex into per-ID queues; completed-burst
+counts include simultaneous accepted enqueue/retirement before choosing the
+lowest pending ID. A selected burst remains locked through backpressure
+until accepted RLAST. Reset flushes pointers/counts/lock, while RAM writes
+retain the recorded Queue semantics.
+
+`NICFASEDReadDeinterleaverCompare.py` compares the actual production boundary,
+emitted annotation archive, copied CPU streams and NIC MMIO allocation. It
+executes the composed native helper/queues through the existing C++ SSA
+interpreter against an independent burst model. Its negative test changes
+the actual queue enqueue-pointer increment from one to zero: native CIRCT
+verification must still pass, while both behavior and structured comparisons
+must reject it. `PrintRocketFASEDReadDeinterleaverCompare.py` supplies the
+shared binding check; the original Print-specific counts and both allocation
+orders remain checked.
+
+The exact SFC NIC artifact is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+(SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`).
+Its `AXI4Deinterleaver` instantiates `Queue_36`, while the no-NIC archive and
+immutable October 1 U250 `design/FireSim-generated.sv` instantiate `Queue_34`.
+All three pass the same checks: 73 surviving typed ports, 30 pass-through
+routes, sixteen eight-entry queues with 71-bit payloads, four-bit completed
+burst counts, 32 bounds assertions, next-count arbitration and burst locking.
+The comparison explicitly accepts the queue module's supplied generated name.
+SFC eliminates B.ready on both sides and input R.ready; native retains and
+behaviorally tests response backpressure.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration220-u250-target-matrix/`.
+`golden-deinterleaver-artifacts.json` records all three exact SFC paths,
+hashes and contracts. `print-deinterleaver-comparison.json` records both
+retained Print-order comparisons. These shared local contracts do not prove
+NIC platform integration or runtime parity.
+
+The native build and focused `goldengate-fased-read-deinterleaver` CTest pass.
+It checks 2,048 queue state samples (reset writes, full queues, wraparound and
+RAM collisions), 8,364 hierarchical SSA cycles (6,050 accepted input and
+3,927 output beats, 1,945 stalls, 186 full-queue observations, 721 simultaneous
+last-beat retirements/enqueues and 42 resets), and eleven atomic rejection
+cases. `build.log` and `ctest.log` retain those results. Compiler SHA256 is
+`f2fe0ea7faaa7ee8f5c87a9e6dfdc93ee032a6f187e1d9212c7e15dc87316958`;
+`tool-input-hashes.json` records compiler, verifier, behavioral-test executable,
+firtool, Verilator and golden-manifest hashes.
+
+The fresh production NIC comparison passes against all three SFC contracts
+and matches the fresh no-NIC helper and queue bodies exactly. It preserves
+208 prior module bodies, 134 typed ports, 26 CPU-stream ports and all 1,792
+emitted annotations, including the raw circuit archive. The wrapper has
+140 connections after inserting clock/reset and memory wiring. Boundary
+SHA256 is `0794dbeb6033e4171dcf0354388d4d6dc91932b6364d4cca71aab03a5385144b`.
+`nic-deinterleaver-comparison.json`, `no-nic-deinterleaver-comparison.json`
+and `immutable-deinterleaver-comparison.json` retain the NIC boundary checks
+against each SFC fixture; `fresh-no-nic-deinterleaver-comparison.json`
+separately checks the no-NIC production wrapper. Both original Print orders
+also pass against this fresh no-NIC helper.
+
+`nic-deinterleaver-cli.json` and `.log` retain the comparison CLI result.
+Its `.behavior.log` records execution of the actual production NIC helper
+and queues with the same coverage as the CTest. The pointer mutation in
+`nic-deinterleaver-mutation/` passes native CIRCT parsing/verification but
+fails actual SSA evaluation at `Queue_34 pointer/full next state` and the
+structured check at `shared semantics changed: GGFASEDDeinterleaveQueue8`.
+(The C++ diagnostic retains the original SFC queue's name.) The mutated full
+production boundary has SHA256
+`cd0e5297482f145e79c69aa6bd82ffd905296e7bfbefc83540dd16b6a03fc2b8`.
+
+The next smallest porting step is NIC FASED host-memory buffering: compare
+all five AXI channel queues after translation against the actual NIC SFC
+buffer before advancing to host-memory arbitration. Broader TracerV/memory
+profiles, SRAM model-port differences, partitioned QSFP semantics, NIC runtime
+and the SFC UART-bearing baseline remain pending. Harness iteration 219
+passed actual CIRCT replacertl/provenance and fresh Verilator smoke with
+unchanged-input long-suite evidence reused. Those results precede this
+change; no manager gate was started here. Pre-existing shared edits are
+preserved and excluded from this checkpoint. The overall port is incomplete.
+
+The fresh all-thirteen archived-input replay completes in `replay/matrix.json`.
+Results remain one compiled, six failed and six unsupported platforms. Existing
+annotation comparisons remain eight matched, six SRAM model-port mismatches
+and twelve not reached. Rejections are implementation gaps. Input hashes,
+effective platform configurations, compile statuses and existing boundary
+checks match iteration 219; only NIC's next-gap diagnostic changes. Complete
+per-recipe stderr was inspected and is retained in `matrix-regression.log`.
+`matrix-regression.json` records the aggregate checks; the matrix exits one
+because the gaps remain, rather than reporting partial comparisons as parity.
+
+The artifact regression passes: all 234 shared NIC and 256 shared no-NIC
+MLIR/JSON files match iteration 219 after normalizing only the candidate
+output-directory annotation. NIC adds exactly the two deinterleaver files.
+No-NIC final RTL, both headers and both XDC files remain byte-identical;
+RTL SHA256 remains
+`866b0e02cc633b969f0945f987b5577ecd6bb578301cb7a1e6aba6eb056a60da`.
+The primary immutable handoff FIRRTL/annotation hashes and normalized U250
+XDC also match. `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json` and
+`artifact-regression.log` retain the results. Golden-manifest SHA256 remains
+`0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
