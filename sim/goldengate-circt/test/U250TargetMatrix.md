@@ -4529,3 +4529,107 @@ also match. `production-boundary-regression.json`,
 `no-nic-emitted-regression.json`, `immutable-rocket-comparison.json`,
 `matrix-regression.json` and `tool-input-hashes.json` retain those checks.
 Pre-existing shared edits were preserved and excluded from this checkpoint.
+
+## Iteration 217: NIC host control-master binding
+
+The production NIC path now invokes `bindControlMaster` after all catalog
+slaves are bound. It verifies the full CIRCT module and emits
+`post-fame-control-master.mlir` and `post-fame-control-master-all.json`.
+The existing native composer assembles the complete host control bundle from
+32 scalar AW/W/B/R boundaries and the aggregate AR boundary. The next explicit
+rejection is `NIC host memory binding and platform integration are not
+implemented`; NIC still does not compile to platform RTL.
+
+The Scala oracle inspected was the InferModelPorts/FAMETransform/SimulationMapping
+ordering in `MidasTransforms.scala`, clock/reset/channel handling in
+`FAMETransform.scala`, `Widget.scala:HasWidgets.genCtrlIO`, and
+`junctions/nasti.scala:NastiRecursiveInterconnect`. The master is connected
+directly to the crossbar; sorted widget regions select the slave catalog.
+The native binding adds no state and preserves the existing decoder,
+dispatchers, response arbiters, tracker retirement and bridge clocks.
+
+`NICControlMasterCompare.py` uses the shared stateless binding check extracted
+from `PrintRocketControlMasterCompare.py`. The original Print comparison
+retains its two allocated-Print requirements; both retained allocation orders
+pass after extraction. The new NIC check also validates the twelve-region
+catalog, every emitted annotation record, and a type-correct mutation of the
+actual production AR bundle connection to AW.
+
+Native build and both focused CTests pass. The control-master unit test checks
+both accepted input stages, all scalar/AR routes, copied clocks, target transfer
+and 26 atomic rejections. The slave-binding test passes 90 catalog bindings
+and 185 atomic rejections, including the twelve-region NIC allocation.
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration217-u250-target-matrix/`.
+`build.log`, `ctest.log`, `ctest-details.log`, `print-master-comparison.json`
+and `tool-input-hashes.json` retain these checks. The compiler SHA256 is
+`6d37b053011d14dae4e2683b69d29aa91743ccd6e4231866820c2f84b8b19ba1`.
+
+The next smallest porting step is the NIC FASED host-memory binding, comparing
+its request/response adaptation with the SFC memory master before address
+translation and platform assembly. NIC runtime, generalized TracerV/memory
+profiles, SRAM model-port differences, partitioned QSFP semantics and the SFC
+UART-bearing baseline remain pending. Harness iteration 216 passed actual
+CIRCT replacertl/provenance and fresh Verilator smoke; unchanged-input long
+suite evidence was reused. Those results precede this change. No manager gate
+was started here. The port remains incomplete.
+
+The fresh NIC composition preserves all 205 prior module bodies, 135 copied
+typed ports and 1,792 emitted annotation records. It consumes exactly 33
+boundary ports and produces 168 connections: 135 copies, 32 scalar channel
+routes and the thirteen-leaf aggregate AR route. All shared master routes
+also match the fresh no-NIC boundary. The NIC boundary SHA256 is
+`92d58cd8e92758cb83b4cdfc26619f5e014892c2c22edd428e3fd197c33a87f2`.
+The raw circuit annotation archive transfers exactly, including targets that
+remain internal after their boundary ports are consumed.
+
+The exact primary SFC comparison artifact is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+(SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`).
+Its `FPGATop` control ABI agrees on all 45 widths/directions; all 24 surviving
+`NastiRecursiveInterconnect` master pins have the same direct request and
+response routes. B/R user outputs are zero in SFC. Native IR also retains
+request fields optimized away by SFC, checked through the typed interface and
+all native SSA routes. This is a complete stateless wiring check at this
+boundary, not a NIC memory/platform/runtime result.
+
+`nic-master-comparison.json` and its complete log retain these checks.
+`nic-master-mutation/` contains the actual production IR with its AR aggregate
+fed from the identical-typed AW aggregate. Native CIRCT parsing/verification
+passes; the structured comparison rejects `actual host control SSA wiring
+differs`. The retained Print comparison preserves its original profile requirements;
+both original allocation orders pass with the shared helper.
+
+The NIC boundary also passes against the same archive's
+`alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+(SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`)
+and the immutable October 1 U250 build-tree fixture's
+`design/FireSim-generated.sv` at
+`/scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/`
+(SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`).
+These compare their shared host ABI/routes to NIC; they do not substitute a
+no-NIC golden for NIC-specific behavior. The complete reports/logs are
+`no-nic-master-comparison.*`, `immutable-master-comparison.*` and
+`golden-master-artifacts.json`.
+
+The fresh all-13 archived-input replay is complete in `replay/matrix.json`.
+Results remain one compiled, six failed and six unsupported platforms;
+comparisons remain eight matched, six SRAM model-port mismatches and twelve
+not reached. Matrix exit 1 and rejected targets remain implementation gaps.
+The NIC recipe alone advances to its explicit host-memory/platform gap.
+
+`artifact-regression.log` records the passing production/collateral/immutable/
+matrix regression. All 228 shared NIC and 256 shared no-NIC MLIR/JSON files
+match iteration 216 after normalizing only the candidate-directory annotation.
+NIC adds exactly the two host control-master boundary files. No-NIC final
+RTL, both headers and both XDC files remain byte-identical; SV SHA256 remains
+`866b0e02cc633b969f0945f987b5577ecd6bb578301cb7a1e6aba6eb056a60da`.
+The primary immutable handoff FIRRTL/annotation hashes and normalized U250
+XDC also match. All thirteen archived input hashes, effective platforms,
+compile statuses and prior structured boundary comparison checks match
+iteration 216; only NIC's explicit next-gap diagnostic changes. Full per-recipe
+stderr was inspected. `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json` and
+`matrix-regression.json` retain the checks. Manifest SHA256 remains
+`0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+Existing shared changes are excluded from this checkpoint.

@@ -4606,11 +4606,8 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedBoundAnnotations, error)))
         return fail("FASED control binding annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED requests and responses to its catalog-selected control slave in " << fasedBoundPath << '\n';
-      // NIC uses the same catalog-selected five-channel FASED slave binding.
-      // Its host control master and remaining platform assembly are separate
-      // boundaries and must be compared before enabling them here.
-      if (!cpuSinks.empty())
-        return fail("NIC host control master and platform integration are not implemented");
+      // NIC and no-NIC share the full host-facing control ABI. Bind the
+      // dispatcher requests and arbiter responses after all catalog slaves.
       if (failed(goldengate::bindControlMaster(circuit, error)))
         return fail("host control master binding: " + error);
       if (failed(mlir::verify(*module))) return fail("host control master binding produced invalid FIRRTL IR");
@@ -4624,6 +4621,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, controlMasterAnnotations, error)))
         return fail("host control master annotations: " + error);
       llvm::outs() << "Assembled CIRCT host control master in " << controlMasterPath << '\n';
+      // NIC host-memory and remaining platform assembly still require their
+      // own comparisons before enabling the following boundaries.
+      if (!cpuSinks.empty())
+        return fail("NIC host memory binding and platform integration are not implemented");
       if (failed(goldengate::bindFASEDHostMemory(circuit, error)))
         return fail("FASED host memory binding: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED host memory binding produced invalid FIRRTL IR");

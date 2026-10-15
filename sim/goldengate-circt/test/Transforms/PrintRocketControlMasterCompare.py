@@ -93,7 +93,8 @@ def sfc_contract(path):
     return declared, pins
 
 
-def compare(before_path, after_path, baseline):
+def compare_binding(before_path, after_path, baseline):
+    """Check the shared stateless master composition independently of widgets."""
     before, after = before_path.read_text(), after_path.read_text()
     pattern = r'^    firrtl.module @(\w+)(\(.*?^    })'
     prior, result = (dict(re.findall(pattern, text, re.M | re.S)) for text in (before, after))
@@ -140,18 +141,24 @@ def compare(before_path, after_path, baseline):
         before_header = before_header[:end] + ', ' + extra + before_header[end:]
     expected_header = transfer(before_header, OLD, NEW, [(d, n) for d, n, _ in copied])
     assert after.splitlines()[1] == expected_header, 'annotation archive transfer differs'
-    print_modules = [name for name in prior if name.startswith('GGPrintBridge')]
+    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(prior),
+                copied_ports=len(copied), consumed_ports=len(consumed), scalar_master_bindings=32,
+                aggregate_AR_bindings=1, master_connections=routes, wrapper_connections=len(nets),
+                annotation_archive_transfer=True, annotation_identity_probes=len(probes),
+                shared_baseline_compared=baseline is not None)
+
+
+def compare(before_path, after_path, baseline):
+    report = compare_binding(before_path, after_path, baseline)
+    after = after_path.read_text()
+    print_modules = re.findall(r'^    firrtl.module @(GGPrintBridge\w+)\(', after, re.M)
     assert len(print_modules) >= 2 and 'GGPrintBridgeHostQueued' in print_modules
     regions = re.search(r'goldengate.controlRegions = \[(.*?)\]', after)[1]
     print_regions = re.findall(r'name = "(PrintBridgeModule_\d+)", size = (\d+) : i64, slave = (\d+) : i32, start = (\d+) : i64', regions)
     assert print_regions == [('PrintBridgeModule_0', '32', '8', '544'),
                              ('PrintBridgeModule_1', '32', '9', '576')]
-    return dict(before=str(before_path), after=str(after_path), unchanged_module_bodies=len(prior),
-                copied_ports=len(copied), consumed_ports=len(consumed), scalar_master_bindings=32,
-                aggregate_AR_bindings=1, master_connections=routes, wrapper_connections=len(nets),
-                retained_Print_modules=len(print_modules), retained_Print_regions=print_regions,
-                annotation_archive_transfer=True, annotation_identity_probes=len(probes),
-                shared_baseline_compared=baseline is not None)
+    report.update(retained_Print_modules=len(print_modules), retained_Print_regions=print_regions)
+    return report
 
 
 def main():
