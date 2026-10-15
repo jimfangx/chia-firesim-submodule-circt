@@ -7,7 +7,8 @@ namespace goldengate {
 // Materialize eight UInt32 counters and ten read-only lanes at bytes 16-52.
 // No top/annotation changes or instances. Recorded bins 0,2,4,8 increment on
 // targetFire; the fifth lanes stay zero per the Scala zip rule. Host reset
-// masks assertions; modelReset resets state only when targetFire is high.
+// masks nonfatal read-only write diagnostics; modelReset resets state only
+// when targetFire is high. Diagnostics remain on the host clock.
 // On duplicate symbol failure, leave IR and result unchanged.
 mlir::LogicalResult materializeFASEDHistograms(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp &result, std::string &error);

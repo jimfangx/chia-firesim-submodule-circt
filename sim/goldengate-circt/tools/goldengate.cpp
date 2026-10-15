@@ -4542,10 +4542,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsAnnotations, error)))
         return fail("FASED transaction and beat counters annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED target-clock transaction and beat counters and read-only MMIO in " << fasedStatisticsPath << '\n';
-      // Statistics observes existing target handshakes, including accepted R
-      // beats through the response hierarchy. Compare NIC histograms next.
-      if (!cpuSinks.empty())
-        return fail("NIC FASED histograms, control responses and platform integration are not implemented");
       if (failed(goldengate::attachFASEDHistograms(circuit, fasedHistogramsBank, error)))
         return fail("FASED outstanding occupancy histograms: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED outstanding occupancy histograms produced invalid FIRRTL IR");
@@ -4559,6 +4555,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsAnnotations, error)))
         return fail("FASED outstanding occupancy histograms annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED target-clock occupancy histograms and read-only MMIO in " << fasedHistogramsPath << '\n';
+      // Histogram observations use the existing pre-edge read/AW occupancies.
+      // NIC control responses and platform integration need separate parity.
+      if (!cpuSinks.empty())
+        return fail("NIC FASED control responses and platform integration are not implemented");
       if (failed(goldengate::addFASEDMMIOBank(circuit, error)))
         return fail("FASED MMIO bank: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED MMIO bank produced invalid FIRRTL IR");

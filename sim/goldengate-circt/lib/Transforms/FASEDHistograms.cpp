@@ -10,7 +10,8 @@
 // Output: first matching upper bound 0,2,4,8 increments on targetFire; wraps
 // at 32 bits. Model reset is synchronous and qualified by targetFire. The
 // allocated fifth bin remains zero, preserving the executable Scala zip rule
-// and optimized SFC RTL. Read-only assertions are suppressed by host reset.
+// and optimized SFC RTL. Nonfatal read-only diagnostics run on the host clock
+// and are suppressed by host reset, independently of the target update policy.
 // Scope: recorded BaseParams histogram profile, not configurable histograms.
 #include "goldengate/FASEDHistograms.h"
 #include "mlir/IR/Builders.h"
@@ -134,8 +135,10 @@ LogicalResult goldengate::materializeFASEDHistograms(CircuitOp circuit,
       Value read=slot("read",index),write=slot("write",index);
       connect(field(read,"bits"),value);connect(field(read,"valid"),one);
       connect(field(write,"ready"),one);
-      b.create<AssertOp>(loc,arg(0),b.create<NotPrimOp>(loc,field(write,"valid")),enabled,
-          "Register "+name+" is read only",ValueRange{},"");
+      // SFC MCRIO.bindReg emits a host-clock diagnostic without stopping the
+      // simulation. Neither a stalled target nor its reset masks this write.
+      b.create<PrintFOp>(loc,arg(0),both(enabled,field(write,"valid")),
+          "Assertion failed: Register "+name+" is read only\n",ValueRange{},"");
     }
   }
 

@@ -4,6 +4,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
+#include "mlir/IR/IRMapping.h"
 #include "mlir/Parser/Parser.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
@@ -210,12 +211,16 @@ void behavior(MLIRContext &context) {
       require(sim.output(6,"read"+lane+".bits")==expected[i],"histogram readback mismatch");
       require(sim.output(6,"read"+lane+".valid")==1 && sim.output(6,"write"+lane+".ready")==1,"MCR handshake mismatch");
     }};check();
-    unsigned assertions=0;for(auto a:sim.module.getOps<AssertOp>()) {
-      bool fail=sim.eval(a->getOperand(2)) && !sim.eval(a->getOperand(1));
+    require(sim.module.getOps<AssertOp>().empty(),"read-only diagnostics must not terminate simulation");
+    unsigned assertions=0;for(auto a:sim.module.getOps<PrintFOp>()) {
+      bool fail=sim.eval(a->getOperand(1));
       bool write=sim.memo.at(sim.key(sim.arg(6))+".write["+std::to_string(assertions)+"].valid");
-      require(fail==(!hostReset && write),"assertion confused target/host reset");assertionFailures+=fail;++assertions;
+      require(a->getOperand(0)==sim.arg(0) && a.getFormatString()==
+          "Assertion failed: Register "+histogramName(assertions)+" is read only\n",
+          "wrong host-clock read-only diagnostic");
+      require(fail==(!hostReset && write),"diagnostic confused target/host reset");assertionFailures+=fail;++assertions;
     }
-    require(assertions==10,"missing read-only assertion");
+    require(assertions==10,"missing read-only diagnostic");
     if(fire) {
       if(modelReset)expected.fill(0);
       else for(unsigned group=0;group<2;++group) {
@@ -295,9 +300,71 @@ void rejections(MLIRContext &context) {
   }
 }
 }
-int main() {
+// Validate production observations before isolating the bank for RTL execution.
+unsigned port(FModuleOp m, llvm::StringRef name) {
+  for(unsigned i=0;i<m.getNumPorts();++i)if(m.getPortName(i)==name)return i;
+  throw std::runtime_error("missing production port: "+name.str());
+}
+Value driver(FModuleOp m, Value dest) {
+  Value result;
+  for(auto &op:*m.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&op.getOperand(0)==dest) {
+    require(!result,"multiple production drivers");result=op.getOperand(1);
+  }
+  require(bool(result),"missing production driver");return result;
+}
+void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
+  auto root=parseSourceFile<ModuleOp>(input,&ctx);
+  require(bool(root)&&succeeded(verify(*root)),"invalid production histogram boundary");
+  auto c=*root->getOps<CircuitOp>().begin();
+  require(c.getName()=="GGFASEDHistogramsWrapper","wrong production histogram root");
+  auto top=named(c,c.getName()),inner=named(c,"GGFASEDStatisticsWrapper"),bank=named(c,"GGFASEDHistograms");
+  InstanceOp sim,original;
+  for(auto i:top.getOps<InstanceOp>()) {
+    if(i.getName()=="sim")sim=i;
+    if(i.getName()=="histograms")original=i;
+  }
+  require(sim&&sim.getModuleName()==inner.getName()&&original&&original.getModuleName()==bank.getName(),
+      "wrong production histogram instances");
+  require(bank.getNumPorts()==7,"wrong production histogram bank arity");
+  SmallVector<Value> sources;
+  for(unsigned i=0;i<6;++i) {
+    auto source=driver(top,original.getResult(i));sources.push_back(source);
+    if(i<2)require(source==top.getArgument(port(top,i?"hostReset":"hostClock")),"wrong host clock/reset");
+    else if(i<4)require(source==sim.getResult(port(inner,i==2?"fased_model_reset":"fased_tfire")),
+        "wrong target reset/fire");
+    else {
+      auto field=source.getDefiningOp<SubfieldOp>();
+      require(field&&field.getFieldName()==(i==4?"value":"awValue")&&
+          field.getInput()==sim.getResult(port(inner,i==4?"fased_pending_reads":"fased_pending_writes")),
+          "wrong pre-edge read/AW occupancy");
+    }
+  }
+  auto mcr=top.getArgument(port(top,"fased_histograms_mcr"));
+  require(driver(top,mcr)==original.getResult(6),"wrong MCR binding");
+  auto isolated=ModuleOp::create(c.getLoc());OpBuilder b(&ctx);
+  b.setInsertionPointToEnd(isolated.getBody());
+  auto exported=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("GGFASEDHistogramsProbe"));
+  b.setInsertionPointToEnd(exported.getBodyBlock());b.insert(bank->clone());
+  auto probe=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDHistogramsProbe"),
+      bank.getConventionAttr(),bank.getPorts());probe.setPublic();
+  b.setInsertionPointToEnd(probe.getBodyBlock());
+  auto instance=b.create<InstanceOp>(c.getLoc(),bank,"histograms");IRMapping map;
+  for(unsigned i=0;i<7;++i)map.map(original.getResult(i),instance.getResult(i));
+  for(unsigned i=0;i<6;++i)map.map(sources[i],probe.getArgument(i));
+  map.map(mcr,probe.getArgument(6));unsigned cloned=0;
+  for(auto &op:*top.getBodyBlock())if(isa<ConnectOp,StrictConnectOp>(op)&&
+      map.contains(op.getOperand(0))&&map.contains(op.getOperand(1))) {b.clone(op,map);++cloned;}
+  require(cloned==7&&succeeded(verify(isolated)),"invalid production histogram probe bindings");
+  std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot export histogram probe");
+  isolated.print(out);out<<'\n';out.close();isolated.erase();
+  llvm::outs()<<"Cloned production histogram bank and seven validated clock/reset/occupancy/MCR bindings\n";
+}
+int main(int argc,char **argv) {
   try {
-    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for (bool selected : {false, true}) {
+    MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+    require(argc==1||argc==3,"usage: goldengate-fased-histograms-test [boundary.mlir probe.mlir]");
+    if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
+    for (bool selected : {false, true}) {
       selectedProfile = selected; phases(context);behavior(context);mapping(context);rejections(context);
     }
     llvm::outs()<<"FASED histograms: 65536 cycles across legacy/selected profiles, all four-bit occupancies, constant fifth bins, target-clock/reset bindings, targets and 46 atomic boundary rejections passed\n";
