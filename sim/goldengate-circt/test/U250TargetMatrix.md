@@ -5063,3 +5063,117 @@ only NIC's next-gap diagnostic changes. Complete per-recipe stderr was read
 and retained in `matrix-regression.log`; `matrix-regression.json` records the
 aggregate checks. The matrix exits one because these gaps remain. No full
 NIC compilation, emitted platform RTL or runtime parity is claimed.
+
+## Iteration 222: NIC shared host-memory AW/W arbitration
+
+The production NIC path now invokes `addHostMemoryWriteArbiter`, verifies
+the full CIRCT module and emits `post-fame-host-memory-write-arbiter.mlir`
+and `-all.json`. The pass creates the two-source AW/W crossbar and its
+depth-two flow source queue using FIRRTL operations. AW reserves a source
+before downstream acceptance; that reservation persists through AW stalls
+and retires only on an accepted WLAST. LoadMem uses ID 16 and FASED IDs
+remain 0 through 15, extended to the five-bit shared interface. NIC stops
+explicitly at `NIC host memory write responses and platform integration
+are not implemented` before B routing.
+
+The Scala oracle inspected was Golden Gate ordering in
+`passes/MidasTransforms.scala`, channel firing and host clock/reset handling
+in `passes/fame/FAMETransform.scala`, and the shared memory crossbar in
+`core/FPGATop.scala`. The existing native implementation preserves the
+buffered FASED source and forwards other interfaces, including NIC CPU
+streams, through the new wrapper.
+
+`NICHostMemoryWriteArbiterCompare.py` checks the actual production wrapper,
+all retained module bodies, shared helpers, CPU stream and MMIO interfaces,
+and raw/emitted annotation target transfer. It executes the generated
+arbiter/queue SSA with the native C++ interpreter. Its negative test changes
+the actual source queue's enqueue-pointer toggle into a type-correct hold;
+full native verification must accept the mutant while behavior and
+structured comparison must reject it.
+`PrintRocketHostMemoryWriteArbiterCompare.py` supplies the generalized binding
+check while retaining the original Print-specific counts. Its SFC contract
+now checks the instantiated source queue, all AW/W payload muxes and five
+arbitration state updates, alongside reservation, backpressure and WLAST
+retirement equations.
+
+The exact NIC SFC artifact compared is
+`automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_nic/design/FireSim-generated.sv`
+(SHA256 `bbffd83a60547249537029e4cb117c578fe830f006d1627f37d53dba3cf824af`).
+Its `AXI4Xbar.awOut_0` instantiates `Queue_23`; the archived no-NIC and
+immutable October 1 U250 `design/FireSim-generated.sv` use `Queue_21`.
+All three match 73 combinational crossbar equations, five arbitration state
+updates, eighteen queue equations and three queue state updates. The queue is depth two, flow enabled,
+pipe disabled, with two-bit source payloads and reset-independent RAM writes.
+The shared interface has 34-bit addresses, 64-bit data and five-bit IDs.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration222-u250-target-matrix/`.
+`golden-arbiter-artifacts.json` records exact golden paths, hashes and
+contracts. `tool-input-hashes.json` records the native compiler, verifier,
+behavioral test, firtool, Verilator and archived manifest; `build.log` retains
+the successful native build. Compiler SHA256 is
+`771081c7d474da8bc617e8f32def544e26eff53f7b013fee813d5f7cb56c785b`.
+
+The focused `goldengate-host-memory-write-arbiter` CTest passes: 256
+exhaustive queue cases (40 reset RAM writes and sixteen bypasses), 216,018
+leaf checks over 12,001 hierarchical SSA edges, and nine atomic rejection
+cases with retained target identities. Traffic coverage includes 9,988 full
+observations, 7,975 stalls, 464 pre-acceptance reservations, fourteen bypasses,
+162 simultaneous enqueue/dequeue edges and 52 resets. `ctest.log` retains
+the results.
+
+The fresh production NIC boundary passes all three SFC contracts and matches
+the fresh no-NIC arbiter/queue helper bodies. It preserves 216 existing
+module bodies, 26 CPU-stream ports, twelve control regions and all 1,792
+emitted annotation records with the expected circuit/public-target transfer.
+The new wrapper has 125 copied typed ports, 127 total ports and 141 exact
+connections. Boundary SHA256 is
+`d559867aecc989350451ebff0b2a5468150c7349b5baa8855bbb17fd2aeea607`.
+`nic-arbiter-comparison.json`, `no-nic-arbiter-comparison.json` and
+`immutable-arbiter-comparison.json` record each golden comparison;
+`fresh-no-nic-arbiter-comparison.json` checks the production no-NIC wrapper.
+`print-arbiter-comparison.json` checks both retained Print allocation orders:
+272 unchanged module bodies, 116 copied ports, 118 total ports, 132 wrapper
+connections and all 21 Print modules per order.
+
+`nic-arbiter-cli.json`, `.log` and `.behavior.log` record the passing new CLI
+and execution of the actual production NIC SSA with the same queue/traffic
+coverage as the focused CTest. The pointer-hold mutant in
+`nic-arbiter-mutation/` passes native parsing/verification, fails behavior at
+`queue next enq` and fails structured comparison at
+`shared helper differs GGHostMemoryWriteSourceQueue2`. Mutant SHA256 is
+`ce21e3f3a955d4edbe77f125ceca6ca4832229f671b826a81bb1ab962c935870`.
+
+The artifact regression passes: all 238 shared NIC and 256 shared no-NIC
+MLIR/JSON files match iteration 221 after normalizing only the candidate
+output-directory annotation. NIC adds exactly the two AW/W boundary files.
+No-NIC final RTL, both headers and both XDC files remain byte-identical;
+RTL SHA256 remains
+`866b0e02cc633b969f0945f987b5577ecd6bb578301cb7a1e6aba6eb056a60da`.
+The primary immutable handoff FIRRTL/annotation hashes and normalized U250
+XDC also match. `production-boundary-regression.json`,
+`no-nic-emitted-regression.json`, `immutable-rocket-comparison.json` and
+`artifact-regression.log` retain these results. Golden-manifest SHA256 remains
+`0292a691278b4c59514b2675bee30af306a382caac33cc94978aa5c590590ffe`.
+
+The next smallest porting step is NIC host-memory B-response routing:
+compare the SFC crossbar's ID 16 LoadMem selection, four-bit FASED ID
+truncation, invalid-ID blocking and sink-specific backpressure before
+advancing that boundary. Remaining risks include NIC AR/R and platform/runtime
+integration, broader TracerV/memory profiles, SRAM model-port differences,
+partitioned QSFP semantics and the pending SFC UART-bearing baseline.
+Harness iteration 221 passed CIRCT replacertl/provenance and fresh Verilator
+smoke; unchanged long-suite evidence was reused. Those gates precede this
+change. No manager gate was started here, and unrelated shared edits remain
+outside this change. The overall port remains incomplete.
+
+The fresh all-thirteen replay completes in `replay/matrix.json`: one compiled,
+six failed and six unsupported platforms. Earlier annotation comparisons
+remain eight matched, six SRAM model-port mismatches and twelve not reached.
+Archived input hashes, effective platform configurations, compile statuses
+and existing boundary checks match iteration 221; only NIC's next-gap
+diagnostic changes. Complete per-recipe stderr was inspected and is retained
+in `matrix-regression.log`; `matrix-regression.json` records the aggregate
+checks. The matrix exits one because these gaps remain. These local AW/W
+checks do not establish full NIC compilation, emitted platform RTL or runtime
+parity.

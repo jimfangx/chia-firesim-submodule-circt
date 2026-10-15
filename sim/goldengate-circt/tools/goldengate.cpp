@@ -4675,10 +4675,6 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, memoryBufferAnnotations, error)))
         return fail("FASED host memory buffer annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED host memory with five two-entry queues in " << memoryBufferPath << '\n';
-      // NIC buffering has a local SFC boundary comparison; shared host
-      // memory arbitration still needs comparison before platform integration.
-      if (!cpuSinks.empty())
-        return fail("NIC host memory write arbitration and platform integration are not implemented");
       if (failed(goldengate::addHostMemoryWriteArbiter(circuit, error)))
         return fail("host memory write arbiter: " + error);
       if (failed(mlir::verify(*module))) return fail("host memory write arbiter produced invalid FIRRTL IR");
@@ -4692,6 +4688,10 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostMemoryWriteArbiterAnnotations, error)))
         return fail("host memory write arbiter annotations: " + error);
       llvm::outs() << "Arbitrated CIRCT LoadMem and FASED AW/W with a two-entry source queue in " << hostMemoryWriteArbiterPath << '\n';
+      // NIC AW/W arbitration is compared at this boundary; response routing
+      // still needs comparison before integrating the platform interface.
+      if (!cpuSinks.empty())
+        return fail("NIC host memory write responses and platform integration are not implemented");
       if (failed(goldengate::routeHostMemoryWriteResponses(circuit, error)))
         return fail("host memory write responses: " + error);
       if (failed(mlir::verify(*module))) return fail("host memory write responses produced invalid FIRRTL IR");
