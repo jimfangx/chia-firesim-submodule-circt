@@ -1,7 +1,7 @@
 // See LICENSE for license details.
 // Oracle: TimingModel.scala:151-167 and FASEDMemoryTimingModel MCR words 14-17.
 // Materialization requires a free bank symbol and preserves top/annotations.
-// Attachment requires the recorded ten-flight 35/64/4-bit FASED profile,
+// Attachment requires positive retained maxFlight and the 35/64/4-bit FASED profile,
 // uninstantiated response-error top, unique sim chain to response releaser,
 // exact model reset/fire and timing request interfaces.
 // Annotations consumed: none.
@@ -12,7 +12,8 @@
 // Analyses preserved: existing channels, constructors and port identities.
 // Output invariants: count AW/AR transactions and all W/R beats, wrapping at
 // 32 bits; state/reset advance only on targetFire. Read-only assertions use
-// host reset independently. Existing response and request drivers unchanged.
+// host reset independently. Counter state is independent of request capacity.
+// Existing response and request drivers unchanged.
 #include "goldengate/FASEDStatistics.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
@@ -68,8 +69,8 @@ LogicalResult attachmentBoundary(CircuitOp circuit, StatisticsAttachment &bounda
   auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() != 10)
-    return reject("FASED statistics currently require the recorded ten-flight constructor");
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
+    return reject("FASED statistics require a positive retained maxFlight constructor");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx);
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);

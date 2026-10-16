@@ -14,6 +14,7 @@ mlir::LogicalResult materializeFASEDStatistics(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp &result, std::string &error);
 // Attach that exact nine-port, uninstantiated bank after response mapping.
 // Validate the complete response hierarchy and bank before mutating any ports.
+// Require positive retained maxFlight; the four counters are capacity independent.
 mlir::LogicalResult attachFASEDStatistics(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp bank, std::string &error);
 // Compatibility API: preflight, materialize and attach atomically on rejection.
