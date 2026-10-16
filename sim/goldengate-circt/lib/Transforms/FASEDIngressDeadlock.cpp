@@ -6,6 +6,7 @@
 // All hierarchy, boundary and collision checks precede mutation.
 #include "goldengate/FASEDIngressDeadlock.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <tuple>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -40,6 +41,20 @@ LogicalResult goldengate::addFASEDIngressDeadlock(CircuitOp circuit,
       return reject("FASED deadlock policy input already exists");
     modules.push_back(found);
   }
+  FModuleOp engine;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == "GGFASEDTokenEngine") engine = m;
+  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
+  auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
+  auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
+    return reject("FASED deadlock checks need positive maxFlight representable in 64 bits");
+  // Match the AW FIFO and SatUpDownCounter contracts from the upstream
+  // passes. FASED caps maxWrites at sixteen; deadlock predicates consume
+  // empty flags, independently of the derived counter value width.
+  const unsigned depth = std::min<int64_t>(16, flight.getInt());
+  const unsigned countWidth = llvm::Log2_64_Ceil(depth + 1);
+  const std::string queueName = "GGFASEDIngressAWQueue" + std::to_string(depth);
   SmallVector<InstanceOp> chain;
   for (unsigned j = 0; j < modules.size(); ++j) {
     SmallVector<InstanceOp> uses;
@@ -62,8 +77,8 @@ LogicalResult goldengate::addFASEDIngressDeadlock(CircuitOp circuit,
     return std::nullopt;
   };
   auto relaxed = port(modules[0], "fased_ingress_relaxed", bit, Direction::In);
-  auto creditsType = BundleType::get(ctx, {{b.getStringAttr("awValue"),false,UIntType::get(ctx,4,false)},
-      {b.getStringAttr("wValue"),false,UIntType::get(ctx,4,false)},
+  auto creditsType = BundleType::get(ctx, {{b.getStringAttr("awValue"),false,UIntType::get(ctx,countWidth,false)},
+      {b.getStringAttr("wValue"),false,UIntType::get(ctx,countWidth,false)},
       {b.getStringAttr("awEmpty"),false,bit},{b.getStringAttr("wEmpty"),false,bit},
       {b.getStringAttr("writeReqDone"),false,bit}});
   auto credits = port(modules[0], "fased_ingress_credits", creditsType, Direction::Out);
@@ -85,7 +100,7 @@ LogicalResult goldengate::addFASEDIngressDeadlock(CircuitOp circuit,
   for (auto i : gates.getOps<InstanceOp>()) {
     if (i.getInstanceName() == "ingressDeadlock")
       return reject("FASED deadlock assertion instance already exists");
-    if (i.getInstanceName() == "awQueue" && i.getModuleName() == "GGFASEDIngressAWQueue10") awQueue = i;
+    if (i.getInstanceName() == "awQueue" && i.getModuleName() == queueName) awQueue = i;
   }
   if (!relaxed || !credits || !order || !clock || !reset || !w || !awQueue ||
       awQueue.getNumResults() < 3 || awQueue.getPortNameStr(2) != "enq")

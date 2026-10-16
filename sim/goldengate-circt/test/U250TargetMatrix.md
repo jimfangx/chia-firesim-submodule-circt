@@ -7901,3 +7901,102 @@ SHA256-verified and losslessly gzipped, recovering another 12,238,149,982 bytes
 (`lossless-storage-cleanup-250-quad.json`). Their JSON/RTL/collateral and all
 current iteration-251 boundaries remain uncompressed; the regression report
 also recognizes the historical gzip paths. Final free space is 24 GiB.
+
+
+### Iteration 252: derive the ingress deadlock boundary from the constructor
+
+`FASEDIngressDeadlock.cpp` now consumes the positive, at-most-64-bit
+`axi4Edge.maxFlight` constructor carried by `GGFASEDTokenEngine`. It checks
+`log2Ceil(min(16, maxFlight) + 1)` credit value bits and the corresponding
+`GGFASEDIngressAWQueue<depth>` identity, matching the upstream AW queue and
+credit passes. This removes the four-bit-credit/ten-entry-queue restriction
+for Gemmini and Saturn Rocket. The two production `firrtl.assert` operations,
+actual enqueue valid/ready bindings, qualified reset, host clock, strict and
+relaxed policies and six internal context ports retain their prior behavior.
+Constructor, hierarchy and boundary validation precede every mutation.
+
+The Scala oracle inspected is `MidasTransforms.scala`, `FAMETransform.scala`,
+`models/dram/IngressUnit.scala` (both deadlock assertions),
+`models/dram/FASEDMemoryTimingModel.scala` (`maxWrites` and `getMaxPerID`),
+`configs/FASEDTargetConfigs.scala` (sixteen default requests),
+`widgets/Lib.scala` (counter width) and `models/dram/EgressUnit.scala`.
+The native test exercises maxFlight 1, 2, 3, 8, 10, 16, 20 and INT64_MAX in
+both ordinary and selected Print hierarchies. All 8,192 assertion cases and
+104 atomic rejection cases pass, including missing/malformed constructors,
+zero/negative/128-bit capacities, incorrect status widths and queue identities.
+The Print binding CTest and selected deadlock integration test pass; the latter
+retains existing modules, ports, ordinary SSA, annotations and allocated
+headers, with nine atomic rejections.
+
+Focused production-boundary comparisons use the following actual SFC artifacts:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  (SHA256 `5ca576a7f925848eb4ec2f2d71bf040e7ff2b2de0a1aedfae141e0801c6b938d`).
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`
+  (SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`).
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  (SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`).
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  (SHA256 `2aaa560a480c9b8c65973c526851c52a6a853f4802ecb4d1bbac493313e4428f`).
+
+All four oracles match the native helper's predicate/enable operands across
+512 cases each (2,048 total), including 32 W failures, 32 AW failures and
+256 reset-disabled cases per oracle. Eight deliberately failing, isolated
+Verilator runs require the two actual production assertions and their exact
+SFC diagnostics. Safe cases clock the unchanged production assertions.
+The exporter clones the actual helper, preserving its assertion operations;
+it does not reconstruct the deadlock conditions. The comparator recursively
+extracts the real SFC expression cones. This is an isolated helper comparison,
+not a FireSim manager metasimulation gate.
+
+Structured before/after checks match all unrelated module bodies, copied
+ports, actual AW/W enqueue valid/ready bindings, qualified reset/clock, six
+context ports, complete annotation archives and the shared Rocket helper.
+They retain the 32,768 issue-policy cases per comparison. The new Gemmini and
+Saturn boundaries have five-bit credits and sixteen-entry AW queues, matching
+their SFC counter widths and AW RAM geometries. The immutable October 1 U250
+artifact is read-only throughout.
+
+Evidence is under generated-src's `iteration252-u250-target-matrix/`:
+`ctest.log`, `selected-print.log`, `deadlock-comparison.json`,
+`deadlock-{rocket,gemmini,saturn,oct1}/` and `next-read-buffer-oracle.json`.
+
+The fresh thirteen-recipe replay uses compiler SHA256
+`1968855485ee9bcd705fa719e28c8c939b09a64356cb48b82fbaaabc58eddf62` and each recipe's archived FIRRTL,
+annotations and effective platform configuration. `replay/matrix.json` retains
+three compiled Rocket recipes, four compiler gaps and six unsupported
+partition/QSFP platforms; exit 1 preserves those gaps. Eight structured
+annotation boundaries match, six retain the previously recorded native SRAM
+model-port differences, and twelve are not reached. Both Gemmini and Saturn
+Rocket now emit `post-fame-fased-ingress-deadlock.mlir` and its complete
+annotation archive before rejecting the read-buffer contract. BOOM/Shuttle
+retain the TracerV constructor/channel restriction.
+
+The next smallest core port is `FASEDReadBuffer.cpp`: derive per-ID storage
+from the constructor's `idReuse`, not the fixed one-request-per-ID geometry.
+For these two targets the archived constructor has maxFlight 20, idReuse 2,
+eight beats per read, four ID bits and 64-bit data. Actual SFC `ReadEgress`
+binds enqueue ID directly without a reorder buffer; `MultiQueue` contains
+256 64-bit data entries, corresponding to sixteen IDs with sixteen beats
+per ID. `next-read-buffer-oracle.json` records these constructors, equations,
+RAM declarations and exact golden hashes. Response scheduling, additional
+capacity assumptions, wider TracerV profiles, SRAM parity and partition/QSFP
+support remain unresolved. No FireSim manager gate was started.
+
+`matrix-regression.json` matches all thirteen input hashes, effective platforms,
+compile statuses and structured comparisons to iteration 251. All 1393 previously
+emitted MLIR/JSON boundary files match after replacing only the candidate
+output-directory prefix. This includes all 779 boundaries for the three
+compiled Rocket recipes. Each Rocket recipe retains six byte-identical final
+RTL/collateral files. Only the two new deadlock boundary/annotation pairs and
+the corresponding later rejection diagnostics are added. The source stability
+check matches all 671 compiler/build inputs and the compiler binary before
+and after the full replay (`source-replay-stability.json`).
+
+Storage cleanup compressed 839 older candidate MLIR files with gzip, verifying each
+decompressed SHA256 before removing its raw copy. The two
+`lossless-storage-cleanup-*.json` manifests record paths, hashes and sizes;
+57924189641 bytes were recovered. Iteration 252 boundaries, all prior JSON,
+final RTL/collateral and every immutable SFC fixture remain intact; free space
+is approximately 26 GiB for the next harness build. The compressed iteration
+251 quad-core and Shuttle dumps had already passed the regression comparison.
