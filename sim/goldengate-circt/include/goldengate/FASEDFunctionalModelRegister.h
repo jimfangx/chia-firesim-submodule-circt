@@ -9,7 +9,9 @@ namespace goldengate {
 // unchanged on failure. No annotation classes or cached analyses consumed.
 mlir::LogicalResult materializeFASEDFunctionalModelRegister(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp &bank, std::string &error);
-// Attach the same uninstantiated four-port bank to the ten-flight latency wrapper.
+// Attach the same uninstantiated four-port bank to the latency wrapper with a
+// positive retained maxFlight. Register width/default and bit-zero ingress
+// binding are independent of the constructor's outstanding-request capacity.
 // Boundary preflight precedes mutation; copied-port targets transfer while the
 // consumed ingress-relaxation target remains on the inner module.
 mlir::LogicalResult attachFASEDFunctionalModelRegister(circt::firrtl::CircuitOp circuit,

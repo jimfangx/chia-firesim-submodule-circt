@@ -3,7 +3,8 @@
 // Materialization requires a free bank symbol and preserves top/annotations.
 // Attachment requires an uninstantiated legacy or selected Print latency-register
 // wrapper, host clock/reset,
-// one-bit ingress relaxed input and retained ten-flight bridge constructor.
+// one-bit ingress relaxed input and a retained positive maxFlight constructor.
+// FuncModelProgrammableRegs does not size this MMIO word from maxFlight.
 // Consumes/produces annotations: none; preserves and explicitly retargets all.
 // IR mutations: a host-clocked 32-bit reset register, decoded MCR word 18
 // (byte offset 72), and a wrapper consuming the ingress relaxation input.
@@ -55,8 +56,8 @@ LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
   auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() != 10)
-    return reject("FASED functional model register currently requires the recorded ten-flight constructor");
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
+    return reject("FASED functional model register requires a positive retained maxFlight constructor");
   auto *ctx = circuit.getContext();
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);
