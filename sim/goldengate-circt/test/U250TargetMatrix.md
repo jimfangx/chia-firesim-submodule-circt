@@ -8119,3 +8119,96 @@ the read-buffer guard to the read-scheduler guard. The final source/build
 snapshot matches all 671 recorded inputs, and the compiler binary is unchanged
 through the replay (`source-replay-stability.json`). The comparator-only wire
 check correction is separately recorded in `comparison-text-check-fix.json`.
+
+
+## Iteration 254 — no-ROB read scheduling for two requests per ID
+
+Iteration 253's replay of all thirteen archived pre-MIDAS inputs showed that
+Gemmini Rocket and Saturn Rocket pass the new sixteen-beat read buffer but
+stop at `FASEDReadScheduler.cpp`'s fixed idReuse 1/maxFlight 10 constructor
+guard. The Scala `ReadEgress` oracle selects direct AXI IDs whenever virtual
+storage is at most `0x20000` bits. With 35/64/4-bit AXI, eight-beat transfers
+and idReuse 1 or 2, virtual storage is at most 16,384 bits, so positive
+maxFlight cannot select a reorder buffer or change request scheduling.
+
+The CIRCT pass now accepts that constructor contract and emits its existing
+FIRRTL scheduler operations for both capacities. It retains the unreset
+current ID, reset valid bit, new-request priority over retirement, immediate
+prefetch ID, token-qualified dequeue and response validity. Unsupported
+widths/capacities, nonpositive maxFlight and oversized integer attributes are
+rejected before mutation. This advances actual compiler output for Gemmini
+and Saturn; it does not claim those complete targets compile.
+
+The native test covers ordinary and selected Print roots, idReuse 1/2 and
+maxFlight 1/10/20: 393,216 scheduler state/edge cases, plus 52 atomic rejection
+checks. Both focused CTests (`goldengate-fased-read-scheduler` and
+`goldengate-print-binding`) pass. The selected Print adapter check also passes
+with unchanged allocated headers, prior operations and recursive annotation
+identity, including nine atomic rejections. Its input is the archived
+`iteration164-print-fased-histograms/compatibility/post-print-fased-read-buffer.mlir.gz`.
+The existing invalid maxFlight test now uses zero, since eleven is supported.
+
+The isolated RTL comparison exports the unchanged production scheduler and
+its actual eight- or sixteen-beat queue, connected as in the production
+wrapper. It compares them against the complete actual SFC `ReadEgress` and
+`MultiQueue` modules from these exact immutable artifacts:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  (SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`).
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  (SHA256 `5ca576a7f925848eb4ec2f2d71bf040e7ff2b2de0a1aedfae141e0801c6b938d`).
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  (SHA256 `2aaa560a480c9b8c65973c526851c52a6a853f4802ecb4d1bbac493313e4428f`).
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`
+  (SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`).
+
+All four sequential differentials pass: 161,864 cycles and 88,506 initialized
+payload checks in total. Rocket and October 1 each run 40,338 cycles; Gemmini
+and Saturn each run 40,594. Request replacement, retirement, reset/capture
+priority, target stalls, sixteen pointer/full-flag sets and defined payloads
+match. Undefined same-address read/write payloads are excluded. The SFC
+scheduler modules are identical across the three matrix profiles; the CIRCT
+scheduler module is also identical across the new profiles. Each production
+composition retains 161 prior modules, compares 190 wrapper connections and
+preserves full annotation archives (1,676 Rocket, 3,697 Gemmini, 2,160 Saturn).
+These are isolated helper simulations, not FireSim manager metasimulations.
+
+The thirteen-target replay uses compiler SHA256
+`73962d7e275509be45ea60bcc3050a9f4f56e159e902720125cbd165dd69dc62`.
+It retains three compiled Rocket recipes, four compiler gaps and six distinct
+unsupported partition/QSFP profiles. Exit 1 preserves those gaps. Eight
+annotation boundaries match, six retain the native SRAM model-port mismatches
+and twelve are not reached. Gemmini and Saturn now emit
+`post-fame-fased-read-scheduler.mlir` and its complete annotation archive,
+then reject at the write-egress constructor guard. BOOM and Saturn Shuttle
+retain the wider TracerV restriction.
+
+Evidence is in generated-src's `iteration254-u250-target-matrix/`:
+`ctest.log`, `selected-print-scheduler.log`, `sfc-read-egress-inspection.json`,
+`read-scheduler-comparison.json`, four `read-scheduler-*-checked/` directories,
+`replay/matrix.json` and per-recipe full stdout/stderr/comparison records.
+No FireSim manager gate was started; ordered manager verification remains
+owned by the harness.
+
+The next smallest core port is `FASEDWriteEgress.cpp`: derive acknowledgment
+counter width from maxReqsPerId and port nonzero testing, wrapping updates,
+retry sampling and simultaneous enqueue/retirement priority. Actual SFC
+Gemmini/Saturn `WriteEgress` has two-bit counters, whereas Rocket has one-bit
+counters; removing its guard alone would be incorrect. Timing-model, wider
+TracerV, native SRAM-model parity, partition/QSFP and full-target execution
+remain unresolved.
+
+Storage cleanup losslessly compressed 717 older iteration 253 MLIR files,
+recovering 48,791,485,946 bytes after verifying every decompressed SHA256.
+`lossless-storage-cleanup-253.json` records the paths, hashes and sizes.
+Current iteration boundaries, older JSON/final RTL/collateral and immutable
+SFC fixtures remain intact.
+
+`matrix-regression.json` verifies the same thirteen archived input hashes,
+effective platforms, compile statuses and structured comparisons as iteration
+253. All 1,401 prior MLIR/JSON boundaries match after normalizing only the
+candidate output-directory prefix. All 18 final Rocket RTL/collateral files
+remain byte-identical. Only Gemmini/Saturn's four scheduler/annotation files
+are added, and their diagnostics advance from read scheduler to write egress.
+The source/build snapshot retains all 671 recorded input hashes; the compiler
+binary is unchanged throughout replay (`source-replay-stability.json`).

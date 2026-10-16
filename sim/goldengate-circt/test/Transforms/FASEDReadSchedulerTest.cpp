@@ -21,7 +21,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false,unsigned reuse=1,unsigned flight=10) {
   llvm::StringRef rootName = selected ? "GGSelectedPrintFASEDReadBufferWrapper"
                                       : "GGFASEDReadBufferWrapper";
   std::string input = "module { firrtl.circuit \"" + rootName.str() +
@@ -41,7 +41,18 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=fal
   auto top=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ports);
   if(mode!=10){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     auto attrs=[&](std::initializer_list<std::pair<llvm::StringRef,int>> es){NamedAttrList list;for(auto [n,v]:es)list.set(n,b.getI64IntegerAttr(v));return list.getDictionary(&ctx);};
-    engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxReadTransfer",8},{"idReuse",mode==11?2:1},{"maxFlight",10}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
+    engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxReadTransfer",8},{"idReuse",mode==11?3:static_cast<int>(reuse)},{"maxFlight",mode==20?0:mode==21?-1:static_cast<int>(flight)}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
+  if(mode>=22&&mode<=25) {
+    auto engine=named(c,"GGFASEDTokenEngine");
+    NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+    NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+    if(mode==22)edge.erase("idReuse");
+    if(mode==23)edge.set("maxFlight",b.getStringAttr("10"));
+    if(mode==24||mode==25)edge.set(mode==24?"idReuse":"maxFlight",
+      b.getIntegerAttr(b.getIntegerType(128),APInt(128,mode==24?1:10)));
+    key.set("axi4Edge",edge.getDictionary(&ctx));
+    engine->setAttr("goldengate.bridgeConstructor",key.getDictionary(&ctx));
+  }
   if(mode==13||mode==14)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==13?"GGFASEDReadScheduler":selected?"GGSelectedPrintFASEDReadSchedulerWrapper":"GGFASEDReadSchedulerWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"used");}if(mode==16)c.setName("other");
   SmallVector<Attribute> raw;for(auto n:{"other","fased_egress_readiness","fased_egress_readiness.readValid","fased_egress_readiness.writeValid","fased_read_buffer_address","fased_read_buffer_deq.valid","fased_read_buffer_deq.bits.data","fased_read_buffer_deq.bits.last"})raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~"+c.getName().str()+"|"+c.getName().str()+">"+std::string(n)))}));
@@ -123,8 +134,8 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx,bool selected) {
-  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx,bool selected,unsigned reuse,unsigned flight) {
+  auto root=fixture(ctx,0,selected,reuse,flight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);require(succeeded(verify(*root)),"invalid scheduler IR");
   Interpreter sim(named(c,"GGFASEDReadScheduler"));auto valid=*sim.module.getOps<RegResetOp>().begin();auto id=*sim.module.getOps<RegOp>().begin();require(sim.state.size()==2,"scheduler state differs");
   std::mt19937_64 random(217);unsigned cases=0,chained=0,resetStarts=0,invalidRetire=0;
@@ -169,8 +180,8 @@ void mapping(MLIRContext &ctx,bool selected) {
   llvm::outs()<<"32 wrapper mapping cases and eight target transfers passed\n";
 }
 void rejection(MLIRContext &ctx,bool selected) {
-  for(unsigned mode=1;mode<=19;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
-  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"20 atomic rejection cases passed\n";
+  for(unsigned mode=1;mode<=25;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDReadScheduler(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDReadScheduler(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"26 atomic rejection cases passed\n";
 }
 }
 int main(int argc, char **argv) {
@@ -190,7 +201,13 @@ int main(int argc, char **argv) {
       // Export the actual emitted scheduler and RAM/pointer operations. This
       // test top only composes them using the production wrapper connections.
       auto scheduler = cast<FModuleOp>(b.insert(named(circuit,"GGFASEDReadScheduler")->clone()));
-      auto buffer = cast<FModuleOp>(b.insert(named(circuit,"GGFASEDReadBuffer16x8")->clone()));
+      FModuleOp productionBuffer;
+      for(auto m:circuit.getOps<FModuleOp>())
+        if(m.getName()=="GGFASEDReadBuffer16x8"||m.getName()=="GGFASEDReadBuffer16x16") {
+          require(!productionBuffer,"ambiguous read buffer");productionBuffer=m;
+        }
+      require(bool(productionBuffer),"missing production read buffer");
+      auto buffer = cast<FModuleOp>(b.insert(productionBuffer->clone()));
       SmallVector<PortInfo> ports;
       auto port = [&](llvm::StringRef name, FModuleOp m, unsigned index) {
         auto p = m.getPorts()[index]; p.name = b.getStringAttr(name); ports.push_back(p);
@@ -222,7 +239,11 @@ int main(int argc, char **argv) {
       out.close(); isolated.erase(); return 0;
     }
     require(argc==1,"usage: goldengate-fased-read-scheduler-test [scheduler.mlir egress.mlir]");
-    for(bool selected:{false,true}) {behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}
+    for(bool selected:{false,true}) {
+      for(unsigned reuse:{1u,2u})for(unsigned flight:{1u,10u,20u})
+        behavior(ctx,selected,reuse,flight);
+      mapping(ctx,selected);rejection(ctx,selected);
+    }
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

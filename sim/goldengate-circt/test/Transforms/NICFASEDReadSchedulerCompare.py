@@ -16,13 +16,13 @@ from pathlib import Path
 import re
 import subprocess
 from NICMMIOBankCompare import modules
-from NICFASEDReadBufferCompare import composition as buffer_composition
+from NICFASEDReadBufferCompare import composition as buffer_composition, helper_name
 from PrintControlResponsesCompare import clean, module, equations
 from PrintRocketControlMasterCompare import native_ports
 from PrintRocketFASEDReadBufferCompare import wrapper_wiring
 from PrintSelectedFASEDReadSchedulerCompare import transfer
 
-SCHEDULER, BUFFER = 'GGFASEDReadScheduler', 'GGFASEDReadBuffer16x8'
+SCHEDULER = 'GGFASEDReadScheduler'
 OLD, NEW = 'GGFASEDReadBufferWrapper', 'GGFASEDReadSchedulerWrapper'
 
 
@@ -32,8 +32,9 @@ def composition(directory, baseline):
     prior, actual = modules(before), modules(after)
     assert all(actual.get(n) == b for n, b in prior.items()), 'existing module changed'
     assert set(actual) - set(prior) == {SCHEDULER, NEW}
-    for name in (SCHEDULER, BUFFER):
-        assert actual[name] == modules(baseline.read_text())[name], 'shared helper changed'
+    if baseline is not None:
+        for name in (SCHEDULER, helper_name(after)):
+            assert actual[name] == modules(baseline.read_text())[name], 'shared helper changed'
     copied = [p for p in native_ports(prior[OLD]) if p[1] not in (
         'fased_egress_readiness', 'fased_read_buffer_address', 'fased_read_buffer_deq')]
     assert native_ports(actual[NEW])[:len(copied)] == copied
@@ -84,11 +85,17 @@ def differential(candidate, golden, export_tool, out):
     exported, native = out / 'read-egress.mlir', out / 'read-egress.sv'
     run([export_tool, candidate, exported], 'export')
     isolated = modules(exported.read_text().replace('firrtl.module public @', 'firrtl.module @'))
-    assert set(isolated) == {SCHEDULER, BUFFER, 'GGNICReadEgress'}
+    buffer = helper_name(candidate.read_text())
+    entries = int(buffer.split('x')[-1])
+    assert set(isolated) == {SCHEDULER, buffer, 'GGNICReadEgress'}
     actual = modules(candidate.read_text())
-    for name in (SCHEDULER, BUFFER):
+    for name in (SCHEDULER, buffer):
         assert isolated[name] == actual[name], 'export rebuilt production helper'
     run(['firtool', exported, '--format=mlir', '--disable-all-randomization', '-o', native], 'firtool')
+    reference = clean(golden.read_text())
+    queue = module(reference, 'MultiQueue')[1]
+    assert re.search(r'reg \[63:0\] ram_data \[0:' + str(16 * entries - 1) + r'\]', queue)
+    assert 'ReorderBuffer' not in module(reference, 'ReadEgress')[1]
     oracle = ''
     for name in ('ReadEgress', 'MultiQueue'):
         header, body = module(clean(golden.read_text()), name)
@@ -157,7 +164,7 @@ begin
  if(oracle.currReqReg_valid&&(!targetFire||!resp_tReady))stalls++;
  if(!oracle.multiQueue_io_enq_ready)fullCycles++;
  if(reset&&enq_valid&&oracle.multiQueue_io_enq_ready)resetWrites++;
- if(oracle.multiQueue_io_deq_ready&&oracle.multiQueue_io_deq_valid&&oracle.multiQueue._GEN_101==7)wraps++;
+ if(oracle.multiQueue_io_deq_ready&&oracle.multiQueue_io_deq_valid&&oracle.multiQueue._GEN_101==@LAST@)wraps++;
  if(oracle.multiQueue_io_deqAddr!=previous)switches++;
  collision=enq_valid&&oracle.multiQueue_io_enq_ready&&
    oracle.multiQueue.ram_data_MPORT_addr==oracle.multiQueue.ram_data_io_deq_bits_MPORT_addr;
@@ -173,14 +180,14 @@ initial begin
  reset=0;targetFire=0;req_valid=0;
  // Initialize every payload location; unspecified power-on RAM is excluded.
  for(i=0;i<16;i++)begin enqAddr=i;
-   for(j=0;j<8;j++)begin enq_valid=1;enq_bits_data={32'hfeed0000+i,32'h01230000+j};
-     enq_bits_last=(j==7);step();end
+   for(j=0;j<@ENTRIES@;j++)begin enq_valid=1;enq_bits_data={32'hfeed0000+i,32'h01230000+j};
+     enq_bits_last=(j==@LAST@);step();end
  end
  payloadInitialized=1;enq_valid=0;resp_tReady=1;targetFire=1;
  // Retire all IDs, with bubbles after last beats, to exercise synchronous
  // prefetch and pointer wrapping before arbitrary interleaved requests.
  for(i=0;i<16;i++)begin req_valid=1;req_bits=i;step();req_valid=0;
-   for(j=0;j<12;j++)step();end
+   for(j=0;j<@DRAIN@;j++)step();end
  for(i=0;i<40000;i++)begin
    rng=rng^(rng<<13);rng=rng^(rng>>17);rng=rng^(rng<<5);
    req_bits=(i%3==0)?resp_tBits_id:rng[3:0];enqAddr=rng[7:4];
@@ -196,7 +203,7 @@ initial begin
    stalls,fullCycles,resetWrites,switches,wraps);
  $finish;
 end endmodule
-'''.replace('@STATE_CHECKS@', '\n'.join(checks))
+'''.replace('@STATE_CHECKS@', '\n'.join(checks)).replace('@LAST@', str(entries-1)).replace('@ENTRIES@', str(entries)).replace('@DRAIN@', str(entries+4))
     (out / 'check.sv').write_text(tb)
     run(['verilator', '--binary', '-j', '4', '--timing', '-Wno-fatal', '--top-module', 'check',
          '--Mdir', out / 'obj', '-o', 'check', out / 'check.sv', native, out / 'oracle.sv'], 'verilator')
@@ -204,7 +211,7 @@ end endmodule
     log = (out / 'simulation.log').read_text()
     assert 'PASS cycles=' in log
     return dict({n: int(v) for n, v in re.findall(r'(\w+)=(\d+)', log)},
-                production_helpers_cloned_verbatim=True, actual_sfc_sequential_rtl=True,
+                production_helpers_cloned_verbatim=True, actual_sfc_sequential_rtl=True, beats_per_id=entries,
                 initialized_payload_memory=True, undefined_RUW_payload_excluded=True)
 
 

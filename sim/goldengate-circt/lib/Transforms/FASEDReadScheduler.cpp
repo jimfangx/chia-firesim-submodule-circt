@@ -1,12 +1,12 @@
 // See LICENSE for license details.
-// Oracle: EgressUnit.scala ReadEgress, recorded Rocket no-ROB profile.
+// Oracle: EgressUnit.scala ReadEgress, 35/64/4-bit, 8-beat no-ROB profiles.
 // Requests address the synchronous buffer immediately on targetFire. The
 // current ID is not reset; only its valid bit is. A new request wins over an
 // accepted final beat. Neither retirement nor dequeue-ready includes the
 // buffer's valid bit: token readiness guarantees that on legal target cycles.
 // Timing-model requests/response payload remain explicit until model lowering.
 // Required input: uninstantiated legacy or selected Print read-buffer top,
-// exact clock/reset/fire/readiness/dequeue ports, recorded 35/64/4 no-ROB key.
+// exact clock/reset/fire/readiness/dequeue ports, 35/64/4 no-ROB key with one or two requests per ID.
 // Annotations: consume none; transfer copied ports and mapped response leaves
 // recursively in rawAnnotations; retain targets of consumed internal ports.
 // IR mutations: append shared scheduler and wrapper, replace circuit root/archive.
@@ -39,10 +39,17 @@ LogicalResult goldengate::addFASEDReadScheduler(CircuitOp circuit, std::string &
   auto key=engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
   auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
   auto widths=key?key.getAs<DictionaryAttr>("axi4Widths"):DictionaryAttr();
-  auto has=[&](DictionaryAttr d,llvm::StringRef n,int v) { auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();return a&&a.getInt()==v; };
-  if (!has(edge,"maxReadTransfer",8)||!has(edge,"idReuse",1)||!has(edge,"maxFlight",10)||
+  auto has=[&](DictionaryAttr d,llvm::StringRef n,int v) { auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();return a&&a.getValue().getBitWidth()<=64&&a.getInt()==v; };
+  auto reuse=edge?edge.getAs<IntegerAttr>("idReuse"):IntegerAttr();
+  auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
+  // ReadEgress selects direct AXI IDs when virtualState <= 0x20000 bits.
+  // For these constructors virtualState is at most 2 * 16 * 8 * 64;
+  // maxFlight cannot enable translation or alter request scheduling.
+  if (!has(edge,"maxReadTransfer",8)||!reuse||reuse.getValue().getBitWidth()>64||
+      (reuse.getInt()!=1&&reuse.getInt()!=2)||!flight||
+      flight.getValue().getBitWidth()>64||flight.getInt()<=0||
       !has(widths,"addrBits",35)||!has(widths,"dataBits",64)||!has(widths,"idBits",4))
-    return reject("FASED read scheduler supports the recorded 35/64/4-bit no-ROB profile");
+    return reject("FASED read scheduler supports 35/64/4-bit, 8-beat, one or two requests per ID with positive maxFlight");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w) {return UIntType::get(ctx,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> es) {
