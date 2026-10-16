@@ -7866,7 +7866,8 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS selected FASED read scheduler, unchanged allocated headers/SSA, 9 atomic rejections\n";
       return 0;
     }
-    if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-read-buffer") {
+    if (argc == 3 && (StringRef(argv[1]) == "--selected-print-fased-read-buffer" ||
+                      StringRef(argv[1]) == "--selected-print-fased-read-buffer-reuse2")) {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
       require(bool(source) && succeeded(verify(*source)), "invalid selected ingress issue boundary");
       auto c = *source->getOps<CircuitOp>().begin(); OpBuilder b(&ctx); std::string error;
@@ -7876,6 +7877,17 @@ int main(int argc, char **argv) {
           hosts.push_back(named(circuit, cast<DictionaryAttr>(attr).getAs<StringAttr>("hostModule").getValue()));
         return hosts;
       };
+      bool reuse2 = StringRef(argv[1]).ends_with("-reuse2");
+      llvm::StringRef helper = reuse2 ? "GGFASEDReadBuffer16x16" : "GGFASEDReadBuffer16x8";
+      if (reuse2) {
+        auto engine = named(c, "GGFASEDTokenEngine");
+        NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+        NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+        edge.set("idReuse", b.getI64IntegerAttr(2));
+        edge.set("maxFlight", b.getI64IntegerAttr(20));
+        key.set("axi4Edge", edge.getDictionary(&ctx));
+        engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
+      }
       // Probe recursive annotation identity, including a copied aggregate leaf.
       SmallVector<Attribute> raw(c->getAttrOfType<ArrayAttr>("rawAnnotations").getValue());
       auto probe = b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.ReadBufferIdentity")),
@@ -7898,7 +7910,7 @@ int main(int argc, char **argv) {
         else if (bad == 3) named(tc, "GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
         else if (bad == 4 || bad == 5) {
           b.setInsertionPointToEnd(tc.getBodyBlock());
-          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr(bad == 4 ? "GGFASEDReadBuffer16x8" : "GGSelectedPrintFASEDReadBufferWrapper"),
+          b.create<FModuleOp>(tc.getLoc(), b.getStringAttr(bad == 4 ? helper : "GGSelectedPrintFASEDReadBufferWrapper"),
               named(tc, "GGSelectedPrintFASEDIngressIssueWrapper").getConventionAttr(), ArrayRef<PortInfo>{});
         } else if (bad == 8) {
           auto aw = named(tc, "GGFASEDIngressAW");
@@ -7911,7 +7923,7 @@ int main(int argc, char **argv) {
           else {
             NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
             NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
-            edge.set("maxFlight", b.getI64IntegerAttr(11));
+            edge.set("maxFlight", b.getI64IntegerAttr(0));
             key.set("axi4Edge", edge.getDictionary(&ctx));
             engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
           }
@@ -7929,6 +7941,10 @@ int main(int argc, char **argv) {
       std::string beforeHeader, afterHeader;
       require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(c, hostsFor(c), beforeHeader, error)), error);
       require(succeeded(goldengate::mapPrintBridgeFASEDReadBuffer(c, hostsFor(c), error)) && succeeded(verify(*source)), error);
+      auto readQueue = named(c, helper);
+      require(std::distance(readQueue.getOps<MemOp>().begin(), readQueue.getOps<MemOp>().end()) == 1 &&
+          (*readQueue.getOps<MemOp>().begin()).getDepth() == (reuse2 ? 256u : 128u),
+          "selected FASED read queue capacity differs");
       SmallVector<Operation *> after;
       for (auto m : modules) {
         require(named(c, m.getName()) == m && body(m) == bodies.at(m.getName().str()), "selected FASED read buffer replaced prior module");

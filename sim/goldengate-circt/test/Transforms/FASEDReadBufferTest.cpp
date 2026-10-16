@@ -13,6 +13,7 @@
 #include <map>
 #include <random>
 #include <stdexcept>
+#include <vector>
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
@@ -26,7 +27,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
 struct Interpreter {
   FModuleOp module;
   MemOp ram;
-  std::array<APInt, 128> memory;
+  std::vector<APInt> memory;
   APInt readOutput = APInt(65,0);
   std::map<std::string, Value> drivers;
   std::map<std::string, APInt> memo;
@@ -36,12 +37,12 @@ struct Interpreter {
     return std::to_string(reinterpret_cast<uintptr_t>(v.getAsOpaquePointer()));
   }
   unsigned width(Value v) { return cast<UIntType>(v.getType()).getWidthOrSentinel(); }
-  Interpreter(FModuleOp m) : module(m) {
+  Interpreter(FModuleOp m, unsigned entries) : module(m), memory(16 * entries) {
     for (auto c : m.getOps<StrictConnectOp>())
       require(drivers.emplace(key(c.getDest()), c.getSrc()).second, "multiple drivers");
     require(std::distance(m.getOps<MemOp>().begin(), m.getOps<MemOp>().end()) == 1, "queue needs one memory");
     ram = *m.getOps<MemOp>().begin();
-    require(ram.getDepth() == 128 && ram.getDataType() == UIntType::get(m.getContext(), 65, false) &&
+    require(ram.getDepth() == 16 * entries && ram.getDataType() == UIntType::get(m.getContext(), 65, false) &&
         ram.getReadLatency() == 1 && ram.getWriteLatency() == 1 && ram.getRuw() == RUWAttr::Undefined &&
         ram.getNumResults() == 2 && ram.getPortKind(size_t(0)) == MemOp::PortKind::Read &&
         ram.getPortKind(size_t(1)) == MemOp::PortKind::Write, "wrong memory geometry/latency/ports");
@@ -88,7 +89,7 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false, unsigned reuse = 1, unsigned flight = 10) {
   std::string text=R"(module {
     firrtl.circuit "GGFASEDIngressIssueWrapper" {
       firrtl.module @GGFASEDTokenEngine() attributes {goldengate.bridgeConstructor = {
@@ -103,8 +104,8 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
     auto p=text.find(a.str()); require(p!=std::string::npos,"missing replacement");text.replace(p,a.size(),z.str());
   };
   if (variant==1) replace("maxReadTransfer = 8","maxReadTransfer = 9");
-  if (variant==2) replace("idReuse = 1","idReuse = 2");
-  if (variant==3) replace("maxFlight = 10","maxFlight = 11");
+  if (variant==2) replace("idReuse = 1","idReuse = 3");
+  if (variant==3) replace("maxFlight = 10","maxFlight = 0");
   if (variant==4) replace("addrBits = 35","addrBits = 34");
   if (variant==5) replace("dataBits = 64","dataBits = 128");
   if (variant==6) replace("idBits = 4","idBits = 5");
@@ -116,6 +117,18 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
   if (variant==12) replace("%other:","%fased_read_buffer_deq:");
   if (variant==13) replace("@GGFASEDTokenEngine","@missingEngine");
   if (variant==14) replace("maxReadTransfer","missingMaxReadTransfer");
+  if (variant==18) replace("idReuse = 1 : i64", "idReuse = -1 : i64");
+  if (variant==19) replace("idReuse", "missingReuse");
+  if (variant==20) replace("idReuse = 1 : i64", "idReuse = 1 : i128");
+  if (variant==21) replace("idReuse = 1 : i64", "idReuse = \"1\"");
+  if (variant==22) replace("maxFlight", "missingFlight");
+  if (variant==23) replace("maxFlight = 10 : i64", "maxFlight = -1 : i64");
+  if (variant==24) replace("maxFlight = 10 : i64", "maxFlight = 10 : i128");
+  if (variant==25) replace("maxFlight = 10 : i64", "maxFlight = \"10\"");
+  if (variant != 2 && !(variant >= 18 && variant <= 21))
+    replace("idReuse = 1", "idReuse = " + std::to_string(reuse));
+  if (variant != 3 && !(variant >= 22 && variant <= 25))
+    replace("maxFlight = 10", "maxFlight = " + std::to_string(flight));
   if (selected) {
     const std::string old = "GGFASEDIngressIssueWrapper", updated = "GGSelectedPrintFASEDIngressIssueWrapper";
     for (size_t at = 0; (at = text.find(old, at)) != std::string::npos; at += updated.size())
@@ -131,7 +144,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
   if (variant!=15) c->setAttr("rawAnnotations",b.getArrayAttr(annos));
   if (variant==16) {
     b.setInsertionPointToEnd(c.getBodyBlock());
-    b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDReadBuffer16x8"),ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{});
+    b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDReadBuffer16x" + std::to_string(8*reuse)),ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{});
   }
   if (variant==17) {
     b.setInsertionPointToEnd(named(c,"GGFASEDTokenEngine").getBodyBlock());
@@ -139,8 +152,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
   }
   return root;
 }
-void behavior(MLIRContext &context, bool selected) {
-  auto root=fixture(context,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &context, bool selected, unsigned reuse, unsigned flight) {
+  unsigned entries = 8 * reuse;
+  auto root=fixture(context,0,selected,reuse,flight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDReadBuffer(c,error)),error);
   require(succeeded(verify(*root)),"read buffer IR verification failed");
   const std::string outer = selected ? "GGSelectedPrintFASEDReadBufferWrapper" : "GGFASEDReadBufferWrapper";
@@ -157,13 +171,13 @@ void behavior(MLIRContext &context, bool selected) {
     require(cast<DictionaryAttr>(a).getAs<StringAttr>("target").getValue()==
         "~"+outer+"|"+target,"annotation transfer differs");
   }
-  Interpreter sim(named(c,"GGFASEDReadBuffer16x8"));std::mt19937_64 rng(216);
+  Interpreter sim(named(c,"GGFASEDReadBuffer16x" + std::to_string(entries)),entries);std::mt19937_64 rng(216);
   unsigned same=0,advance=0,resetWrites=0,full=0,wrap=0,collisions=0;
   // Independent known-state samples include all IDs and arbitrary pointer/full
   // states, previous-address switches, stalls, wraparound and reset edges.
   for (unsigned cycle=0;cycle<40000;++cycle) {
     std::array<unsigned,16> ep,dp,mf;
-    for (unsigned i=0;i<16;++i) { ep[i]=rng()%8;dp[i]=rng()%8;mf[i]=rng()%2; }
+    for (unsigned i=0;i<16;++i) { ep[i]=rng()%entries;dp[i]=rng()%entries;mf[i]=rng()%2; }
     unsigned ea=rng()%16,da=rng()%16,previous=rng()%16;
     if (cycle%3==0) da=previous;
     if (cycle%5==0) ea=previous;
@@ -187,8 +201,8 @@ void behavior(MLIRContext &context, bool selected) {
     input(sim.arg(3),"ready",1,ready);input(sim.arg(4),"",4,ea);input(sim.arg(5),"",4,da);
     bool enqReady=!(ep[ea]==dp[ea]&&mf[ea]),push=valid&&enqReady,pop=ready&&dv;
     bool prefetch=pop&&previous==da;
-    bool empty=prefetch ? ((dp[da]+1)%8)==ep[da] : dp[da]==ep[da]&&!mf[da];
-    unsigned address=da*8+(dp[da]+unsigned(prefetch))%8;
+    bool empty=prefetch ? ((dp[da]+1)%entries)==ep[da] : dp[da]==ep[da]&&!mf[da];
+    unsigned address=da*entries+(dp[da]+unsigned(prefetch))%entries;
     require(sim.drive(sim.arg(2),"ready").getBoolValue()==enqReady,"enqueue full differs");
     require(sim.drive(sim.arg(3),"valid").getBoolValue()==dv,"synchronous dequeue valid differs");
     require(sim.eval(sim.arg(6)).getBoolValue()==empty,"prefetch empty differs");
@@ -196,14 +210,14 @@ void behavior(MLIRContext &context, bool selected) {
     require(sim.drive(sim.arg(3),"bits.data")==sim.readOutput.lshr(1).trunc(64)&&
       sim.drive(sim.arg(3),"bits.last")==sim.readOutput.trunc(1),"stored beat unpack differs");
     auto expectedMemory=sim.memory;APInt nextRead=expectedMemory[address];
-    if (push) expectedMemory[ea*8+ep[ea]]=(APInt(65,data)<<1)|APInt(65,last);
+    if (push) expectedMemory[ea*entries+ep[ea]]=(APInt(65,data)<<1)|APInt(65,last);
     same+=ea==previous;advance+=prefetch;resetWrites+=reset&&push;full+=!enqReady;
-    wrap+=pop&&dp[previous]==7;collisions+=push&&ea*8+ep[ea]==address;
+    wrap+=pop&&dp[previous]==entries-1;collisions+=push&&ea*entries+ep[ea]==address;
     sim.edge();require(sim.memory==expectedMemory&&sim.readOutput==nextRead,"RAM write/read/reset differs");
     for (auto r:sim.module.getOps<RegResetOp>()) {
       auto n=r.getName();unsigned v=0;
-      if (n.consume_front("enqPtrs_")) {unsigned i=std::stoul(n.str());v=(ep[i]+unsigned(push&&ea==i))%8;}
-      else if (n.consume_front("deqPtrs_")) {unsigned i=std::stoul(n.str());v=(dp[i]+unsigned(pop&&previous==i))%8;}
+      if (n.consume_front("enqPtrs_")) {unsigned i=std::stoul(n.str());v=(ep[i]+unsigned(push&&ea==i))%entries;}
+      else if (n.consume_front("deqPtrs_")) {unsigned i=std::stoul(n.str());v=(dp[i]+unsigned(pop&&previous==i))%entries;}
       else if (n.consume_front("maybe_full_")) {
         unsigned i=std::stoul(n.str());v=mf[i];
         if (ea==previous) {if (ea==i&&push!=pop) v=push;}
@@ -214,23 +228,23 @@ void behavior(MLIRContext &context, bool selected) {
     require(sim.state.lookup(id.getResult()).getZExtValue()==da,"read ID was reset or held");
   }
   require(same&&advance&&resetWrites&&full&&wrap&&collisions,"missing coverage");
-  llvm::outs()<<"40000 read buffer state/edge samples: same ID "<<same<<", prefetch "<<advance
+  llvm::outs()<<"entries="<<entries<<" maxFlight="<<flight<<" 40000 read buffer state/edge samples: same ID "<<same<<", prefetch "<<advance
     <<", reset writes "<<resetWrites<<", full "<<full<<", dequeue wraps "<<wrap<<", RUW collisions "<<collisions<<"\n";
 }
-void rejection(MLIRContext &context, bool selected) {
-  for (unsigned v=1;v<=17;++v) {
-    auto root=fixture(context,v,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
+void rejection(MLIRContext &context, bool selected, unsigned reuse) {
+  for (unsigned v=1;v<=25;++v) {
+    auto root=fixture(context,v,selected,reuse);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
     {llvm::raw_string_ostream s(before);root->print(s);}
     require(failed(goldengate::addFASEDReadBuffer(c,error))&&!error.empty(),"invalid boundary accepted");
     {llvm::raw_string_ostream s(after);root->print(s);}
     require(before==after,"rejection mutated IR");
   }
-  auto root=fixture(context,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
+  auto root=fixture(context,0,selected,reuse);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;
   require(succeeded(goldengate::addFASEDReadBuffer(c,error)),error);
   {llvm::raw_string_ostream s(before);root->print(s);}
   require(failed(goldengate::addFASEDReadBuffer(c,error)),"repeated pass accepted");
   {llvm::raw_string_ostream s(after);root->print(s);} require(before==after,"repeat mutated IR");
-  llvm::outs()<<"18 atomic rejection cases\n";
+  llvm::outs()<<"26 atomic rejection cases\n";
 }
 } // namespace
 int main(int argc, char **argv) {
@@ -245,11 +259,17 @@ int main(int argc, char **argv) {
               "expected FASED read buffer boundary");
       auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&context);
       b.setInsertionPointToEnd(isolated.getBody());
-      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr("GGFASEDReadBuffer16x8"));
+      FModuleOp production;
+      for (auto m : circuit.getOps<FModuleOp>())
+        if (m.getName() == "GGFASEDReadBuffer16x8" || m.getName() == "GGFASEDReadBuffer16x16") {
+          require(!production, "ambiguous production read buffer"); production = m;
+        }
+      require(bool(production), "missing production read buffer");
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr(production.getName()));
       b.setInsertionPointToEnd(exported.getBodyBlock());
       // Clone actual production FIRRTL, including its memory and all control
       // expressions. No queue state or payload logic is rebuilt for this test.
-      auto helper = cast<FModuleOp>(b.insert(named(circuit, "GGFASEDReadBuffer16x8")->clone()));
+      auto helper = cast<FModuleOp>(b.insert(production->clone()));
       helper.setPublic();
       require(succeeded(verify(isolated)), "exported read buffer invalid");
       std::error_code ec; llvm::raw_fd_ostream out(argv[2], ec);
@@ -257,6 +277,9 @@ int main(int argc, char **argv) {
       out.close(); isolated.erase(); return 0;
     }
     require(argc == 1, "usage: goldengate-fased-read-buffer-test [read-buffer.mlir helper.mlir]");
-    for (bool selected : {false,true}) { behavior(context,selected);rejection(context,selected); } return 0;
+    for (bool selected : {false,true}) for (unsigned reuse : {1u,2u}) {
+      for (unsigned flight : {1u,10u,20u}) behavior(context,selected,reuse,flight);
+      rejection(context,selected,reuse);
+    } return 0;
   } catch (const std::exception &e) {llvm::errs()<<e.what()<<'\n';return 1;}
 }

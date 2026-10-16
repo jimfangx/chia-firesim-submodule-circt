@@ -1,7 +1,8 @@
 // See LICENSE for license details.
 // Oracle: Lib.scala MultiQueue and EgressUnit.scala ReadEgress without ROB.
-// Recorded Rocket profile: 16 IDs, eight beats/ID, data+last only. A synchronous
-// read prefetches after an accepted dequeue and remembers the previous ID.
+// Recorded profiles: 16 IDs, eight beats/request, one or two requests/ID.
+// Store data+last only. A synchronous read prefetches after an accepted
+// dequeue and remembers the previous ID.
 // Host R is always accepted by ReadEgress; internal MultiQueue can be full.
 // Qualified egress reset clears pointer/full/valid state, never RAM or read ID.
 // Consumes flat R handshakes; exposes R payload and raw read-buffer dequeue.
@@ -9,12 +10,12 @@
 // All supported-profile, hierarchy and port checks precede mutation.
 #include "goldengate/FASEDReadBuffer.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral queueName = "GGFASEDReadBuffer16x8";
   bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressIssueWrapper";
   llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDReadBufferWrapper" : "GGFASEDReadBufferWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
@@ -22,7 +23,7 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
     return reject("FASED read buffer requires the active ingress issue wrapper");
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getModuleName() == queueName || m.getModuleName() == wrapperName)
+    if (m.getModuleName() == wrapperName)
       return reject("FASED read buffer helper or wrapper already exists");
     if (m.getModuleName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
     if (m.getModuleName() == "GGFASEDTokenEngine") engine = dyn_cast<FModuleOp>(m.getOperation());
@@ -33,11 +34,24 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto widths = key ? key.getAs<DictionaryAttr>("axi4Widths") : DictionaryAttr();
   auto has = [&](DictionaryAttr d, llvm::StringRef n, int v) {
-    auto a = d ? d.getAs<IntegerAttr>(n) : IntegerAttr(); return a && a.getInt() == v;
+    auto a = d ? d.getAs<IntegerAttr>(n) : IntegerAttr(); return a && a.getValue().getBitWidth() <= 64 && a.getInt() == v;
   };
-  if (!has(edge,"maxReadTransfer",8) || !has(edge,"idReuse",1) || !has(edge,"maxFlight",10) ||
+  auto reuse = edge ? edge.getAs<IntegerAttr>("idReuse") : IntegerAttr();
+  auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
+  if (!has(edge,"maxReadTransfer",8) || !reuse ||
+      reuse.getValue().getBitWidth() > 64 || (reuse.getInt() != 1 && reuse.getInt() != 2) ||
+      !flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0 ||
       !has(widths,"dataBits",64) || !has(widths,"idBits",4) || !has(widths,"addrBits",35))
-    return reject("FASED read buffer supports the recorded 35/64/4-bit, 8-beat, one-request-per-ID profile");
+    return reject("FASED read buffer supports 35/64/4-bit, 8-beat, one or two requests per ID with positive maxFlight");
+  // BaseConfig.maxReadsPerID uses edge.idReuse directly. ReadEgress's virtual
+  // state is at most 16 * 16 * 64 bits here, below the translation threshold;
+  // maxFlight therefore does not reduce this per-ID storage allocation.
+  unsigned entries = 8 * reuse.getInt();
+  unsigned pointerWidth = llvm::Log2_64(entries), memoryDepth = 16 * entries;
+  std::string queueName = "GGFASEDReadBuffer16x" + std::to_string(entries);
+  for (auto m : circuit.getOps<FModuleLike>())
+    if (m.getModuleName() == queueName)
+      return reject("FASED read buffer helper or wrapper already exists");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx,w,false); }; auto bit = uint(1);
   auto bundle = [&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> es) {
@@ -87,11 +101,11 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
   auto neg = [&](Value a)->Value { return b.create<NotPrimOp>(loc,a); };
   auto eq = [&](Value a,Value z)->Value { return b.create<EQPrimOp>(loc,a,z); };
   auto mux = [&](Value c,Value a,Value z)->Value { return b.create<MuxPrimOp>(loc,c,a,z); };
-  auto inc = [&](Value v)->Value { return b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,v,constant(3,1)),2,0); };
+  auto inc = [&](Value v)->Value { return b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,v,constant(pointerWidth,1)),pointerWidth-1,0); };
   SmallVector<Value> enqPtrs,deqPtrs,fullFlags;
   for (unsigned i=0;i<16;++i) {
-    enqPtrs.push_back(reg(3,"enqPtrs_"+std::to_string(i)));
-    deqPtrs.push_back(reg(3,"deqPtrs_"+std::to_string(i)));
+    enqPtrs.push_back(reg(pointerWidth,"enqPtrs_"+std::to_string(i)));
+    deqPtrs.push_back(reg(pointerWidth,"deqPtrs_"+std::to_string(i)));
     fullFlags.push_back(reg(1,"maybe_full_"+std::to_string(i)));
   }
   Value previousId = b.create<RegOp>(loc,uint(4),arg(0),"deqAddrReg").getResult();
@@ -114,10 +128,10 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
     Value different=mux(both(pop,deqId),constant(1,0),mux(both(push,enqId),constant(1,1),fullFlags[i]));
     connect(fullFlags[i],mux(sameId,mux(both(enqId,b.create<XorPrimOp>(loc,push,pop)),push,fullFlags[i]),different));
   }
-  SmallVector<Type> memTypes{MemOp::getTypeForPort(128,uint(65),MemOp::PortKind::Read),
-      MemOp::getTypeForPort(128,uint(65),MemOp::PortKind::Write)};
+  SmallVector<Type> memTypes{MemOp::getTypeForPort(memoryDepth,uint(65),MemOp::PortKind::Read),
+      MemOp::getTypeForPort(memoryDepth,uint(65),MemOp::PortKind::Write)};
   SmallVector<Attribute> memNames{b.getStringAttr("read"),b.getStringAttr("write")};
-  auto ram=b.create<MemOp>(loc,memTypes,1,1,128,RUWAttr::Undefined,memNames,"ram");
+  auto ram=b.create<MemOp>(loc,memTypes,1,1,memoryDepth,RUWAttr::Undefined,memNames,"ram");
   auto reader=ram.getResult(0),writer=ram.getResult(1);
   connect(field(reader,"clk"),arg(0));connect(field(reader,"en"),constant(1,1));
   connect(field(reader,"addr"),b.create<CatPrimOp>(loc,arg(5),mux(advance,nextRP,rp)));

@@ -2502,6 +2502,7 @@ LogicalResult goldengate::mapPrintBridgeFASEDReadBuffer(CircuitOp circuit,
   for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
     if (auto m = dyn_cast<FModuleOp>(&op))
       if (m.getName() == "GGFASEDReadBuffer16x8" ||
+          m.getName() == "GGFASEDReadBuffer16x16" ||
           m.getName() == "GGSelectedPrintFASEDReadBufferWrapper")
         op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
   circuit->setAttr("rawAnnotations", staged->getOperation()->getAttr("rawAnnotations"));

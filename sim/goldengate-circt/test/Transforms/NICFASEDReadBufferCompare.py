@@ -13,22 +13,30 @@ from pathlib import Path
 import re
 import subprocess
 from NICMMIOBankCompare import modules
-from PrintControlResponsesCompare import clean, module
+from PrintControlResponsesCompare import clean, equations, module
 from PrintRocketControlMasterCompare import native_ports
 from PrintRocketFASEDReadBufferCompare import wrapper_wiring
 from PrintSelectedFASEDReadBufferCompare import reference_boundary, transfer
 
-HELPER = 'GGFASEDReadBuffer16x8'
 OLD, NEW = 'GGFASEDIngressIssueWrapper', 'GGFASEDReadBufferWrapper'
+
+
+def helper_name(text):
+    names = [n for n in modules(text) if re.fullmatch(r'GGFASEDReadBuffer16x(?:8|16)', n)]
+    assert len(names) == 1, names
+    return names[0]
 
 
 def composition(directory, baseline):
     before = (directory / 'post-fame-fased-ingress-deadlock.mlir').read_text()
     after = (directory / 'post-fame-fased-read-buffer.mlir').read_text()
     prior, actual = modules(before), modules(after)
+    helper = helper_name(after)
+    entries = int(helper.split('x')[-1])
     assert all(actual.get(n) == b for n, b in prior.items()), 'existing module changed'
-    assert set(actual) - set(prior) == {HELPER, NEW}
-    assert actual[HELPER] == modules(baseline.read_text())[HELPER], 'shared queue changed'
+    assert set(actual) - set(prior) == {helper, NEW}
+    if baseline is not None:
+        assert actual[helper] == modules(baseline.read_text())[helper], 'shared queue changed'
     copied_ports = [p for p in native_ports(prior[OLD]) if p[1] != 'fased_host_responses']
     copied = [p[1] for p in copied_ports]
     assert native_ports(actual[NEW])[:len(copied)] == copied_ports
@@ -56,7 +64,7 @@ def composition(directory, baseline):
     raw_after = json.loads((directory / 'post-fame-fased-read-buffer-all.json').read_text())
     assert transfer(raw_before, OLD, NEW, copied) == raw_after, 'annotation transfer differs'
     return dict(existing_modules_retained=len(prior), wrapper_connections_compared=len(expected),
-                annotation_records_retained=len(raw_after), payload_bits=65, queues=16, beats_per_id=8)
+                annotation_records_retained=len(raw_after), payload_bits=65, queues=16, beats_per_id=entries)
 
 
 def differential(candidate, golden, export_tool, out):
@@ -67,10 +75,23 @@ def differential(candidate, golden, export_tool, out):
                            stderr=subprocess.STDOUT, check=True)
     exported, native = out / 'helper.mlir', out / 'helper.sv'
     run([export_tool, candidate, exported], 'export')
+    helper = helper_name(candidate.read_text())
+    entries = int(helper.split('x')[-1])
+    ptr_width = (entries - 1).bit_length()
     isolated = modules(exported.read_text().replace('firrtl.module public @', 'firrtl.module @'))
-    assert isolated == {HELPER: modules(candidate.read_text())[HELPER]}, 'export rebuilt queue'
+    assert isolated == {helper: modules(candidate.read_text())[helper]}, 'export rebuilt queue'
     run(['firtool', exported, '--format=mlir', '--disable-all-randomization', '-o', native], 'firtool')
     header, body = module(clean(golden.read_text()), 'MultiQueue')
+    assert re.search(r'reg \[63:0\] ram_data \[0:' + str(16*entries-1) + r'\]', body)
+    assert re.search(r'reg \[' + str(ptr_width-1) + r':0\] enqPtrs_0;', body)
+    read_header, read = module(clean(golden.read_text()), 'ReadEgress')
+    assert 'ReorderBuffer' not in read
+    read_bindings = equations(read)
+    assert read_bindings['multiQueue_io_enqAddr'] == 'io_enq_bits_id'
+    assert read_bindings['multiQueue_io_enq_valid'] == 'io_enq_valid'
+    # SFC folds the no-ROB branch's constant enqueue-ready upstream and
+    # removes that port. The queue's own full/ready logic remains below.
+    assert 'io_enq_ready' not in read_header
     # Keep the complete recorded module, including its actual sequential
     # pointer/full updates and synchronous RAM. Only its symbol is renamed.
     (out / 'oracle.sv').write_text('module SFCMultiQueue(' + header + ');' + body + 'endmodule\n')
@@ -93,7 +114,7 @@ integer switches=0,simultaneous=0,wraps=0,undefinedPayloadSkips=0,i,j;
 reg comparePayload=0,payloadInitialized=0,collision;
 reg [3:0] previous=0;
 reg [31:0] rng=32'h19c7;
-GGFASEDReadBuffer16x8 candidate(.*);
+@HELPER@ candidate(.*);
 SFCMultiQueue oracle(.clock(clock),.reset(reset),.io_enq_ready(sfc_ready),
  .io_enq_valid(enq_valid),.io_enq_bits_data(enq_bits_data),.io_enq_bits_last(enq_bits_last),
  .io_deq_ready(deq_ready),.io_deq_valid(sfc_valid),.io_deq_bits_data(sfc_data),
@@ -115,7 +136,7 @@ begin
  if(!enq_ready)fullCycles++;
  if(enq_valid&&enq_ready&&deq_ready&&deq_valid)simultaneous++;
  if(reset&&enq_valid&&enq_ready)resetWrites++;
- if(deq_ready&&deq_valid&&oracle._GEN_101==3'h7)wraps++;
+ if(deq_ready&&deq_valid&&oracle._GEN_101==@PTR_WIDTH@'h@LAST_HEX@)wraps++;
  collision=enq_valid&&enq_ready&&
    oracle.ram_data_MPORT_addr==oracle.ram_data_io_deq_bits_MPORT_addr;
  collisions+=collision;
@@ -131,14 +152,14 @@ initial begin
  // does not claim equivalence for unspecified power-on memory state.
  for(i=0;i<16;i++)begin
    enqAddr=i;deqAddr=i;
-   for(j=0;j<8;j++)begin
+   for(j=0;j<@ENTRIES@;j++)begin
      enq_valid=1;enq_bits_data={32'hfeed0000+i,32'h01230000+j};
-     enq_bits_last=(j==7);step();
+     enq_bits_last=(j==@LAST@);step();
    end
  end
  // Force full queues, drain and wrap before injecting arbitrary ID changes.
  payloadInitialized=1;enq_valid=0;deq_ready=1;
- for(i=0;i<16;i++)begin deqAddr=i;enqAddr=i;for(j=0;j<12;j++)step();end
+ for(i=0;i<16;i++)begin deqAddr=i;enqAddr=i;for(j=0;j<@DRAIN@;j++)step();end
  for(i=0;i<40000;i++)begin
    rng=rng^(rng<<13);rng=rng^(rng>>17);rng=rng^(rng<<5);
    enqAddr=rng[3:0];deqAddr=(i%3==0)?previous:rng[7:4];
@@ -153,6 +174,9 @@ initial begin
  $finish;
 end endmodule
 '''.replace('@STATE_CHECKS@', '\n'.join(checks))
+    for key, value in dict(HELPER=helper, PTR_WIDTH=ptr_width, LAST_HEX=format(entries-1,'x'),
+                           ENTRIES=entries, LAST=entries-1, DRAIN=entries+4).items():
+        tb = tb.replace('@'+key+'@', str(value))
     (out / 'check.sv').write_text(tb)
     run(['verilator', '--binary', '-j', '4', '--timing', '-Wno-fatal', '--top-module', 'check',
          '--Mdir', out / 'obj', '-o', 'check', out / 'check.sv', native, out / 'oracle.sv'], 'verilator')
@@ -160,7 +184,7 @@ end endmodule
     log = (out / 'simulation.log').read_text()
     assert 'PASS cycles=' in log
     coverage = {n: int(v) for n, v in re.findall(r'(\w+)=(\d+)', log)}
-    return dict(coverage, production_helper_cloned_verbatim=True, actual_sfc_sequential_rtl=True,
+    return dict(coverage, beats_per_id=entries, memory_depth=16*entries, pointer_width=ptr_width, production_helper_cloned_verbatim=True, actual_sfc_sequential_rtl=True,
                 initialized_payload_memory=True, undefined_RUW_payload_excluded=True)
 
 
