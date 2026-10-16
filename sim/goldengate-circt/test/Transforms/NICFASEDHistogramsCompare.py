@@ -40,7 +40,16 @@ def composition(directory, baseline):
     old = json.loads((directory/'post-fame-fased-statistics-all.json').read_text())
     new = json.loads((directory/'post-fame-fased-histograms-all.json').read_text())
     assert transfer(old, OLD, NEW, {p[1] for p in copied}) == new
-    assert after[HELPER] == reference[HELPER]
+    expected_bank = reference[HELPER]
+    for name in ('pendingReads', 'pendingAW'):
+        actual_width, = re.findall(r'in %'+name+r': !firrtl.uint<(\d+)>', after[HELPER])
+        expected_bank = re.sub(r'(in %'+name+r': !firrtl.uint<)\d+(>)',
+                               lambda m: m[1]+actual_width+m[2], expected_bank)
+        expected_bank, comparisons = re.subn(
+            r'(firrtl.leq %'+name+r', %c\d+_ui4(?:_\d+)? : \(!firrtl.uint<)\d+(>)',
+            lambda m: m[1]+actual_width+m[2], expected_bank)
+        assert comparisons == 4
+    assert after[HELPER] == expected_bank
     assert re.findall(r'name = "(\w+)", offset = (\d+) : i32, readable = true, writeable = false', after[HELPER]) == list(zip(NAMES,map(str,range(16,53,4))))
     return dict(unchanged_modules=len(before), copied_ports=len(copied),
                 wrapper_connections_compared=len(expected), annotation_records_retained=len(new))
@@ -62,7 +71,13 @@ def oracle(path):
     mcr = equations(module(reference, kind)[1])
     for i in (4,9):
         assert any(f"5'h{4+i:x} == rIndex ? 32'h0 : " in v for v in mcr.values())
-    pins = ['input clock,reset', 'input [3:0] SatUpDownCounter_io_value,SatUpDownCounter_1_io_value']
+    widths = []
+    for name in ('SatUpDownCounter_io_value', 'SatUpDownCounter_1_io_value'):
+        high, = re.findall(r'wire \[(\d+):0\] '+name+r';', pipe)
+        widths.append(int(high)+1)
+    assert widths[0] == widths[1] and widths[0] in (4, 5)
+    width = widths[0]
+    pins = ['input clock,reset', f'input [{width-1}:0] SatUpDownCounter_io_value,SatUpDownCounter_1_io_value']
     pins += [f'output [31:0] crFile_io_mcr_read_{4+i}_bits' for i in range(10)]
     cone = 'module SFCHistograms('+','.join(pins)+');\n'
     updates, diagnostics = [], []
@@ -72,11 +87,11 @@ def oracle(path):
             assignment, = re.findall(r'\bwire\s+'+symbol+r'\s*=\s*[^;]+;',pipe)
             cone += assignment+'\n'
         for term,bound in zip(terms[:3],BOUNDS):
-            assert eq[f'_T_{term}'] == f"{count} <= 4'h{bound:x}"
+            assert eq[f'_T_{term}'] == f"{count} <= {width}'h{bound:x}"
         assert eq[f'_T_{terms[3]}'] == f'_T_{terms[0]} | _T_{terms[1]}'
         assert eq[f'_T_{terms[4]}'] == f'_T_{terms[0]} | _T_{terms[1]} | _T_{terms[2]}'
-        guards = [f"{count} <= 4'h0", f"~({count} <= 4'h0) & {count} <= 4'h2",
-                  f"~_T_{terms[3]} & {count} <= 4'h4", f"~_T_{terms[4]} & {count} <= 4'h8"]
+        guards = [f"{count} <= {width}'h0", f"~({count} <= {width}'h0) & {count} <= {width}'h2",
+                  f"~_T_{terms[3]} & {count} <= {width}'h4", f"~_T_{terms[4]} & {count} <= {width}'h8"]
         for bin in range(5):
             name = group+'OutstandingHistogram_'+str(bin); i=NAMES.index(name)
             if bin<4:
@@ -139,9 +154,13 @@ def differential(candidate, cone, export_tool, out):
         assert diagnostic in (out/(name+'.log')).read_text()
     run(['firtool',exported,'--format=mlir','--disable-all-randomization','-o',native],'firtool')
     (out/'oracle.sv').write_text(cone)
+    width, = re.findall(r'in %pendingReads: !firrtl.uint<(\d+)>', modules(candidate.read_text())[HELPER])
+    width = int(width)
+    assert f'input [{width-1}:0] SatUpDownCounter_io_value' in cone, 'SFC/candidate occupancy widths differ'
     tb='''module check;
 reg clock=0,hostReset=0,modelReset=0,targetFire=0;
-reg [3:0] pendingReads=0,pendingAW=0,mcr_wstrb=0;
+reg [COUNT_HIGH:0] pendingReads=0,pendingAW=0;
+reg [3:0] mcr_wstrb=0;
 reg [9:0] writes=0,readReady=0;
 reg [31:0] writeBits=0;
 reg oracleOnly=0,nativeOnly=0;
@@ -162,7 +181,7 @@ wire diagnosticReset=hostReset|nativeOnly,candidateReset=hostReset|oracleOnly;
     tb+='SFCDiagnostics diagnostics('+','.join(ports)+');\n'
     tb+='''reg [31:0] expected[0:9];reg [63:0] rng=233;
 integer cycles=0,wraps=0,stalledResets=0,hostOnlyResets=0,aboveLastBound=0,badWrite;
-function integer bin(input [3:0] count);begin
+function integer bin(input [COUNT_HIGH:0] count);begin
  bin=count==0?0:count<=2?1:count<=4?2:count<=8?3:4;
 end endfunction
 task compare;begin
@@ -200,13 +219,13 @@ initial begin
   $display("PASS illegal-write mask=%0d continued",badWrite);$finish;
  end else begin
  modelReset=1;targetFire=1;step();
- for(integer i=0;i<8192;i++)begin
-  pendingReads=i[3:0];pendingAW=i[7:4];hostReset=i[8];modelReset=i[9];targetFire=i[10];
-  seed(i[11]?32'hffffffff:32'hfffffffe);writes=hostReset?i[9:0]:0;step();
+ for(integer i=0;i<EXHAUSTIVE;i++)begin
+  pendingReads=i[COUNT_HIGH:0];pendingAW=i[AW_HIGH:COUNT_WIDTH];hostReset=i[CONTROL_BASE];modelReset=i[RESET_BIT];targetFire=i[FIRE_BIT];
+  seed(i[SEED_BIT]?32'hffffffff:32'hfffffffe);writes=hostReset?i[9:0]:0;step();
  end
  for(integer i=0;i<32768;i++)begin
   rng=rng^(rng<<13);rng=rng^(rng>>7);rng=rng^(rng<<17);
-  pendingReads=rng[3:0];pendingAW=rng[7:4];hostReset=rng[8];modelReset=i%31==0;targetFire=rng[9];
+  pendingReads=rng[COUNT_HIGH:0];pendingAW=rng[AW_HIGH:COUNT_WIDTH];hostReset=rng[CONTROL_BASE];modelReset=i%31==0;targetFire=rng[FIRE_BIT];
   readReady=rng[19:10];mcr_wstrb=rng[23:20];writeBits=rng[55:24];writes=hostReset?rng[19:10]:0;
   if(i%97==0)seed(32'hffffffff);step();
  end
@@ -215,6 +234,11 @@ initial begin
  end
 end endmodule
 '''
+    substitutions = dict(COUNT_HIGH=width-1, AW_HIGH=2*width-1, COUNT_WIDTH=width,
+                         CONTROL_BASE=2*width, RESET_BIT=2*width+1,
+                         FIRE_BIT=2*width+2, SEED_BIT=2*width+3,
+                         EXHAUSTIVE=1 << (2*width+5))
+    for name, value in substitutions.items(): tb = tb.replace(name, str(value))
     (out/'check.sv').write_text(tb)
     run(['verilator','--binary','--assert','-j','4','--timing','-Wno-fatal','--top-module','check','--Mdir',out/'obj','-o','check',out/'check.sv',native,out/'oracle.sv'],'verilator')
     run([out/'obj/check'],'simulation');log=(out/'simulation.log').read_text();assert 'PASS cycles=' in log
@@ -226,7 +250,7 @@ end endmodule
             for i,name in enumerate(NAMES):
                 assert diag.count(f'Assertion failed: Register {name} is read only') == (3*(2 if mode=='joint' else 1) if mask&(1<<i) else 0)
     return dict({n:int(v) for n,v in re.findall(r'(\w+)=(\d+)',log)},production_bank_cloned_verbatim=True,
-                validated_bindings_cloned=7,valid_IR_mutations_rejected=len(mutations),illegal_write_runs=33,
+                occupancy_width=width,validated_bindings_cloned=7,valid_IR_mutations_rejected=len(mutations),illegal_write_runs=33,
                 nonfatal_diagnostics_and_reset_suppression_matched=True,
                 scope='pre-edge occupancies and decoded MMIO; independent host/target edges')
 
@@ -236,7 +260,9 @@ def main():
     for n in ('candidate-dir','baseline','golden','immutable','export-tool','output-dir','report-json'):
         p.add_argument('--'+n,type=Path,required=True)
     a=p.parse_args();cone=oracle(a.golden)
-    assert ' '.join(cone.split())==' '.join(oracle(a.immutable).split())
+    def width_normalized(cone):
+        return ' '.join(cone.replace("5'h", "4'h").replace('[4:0]', '[3:0]').split())
+    assert width_normalized(cone)==width_normalized(oracle(a.immutable))
     candidate=a.candidate_dir/'post-fame-fased-histograms.mlir'
     result=composition(a.candidate_dir,a.baseline)
     result.update(golden=str(a.golden.resolve()),immutable=str(a.immutable.resolve()),golden_sha256=hashlib.sha256(a.golden.read_bytes()).hexdigest(),

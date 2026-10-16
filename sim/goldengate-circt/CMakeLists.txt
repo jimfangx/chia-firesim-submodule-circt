@@ -1040,7 +1040,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-mmio-bank COMMAND goldengate-fased-mmio-bank-test)
   add_executable(goldengate-fased-histograms-test
-    test/Transforms/FASEDHistogramsTest.cpp lib/Transforms/FASEDHistograms.cpp)
+    test/Transforms/FASEDHistogramsTest.cpp lib/Transforms/FASEDHistograms.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-histograms-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-histograms-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-histograms-test PRIVATE

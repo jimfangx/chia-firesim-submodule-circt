@@ -10,6 +10,9 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
 #include <array>
+#include <algorithm>
+#include <climits>
+#include "llvm/Support/MathExtras.h"
 #include <map>
 #include <random>
 #include <stdexcept>
@@ -17,6 +20,8 @@ using namespace mlir;
 using namespace circt::firrtl;
 namespace {
 bool selectedProfile = false;
+int64_t maxFlight = 10;
+unsigned countWidth() { return llvm::Log2_64_Ceil(std::min<int64_t>(16, maxFlight) + 1); }
 std::string profileName(llvm::StringRef name) {
   return selectedProfile && (name == "GGFASEDStatisticsWrapper" || name == "GGFASEDHistogramsWrapper")
       ? "GGSelectedPrint" + name.drop_front(2).str() : name.str();
@@ -89,6 +94,11 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         out %fased_pending_writes: !firrtl.bundle<awValue: uint<4>, wValue: uint<4>, awFull: uint<1>, wFull: uint<1>>,
         out %other: !firrtl.uint<8>) {}
     } })";
+  size_t widthPos = 0;
+  while ((widthPos = text.find("uint<4>", widthPos)) != std::string::npos) {
+    auto next = "uint<" + std::to_string(countWidth()) + ">";
+    text.replace(widthPos, 7, next); widthPos += next.size();
+  }
   if (selectedProfile) {
     size_t pos = 0; const std::string old = "GGFASEDStatisticsWrapper", next = profileName(old);
     while ((pos = text.find(old, pos)) != std::string::npos) { text.replace(pos, old.size(), next); pos += next.size(); }
@@ -96,7 +106,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
   auto root=parseSourceString<ModuleOp>(text,&context);
   require(bool(root),"fixture parse failed");auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
   named(c,"GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({
-    b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(10))}))}));
+    b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(maxFlight))}))}));
   SmallVector<Attribute> annos;
   for(auto name:{"fased_pending_writes.awValue","hostReset","other"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
@@ -116,12 +126,36 @@ void phases(MLIRContext &context) {
   c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
       b.getNamedAttr("class", b.getStringAttr("test.Target")),
       b.getNamedAttr("target", b.getStringAttr("~GGControlErrorWrapper|GGControlErrorWrapper>other"))})}));
+  auto topWithoutKey = named(c, "GGControlErrorWrapper");
+  FModuleOp unchangedResult = topWithoutKey; std::string missingError;
+  auto withoutKey = dump(*early);
+  require(failed(goldengate::materializeFASEDHistograms(c, unchangedResult, missingError)) &&
+      unchangedResult == topWithoutKey && dump(*early) == withoutKey,
+      "missing early constructor accepted or materialization mutated IR");
+  auto retained = fixture(context);
+  auto key = named(*retained->getOps<CircuitOp>().begin(), "GGFASEDTokenEngine")
+      ->getAttr("goldengate.bridgeConstructor");
+  auto earlyAnnotations = llvm::to_vector(c->getAttrOfType<ArrayAttr>("rawAnnotations"));
+  earlyAnnotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("firesim.lib.bridgeutils.BridgeIOAnnotation")),
+      b.getNamedAttr("widgetClass", b.getStringAttr("midas.models.FASEDMemoryTimingModel")),
+      b.getNamedAttr("widgetConstructorKey", key)}));
+  c->setAttr("rawAnnotations", b.getArrayAttr(earlyAnnotations));
+  earlyAnnotations.push_back(earlyAnnotations.back());
+  c->setAttr("rawAnnotations", b.getArrayAttr(earlyAnnotations));
+  auto duplicateKey = dump(*early);
+  require(failed(goldengate::materializeFASEDHistograms(c, unchangedResult, missingError)) &&
+      unchangedResult == topWithoutKey && dump(*early) == duplicateKey,
+      "ambiguous early constructor accepted or materialization mutated IR");
+  earlyAnnotations.pop_back(); c->setAttr("rawAnnotations", b.getArrayAttr(earlyAnnotations));
   auto top = named(c, "GGControlErrorWrapper"); auto topBefore = dump(top);
   auto annotations = c->getAttr("rawAnnotations"); FModuleOp bank; std::string error;
   require(succeeded(goldengate::materializeFASEDHistograms(c, bank, error)), error);
   require(c.getName() == "GGControlErrorWrapper" && dump(top) == topBefore &&
       c->getAttr("rawAnnotations") == annotations && succeeded(verify(*early)),
       "early materialization changed top identity, ports or annotations");
+  for (unsigned i : {4, 5}) require(bank.getArgument(i).getType() == UIntType::get(&context, countWidth()),
+      "early histogram input disagrees with retained capacity");
   unsigned uses = 0; c.walk([&](InstanceOp i) { uses += i.getModuleName() == bank.getName(); });
   require(uses == 0, "materialization prematurely attached the bank");
   auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
@@ -179,7 +213,7 @@ void phases(MLIRContext &context) {
     require(failed(goldengate::attachFASEDHistograms(circuit, candidate, error)) &&
         !error.empty() && dump(*root) == before, "invalid standalone bank accepted or mutated IR");
   }
-  llvm::outs() << "FASED histograms MMIO phases: early global words 4-13, unchanged top/annotations, split/combined equivalence and 28 atomic rejections passed\n";
+  llvm::outs() << "FASED histograms MMIO phases: early global words 4-13, unchanged top/annotations, split/combined equivalence and 30 atomic rejections passed\n";
 }
 void behavior(MLIRContext &context) {
   auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();std::string error;
@@ -188,11 +222,12 @@ void behavior(MLIRContext &context) {
   Interpreter sim(named(c,"GGFASEDHistograms"));
   std::array<uint32_t,10> expected{};std::mt19937 random(233);
   unsigned wraps=0,stalledResets=0,overflowSamples=0,assertionFailures=0;
+  const unsigned countRange = 1u << countWidth();
   for(unsigned cycle=0;cycle<32768;++cycle) {
     unsigned controls=cycle<16384?cycle%8:random()&7;
     bool hostReset=controls&1,modelReset=(controls>>1)&1,fire=(controls>>2)&1;
-    unsigned reads=cycle<16384?(cycle/8)%16:random()%16;
-    unsigned aw=cycle<16384?(cycle/128)%16:random()%16;
+    unsigned reads=cycle<16384?(cycle/8)%countRange:random()%countRange;
+    unsigned aw=cycle<16384?(cycle/(8*countRange))%countRange:random()%countRange;
     if(cycle<16384 || cycle%97==0) {
       const uint32_t edges[]{0,1,2,0x7fffffffU,0x80000000U,0xfffffffdU,0xfffffffeU,0xffffffffU};
       for(unsigned i=0;i<10;++i)expected[i]=i%5==4?0:edges[(cycle/2048+i)%8];
@@ -232,7 +267,9 @@ void behavior(MLIRContext &context) {
     }
     stalledResets+=modelReset&&!fire;sim.edge();sim.memo.clear();check();
   }
-  require(wraps && stalledResets && overflowSamples && assertionFailures,"missing edge coverage");
+  require(wraps && stalledResets && assertionFailures,"missing edge coverage");
+  require(countRange > 8 ? overflowSamples != 0 : overflowSamples == 0,
+          "overflow-bin coverage disagrees with the observation width");
 }
 void mapping(MLIRContext &context) {
   auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();std::string error;
@@ -276,13 +313,13 @@ void mapping(MLIRContext &context) {
     "~"+profileName("GGFASEDHistogramsWrapper")+"|"+profileName("GGFASEDHistogramsWrapper")+">"),"target transfer failed");
 }
 void rejections(MLIRContext &context) {
-  for(unsigned mode=0;mode<23;++mode) {
+  for(unsigned mode=0;mode<27;++mode) {
     auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
     auto top=named(c,"GGFASEDStatisticsWrapper"),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");if(mode==1)c->removeAttr("rawAnnotations");
     if(mode==2)engine->removeAttr("goldengate.bridgeConstructor");
     if(mode==3)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
-        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(9))}))}));
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(0))}))}));
     if(mode>=4 && mode<10) {auto names=llvm::to_vector(top.getPortNames());names[mode-4]=b.getStringAttr("missing");top.setPortNames(names);}
     if(mode>=10 && mode<16) {SmallVector<bool> dirs;for(auto p:top.getPorts())dirs.push_back(p.direction==Direction::Out);dirs[mode-10]=!dirs[mode-10];top.setPortDirections(dirs);}
     if(mode==16) {b.setInsertionPointToEnd(engine.getBodyBlock());b.create<InstanceOp>(top.getLoc(),top,"usedTop");}
@@ -294,6 +331,13 @@ void rejections(MLIRContext &context) {
         ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{});}
     if(mode==22) engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
         b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getIntegerAttr(IntegerType::get(&context,128),APInt(128,10)))}))}));
+    if(mode>=23) {
+      Attribute capacity = mode==23 ? Attribute(b.getI64IntegerAttr(-1)) :
+          mode==24 ? Attribute(b.getStringAttr("10")) : Attribute();
+      auto edge=b.getDictionaryAttr(capacity ? ArrayRef<NamedAttribute>{b.getNamedAttr("maxFlight",capacity)} : ArrayRef<NamedAttribute>{});
+      engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",edge)}));
+      if(mode==26)engine->removeAttr("goldengate.bridgeConstructor");
+    }
     std::string before;llvm::raw_string_ostream out(before);root->print(out);out.flush();std::string error;
     require(failed(goldengate::addFASEDHistograms(c,error)) && !error.empty(),"invalid boundary accepted");
     std::string after;llvm::raw_string_ostream next(after);root->print(next);next.flush();require(before==after,"rejection mutated circuit");
@@ -364,10 +408,12 @@ int main(int argc,char **argv) {
     MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
     require(argc==1||argc==3,"usage: goldengate-fased-histograms-test [boundary.mlir probe.mlir]");
     if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
+    for (int64_t capacity : {int64_t(1), int64_t(9), int64_t(10), int64_t(16), int64_t(20), int64_t(INT64_MAX)})
     for (bool selected : {false, true}) {
+      maxFlight = capacity;
       selectedProfile = selected; phases(context);behavior(context);mapping(context);rejections(context);
     }
-    llvm::outs()<<"FASED histograms: 65536 cycles across legacy/selected profiles, all four-bit occupancies, constant fifth bins, target-clock/reset bindings, targets and 46 atomic boundary rejections passed\n";
+    llvm::outs()<<"FASED histograms: 393216 cycles across six capacities and legacy/selected profiles, all representable occupancies, constant fifth bins, target-clock/reset bindings, targets and 324 atomic boundary rejections passed\n";
     return 0;
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
 }

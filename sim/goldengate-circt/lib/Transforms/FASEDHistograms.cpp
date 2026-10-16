@@ -1,7 +1,8 @@
 // See LICENSE for license details.
 // Oracle: TimingModel.scala:169-192; FASED MCR words 4-13 in the recorded SFC RTL.
-// Materialization requires a free bank symbol and preserves top/annotations.
-// Attachment requires an uninstantiated statistics wrapper, ten-flight model,
+// Materialization requires a free bank symbol and a positive retained maxFlight;
+// preserves top/annotations and sizes observations as log2Ceil(min(16,maxFlight)+1).
+// Attachment requires an uninstantiated statistics wrapper, retained capacity,
 // exact target reset/fire and pendingReads/pendingAW observation bundles.
 // Consumes/produces annotations: none; copied top targets explicitly transfer.
 // Mutations: eight UInt<32> histogram registers, ten read-only MCR lanes,
@@ -14,6 +15,7 @@
 // and are suppressed by host reset, independently of the target update policy.
 // Scope: recorded BaseParams histogram profile, not configurable histograms.
 #include "goldengate/FASEDHistograms.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
@@ -26,7 +28,7 @@ llvm::StringRef wrapperName(CircuitOp circuit) {
       ? "GGSelectedPrintFASEDHistogramsWrapper" : "GGFASEDHistogramsWrapper";
 }
 constexpr llvm::StringLiteral controlName="fased_histograms_mcr";
-SmallVector<PortInfo> histogramPorts(MLIRContext *ctx) {
+SmallVector<PortInfo> histogramPorts(MLIRContext *ctx, unsigned width) {
   OpBuilder b(ctx);
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};auto bit=uint(1);
   auto token=BundleType::get(ctx,{{b.getStringAttr("ready"),true,bit},
@@ -38,7 +40,7 @@ SmallVector<PortInfo> histogramPorts(MLIRContext *ctx) {
   for(auto name:{"hostReset","modelReset","targetFire"})
     bankPorts.push_back({b.getStringAttr(name),bit,Direction::In});
   for(auto name:{"pendingReads","pendingAW"})
-    bankPorts.push_back({b.getStringAttr(name),uint(4),Direction::In});
+    bankPorts.push_back({b.getStringAttr(name),uint(width),Direction::In});
   bankPorts.push_back({b.getStringAttr("mcr"),mcr,Direction::Out});
   return bankPorts;
 }
@@ -48,26 +50,21 @@ LogicalResult attachmentBoundary(CircuitOp circuit, FModuleOp &inner,
   if(circuit.getName()!="GGFASEDStatisticsWrapper" &&
       circuit.getName()!="GGSelectedPrintFASEDStatisticsWrapper")
     return reject("FASED histograms require the active statistics wrapper");
-  FModuleOp engine;
   for(auto m:circuit.getOps<FModuleLike>()) {
     if(m.getName()==wrapperName(circuit))
       return reject("FASED histogram wrapper already exists");
     if(m.getName()==circuit.getName())inner=dyn_cast<FModuleOp>(m.getOperation());
-    if(m.getName()=="GGFASEDTokenEngine")engine=dyn_cast<FModuleOp>(m.getOperation());
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if(!inner || !raw)return reject("FASED histograms need a top and retained annotations");
-  auto key=engine?engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"):DictionaryAttr();
-  auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
-  auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
-  if(!flight || flight.getValue().getBitWidth()>64 || flight.getInt()!=10)
-    return reject("FASED histograms currently require the recorded ten-flight constructor");
+  unsigned limit, width;
+  if (failed(goldengate::getFASEDRequestLimitProfile(circuit, limit, width, error))) return failure();
   auto *ctx=circuit.getContext();OpBuilder b(ctx);
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};auto bit=uint(1);
-  auto reads=BundleType::get(ctx,{{b.getStringAttr("value"),false,uint(4)},
+  auto reads=BundleType::get(ctx,{{b.getStringAttr("value"),false,uint(width)},
       {b.getStringAttr("full"),false,bit}});
-  auto writes=BundleType::get(ctx,{{b.getStringAttr("awValue"),false,uint(4)},
-      {b.getStringAttr("wValue"),false,uint(4)},{b.getStringAttr("awFull"),false,bit},
+  auto writes=BundleType::get(ctx,{{b.getStringAttr("awValue"),false,uint(width)},
+      {b.getStringAttr("wValue"),false,uint(width)},{b.getStringAttr("awFull"),false,bit},
       {b.getStringAttr("wFull"),false,bit}});
   const llvm::StringRef names[]{"hostClock","hostReset","fased_model_reset","fased_tfire",
       "fased_pending_reads","fased_pending_writes"};
@@ -95,12 +92,14 @@ LogicalResult goldengate::materializeFASEDHistograms(CircuitOp circuit,
   for (auto m : circuit.getOps<FModuleLike>()) if (m.getName() == bankName) {
     error = "FASED histogram module already exists"; return failure();
   }
+  unsigned limit, width;
+  if (failed(getFASEDRequestLimitProfile(circuit, limit, width, error))) return failure();
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};
   // Local lanes 0-9 retain global words 4-13 (16-52 bytes).
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto bank=b.create<FModuleOp>(loc,b.getStringAttr(bankName),
-      ConventionAttr::get(ctx,Convention::Internal),histogramPorts(ctx));
+      ConventionAttr::get(ctx,Convention::Internal),histogramPorts(ctx, width));
   SmallVector<Attribute> registers;
   for(unsigned i=0;i<10;++i)registers.push_back(b.getDictionaryAttr({
       b.getNamedAttr("name",b.getStringAttr(std::string(i<5?"writeOutstandingHistogram_":"readOutstandingHistogram_")+std::to_string(i%5))),
@@ -154,7 +153,9 @@ LogicalResult goldengate::attachFASEDHistograms(CircuitOp circuit,
   if (!bank || bank->getParentOp()!=circuit.getOperation() || bank.getName()!=bankName)
     return reject("FASED histogram attachment requires its materialized bank in this circuit");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
-  auto expected=histogramPorts(ctx); auto actual=bank.getPorts();
+  unsigned limit, width;
+  if (failed(getFASEDRequestLimitProfile(circuit, limit, width, error))) return failure();
+  auto expected=histogramPorts(ctx, width); auto actual=bank.getPorts();
   if (actual.size()!=expected.size()) return reject("FASED histogram bank needs exactly seven ports");
   for (auto [i,p]:llvm::enumerate(actual))
     if (p.name!=expected[i].name || p.type!=expected[i].type || p.direction!=expected[i].direction)

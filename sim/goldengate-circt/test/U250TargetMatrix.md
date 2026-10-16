@@ -8989,3 +8989,102 @@ widths from retained capacity and compare its bin updates against the archived
 Gemmini/Saturn SFC RTL, preserving the Scala zip rule and zero fifth bin.
 Histogram/MMIO capacity guards, wider TracerV, SRAM model equivalence and QSFP
 platform support remain open; this milestone does not complete the port.
+
+
+## Iteration 262 — constructor-sized FASED occupancy histograms (2026-10-16)
+
+`FASEDHistograms.cpp` now derives pending-read/AW observation widths from the
+retained constructor using `log2Ceil(min(16,maxFlight)+1)`, matching
+`BaseConfig.maxReads/maxWrites` and `TimingModel.bindHistograms`. Early bank
+materialization uses the unique retained BridgeIO constructor; the mapped
+engine constructor is authoritative during attachment. Missing, malformed,
+nonpositive, oversized or ambiguous constructor values reject before mutation.
+Both legacy and selected-print wrappers retain their interfaces apart from the
+constructor-sized count inputs. The eight UInt32 counters, first matching
+bounds 0/2/4/8, target-fire-qualified model reset, constant zero fifth bins,
+host-clock nonfatal diagnostics and ten read-only MMIO words remain intact.
+
+The native compiler rebuilt. All ten focused FASED tests passed: histograms,
+statistics, response errors, functional-model register, latency registers,
+request limits, read/write admission, write retirement and write pairing.
+Histogram tests execute **393,216 cycles** across capacities 1, 9, 10, 16, 20
+and `INT64_MAX`, in both wrapper profiles, and check **324** atomic boundary
+rejections plus **360** split-API/preflight rejections. The initial coverage
+predicate was corrected because one-bit counts cannot exceed eight; the final
+histogram rerun passed. The other nine tests passed in the initial run.
+
+`NICFASEDHistogramsCompare.py` executes the actual emitted histogram bank
+against update/diagnostic cones extracted from these exact immutable SFC files:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `5ca576a7f925848eb4ec2f2d71bf040e7ff2b2de0a1aedfae141e0801c6b938d`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2aaa560a480c9b8c65973c526851c52a6a853f4802ecb4d1bbac493313e4428f`.
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+
+All four comparisons passed: **40,961 cycles** each for the archived and
+October 1 Rocket fixtures, and **65,537 cycles** each for Gemmini and Saturn,
+totaling **212,996**. Each SFC cone executes at its original four- or five-bit
+width. The five-bit tests cover all representable count combinations,
+including occupancy 16, wraparound, independent host/target resets and stalls.
+Each comparison additionally passes 33 illegal-write runs and rejects three
+valid-IR binding mutations. The production bank is cloned verbatim with its
+seven validated clock/reset/occupancy/MMIO bindings. Scope is pre-edge counts
+and decoded MMIO, not complete producer queues or platform behavior.
+
+Composition preserves 186 preceding modules, copies 190 ports, checks 197
+wrapper connections and retains/retargets 1,676 / 3,697 / 2,160 annotation
+records for Rocket / Gemmini / Saturn. Bank comparison permits only the two
+count input widths and eight corresponding LEQ operand widths to differ;
+all four comparisons per count must be present, including suffixed SSA
+constant names. The three exact sibling `design/FireSim-generated.const.h`
+files, SHA256
+`34a3d08b9cf8b179eb0f951e23e187c37d30ff1ea084aa76058e704f5737a308`,
+match the ten read-only offsets 16..52 and absolute addresses 144..180.
+The October 1 build-tree fixture has no `.const.h`; no header comparison is
+claimed there. Its full staging FASED constructor also matches the candidate
+(`immutable-constructor-comparison.json`), using the immutable staging
+`firechip.chip.FireSim.FireSimRocketConfig.anno.json`, SHA256
+`4793fa4344b6e2a4faa4775579a382e00fae728740e6bb877e8981f433d2338d`.
+
+All thirteen archived inputs and distinct effective platforms were replayed.
+The matrix remains **incomplete**: three Rocket compiles, four compiler
+rejections and six unsupported QSFP profiles; structured SFC comparisons
+remain eight matched, six SRAM/model-port mismatches and twelve not reached.
+Gemmini and Saturn now emit histogram MLIR/annotation pairs and next reject at
+`FASED MMIO bank requires the recorded ten-flight constructor`. BOOM/Shuttle
+retain the wider TracerV rejection. No target or platform was substituted.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration262-u250-target-matrix/`:
+`build.log`, `ctest.log`, `histogram-test-rerun.log`,
+`histogram-test-complete.log`, `ctest-results.json`, `replay/matrix.json`,
+`matrix-verdict.json`, `histograms-comparison.json`, four per-fixture reports
+and production-export/firtool/Verilator/simulation/mutation logs.
+`matrix-regression.json` checks all **1,465** prior files: **1,355** unchanged
+and **110** with only the two count widths/eight LEQ operand widths changed
+(55 Gemmini and 55 Saturn files). Exactly four files are added: the histogram
+boundary pair for each target. Input hashes, effective platforms, compile
+statuses and structured comparison results are unchanged.
+`rocket-rtl-regression.json` checks byte identity of all eighteen final Rocket
+RTL/collateral files. `source-replay-stability.json` checks 912 live source
+files and both executable hashes before this report; test-only coverage/SSA
+comparison corrections are explicitly recorded. Compiler SHA256:
+`729d06aad332d76285b4b86c08eb0fae975dfc68e6175635d2b9d226eb0b4f74`.
+
+For storage, 735 current replay MLIR dumps were losslessly compressed,
+recovering 50,901,216,613 bytes; every decompressed SHA256 matches its original
+(`lossless-storage-cleanup-262.json`). Statistics/histogram comparison inputs,
+annotations, logs and final RTL remain available; compressed paths have a
+`.gz` suffix. Both immutable fixture trees are untouched.
+
+No FireSim manager gate or hardware step was started. Supplied iteration 261
+manager/smoke passes are prior-version evidence; the SFC UART-bearing baseline
+remains pending. The next smallest port is constructor-aware validation of
+the aggregate FASED MMIO bank, comparing all 21 lanes/targets against Gemmini
+and Saturn SFC output before advancing further. MMIO/downstream capacity
+guards, wider TracerV, SRAM equivalence and QSFP support remain open; this
+milestone does not complete the port.

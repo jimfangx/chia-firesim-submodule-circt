@@ -9,10 +9,13 @@ namespace goldengate {
 // targetFire; the fifth lanes stay zero per the Scala zip rule. Host reset
 // masks nonfatal read-only write diagnostics; modelReset resets state only
 // when targetFire is high. Diagnostics remain on the host clock.
-// On duplicate symbol failure, leave IR and result unchanged.
+// Requires positive retained maxFlight (mapped engine or unique early BridgeIO).
+// Pending read/AW inputs use log2Ceil(min(16,maxFlight)+1) bits, matching the
+// admission counters. Missing/malformed capacity or duplicate symbols leave
+// IR and result unchanged.
 mlir::LogicalResult materializeFASEDHistograms(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp &result, std::string &error);
-// Attach that unused bank to the recorded statistics wrapper. Validate exact
+// Attach that unused bank to the constructor-sized statistics wrapper. Validate exact
 // ports, ownership, constructor and observation boundary before any mutation;
 // preserve drivers and transfer copied top targets. Observe pending AW, not W.
 mlir::LogicalResult attachFASEDHistograms(circt::firrtl::CircuitOp circuit,
