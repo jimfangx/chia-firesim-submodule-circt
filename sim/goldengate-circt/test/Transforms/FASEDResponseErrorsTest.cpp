@@ -17,6 +17,7 @@ using namespace mlir;
 using namespace circt::firrtl;
 namespace {
 bool selected = false;
+int64_t maxFlight = 10;
 std::string profile(llvm::StringRef input) {
   std::string result = input.str();
   if (selected) for (auto suffix : {"ResponseErrorsWrapper", "FunctionalModelRegisterWrapper"}) {
@@ -93,7 +94,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
     } })"), &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   named(c, "GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
-    b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(10))}))}));
+    b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI64IntegerAttr(maxFlight))}))}));
   SmallVector<Attribute> annos;
   for (auto name : {"fased_host_read_response.bits.resp", "fased_host_write_response.ready", "other"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
@@ -231,7 +232,10 @@ void behavior(MLIRContext &context) {
 }
 void mapping(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto constructor = named(c,"GGFASEDTokenEngine")->getAttr("goldengate.bridgeConstructor");
   require(succeeded(goldengate::addFASEDResponseErrors(c,error)),error);
+  require(named(c,"GGFASEDTokenEngine")->getAttr("goldengate.bridgeConstructor") == constructor,
+      "retained constructor changed");
   auto top = named(c,profile("GGFASEDResponseErrorsWrapper")), bank = named(c,"GGFASEDResponseErrors");
   require(top.getNumPorts()==8 && top.getPortName(7)=="fased_response_errors_mcr","copied port shape mismatch");
   auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
@@ -271,14 +275,14 @@ void mapping(MLIRContext &context) {
       profile("~GGFASEDResponseErrorsWrapper|GGFASEDResponseErrorsWrapper>")),"target identity mismatch");
 }
 void rejections(MLIRContext &context) {
-  for(unsigned mode=0;mode<19;++mode) {
+  for(unsigned mode=0;mode<23;++mode) {
     auto root=fixture(context);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
     auto top=named(c,profile("GGFASEDFunctionalModelRegisterWrapper")),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");
     if(mode==1)c->removeAttr("rawAnnotations");
     if(mode==2)engine->removeAttr("goldengate.bridgeConstructor");
     if(mode==3)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
-        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(9))}))}));
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(0))}))}));
     if(mode>=4 && mode<8) {auto names=llvm::to_vector(top.getPortNames());names[mode-4]=b.getStringAttr("missing");top.setPortNames(names);}
     if(mode>=8 && mode<12) {SmallVector<bool> dirs;for(auto p:top.getPorts())dirs.push_back(p.direction==Direction::Out);dirs[mode-8]=true;top.setPortDirections(dirs);}
     if(mode==12) {b.setInsertionPointToStart(engine.getBodyBlock());b.create<InstanceOp>(top.getLoc(),top,"usedTop");}
@@ -293,6 +297,14 @@ void rejections(MLIRContext &context) {
     if (mode == 18) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
       b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight",
         b.getIntegerAttr(IntegerType::get(&context, 128), APInt(128, 10)))}))}));
+    if (mode >= 19) {
+      SmallVector<NamedAttribute> fields;
+      if (mode == 19) fields.push_back(b.getNamedAttr("maxFlight", b.getI64IntegerAttr(-1)));
+      if (mode == 20) fields.push_back(b.getNamedAttr("maxFlight", b.getStringAttr("10")));
+      engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr(mode == 22
+          ? ArrayRef<NamedAttribute>{}
+          : ArrayRef<NamedAttribute>{b.getNamedAttr("axi4Edge", b.getDictionaryAttr(fields))}));
+    }
     std::string before;llvm::raw_string_ostream out(before);root->print(out);out.flush();std::string error;
     require(failed(goldengate::addFASEDResponseErrors(c,error)) && !error.empty(),"invalid boundary accepted");
     std::string after;llvm::raw_string_ostream next(after);root->print(next);next.flush();require(before==after,"rejection mutated circuit");
@@ -376,9 +388,13 @@ int main(int argc,char **argv) {
     require(argc==1||argc==3,"usage: goldengate-fased-response-errors-test [boundary.mlir probe.mlir]");
     if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
     for (bool profileSelected : {false, true}) {
-      selected = profileSelected; phases(context);behavior(context);mapping(context);rejections(context);
+      selected = profileSelected;
+      for (int64_t flight : {int64_t(1), int64_t(9), int64_t(10), int64_t(16),
+                            int64_t(20), INT64_MAX}) {
+        maxFlight = flight; phases(context);behavior(context);mapping(context);rejections(context);
+      }
     }
-    llvm::outs()<<"FASED response errors: 65536 cycles across legacy/selected profiles, handshake/host bindings, targets and 38 atomic boundary rejections passed\n";
+    llvm::outs()<<"FASED response errors: 393216 cycles across legacy/selected profiles and six positive flight capacities, handshake/host bindings, retained constructors, targets and 276 atomic boundary rejections passed\n";
     return 0;
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
 }

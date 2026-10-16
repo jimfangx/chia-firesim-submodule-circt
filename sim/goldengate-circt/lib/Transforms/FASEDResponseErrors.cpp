@@ -2,7 +2,8 @@
 // Oracle: FASEDMemoryTimingModel.scala:580-587 and MCRIO.bindReg.
 // Materialization requires a free bank symbol and preserves top/annotations.
 // Attachment requires an uninstantiated functional-model wrapper, exact
-// host clock/reset and recorded 64/4-bit host response bundles, ten flights.
+// host clock/reset and recorded 64/4-bit host response bundles, positive
+// retained maxFlight. The two error codes do not depend on queue capacity.
 // Annotations consumed: none.
 // Annotations produced: none; all retained targets explicitly retargeted.
 // IR mutations: two host-clock UInt<2> reset registers, read-only decoded
@@ -65,8 +66,8 @@ LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
   auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() != 10)
-    return reject("FASED response errors currently require the recorded ten-flight constructor");
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
+    return reject("FASED response errors require a positive retained maxFlight constructor");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx);
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);

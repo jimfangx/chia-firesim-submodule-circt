@@ -10,6 +10,7 @@ mlir::LogicalResult materializeFASEDResponseErrors(circt::firrtl::CircuitOp circ
     circt::firrtl::FModuleOp &bank, std::string &error);
 // Attach that bank once the exact host response bundles exist; observe the
 // accepted R/B handshakes, preserve SFC capture behavior, and retarget identities.
+// Require a positive retained maxFlight; error-code state is capacity independent.
 mlir::LogicalResult attachFASEDResponseErrors(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp bank, std::string &error);
 // Combined compatibility entry point; rejected boundaries leave IR unchanged.

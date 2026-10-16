@@ -8784,3 +8784,112 @@ final RTL/collateral and both immutable fixture trees remain preserved.
 After the regression comparison, the 130 current Shuttle MLIR dumps were
 also losslessly compressed, recovering 9,672,530,627 bytes
 (`lossless-storage-cleanup-259-shuttle.json`). About 31 GiB remains free.
+
+## Iteration 260: constructor-independent FASED response-error registers
+
+`FASEDResponseErrors.cpp` now accepts a retained positive maxFlight representable
+in 64 bits, instead of requiring ten flights. The header and native test document
+and exercise this attachment contract. Missing, noninteger, zero, negative and
+wider-than-64-bit constructors still reject before any mutation. The exact
+64/4-bit host-response bundles, host clock/reset, unused top and annotation
+requirements remain enforced. The full constructor is retained unchanged.
+
+The executable oracle is `models/dram/FASEDMemoryTimingModel.scala:580-587`
+and `widgets/Lib.scala`'s `MCRIO.bindReg`. Its two reset-to-zero UInt<2> registers
+are independent of outstanding-request capacity. Accepted nonzero R/B errors
+capture the current R response code, including the SFC B-error/current-Rresp
+behavior. Existing CIRCT FIRRTL operations preserve that behavior, host-reset
+priority, zero-extended 32-bit readback and nonfatal read-only write diagnostics.
+`MidasTransforms.scala` ordering and `FAMETransform.scala` host/target clock
+semantics were inspected; no Scala oracle changed.
+
+The compiler builds and nine focused CTests pass: response errors, functional
+model register, latency registers, request limits, read/write admission, write
+retirement, write pairing and statistics. The updated response-error test checks
+**393,216 cycles** across ordinary/selected-Print roots and capacities 1, 9, 10,
+16, 20 and INT64_MAX, with **276 atomic boundary rejections** plus 408 split-API
+rejections. Constructor identity, annotation transfers and stalled response
+handshakes are checked. The archived Rocket constructor has ten flights;
+Gemmini and Saturn both have twenty.
+
+The existing `Transforms/NICFASEDResponseErrorsCompare.py` exporter/comparator
+was reused without source changes. Four production differential comparisons
+pass for **133,124 host cycles** (33,281 per fixture). Each clones the actual
+emitted bank and all nine clock/reset/response/MCR bindings, then executes
+verbatim SFC register updates, readback and diagnostics against it before and
+after every edge. Coverage includes all sixteen R/B error-code pairs, both valid
+bits, reset/write combinations, B errors capturing zero or distinct current R
+codes, target stalls and readback backpressure. Three illegal-write masks run
+in native/oracle/joint modes: repeated diagnostics continue simulation, reset
+suppresses diagnostics and state recovery matches. Four valid-IR binding
+mutations per fixture reject. SFC optimized response ready away, so these RTL
+probes use its always-ready boundary; the native CTest additionally checks ready
+stalls. Full AXI transport, response queues and complete target behavior are
+separate validation boundaries.
+
+The exact SFC RTL artifacts compared, all matching this register bank, are:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `5ca576a7f925848eb4ec2f2d71bf040e7ff2b2de0a1aedfae141e0801c6b938d`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2aaa560a480c9b8c65973c526851c52a6a853f4802ecb4d1bbac493313e4428f`.
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+
+All extracted archived cones match the immutable October 1 cone. For Rocket,
+Gemmini and Saturn, composition preserves 184 preceding modules, copies 188
+ports, checks 197 wrapper connections and retains/retargets respectively
+1,676 / 3,697 / 2,160 annotation records. Their exact sibling
+`design/FireSim-generated.const.h` files (SHA256
+`34a3d08b9cf8b179eb0f951e23e187c37d30ff1ea084aa76058e704f5737a308`)
+match read-only `rrespError`/`brespError` byte offsets 76/80 and absolute
+addresses 204/208. The October 1 build-tree fixture has no `.const.h`; its
+comparison uses the same composition/oracle/differential functions without
+claiming a header comparison.
+
+The full thirteen-target archived-input replay retains three Rocket compiles,
+four compiler rejections and six distinct unsupported QSFP profiles. Gemmini
+and Saturn now emit `post-fame-fased-response-errors.mlir` and
+`post-fame-fased-response-errors-all.json`; both next reject at
+`FASED statistics currently require the recorded ten-flight constructor`.
+BOOM/Shuttle retain their wider TracerV rejection. Structured SFC comparisons
+remain eight matched, six native SRAM/model-port mismatches and twelve not
+reached. The replay exits 1 for these retained gaps, not a full-matrix pass.
+The compiler SHA256 is
+`000e23b9cdbc8d6b6d602c03d4383beb1c7dbb5bfaca8d18b023670d3f9b7aeb`.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration260-u250-target-matrix/`:
+`build.log`, `ctest.log`, `replay/matrix.json`,
+`response-errors-comparison.json`, four per-fixture JSON files and their
+production-export/firtool/Verilator/simulation/mutation logs.
+`matrix-regression.json` verifies all **1,457** prior MLIR/annotation files
+unchanged after normalizing only the candidate-directory prefix. The four
+new files are the response-error boundary pairs for Gemmini and Saturn.
+Input hashes, effective platforms, compile statuses and structured comparison
+results are unchanged. `rocket-rtl-regression.json` verifies byte identity of
+all eighteen final Rocket RTL/collateral files. The complete retained FASED
+constructor also matches
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json`,
+SHA256 `4793fa4344b6e2a4faa4775579a382e00fae728740e6bb877e8981f433d2338d`
+(`immutable-constructor-comparison.json`). `source-replay-stability.json`
+checks 912 live compiler/build/test and Scala oracle source files plus the
+executable hash after verification and before appending this report.
+
+No FireSim manager gate or hardware step was started. Supplied iteration 259
+CIRCT replace-RTL, smoke, portable Spike differential (90,141 checks) and
+Rocket UART-bearing suite (90,805 checks) passes are prior-version evidence;
+the SFC UART-bearing differential baseline remains pending. The next smallest
+port is the statistics attachment's capacity guard, with differential checks
+of its counters and response-observation hierarchy. Histogram/queue capacity,
+wider TracerV, SRAM model equivalence and QSFP gaps remain separate work.
+
+For storage, 280 remaining iteration 259 MLIR dumps were losslessly compressed,
+recovering 13,078,394,166 bytes; 731 iteration 260 replay MLIR dumps recovered
+50,563,779,326 bytes. Every decompressed SHA256 matches its original
+(`lossless-storage-cleanup-259.json`, `lossless-storage-cleanup-260.json`).
+Historical paths now have a `.gz` suffix; the previous Rocket response-error
+baseline, current production comparison inputs, JSON/logs and final RTL remain
+available. Both immutable fixture trees are untouched. About 33 GiB is free.
