@@ -1,7 +1,7 @@
 // See LICENSE for license details.
-// Oracle: EgressUnit.scala WriteEgress, recorded Rocket idReuse=1 profile.
+// Oracle: EgressUnit.scala WriteEgress, idReuse=1/2 constructor profiles.
 // Host B always accepts; its response metadata is discarded except the ID.
-// Counters wrap at one bit. haveAck samples OLD counters on request start or
+// Counters wrap at log2Up(idReuse+1) bits. haveAck samples OLD nonzero counts on request start or
 // retry, including host clocks without targetFire. Retry selects the current
 // ID even on a simultaneous new request. Same-ID enqueue/retirement cancel.
 // Only valid, haveAck and counters reset; the request ID remains unreset.
@@ -42,11 +42,19 @@ LogicalResult goldengate::addFASEDWriteEgress(CircuitOp circuit, std::string &er
   auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
   auto widths=key?key.getAs<DictionaryAttr>("axi4Widths"):DictionaryAttr();
   auto has=[&](DictionaryAttr d,llvm::StringRef n,int v) {
-    auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();return a&&a.getInt()==v;
+    auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();return a&&a.getValue().getBitWidth()<=64&&a.getInt()==v;
   };
-  if (!has(edge,"maxWriteTransfer",8)||!has(edge,"idReuse",1)||!has(edge,"maxFlight",10)||
+  auto reuse=edge?edge.getAs<IntegerAttr>("idReuse"):IntegerAttr();
+  auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
+  // maxRequests/maxReqLength do not enter the SFC WriteEgress logic.
+  // Its acknowledgment width uses maxReqsPerId directly, without clamping
+  // to maxFlight; maxFlight=1 still needs two bits when idReuse=2.
+  if (!has(edge,"maxWriteTransfer",8)||!reuse||reuse.getValue().getBitWidth()>64||
+      (reuse.getInt()!=1&&reuse.getInt()!=2)||!flight||
+      flight.getValue().getBitWidth()>64||flight.getInt()<=0||
       !has(widths,"addrBits",35)||!has(widths,"dataBits",64)||!has(widths,"idBits",4))
-    return reject("FASED write egress supports the recorded 35/64/4-bit, one-request-per-ID profile");
+    return reject("FASED write egress supports 35/64/4-bit, 8-beat, one or two requests per ID with positive maxFlight");
+  unsigned counterWidth=reuse.getInt()==1?1:2;
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w) {return UIntType::get(ctx,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> es) {
@@ -91,27 +99,40 @@ LogicalResult goldengate::addFASEDWriteEgress(CircuitOp circuit, std::string &er
   auto neg=[&](Value a)->Value{return b.create<NotPrimOp>(loc,a);};
   auto eq=[&](Value a,Value z)->Value{return b.create<EQPrimOp>(loc,a,z);};
   auto mux=[&](Value c,Value a,Value z)->Value{return b.create<MuxPrimOp>(loc,c,a,z);};
-  auto reg=[&](llvm::StringRef name)->Value {
-    return b.create<RegResetOp>(loc,bit,arg(0),arg(1),constant(1,0),name).getResult();
+  auto reg=[&](llvm::StringRef name,unsigned width=1)->Value {
+    return b.create<RegResetOp>(loc,uint(width),arg(0),arg(1),constant(width,0),name).getResult();
   };
   Value valid=reg("currReqReg_valid"),ack=reg("haveAck");
   Value id=b.create<RegOp>(loc,uint(4),arg(0),"currReqReg_bits").getResult();
   SmallVector<Value> counters;
-  for(unsigned i=0;i<16;++i) counters.push_back(reg("ackCounters_"+std::to_string(i)));
+  for(unsigned i=0;i<16;++i) counters.push_back(reg("ackCounters_"+std::to_string(i),counterWidth));
   Value start=both(arg(2),field(arg(3),"valid"));
   Value retire=both(both(both(arg(2),valid),ack),field(arg(5),"tReady"));
   Value retry=both(valid,neg(ack)),deqId=mux(retry,id,field(arg(3),"bits"));
   Value selected=counters.front();
   for(unsigned i=1;i<16;++i) selected=mux(eq(deqId,constant(4,i)),counters[i],selected);
+  if(counterWidth>1) selected=neg(eq(selected,constant(counterWidth,0)));
   connect(valid,mux(start,constant(1,1),mux(retire,constant(1,0),valid)));
   connect(id,mux(start,field(arg(3),"bits"),id));
   connect(ack,mux(either(retry,start),selected,ack));
   Value enq=field(arg(4),"valid"),enqId=field(field(arg(4),"bits"),"id");
   Value cancel=both(both(retire,enq),eq(id,enqId));
   for(unsigned i=0;i<16;++i) {
-    Value change=both(neg(cancel),either(both(enq,eq(enqId,constant(4,i))),both(retire,eq(id,constant(4,i)))));
-    // Width one: increment and decrement both toggle, without saturation.
-    connect(counters[i],mux(change,neg(counters[i]),counters[i]));
+    if(counterWidth==1) {
+      Value change=both(neg(cancel),either(both(enq,eq(enqId,constant(4,i))),both(retire,eq(id,constant(4,i)))));
+      // Width one: increment and decrement both toggle, without saturation.
+      connect(counters[i],mux(change,neg(counters[i]),counters[i]));
+    } else {
+      Value increment=b.create<AddPrimOp>(loc,counters[i],constant(1,1));
+      Value decrement=b.create<SubPrimOp>(loc,counters[i],constant(1,1));
+      // FIRRTL arithmetic widens; assignment truncation wraps at the register
+      // width, including overflow and underflow. Do not saturate at idReuse.
+      increment=b.create<BitsPrimOp>(loc,increment,counterWidth-1,0);
+      decrement=b.create<BitsPrimOp>(loc,decrement,counterWidth-1,0);
+      Value next=mux(both(enq,eq(enqId,constant(4,i))),increment,
+                     mux(both(retire,eq(id,constant(4,i))),decrement,counters[i]));
+      connect(counters[i],mux(cancel,counters[i],next));
+    }
   }
   connect(field(arg(4),"ready"),constant(1,1));
   connect(field(arg(5),"hValid"),either(neg(valid),ack));

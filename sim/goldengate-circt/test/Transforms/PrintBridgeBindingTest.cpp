@@ -7737,7 +7737,7 @@ int main(int argc, char **argv) {
           else {
             NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
             NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
-            edge.set("maxFlight", b.getI64IntegerAttr(11));
+            edge.set("maxFlight", b.getI64IntegerAttr(0));
             key.set("axi4Edge", edge.getDictionary(&ctx));
             engine->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
           }

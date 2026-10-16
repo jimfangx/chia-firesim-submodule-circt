@@ -8212,3 +8212,114 @@ remain byte-identical. Only Gemmini/Saturn's four scheduler/annotation files
 are added, and their diagnostics advance from read scheduler to write egress.
 The source/build snapshot retains all 671 recorded input hashes; the compiler
 binary is unchanged throughout replay (`source-replay-stability.json`).
+
+
+## Iteration 255 — constructor-derived write acknowledgment counters
+
+Iteration 254's replay showed Gemmini Rocket and Saturn Rocket reaching the
+write-egress constructor guard. Their actual SFC `WriteEgress` modules have
+sixteen two-bit acknowledgment counters, whereas Rocket's counters have one
+bit. `BaseConfig.getMaxPerID` uses the edge's idReuse directly, and SFC
+`WriteEgress` sizes its counters with `log2Up(maxReqsPerId + 1)`; maxFlight
+does not clamp this width. Its maxRequests/maxReqLength arguments do not
+enter the acknowledgment logic.
+
+`FASEDWriteEgress.cpp` now accepts idReuse 1/2 with positive maxFlight for
+the existing 35/64/4-bit, eight-beat profile. It emits two-bit FIRRTL reset
+registers, widened additions/subtractions with explicit truncation, and
+nonzero testing of old counts. A count of two therefore acknowledges a
+request even though its low bit is zero. Overflow wraps from three to zero
+and underflow from zero to three; these are SFC register-width semantics,
+not saturation at idReuse. Same-ID simultaneous host arrival and target
+retirement cancel; different IDs update independently. Retry sampling on
+host clocks, retry ID priority over a simultaneous new request, qualified
+reset, new-request priority and the unreset request ID are preserved. The
+one-bit operation sequence remains unchanged. Constructor, identity and
+boundary rejection checks precede all mutations.
+
+The native test checks both ordinary and selected Print roots, idReuse 1/2
+and maxFlight 1/10/20, including arbitrary counter state and continuous
+sequences. Atomic rejection coverage includes nonpositive maxFlight,
+unsupported idReuse, missing/wrong-type fields, oversized integer attributes,
+missing boundaries and repeated application. The selected Print CLI's invalid
+maxFlight probe now uses zero because positive values are supported.
+
+Exact SFC RTL inputs for the isolated production-helper comparisons are:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  SHA256 `5ca576a7f925848eb4ec2f2d71bf040e7ff2b2de0a1aedfae141e0801c6b938d`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`
+  SHA256 `2aaa560a480c9b8c65973c526851c52a6a853f4802ecb4d1bbac493313e4428f`.
+- The immutable October 1 U250 build-tree
+  `deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+
+The comparator clones the emitted production helper verbatim and executes
+it against the complete SFC sequential module, comparing all sixteen
+counters, valid, haveAck, current ID and defined response metadata after
+initial reset/ID capture. Wrapper checks retain preceding modules, compare
+all connections and recursively transfer the full annotation archive.
+
+Validation evidence is in
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration255-u250-target-matrix/`:
+
+- Native compiler, write-egress test and Print-binding test build passed
+  (`build.log`). Both focused CTests passed (`ctest.log`). The write-egress
+  interpreter checked 513,216 transitions across the twelve constructor/root
+  combinations, including two-bit nonzero counts, wrapping and underflow;
+  54 invalid/repeated applications rejected without changing the IR.
+- The archived selected Print read-scheduler boundary passed the production
+  adapter check (`selected-print-write-egress.log`): allocated headers, prior
+  SSA operations and annotation targets were preserved; nine invalid inputs
+  rejected atomically.
+- Four actual SFC RTL comparisons passed for 160,776 clocked cycles in
+  total (`write-egress-comparison.json`). Rocket/October 1 each checked
+  40,130 cycles; Gemmini/Saturn each checked 40,258 cycles. Each two-bit
+  run covered 1,930 even nonzero samples, 2,390 overflows and 359 underflows,
+  with cancellations and wraps exercised for all sixteen IDs. Each boundary
+  retains all 163 preceding modules and checks 191 wrapper connections;
+  annotation archives retain 1,676 Rocket, 3,697 Gemmini and 2,160 Saturn
+  records. These compare the actual generated sequential modules, not a
+  separately rewritten behavioral oracle.
+
+Both Gemmini and Saturn now pass write egress, response release, timing,
+write admission and read admission, then reject at the request-limit pass:
+`FASED request limits currently require the recorded ten-flight constructor`.
+The next smallest change is constructor-derived request-limit register
+reset values and admission widths for their twenty-flight profiles, compared
+against these same SFC models' MMIO and request-limit RTL. Merely relaxing
+that guard would retain the wrong reset value/width. Remaining deinterleaver,
+host-buffer, wider trace, model-port and partitioned QSFP gaps still require
+separate ports; this milestone establishes neither full matrix support nor
+Linux boot.
+
+The full archived-input replay (`replay/matrix.json`) completed with three
+compiled Rocket recipes, four compiler rejections and six distinct unsupported
+QSFP platform recipes. Structured comparisons remain eight matched, six
+native SRAM/model-interface mismatches and twelve not reached; the latter
+two categories are unresolved gaps. BOOM and Saturn Shuttle still reject
+at the wider TracerV constructor. Only the Gemmini/Saturn diagnostics advance
+from write egress to request limits. The replay uses compiler SHA256
+`1a2eb5cca0a718916559b4c3925a03f91d100dfc094f2d4ab0a7e4f573bed57b`.
+
+Storage cleanup losslessly compressed 718 older iteration 254 MLIR files,
+recovering 48,959,035,700 bytes after verifying every decompressed SHA256
+(`lossless-storage-cleanup-254.json`). Current boundaries, earlier JSON,
+final RTL/collateral and immutable SFC fixtures remain available.
+
+`matrix-regression.json` verifies unchanged archived inputs, effective
+platforms, compile statuses and structured comparison results. All 1,405
+prior MLIR/JSON boundaries match after normalizing only the candidate
+output-directory prefix; all 18 final Rocket RTL/collateral files remain
+byte-identical. Gemmini and Saturn each add twenty boundary/annotation
+files from write egress through read admission. The source snapshot retains
+all 750 recorded input hashes, and the compiler binary stayed unchanged
+throughout replay (`source-replay-stability.json`).
+
+Iteration 254's supplied harness feedback reports CIRCT replacertl and fresh
+bare-metal Verilator smoke passing, with unchanged-input long-suite evidence
+reused and the SFC UART-bearing baseline still pending. No iteration 255
+manager verification or hardware step was started by the implementation
+agent; those ordered gates remain harness-owned.

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # See LICENSE for license details.
-"""Compare production NIC write acknowledgment state with complete SFC RTL.
+"""Compare production write acknowledgment state with complete SFC RTL.
 
 Check the emitted helper, wrapper connections and recursive annotation transfer.
 Clone the actual helper for RTL execution against the complete archived SFC
@@ -28,15 +28,17 @@ def composition(directory, baseline):
     actual = modules((directory / 'post-fame-fased-write-egress.mlir').read_text())
     assert prior and all(actual.get(n) == b for n, b in prior.items()), 'existing module changed'
     assert set(actual) - set(prior) == {HELPER, NEW}
-    baseline_modules = modules(baseline.read_text())
-    assert actual[HELPER] == baseline_modules[HELPER], 'shared helper changed'
+    baseline_modules = modules(baseline.read_text()) if baseline is not None else None
+    if baseline_modules is not None:
+        assert actual[HELPER] == baseline_modules[HELPER], 'shared helper changed'
     copied = [p for p in native_ports(prior[OLD]) if p[1] not in (
         'fased_write_egress_valid', 'fased_host_write_responses')]
     ports = native_ports(actual[NEW])
     assert ports[:len(copied)] == copied
     assert [p[1] for p in ports[len(copied):]] == [
         'fased_host_write_response', 'fased_write_egress_req', 'fased_write_egress_resp']
-    assert ports[len(copied):] == native_ports(baseline_modules[NEW])[-3:], 'write boundary types differ'
+    if baseline_modules is not None:
+        assert ports[len(copied):] == native_ports(baseline_modules[NEW])[-3:], 'write boundary types differ'
     read_wiring = wrapper_wiring(prior[OLD])
     assert read_wiring['sim.fased_egress_readiness.writeValid'] == 'top.fased_write_egress_valid'
     assert read_wiring['sim.fased_egress_readiness.readValid'] == 'readScheduler.resp.hValid'
@@ -63,8 +65,10 @@ def composition(directory, baseline):
 
 
 def reference_boundary(golden, immutable):
-    text, reference = clean(golden.read_text()), clean(immutable.read_text())
-    assert module(text, 'WriteEgress') == module(reference, 'WriteEgress'), 'immutable SFC WriteEgress differs'
+    text = clean(golden.read_text())
+    if immutable is not None:
+        reference = clean(immutable.read_text())
+        assert module(text, 'WriteEgress') == module(reference, 'WriteEgress'), 'immutable SFC WriteEgress differs'
     host = equations(module(text, 'FASEDMemoryTimingModel')[1])
     assert host['writeEgress_clock'] == 'clock'
     assert host['writeEgress_reset'] == 'reset | _readEgress_reset_T_1'
@@ -92,8 +96,12 @@ def differential(candidate, golden, export_tool, out):
     run(['firtool', exported, '--format=mlir', '--disable-all-randomization', '-o', native], 'firtool')
     header, body = module(clean(golden.read_text()), 'WriteEgress')
     (out / 'oracle.sv').write_text('module SFCWriteEgress(' + header + ');' + body + 'endmodule\n')
+    widths = re.findall(r'reg\s*(\[1:0\])?\s+ackCounters_\d+\s*;', body)
+    assert len(widths) == 16 and len(set(widths)) == 1, 'unsupported SFC counter geometry'
+    counter_width = 2 if widths[0] else 1
+    counter_max = (1 << counter_width) - 1
     checks = '\n'.join(f'if(candidate.{n} !== oracle.{n})$fatal(1,"{n} differs cycle=%0d",cycles);'
-                        for n in ['currReqReg_valid', 'haveAck'] + [f'ackCounters_{i}' for i in range(16)])
+                        for n in ['currReqReg_valid', 'currReqReg_bits', 'haveAck'] + [f'ackCounters_{i}' for i in range(16)])
     tb = r'''module check;
 reg clock=0,reset=0,targetFire=0,req_valid=0,resp_tReady=0,enq_valid=0,enq_bits_user=0;
 reg [3:0] req_bits=0,enq_bits_id=0;
@@ -104,7 +112,7 @@ wire [1:0] resp_tBits_resp;
 wire sfc_ready,sfc_valid;
 wire [3:0] sfc_id;
 integer cycles=0,starts=0,retirements=0,chained=0,resetStarts=0,retries=0,wraps=0;
-integer cancellations=0,differentIDs=0,oldSamples=0,stalls=0,i,j;
+integer cancellations=0,differentIDs=0,oldSamples=0,stalls=0,evenNonzero=0,underflows=0,i,j;
 reg [15:0] seenIDs=0,cancelIDs=0,wrapIDs=0;
 reg [31:0] rng=32'h197ab;
 GGFASEDWriteEgress candidate(.*);
@@ -131,11 +139,18 @@ begin
  end
  if(oracle.currReqReg_valid&&!oracle.haveAck&&!targetFire)retries++;
  if(oracle.currReqReg_valid&&(!targetFire||!resp_tReady))stalls++;
+ if(!reset&&(oracle.retry||(targetFire&&req_valid)))begin
+  @EVEN_CHECKS@
+ end
+ if(!reset&&targetFire&&oracle.currReqReg_valid&&oracle.haveAck&&resp_tReady&&
+    !(enq_valid&&enq_bits_id==sfc_id))begin
+  @UNDERFLOW_CHECKS@
+ end
  if(enq_valid&&!reset)begin
   seenIDs[enq_bits_id]=1;
   if((oracle.retry||(targetFire&&req_valid))&&oracle.deqId==enq_bits_id)oldSamples++;
   if(!(targetFire&&oracle.currReqReg_valid&&oracle.haveAck&&resp_tReady&&enq_bits_id==sfc_id))begin
-   if(oracle.ackCounters_0 && enq_bits_id==0)begin wraps++;wrapIDs[0]=1;end
+   if(oracle.ackCounters_0 == @COUNTER_MAX@ && enq_bits_id==0)begin wraps++;wrapIDs[0]=1;end
    @WRAP_CHECKS@
   end
  end
@@ -144,15 +159,24 @@ end endtask
 initial begin
  // The request ID is unreset and is defined by capture even during reset.
  reset=1;targetFire=1;req_valid=1;req_bits=5;step();step();
- // Each ID: wrap its one-bit counter, retry without targetFire, then cancel
+ // Each ID: wrap its counter, retry without targetFire, then cancel
  // simultaneous same-ID arrival/retirement and chain a new request.
  for(i=0;i<16;i++)begin
   reset=1;targetFire=0;req_valid=0;enq_valid=0;step();
-  reset=0;enq_bits_id=i;enq_valid=1;step();step();step();
+  reset=0;enq_bits_id=i;enq_valid=1;
+  for(j=0;j<@COUNTER_MAX@+2;j++)step();
   enq_valid=0;targetFire=1;req_valid=1;req_bits=i;step();
   targetFire=0;req_valid=0;step();
   targetFire=1;resp_tReady=1;req_valid=1;enq_valid=1;step();
   targetFire=0;req_valid=0;enq_valid=0;step();
+ end
+ // A count of two must acknowledge a request even though its low bit is zero.
+ // Exercise each ID, including retry sampling independently of targetFire.
+ if(@COUNTER_WIDTH@==2)for(i=0;i<16;i++)begin
+  reset=1;enq_valid=0;targetFire=0;req_valid=0;step();
+  reset=0;enq_valid=1;enq_bits_id=i;step();step();
+  enq_valid=0;targetFire=1;req_valid=1;req_bits=i;step();
+  targetFire=0;req_valid=0;step();step();
  end
  for(i=0;i<40000;i++)begin
   rng=rng^(rng<<13);rng=rng^(rng>>17);rng=rng^(rng<<5);
@@ -162,16 +186,21 @@ initial begin
  end
  if(starts<1000||retirements<100||chained<100||resetStarts<20||retries<1000||
     wraps<100||cancellations<100||differentIDs<100||oldSamples<100||stalls<1000||
+    (@COUNTER_WIDTH@==2&&evenNonzero<16)||underflows<10||
     seenIDs!==16'hffff||cancelIDs!==16'hffff||wrapIDs!==16'hffff)
   $fatal(1,"missing coverage");
- $display("PASS cycles=%0d starts=%0d retirements=%0d chained=%0d reset_starts=%0d host_retries=%0d counter_wraps=%0d same_ID_cancellations=%0d different_ID_updates=%0d old_counter_samples=%0d stalls=%0d IDs=%0d cancel_IDs=%0d wrap_IDs=%0d",
+ $display("PASS cycles=%0d starts=%0d retirements=%0d chained=%0d reset_starts=%0d host_retries=%0d counter_wraps=%0d same_ID_cancellations=%0d different_ID_updates=%0d old_counter_samples=%0d stalls=%0d even_nonzero_samples=%0d underflows=%0d IDs=%0d cancel_IDs=%0d wrap_IDs=%0d",
   cycles,starts,retirements,chained,resetStarts,retries,wraps,cancellations,differentIDs,
-  oldSamples,stalls,seenIDs,cancelIDs,wrapIDs);
+  oldSamples,stalls,evenNonzero,underflows,seenIDs,cancelIDs,wrapIDs);
  $finish;
 end endmodule
 '''.replace('@STATE_CHECKS@', checks).replace('@WRAP_CHECKS@', '\n'.join(
-        f'if(oracle.ackCounters_{i} && enq_bits_id=={i})begin wraps++;wrapIDs[{i}]=1;end'
-        for i in range(1,16)))
+        f'if(oracle.ackCounters_{i} == {counter_max} && enq_bits_id=={i})begin wraps++;wrapIDs[{i}]=1;end'
+        for i in range(1,16))).replace('@EVEN_CHECKS@', '\n'.join(
+        f'if(oracle.deqId=={i} && oracle.ackCounters_{i}==2)evenNonzero++;'
+        for i in range(16))).replace('@UNDERFLOW_CHECKS@', '\n'.join(
+        f'if(sfc_id=={i} && oracle.ackCounters_{i}==0)underflows++;'
+        for i in range(16))).replace('@COUNTER_MAX@', str(counter_max)).replace('@COUNTER_WIDTH@', str(counter_width))
     (out / 'check.sv').write_text(tb)
     run(['verilator', '--binary', '-j', '4', '--timing', '-Wno-fatal', '--top-module', 'check',
          '--Mdir', out / 'obj', '-o', 'check', out / 'check.sv', native, out / 'oracle.sv'], 'verilator')
@@ -180,6 +209,7 @@ end endmodule
     assert 'PASS cycles=' in log
     return dict({n: int(v) for n,v in re.findall(r'(\w+)=(\d+)',log)},
                 production_helper_cloned_verbatim=True, actual_sfc_sequential_rtl=True,
+                counter_width=counter_width,
                 all_state_compared_after_initial_reset_and_ID_capture=True)
 
 

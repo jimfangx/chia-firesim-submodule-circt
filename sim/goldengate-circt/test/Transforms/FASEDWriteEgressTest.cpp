@@ -21,7 +21,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false,unsigned reuse=1,unsigned flight=10) {
   llvm::StringRef rootName=selected?"GGSelectedPrintFASEDReadSchedulerWrapper":"GGFASEDReadSchedulerWrapper";
   std::string input="module { firrtl.circuit \"" + rootName.str() +
       "\" { firrtl.module @" + rootName.str() + "() {} } }";
@@ -38,7 +38,18 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=fal
   auto top=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ports);
   if(mode!=9){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     auto attrs=[&](std::initializer_list<std::pair<llvm::StringRef,int>> es){NamedAttrList list;for(auto [n,v]:es)list.set(n,b.getI64IntegerAttr(v));return list.getDictionary(&ctx);};
-    if(mode!=20)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxWriteTransfer",mode==19?4:8},{"idReuse",mode==10?2:1},{"maxFlight",10}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
+    if(mode!=20)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxWriteTransfer",mode==19?4:8},{"idReuse",mode==10?3:static_cast<int>(reuse)},{"maxFlight",mode==21?0:mode==22?-1:static_cast<int>(flight)}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
+  if(mode>=23&&mode<=26) {
+    auto engine=named(c,"GGFASEDTokenEngine");
+    NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
+    NamedAttrList edge(cast<DictionaryAttr>(key.get("axi4Edge")));
+    if(mode==23)edge.erase("idReuse");
+    if(mode==24)edge.set("maxFlight",b.getStringAttr("10"));
+    if(mode==25||mode==26)edge.set(mode==25?"idReuse":"maxFlight",
+      b.getIntegerAttr(b.getIntegerType(128),APInt(128,mode==25?1:10)));
+    key.set("axi4Edge",edge.getDictionary(&ctx));
+    engine->setAttr("goldengate.bridgeConstructor",key.getDictionary(&ctx));
+  }
   if(mode==12||mode==13)b.create<FModuleOp>(c.getLoc(),b.getStringAttr(mode==12?"GGFASEDWriteEgress":selected?"GGSelectedPrintFASEDWriteEgressWrapper":"GGFASEDWriteEgressWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==14){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(c.getLoc(),top,"used");}if(mode==15)c.setName("other");
   SmallVector<Attribute> raw;for(auto n:{"other","fased_write_egress_valid","fased_host_write_responses","fased_host_write_responses.bReady","fased_host_write_responses.bValid"})raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr("~"+rootName.str()+"|"+rootName.str()+">"+std::string(n)))}));
@@ -120,39 +131,45 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx,bool selected) {
-  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx,bool selected,unsigned reuse,unsigned flight) {
+  auto root=fixture(ctx,0,selected,reuse,flight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);require(succeeded(verify(*root)),"invalid write egress IR");
   Interpreter sim(named(c,"GGFASEDWriteEgress"));std::map<std::string,Value> regs;
   for(auto r:sim.module.getOps<RegResetOp>())regs[r.getName().str()]=r.getResult();for(auto r:sim.module.getOps<RegOp>())regs[r.getName().str()]=r.getResult();
   require(regs.size()==19,"write egress state differs");
-  std::mt19937_64 random(218);unsigned cases=0,cancelled=0,hostRetries=0,priority=0,wraps=0,oldSample=0;
-  auto sample=[&](unsigned active,unsigned ack,unsigned id,unsigned enqId,unsigned newId,unsigned flags,unsigned mask){
+  const unsigned counterWidth=reuse==1?1:2,limit=(1<<counterWidth)-1;
+  for(unsigned j=0;j<16;++j)require(sim.width(regs.at("ackCounters_"+std::to_string(j)))==counterWidth,"constructor counter width differs");
+  std::mt19937_64 random(218);unsigned cases=0,cancelled=0,hostRetries=0,priority=0,wraps=0,oldSample=0,evenNonzero=0,underflows=0;
+  auto sample=[&](unsigned active,unsigned ack,unsigned id,unsigned enqId,unsigned newId,unsigned flags,uint64_t mask){
     sim.memo.clear();sim.state[regs.at("currReqReg_valid")]=APInt(1,active);sim.state[regs.at("currReqReg_bits")]=APInt(4,id);sim.state[regs.at("haveAck")]=APInt(1,ack);
-    for(unsigned j=0;j<16;++j)sim.state[regs.at("ackCounters_"+std::to_string(j))]=APInt(1,mask>>j&1);
+    for(unsigned j=0;j<16;++j)sim.state[regs.at("ackCounters_"+std::to_string(j))]=APInt(counterWidth,(mask>>(j*counterWidth))&limit);
     bool reset=flags&1,fire=flags>>1&1,request=flags>>2&1,enq=flags>>3&1,ready=flags>>4&1;
     sim.put(sim.arg(1),"",reset);sim.put(sim.arg(2),"",fire);sim.put(sim.arg(3),"valid",request);sim.put(sim.arg(3),"bits",newId);
     sim.put(sim.arg(4),"valid",enq);sim.put(sim.arg(4),"bits.id",enqId);sim.put(sim.arg(4),"bits.user",random()&1);sim.put(sim.arg(4),"bits.resp",random()&3);sim.put(sim.arg(5),"tReady",ready);
     bool start=fire&&request,retire=fire&&active&&ack&&ready,retry=active&&!ack,cancel=retire&&enq&&id==enqId;
-    unsigned selected=retry?id:newId,nextMask=mask;
-    if(!cancel){if(enq)nextMask^=1<<enqId;if(retire)nextMask^=1<<id;}
+    unsigned selected=retry?id:newId;
+    auto count=[&](unsigned j){return unsigned((mask>>(j*counterWidth))&limit);};
+    auto expected=[&](unsigned j){
+      int delta=cancel?0:enq&&enqId==j?1:retire&&id==j?-1:0;
+      return (count(j)+delta)&limit;
+    };
     require(sim.output(sim.arg(4),"ready",1).getBoolValue(),"host B backpressured");
     require(sim.output(sim.arg(5),"hValid",1).getBoolValue()==(!active||ack),"write token validity differs");
     require(sim.output(sim.arg(5),"tBits.id",4).getZExtValue()==id,"response ID differs");
     require(sim.output(sim.arg(5),"tBits.user",1).isZero()&&sim.output(sim.arg(5),"tBits.resp",2).isZero(),"response metadata not normalized");
     sim.edge();require(sim.state[regs.at("currReqReg_valid")].getZExtValue()==(reset?0:start?1:retire?0:active),"start/reset/retire priority differs");
     require(sim.state[regs.at("currReqReg_bits")].getZExtValue()==(start?newId:id),"unreset ID differs");
-    require(sim.state[regs.at("haveAck")].getZExtValue()==(reset?0:(retry||start)?(mask>>selected&1):ack),"old counter sampling or retry ID priority differs");
-    for(unsigned j=0;j<16;++j)require(sim.state[regs.at("ackCounters_"+std::to_string(j))].getZExtValue()==(reset?0:nextMask>>j&1),"counter update/cancel/wrap differs");
-    ++cases;cancelled+=cancel;hostRetries+=retry&&!fire;priority+=start&&retire;wraps+=enq&&(mask>>enqId&1)&&!cancel;oldSample+=(retry||start)&&enq&&selected==enqId;
+    require(sim.state[regs.at("haveAck")].getZExtValue()==(reset?0:(retry||start)?(count(selected)!=0):ack),"old counter sampling or retry ID priority differs");
+    for(unsigned j=0;j<16;++j)require(sim.state[regs.at("ackCounters_"+std::to_string(j))].getZExtValue()==(reset?0:expected(j)),"counter update/cancel/wrap differs");
+    ++cases;cancelled+=cancel;hostRetries+=retry&&!fire;priority+=start&&retire;wraps+=enq&&count(enqId)==limit&&!cancel;underflows+=retire&&!cancel&&count(id)==0;evenNonzero+=(retry||start)&&count(selected)==2&&!reset;oldSample+=(retry||start)&&enq&&selected==enqId;
   };
   for(unsigned active=0;active<2;++active)for(unsigned ack=0;ack<2;++ack)for(unsigned id=0;id<16;++id)for(unsigned enqId=0;enqId<16;++enqId)for(unsigned flags=0;flags<32;++flags)
-    sample(active,ack,id,enqId,random()%16,flags,random()&65535);
+    sample(active,ack,id,enqId,random()%16,flags,random());
   // Continuous state sequences also exercise one-host-cycle response arrival
   // latency, stale haveAck, reset traffic and repeated wrapping acknowledgements.
-  for(unsigned j=0;j<10000;++j){unsigned mask=0;for(unsigned k=0;k<16;++k)mask|=sim.state[regs.at("ackCounters_"+std::to_string(k))].getZExtValue()<<k;
+  for(unsigned j=0;j<10000;++j){uint64_t mask=0;for(unsigned k=0;k<16;++k)mask|=sim.state[regs.at("ackCounters_"+std::to_string(k))].getZExtValue()<<(k*counterWidth);
     sample(sim.state[regs.at("currReqReg_valid")].getZExtValue(),sim.state[regs.at("haveAck")].getZExtValue(),sim.state[regs.at("currReqReg_bits")].getZExtValue(),random()%16,random()%16,random()%32,mask);}
-  require(cancelled&&hostRetries&&priority&&wraps&&oldSample,"write egress coverage missing");llvm::outs()<<cases<<" write egress transitions; "<<cancelled<<" same-ID cancellations, "<<hostRetries<<" host-only retries, "<<priority<<" chained requests, "<<wraps<<" counter wraps, "<<oldSample<<" old counter samples passed\n";
+  require(cancelled&&hostRetries&&priority&&wraps&&oldSample&&underflows&&(reuse==1||evenNonzero),"write egress coverage missing");llvm::outs()<<"idReuse="<<reuse<<" maxFlight="<<flight<<": "<<cases<<" write egress transitions; "<<cancelled<<" same-ID cancellations, "<<hostRetries<<" host-only retries, "<<priority<<" chained requests, "<<wraps<<" counter wraps, "<<oldSample<<" old counter samples, "<<evenNonzero<<" even nonzero samples, "<<underflows<<" underflows passed\n";
 }
 void mapping(MLIRContext &ctx,bool selected) {
   auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);
@@ -178,8 +195,8 @@ void mapping(MLIRContext &ctx,bool selected) {
   llvm::outs()<<"64 wrapper mapping cases and five target transfers passed\n";
 }
 void rejection(MLIRContext &ctx,bool selected) {
-  for(unsigned mode=1;mode<=20;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
-  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"21 atomic rejection cases passed\n";
+  for(unsigned mode=1;mode<=26;++mode){auto root=fixture(ctx,mode,selected);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error))&&!error.empty(),"invalid boundary accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
+  auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDWriteEgress(c,error)),error);{llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteEgress(c,error)),"repeat accepted");{llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"27 atomic rejection cases passed\n";
 }
 }
 int main(int argc, char **argv) {
@@ -205,7 +222,10 @@ int main(int argc, char **argv) {
       out.close(); isolated.erase(); return 0;
     }
     require(argc == 1, "usage: goldengate-fased-write-egress-test [boundary.mlir helper.mlir]");
-    for(bool selected:{false,true}) {behavior(ctx,selected);mapping(ctx,selected);rejection(ctx,selected);}
+    for(bool selected:{false,true}) {
+      for(unsigned reuse:{1u,2u})for(unsigned flight:{1u,10u,20u})behavior(ctx,selected,reuse,flight);
+      mapping(ctx,selected);rejection(ctx,selected);
+    }
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }
