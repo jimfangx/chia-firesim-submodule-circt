@@ -11,6 +11,8 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+unsigned maxFlight = 10;
+unsigned countWidth() { return maxFlight >= 16 ? 5 : 4; }
 llvm::StringRef names[]{"GGFASEDWriteAdmissionWrapper", "GGFASEDWriteRetirementWrapper",
   "GGFASEDWritePairingWrapper", "GGFASEDTimingAWQueueWrapper",
   "GGFASEDWriteLatencyWrapper", "GGFASEDReadLatencyWrapper", "GGFASEDTimingCycleWrapper",
@@ -89,6 +91,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   if(mode==24) {auto other=make("Other",{});b.setInsertionPointToEnd(other.getBodyBlock());b.create<InstanceOp>(loc,inner,"used");}
   if(mode==25)make(profile("GGFASEDReadAdmissionWrapper"),{});
   if(mode==26)c.setName("Wrong");
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),
+      ConventionAttr::get(&ctx,Convention::Internal),ArrayRef<PortInfo>{});
+  engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({
+      b.getNamedAttr("axi4Edge",b.getDictionaryAttr({
+        b.getNamedAttr("maxFlight",b.getI64IntegerAttr(maxFlight))}))}));
   if(mode!=1)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({
     b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
     b.getNamedAttr("targets",b.getArrayAttr({
@@ -148,7 +156,7 @@ void behavior(MLIRContext &ctx) {
   auto bits=last.getInput().getDefiningOp<SubfieldOp>();require(bits&&bits.getFieldName()=="bits"&&bits.getInput()==ready.getInput(),"wrong R payload");
   auto helper=named(c,"GGFASEDReadAdmission");unsigned regs=0;
   for(auto reg:helper.getOps<RegResetOp>()) {
-    ++regs;require(reg.getResult().getType()==UIntType::get(&ctx,4,false),"wrong read counter width");
+    ++regs;require(reg.getResult().getType()==UIntType::get(&ctx,countWidth(),false),"wrong read counter width");
     auto r=reg.getResetSignal().getDefiningOp<AndPrimOp>();
     require(r&&r.getLhs()==helper.getBodyBlock()->getArgument(1)&&r.getRhs()==helper.getBodyBlock()->getArgument(2),"reset not gated by fire");
     auto next=driver(helper,reg.getResult()).getDefiningOp<MuxPrimOp>();
@@ -285,10 +293,10 @@ int main(int argc,char **argv) {
       "GGSelectedPrintFASEDWritePairingWrapper", "GGSelectedPrintFASEDTimingAWQueueWrapper",
       "GGSelectedPrintFASEDWriteLatencyWrapper", "GGSelectedPrintFASEDReadLatencyWrapper",
       "GGSelectedPrintFASEDTimingCycleWrapper", "GGSelectedPrintFASEDResponseReleaserWrapper"};
-    behavior(ctx); rejection(ctx);
+    for(unsigned flight : {10u,20u}) { maxFlight=flight; behavior(ctx); rejection(ctx); }
     selectedPrint = true;
     for (unsigned i = 0; i < 8; ++i) names[i] = selectedNames[i];
-    behavior(ctx); rejection(ctx);
+    for(unsigned flight : {10u,20u}) { maxFlight=flight; behavior(ctx); rejection(ctx); }
   }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

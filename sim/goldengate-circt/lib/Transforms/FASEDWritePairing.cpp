@@ -4,7 +4,7 @@
 // 35/64/4-bit no-LLC model, exact clock/reset/fire/request/pairing boundaries.
 // Annotations consumed/produced: none; copied targets move to the new top;
 // consumed pairing targets remain on the instantiated inner module.
-// IR mutations: two four-bit saturating counters and combinational AW/W pairing;
+// IR mutations: two constructor-sized saturating counters and combinational AW/W pairing;
 // bind accepted AW and last W handshakes and retire both on target B.fire.
 // Analyses required/preserved: retained constructor, no cached analyses.
 // Output invariants: counter state/reset advance only on targetFire. Simultaneous
@@ -13,6 +13,7 @@
 // Target B.fire and runtime maximum remain explicit boundaries. Request-ready
 // admission is unchanged; observed full flags will drive it in a later pass.
 #include "goldengate/FASEDWritePairing.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
@@ -43,6 +44,9 @@ LogicalResult goldengate::addFASEDWritePairing(CircuitOp circuit,
   };
   if (!has("addrBits", 35) || !has("dataBits", 64) || !has("idBits", 4))
     return reject("FASED write pairing requires the recorded 35/64/4-bit profile");
+  unsigned limit, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, limit, countWidth, error)))
+    return failure();
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); }; auto bit = uint(1);
   auto payload = [&](std::initializer_list<std::pair<llvm::StringRef, unsigned>> fields) {
@@ -76,11 +80,11 @@ LogicalResult goldengate::addFASEDWritePairing(CircuitOp circuit,
       return reject("FASED write pairing boundary already exists");
   bool used = false; circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("FASED write pairing needs an uninstantiated top");
-  auto pending = payload({{"awValue",4},{"wValue",4},{"awFull",1},{"wFull",1}});
+  auto pending = payload({{"awValue",countWidth},{"wValue",countWidth},{"awFull",1},{"wFull",1}});
   SmallVector<PortInfo> hp{{b.getStringAttr("clock"), types[0], Direction::In},
       {b.getStringAttr("reset"), bit, Direction::In}, {b.getStringAttr("targetFire"), bit, Direction::In},
       {b.getStringAttr("awFire"), bit, Direction::In}, {b.getStringAttr("wLastFire"), bit, Direction::In},
-      {b.getStringAttr("bFire"), bit, Direction::In}, {b.getStringAttr("writeMaxReqs"), uint(4), Direction::In},
+      {b.getStringAttr("bFire"), bit, Direction::In}, {b.getStringAttr("writeMaxReqs"), uint(countWidth), Direction::In},
       {b.getStringAttr("pairComplete"), bit, Direction::Out}, {b.getStringAttr("pending"), pending, Direction::Out}};
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto helper = b.create<FModuleOp>(loc, b.getStringAttr(helperName), ConventionAttr::get(ctx, Convention::Internal), hp);
@@ -96,15 +100,15 @@ LogicalResult goldengate::addFASEDWritePairing(CircuitOp circuit,
   Value enabledReset = both(arg(1),arg(2));
   SmallVector<Value> values;
   for (unsigned i=0; i<2; ++i) {
-    Value value = b.create<RegResetOp>(loc,uint(4),arg(0),enabledReset,constant(4,0),
+    Value value = b.create<RegResetOp>(loc,uint(countWidth),arg(0),enabledReset,constant(countWidth,0),
         i ? "pendingW" : "pendingAW").getResult();
     values.push_back(value);
     Value inc=arg(3+i), dec=arg(5), full=b.create<GEQPrimOp>(loc,value,arg(6));
-    Value empty=b.create<EQPrimOp>(loc,value,constant(4,0));
+    Value empty=b.create<EQPrimOp>(loc,value,constant(countWidth,0));
     Value up=both(both(inc,neg(dec)),neg(full));
     Value down=both(both(neg(inc),dec),neg(empty));
-    Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,value,constant(4,1)),3,0);
-    Value minus=b.create<BitsPrimOp>(loc,b.create<SubPrimOp>(loc,value,constant(4,1)),3,0);
+    Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,value,constant(countWidth,1)),countWidth-1,0);
+    Value minus=b.create<BitsPrimOp>(loc,b.create<SubPrimOp>(loc,value,constant(countWidth,1)),countWidth-1,0);
     connect(value,mux(arg(2),mux(up,plus,mux(down,minus,value)),value));
     connect(field(arg(8),i ? "wValue" : "awValue"),value);
     connect(field(arg(8),i ? "wFull" : "awFull"),full);
@@ -118,7 +122,7 @@ LogicalResult goldengate::addFASEDWritePairing(CircuitOp circuit,
     if (i != indices[4]) { copied.push_back(i); ports.push_back(p); }
   unsigned added = ports.size();
   ports.push_back({b.getStringAttr("fased_target_b_fire"),bit,Direction::In});
-  ports.push_back({b.getStringAttr("fased_write_max_reqs"),uint(4),Direction::In});
+  ports.push_back({b.getStringAttr("fased_write_max_reqs"),uint(countWidth),Direction::In});
   ports.push_back({b.getStringAttr("fased_pending_writes"),pending,Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper=b.create<FModuleOp>(loc,b.getStringAttr(wrapperName),inner.getConventionAttr(),ports);

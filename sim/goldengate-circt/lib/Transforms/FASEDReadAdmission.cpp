@@ -3,7 +3,7 @@
 // Requires: uninstantiated write-admission top; unique eight-module sim chain;
 // exact recorded 35/64/4-bit no-LLC requests, model clock/reset/fire and R response.
 // Consumes/produces annotations: none; copied top references transfer to wrapper.
-// Mutations: append internal accepted-final-R observations; create a four-bit
+// Mutations: append internal accepted-final-R observations; create a constructor-sized
 // pending-read counter and close AR ready with !full. Existing AW/W pass through.
 // Analyses required/preserved: no cached analyses. Preflight checks all modified
 // hierarchy uses before mutation; cloned instances retain custom attributes.
@@ -12,6 +12,7 @@
 // limit reductions do not clamp state. Ready has no reset/fire/host-ready mask.
 // Runtime readMaxReqs remains an explicit boundary until FASED MMIO is ported.
 #include "goldengate/FASEDReadAdmission.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
@@ -60,6 +61,9 @@ LogicalResult goldengate::bindFASEDReadAdmission(CircuitOp circuit,
       return reject("FASED read admission needs the recorded sim chain");
     if (j) chain.push_back(uses[0]);
   }
+  unsigned limit, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, limit, countWidth, error)))
+    return failure();
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); }; auto bit = uint(1);
   auto port = [&](FModuleOp m, llvm::StringRef n, Type t, Direction d)->std::optional<unsigned> {
@@ -105,8 +109,8 @@ LogicalResult goldengate::bindFASEDReadAdmission(CircuitOp circuit,
     return reject("FASED read admission needs exact clock/reset/fire/requests and releaser R response");
   auto ports=modules[0].getPorts(); unsigned added=ports.size();
   ports[*req].type=requests(false);
-  auto pending=payload({{"value",4},{"full",1}});
-  ports.push_back({b.getStringAttr("fased_read_max_reqs"),uint(4),Direction::In});
+  auto pending=payload({{"value",countWidth},{"full",1}});
+  ports.push_back({b.getStringAttr("fased_read_max_reqs"),uint(countWidth),Direction::In});
   ports.push_back({b.getStringAttr("fased_pending_reads"),pending,Direction::Out});
 
   // Append bottom-up, preserving existing result indices, uses and metadata.
@@ -143,7 +147,7 @@ LogicalResult goldengate::bindFASEDReadAdmission(CircuitOp circuit,
   SmallVector<PortInfo> hp{{b.getStringAttr("clock"),ClockType::get(ctx),Direction::In},
     {b.getStringAttr("reset"),bit,Direction::In},{b.getStringAttr("targetFire"),bit,Direction::In},
     {b.getStringAttr("arValid"),bit,Direction::In},{b.getStringAttr("rLastFire"),bit,Direction::In},
-    {b.getStringAttr("readMaxReqs"),uint(4),Direction::In},{b.getStringAttr("arReady"),bit,Direction::Out},
+    {b.getStringAttr("readMaxReqs"),uint(countWidth),Direction::In},{b.getStringAttr("arReady"),bit,Direction::Out},
     {b.getStringAttr("pending"),pending,Direction::Out}};
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto helper=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDReadAdmission"),
@@ -153,14 +157,14 @@ LogicalResult goldengate::bindFASEDReadAdmission(CircuitOp circuit,
   auto constant=[&](unsigned w,uint64_t n)->Value{return b.create<ConstantOp>(loc,uint(w),APInt(w,n));};
   auto neg=[&](Value v)->Value{return b.create<NotPrimOp>(loc,v);};
   auto mux=[&](Value c,Value a,Value z)->Value{return b.create<MuxPrimOp>(loc,c,a,z);};
-  Value value=b.create<RegResetOp>(loc,uint(4),arg(0),both(arg(1),arg(2)),constant(4,0),"pendingReads").getResult();
+  Value value=b.create<RegResetOp>(loc,uint(countWidth),arg(0),both(arg(1),arg(2)),constant(countWidth,0),"pendingReads").getResult();
   Value full=b.create<GEQPrimOp>(loc,value,arg(5));
   Value ready=neg(full),inc=both(arg(3),ready),dec=arg(4);
-  Value empty=b.create<EQPrimOp>(loc,value,constant(4,0));
+  Value empty=b.create<EQPrimOp>(loc,value,constant(countWidth,0));
   Value up=both(both(inc,neg(dec)),neg(full));
   Value down=both(both(neg(inc),dec),neg(empty));
-  Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,value,constant(4,1)),3,0);
-  Value minus=b.create<BitsPrimOp>(loc,b.create<SubPrimOp>(loc,value,constant(4,1)),3,0);
+  Value plus=b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,value,constant(countWidth,1)),countWidth-1,0);
+  Value minus=b.create<BitsPrimOp>(loc,b.create<SubPrimOp>(loc,value,constant(countWidth,1)),countWidth-1,0);
   connect(value,mux(arg(2),mux(up,plus,mux(down,minus,value)),value));
   connect(arg(6),ready); connect(field(arg(7),"value"),value); connect(field(arg(7),"full"),full);
   b.setInsertionPointToEnd(circuit.getBodyBlock());

@@ -1095,7 +1095,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-request-limits COMMAND goldengate-fased-request-limits-test)
   add_executable(goldengate-fased-read-admission-test
-    test/Transforms/FASEDReadAdmissionTest.cpp lib/Transforms/FASEDReadAdmission.cpp)
+    test/Transforms/FASEDReadAdmissionTest.cpp lib/Transforms/FASEDReadAdmission.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-read-admission-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-read-admission-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-read-admission-test PRIVATE
@@ -1104,7 +1105,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-read-admission COMMAND goldengate-fased-read-admission-test)
   add_executable(goldengate-fased-write-admission-test
-    test/Transforms/FASEDWriteAdmissionTest.cpp lib/Transforms/FASEDWriteAdmission.cpp)
+    test/Transforms/FASEDWriteAdmissionTest.cpp lib/Transforms/FASEDWriteAdmission.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-write-admission-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-write-admission-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-write-admission-test PRIVATE
@@ -1122,7 +1124,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-write-retirement COMMAND goldengate-fased-write-retirement-test)
   add_executable(goldengate-fased-write-pairing-test
-    test/Transforms/FASEDWritePairingTest.cpp lib/Transforms/FASEDWritePairing.cpp)
+    test/Transforms/FASEDWritePairingTest.cpp lib/Transforms/FASEDWritePairing.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-write-pairing-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-write-pairing-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-write-pairing-test PRIVATE

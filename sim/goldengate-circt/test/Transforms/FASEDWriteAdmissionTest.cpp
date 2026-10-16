@@ -14,6 +14,8 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+unsigned maxFlight = 10;
+unsigned countWidth() { return maxFlight >= 16 ? 5 : 4; }
 void require(bool ok, llvm::StringRef why) { if (!ok) throw std::runtime_error(why.str()); }
 FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m:c.getOps<FModuleOp>()) if (m.getName()==name) return m;
@@ -34,7 +36,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=f
   auto data=payload({{"user",1},{"strb",8},{"id",4},{"last",1},{"data",mode==6?32u:64u}});
   auto requests=BundleType::get(&ctx,{{b.getStringAttr("aw"),false,dec(address,mode!=7)},
     {b.getStringAttr("w"),false,dec(data,mode!=8)},{b.getStringAttr("ar"),false,dec(address,mode!=9)}});
-  auto pending=payload({{"awValue",mode==10?5u:4u},{"wValue",4},{"awFull",mode==11?2u:1u},{"wFull",1}});
+  auto pending=payload({{"awValue",mode==10?countWidth()+1:countWidth()},{"wValue",countWidth()},{"awFull",mode==11?2u:1u},{"wFull",1}});
   SmallVector<PortInfo> ps{{b.getStringAttr("fased_timing_requests"),requests,Direction::Out},
     {b.getStringAttr("fased_pending_writes"),pending,Direction::Out},
     {b.getStringAttr("hostClock"),ClockType::get(&ctx),Direction::In},
@@ -46,6 +48,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=f
   if(mode==14){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   std::string circuitTarget="~"+c.getName().str(), topTarget=circuitTarget+"|"+top.getName().str()+">";
   if(mode==15)c.setName("wrong");
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),
+      ConventionAttr::get(&ctx,Convention::Internal),ArrayRef<PortInfo>{});
+  engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({
+      b.getNamedAttr("axi4Edge",b.getDictionaryAttr({
+        b.getNamedAttr("maxFlight",b.getI64IntegerAttr(maxFlight))}))}));
   if(mode!=12)c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Annotation")),
     b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr(circuitTarget),
       b.getStringAttr(topTarget+"fased_timing_requests.aw.ready"),
@@ -214,7 +222,7 @@ int main(int argc,char **argv) {
   try{
     require(argc==1||argc==3,"usage: goldengate-fased-write-admission-test [boundary.mlir probe.mlir]");
     if(argc==3)exportProduction(ctx,argv[1],argv[2]);
-    else for(bool selected:{false,true}){behavior(ctx,selected);rejection(ctx,selected);}
+    else for(unsigned flight:{10u,20u}) for(bool selected:{false,true}){maxFlight=flight;behavior(ctx,selected);rejection(ctx,selected);}
   }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}
   return 0;
 }

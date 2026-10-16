@@ -1,7 +1,7 @@
 // See LICENSE for license details.
 // Oracle: TimingModel.scala SplitTransactionModel AW/W ready := ~pending.full.
 // Required invariants: uninstantiated legacy or selected Print write-retirement top, exact recorded
-// 35/64/4-bit requests and four-bit pending-counter observations.
+// 35/64/4-bit requests and constructor-sized pending-counter observations.
 // Annotations consumed/produced: none; copied top references transfer to the
 // wrapper, including ready fields whose identities now denote driven outputs.
 // IR mutations: wrap the top and close AW/W reverse ready with NotPrimOps.
@@ -12,6 +12,7 @@
 // reverse ready pass through. AW/W ready remain observable but cannot be driven
 // from the external boundary; only those two bundle flips change.
 #include "goldengate/FASEDWriteAdmission.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
@@ -36,6 +37,9 @@ LogicalResult goldengate::bindFASEDWriteAdmission(CircuitOp circuit,
   bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("FASED write admission needs an uninstantiated top");
+  unsigned limit, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, limit, countWidth, error)))
+    return failure();
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); }; auto bit = uint(1);
   auto payload = [&](std::initializer_list<std::pair<llvm::StringRef, unsigned>> fields) {
@@ -55,7 +59,7 @@ LogicalResult goldengate::bindFASEDWriteAdmission(CircuitOp circuit,
       {b.getStringAttr("w"),false,channel(data,reverseWriteReady)},
       {b.getStringAttr("ar"),false,channel(address,true)}});
   };
-  auto pending = payload({{"awValue",4},{"wValue",4},{"awFull",1},{"wFull",1}});
+  auto pending = payload({{"awValue",countWidth},{"wValue",countWidth},{"awFull",1},{"wFull",1}});
   auto port = [&](llvm::StringRef n, Type t)->std::optional<unsigned> {
     for (auto [i,p] : llvm::enumerate(inner.getPorts()))
       if (p.name == n && p.type == t && p.direction == Direction::Out) return i;

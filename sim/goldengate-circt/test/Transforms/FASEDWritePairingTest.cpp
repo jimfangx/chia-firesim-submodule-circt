@@ -16,6 +16,8 @@
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
+unsigned maxFlight = 10;
+unsigned countWidth() { return maxFlight >= 16 ? 5 : 4; }
 void require(bool ok, llvm::StringRef why) { if (!ok) throw std::runtime_error(why.str()); }
 FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
@@ -53,7 +55,8 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   auto top=b.create<FModuleOp>(loc,b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ps);
   if(mode!=11){auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     if(mode!=17)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({
-      b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==16?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));}
+      b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==16?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))})),
+      b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(mode==23?0:maxFlight))}))}));}
   if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?"GGFASEDWritePairing":newName()),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   if(mode==18)c.setName("wrong");
@@ -150,12 +153,12 @@ void behavior(MLIRContext &ctx) {
   unsigned cases=0,stalls=0,stalledResets=0,simultaneous=0,atFull=0,underflows=0,limitBelow=0;
   auto sample=[&](unsigned aw,unsigned w,unsigned maximum,unsigned flags) {
     bool reset=flags&1,fire=flags&2,ai=flags&4,wi=flags&8,bi=flags&16;
-    sim.memo.clear();sim.state[regs[0]]=APInt(4,aw);sim.state[regs[1]]=APInt(4,w);
+    sim.memo.clear();sim.state[regs[0]]=APInt(countWidth(),aw);sim.state[regs[1]]=APInt(countWidth(),w);
     for(unsigned j=1;j<7;++j)sim.put(sim.arg(j),"",j==1?reset:j==2?fire:j==3?ai:j==4?wi:j==5?bi:maximum);
     bool paired=ai&&wi;
     if(w>aw&&ai)paired=true;if(aw>w&&wi)paired=true;
     require(sim.output(sim.arg(7),"",1).getZExtValue()==paired,"pre-edge pairing differs");
-    require(sim.output(sim.arg(8),"awValue",4).getZExtValue()==aw&&sim.output(sim.arg(8),"wValue",4).getZExtValue()==w,"pending count observation differs");
+    require(sim.output(sim.arg(8),"awValue",countWidth()).getZExtValue()==aw&&sim.output(sim.arg(8),"wValue",countWidth()).getZExtValue()==w,"pending count observation differs");
     require(sim.output(sim.arg(8),"awFull",1).getZExtValue()==(aw>=maximum)&&sim.output(sim.arg(8),"wFull",1).getZExtValue()==(w>=maximum),"runtime full differs");
     auto next=[&](unsigned value,bool inc) {
       if(!fire)return value;if(reset)return 0u;
@@ -169,10 +172,12 @@ void behavior(MLIRContext &ctx) {
     atFull+=fire&&!reset&&((ai&&aw>=maximum)||(wi&&w>=maximum));underflows+=fire&&!reset&&bi&&(!aw||!w);
     limitBelow+=aw>maximum||w>maximum;return std::pair<unsigned,unsigned>{na,nw};
   };
-  for(unsigned aw=0;aw<16;++aw)for(unsigned w=0;w<16;++w)for(unsigned max=0;max<16;++max)
-    for(unsigned flags=0;flags<32;++flags)sample(aw,w,max,flags);
+  unsigned states = 1u << countWidth();
+  for(unsigned aw=0;aw<states;++aw)for(unsigned w=0;w<states;++w)for(unsigned max=0;max<states;++max)
+    if(countWidth()==4 || aw==w || aw+1==w || w+1==aw || aw==0 || w==0)
+      for(unsigned flags=0;flags<32;++flags)sample(aw,w,max,flags);
   std::mt19937 random(224);unsigned aw=0,w=0;
-  for(unsigned i=0;i<20000;++i){auto next=sample(aw,w,random()%11,(random()&30)|(i%997==0));aw=next.first;w=next.second;}
+  for(unsigned i=0;i<20000;++i){auto next=sample(aw,w,random()%(1u << countWidth()),(random()&30)|(i%997==0));aw=next.first;w=next.second;}
   require(stalls&&stalledResets&&simultaneous&&atFull&&underflows&&limitBelow,"pending coverage missing");
   llvm::outs()<<cases<<" pending-counter/pairing transitions passed; stalls="<<stalls<<", stalled resets="<<stalledResets
     <<", simultaneous="<<simultaneous<<", full="<<atFull<<", empty retirements="<<underflows<<", reduced limits="<<limitBelow<<"\n";
@@ -202,12 +207,12 @@ void mapping(MLIRContext &ctx) {
 }
 
 void rejection(MLIRContext &ctx) {
-  for(unsigned mode=1;mode<=22;++mode){auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
+  for(unsigned mode=1;mode<=23;++mode){auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
     {llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWritePairing(c,error))&&!error.empty(),"invalid boundary accepted");
     {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
   auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDWritePairing(c,error)),error);
   {llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWritePairing(c,error)),"repeat accepted");
-  {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"23 atomic rejection cases passed\n";
+  {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"24 atomic rejection cases passed\n";
 }
 }
 int main(int argc, char **argv) {
@@ -233,8 +238,8 @@ int main(int argc, char **argv) {
       out.close(); isolated.erase(); return 0;
     }
     require(argc == 1, "usage: goldengate-fased-write-pairing-test [boundary.mlir helper.mlir]");
-    for (bool profile : {false,true}) {
-      selected=profile; behavior(ctx); mapping(ctx); rejection(ctx);
+    for (unsigned flight : {10u,20u}) for (bool profile : {false,true}) {
+      maxFlight=flight; selected=profile; behavior(ctx); mapping(ctx); rejection(ctx);
     }
   } catch (const std::exception &e) { llvm::errs()<<e.what()<<"\n"; return 1; }
   return 0;

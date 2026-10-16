@@ -4,6 +4,11 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
+// Shared constructor profile for the MMIO maxima and pending read/AW/W counters.
+// Uses the mapped engine when present, otherwise the unique early BridgeIO key.
+// Rejects missing/malformed maxFlight before callers mutate IR.
+mlir::LogicalResult getFASEDRequestLimitProfile(circt::firrtl::CircuitOp circuit,
+    unsigned &limit, unsigned &width, std::string &error);
 // Create two host-clocked 32-bit registers resetting to min(16,maxFlight).
 // Their admission outputs have log2Ceil(min(16,maxFlight)+1) bits.
 // Requires a positive retained maxFlight and free bank symbol; preserves top/ports/annotations and leaves result

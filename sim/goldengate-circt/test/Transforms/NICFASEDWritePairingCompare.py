@@ -58,16 +58,17 @@ def composition(directory, baseline):
                 annotation_records_retained=len(new), counter_width=4, counters=2)
 
 
-def oracle(path):
+def oracle(path, width=4):
+    assert width in (4, 5)
     text = clean(path.read_text())
     header, counter = module(text, 'SatUpDownCounter_1')
     eq = {k: ' '.join(v.split()) for k, v in equations(counter).items()}
     for name, expression in {'io_value': 'value', 'io_full': 'value >= io_max',
-                            'io_empty': "value == 4'h0", '_value_T_1': "value + 4'h1",
-                            '_value_T_3': "value - 4'h1"}.items():
+                            'io_empty': f"value == {width}'h0", '_value_T_1': f"value + {width}'h1",
+                            '_value_T_3': f"value - {width}'h1"}.items():
         assert eq[name] == expression
-    assert re.search(r'reg \[3:0\] value;', counter)
-    assert re.search(r"if \(reset\) begin\s*value <= 4'h0;\s*end else if \(io_inc & ~io_dec & ~io_full\) begin\s*value <= _value_T_1;\s*end else if \(~io_inc & io_dec & ~io_empty\) begin\s*value <= _value_T_3;", counter)
+    assert re.search(rf'reg \[{width-1}:0\] value;', counter)
+    assert re.search(rf"if \(reset\) begin\s*value <= {width}'h0;\s*end else if \(io_inc & ~io_dec & ~io_full\) begin\s*value <= _value_T_1;\s*end else if \(~io_inc & io_dec & ~io_empty\) begin\s*value <= _value_T_3;", counter)
     pipe = module(text, 'LatencyPipe')[1]
     eq = {k: ' '.join(v.split()) for k, v in equations(pipe).items()}
     expected = {'_T_5': 'tNasti_io_tNasti_w_ready & tNasti_io_tNasti_w_valid',
@@ -113,11 +114,12 @@ assign awValue=SatUpDownCounter_1_io_value; assign wValue=SatUpDownCounter_2_io_
 assign awFull=SatUpDownCounter_1_io_full; assign wFull=SatUpDownCounter_2_io_full;
 endmodule
 '''
+    shell = shell.replace('[3:0]', f'[{width-1}:0]')
     _, gate = oracle_cone(path)
     return 'module SatUpDownCounter_1('+header+');'+counter+'endmodule\n'+shell, gate
 
 
-def differential(candidate, cone, gate, export_tool, out, retirement=False, admission=None):
+def differential(candidate, cone, gate, export_tool, out, retirement=False, admission=None, width=4):
     out = out.resolve(); out.mkdir(parents=True, exist_ok=False)
     def run(cmd, name):
         with (out/(name+'.log')).open('w') as log:
@@ -271,6 +273,15 @@ SFCPairing oracle(''')
         tb = tb.replace('saturation<100||', 'saturation!=0||blockedAW<100||blockedW<100||zeroMax<100||')
         tb = tb.replace(' $finish;', ''' $display("blocked_aw=%0d blocked_w=%0d zero_max=%0d",blockedAW,blockedW,zeroMax);
  $finish;''')
+    assert width in (4, 5)
+    if width == 5:
+        tb = tb.replace('[3:0]', '[4:0]').replace("4'(", "5'(")
+        tb = tb.replace('readMaxReqs=15', 'readMaxReqs=31').replace('writeMaxReqs=15', 'writeMaxReqs=31')
+        tb = tb.replace('i<17;', 'i<33;').replace('i<16;', 'i<32;').replace('i<15;', 'i<31;')
+        tb = tb.replace('MaxReqs=rng[7:4]', 'MaxReqs=rng[8:4]')
+        tb = tb.replace('reg [15:0] limits', 'reg [31:0] limits')
+        for bitmap in ('limits', 'states', 'awStates', 'wStates'):
+            tb = tb.replace(bitmap+"!=16'hffff", bitmap+"!=32'hffffffff")
     (out/'check.sv').write_text(tb)
     run(['verilator', '--binary', '--assert', '-j', '4', '--timing', '-Wno-fatal',
          '--top-module', 'check', '--Mdir', out/'obj', '-o', 'check',
@@ -283,7 +294,7 @@ SFCPairing oracle(''')
                 production_admission_operations_and_sfc_ready_assignments_executed=admission is not None,
                 admission_feedback_closed=admission is not None,
                 original_aw_w_b_handshake_equations_executed=True,
-                all_sixteen_limits_and_counter_states_exercised=True,
+                limit_and_state_values_exercised=1 << width, counter_width=width,
                 outputs_and_registers_compared_before_and_after_every_edge=True,
                 recorded_clock_gate_delta_cycle_behavior_excluded=True)
 

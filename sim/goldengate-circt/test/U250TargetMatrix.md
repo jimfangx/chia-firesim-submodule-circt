@@ -8436,3 +8436,127 @@ token-engine creation, motivating the retained BridgeIO lookup above; its
 remaining raw MLIR files were also compressed and verified separately
 (`lossless-first-attempt.json`). Final replay boundaries, RTL/collateral,
 logs, JSON evidence and both immutable SFC fixture trees are preserved.
+
+## Iteration 257: constructor-sized pending read/AW/W admission counters
+
+The native `FASEDWritePairing.cpp`, `FASEDWriteAdmission.cpp` and
+`FASEDReadAdmission.cpp` now use the request-limit bank's retained constructor
+profile for pending-counter state and limit/observation ports. The shared
+`getFASEDRequestLimitProfile` in `FASEDRequestLimits.cpp` retains its existing
+validation and early BridgeIO/mapped-engine selection. Each pass checks the
+profile before mutating IR. The three standalone test targets now link that
+shared implementation through `CMakeLists.txt`.
+
+The executable oracle is `TimingModel.scala` pendingReads/pendingAWReq/
+pendingWReq and SplitTransactionModel, plus `widgets/Lib.scala`
+SatUpDownCounter. Default BaseParams cap the constructor at 16:
+`log2Ceil(min(16,maxFlight)+1)` gives four bits for Rocket's maxFlight=10 and
+five bits for Gemmini/Saturn Rocket's maxFlight=20. Add/subtract intermediates
+and truncation widths follow the state width. The accepted AR, AW, last-W,
+final-R and B handshakes, pre-edge AW/W pairing, simultaneous increment/
+decrement hold, full/empty guards, and targetFire-qualified state/reset are
+preserved. Readiness remains combinational and runtime limit reductions do
+not clamp existing state. All representable runtime limits, including 31
+for the five-bit profile, are valid low-bit MMIO values; the capacity cap
+sets reset defaults and widths, rather than clamping MMIO writes.
+
+Both twenty-flight production candidates now attach their previously
+materialized five-bit request-limit banks. The next rejection is
+`FASED latency registers currently require the recorded ten-flight constructor`.
+This is incremental admission support, not complete Gemmini/Saturn compilation.
+The ten-entry timing AW queue, histogram assumptions, other model behavior,
+platform/driver parity and full target execution still require separate work.
+
+The compiler and all five focused CTests pass: request limits, write pairing,
+write admission, read admission and B retirement. Ordinary and selected Print
+counter/admission fixtures cover maxFlight 10 and 20, retained wiring and
+annotation transfer, and atomic rejection. Pairing checks 657,536 transitions
+across the four profiles, including 355,392 five-bit transitions. The unchanged
+request-limit bank test covers twenty root/constructor profiles, widths 1–5,
+655,360 cycles and 900 atomic rejections.
+
+`Transforms/FASEDAdmissionProfilesCompare.py` checks production helper widths,
+the unchanged early/attached bank and its admission connections. It invokes
+the existing production exporters, cloning the actual counter helpers,
+eight final-R observation hops, six B observation hops, and AW/W ready
+operations/bindings. The comparator extensions accept the actual four- or
+five-bit SFC declarations and execute their original counter bodies,
+instances and handshake/pairing equations verbatim. Only the surrounding
+probe shell and stimulus width change. Each implementation closes its own
+ready feedback, and outputs/registers are checked before and after every
+qualified model edge.
+
+Four SFC comparisons pass for **321,648 cycles**. The exact golden inputs are:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `5ca576a7f925848eb4ec2f2d71bf040e7ff2b2de0a1aedfae141e0801c6b938d`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2aaa560a480c9b8c65973c526851c52a6a853f4802ecb4d1bbac493313e4428f`.
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+
+Rocket and the immutable October 1 RTL each pass 40,231 read cycles and
+40,101 closed write-admission/pairing/retirement cycles, covering all sixteen
+limits and states. Gemmini and Saturn each pass 40,295 read cycles and
+40,197 write cycles, covering all 32 limits and states. Cases include zero
+limits, lowering limits below occupancy, independently leading AW/W traffic,
+blocked requests, nonfinal R/W beats, B/R backpressure, empty retirements,
+simultaneous acceptance/retirement, target stalls and stalled resets.
+These probes exclude completion queues, latency scheduling, the recorded
+clock-gate shim's delta-cycle behavior and whole-target execution.
+
+The immutable primary compiler fixture's
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json`
+(SHA256 `4793fa4344b6e2a4faa4775579a382e00fae728740e6bb877e8981f433d2338d`)
+again matches the candidate's complete retained FASED constructor key.
+All eighteen final RTL/collateral files for the three compiled Rocket recipes
+are byte-identical to iteration 256 (`rocket-rtl-regression.json`).
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration257-u250-target-matrix/`:
+`build-fixed.log`, `ctest.log`, `admission-comparison.json`, the per-fixture
+export/firtool/Verilator/simulation logs, and
+`immutable-constructor-comparison.json`. An initial comparison was launched
+before its input boundary existed; `rocket-first-check.log` records that
+missing-file failure. The successful comparison uses the subsequently
+completed production boundary. The initial native test link failure was
+fixed by the explicit shared-profile dependency in CMake.
+
+To make room for this full replay, 733 iteration 256 MLIR artifacts were
+losslessly gzip-compressed; their original/decompressed SHA256 values match
+(`lossless-storage-cleanup-256.json`). Logs, JSON, RTL and all immutable SFC
+fixtures remain intact. No manager verification gate or hardware step was
+started; the supplied iteration 256 harness compile and fresh Verilator
+smoke passes remain prior evidence only.
+
+The completed `replay/matrix.json` retains thirteen distinct effective
+platform/input profiles: three Rocket compiles, four compiler rejections,
+and six unsupported QSFP profiles. BOOM and Shuttle retain their wider
+TracerV rejection. Structured SFC boundary results remain eight matched,
+six native SRAM/model-port mismatches and twelve not reached; these are
+partial results, not full semantic parity. The replay compiler SHA256 is
+`ae9c3c7d15f74a028925e87977000d9c3dc2ce0fa5395f3293569b555d150fbe`.
+
+`matrix-regression.json` checks all 1,445 prior MLIR/annotation files against
+iteration 256: 1,437 unchanged, eight changed only in the pending-counter
+helpers and their wrapper types/arithmetic widths for Gemmini/Saturn. Their
+existing ingress-credit widths, payloads and all other module bodies are
+preserved. Each target adds `post-fame-fased-request-limits.mlir` and its
+annotation file, advancing to the latency-register constructor guard.
+All other failures, structured comparisons, inputs and effective platforms
+are unchanged. `source-replay-stability.json` verifies 751 source/build/test
+inputs and the compiler hash through the completed replay.
+
+The next smallest port is to validate and generalize the FASED latency
+register attachment against these same Gemmini/Saturn SFC constructors and
+full-width MMIO/register behavior. Queue capacity and remaining monitor
+counter assumptions must then be addressed before claiming target support.
+
+After the regression comparison, the 130 current Shuttle MLIR dumps were
+also losslessly gzip-compressed, recovering 9,672,530,627 bytes and leaving
+about 19 GiB free for harness verification. Original/decompressed hashes are
+recorded in `lossless-storage-cleanup-257-shuttle.json`; their historical
+`.mlir` paths now have a `.gz` suffix. All four behavioral comparisons'
+production inputs, final RTL/collateral, logs and JSON remain uncompressed.

@@ -25,9 +25,62 @@ llvm::StringRef wrapperName(CircuitOp circuit) {
       ? "GGSelectedPrintFASEDRequestLimitsWrapper" : "GGFASEDRequestLimitsWrapper";
 }
 constexpr llvm::StringLiteral controlName = "fased_request_limits_mcr";
+SmallVector<PortInfo> requestLimitPorts(MLIRContext *ctx, unsigned width) {
+  OpBuilder b(ctx);
+  auto u = [&](unsigned w) { return UIntType::get(ctx, w, false); };
+  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, u(1)},
+      {b.getStringAttr("valid"), false, u(1)}, {b.getStringAttr("bits"), false, u(32)}});
+  auto words = FVectorType::get(token, 2);
+  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
+      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, u(4)}});
+  auto limits = BundleType::get(ctx, {{b.getStringAttr("write"), false, u(width)},
+      {b.getStringAttr("read"), false, u(width)}});
+  return {{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
+      {b.getStringAttr("reset"), u(1), Direction::In},
+      {b.getStringAttr("limits"), limits, Direction::Out},
+      {b.getStringAttr("mcr"), mcr, Direction::Out}};
+}
+LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
+    unsigned (&indices)[4], std::string &error) {
+  auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
+  if (circuit.getName() != "GGFASEDReadAdmissionWrapper" &&
+      circuit.getName() != "GGSelectedPrintFASEDReadAdmissionWrapper")
+    return reject("FASED request limits require the active read admission wrapper");
+  for (auto m : circuit.getOps<FModuleLike>()) {
+    if (m.getName() == wrapperName(circuit))
+      return reject("FASED request limit wrapper already exists");
+    if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
+  }
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!inner || !raw) return reject("FASED request limits need a top and retained annotations");
+  unsigned limit, width;
+  if (failed(goldengate::getFASEDRequestLimitProfile(circuit, limit, width, error))) return failure();
+  auto *ctx = circuit.getContext();
+  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
+  auto bit = uint(1);
+  std::optional<unsigned> clock, reset, writeLimit, readLimit;
+  for (auto [i, port] : llvm::enumerate(inner.getPorts())) {
+    if (port.name == controlName) return reject("FASED request limit MCR port already exists");
+    if (port.name == "hostClock" && isa<ClockType>(port.type) && port.direction == Direction::In) clock = i;
+    if (port.name == "hostReset" && port.type == bit && port.direction == Direction::In) reset = i;
+    if (port.name == "fased_write_max_reqs" && port.type == uint(width) && port.direction == Direction::In) writeLimit = i;
+    if (port.name == "fased_read_max_reqs" && port.type == uint(width) && port.direction == Direction::In) readLimit = i;
+  }
+  if (!clock || !reset || !writeLimit || !readLimit)
+    return reject("FASED request limits need host clock/reset and constructor-sized admission limits");
+  bool used = false;
+  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
+  if (used) return reject("FASED request limits need an uninstantiated top");
+
+  indices[0] = *clock; indices[1] = *reset;
+  indices[2] = *writeLimit; indices[3] = *readLimit;
+  return success();
+}
+} // namespace
+
 // BaseConfig.maxReads/maxWrites cap edge.maxFlight at default BaseParams=16.
 // Custom BaseParams are not represented by the supported constructor handoff.
-LogicalResult requestLimitProfile(CircuitOp circuit, unsigned &limit,
+LogicalResult goldengate::getFASEDRequestLimitProfile(CircuitOp circuit, unsigned &limit,
     unsigned &width, std::string &error) {
   FModuleOp engine;
   for (auto m : circuit.getOps<FModuleOp>())
@@ -64,58 +117,6 @@ LogicalResult requestLimitProfile(CircuitOp circuit, unsigned &limit,
   width = llvm::Log2_64_Ceil(limit + 1);
   return success();
 }
-SmallVector<PortInfo> requestLimitPorts(MLIRContext *ctx, unsigned width) {
-  OpBuilder b(ctx);
-  auto u = [&](unsigned w) { return UIntType::get(ctx, w, false); };
-  auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, u(1)},
-      {b.getStringAttr("valid"), false, u(1)}, {b.getStringAttr("bits"), false, u(32)}});
-  auto words = FVectorType::get(token, 2);
-  auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
-      {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, u(4)}});
-  auto limits = BundleType::get(ctx, {{b.getStringAttr("write"), false, u(width)},
-      {b.getStringAttr("read"), false, u(width)}});
-  return {{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-      {b.getStringAttr("reset"), u(1), Direction::In},
-      {b.getStringAttr("limits"), limits, Direction::Out},
-      {b.getStringAttr("mcr"), mcr, Direction::Out}};
-}
-LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
-    unsigned (&indices)[4], std::string &error) {
-  auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (circuit.getName() != "GGFASEDReadAdmissionWrapper" &&
-      circuit.getName() != "GGSelectedPrintFASEDReadAdmissionWrapper")
-    return reject("FASED request limits require the active read admission wrapper");
-  for (auto m : circuit.getOps<FModuleLike>()) {
-    if (m.getName() == wrapperName(circuit))
-      return reject("FASED request limit wrapper already exists");
-    if (m.getName() == circuit.getName()) inner = dyn_cast<FModuleOp>(m.getOperation());
-  }
-  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!inner || !raw) return reject("FASED request limits need a top and retained annotations");
-  unsigned limit, width;
-  if (failed(requestLimitProfile(circuit, limit, width, error))) return failure();
-  auto *ctx = circuit.getContext();
-  auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
-  auto bit = uint(1);
-  std::optional<unsigned> clock, reset, writeLimit, readLimit;
-  for (auto [i, port] : llvm::enumerate(inner.getPorts())) {
-    if (port.name == controlName) return reject("FASED request limit MCR port already exists");
-    if (port.name == "hostClock" && isa<ClockType>(port.type) && port.direction == Direction::In) clock = i;
-    if (port.name == "hostReset" && port.type == bit && port.direction == Direction::In) reset = i;
-    if (port.name == "fased_write_max_reqs" && port.type == uint(width) && port.direction == Direction::In) writeLimit = i;
-    if (port.name == "fased_read_max_reqs" && port.type == uint(width) && port.direction == Direction::In) readLimit = i;
-  }
-  if (!clock || !reset || !writeLimit || !readLimit)
-    return reject("FASED request limits need host clock/reset and constructor-sized admission limits");
-  bool used = false;
-  circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
-  if (used) return reject("FASED request limits need an uninstantiated top");
-
-  indices[0] = *clock; indices[1] = *reset;
-  indices[2] = *writeLimit; indices[3] = *readLimit;
-  return success();
-}
-} // namespace
 
 LogicalResult goldengate::materializeFASEDRequestLimits(CircuitOp circuit,
     FModuleOp &result, std::string &error) {
@@ -125,7 +126,7 @@ LogicalResult goldengate::materializeFASEDRequestLimits(CircuitOp circuit,
       return failure();
     }
   unsigned limit, width;
-  if (failed(requestLimitProfile(circuit, limit, width, error))) return failure();
+  if (failed(goldengate::getFASEDRequestLimitProfile(circuit, limit, width, error))) return failure();
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1); auto bankPorts = requestLimitPorts(ctx, width);
@@ -171,7 +172,7 @@ LogicalResult goldengate::attachFASEDRequestLimits(CircuitOp circuit,
     return reject("FASED request-limit attachment requires its materialized bank in this circuit");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   unsigned limit, width;
-  if (failed(requestLimitProfile(circuit, limit, width, error))) return failure();
+  if (failed(goldengate::getFASEDRequestLimitProfile(circuit, limit, width, error))) return failure();
   auto expected = requestLimitPorts(ctx, width); auto actual = bank.getPorts();
   if (actual.size() != expected.size()) return reject("FASED request-limit bank needs exactly four ports");
   for (auto [i, port] : llvm::enumerate(actual))
