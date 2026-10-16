@@ -3,7 +3,7 @@
 // Materialization requires a free bank symbol and preserves top identity/annotations.
 // Attachment requires an uninstantiated legacy or selected Print request-limit
 // wrapper, host clock/reset,
-// 32-bit latency inputs and the retained recorded ten-flight bridge profile.
+// 32-bit latency inputs and a retained positive maxFlight bridge constructor.
 // Consumes/produces annotations: none; preserves and explicitly retargets all.
 // IR mutations: two host-clocked reset registers, a decoded MCR fragment for
 // words 0/1 (byte offsets 0/4), and a wrapper consuming both latency inputs.
@@ -57,8 +57,11 @@ LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
   auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() != 10)
-    return reject("FASED latency registers currently require the recorded ten-flight constructor");
+  // LatencyPipeMMRegIO declares both latencies as UInt(32.W), independently
+  // of BaseConfig.maxReads/maxWrites. maxFlight sizes the request machinery,
+  // not these host registers or their full-width timing-model bindings.
+  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
+    return reject("FASED latency registers require a positive 64-bit maxFlight constructor");
   auto *ctx = circuit.getContext();
   auto uint = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = uint(1);

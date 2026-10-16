@@ -18,6 +18,7 @@ using namespace mlir;
 using namespace circt::firrtl;
 namespace {
 bool selected = false;
+int64_t maxFlight = 10;
 std::string profile(llvm::StringRef input) {
   std::string result = input.str();
   if (selected) for (auto suffix : {"LatencyRegistersWrapper", "RequestLimitsWrapper"}) {
@@ -90,7 +91,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
     } })"), &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   named(c, "GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
-    b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(10))}))}));
+    b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI64IntegerAttr(maxFlight))}))}));
   SmallVector<Attribute> annos;
   for (auto name : {"fased_write_latency", "fased_read_latency", "other", "hostReset"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
@@ -217,7 +218,10 @@ void behavior(MLIRContext &context) {
 }
 void mapping(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto constructor = named(c, "GGFASEDTokenEngine")->getAttr("goldengate.bridgeConstructor");
   require(succeeded(goldengate::addFASEDLatencyRegisters(c, error)), error);
+  require(named(c, "GGFASEDTokenEngine")->getAttr("goldengate.bridgeConstructor") == constructor,
+      "latency attachment changed the retained constructor");
   auto top = named(c, profile("GGFASEDLatencyRegistersWrapper")), bank = named(c, "GGFASEDLatencyRegisters");
   require(top.getNumPorts() == 6 && top.getPortName(5) == "fased_latency_mcr", "latency ports not consumed");
   auto regs = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
@@ -250,14 +254,14 @@ void mapping(MLIRContext &context) {
   }
 }
 void rejections(MLIRContext &context) {
-  for (unsigned mode = 0; mode < 15; ++mode) {
+  for (unsigned mode = 0; mode < 18; ++mode) {
     auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
     auto top = named(c, profile("GGFASEDRequestLimitsWrapper")), engine = named(c, "GGFASEDTokenEngine");
     if (mode == 0) c.setName("WrongTop");
     if (mode == 1) c->removeAttr("rawAnnotations");
     if (mode == 2) engine->removeAttr("goldengate.bridgeConstructor");
     if (mode == 3) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
-        b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(9))}))}));
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(0))}))}));
     if (mode >= 4 && mode < 8) { auto names = llvm::to_vector(top.getPortNames()); names[mode - 4] = b.getStringAttr("missing"); top.setPortNames(names); }
     if (mode >= 8 && mode < 12) {
       SmallVector<bool> dirs; for (auto port : top.getPorts()) dirs.push_back(port.direction == Direction::Out); dirs[mode - 8] = true; top.setPortDirections(dirs);
@@ -266,6 +270,11 @@ void rejections(MLIRContext &context) {
     if (mode == 13) { auto names = llvm::to_vector(top.getPortNames()); names[6] = b.getStringAttr("fased_latency_mcr"); top.setPortNames(names); }
     if (mode == 14) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
         b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getIntegerAttr(b.getIntegerType(128), APInt(128, 10)))}))}));
+    if (mode == 15) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI64IntegerAttr(-1))}))}));
+    if (mode == 16) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({}));
+    if (mode == 17) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getStringAttr("20"))}))}));
     std::string before; llvm::raw_string_ostream out(before); root->print(out); out.flush(); std::string error;
     require(failed(goldengate::addFASEDLatencyRegisters(c, error)) && !error.empty(), "invalid boundary accepted");
     std::string after; llvm::raw_string_ostream next(after); root->print(next); next.flush();
@@ -339,9 +348,12 @@ int main(int argc,char **argv) {
     if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
     for (bool selectedProfile : {false, true}) {
       selected = selectedProfile;
-      phases(context); behavior(context); mapping(context); rejections(context);
+      for (int64_t flight : {int64_t(1), int64_t(9), int64_t(10), int64_t(16), int64_t(20), INT64_MAX}) {
+        maxFlight = flight;
+        phases(context); behavior(context); mapping(context); rejections(context);
+      }
     }
-    llvm::outs() << "FASED latency registers: 65536 cycles across legacy/selected profiles, host/timing bindings, targets and 70 atomic rejections passed\n";
+    llvm::outs() << "FASED latency registers: 393216 cycles across twelve root/flight profiles, host/timing bindings, retained constructors, targets and 456 atomic rejections passed\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
 }

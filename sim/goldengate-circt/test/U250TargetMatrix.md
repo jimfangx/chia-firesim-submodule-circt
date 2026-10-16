@@ -8560,3 +8560,117 @@ about 19 GiB free for harness verification. Original/decompressed hashes are
 recorded in `lossless-storage-cleanup-257-shuttle.json`; their historical
 `.mlir` paths now have a `.gz` suffix. All four behavioral comparisons'
 production inputs, final RTL/collateral, logs and JSON remain uncompressed.
+
+## Iteration 258: constructor-independent FASED latency-register attachment
+
+`FASEDLatencyRegisters.cpp` now accepts a retained positive maxFlight
+constructor instead of requiring exactly ten flights. Its public header and
+native test document and exercise this boundary. The materialized bank,
+32-bit timing inputs, host clock/reset connections, reset value 30, MCR
+handshakes, offsets and annotation transfer are unchanged. Missing, zero,
+negative, noninteger and wider-than-64-bit constructors still reject before
+mutation. This does not generalize the later timing queues or monitor banks.
+
+The semantic oracle is `models/dram/LatencyBandwidthPipe.scala`:
+`LatencyPipeMMRegIO` declares both latency values as `UInt(32.W)` with runtime
+default 30 independently of BaseConfig.maxReads/maxWrites. `Widget.attachIO`
+and `genAndAttachReg` create the host registers; `MCRIO.bindReg` writes on
+write-valid, ignores write strobes and targetFire, reads the complete value,
+and keeps read-valid/write-ready asserted. Reset takes priority over writes.
+The port preserves this behavior through the existing FIRRTL operations.
+
+The compiler builds and all six focused CTests pass: latency registers,
+request limits, read admission, write admission, B retirement and AW/W pairing.
+The latency test checks 393,216 cycles and 456 atomic rejections across
+ordinary/selected Print roots and maxFlight values 1, 9, 10, 16, 20 and
+INT64_MAX. It also verifies that attachment preserves the complete retained
+constructor, copied/consumed annotation targets and full-width timing inputs.
+
+The existing `Transforms/NICFASEDLatencyRegistersCompare.py` production
+exporter/comparator was reused without source changes. Each probe clones the
+actual emitted bank and its five wrapper connections; the SFC register
+declarations, sequential updates, readback and timing assignments are
+extracted verbatim. Four comparisons pass for **131,396 cycles** (32,849 per
+fixture), checking both sides of each host edge. Stimulus includes reset/write
+priority, full 32-bit values and upper bits, all sixteen write strobes, both
+register write masks, read backpressure and writes during target stalls.
+Three valid-IR binding mutations per probe reject: model-reset substitution,
+crossed latency sources and disconnected MCR wiring. These decoded-bank probes
+do not execute the AXI transport, completion queues or whole target.
+
+The exact SFC RTL artifacts compared are:
+
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2c4960ccd0f4bfabff888cbd7d48867eac21f19ac99a4ee105f82c30464ff702`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_gemmini_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `5ca576a7f925848eb4ec2f2d71bf040e7ff2b2de0a1aedfae141e0801c6b938d`.
+- `automation/chia_firesim_circt/golden/u250-sfc-20261013/alveo_u250_firesim_saturn_REFV256D128_rocket_singlecore_no_nic/design/FireSim-generated.sv`,
+  SHA256 `2aaa560a480c9b8c65973c526851c52a6a853f4802ecb4d1bbac493313e4428f`.
+- `sims/firesim/deploy/results-build/2026-10-01--04-55-23-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config.sfc-golden-2026-10-01/design/FireSim-generated.sv`,
+  SHA256 `20c6ae241b9fbd0cdcab98da3387eb754d45a96c6bc347811982785fa0db1243`.
+
+For Rocket, Gemmini and Saturn, attachment preserves all 182 preceding module
+bodies, copies 187 ports, checks 192 wrapper connections and transfers all
+1,676 / 3,697 / 2,160 respective annotation records. Their banks are identical
+to the prior Rocket bank. The three archived `design/FireSim-generated.const.h`
+files also match writeLatency/readLatency offsets 0/4, absolute addresses
+128/132 and read/write permissions. The first direct October 1 invocation
+stopped before simulation because that immutable build tree has no generated
+`.const.h`. `latency-immutable-driver.log` retains the error. The successful
+direct comparison calls the same composition/oracle/differential functions
+without the unavailable header check; it makes no October 1 header ABI claim.
+The other three comparisons additionally verify that their extracted SFC
+register cones are identical to the October 1 cone.
+
+The thirteen-target archived-input replay retains three Rocket compiles,
+four compiler rejections and six distinct unsupported QSFP platform profiles.
+Gemmini/Saturn now emit `post-fame-fased-latency-registers.mlir` and its complete
+annotation file. Both then reject with
+`FASED functional model register currently requires the recorded ten-flight constructor`.
+BOOM/Shuttle retain their wider TracerV rejection. Structured SFC annotation
+comparisons remain eight matched, six native SRAM/model-port mismatches and
+twelve not reached. These results do not establish complete target parity.
+The replay compiler SHA256 is
+`7d93a255996beac67fa476e80580e0a8ce488ea93ad476fef7f49eea38f8c917`.
+
+Evidence is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration258-u250-target-matrix/`:
+`build.log`, `ctest.log`, `focused-ctest-output.log`, `replay/matrix.json`,
+`latency-comparison.json`, the four per-fixture comparison JSON files and
+their export/firtool/Verilator/simulation logs. `source-replay-stability.json`
+checks 902 source/build/test inputs and the compiler hash after replay and
+behavioral comparisons, before appending this report.
+
+No FireSim manager verification gate or hardware step was started. The
+supplied iteration 257 native CIRCT compile and fresh bare-metal Verilator
+smoke passes remain prior evidence; unchanged long-suite evidence was reused
+and the SFC UART-bearing baseline remained pending. The next smallest port is
+the one-bit functional-model relaxation register's constructor-independent
+attachment and its host-MMIO/ingress binding comparison against these same
+Gemmini/Saturn goldens. Later queue capacities, statistics/histograms and
+remaining constructor guards still need separate semantic work.
+
+`matrix-regression.json` verifies that all 1,449 prior MLIR/annotation boundary
+files are unchanged after normalizing only the candidate-directory prefix.
+The only new boundaries are the latency-register FIRRTL/annotation pair for
+Gemmini and Saturn. Archived input hashes, effective platforms, compile
+statuses and structured SFC comparison results are unchanged; the two updated
+failure diagnostics are recorded explicitly. `rocket-rtl-regression.json`
+verifies byte identity for all eighteen final Rocket RTL/collateral files.
+The first regression-check invocation stopped on the absent candidate
+directories of the pre-ingestion QSFP rejections; the complete successful
+rerun handles these directories explicitly (`matrix-regression-check.log`).
+
+`immutable-constructor-comparison.json` also verifies the complete retained
+FASED constructor against
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json`,
+SHA256 `4793fa4344b6e2a4faa4775579a382e00fae728740e6bb877e8981f433d2338d`.
+
+For replay storage, 616 remaining iteration 257 MLIR dumps were losslessly
+gzip-compressed, recovering 41,056,925,966 bytes
+(`lossless-storage-cleanup-257.json`). After regression comparison, 256 current
+quad-core Rocket/Shuttle MLIR dumps were compressed in the same way, recovering
+21,910,680,609 bytes (`lossless-storage-cleanup-258.json`). Each original and
+decompressed SHA256 matches; historical raw paths now have a `.gz` suffix.
+Current latency-comparison inputs/probes, logs, JSON, final RTL/collateral and
+both immutable fixture trees are preserved. About 23 GiB remains free.

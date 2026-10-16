@@ -9,8 +9,9 @@ namespace goldengate {
 // unchanged on failure. No annotation classes or cached analyses consumed.
 mlir::LogicalResult materializeFASEDLatencyRegisters(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp &bank, std::string &error);
-// Attach the same uninstantiated four-port bank to the recorded ten-flight
-// request-limit wrapper. Boundary preflight precedes mutation; copied-port
+// Attach the same uninstantiated four-port bank to the request-limit wrapper
+// with a retained positive maxFlight. Latency widths/defaults do not depend
+// on flight count. Boundary preflight precedes mutation; copied-port
 // targets transfer while consumed latency targets remain on the inner module.
 mlir::LogicalResult attachFASEDLatencyRegisters(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp bank, std::string &error);
