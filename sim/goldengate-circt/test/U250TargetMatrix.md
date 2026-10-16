@@ -8323,3 +8323,116 @@ bare-metal Verilator smoke passing, with unchanged-input long-suite evidence
 reused and the SFC UART-bearing baseline still pending. No iteration 255
 manager verification or hardware step was started by the implementation
 agent; those ordered gates remain harness-owned.
+
+
+## Iteration 256: constructor-sized FASED request-limit MMIO bank
+
+`FASEDRequestLimits.cpp` now derives the two 32-bit request-limit registers'
+reset default and admission output width from the retained FASED constructor.
+The executable Scala oracle is `BaseConfig.maxReads/maxWrites` in
+`FASEDMemoryTimingModel.scala` and `SplitTransactionMMRegIO.maxReqRegisters`
+in `TimingModel.scala`: default BaseParams cap the request limit at 16, so
+`min(16,maxFlight)` resets each register and `log2Ceil(limit+1)` sizes its
+admission output. The twenty-flight Gemmini and Saturn Rocket constructors
+therefore require reset 16 and five bits, rather than reset 20. Rocket's
+ten-flight profile retains reset 10 and four bits. Custom BaseParams are
+outside the current constructor handoff and are not established by this port.
+
+The bank is materialized during control allocation, before the token engine
+exists. It reads the unique retained FASED BridgeIO constructor at that phase;
+once mapped, the engine's constructor is authoritative. Missing, malformed,
+nonpositive, oversized and ambiguous constructors reject before mutation.
+Host-clock reset wins over simultaneous MMIO writes; writes ignore strobes
+and target-cycle stalls; readback retains the full 32-bit value. The unchanged
+register offsets are 8/12, with both words readable and writeable. Attachment
+requires admission inputs of the constructor-derived width before mutating IR.
+
+Gemmini and Saturn Rocket still reject at attachment because the preceding
+read/write admission implementations expose four-bit pending counters and
+limits. The five-bit banks are deliberately left unattached in their emitted
+boundaries. Isolated bank equivalence does not establish admission-counter
+composition, complete target compilation, model behavior or Linux boot.
+The next smallest port is constructor-sized pending-read, pending-AW and
+pending-W counters and their wrapper ports, preserving target-cycle qualified
+updates, reset priority and wrapping semantics against these same SFC models.
+
+The native compiler and request-limit test build passed. The focused native
+test checks 655,360 cycles over twenty ordinary/selected-root and constructor
+profiles (maxFlight 1, 2, 3, 7, 8, 10, 15, 16, 20 and INT64_MAX). It covers
+all admission values at widths 1–5, reset/write priority, full-width readback,
+host/admission wiring and annotation transfer, plus 900 atomic rejections.
+The final early-BridgeIO version passes the same test (`ctest-final.log`).
+The preceding five-test request-limit/admission/latency/control run also
+passed (`ctest.log`).
+
+The primary immutable compiler fixture
+`sims/firesim-staging/generated-src/firechip.chip.FireSim.FireSimRocketConfig.sfc-golden-2026-10-01/firechip.chip.FireSim.FireSimRocketConfig.anno.json`
+(SHA256 `4793fa4344b6e2a4faa4775579a382e00fae728740e6bb877e8981f433d2338d`)
+retains exactly the same complete FASED constructor key as the candidate's
+early request-limit boundary. This comparison includes AXI widths, memory
+region, address sets, transfer sizes, ID reuse and maxFlight; the expected
+annotation-class transition is BridgeAnnotation to BridgeIOAnnotation
+(`immutable-constructor-comparison.json`).
+
+
+Four actual SFC RTL comparisons passed for 131,428 host-clocked cycles in
+`request-limits-comparison.json`. The exact inputs are the three archived
+Rocket, Gemmini and Saturn Rocket `design/FireSim-generated.sv` files and the
+immutable October 1 U250 `design/FireSim-generated.sv` listed in iteration
+255 above, with those same four SHA256 values. Each comparison executes the
+original SFC register declarations, sequential updates, low-bit assignments
+and full-word readback against the verbatim emitted CIRCT bank. Outputs and
+registers are compared before and after every host edge.
+
+Rocket and October 1 each check 32,849 cycles, all sixteen four-bit admission
+values, all sixteen strobes and all four write masks. Their exported probes
+execute all five production wrapper bindings, and three valid-IR binding
+mutations are rejected. The archived Rocket header also matches allocated
+request-limit offsets and permissions; the immutable build-tree fixture lacks
+that header, so its comparison covers the RTL bank and production bindings.
+Gemmini and Saturn each check 32,865 cycles and all 32 five-bit admission
+values, including reset/write collisions, zero-strobe writes, upper-bit
+readback, target stalls and read backpressure. Their probes clone only the
+early materialized bank, and explicitly report no production admission-binding
+execution. `request-limit-profiles.json` additionally verifies all three
+complete constructors against their archived input annotations and checks the
+emitted bank's reset literal and admission types.
+
+All evidence for this iteration is under
+`sim/generated-src/xilinx_alveo_u250/xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/iteration256-u250-target-matrix/`.
+
+
+The final archived-input replay (`replay-fixed/matrix.json`) records three
+compiled Rocket recipes, four compiler rejections and six distinct unsupported
+QSFP platforms. Structured comparisons remain eight matched, six native
+SRAM/model-port mismatches and twelve not reached. These unresolved results
+are not parity claims. Gemmini and Saturn Rocket now diagnose the remaining
+constructor-sized admission-port mismatch; BOOM and Saturn Shuttle still
+reject at the wider TracerV constructor. The replay compiler SHA256 is
+`ab5aa87c67647a5079bea2f70545bbe4caf2509861f760d4fe19f506e55ab400`.
+
+`rocket-rtl-regression.json` verifies that all eighteen final Rocket RTL and
+collateral files are byte-identical to iteration 255. Iteration 255's supplied
+harness feedback reports native CIRCT replacertl and fresh bare-metal
+Verilator smoke passing; unchanged-input long-suite evidence was reused and
+the SFC UART-bearing baseline remained pending. No manager verification or
+hardware step was started by the implementation agent in iteration 256.
+
+
+`matrix-regression.json` verifies unchanged archived inputs, effective
+platforms, compile statuses and structured comparison results. Of the 1,445
+prior MLIR/JSON boundary files, 1,337 match after normalizing only the
+candidate output-directory prefix. The other 108 differ exclusively in
+the Gemmini/Saturn `GGFASEDRequestLimits` module: reset 10 becomes 16 and
+four-bit admission outputs become five bits; every operation outside that
+bank remains unchanged. No new boundary files were added. All 750
+recorded source-input hashes and the compiler binary remain unchanged
+through replay (`source-replay-stability.json`).
+
+Older iteration 255 MLIR files were compressed losslessly after verifying
+each decompressed SHA256 (`lossless-storage-cleanup-255.json`). The failed
+initial iteration 256 replay exposed that early control allocation precedes
+token-engine creation, motivating the retained BridgeIO lookup above; its
+remaining raw MLIR files were also compressed and verified separately
+(`lossless-first-attempt.json`). Final replay boundaries, RTL/collateral,
+logs, JSON evidence and both immutable SFC fixture trees are preserved.

@@ -9,6 +9,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <array>
 #include <map>
 #include <random>
@@ -17,6 +19,9 @@ using namespace mlir;
 using namespace circt::firrtl;
 namespace {
 bool selected = false;
+int64_t maxFlight = 10;
+unsigned limit() { return std::min<int64_t>(16, maxFlight); }
+unsigned limitWidth() { return llvm::Log2_64_Ceil(limit() + 1); }
 std::string profile(llvm::StringRef input) {
   std::string result = input.str();
   if (selected) for (auto suffix : {"ReadAdmissionWrapper", "RequestLimitsWrapper"}) {
@@ -78,7 +83,7 @@ struct Interpreter {
   }
 };
 OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
-  auto root = parseSourceString<ModuleOp>(profile(R"(module {
+  auto text = profile(R"(module {
     firrtl.circuit "GGFASEDReadAdmissionWrapper" {
       firrtl.module @GGFASEDTokenEngine() {}
       firrtl.module @GGFASEDReadAdmissionWrapper(
@@ -86,10 +91,16 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context) {
         in %fased_write_max_reqs: !firrtl.uint<4>, in %fased_read_max_reqs: !firrtl.uint<4>,
         in %targetFire: !firrtl.uint<1>, in %modelReset: !firrtl.uint<1>,
         out %other: !firrtl.uint<8>) {}
-    } })"), &context);
+    } })");
+  size_t pos = 0;
+  while ((pos = text.find("!firrtl.uint<4>", pos)) != std::string::npos) {
+    text.replace(pos, 15, "!firrtl.uint<" + std::to_string(limitWidth()) + ">");
+    pos += 15;
+  }
+  auto root = parseSourceString<ModuleOp>(text, &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   named(c, "GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
-    b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(10))}))}));
+    b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI64IntegerAttr(maxFlight))}))}));
   SmallVector<Attribute> annos;
   for (auto name : {"fased_write_max_reqs", "fased_read_max_reqs", "other", "hostReset"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Annotation")),
@@ -109,6 +120,30 @@ void phases(MLIRContext &context) {
   c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
       b.getNamedAttr("class", b.getStringAttr("test.Target")),
       b.getNamedAttr("target", b.getStringAttr("~GGControlErrorWrapper|GGControlErrorWrapper>other"))})}));
+  auto key = b.getDictionaryAttr({b.getNamedAttr("axi4Edge", b.getDictionaryAttr({
+      b.getNamedAttr("maxFlight", b.getI64IntegerAttr(maxFlight))}))});
+  auto bridge = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("firesim.lib.bridgeutils.BridgeIOAnnotation")),
+      b.getNamedAttr("widgetClass", b.getStringAttr("midas.models.FASEDMemoryTimingModel")),
+      b.getNamedAttr("widgetConstructorKey", key)});
+  auto raw = llvm::to_vector(c->getAttrOfType<ArrayAttr>("rawAnnotations")); raw.push_back(bridge);
+  c->setAttr("rawAnnotations", b.getArrayAttr(raw));
+  for (unsigned bad = 0; bad < 4; ++bad) {
+    auto malformed = cast<CircuitOp>(c->clone());
+    if (bad == 0) malformed->removeAttr("rawAnnotations");
+    if (bad == 1) malformed->setAttr("rawAnnotations", b.getArrayAttr({bridge, bridge}));
+    if (bad >= 2) {
+      NamedAttrList fields(bridge.getValue());
+      if (bad == 2) fields.erase("widgetConstructorKey");
+      else fields.set("class", b.getStringAttr("test.NotBridgeIO"));
+      malformed->setAttr("rawAnnotations", b.getArrayAttr({fields.getDictionary(&context)}));
+    }
+    auto before = dump(malformed); FModuleOp result; std::string error;
+    require(failed(goldengate::materializeFASEDRequestLimits(malformed, result, error)) &&
+        !result && !error.empty() && dump(malformed) == before,
+        "malformed early BridgeIO materialization changed IR");
+    malformed.erase();
+  }
   auto top = named(c, "GGControlErrorWrapper"); auto topBefore = dump(top);
   auto annotations = c->getAttr("rawAnnotations"); FModuleOp bank; std::string error;
   require(succeeded(goldengate::materializeFASEDRequestLimits(c, bank, error)), error);
@@ -175,6 +210,7 @@ void behavior(MLIRContext &context) {
   require(succeeded(goldengate::addFASEDRequestLimits(c, error)), error);
   require(succeeded(verify(*root)), "request limit IR verification failed");
   Interpreter sim(named(c, "GGFASEDRequestLimits")); std::array<uint32_t, 2> expected{1, 1};
+  uint64_t observed[2]{0, 0};
   std::mt19937 random(228); unsigned resetWrites = 0, zeroStrobeWrites = 0, highBits = 0;
   for (unsigned cycle = 0; cycle < 32768; ++cycle) {
     bool reset = cycle < 128 ? cycle & 1 : (random() & 31) == 0;
@@ -195,16 +231,19 @@ void behavior(MLIRContext &context) {
         require(sim.output(3, "read[" + std::to_string(i) + "].bits") == expected[i], "full word readback mismatch");
         require(sim.output(3, "read[" + std::to_string(i) + "].valid") == 1 &&
             sim.output(3, "write[" + std::to_string(i) + "].ready") == 1, "MCR handshake mismatch");
-        require(sim.output(2, i == 0 ? "write" : "read") == (expected[i] & 15), "admission limit truncation mismatch");
+        observed[i] |= uint64_t(1) << (expected[i] & ((1U << limitWidth()) - 1));
+        require(sim.output(2, i == 0 ? "write" : "read") == (expected[i] & ((1U << limitWidth()) - 1)), "admission limit truncation mismatch");
       }
     };
     check(); auto next = expected;
     for (unsigned i = 0; i < 2; ++i) if (mask & (1 << i)) next[i] = data[i];
-    if (reset) next = {10, 10};
+    if (reset) next = {limit(), limit()};
     resetWrites += reset && mask; zeroStrobeWrites += !strobe && mask; highBits += bool(data[0] & 0x80000000U);
     sim.edge(); sim.memo.clear(); expected = next; check();
   }
-  require(resetWrites && zeroStrobeWrites && highBits, "coverage missing");
+  require(resetWrites && zeroStrobeWrites && highBits &&
+      observed[0] == ((uint64_t(1) << (1U << limitWidth())) - 1) && observed[0] == observed[1],
+      "reset/write/upper-bit/all-admission-values coverage missing");
 }
 void mapping(MLIRContext &context) {
   auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
@@ -248,7 +287,7 @@ void rejections(MLIRContext &context) {
     if (mode == 1) c->removeAttr("rawAnnotations");
     if (mode == 2) engine->removeAttr("goldengate.bridgeConstructor");
     if (mode == 3) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
-        b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(9))}))}));
+        b.getDictionaryAttr({b.getNamedAttr("maxFlight", b.getI32IntegerAttr(0))}))}));
     if (mode >= 4 && mode < 8) { auto names = llvm::to_vector(top.getPortNames()); names[mode - 4] = b.getStringAttr("missing"); top.setPortNames(names); }
     if (mode >= 8 && mode < 12) {
       SmallVector<bool> dirs; for (auto port : top.getPorts()) dirs.push_back(port.direction == Direction::Out); dirs[mode - 8] = true; top.setPortDirections(dirs);
@@ -262,6 +301,33 @@ void rejections(MLIRContext &context) {
     std::string after; llvm::raw_string_ostream next(after); root->print(next); next.flush();
     require(before == after, "rejection mutated circuit");
   }
+  for (unsigned mode = 0; mode < 6; ++mode) {
+    auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin();
+    OpBuilder b(&context); auto engine = named(c, "GGFASEDTokenEngine");
+    if (mode == 0) engine.erase();
+    if (mode == 1) engine->removeAttr("goldengate.bridgeConstructor");
+    if (mode >= 2) {
+      Attribute flight = mode == 2 ? Attribute(b.getI64IntegerAttr(0)) :
+          mode == 3 ? Attribute(b.getI64IntegerAttr(-1)) :
+          mode == 4 ? Attribute(b.getStringAttr("20")) :
+          Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 20)));
+      engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
+          b.getNamedAttr("axi4Edge", b.getDictionaryAttr({b.getNamedAttr("maxFlight", flight)}))}));
+    }
+    auto before = dump(*root); FModuleOp unchanged = named(c, profile("GGFASEDReadAdmissionWrapper"));
+    auto expected = unchanged; std::string error;
+    require(failed(goldengate::materializeFASEDRequestLimits(c, unchanged, error)) &&
+        !error.empty() && unchanged == expected && dump(*root) == before,
+        "malformed materialization changed result or IR");
+  }
+  auto root = fixture(context); auto c = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context); auto top = named(c, profile("GGFASEDReadAdmissionWrapper"));
+  auto ports = top.getPorts(); ports[2].type = UIntType::get(&context, limitWidth() == 4 ? 5 : 4);
+  auto types = llvm::to_vector(top.getPortTypes()); types[2] = TypeAttr::get(ports[2].type);
+  top.setPortTypes(types);
+  auto before = dump(*root); std::string error;
+  require(failed(goldengate::addFASEDRequestLimits(c, error)) && dump(*root) == before,
+      "constructor/admission width mismatch accepted or mutated IR");
 }
 }
 // Export the real bank and real wrapper bindings, not a rebuilt test model.
@@ -276,10 +342,39 @@ Value driver(FModuleOp m,Value dest) {
   }
   require(bool(result),"missing production driver");return result;
 }
-void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
+void exportProduction(MLIRContext &ctx,const char *input,const char *output,bool bankOnly=false) {
   auto root=parseSourceFile<ModuleOp>(input,&ctx);
   require(bool(root)&&succeeded(verify(*root)),"invalid production request-limit boundary");
   auto c=*root->getOps<CircuitOp>().begin();
+  if (bankOnly) {
+    auto bank = named(c, "GGFASEDRequestLimits");
+    bool used = false; c.walk([&](InstanceOp i) { used |= i.getModuleName() == bank.getName(); });
+    require(!used, "materialized bank was already attached");
+    auto isolated = ModuleOp::create(c.getLoc()); OpBuilder b(&ctx);
+    b.setInsertionPointToEnd(isolated.getBody());
+    auto exported = b.create<CircuitOp>(c.getLoc(), b.getStringAttr("GGFASEDRequestLimitsProbe"));
+    b.setInsertionPointToEnd(exported.getBodyBlock()); b.insert(bank->clone());
+    auto probe = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDRequestLimitsProbe"), bank.getConventionAttr(), bank.getPorts());
+    probe.setPublic(); b.setInsertionPointToStart(probe.getBodyBlock());
+    auto mmio = b.create<InstanceOp>(c.getLoc(), bank, "requestLimits");
+    for (auto [i, p] : llvm::enumerate(bank.getPorts())) {
+      if (i == 2) {
+        for (auto name : {"write", "read"})
+          b.create<StrictConnectOp>(c.getLoc(),
+              b.create<SubfieldOp>(c.getLoc(), probe.getBodyBlock()->getArgument(2), name),
+              b.create<SubfieldOp>(c.getLoc(), mmio.getResult(2), name));
+        continue;
+      }
+      auto external = probe.getBodyBlock()->getArgument(i);
+      b.create<ConnectOp>(c.getLoc(), p.direction == Direction::In ? mmio.getResult(i) : external,
+          p.direction == Direction::In ? external : mmio.getResult(i));
+    }
+    require(succeeded(verify(isolated)), "invalid materialized bank probe");
+    std::error_code ec; llvm::raw_fd_ostream out(output, ec); require(!ec, "cannot export bank probe");
+    isolated.print(out); out << '\n'; out.close(); isolated.erase();
+    llvm::outs() << "Cloned materialized production bank; admission attachment remains unsupported\n";
+    return;
+  }
   require(c.getName()=="GGFASEDRequestLimitsWrapper","wrong production request-limit root");
   auto top=named(c,c.getName()),inner=named(c,"GGFASEDReadAdmissionWrapper"),bank=named(c,"GGFASEDRequestLimits");
   InstanceOp sim,original;
@@ -326,13 +421,20 @@ void exportProduction(MLIRContext &ctx,const char *input,const char *output) {
 int main(int argc,char **argv) {
   try {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    require(argc==1||argc==3,"usage: goldengate-fased-request-limits-test [boundary.mlir probe.mlir]");
+    require(argc==1||argc==3||(argc==4&&llvm::StringRef(argv[1])=="--materialized-bank"),"usage: goldengate-fased-request-limits-test [boundary.mlir probe.mlir]");
     if(argc==3){exportProduction(context,argv[1],argv[2]);return 0;}
+    if(argc==4){exportProduction(context,argv[2],argv[3],true);return 0;}
+    unsigned profiles = 0;
     for (bool selectedProfile : {false, true}) {
       selected = selectedProfile;
-      phases(context); behavior(context); mapping(context); rejections(context);
+      for (int64_t flight : {int64_t(1), int64_t(2), int64_t(3), int64_t(7), int64_t(8),
+          int64_t(10), int64_t(15), int64_t(16), int64_t(20), INT64_MAX}) {
+        maxFlight = flight; ++profiles;
+        phases(context); behavior(context); mapping(context); rejections(context);
+      }
     }
-    llvm::outs() << "FASED request limits: 65536 cycles across legacy/selected profiles, host/admission bindings, targets and 68 atomic rejections passed\n";
+    llvm::outs() << "FASED request limits: " << profiles * 32768 << " cycles across " << profiles
+        << " constructor/root profiles, 1-5 bit admission, reset/write priority, bindings, targets and 900 atomic rejections passed\n";
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << "\n"; return 1; }
 }

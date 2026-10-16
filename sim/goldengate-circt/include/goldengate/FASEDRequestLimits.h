@@ -4,12 +4,13 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
-// Create two host-clocked 32-bit reset-to-10 registers and their MCR registry.
-// Requires a free bank symbol; preserves top/ports/annotations and leaves result
+// Create two host-clocked 32-bit registers resetting to min(16,maxFlight).
+// Their admission outputs have log2Ceil(min(16,maxFlight)+1) bits.
+// Requires a positive retained maxFlight and free bank symbol; preserves top/ports/annotations and leaves result
 // unchanged on failure. No annotation classes or cached analyses consumed.
 mlir::LogicalResult materializeFASEDRequestLimits(circt::firrtl::CircuitOp circuit,
     circt::firrtl::FModuleOp &bank, std::string &error);
-// Attach the same uninstantiated four-port bank to the recorded ten-flight
+// Attach the same uninstantiated four-port bank to the constructor-sized
 // read-admission wrapper. Boundary preflight precedes mutation; copied-port
 // targets transfer while consumed admission targets remain on the inner module.
 mlir::LogicalResult attachFASEDRequestLimits(circt::firrtl::CircuitOp circuit,
