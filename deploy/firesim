@@ -312,6 +312,19 @@ def buildbitstream(build_config_file: BuildConfigFile) -> None:
         rootLogger.critical("ERROR: A bitstream build failed.")
         sys.exit(1)
 
+
+@register_task
+def replacertl(build_config_file: BuildConfigFile) -> None:
+    """Run only FireSim's existing ``replace-rtl`` compiler target.
+
+    This is the local Golden Gate compile phase that ``buildbitstream`` normally
+    performs before driver and FPGA bitstream work.  Exposing it as a manager
+    task lets CI and agent loops stop on a compiler error before consuming a
+    build farm or FPGA.
+    """
+    for build_config in build_config_file.builds_list:
+        execute(build_config.bitbuilder.replace_rtl, hosts=['localhost'])
+
 @register_task
 def builddriver(runtime_conf: RuntimeConfig) -> None:
     """ Only perform the driver build (host-processor side of an FPGA sim or

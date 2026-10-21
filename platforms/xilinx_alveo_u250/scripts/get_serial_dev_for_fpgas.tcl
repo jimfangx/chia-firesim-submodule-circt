@@ -8,8 +8,10 @@ set_param labtools.enable_cs_server false
 open_hw_manager
 connect_hw_server -allow_non_jtag
 
-# by default vivado opens a default hw target
-close_hw_target
+# Vivado Lab may connect without selecting a target.
+if {[llength [current_hw_target -quiet]] > 0} {
+    close_hw_target
+}
 
 foreach {hw_target} [get_hw_targets] {
     open_hw_target $hw_target

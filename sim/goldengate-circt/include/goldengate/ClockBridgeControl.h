@@ -15,7 +15,9 @@ mlir::LogicalResult mapClockBridgeControl(circt::firrtl::CircuitOp circuit,
 mlir::LogicalResult mapResetPulseBridgeControl(circt::firrtl::CircuitOp circuit,
                                               unsigned addressBits, unsigned idBits,
                                               std::string &error);
-// UART uses the same six-word MCRFile transport as ClockBridge.
+// UART derives transport size from its MMIO registry and validates bank/wrapper
+// lanes before mutation. The recorded six words retain addr[4:2]; indices six
+// and seven read lane zero without a handshake and cannot commit writes.
 mlir::LogicalResult mapUARTBridgeControl(circt::firrtl::CircuitOp circuit,
                                         unsigned addressBits, unsigned idBits,
                                         std::string &error);

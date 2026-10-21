@@ -817,7 +817,7 @@ if(BUILD_TESTING)
     lib/Support/FASEDHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
     lib/Support/AnnotationEmission.cpp
     lib/Transforms/FASEDMMIOBank.cpp lib/Transforms/ControlAddressDecode.cpp
-    lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/FASEDRequestLimits.cpp lib/Transforms/ClockBridgeControl.cpp)
   target_compile_features(goldengate-fased-header-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-header-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-header-test PRIVATE
@@ -1031,7 +1031,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-xdc-emission COMMAND goldengate-xdc-emission-test)
   add_executable(goldengate-fased-mmio-bank-test
     test/Transforms/FASEDMMIOBankTest.cpp lib/Transforms/FASEDMMIOBank.cpp
-    lib/Transforms/ControlAddressDecode.cpp)
+    lib/Transforms/ControlAddressDecode.cpp lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-mmio-bank-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-mmio-bank-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-mmio-bank-test PRIVATE

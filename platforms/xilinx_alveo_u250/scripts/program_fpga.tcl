@@ -40,8 +40,11 @@ set_param labtools.enable_cs_server false
 open_hw_manager
 connect_hw_server -allow_non_jtag
 
-# by default vivado opens a default hw target
-close_hw_target
+# Vivado Lab can connect without selecting a target. Only close an existing
+# current target; an unconditional close aborts before programming in that case.
+if {[llength [current_hw_target -quiet]] > 0} {
+    close_hw_target
+}
 
 # check if serial is in hw targets
 set final_hw_target ""

@@ -1,0 +1,4 @@
+circt_u250_firesim_rocket_singlecore:
+  bitstream_tar: file:///scratch/jfx/fsim-circt/sims/firesim/deploy/results-build/2026-10-15--09-43-32-circt_u250_firesim_rocket_singlecore/cl_xilinx_alveo_u250-firesim-FireSim-FireSimRocketConfig-BaseXilinxAlveoU250Config/firesim.tar.gz
+  deploy_quintuplet_override: null
+  custom_runtime_config: null

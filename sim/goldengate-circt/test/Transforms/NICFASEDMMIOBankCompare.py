@@ -2,6 +2,7 @@
 # See LICENSE for license details.
 """Check production FASED lane assembly against the archived SFC MMIO ABI.
 
+Request capacity changes producer occupancy widths but not this UInt32 ABI.
 Execute the actual cloned CIRCT routing with independent fragment/aggregate
 pins. This proves the combinational carrier, not the register state machines,
 Nasti decoder, NIC execution or platform integration.
@@ -212,9 +213,10 @@ def main():
     p = argparse.ArgumentParser(description=__doc__)
     for name in ('candidate-dir', 'golden', 'export-tool', 'output-dir'):
         p.add_argument('--'+name, type=Path, required=True)
+    p.add_argument('--header', type=Path, help='explicit SFC driver header when archived separately from RTL')
     a = p.parse_args(); out = a.output_dir.resolve(); out.mkdir(parents=True, exist_ok=False)
     candidate = a.candidate_dir/'post-fame-fased-mmio.mlir'
-    report = dict(oracle=oracle(a.golden, candidate), composition=composition(a.candidate_dir),
+    report = dict(oracle=oracle(a.golden, candidate, a.header), composition=composition(a.candidate_dir),
                   execution=execute(candidate, a.export_tool, out),
                   scope='decoded combinational MMIO lane assembly; control transport and NIC runtime remain pending')
     (out/'comparison.json').write_text(json.dumps(report, indent=2)+'\n')

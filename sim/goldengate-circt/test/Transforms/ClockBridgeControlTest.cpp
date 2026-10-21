@@ -23,10 +23,10 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   throw std::runtime_error("module missing");
 }
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0,
-                               unsigned bridge = 0, unsigned tsiWords = 9) {
-  std::string top = bridge == 7 ? "GGTSIMMIOWrapper" : bridge == 6 ? "GGSimulationMasterWrapper" : bridge == 5 ? "GGLoadMemReadDataWrapper" : bridge == 4 ? "GGCPUStreamCountWrapper" : bridge == 1 ? "GGResetPulseBridgeWrapper" : bridge == 2 ? "GGPeekPokeMMIOWrapper" : bridge == 3 ? "GGTracerVTriggerWrapper" : "GGClockBridgeWrapper";
-  std::string bank = bridge == 7 ? "tsiBridge_mcr" : bridge == 6 ? "simulationMaster_mcr" : bridge == 5 ? "loadmemWrite_mcr" : bridge == 4 ? "cpuStream_mcr" : bridge == 1 ? "resetBridge_mcr" : bridge == 2 ? "peekPokeBridge_mcr" : bridge == 3 ? "tracerv_mcr" : "clockBridge_mcr";
-  unsigned words = bridge == 7 ? tsiWords : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
+                               unsigned bridge = 0, unsigned registerWords = 0) {
+  std::string top = bridge == 8 ? "GGUARTMMIOWrapper" : bridge == 7 ? "GGTSIMMIOWrapper" : bridge == 6 ? "GGSimulationMasterWrapper" : bridge == 5 ? "GGLoadMemReadDataWrapper" : bridge == 4 ? "GGCPUStreamCountWrapper" : bridge == 1 ? "GGResetPulseBridgeWrapper" : bridge == 2 ? "GGPeekPokeMMIOWrapper" : bridge == 3 ? "GGTracerVTriggerWrapper" : "GGClockBridgeWrapper";
+  std::string bank = bridge == 8 ? "uartBridge_mcr" : bridge == 7 ? "tsiBridge_mcr" : bridge == 6 ? "simulationMaster_mcr" : bridge == 5 ? "loadmemWrite_mcr" : bridge == 4 ? "cpuStream_mcr" : bridge == 1 ? "resetBridge_mcr" : bridge == 2 ? "peekPokeBridge_mcr" : bridge == 3 ? "tracerv_mcr" : "clockBridge_mcr";
+  unsigned words = bridge >= 7 ? (registerWords ? registerWords : bridge == 8 ? 6 : 9) : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
   std::string token="bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<32>>";
   std::string header="module { firrtl.circuit \""+top+"\" { firrtl.module @"+top+"(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %data: !firrtl.uint<8>";
   if (bridge == 5) {
@@ -44,11 +44,11 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0,
   require(bool(root),"parse failed"); auto c=*root->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
   auto a=b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test")),b.getNamedAttr("target",b.getStringAttr("~"+top+"|"+top+">"+(bad == 2 ? bank+".read[0].bits" : "data")))});
   c->setAttr("rawAnnotations",b.getArrayAttr({a}));
-  if (bridge == 7) {
+  if (bridge >= 7) {
     auto inner = named(c,top);
     b.setInsertionPointToEnd(c.getBodyBlock());
     const PortInfo ports[]{{b.getStringAttr("mcr"),inner.getPortType(3),Direction::Out}};
-    auto owner = b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGTSIMMIOBank"),
+    auto owner = b.create<FModuleOp>(c.getLoc(),b.getStringAttr(bridge == 8 ? "GGUARTMMIOBank" : "GGTSIMMIOBank"),
         inner.getConventionAttr(),ports);
     SmallVector<Attribute> rows;
     // Decode follows byte offsets, independently of metadata row order.
@@ -69,6 +69,7 @@ void addTracerBanks(CircuitOp c) {
 }
 LogicalResult mapControl(CircuitOp c, unsigned bridge, unsigned addressBits,
                          unsigned idBits, std::string &error) {
+  if (bridge == 8) return goldengate::mapUARTBridgeControl(c,addressBits,idBits,error);
   if (bridge == 7) return goldengate::mapTSIBridgeControl(c,addressBits,idBits,error);
   if (bridge == 6) return goldengate::mapSimulationMasterControl(c,addressBits,idBits,error);
   if (bridge == 5) return goldengate::mapLoadMemControl(c,addressBits,idBits,error);
@@ -125,18 +126,18 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx, unsigned bridge, unsigned tsiWords = 9,
+void behavior(MLIRContext &ctx, unsigned bridge, unsigned registerWords = 0,
               bool multipleTracerBanks = false, unsigned tracerBank = 0) {
-  unsigned bankWords = bridge == 7 ? tsiWords : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
+  unsigned bankWords = bridge >= 7 ? (registerWords ? registerWords : bridge == 8 ? 6 : 9) : bridge == 6 ? 3 : bridge == 5 ? 9 : bridge == 4 ? 1 : bridge == 1 ? 2 : bridge == 2 ? 7 : bridge == 3 ? 15 : 6;
   unsigned indexBits = llvm::Log2_64_Ceil(bankWords);
   unsigned indexMask = (1U << indexBits) - 1;
-  std::string prefix = bridge == 7 ? "GGTSI" : bridge == 6 ? "GGSimulationMaster" : bridge == 5 ? "GGLoadMem" : bridge == 4 ? "GGCPUStream" : bridge == 1 ? "GGResetPulseBridge" : bridge == 2 ? "GGPeekPoke" : bridge == 3 ? "GGTracerV" : "GGClockBridge";
-  auto root=fixture(ctx,0,bridge,tsiWords); auto c=*root->getOps<CircuitOp>().begin(); std::string error;
+  std::string prefix = bridge == 8 ? "GGUART" : bridge == 7 ? "GGTSI" : bridge == 6 ? "GGSimulationMaster" : bridge == 5 ? "GGLoadMem" : bridge == 4 ? "GGCPUStream" : bridge == 1 ? "GGResetPulseBridge" : bridge == 2 ? "GGPeekPoke" : bridge == 3 ? "GGTracerV" : "GGClockBridge";
+  auto root=fixture(ctx,0,bridge,registerWords); auto c=*root->getOps<CircuitOp>().begin(); std::string error;
   if (multipleTracerBanks) addTracerBanks(c);
   require(succeeded(mapControl(c,bridge,25,12,error)),error);
   require(succeeded(verify(*root)),"IR verification failed");
-  auto adapter=named(c,prefix+"MCRFile"+(multipleTracerBanks && tracerBank ? "_"+std::to_string(tracerBank) : "")), wrapper=named(c,prefix+(bridge == 2 || bridge == 3 || bridge == 7 ? "BridgeControlWrapper" : "ControlWrapper"));
-  require(wrapper.getPortName(3)==(bridge == 7 ? "tsiBridge_ctrl" : bridge == 6 ? "simulationMaster_ctrl" : bridge == 5 ? "loadmem_ctrl" : bridge == 4 ? "cpuStream_ctrl" : bridge == 1 ? "resetBridge_ctrl" : bridge == 2 ? "peekPokeBridge_ctrl" : bridge == 3 ? "tracerv_ctrl" : "clockBridge_ctrl") && wrapper.getPortDirection(3)==Direction::In,"slave boundary missing");
+  auto adapter=named(c,prefix+"MCRFile"+(multipleTracerBanks && tracerBank ? "_"+std::to_string(tracerBank) : "")), wrapper=named(c,prefix+(bridge == 2 || bridge == 3 || bridge >= 7 ? "BridgeControlWrapper" : "ControlWrapper"));
+  require(wrapper.getPortName(3)==(bridge == 8 ? "uartBridge_ctrl" : bridge == 7 ? "tsiBridge_ctrl" : bridge == 6 ? "simulationMaster_ctrl" : bridge == 5 ? "loadmem_ctrl" : bridge == 4 ? "cpuStream_ctrl" : bridge == 1 ? "resetBridge_ctrl" : bridge == 2 ? "peekPokeBridge_ctrl" : bridge == 3 ? "tracerv_ctrl" : "clockBridge_ctrl") && wrapper.getPortDirection(3)==Direction::In,"slave boundary missing");
   auto annos=c->getAttrOfType<ArrayAttr>("rawAnnotations");
   require(cast<DictionaryAttr>(annos[0]).getAs<StringAttr>("target").getValue()=="~"+wrapper.getName().str()+"|"+wrapper.getName().str()+">data","copied target was not transferred");
   require(std::distance(adapter.getOps<RegResetOp>().begin(),adapter.getOps<RegResetOp>().end())==4,"transaction flag count");
@@ -437,6 +438,66 @@ void tsiMapping(MLIRContext &ctx) {
   }
   llvm::outs()<<"TSI: aggregate control/bank bindings, six nested target transfers, 30 atomic boundary rejections and repeated-pass rejection passed\n";
 }
+// Exercise UART's registry preflight independently of its six-word generator.
+// Every malformed registry/bank must leave the complete circuit untouched.
+void uartMapping(MLIRContext &ctx) {
+  auto printed=[](ModuleOp m) { std::string s; llvm::raw_string_ostream out(s); m.print(out); return s; };
+  OpBuilder b(&ctx);
+  for (unsigned bad=0;bad<19;++bad) {
+    auto root=fixture(ctx,0,8,bad==16?9:6);
+    auto c=*root->getOps<CircuitOp>().begin(); auto bank=named(c,"GGUARTMMIOBank");
+    if (bad==0) bank->removeAttr("goldengate.mmioRegisters");
+    if (bad>=1 && bad<=12) {
+      auto rows=llvm::to_vector(bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      if (bad==1) rows.clear();
+      if (bad==2) rows[0]=b.getStringAttr("not a row");
+      if (bad>=3 && bad<=10) {
+        NamedAttrList row(cast<DictionaryAttr>(rows[0]));
+        if (bad==3) row.set("offset",b.getI64IntegerAttr(-4));
+        if (bad==4) row.set("offset",b.getI64IntegerAttr(21));
+        if (bad==5) row.set("offset",b.getI64IntegerAttr(24));
+        if (bad==6) row.set("name",b.getStringAttr("register_0"));
+        if (bad==7) row.erase("writeable");
+        if (bad==8) row.set("readable",b.getStringAttr("true"));
+        if (bad==9) row.set("offset",b.getI64IntegerAttr(0));
+        if (bad==10) { row.set("readable",b.getBoolAttr(false)); row.set("writeable",b.getBoolAttr(false)); }
+        rows[0]=row.getDictionary(&ctx);
+      }
+      if (bad==11) rows.erase(rows.begin()); // Dense five words, stale six bank lanes.
+      if (bad==12) rows.push_back(rows[0]);
+      bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+    }
+    if (bad==13) bank.erase();
+    if (bad==14) bank.setPortTypes({TypeAttr::get(UIntType::get(&ctx,2,false))});
+    if (bad==15) bank.setPortNames({b.getStringAttr("missing")});
+    if (bad==17) {
+      // The bank and dense registry agree, but the wrapper still has six lanes.
+      auto rows=llvm::to_vector(bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters"));
+      rows.erase(rows.begin()); bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));
+      auto elements=llvm::to_vector(cast<BundleType>(bank.getPortType(0)).getElements());
+      for (unsigned i : {0U,1U}) elements[i].type=FVectorType::get(
+          cast<FVectorType>(elements[i].type).getElementType(),5);
+      bank.setPortTypes({TypeAttr::get(BundleType::get(&ctx,elements))});
+    }
+    if (bad==18) {
+      auto registry=bank->getAttr("goldengate.mmioRegisters"); auto type=bank.getPortType(0);
+      bank.erase(); b.setInsertionPointToEnd(c.getBodyBlock());
+      const PortInfo ports[]{{b.getStringAttr("mcr"),type,Direction::In}};
+      auto wrong=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGUARTMMIOBank"),
+          ConventionAttr::get(&ctx,Convention::Internal),ports);
+      wrong->setAttr("goldengate.mmioRegisters",registry);
+    }
+    auto before=printed(*root); std::string error;
+    require(failed(goldengate::mapUARTBridgeControl(c,bad==16?5:25,12,error)),"invalid UART registry/bank accepted");
+    require(before==printed(*root),"UART registry rejection mutated IR");
+  }
+  auto root=fixture(ctx,0,8); auto c=*root->getOps<CircuitOp>().begin(); std::string error;
+  require(succeeded(goldengate::mapUARTBridgeControl(c,25,12,error)),error);
+  auto before=printed(*root);
+  require(failed(goldengate::mapUARTBridgeControl(c,25,12,error)),"repeated UART mapping accepted");
+  require(before==printed(*root),"repeated UART mapping mutated IR");
+  llvm::outs()<<"UART: 19 atomic registry/bank rejections and repeated-pass rejection passed\n";
+}
 // Preflight the last bank before constructing any of the first three slaves.
 void tracerMultiplicity(MLIRContext &ctx) {
   auto printed=[](ModuleOp m) { std::string s; llvm::raw_string_ostream out(s); m.print(out); return s; };
@@ -492,7 +553,8 @@ void rejection(MLIRContext &ctx, unsigned bridge) {
 }
 }
 int main(){
-  try {MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();tracerMultiplicity(ctx);for(unsigned bank=0;bank<4;++bank) behavior(ctx,3,0,true,bank);countBank(ctx);loadMemMapping(ctx);tsiMapping(ctx);for(unsigned bridge : {0U,1U,2U,3U,4U,5U,6U,7U}) {behavior(ctx,bridge);rejection(ctx,bridge);}
-    for(unsigned count : {1U,16U,17U}) behavior(ctx,7,count);}
+  try {MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();tracerMultiplicity(ctx);for(unsigned bank=0;bank<4;++bank) behavior(ctx,3,0,true,bank);countBank(ctx);loadMemMapping(ctx);tsiMapping(ctx);uartMapping(ctx);for(unsigned bridge : {0U,1U,2U,3U,4U,5U,6U,7U,8U}) {behavior(ctx,bridge);rejection(ctx,bridge);}
+    for(unsigned count : {1U,16U,17U}) behavior(ctx,7,count);
+    for(unsigned count : {1U,8U,9U}) behavior(ctx,8,count);}
   catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}return 0;
 }

@@ -326,7 +326,20 @@ LogicalResult goldengate::mapResetPulseBridgeControl(CircuitOp circuit,
 
 LogicalResult goldengate::mapUARTBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
-  return mapBridgeControl(circuit, addressBits, idBits, 6,
+  // Widget.genCRFile sizes the transport from its registered MMIO words.
+  // Validate both the registry and bank lanes before creating any hardware;
+  // mapBridgeControl also checks the wrapper's matching decoded boundary.
+  ControlMMIOWidget registry;
+  const llvm::StringRef modules[]{"GGUARTMMIOBank"};
+  if (failed(deriveControlMMIOWidget(circuit, "UARTBridgeModule_0",
+          modules[0], modules, registry, error, Direction::Out)))
+    return failure();
+  if (registry.registerCount > std::numeric_limits<unsigned>::max()) {
+    error = "UART register count exceeds the supported MCR lane count";
+    return failure();
+  }
+  return mapBridgeControl(circuit, addressBits, idBits,
+      static_cast<unsigned>(registry.registerCount),
       "GGUARTMMIOWrapper", "GGUARTBridgeControlWrapper",
       "GGUARTMCRFile", "uartBridge_mcr", "uartBridge_ctrl", error);
 }
