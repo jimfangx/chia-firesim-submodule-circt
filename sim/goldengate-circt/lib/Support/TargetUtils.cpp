@@ -100,10 +100,10 @@ goldengate::resolveAnnotationTarget(CircuitOp circuit, llvm::StringRef spelling,
   llvm::StringRef portAndPath = moduleAndPort.second;
   auto firstField = portAndPath.find_first_of(".[");
   llvm::StringRef portName = portAndPath.take_front(firstField);
-  for (unsigned i = 0, n = module.getPorts().size(); i != n; ++i) {
+  for (unsigned i = 0, n = module.getNumPorts(); i != n; ++i) {
     if (module.getPortName(i) != portName)
       continue;
-    auto type = mlir::dyn_cast<FIRRTLBaseType>(module.getPorts()[i].type);
+    auto type = mlir::dyn_cast<FIRRTLBaseType>(module.getPortType(i));
     if (!type) {
       error = "target port is not a FIRRTL base type: " + portName.str();
       return std::nullopt;

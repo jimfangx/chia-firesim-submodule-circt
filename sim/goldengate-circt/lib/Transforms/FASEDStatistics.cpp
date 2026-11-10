@@ -259,9 +259,9 @@ LogicalResult goldengate::attachFASEDStatistics(CircuitOp circuit,
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), mmio = b.create<InstanceOp>(loc, bank, "statistics");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto port = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc, port.direction == Direction::In ? sim.getResult(i) : external,
-                             port.direction == Direction::In ? external : sim.getResult(i));
+    auto port = inner.getPortDirection(i); Value external = wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc, port == Direction::In ? sim.getResult(i) : external,
+                             port == Direction::In ? external : sim.getResult(i));
   }
   connect(mmio.getResult(0),outer(indices[0]));connect(mmio.getResult(1),outer(indices[1]));
   connect(mmio.getResult(2),sim.getResult(indices[2]));connect(mmio.getResult(3),sim.getResult(indices[3]));

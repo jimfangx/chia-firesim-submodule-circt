@@ -128,7 +128,7 @@ goldengate::analyzeChannelConnection(CircuitOp circuit, Annotation annotation,
     }
     for (const auto &[name, target] : result.handshake) {
       auto module = target.module;
-      mlir::Type type = module.getPorts()[*target.port].type;
+      mlir::Type type = module.getPortType(*target.port);
       uint64_t field = target.fieldID.value_or(0);
       while (field) {
         if (auto bundle = mlir::dyn_cast<BundleType>(type)) {

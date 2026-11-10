@@ -211,7 +211,7 @@ LogicalResult goldengate::rewriteSRAMVirtualClocks(
       if (group->module != model) continue;
       ++groups;
       if (group->clockPort || llvm::any_of(group->ports, [&](unsigned port) {
-            return isa<ClockType>(model.getPorts()[port].type);
+            return isa<ClockType>(model.getPortType(port));
           })) {
         error = "SRAM " + model.getName().str() +
                 " has an explicit local clock channel/association";

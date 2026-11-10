@@ -107,7 +107,7 @@ static LogicalResult addNICTokenQueuesImpl(CircuitOp circuit, std::string &error
       auto t = spelling ? resolveAnnotationTarget(circuit, spelling.getValue(), error) : std::nullopt;
       if (!t || t->module != inner || !t->port ||
           inner.getPortType(*t->port) != token(widths[j]) ||
-          inner.getPorts()[*t->port].direction != (j < 4 ? Direction::Out : Direction::In) ||
+          inner.getPortDirection(*t->port) != (j < 4 ? Direction::Out : Direction::In) ||
           t->fieldID != token(widths[j]).getFieldID(2) || !consumed.insert(*t->port).second)
         return reject("NIC endpoint must resolve to a distinct typed active pipe payload");
       widget.channels[j] = *t->port;
@@ -199,8 +199,8 @@ static LogicalResult addNICTokenQueuesImpl(CircuitOp circuit, std::string &error
   auto arg = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(i); };
   auto outer = [&](unsigned i) { return arg(llvm::find(copied, i) - copied.begin()); };
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i]; b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : arg(j),
-        p.direction == Direction::In ? arg(j) : sim.getResult(i));
+    auto p = inner.getPortDirection(i); b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : arg(j),
+        p == Direction::In ? arg(j) : sim.getResult(i));
   }
   SmallVector<Attribute> bindings;
   for (auto [index, widget] : llvm::enumerate(widgets)) {

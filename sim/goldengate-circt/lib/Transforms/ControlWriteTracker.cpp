@@ -42,7 +42,7 @@ LogicalResult goldengate::addControlWriteTracker(CircuitOp circuit, std::string 
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) old[p.name.getValue().str()] = i;
   auto exact = [&](std::string n, Type t, Direction d) {
     auto it = old.find(n);
-    return it != old.end() && inner.getPorts()[it->second].type == t && inner.getPorts()[it->second].direction == d;
+    return it != old.end() && inner.getPortType(it->second) == t && inner.getPortDirection(it->second) == d;
   };
   if (!exact("hostClock", ClockType::get(ctx), Direction::In) || !exact("hostReset", uint(1), Direction::In) ||
       !exact("ctrl_decode_aw_target", uint(routeWidth), Direction::Out) ||
@@ -78,7 +78,7 @@ LogicalResult goldengate::addControlWriteTracker(CircuitOp circuit, std::string 
   auto external = [&](std::string n) { return wrapper.getBodyBlock()->getArgument(copied.at(n)); };
   auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
   for (auto [n, i] : copied) {
-    auto d = inner.getPorts()[old.at(n)].direction; Value outside = wrapper.getBodyBlock()->getArgument(i);
+    auto d = inner.getPortDirection(old.at(n)); Value outside = wrapper.getBodyBlock()->getArgument(i);
     b.create<ConnectOp>(loc, d == Direction::In ? result(n) : outside, d == Direction::In ? outside : result(n));
   }
   connect(track("clock"), external("hostClock")); connect(track("reset"), external("hostReset"));

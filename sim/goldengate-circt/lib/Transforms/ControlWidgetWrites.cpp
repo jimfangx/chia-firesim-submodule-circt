@@ -400,8 +400,8 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
   // Complete preflight before adding any operation or changing annotations.
   for(auto binding:bindings) {
     auto found=old.find(binding.port);
-    if(found==old.end()||inner.getPorts()[found->second].type!=controlType||
-       inner.getPorts()[found->second].direction!=Direction::In)
+    if(found==old.end()||inner.getPortType(found->second)!=controlType||
+       inner.getPortDirection(found->second)!=Direction::In)
       return reject("widget writes require matching Nasti control bundles");
     controls.insert(binding.port);
     std::string prefix="ctrl_write_dispatch_slave_"+std::to_string(binding.slave)+"_";
@@ -411,8 +411,8 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
     for(auto f:fields) {
       auto n=prefix+f.name;auto it=old.find(n);
       auto dir=StringRef(f.name).ends_with("ready")?Direction::In:Direction::Out;
-      if(it==old.end()||inner.getPorts()[it->second].type!=uint(f.width)||
-         inner.getPorts()[it->second].direction!=dir)
+      if(it==old.end()||inner.getPortType(it->second)!=uint(f.width)||
+         inner.getPortDirection(it->second)!=dir)
         return reject("widget writes are missing an exact dispatch slave boundary");
       consumed.insert(n);
     }
@@ -450,7 +450,7 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
         b.create<ConnectOp>(loc,e.isFlip?z:a,e.isFlip?a:z);
       }
     } else {
-      auto dir=inner.getPorts()[old.at(n)].direction;
+      auto dir=inner.getPortDirection(old.at(n));
       b.create<ConnectOp>(loc,dir==Direction::In?v:external,dir==Direction::In?external:v);
     }
   }

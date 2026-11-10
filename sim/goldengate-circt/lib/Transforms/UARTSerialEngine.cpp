@@ -184,9 +184,9 @@ LogicalResult goldengate::addUARTSerialEngine(CircuitOp circuit, std::string &er
   auto sim = b.create<InstanceOp>(loc, inner, "sim");
   auto serial = b.create<InstanceOp>(loc, engine, "UARTBridgeSerial_0");
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
-                             p.direction == Direction::In ? external : sim.getResult(i));
+    auto p = inner.getPortDirection(i); Value external = wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : external,
+                             p == Direction::In ? external : sim.getResult(i));
   }
   auto outerArg = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   connect(serial.getResult(0), outerArg(*hostClock)); connect(serial.getResult(1), outerArg(*hostReset));

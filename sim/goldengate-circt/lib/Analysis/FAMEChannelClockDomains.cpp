@@ -60,6 +60,10 @@ goldengate::analyzeFAMEChannelClockDomains(
     llvm::SmallVector<InstanceOp> instances;
   };
   std::map<std::pair<std::string, Direction>, LocalClock> locals;
+  // This analysis never changes the fixed model or its connectivity. Several
+  // channels can use the same clock port; trace each successful query once,
+  // while retaining every binding's hub/domain and sharing checks below.
+  std::map<unsigned, unsigned> clockSources;
   for (auto attr : raw) {
     Annotation anno(attr);
     if (!anno.isClass(AnnotationClasses::ChannelConnection)) continue;
@@ -77,16 +81,21 @@ goldengate::analyzeFAMEChannelClockDomains(
       if (group.module != model) continue;
       std::string clockName;
       if (group.clockPort) {
-        auto source = analyzeLocalChannelClockSource(model, *group.clockPort, error);
-        if (!source) {
-          error = "channel " + group.name + ": " + error;
-          return std::nullopt;
+        auto source = clockSources.find(*group.clockPort);
+        if (source == clockSources.end()) {
+          auto resolved =
+              analyzeLocalChannelClockSource(model, *group.clockPort, error);
+          if (!resolved) {
+            error = "channel " + group.name + ": " + error;
+            return std::nullopt;
+          }
+          source = clockSources.emplace(*group.clockPort, *resolved).first;
         }
-        if (!hubPorts.count(*source)) {
+        if (!hubPorts.count(source->second)) {
           error = "channel clock source is outside the FAME hub: " + group.name;
           return std::nullopt;
         }
-        clockName = model.getPortName(*source).str();
+        clockName = model.getPortName(source->second).str();
       } else if (!virtualClock) {
         error = "missing associated channel clock: " + group.name;
         return std::nullopt;

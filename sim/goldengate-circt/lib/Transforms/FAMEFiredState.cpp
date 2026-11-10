@@ -33,7 +33,7 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
     if (!name.empty() && reserved.insert(name.str()).second)
       names.newName(name);
   };
-  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i) {
+  for (unsigned i = 0, n = module.getNumPorts(); i < n; ++i) {
     auto name = module.getPortName(i);
     reserve(name);
     if (module.getPortDirection(i) != Direction::In)
@@ -82,7 +82,7 @@ LogicalResult goldengate::ensureFAMEFiredRegisters(
     auto portName = channel.name +
                     (channel.isInput ? "_sink" : "_source");
     bool foundPort = false;
-    for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
+    for (unsigned i = 0, n = module.getNumPorts(); i < n; ++i)
       if (module.getPortName(i) == portName &&
           module.getPortDirection(i) ==
               (channel.isInput ? Direction::In : Direction::Out))
@@ -148,7 +148,7 @@ LogicalResult goldengate::rewriteFAMEFiredStates(
   if (failed(firedRegisters.collect(module, error)))
     return failure();
   std::map<std::string, unsigned> ports;
-  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
+  for (unsigned i = 0, n = module.getNumPorts(); i < n; ++i)
     ports.emplace(module.getPortName(i).str(), i);
   auto hostClockPort = ports.find("hostClock");
   auto hostResetPort = ports.find("hostReset");

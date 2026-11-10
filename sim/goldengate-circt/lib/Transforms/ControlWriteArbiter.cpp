@@ -71,8 +71,8 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
       {"ctrl_error_b_bits_user", uint(1), Direction::Out}};
   for (auto r : required) {
     auto it = old.find(r.name);
-    if (it == old.end() || inner.getPorts()[it->second].type != r.type ||
-        inner.getPorts()[it->second].direction != r.direction)
+    if (it == old.end() || inner.getPortType(it->second) != r.type ||
+        inner.getPortDirection(it->second) != r.direction)
       return reject("control write arbiter requires exact clock and error response boundaries");
   }
   std::set<std::string> widgetPorts;
@@ -86,8 +86,8 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
         !widgetPorts.insert(port.getValue().str()).second)
       return reject("control write arbiter read bindings must identify unique decoded slaves and matching region names");
     auto it = old.find(port.getValue().str());
-    if (it == old.end() || inner.getPorts()[it->second].type != controlType ||
-        inner.getPorts()[it->second].direction != Direction::In)
+    if (it == old.end() || inner.getPortType(it->second) != controlType ||
+        inner.getPortDirection(it->second) != Direction::In)
       return reject("control write arbiter widget response bundle differs");
     widgets[slave.getInt()] = port.getValue().str();
   }
@@ -192,7 +192,7 @@ LogicalResult goldengate::addControlWriteArbiter(CircuitOp circuit,
   auto ap = [&](std::string n) { return arb.getResult(hpIndex.at(n)); };
   for (auto [n, i] : copied) {
     Value external = wrapper.getBodyBlock()->getArgument(i);
-    auto d = inner.getPorts()[old.at(n)].direction;
+    auto d = inner.getPortDirection(old.at(n));
     b.create<ConnectOp>(loc, d == Direction::In ? result(n) : external, d == Direction::In ? external : result(n));
   }
   connect(ap("clock"), topArg("hostClock"));

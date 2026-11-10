@@ -119,7 +119,7 @@ LogicalResult rewriteMultiportInputChannel(
       }
     if (!topPort || !topPorts.insert(*topPort).second ||
         top.getPortDirection(*topPort) != Direction::In ||
-        top.getPorts()[*topPort].type != instance.getResult(modelPort).getType() ||
+        top.getPortType(*topPort) != instance.getResult(modelPort).getType() ||
         removeCommonPrefix(top.getPortName(*topPort), binding.globalName) !=
             field) {
       error = "FAME input bundle field has no matching top port";
@@ -309,7 +309,7 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
       topPort = connection.topPort;
     }
   if (!topPort || top.getPortDirection(*topPort) != Direction::In ||
-      top.getPorts()[*topPort].type != payloadType) {
+      top.getPortType(*topPort) != payloadType) {
     error = "FAME input channel has no matching top port";
     return failure();
   }
@@ -453,8 +453,8 @@ LogicalResult goldengate::addFAMEClockChannelToken(
   if (!topClock || !modelClock ||
       top.getPortDirection(*topClock) != Direction::In ||
       model.getPortDirection(*modelClock) != Direction::In ||
-      !isa<ClockType>(top.getPorts()[*topClock].type) ||
-      !isa<ClockType>(model.getPorts()[*modelClock].type)) {
+      !isa<ClockType>(top.getPortType(*topClock)) ||
+      !isa<ClockType>(model.getPortType(*modelClock))) {
     error = "target clock token has no matching scalar clock ports";
     return failure();
   }
@@ -916,8 +916,8 @@ LogicalResult goldengate::removeFAMETargetClockPort(
   if (!topClock || !modelClock ||
       top.getPortDirection(*topClock) != Direction::In ||
       model.getPortDirection(*modelClock) != Direction::In ||
-      !isa<ClockType>(top.getPorts()[*topClock].type) ||
-      !isa<ClockType>(model.getPorts()[*modelClock].type) ||
+      !isa<ClockType>(top.getPortType(*topClock)) ||
+      !isa<ClockType>(model.getPortType(*modelClock)) ||
       hasPortAnnotations(top, *topClock) ||
       hasPortAnnotations(model, *modelClock) ||
       top.getPorts()[*topClock].sym || model.getPorts()[*modelClock].sym) {

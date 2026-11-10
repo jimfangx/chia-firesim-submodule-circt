@@ -86,11 +86,11 @@ LogicalResult goldengate::addHostMemoryWriteArbiter(CircuitOp circuit,
   auto mem=port("fased_host_mem",master,Direction::Out);
   auto clock=port("hostClock",ClockType::get(ctx),Direction::In),reset=port("hostReset",uint(1),Direction::In);
   if(!mem||!clock||!reset||old.count("host_mem_write"))return reject("host memory write arbiter needs exact clock/reset and translated AXI master");
-  if(buffer.getNumPorts()!=4 || buffer.getPorts()[0].type!=ClockType::get(ctx) ||
-     buffer.getPorts()[0].direction!=Direction::In || buffer.getPorts()[1].type!=uint(1) ||
-     buffer.getPorts()[1].direction!=Direction::In || buffer.getPorts()[2].type!=master ||
-     buffer.getPorts()[2].direction!=Direction::In || buffer.getPorts()[3].type!=master ||
-     buffer.getPorts()[3].direction!=Direction::Out)
+  if(buffer.getNumPorts()!=4 || buffer.getPortType(0)!=ClockType::get(ctx) ||
+     buffer.getPortDirection(0)!=Direction::In || buffer.getPortType(1)!=uint(1) ||
+     buffer.getPortDirection(1)!=Direction::In || buffer.getPortType(2)!=master ||
+     buffer.getPortDirection(2)!=Direction::In || buffer.getPortType(3)!=master ||
+     buffer.getPortDirection(3)!=Direction::Out)
     return reject("host memory write arbiter needs the exact five-channel memory buffer");
   consumed.insert("fased_host_mem");
   struct Leaf {const char *name;unsigned width;Direction direction;};
@@ -264,8 +264,8 @@ LogicalResult goldengate::addHostMemoryWriteArbiter(CircuitOp circuit,
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim=b.create<InstanceOp>(loc,inner,"sim"),arb=b.create<InstanceOp>(loc,helper,"write_arbiter");
   for(auto [n,i]:copied) {
-    auto p=inner.getPorts()[old.at(n)];Value v=sim.getResult(old.at(n)),a=arg(wrapper,i);
-    b.create<ConnectOp>(loc,p.direction==Direction::In?v:a,p.direction==Direction::In?a:v);
+    auto p = inner.getPortDirection(old.at(n));Value v=sim.getResult(old.at(n)),a=arg(wrapper,i);
+    b.create<ConnectOp>(loc,p==Direction::In?v:a,p==Direction::In?a:v);
   }
   c(arb.getResult(0),arg(wrapper,copied.at("hostClock")));c(arb.getResult(1),arg(wrapper,copied.at("hostReset")));
   for(auto l:ls) {

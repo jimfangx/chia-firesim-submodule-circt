@@ -254,9 +254,9 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   for (auto &plan : plans) configs.push_back(b.create<InstanceOp>(loc, plan.bank, plan.instanceName));
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
-                             p.direction == Direction::In ? external : sim.getResult(i));
+    auto p = inner.getPortDirection(i); Value external = wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : external,
+                             p == Direction::In ? external : sim.getResult(i));
   }
   for (auto [i, plan] : llvm::enumerate(plans)) {
     auto config = configs[i];

@@ -106,7 +106,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error, 
   // Every rejection above precedes mutation.
   auto *ctx=circuit.getContext(); OpBuilder b(ctx); auto loc=circuit.getLoc();
   auto u=[&](unsigned w){return UIntType::get(ctx,w);};
-  auto type=[&](StringRef n){return inner.getPorts()[indices.at(n.str())].type;};
+  auto type=[&](StringRef n){return inner.getPortType(indices.at(n.str()));};
   // Nasti has region/user and W.id absent from the CPU AXI4 bundle.
   // Build its schema from the validated control Nasti contract, changing only
   // the PCIS widths from CreateNastiParameters(CPUManagedAXI4Key).

@@ -424,7 +424,7 @@ LogicalResult goldengate::addFAMEPipeWrapper(CircuitOp circuit,
       return failure();
     }
   std::optional<unsigned> clockPort, resetPort;
-  for (unsigned i = 0, n = target.getPorts().size(); i < n; ++i) {
+  for (unsigned i = 0, n = target.getNumPorts(); i < n; ++i) {
     auto name = target.getPortName(i);
     if (name == "hostClock")
       clockPort = i;

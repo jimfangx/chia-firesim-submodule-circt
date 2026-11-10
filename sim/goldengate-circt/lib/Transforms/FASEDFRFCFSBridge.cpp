@@ -234,11 +234,11 @@ LogicalResult attach(CircuitOp circuit, std::string &error) {
     llvm_unreachable("unknown model pin");
   };
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i];
+    auto p = inner.getPortDirection(i);
     auto arg = wrapper.getBodyBlock()->getArgument(j);
     b.create<ConnectOp>(loc,
-                        p.direction == Direction::In ? sim.getResult(i) : arg,
-                        p.direction == Direction::In ? arg : sim.getResult(i));
+                        p == Direction::In ? sim.getResult(i) : arg,
+                        p == Direction::In ? arg : sim.getResult(i));
   }
 
   con(pin("clock"),
@@ -293,12 +293,12 @@ LogicalResult attach(CircuitOp circuit, std::string &error) {
         pin(egress + "Ready"));
   }
   for (auto [j, i] : llvm::enumerate(exported)) {
-    auto p = model.getPorts()[i];
+    auto p = model.getPortDirection(i);
     auto arg = wrapper.getBodyBlock()->getArgument(copied.size() + j);
     b.create<ConnectOp>(
         loc,
-        p.direction == Direction::In ? timingModel.getResult(i) : arg,
-        p.direction == Direction::In ? arg : timingModel.getResult(i));
+        p == Direction::In ? timingModel.getResult(i) : arg,
+        p == Direction::In ? arg : timingModel.getResult(i));
   }
   std::string oldPrefix = "~" + circuit.getName().str(),
               newPrefix = "~" + wrapperName.str(),

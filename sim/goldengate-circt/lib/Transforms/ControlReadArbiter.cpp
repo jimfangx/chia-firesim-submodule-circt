@@ -76,8 +76,8 @@ LogicalResult goldengate::addControlReadArbiter(CircuitOp circuit,
       {"ctrl_error_r_bits_user", uint(1), Direction::Out}};
   for (auto r : required) {
     auto it = old.find(r.name);
-    if (it == old.end() || inner.getPorts()[it->second].type != r.type ||
-        inner.getPorts()[it->second].direction != r.direction)
+    if (it == old.end() || inner.getPortType(it->second) != r.type ||
+        inner.getPortDirection(it->second) != r.direction)
       return reject("control read arbiter requires exact clock and error response boundaries");
   }
   std::set<std::string> widgetPorts;
@@ -91,8 +91,8 @@ LogicalResult goldengate::addControlReadArbiter(CircuitOp circuit,
         !widgetPorts.insert(port.getValue().str()).second)
       return reject("control read arbiter read bindings must identify unique decoded slaves and matching region names");
     auto it = old.find(port.getValue().str());
-    if (it == old.end() || inner.getPorts()[it->second].type != controlType ||
-        inner.getPorts()[it->second].direction != Direction::In)
+    if (it == old.end() || inner.getPortType(it->second) != controlType ||
+        inner.getPortDirection(it->second) != Direction::In)
       return reject("control read arbiter widget response bundle differs");
     widgets[slave.getInt()] = port.getValue().str();
   }
@@ -100,8 +100,8 @@ LogicalResult goldengate::addControlReadArbiter(CircuitOp circuit,
     for (auto suffix : {"valid", "tag"}) {
       std::string n = "ctrl_read_tracker_deq_" + std::to_string(i) + "_" + suffix;
       auto it = old.find(n);
-      if (it == old.end() || inner.getPorts()[it->second].direction != Direction::In ||
-          inner.getPorts()[it->second].type != uint(StringRef(suffix) == "tag" ? 12 : 1))
+      if (it == old.end() || inner.getPortDirection(it->second) != Direction::In ||
+          inner.getPortType(it->second) != uint(StringRef(suffix) == "tag" ? 12 : 1))
         return reject("control read arbiter requires explicit tracker retirement inputs for every unbound decoded slave");
     }
   }
@@ -191,7 +191,7 @@ LogicalResult goldengate::addControlReadArbiter(CircuitOp circuit,
     if (widgetPorts.count(n)) {
       b.create<ConnectOp>(loc, field(external, "b"), field(result(n), "b"));
     } else {
-      auto d = inner.getPorts()[old.at(n)].direction;
+      auto d = inner.getPortDirection(old.at(n));
       b.create<ConnectOp>(loc, d == Direction::In ? result(n) : external, d == Direction::In ? external : result(n));
     }
   }

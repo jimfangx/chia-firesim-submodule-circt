@@ -139,8 +139,8 @@ LogicalResult goldengate::addFASEDReadLatency(CircuitOp circuit,
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim=b.create<InstanceOp>(loc,inner,"sim"),queue=b.create<InstanceOp>(loc,helper,"readLatency");
   for (auto [j,i] : llvm::enumerate(copied)) {
-    Value v=wrapper.getBodyBlock()->getArgument(j);auto p=inner.getPorts()[i];
-    b.create<ConnectOp>(loc,p.direction==Direction::In?sim.getResult(i):v,p.direction==Direction::In?v:sim.getResult(i));
+    Value v=wrapper.getBodyBlock()->getArgument(j);auto p = inner.getPortDirection(i);
+    b.create<ConnectOp>(loc,p==Direction::In?sim.getResult(i):v,p==Direction::In?v:sim.getResult(i));
   }
   connect(queue.getResult(0),wrapper.getBodyBlock()->getArgument(llvm::find(copied,indices[0])-copied.begin()));
   for(unsigned j=1;j<4;++j)connect(queue.getResult(j),sim.getResult(indices[j]));

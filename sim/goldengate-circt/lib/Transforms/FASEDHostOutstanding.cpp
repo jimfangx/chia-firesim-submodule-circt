@@ -109,9 +109,9 @@ LogicalResult goldengate::addFASEDHostOutstanding(CircuitOp circuit, std::string
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   auto extra = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(added + i); };
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
-                             p.direction == Direction::In ? external : sim.getResult(i));
+    auto p = inner.getPortDirection(i); Value external = wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : external,
+                             p == Direction::In ? external : sim.getResult(i));
   }
   connect(counters.getResult(0), outer(indices[0])); connect(counters.getResult(1), outer(indices[1]));
   connect(counters.getResult(2), extra(1));

@@ -5,6 +5,7 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 #include <algorithm>
 #include <map>
 #include <set>
@@ -33,7 +34,7 @@ public:
     auto circuit = module->getParentOfType<CircuitOp>();
     for (auto &op : circuit.getBodyBlock()->getOperations())
       if (auto child = dyn_cast<FModuleLike>(&op))
-        modules[child.getModuleName().str()] = child;
+        modules[child.getModuleName()] = child;
   }
 
   Trace trace(unsigned port) {
@@ -77,7 +78,7 @@ private:
 
   void orderInputs(FModuleOp current, Value value, unsigned fieldID,
                    Trace &result) {
-    auto &graph = edges[current.getOperation()];
+    const auto &graph = edges[current.getOperation()];
     auto root = getFieldRefFromValue(value).getSubField(fieldID);
     SmallVector<circt::FieldRef> queue{root};
     DenseSet<circt::FieldRef> visited;
@@ -102,13 +103,17 @@ private:
         }
         if (!expressions.insert(field).second)
           return;
-        for (auto source : graph.lookup(field))
-          self(self, source);
+        auto sources = graph.find(field);
+        if (sources != graph.end())
+          for (auto source : sources->second)
+            self(self, source);
       };
       // Enqueuing can grow queue; copy the current field before doing so.
       auto field = queue[next];
-      for (auto source : graph.lookup(field))
-        enqueue(enqueue, source);
+      auto sources = graph.find(field);
+      if (sources != graph.end())
+        for (auto source : sources->second)
+          enqueue(enqueue, source);
     }
     if (ordered.size() != result.inputPorts.size())
       result.blockers.insert(current.getName().str() +
@@ -222,7 +227,7 @@ private:
       // selected aggregate field across both sides of the instance boundary.
       if (auto instance = dyn_cast<InstanceOp>(op)) {
         unsigned port = cast<OpResult>(fieldRef.getValue()).getResultNumber();
-        auto child = modules.find(instance.getModuleName().str());
+        auto child = modules.find(instance.getModuleName());
         if (child == modules.end() ||
             child->second.getPortDirection(port) != Direction::Out) {
           result.blockers.insert(current.getName().str() + ":unresolved instance " +
@@ -435,7 +440,7 @@ private:
 
   FModuleOp module;
   bool retainPorts;
-  std::map<std::string, FModuleLike> modules;
+  llvm::StringMap<FModuleLike> modules;
   DenseSet<Operation *> indexed;
   DenseSet<Operation *> conditionalModules;
   DenseSet<Operation *> foreignConnectModules;

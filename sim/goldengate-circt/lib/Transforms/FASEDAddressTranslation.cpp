@@ -80,7 +80,7 @@ LogicalResult goldengate::addFASEDAddressTranslation(CircuitOp circuit,
   auto inType=master(35),outType=master(34);
   std::map<std::string,unsigned> old,copied;
   for(auto [i,p]:llvm::enumerate(inner.getPorts()))old[p.name.getValue().str()]=i;
-  auto port=[&](StringRef n,Type t,Direction d){auto i=old.find(n.str());return i!=old.end()&&inner.getPorts()[i->second].type==t&&inner.getPorts()[i->second].direction==d;};
+  auto port=[&](StringRef n,Type t,Direction d){auto i=old.find(n.str());return i!=old.end()&&inner.getPortType(i->second)==t&&inner.getPortDirection(i->second)==d;};
   if(!port("fased_host_mem",inType,Direction::Out) ||
       !port("hostClock",ClockType::get(ctx),Direction::In) ||
       !port("hostReset",uint(1),Direction::In))
@@ -144,7 +144,7 @@ LogicalResult goldengate::addFASEDAddressTranslation(CircuitOp circuit,
   auto translation=b.create<InstanceOp>(loc,helper,"translation");
   for(auto [n,i]:copied) {
     Value v=sim.getResult(old.at(n)),a=wrapper.getBodyBlock()->getArgument(i);
-    bool input=inner.getPorts()[old.at(n)].direction==Direction::In;
+    bool input=inner.getPortDirection(old.at(n))==Direction::In;
     b.create<ConnectOp>(loc,input?v:a,input?a:v);
   }
   connect(translation.getResult(0),wrapper.getBodyBlock()->getArgument(copied.at("hostClock")));

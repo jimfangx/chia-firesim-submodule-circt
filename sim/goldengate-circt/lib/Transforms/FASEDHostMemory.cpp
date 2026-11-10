@@ -79,8 +79,8 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
   if (old.count("fased_host_mem")) return reject("FASED host memory boundary exists");
   for (unsigned j=0;j<3;++j) {
     auto i=old.find(names[j].str());
-    if (i==old.end() || inner.getPorts()[i->second].type!=types[j] ||
-        inner.getPorts()[i->second].direction!=(j==0?Direction::Out:Direction::In))
+    if (i==old.end() || inner.getPortType(i->second)!=types[j] ||
+        inner.getPortDirection(i->second)!=(j==0?Direction::Out:Direction::In))
       return reject("FASED host memory needs exact split request/response bundles");
     consumed.insert(names[j].str());
   }
@@ -99,7 +99,7 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
   auto sim=b.create<InstanceOp>(loc,inner,"sim");
   for (auto [n,i] : copied) {
     Value v=sim.getResult(old.at(n)), a=wrapper.getBodyBlock()->getArgument(i);
-    auto d=inner.getPorts()[old.at(n)].direction;
+    auto d=inner.getPortDirection(old.at(n));
     b.create<ConnectOp>(loc,d==Direction::In?v:a,d==Direction::In?a:v);
   }
   auto field=[&](Value v,StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};

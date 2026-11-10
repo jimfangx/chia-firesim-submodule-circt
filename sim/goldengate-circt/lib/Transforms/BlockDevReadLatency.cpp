@@ -124,9 +124,9 @@ LogicalResult goldengate::addBlockDevReadLatency(CircuitOp circuit, std::string 
   auto queue = b.create<InstanceOp>(loc, pipe, "readLatencyPipe");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
-                             p.direction == Direction::In ? external : sim.getResult(i));
+    auto p = inner.getPortDirection(i); Value external = wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : external,
+                             p == Direction::In ? external : sim.getResult(i));
   }
   connect(queue.getResult(0), outer(indices[0]));
   connect(queue.getResult(1), sim.getResult(indices[2]));

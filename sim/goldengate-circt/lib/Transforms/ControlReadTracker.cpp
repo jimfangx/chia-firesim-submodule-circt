@@ -82,8 +82,8 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
       {"ctrl_error_r_bits_id", uint(12), Direction::Out}};
   for (auto r : required) {
     auto it = old.find(r.name);
-    if (it == old.end() || inner.getPorts()[it->second].type != r.type ||
-        inner.getPorts()[it->second].direction != r.direction)
+    if (it == old.end() || inner.getPortType(it->second) != r.type ||
+        inner.getPortDirection(it->second) != r.direction)
       return reject("control read tracker requires exact clock, dispatch and error boundaries");
   }
   std::set<std::string> widgetPorts;
@@ -97,8 +97,8 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
         !widgetPorts.insert(port.getValue().str()).second)
       return reject("control read tracker read bindings must identify unique decoded slaves and matching region names");
     auto it = old.find(port.getValue().str());
-    if (it == old.end() || inner.getPorts()[it->second].type != controlType ||
-        inner.getPorts()[it->second].direction != Direction::In)
+    if (it == old.end() || inner.getPortType(it->second) != controlType ||
+        inner.getPortDirection(it->second) != Direction::In)
       return reject("control read tracker widget response bundle differs");
     widgets[slave.getInt()] = port.getValue().str();
   }
@@ -185,7 +185,7 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
   auto result = [&](std::string n) { return sim.getResult(old.at(n)); };
   auto track = [&](std::string n) { return tracker.getResult(hpIndex.at(n)); };
   for (auto [n, i] : copied) {
-    auto d = inner.getPorts()[old.at(n)].direction; Value external = wrapper.getBodyBlock()->getArgument(i);
+    auto d = inner.getPortDirection(old.at(n)); Value external = wrapper.getBodyBlock()->getArgument(i);
     b.create<ConnectOp>(loc, d == Direction::In ? result(n) : external, d == Direction::In ? external : result(n));
   }
   connect(track("clock"), topArg("hostClock")); connect(track("reset"), topArg("hostReset"));

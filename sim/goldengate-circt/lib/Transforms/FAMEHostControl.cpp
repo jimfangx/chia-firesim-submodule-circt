@@ -51,7 +51,7 @@ LogicalResult goldengate::addFAMEHostControl(CircuitOp circuit,
       return;
     }
     Value clock, reset;
-    for (unsigned i = 0, n = parent.getPorts().size(); i < n; ++i) {
+    for (unsigned i = 0, n = parent.getNumPorts(); i < n; ++i) {
       if (parent.getPortDirection(i) != Direction::In)
         continue;
       if (parent.getPortName(i) == "hostClock")

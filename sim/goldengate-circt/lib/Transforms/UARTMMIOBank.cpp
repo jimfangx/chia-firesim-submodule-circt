@@ -103,9 +103,9 @@ LogicalResult goldengate::addUARTMMIOBank(CircuitOp circuit, std::string &error)
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), mmio = b.create<InstanceOp>(loc, bank, "uartRegisters");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
-                             p.direction == Direction::In ? external : sim.getResult(i));
+    auto p = inner.getPortDirection(i); Value external = wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : external,
+                             p == Direction::In ? external : sim.getResult(i));
   }
   connect(mmio.getResult(0), outer(*clock)); connect(mmio.getResult(1), outer(*reset));
   b.create<ConnectOp>(loc, mmio.getResult(2), sim.getResult(*tx));

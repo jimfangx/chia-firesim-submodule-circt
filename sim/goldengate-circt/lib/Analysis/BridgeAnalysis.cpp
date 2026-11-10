@@ -196,8 +196,9 @@ mlir::LogicalResult goldengate::promoteBridgePorts(
     std::set<unsigned> recursiveBundlePorts;
     std::set<std::string> fieldNames;
     bool supported = true;
-    for (unsigned i = 0; i < bridge.module.getNumPorts(); ++i) {
-      PortInfo port = bridge.module.getPorts()[i];
+    const auto bridgePorts = bridge.module.getPorts();
+    for (unsigned i = 0; i < bridgePorts.size(); ++i) {
+      const PortInfo &port = bridgePorts[i];
       auto type = dyn_cast<FIRRTLBaseType>(port.type);
       if (!type || !supportedType(type)) {
         supported = false;

@@ -101,7 +101,7 @@ LogicalResult goldengate::prepareClockBridgeHeader(
       identity.getAsInteger(10, widgetIndex) || !regionSlave || regionSlave.getInt() != slave.getInt() ||
       !start || start.getInt() < 0 || start.getInt() % 4 || !size || size.getInt() < 24)
     return reject("invalid ClockBridge widget identity or MMIO region");
-  auto address = decoder.getNumPorts() ? dyn_cast<UIntType>(decoder.getPorts()[0].type) : UIntType();
+  auto address = decoder.getNumPorts() ? dyn_cast<UIntType>(decoder.getPortType(0)) : UIntType();
   if (!address || !address.getWidth() || *address.getWidth() < 1 || *address.getWidth() > 63 ||
       uint64_t(start.getInt()) >= (uint64_t(1) << *address.getWidth()) ||
       uint64_t(size.getInt()) > (uint64_t(1) << *address.getWidth()) - start.getInt())

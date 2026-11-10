@@ -30,3 +30,36 @@ if(NOT key_type STREQUAL "NULL" OR NOT nested_type STREQUAL "NULL"
   message(FATAL_ERROR "Retained annotation JSON types changed: ${annotations}")
 endif()
 message(STATUS "Explicit null constructor fields and nested JSON types preserved")
+
+# Exercise the diagnostic consumer of the lazily parsed external JSON tree.
+execute_process(COMMAND "${COMPILER}" "${WORK}/input.fir"
+  --annotation-file "${WORK}/input.json" --output-dir "${WORK}/analysis"
+  RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 15)
+if(NOT result EQUAL 0)
+  message(FATAL_ERROR "Annotation analysis failed: ${result}\n${output}\n${error}")
+endif()
+file(READ "${WORK}/analysis/analysis.json" analysis)
+string(JSON count GET "${analysis}" annotation_count)
+string(JSON class_count GET "${analysis}" annotation_classes "test.NullOption")
+if(NOT count EQUAL 1 OR NOT class_count EQUAL 1)
+  message(FATAL_ERROR "Annotation analysis lost retained classes: ${analysis}")
+endif()
+
+# Production compilation relies on the importer to validate external JSON;
+# the separate diagnostic JSON tree must not be required to reject bad input.
+set(invalid_annotations "{" "{}" "null" "7" "\"text\"" "[null]" "[7]" "[] trailing")
+set(index 0)
+foreach(annotations IN LISTS invalid_annotations)
+  math(EXPR index "${index} + 1")
+  file(WRITE "${WORK}/invalid-${index}.json" "${annotations}")
+  foreach(mode compile-baseline lower-types)
+    execute_process(COMMAND "${COMPILER}" "${WORK}/input.fir"
+      --annotation-file "${WORK}/invalid-${index}.json"
+      --output-dir "${WORK}/invalid-${index}-${mode}" "--${mode}"
+      RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error TIMEOUT 15)
+    if(NOT result EQUAL 1 OR NOT error MATCHES "FIRRTL/annotation import failed")
+      message(FATAL_ERROR "${mode} failed to reject malformed annotations ${annotations}: ${result}\n${output}\n${error}")
+    endif()
+  endforeach()
+endforeach()
+message(STATUS "Importer rejects malformed annotation JSON in production and diagnostic modes")

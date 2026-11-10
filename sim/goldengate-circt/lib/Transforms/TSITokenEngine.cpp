@@ -198,9 +198,9 @@ LogicalResult goldengate::addTSITokenEngine(CircuitOp circuit, std::string &erro
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), tsi = b.create<InstanceOp>(loc, engine, "TSIBridgeModule_0");
   for (auto [j, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
-                             p.direction == Direction::In ? external : sim.getResult(i));
+    auto p = inner.getPortDirection(i); Value external = wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : external,
+                             p == Direction::In ? external : sim.getResult(i));
   }
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
   connect(tsi.getResult(0), outer(*hostClock)); connect(tsi.getResult(1), outer(*hostReset));

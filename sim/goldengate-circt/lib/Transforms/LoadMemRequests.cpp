@@ -138,9 +138,9 @@ LogicalResult goldengate::addLoadMemRequests(CircuitOp circuit, std::string &err
   auto arb = b.create<InstanceOp>(loc, arbiter, "requestArbiter");
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(i); };
   for (auto [o, i] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[i];
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : outer(o),
-        p.direction == Direction::In ? outer(o) : sim.getResult(i));
+    auto p = inner.getPortDirection(i);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : outer(o),
+        p == Direction::In ? outer(o) : sim.getResult(i));
     if (i == indices[0] || i == indices[1]) connect(requests.getResult(i == indices[0] ? 0 : 1), outer(o));
   }
   connect(outer(writeReady), field(requests.getResult(2), "ready"));

@@ -32,7 +32,7 @@ LogicalResult goldengate::materializeFASEDRankStateTracker(
   auto u = [&](unsigned width) { return UIntType::get(ctx, width, false); };
   auto bit = u(1);
   // Reuse the exact timing bundle emitted by the bank helper.
-  auto timings = bank.getPorts()[7].type;
+  auto timings = bank.getPortType(7);
   SmallVector<BundleType::BundleElement> bankFields;
   for (auto n : {"canCASW", "canCASR", "canPRE", "canACT", "state"})
     bankFields.push_back({b.getStringAttr(n), false, bit});

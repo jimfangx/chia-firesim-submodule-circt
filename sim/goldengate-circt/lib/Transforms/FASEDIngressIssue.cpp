@@ -86,7 +86,7 @@ LogicalResult goldengate::addFASEDIngressIssue(CircuitOp circuit,std::string &er
   b.setInsertionPointToEnd(circuit.getBodyBlock());auto wrapper=b.create<FModuleOp>(loc,b.getStringAttr(wrapperName),inner.getConventionAttr(),ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());auto sim=b.create<InstanceOp>(loc,inner,"sim");auto issue=b.create<InstanceOp>(loc,helper,"ingressIssue");
   auto outer=[&](unsigned i){return wrapper.getBodyBlock()->getArgument(llvm::find(copied,i)-copied.begin());};auto extra=[&](unsigned i){return wrapper.getBodyBlock()->getArgument(added+i);};
-  for(auto [j,i]:llvm::enumerate(copied)){auto p=inner.getPorts()[i];Value v=wrapper.getBodyBlock()->getArgument(j);b.create<ConnectOp>(loc,p.direction==Direction::In?sim.getResult(i):v,p.direction==Direction::In?v:sim.getResult(i));}
+  for(auto [j,i]:llvm::enumerate(copied)){auto p = inner.getPortDirection(i);Value v=wrapper.getBodyBlock()->getArgument(j);b.create<ConnectOp>(loc,p==Direction::In?sim.getResult(i):v,p==Direction::In?v:sim.getResult(i));}
   connect(issue.getResult(0),outer(indices[0]));connect(issue.getResult(1),sim.getResult(indices[1]));connect(issue.getResult(2),outer(indices[2]));connect(issue.getResult(3),sim.getResult(indices[3]));connect(issue.getResult(4),sim.getResult(indices[4]));
   connect(issue.getResult(5),field(sim.getResult(indices[5]),"awEmpty"));connect(issue.getResult(6),field(sim.getResult(indices[5]),"wEmpty"));
   for(unsigned j=7;j<=10;++j)b.create<ConnectOp>(loc,issue.getResult(j),sim.getResult(indices[j-1]));

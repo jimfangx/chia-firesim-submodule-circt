@@ -95,7 +95,7 @@ LogicalResult rewriteMultiportOutputChannel(
       if (!aliasField || *aliasField != field ||
           !topPorts.insert(topPort).second ||
           top.getPortDirection(topPort) != Direction::Out ||
-          top.getPorts()[topPort].type != instance.getResult(modelPort).getType()) {
+          top.getPortType(topPort) != instance.getResult(modelPort).getType()) {
         if (error.empty()) error = "FAME output bundle alias has incompatible payload";
         return failure();
       }
@@ -387,7 +387,7 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
   auto circuit = top->getParentOfType<CircuitOp>();
   for (unsigned topPort : topPorts) {
     if (top.getPortDirection(topPort) != Direction::Out ||
-        top.getPorts()[topPort].type != payloadType) {
+        top.getPortType(topPort) != payloadType) {
       error = "FAME output alias has incompatible direction or payload";
       return failure();
     }

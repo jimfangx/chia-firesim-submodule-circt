@@ -176,10 +176,10 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
     auto instance=n=="cpu_managed_axi4"?cpu:sim; Value v;
     for (auto [i,p]:llvm::enumerate(instance.getPortNames()))
       if (cast<StringAttr>(p).getValue()==n) v=instance.getResult(i);
-    auto p=inner.getPorts()[old.at(n)]; Value a=inner.getBodyBlock()->getArgument(old.at(n));
+    auto p = inner.getPortDirection(old.at(n)); Value a=inner.getBodyBlock()->getArgument(old.at(n));
     if (!v||v.getType()!=a.getType()||!a.hasOneUse()||!v.hasOneUse())
       return reject("platform port requires one exact child forwarding use");
-    Value dest=p.direction==Direction::In?v:a,src=p.direction==Direction::In?a:v;
+    Value dest=p==Direction::In?v:a,src=p==Direction::In?a:v;
     unsigned count=0; bool wrong=false;
     // Inspect every driver, including strict connects, so a second driver
     // cannot be concealed by the public argument's single forwarding use.
@@ -209,8 +209,9 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
   // consumers; normal CIRCT lowering can remove unused logic later.
   auto *ctx=circuit.getContext(); OpBuilder b(ctx); auto loc=circuit.getLoc();
   SmallVector<PortInfo> ports;
+  const auto innerPorts = inner.getPorts();
   for (auto n:{"hostClock","hostReset","ctrl","mem_0","cpu_managed_axi4"}) {
-    auto p=inner.getPorts()[old.at(n)]; p.name=b.getStringAttr(publicNames.at(n)); ports.push_back(p);
+    auto p=innerPorts[old.at(n)]; p.name=b.getStringAttr(publicNames.at(n)); ports.push_back(p);
   }
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper=b.create<FModuleOp>(loc,b.getStringAttr(newName),inner.getConventionAttr(),ports);

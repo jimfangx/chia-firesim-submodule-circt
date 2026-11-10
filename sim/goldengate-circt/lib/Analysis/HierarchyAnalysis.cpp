@@ -67,7 +67,7 @@ goldengate::analyzeTopHierarchy(CircuitOp circuit, std::string &error) {
     auto childModule = child ? mlir::dyn_cast<FModuleLike>(
                                    child->getModule().getOperation()) : FModuleLike();
     if (!childModule || childModule.getModuleName() != instance.getModuleName() ||
-        instancePort >= childModule.getPorts().size()) {
+        instancePort >= childModule.getNumPorts()) {
       error = "instance graph and child port identity disagree at " +
               top.getPortName(topPort).str();
       return;

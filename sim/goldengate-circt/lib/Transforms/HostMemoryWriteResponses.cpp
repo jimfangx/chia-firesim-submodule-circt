@@ -154,8 +154,8 @@ LogicalResult goldengate::routeHostMemoryWriteResponses(CircuitOp circuit,
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto child=b.create<InstanceOp>(loc,inner,"sim"),router=b.create<InstanceOp>(loc,helper,"write_responses");
   for(auto [n,i]:copied) {
-    auto p=inner.getPorts()[old.at(n)];Value v=child.getResult(old.at(n)),a=arg(wrapper,i);
-    b.create<ConnectOp>(loc,p.direction==Direction::In?v:a,p.direction==Direction::In?a:v);
+    auto p = inner.getPortDirection(old.at(n));Value v=child.getResult(old.at(n)),a=arg(wrapper,i);
+    b.create<ConnectOp>(loc,p==Direction::In?v:a,p==Direction::In?a:v);
   }
   for(auto ch:{"aw","w"})b.create<ConnectOp>(loc,f(arg(wrapper,wi),ch),f(child.getResult(*w),ch));
   b.create<ConnectOp>(loc,router.getResult(0),f(arg(wrapper,wi),"b"));

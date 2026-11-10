@@ -134,8 +134,8 @@ LogicalResult goldengate::specializeHostMemoryPort(CircuitOp circuit,
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto child=b.create<InstanceOp>(loc,inner,"sim"),adapter=b.create<InstanceOp>(loc,helper,"memory_port");
   for(auto [n,i]:copied) {
-    auto p=inner.getPorts()[old.at(n)];Value v=child.getResult(old.at(n)),a=arg(wrapper,i);
-    b.create<ConnectOp>(loc,p.direction==Direction::In?v:a,p.direction==Direction::In?a:v);
+    auto p = inner.getPortDirection(old.at(n));Value v=child.getResult(old.at(n)),a=arg(wrapper,i);
+    b.create<ConnectOp>(loc,p==Direction::In?v:a,p==Direction::In?a:v);
   }
   b.create<ConnectOp>(loc,adapter.getResult(0),child.getResult(*mem));
   b.create<ConnectOp>(loc,arg(wrapper,mi),adapter.getResult(1));

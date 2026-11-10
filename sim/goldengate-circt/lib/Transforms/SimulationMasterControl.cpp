@@ -106,7 +106,7 @@ LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
   std::set<std::string> consumed;
   auto required = [&](std::string n, Type t, Direction d, bool consume = true) {
     auto it = old.find(n);
-    if (it == old.end() || inner.getPorts()[it->second].type != t || inner.getPorts()[it->second].direction != d) return false;
+    if (it == old.end() || inner.getPortType(it->second) != t || inner.getPortDirection(it->second) != d) return false;
     if (consume) consumed.insert(n);
     return true;
   };
@@ -149,7 +149,7 @@ LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
   auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc,d,s); };
   for (auto [n,i] : copied) {
     Value v = sim.getResult(old.at(n)), a = wrapper.getBodyBlock()->getArgument(i);
-    auto d = inner.getPorts()[old.at(n)].direction;
+    auto d = inner.getPortDirection(old.at(n));
     b.create<ConnectOp>(loc,d == Direction::In ? v : a,d == Direction::In ? a : v);
   }
   Value ctrl = sim.getResult(old.at(spec.controlPort.str()));
@@ -320,7 +320,7 @@ LogicalResult goldengate::bindControlMaster(CircuitOp circuit,
   if(old.count("ctrl"))return reject("host control port exists");
   auto exact=[&](std::string n,Type t,Direction d){
     auto i=old.find(n);
-    if(i==old.end()||inner.getPorts()[i->second].type!=t||inner.getPorts()[i->second].direction!=d)return false;
+    if(i==old.end()||inner.getPortType(i->second)!=t||inner.getPortDirection(i->second)!=d)return false;
     consumed.insert(n);return true;
   };
   for(auto &w:wires)if(!exact(w.boundary,uint(w.width),w.direction))
@@ -338,7 +338,7 @@ LogicalResult goldengate::bindControlMaster(CircuitOp circuit,
   b.setInsertionPointToStart(wrapper.getBodyBlock());auto sim=b.create<InstanceOp>(loc,inner,"sim");
   for(auto [n,i]:copied) {
     Value v=sim.getResult(old.at(n)),a=wrapper.getBodyBlock()->getArgument(i);
-    auto d=inner.getPorts()[old.at(n)].direction;
+    auto d=inner.getPortDirection(old.at(n));
     b.create<ConnectOp>(loc,d==Direction::In?v:a,d==Direction::In?a:v);
   }
   auto field=[&](Value v,llvm::StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};

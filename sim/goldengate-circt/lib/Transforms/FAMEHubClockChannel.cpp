@@ -53,8 +53,8 @@ LogicalResult goldengate::rewriteFAMEHubClockChannel(
         top.getPortName(d.topPort) != d.topClockName ||
         model.getPortDirection(d.modelPort) != Direction::In ||
         top.getPortDirection(d.topPort) != Direction::In ||
-        !isa<ClockType>(model.getPorts()[d.modelPort].type) ||
-        !isa<ClockType>(top.getPorts()[d.topPort].type))
+        !isa<ClockType>(model.getPortType(d.modelPort)) ||
+        !isa<ClockType>(top.getPortType(d.topPort)))
       return reject("hub clock rewrite domain identity is stale");
     if (domains.size() == 1 ? !d.payloadField.empty()
                             : (d.payloadField.empty() || !fields.insert(d.payloadField).second ||

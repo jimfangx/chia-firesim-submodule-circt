@@ -141,9 +141,9 @@ LogicalResult goldengate::addFASEDResponseReleaser(CircuitOp circuit,
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim"), releaser = b.create<InstanceOp>(loc, helper, "releaser");
   for (auto [j, i] : llvm::enumerate(copied)) {
-    Value v = wrapper.getBodyBlock()->getArgument(j); auto p = inner.getPorts()[i];
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : v,
-                       p.direction == Direction::In ? v : sim.getResult(i));
+    Value v = wrapper.getBodyBlock()->getArgument(j); auto p = inner.getPortDirection(i);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : v,
+                       p == Direction::In ? v : sim.getResult(i));
   }
   auto extra = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(added + i); };
   connect(releaser.getResult(0), wrapper.getBodyBlock()->getArgument(llvm::find(copied, indices[0]) - copied.begin()));

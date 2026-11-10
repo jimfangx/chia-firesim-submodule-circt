@@ -159,8 +159,8 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
   auto outer=[&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied,i)-copied.begin()); };
   auto extra=[&](unsigned i) { return wrapper.getBodyBlock()->getArgument(added+i); };
   for (auto [j,i] : llvm::enumerate(copied)) {
-    Value v=wrapper.getBodyBlock()->getArgument(j);auto p=inner.getPorts()[i];
-    b.create<ConnectOp>(loc,p.direction==Direction::In?sim.getResult(i):v,p.direction==Direction::In?v:sim.getResult(i));
+    Value v=wrapper.getBodyBlock()->getArgument(j);auto p = inner.getPortDirection(i);
+    b.create<ConnectOp>(loc,p==Direction::In?sim.getResult(i):v,p==Direction::In?v:sim.getResult(i));
   }
   connect(buffer.getResult(0),outer(*clock));connect(buffer.getResult(1),sim.getResult(*reset));
   Value hostRead=extra(1),bits=field(hostRead,"bits"),queueEnq=buffer.getResult(2),flat=sim.getResult(*host);

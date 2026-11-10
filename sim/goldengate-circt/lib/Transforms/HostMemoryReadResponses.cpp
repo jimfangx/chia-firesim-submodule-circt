@@ -147,8 +147,8 @@ LogicalResult goldengate::routeHostMemoryReadResponses(CircuitOp circuit,
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto child=b.create<InstanceOp>(loc,inner,"sim"),router=b.create<InstanceOp>(loc,helper,"read_responses");
   for(auto [n,i]:copied) {
-    auto p=inner.getPorts()[old.at(n)];Value v=child.getResult(old.at(n)),a=arg(wrapper,i);
-    b.create<ConnectOp>(loc,p.direction==Direction::In?v:a,p.direction==Direction::In?a:v);
+    auto p = inner.getPortDirection(old.at(n));Value v=child.getResult(old.at(n)),a=arg(wrapper,i);
+    b.create<ConnectOp>(loc,p==Direction::In?v:a,p==Direction::In?a:v);
   }
   for(auto ch:{"aw","w","b","ar"}) {
     bool response=StringRef(ch)=="b";Value a=f(arg(wrapper,hi),ch),v=f(child.getResult(*host),ch);

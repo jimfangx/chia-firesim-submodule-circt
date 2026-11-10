@@ -947,10 +947,8 @@ int main(int argc, char **argv) {
   auto annoBuffer = llvm::MemoryBuffer::getFile(annoPath);
   if (!annoBuffer)
     return fail("cannot read annotation file: " + annoPath.str());
-  auto parsedAnnotations = llvm::json::parse((*annoBuffer)->getBuffer());
-  if (!parsedAnnotations || !parsedAnnotations->getAsArray())
-    return fail("annotation file must contain a JSON array");
-  sourceMgr.AddNewSourceBuffer(std::move(*annoBuffer), llvm::SMLoc());
+  auto annotationBufferID =
+      sourceMgr.AddNewSourceBuffer(std::move(*annoBuffer), llvm::SMLoc());
 
   mlir::DialectRegistry registry;
   registry.insert<FIRRTLDialect, chirrtl::CHIRRTLDialect, hw::HWDialect>();
@@ -6010,6 +6008,14 @@ int main(int argc, char **argv) {
                  << rewrittenPath << '\n';
     return 0;
   }
+
+  // The importer already parses and validates the annotation JSON. Only this
+  // diagnostic path needs a separate JSON tree to check retained annotations;
+  // production compilation returns above without constructing it again.
+  auto parsedAnnotations = llvm::json::parse(
+      sourceMgr.getMemoryBuffer(annotationBufferID)->getBuffer());
+  if (!parsedAnnotations || !parsedAnnotations->getAsArray())
+    return fail("annotation file must contain a JSON array");
 
   // CIRCT's FIR parser leaves unknown Golden Gate classes as rawAnnotations.
   // Keep them in the IR until a dedicated GG pass has explicitly consumed or

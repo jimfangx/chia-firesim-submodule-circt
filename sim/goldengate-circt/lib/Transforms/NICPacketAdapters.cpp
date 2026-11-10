@@ -160,8 +160,8 @@ LogicalResult goldengate::addNICPacketAdapters(CircuitOp circuit, std::string &e
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim = b.create<InstanceOp>(loc, inner, "sim");
   auto arg = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(i); };
-  for (auto [j,i] : llvm::enumerate(copied)) { auto p = inner.getPorts()[i];
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : arg(j), p.direction == Direction::In ? arg(j) : sim.getResult(i)); }
+  for (auto [j,i] : llvm::enumerate(copied)) { auto p = inner.getPortDirection(i);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(i) : arg(j), p == Direction::In ? arg(j) : sim.getResult(i)); }
   SmallVector<Attribute> bindings;
   for (auto [index, widget] : llvm::enumerate(widgets)) {
     std::string prefix = nics == 1 ? "" : "nic" + std::to_string(index) + "_";

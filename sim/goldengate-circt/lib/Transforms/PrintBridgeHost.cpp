@@ -219,8 +219,9 @@ LogicalResult goldengate::materializePrintBridgeHostQueues(CircuitOp circuit,
       return reject("PrintBridge host queue identity already materialized or duplicated");
     if (host.getNumPorts() != 12)
       return reject("PrintBridge host queue requires the twelve-port local host boundary");
+    const auto hostPorts = host.getPorts();
     for (unsigned i = 0; i < 12; ++i) {
-      auto p = host.getPorts()[i];
+      const auto &p = hostPorts[i];
       auto direction = i < 4 || i == 8 || i == 11 ? Direction::In : Direction::Out;
       Type expected = i == 0 ? Type(ClockType::get(context)) :
           i == 6 ? Type(UIntType::get(context, 64)) : i == 10 ? Type(word) : Type(bit);

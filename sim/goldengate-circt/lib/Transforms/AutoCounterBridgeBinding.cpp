@@ -87,8 +87,9 @@ LogicalResult goldengate::bindAutoCounterBridgeHosts(CircuitOp circuit,
          (!textIs(op,"class",AnnotationClasses::AutoCounterAccumulate)&&!textIs(op,"class",AnnotationClasses::AutoCounterIdentity)))
         return reject("AutoCounter binding requires typed event fields and operations");
     }
+    const auto hostPorts = host.getPorts();
     for(unsigned i=0;i<8;++i) {
-      auto port=host.getPorts()[i];auto expected=i==0?Type(clock):Type(bit);
+      const auto &port=hostPorts[i];auto expected=i==0?Type(clock):Type(bit);
       auto direction=(i==5||i==6)?Direction::Out:Direction::In;
       if(port.name!=expectedNames[i]||port.direction!=direction||
          ((i!=4&&i!=7)&&port.type!=expected))return reject("AutoCounter binding host port contract mismatch");

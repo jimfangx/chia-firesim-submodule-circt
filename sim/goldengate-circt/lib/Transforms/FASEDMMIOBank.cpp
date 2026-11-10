@@ -105,9 +105,9 @@ LogicalResult goldengate::addFASEDMMIOBank(CircuitOp circuit, std::string &error
   wrapper->setAttr("goldengate.mmioRegisters",b.getArrayAttr(registers));
   b.setInsertionPointToStart(wrapper.getBodyBlock());auto sim=b.create<InstanceOp>(loc,inner,"sim");
   for(auto [j,i]:llvm::enumerate(copied)) {
-    auto p=inner.getPorts()[i];Value external=wrapper.getArgument(j);
-    b.create<ConnectOp>(loc,p.direction==Direction::In?sim.getResult(i):external,
-        p.direction==Direction::In?external:sim.getResult(i));
+    auto p = inner.getPortDirection(i);Value external=wrapper.getArgument(j);
+    b.create<ConnectOp>(loc,p==Direction::In?sim.getResult(i):external,
+        p==Direction::In?external:sim.getResult(i));
   }
   auto field=[&](Value v,llvm::StringRef name)->Value{return b.create<SubfieldOp>(loc,v,name);};
   auto lane=[&](Value v,llvm::StringRef group,unsigned i)->Value{

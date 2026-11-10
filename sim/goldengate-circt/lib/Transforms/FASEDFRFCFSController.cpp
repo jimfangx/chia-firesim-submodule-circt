@@ -30,12 +30,14 @@ LogicalResult goldengate::materializeFASEDFRFCFSController(
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto u = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   SmallVector<PortInfo> ports;
+  const auto frontendPorts = frontend.getPorts();
+  const auto schedulerPorts = scheduler.getPorts();
   auto port = [&](StringRef n, Type t, Direction d) { ports.push_back({b.getStringAttr(n), t, d}); };
   auto copy = [&](FModuleOp m, StringRef n) {
     for (auto p : m.getPorts()) if (p.getName() == n) { ports.push_back(p); return; }
     llvm_unreachable("unknown copied port");
   };
-  for (unsigned i = 0; i < 16; ++i) ports.push_back(frontend.getPorts()[i]);
+  for (unsigned i = 0; i < 16; ++i) ports.push_back(frontendPorts[i]);
   for (auto n : {"pendingWReq", "pendingAWReq"}) port(n, u(maxWrites == 10 ? 4 : 5), Direction::In);
   for (auto n : {"completedReadValid", "completedReadReady", "completedReadID", "completedReadLen",
                  "completedWriteValid", "completedWriteReady", "completedWriteID"}) copy(backend, n);
@@ -45,11 +47,11 @@ LogicalResult goldengate::materializeFASEDFRFCFSController(
     port(std::string(stem)+"AddrMask", u(StringRef(stem)=="bank" ? 3 : StringRef(stem)=="rank" ? 2 : 26), Direction::In);
   }
   port("targetCycle", u(64), Direction::Out);
-  for (unsigned i = 13; i < scheduler.getNumPorts(); ++i) ports.push_back(scheduler.getPorts()[i]);
+  for (unsigned i = 13; i < schedulerPorts.size(); ++i) ports.push_back(schedulerPorts[i]);
   for (auto n : {"readCount", "writeCount"}) copy(backend, n);
   for (auto n : {"backendReadReady", "backendWriteReady"}) port(n, u(1), Direction::Out);
-  for (unsigned i = 19; i < frontend.getNumPorts(); ++i) ports.push_back(frontend.getPorts()[i]);
-  port("decoded", scheduler.getPorts()[5].type, Direction::Out);
+  for (unsigned i = 19; i < frontendPorts.size(); ++i) ports.push_back(frontendPorts[i]);
+  port("decoded", scheduler.getPortType(5), Direction::Out);
   port("ranksInUse", u(4), Direction::Out);
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto module = b.create<FModuleOp>(loc, b.getStringAttr(name), ConventionAttr::get(ctx, Convention::Internal), ports);
@@ -77,7 +79,7 @@ LogicalResult goldengate::materializeFASEDFRFCFSController(
     con(fp(n), arg(n)); con(sp(n), arg(n)); con(dp(n), arg(n));
   }
   for (unsigned i=3;i<16;++i) {
-    auto p=frontend.getPorts()[i];
+    const auto &p=frontendPorts[i];
     if (p.direction==Direction::In) con(f.getResult(i), arg(p.getName()));
     else con(arg(p.getName()), f.getResult(i));
   }

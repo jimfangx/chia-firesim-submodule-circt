@@ -44,7 +44,7 @@ LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
   for (auto n : {"canCASW", "canCASR", "canPRE", "canACT", "canREF", "wantREF", "state"})
     statusFields.push_back({b.getStringAttr(n), false, bitType});
   statusFields.push_back({b.getStringAttr("banks"), false,
-                         cast<FIRRTLBaseType>(rank.getPorts()[17].type)});
+                         cast<FIRRTLBaseType>(rank.getPortType(17))});
   auto statusType = BundleType::get(ctx, statusFields);
   SmallVector<PortInfo> ports;
   auto port = [&](StringRef n, Type t, Direction d) { ports.push_back({b.getStringAttr(n), t, d}); };
@@ -55,7 +55,7 @@ LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
   port("nextBits", metadataType, Direction::In);                          // 5
   for (auto n : {"backendReadReady", "backendWriteReady"})
     port(n, bitType, Direction::In);                                      // 6-7
-  port("timings", rank.getPorts()[8].type, Direction::In);                // 8
+  port("timings", rank.getPortType(8), Direction::In);                // 8
   port("schedulerWindowSize", u(3), Direction::In);                       // 9
   port("openPagePolicy", bitType, Direction::In);                         // 10
   port("ranksInUse", u(4), Direction::In);                                // 11
@@ -73,7 +73,7 @@ LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
   port("cmdBank", u(3), Direction::Out);                                  // 23
   port("cmdRow", u(26), Direction::Out);                                  // 24
   port("autoPRE", bitType, Direction::Out);                               // 25
-  port("entries", buffer.getPorts()[6].type, Direction::Out);             // 26
+  port("entries", buffer.getPortType(6), Direction::Out);             // 26
   port("rankStati", FVectorType::get(statusType, 4), Direction::Out);      // 27
   port("bankHasReadyEntries", u(32), Direction::Out);                      // 28
   b.setInsertionPointToEnd(circuit.getBodyBlock());

@@ -78,7 +78,7 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
     {"ctrl_error_ar_bits_id",12,Direction::In}};
   for(auto r:required) {
     auto it=old.find(r.name);
-    if(it==old.end()||inner.getPorts()[it->second].type!=uint(r.width)||inner.getPorts()[it->second].direction!=r.dir)
+    if(it==old.end()||inner.getPortType(it->second)!=uint(r.width)||inner.getPortDirection(it->second)!=r.dir)
       return reject("control read dispatch requires catalog-sized decoder/error boundaries");
   }
   for(auto a:bindings) {
@@ -89,7 +89,7 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
       return reject("control read dispatch has invalid or duplicate widget bindings");
     auto it=old.find(port.getValue().str());
     if(regionNames[slave.getInt()]!=name||it==old.end()||
-       inner.getPorts()[it->second].type!=controlType||inner.getPorts()[it->second].direction!=Direction::In)
+       inner.getPortType(it->second)!=controlType||inner.getPortDirection(it->second)!=Direction::In)
       return reject("control read dispatch widget catalog or control bundle differs");
     widgets[port.getValue().str()]=slave.getInt();
   }
@@ -144,7 +144,7 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
   for(auto [n,i]:copied) {
     Value a=sim.getResult(old.at(n)),z=topArg(i);
     if(widgets.count(n))for(auto ch:{"b","r"})b.create<ConnectOp>(loc,field(z,ch),field(a,ch));
-    else {auto d=inner.getPorts()[old.at(n)].direction;b.create<ConnectOp>(loc,d==Direction::In?a:z,d==Direction::In?z:a);}
+    else {auto d=inner.getPortDirection(old.at(n));b.create<ConnectOp>(loc,d==Direction::In?a:z,d==Direction::In?z:a);}
   }
   connect(dispatch.getResult(hi.at("route")),sim.getResult(old.at("ctrl_decode_ar_route")));
   connect(dispatch.getResult(hi.at("target")),sim.getResult(old.at("ctrl_decode_ar_target")));

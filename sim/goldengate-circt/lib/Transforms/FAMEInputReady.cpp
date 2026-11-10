@@ -38,7 +38,7 @@ LogicalResult goldengate::rewriteFAMEInputReadies(
   if (failed(firedRegisters.collect(module, error)))
     return failure();
   std::map<std::string, unsigned> ports;
-  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
+  for (unsigned i = 0, n = module.getNumPorts(); i < n; ++i)
     ports.emplace(module.getPortName(i).str(), i);
 
   std::set<std::string> seenInputs;

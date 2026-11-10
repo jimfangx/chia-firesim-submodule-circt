@@ -466,7 +466,7 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     error = "ReadyValidChannel needs the pipe wrapper and its target instance"; return failure();
   }
   std::optional<unsigned> clock, reset;
-  for (unsigned i = 0; i < wrapper.getPorts().size(); ++i) {
+  for (unsigned i = 0; i < wrapper.getNumPorts(); ++i) {
     if (wrapper.getPortName(i) == "hostClock") clock = i;
     if (wrapper.getPortName(i) == "hostReset") reset = i;
   }

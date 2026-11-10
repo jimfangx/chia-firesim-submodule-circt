@@ -151,8 +151,8 @@ LogicalResult goldengate::addFASEDWriteEgress(CircuitOp circuit, std::string &er
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim=b.create<InstanceOp>(loc,inner,"sim"),egress=b.create<InstanceOp>(loc,helper,"writeEgress");
   for(auto [j,i]:llvm::enumerate(copied)) {
-    auto p=inner.getPorts()[i];Value v=wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc,p.direction==Direction::In?sim.getResult(i):v,p.direction==Direction::In?v:sim.getResult(i));
+    auto p = inner.getPortDirection(i);Value v=wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc,p==Direction::In?sim.getResult(i):v,p==Direction::In?v:sim.getResult(i));
   }
   auto extra=[&](unsigned i){return wrapper.getBodyBlock()->getArgument(added+i);};
   connect(egress.getResult(0),wrapper.getBodyBlock()->getArgument(llvm::find(copied,indices[0])-copied.begin()));

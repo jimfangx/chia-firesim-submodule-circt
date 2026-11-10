@@ -27,7 +27,7 @@ LogicalResult goldengate::rewriteFAMEOutputValids(
     FModuleOp module, llvm::ArrayRef<LocalChannelDependency> dependencies,
     std::string &error) {
   std::map<std::string, unsigned> ports;
-  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
+  for (unsigned i = 0, n = module.getNumPorts(); i < n; ++i)
     ports.emplace(module.getPortName(i).str(), i);
 
   auto lookupPort = [&](const std::string &name, Direction direction) -> Value {

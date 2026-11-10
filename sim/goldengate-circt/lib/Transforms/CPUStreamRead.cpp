@@ -913,9 +913,9 @@ LogicalResult goldengate::addCPUStreamRead(
     return wrapper.getBodyBlock()->getArgument(llvm::find(copied, innerIndex) - copied.begin());
   };
   for (auto [i, old] : llvm::enumerate(copied)) {
-    auto p = inner.getPorts()[old]; Value external = wrapper.getBodyBlock()->getArgument(i);
-    b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(old) : external,
-        p.direction == Direction::In ? external : sim.getResult(old));
+    auto p = inner.getPortDirection(old); Value external = wrapper.getBodyBlock()->getArgument(i);
+    b.create<ConnectOp>(loc, p == Direction::In ? sim.getResult(old) : external,
+        p == Direction::In ? external : sim.getResult(old));
   }
   connect(transport.getResult(0), externalFor(*clock)); connect(transport.getResult(1), externalFor(*reset));
   for (auto [i, innerPort] : llvm::enumerate(streamPorts))

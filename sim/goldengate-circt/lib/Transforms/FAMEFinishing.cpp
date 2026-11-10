@@ -76,7 +76,7 @@ LogicalResult goldengate::rewriteFAMEFinishing(
   }
 
   std::map<std::string, unsigned> ports;
-  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i)
+  for (unsigned i = 0, n = module.getNumPorts(); i < n; ++i)
     ports.emplace(module.getPortName(i).str(), i);
   auto lookupPort = [&](const std::string &name, Direction direction) -> Value {
     auto found = ports.find(name);
@@ -145,7 +145,7 @@ LogicalResult goldengate::rewriteFAMEFinishing(
     coveredPorts.insert(channel.port);
   for (const auto &channel : outputs)
     coveredPorts.insert(channel.port);
-  for (unsigned i = 0, n = module.getPorts().size(); i < n; ++i) {
+  for (unsigned i = 0, n = module.getNumPorts(); i < n; ++i) {
     Value port = module.getBodyBlock()->getArgument(i);
     if (!hasDecoupledFields(port) || coveredPorts.count(port))
       continue;

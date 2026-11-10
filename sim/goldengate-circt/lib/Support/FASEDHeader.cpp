@@ -132,7 +132,7 @@ LogicalResult goldengate::prepareFASEDHeader(CircuitOp circuit,
     return reject(
         "invalid FASEDMemoryTimingModel widget identity or MMIO region");
   auto address = decoder.getNumPorts()
-                     ? dyn_cast<UIntType>(decoder.getPorts()[0].type)
+                     ? dyn_cast<UIntType>(decoder.getPortType(0))
                      : UIntType();
   if (!address || !address.getWidth() || *address.getWidth() < 1 ||
       *address.getWidth() > 63 ||

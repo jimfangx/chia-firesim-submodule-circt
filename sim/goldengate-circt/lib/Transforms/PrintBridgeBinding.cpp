@@ -76,8 +76,9 @@ LogicalResult goldengate::bindPrintBridgeHosts(CircuitOp circuit,
         return reject("PrintBridge binding requires the 6144x512 CPU queue RAM");
     }
     if (memories != 1) return reject("PrintBridge binding requires one outgoing queue RAM");
+    const auto hostPorts = host.getPorts();
     for (unsigned i = 0; i < 13; ++i) {
-      auto p = host.getPorts()[i];
+      const auto &p = hostPorts[i];
       Type expected = i == 0 ? Type(clock) : i == 6 ? Type(UIntType::get(ctx, 64)) :
           i == 10 ? Type(UIntType::get(ctx, 512)) : i == 12 ? Type(count) : Type(bit);
       auto direction = i < 4 || i == 8 || i == 11 ? Direction::In : Direction::Out;

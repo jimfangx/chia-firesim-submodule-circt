@@ -54,14 +54,14 @@ goldengate::analyzeFAMEHubClockDomains(
         !modelPorts.insert(modelPort).second ||
         !llvm::is_contained(binding.instancePorts, modelPort) ||
         model.getPortDirection(modelPort) != Direction::In ||
-        !mlir::isa<ClockType>(model.getPorts()[modelPort].type))
+        !mlir::isa<ClockType>(model.getPortType(modelPort)))
       return reject("model clock port is repeated, unbound or not an input Clock");
     if (sink.module != top || !sink.port ||
         *sink.port >= top.getNumPorts() ||
         (sink.fieldID && *sink.fieldID != 0) ||
         !topPorts.insert(*sink.port).second ||
         top.getPortDirection(*sink.port) != Direction::In ||
-        !mlir::isa<ClockType>(top.getPorts()[*sink.port].type))
+        !mlir::isa<ClockType>(top.getPortType(*sink.port)))
       return reject("clock sink is repeated or not a top input Clock");
     unsigned matches = 0;
     for (const auto &connection : hierarchy.connections) {
@@ -118,7 +118,7 @@ channelPortType(const goldengate::GGChannelConnection &channel,
   if (endpoints.size() == 1) {
     auto module = endpoints.front().module;
     payload = mlir::dyn_cast<FIRRTLBaseType>(
-        module.getPorts()[*endpoints.front().port].type);
+        module.getPortType(*endpoints.front().port));
     if (!payload) {
       error = "channel endpoint has no FIRRTL hardware type: " + channel.name;
       return std::nullopt;
@@ -140,7 +140,7 @@ channelPortType(const goldengate::GGChannelConnection &channel,
         return std::nullopt;
       }
       auto fieldType = mlir::dyn_cast<FIRRTLBaseType>(
-          module.getPorts()[*endpoint.port].type);
+          module.getPortType(*endpoint.port));
       if (!fieldType) {
         error = "channel endpoint has no FIRRTL hardware type: " + channel.name;
         return std::nullopt;
@@ -170,12 +170,12 @@ goldengate::analyzeFAMEPorts(
   std::set<unsigned> stale;
   bool hasHostClock = false;
   auto top = hierarchy.top;
-  for (unsigned i = 0, n = top.getPorts().size(); i != n; ++i) {
+  for (unsigned i = 0, n = top.getNumPorts(); i != n; ++i) {
     if (top.getPortName(i) == "hostClock") {
       hasHostClock = true;
       continue;
     }
-    if (mlir::isa<ClockType>(top.getPorts()[i].type))
+    if (mlir::isa<ClockType>(top.getPortType(i)))
       stale.insert(i);
   }
   if (!hasHostClock) {

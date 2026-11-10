@@ -111,9 +111,9 @@ LogicalResult goldengate::addLoadMemWriteData(CircuitOp circuit, std::string &er
   b.setInsertionPointToStart(wrapper.getBodyBlock());
   auto sim=b.create<InstanceOp>(loc,inner,"sim"), data=b.create<InstanceOp>(loc,fifo,"writeData");
   for (auto [j,i] : llvm::enumerate(copied)) {
-    auto p=inner.getPorts()[i]; auto external=wrapper.getBodyBlock()->getArgument(j);
-    b.create<ConnectOp>(loc,p.direction==Direction::In ? sim.getResult(i) : external,
-        p.direction==Direction::In ? external : sim.getResult(i));
+    auto p = inner.getPortDirection(i); auto external=wrapper.getBodyBlock()->getArgument(j);
+    b.create<ConnectOp>(loc,p==Direction::In ? sim.getResult(i) : external,
+        p==Direction::In ? external : sim.getResult(i));
     if (i == indices[0] || i == indices[1]) connect(data.getResult(i == indices[0] ? 0 : 1),external);
   }
   connect(data.getResult(5),sim.getResult(indices[2]));

@@ -139,8 +139,9 @@ LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
     error = "promoted model port name collides: " + promotedName;
     return failure();
   }
-  for (unsigned i = 0; i < child.getNumPorts(); ++i) {
-    PortInfo childPort = child.getPorts()[i];
+  const auto childPorts = child.getPorts();
+  for (unsigned i = 0; i < childPorts.size(); ++i) {
+    const PortInfo &childPort = childPorts[i];
     auto baseType = dyn_cast<FIRRTLBaseType>(childPort.type);
     if (!baseType || baseType.containsAnalog()) {
       error = "model promotion requires non-analog FIRRTL ports";

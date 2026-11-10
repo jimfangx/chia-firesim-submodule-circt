@@ -106,7 +106,7 @@ LogicalResult goldengate::addControlWriteDispatch(CircuitOp circuit, std::string
   auto topArg=[&](unsigned i){return wrapper.getBodyBlock()->getArgument(i);};
   for(auto [n,index]:copied) {
     Value v=sim.getResult(old.at(n)),outside=topArg(index);
-    if(inner.getPorts()[old.at(n)].direction==Direction::In)b.create<ConnectOp>(loc,v,outside);
+    if(inner.getPortDirection(old.at(n))==Direction::In)b.create<ConnectOp>(loc,v,outside);
     else b.create<ConnectOp>(loc,outside,v);
   }
   const std::pair<const char*,const char*> live[]{
