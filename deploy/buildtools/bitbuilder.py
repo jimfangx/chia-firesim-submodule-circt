@@ -78,7 +78,7 @@ class BitBuilder(metaclass=abc.ABCMeta):
         deploy_dir = get_deploy_dir()
         with InfoStreamLogger("stdout"), prefix(f"cd {deploy_dir}/../"), prefix(
             create_export_string({"RISCV", "PATH", "LD_LIBRARY_PATH"})
-        ), prefix("source sourceme-manager.sh --skip-ssh-setup"), InfoStreamLogger(
+        ), prefix("set -- && source sourceme-manager.sh"), InfoStreamLogger(
             "stdout"
         ), prefix(
             "cd sim/"
@@ -94,7 +94,7 @@ class BitBuilder(metaclass=abc.ABCMeta):
         deploy_dir = get_deploy_dir()
         with InfoStreamLogger("stdout"), prefix(f"cd {deploy_dir}/../"), prefix(
             create_export_string({"RISCV", "PATH", "LD_LIBRARY_PATH"})
-        ), prefix("source sourceme-manager.sh --skip-ssh-setup"), prefix("cd sim/"):
+        ), prefix("set -- && source sourceme-manager.sh"), prefix("cd sim/"):
             run(self.build_config.make_recipe("driver", deploy_dir))
 
     @abc.abstractmethod

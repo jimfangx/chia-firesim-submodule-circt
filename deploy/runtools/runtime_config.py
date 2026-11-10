@@ -702,8 +702,8 @@ class RuntimeHWConfig:
         deploy_dir = get_deploy_dir()
         with InfoStreamLogger("stdout"), prefix(f"cd {deploy_dir}/../"), prefix(
             create_export_string({"RISCV", "PATH", "LD_LIBRARY_PATH"})
-        ), prefix("source sourceme-manager.sh --skip-ssh-setup"), prefix("cd sim/"):
-            driverbuildcommand = f"make PLATFORM={self.get_platform()} TARGET_PROJECT={target_project} {extra_target_project_make_args(target_project, target_project_makefrag, deploy_dir)} DESIGN={design} TARGET_CONFIG={target_config} PLATFORM_CONFIG={platform_config} {self.get_driver_build_target()}"
+        ), prefix("set -- && source sourceme-manager.sh"), prefix("cd sim/"):
+            driverbuildcommand = f"make GOLDENGATE_COMPILER=circt PLATFORM={self.get_platform()} TARGET_PROJECT={target_project} {extra_target_project_make_args(target_project, target_project_makefrag, deploy_dir)} DESIGN={design} TARGET_CONFIG={target_config} PLATFORM_CONFIG={platform_config} {self.get_driver_build_target()}"
             buildresult = run(driverbuildcommand)
             self.handle_failure(
                 buildresult, "driver build", "firesim/sim", driverbuildcommand

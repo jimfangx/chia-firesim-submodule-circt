@@ -25,6 +25,22 @@ locally and are excluded from this source snapshot.
 
 ## Using FireSim
 
+This checkout uses the native CIRCT Golden Gate compiler for `firesim buildbitstream`,
+driver builds, and direct `make compile` / `make replace-rtl` invocations. SFC
+selection is disabled in these build paths; CIRCT failures stop the build. The
+separate golden-reference tools can still invoke SFC for comparison.
+
+On F2, initialize the complete manager environment before using the manager:
+
+```bash
+source ./sourceme-manager.sh
+cd deploy
+firesim buildbitstream
+```
+
+Use the full `sourceme-manager.sh` setup on F2, including SSH setup. The native
+compiler is built automatically with CMake/Ninja using the active CIRCT toolchain.
+
 To get started with FireSim, you can find our extensive documentation and getting-started guide at
 [docs.fires.im](https://docs.fires.im). The FireSim codebase is open-source at
 [github.com/firesim/firesim](https://github.com/firesim/firesim) and we welcome pull requests and issues.

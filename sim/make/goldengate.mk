@@ -18,9 +18,12 @@ simulator_xdc := $(GENERATED_DIR)/$(BASE_FILE_NAME).synthesis.xdc
 # extracted used to generate new runtime configurations.
 fame_annos := $(GENERATED_DIR)/post-bridge-extraction.json
 
-# Keep the Scala implementation available as the reference while the CIRCT
-# compiler is brought up. The normal compiler selection is CIRCT.
+# FireSim production builds use the native CIRCT compiler exclusively. The
+# separate golden-reference tools invoke SFC directly for comparisons.
 GOLDENGATE_COMPILER ?= circt
+ifneq ($(GOLDENGATE_COMPILER),circt)
+$(error FireSim builds require GOLDENGATE_COMPILER=circt; SFC is disabled in the normal build flow)
+endif
 GOLDENGATE_CIRCT_BUILD_TYPE ?= Release
 GOLDENGATE_CIRCT_PREFIX ?= $(abspath $(dir $(shell which firtool))/..)
 goldengate_circt_build := $(GENERATED_DIR)/goldengate-circt-build
@@ -40,10 +43,6 @@ GOLDENGATE_CIRCT_ILA_PROBE_TRIGGERS ?= 2
 verilog: $(simulator_verilog)
 compile: $(simulator_verilog)
 
-# Disable FIRRTL 1.4 deduplication because it creates multiple failures
-# Run the 1.3 version instead (checked-in). If dedup must be completely disabled,
-# pass --no-legacy-dedup as well
-ifeq ($(GOLDENGATE_COMPILER),circt)
 ifeq ($(GOLDENGATE_CIRCT_AUTOILA),enabled)
 goldengate_circt_ila_flags := --enable-autoila --ila-depth $(GOLDENGATE_CIRCT_ILA_DEPTH) --ila-probe-triggers $(GOLDENGATE_CIRCT_ILA_PROBE_TRIGGERS)
 else ifneq ($(GOLDENGATE_CIRCT_AUTOILA),disabled)
@@ -106,22 +105,6 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(partition_he
 		if test -f "$$collateral"; then cp "$$collateral" $(GENERATED_DIR)/; fi; \
 	done
 	cp $(GENERATED_DIR)/circt-ingestion/post-bridge-extraction-all.json $(fame_annos)
-else ifeq ($(GOLDENGATE_COMPILER),sfc)
-$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(partition_header) $(peer2peer_map) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
-	$(call run_jar_scala_main,$(firesim_base_dir),$(FIRESIM_MAIN_CP),midas.stage.GoldenGateMain,\
-		-i $(FIRRTL_FILE) \
-		-td $(GENERATED_DIR) \
-		-faf $(ANNO_FILE) \
-		-ggcp $(PLATFORM_CONFIG_PACKAGE) \
-		-ggcs $(PLATFORM_CONFIG) \
-		--output-filename-base $(BASE_FILE_NAME) \
-		--allow-unrecognized-annotations \
-		--no-dedup)
-	grep -sh ^ $(GENERATED_DIR)/firrtl_black_box_resource_files.f | \
-		xargs cat >> $(simulator_verilog) # Append blackboxes to FPGA wrapper, if any
-else
-$(error Unknown GOLDENGATE_COMPILER '$(GOLDENGATE_COMPILER)'; use circt or sfc)
-endif
 
 ####################################
 # Runtime-Configuration Generation #
