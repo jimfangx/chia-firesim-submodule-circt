@@ -11,12 +11,495 @@
 #include "goldengate/TracerVTokenEngine.h"
 #include "goldengate/CPUStreamRead.h"
 #include "llvm/ADT/StringSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/APSInt.h"
 #include "llvm/Support/MathExtras.h"
 #include <limits>
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
+
+LogicalResult goldengate::validateF2CPUStreamAckRoute(CircuitOp circuit,
+                                                     std::string &error) {
+  auto reject=[&](StringRef why){error="F2 explicit source ACK route differs: "+why.str();return failure();};
+  FModuleOp read,bank,rw,cw;
+  for(auto m:circuit.getOps<FModuleOp>()) {
+    if(m.getName()=="GGCPUStreamRead")read=m;
+    if(m.getName()=="GGCPUStreamCountBank")bank=m;
+    if(m.getName()=="GGCPUStreamReadWrapper")rw=m;
+    if(m.getName()=="GGCPUStreamCountWrapper")cw=m;
+  }
+  auto sources=read?read->getAttrOfType<ArrayAttr>("goldengate.sourceStreams"):ArrayAttr{};
+  if(!read||!bank||!rw||!cw||!sources||sources.empty())return reject("module inventory");
+  if(bank.getNumPorts()<4)return reject("count port inventory");
+  unsigned n=sources.size(),total=bank.getNumPorts()-4;
+  auto type=FVectorType::get(UIntType::get(circuit.getContext(),1),n);
+  for(auto m:{read,bank,rw})
+    if(m.getPorts().back().name!="sdkReadAck"||m.getPorts().back().type!=type||
+       m.getPorts().back().direction!=(m==bank?Direction::Out:Direction::In))return reject("port inventory");
+  SmallVector<InstanceOp> ri,bi,wi;
+  circuit.walk([&](InstanceOp i){
+    if(i.getModuleName()==read.getName())ri.push_back(i);
+    if(i.getModuleName()==bank.getName())bi.push_back(i);
+    if(i.getModuleName()==rw.getName())wi.push_back(i);
+  });
+  if(ri.size()!=1||bi.size()!=1||wi.size()!=1||ri[0]->getParentOfType<FModuleOp>()!=rw||
+     bi[0]->getParentOfType<FModuleOp>()!=cw||wi[0]->getParentOfType<FModuleOp>()!=cw)
+    return reject("instance inventory");
+  auto driver=[&](FModuleOp m,Value dest)->Value{
+    Value value;unsigned count=0;
+    for(auto c:m.getOps<StrictConnectOp>())if(c.getDest()==dest){value=c.getSrc();++count;}
+    for(auto c:m.getOps<ConnectOp>())if(c.getDest()==dest){value=c.getSrc();++count;}
+    return count==1?value:Value{};
+  };
+  if(driver(rw,ri[0].getResults().back())!=rw.getBodyBlock()->getArguments().back()||
+     driver(cw,wi[0].getResults().back())!=bi[0].getResults().back())return reject("live hierarchy wiring");
+  auto operand=[](Value v,StringRef name,unsigned i)->Value{
+    auto *op=v?v.getDefiningOp():nullptr;
+    return op&&op->getName().getStringRef()==name&&i<op->getNumOperands()?op->getOperand(i):Value{};
+  };
+  auto eq=[](Value v,Value lhs,uint64_t rhs){
+    auto e=v?v.getDefiningOp<EQPrimOp>():EQPrimOp{};
+    auto k=e?e.getRhs().getDefiningOp<ConstantOp>():ConstantOp{};
+    return e&&e.getLhs()==lhs&&k&&k.getValue()==rhs;
+  };
+  Value mcr=bank.getArgument(total+2),reset=bank.getArgument(1);
+  auto field=[](Value v,StringRef name,Value input){auto f=v?v.getDefiningOp<SubfieldOp>():SubfieldOp{};return f&&f.getInput()==input&&f.getFieldName()==name;};
+  auto slot=[&](Value v,StringRef name,unsigned i){
+    auto f=v?v.getDefiningOp<SubfieldOp>():SubfieldOp{};
+    auto ix=f?f.getInput().getDefiningOp<SubindexOp>():SubindexOp{};
+    return f&&f.getFieldName()==name&&ix&&ix.getIndex()==i&&field(ix.getInput(),"write",mcr);
+  };
+  auto registers=bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  if(!registers||registers.size()!=total||total<n)return reject("count registry");
+  unsigned ackDrivers=0; SmallVector<bool> ackSeen(n,false);
+  for(auto c:bank.getOps<StrictConnectOp>()) {
+    auto ix=c.getDest().getDefiningOp<SubindexOp>();
+    if(!ix||ix.getInput()!=bank.getBodyBlock()->getArguments().back())continue;
+    ++ackDrivers;unsigned i=ix.getIndex();if(i>=n||ackSeen[i])return reject("ACK index");ackSeen[i]=true;
+    Value outer=c.getSrc(),inner=operand(outer,"firrtl.and",0),notReset=operand(outer,"firrtl.and",1);
+    Value valid=operand(inner,"firrtl.and",0),accepted=operand(inner,"firrtl.and",1);
+    Value checks=operand(accepted,"firrtl.and",0),nonempty=operand(accepted,"firrtl.and",1);
+    Value dataEQ=operand(checks,"firrtl.and",0),strobeEQ=operand(checks,"firrtl.and",1);
+    auto de=dataEQ?dataEQ.getDefiningOp<EQPrimOp>():EQPrimOp{};
+    auto se=strobeEQ?strobeEQ.getDefiningOp<EQPrimOp>():EQPrimOp{};
+    if(!slot(valid,"valid",i)||!de||!slot(de.getLhs(),"bits",i)||!eq(dataEQ,de.getLhs(),1)||
+       !se||!field(se.getLhs(),"wstrb",mcr)||!eq(strobeEQ,se.getLhs(),15)||
+       !eq(operand(nonempty,"firrtl.not",0),bank.getArgument(i+2),0)||
+       operand(notReset,"firrtl.not",0)!=reset)return reject("ACK write predicate");
+    unsigned assertions=0;
+    for(auto a:bank.getOps<AssertOp>()) {
+      Value pred=a.getPredicate();
+      if(operand(operand(pred,"firrtl.or",0),"firrtl.not",0)!=valid)continue;
+      if(operand(pred,"firrtl.or",1)!=accepted||a.getClock()!=bank.getArgument(0)||
+         operand(a.getEnable(),"firrtl.not",0)!=reset||
+         a.getMessage()!="F2 CPU stream ACK requires data1, full strobes, and a nonempty source")return reject("ACK assertion");
+      ++assertions;
+    }
+    if(assertions!=1)return reject("ACK assertion inventory");
+  }
+  if(ackDrivers!=n)return reject("ACK driver inventory");
+  for(unsigned i=0;i<total;++i){
+    auto d=dyn_cast<DictionaryAttr>(registers[i]);auto wr=d?d.getAs<BoolAttr>("writeable"):BoolAttr{};
+    if(!wr||wr.getValue()!=(i<n))return reject("source-only ACK write permissions");
+  }
+  // Check the actual AXI register file and every aggregate connection to the
+  // count bank. A valid bank-local predicate cannot authorize a tied-off bus.
+  FModuleOp file; SmallVector<InstanceOp> fi,ci;
+  for(auto m:circuit.getOps<FModuleOp>())if(m.getName()=="GGCPUStreamMCRFile")file=m;
+  if(!file||file.getNumPorts()!=4)return reject("control register file");
+  circuit.walk([&](InstanceOp i){if(i.getModuleName()==file.getName())fi.push_back(i);if(i.getModuleName()==cw.getName())ci.push_back(i);});
+  if(fi.size()!=1||ci.size()!=1)return reject("control/count instance inventory");
+  auto root=[](Value v) {
+    while (true) {
+      if(auto f=v.getDefiningOp<SubfieldOp>()){v=f.getInput();continue;}
+      if(auto i=v.getDefiningOp<SubindexOp>()){v=i.getInput();continue;}
+      if(auto i=v.getDefiningOp<SubaccessOp>()){v=i.getInput();continue;}
+      return v;
+    }
+  };
+  // NIC read/write/MMIO wrappers may separate the MCRFile from CountWrapper.
+  // Follow the actual aggregate connection at each boundary, checking both
+  // ends: flipped write fields can be overridden at the source end as well.
+  auto mcrType=bank.getPortType(total+2);
+  auto owner=fi[0]->getParentOfType<FModuleOp>();
+  Value dest=fi[0].getResult(3);
+  llvm::SmallPtrSet<Operation *,8> visited;
+  bool sawCount=false;
+  while(true) {
+    if(!visited.insert(owner.getOperation()).second || dest.getType()!=mcrType)
+      return reject("cyclic or mistyped MCR aggregate route");
+    Value source=driver(owner,dest);
+    if(!source||source.getType()!=mcrType||root(source)!=source)
+      return reject("missing or mistyped MCR aggregate driver");
+    bool override=false;
+    unsigned drivers=0;
+    owner.walk([&](Operation *op) {
+      Value target;
+      if(auto c=dyn_cast<StrictConnectOp>(op))target=c.getDest();
+      if(auto c=dyn_cast<ConnectOp>(op))target=c.getDest();
+      if(!target)return;
+      Value base=root(target);
+      if(base!=dest&&base!=source)return;
+      if(target!=base || target==source || op->getBlock()!=owner.getBodyBlock())override=true;
+      if(target==dest)++drivers;
+    });
+    if(override||drivers!=1)return reject("partial or ambiguous MCR aggregate route");
+    if(owner==cw)sawCount=true;
+    if(source==bi[0].getResult(total+2)) {
+      if(!sawCount||owner!=cw)return reject("MCR aggregate bypassed count wrapper");
+      break;
+    }
+    auto result=dyn_cast<OpResult>(source);
+    auto child=result?dyn_cast<InstanceOp>(result.getOwner()):InstanceOp{};
+    FModuleOp childModule;
+    if(child)for(auto m:circuit.getOps<FModuleOp>())
+      if(m.getName()==child.getModuleName())childModule=m;
+    if(!childModule||result.getResultNumber()>=childModule.getNumPorts())
+      return reject("MCR aggregate is not a module output");
+    unsigned port=result.getResultNumber();
+    auto info=childModule.getPorts()[port];
+    if(info.name!="cpuStream_mcr"||info.direction!=Direction::Out||info.type!=mcrType)
+      return reject("MCR wrapper port inventory");
+    unsigned instances=0;
+    circuit.walk([&](InstanceOp i){if(i.getModuleName()==childModule.getName())++instances;});
+    if(instances!=1)return reject("ambiguous MCR wrapper instance");
+    owner=childModule;
+    dest=owner.getArgument(port);
+  }
+  Value held,data; StrictConnectOp dataDriver;
+  for(auto c:file.getOps<StrictConnectOp>()) {
+    if(field(c.getDest(),"wstrb",file.getArgument(3))) {if(held)return reject("multiple strobe drivers");held=c.getSrc();}
+    auto r=c.getDest().getDefiningOp<RegOp>();
+    if(r&&r->getAttrOfType<StringAttr>("name")=="wData"){if(dataDriver)return reject("multiple W-data drivers");data=c.getDest();dataDriver=c;}
+  }
+  auto reg=held?held.getDefiningOp<RegOp>():RegOp{};
+  Value heldNext=held?driver(file,held):Value{};
+  auto heldMux=heldNext?heldNext.getDefiningOp<MuxPrimOp>():MuxPrimOp{};
+  auto dataMux=dataDriver?dataDriver.getSrc().getDefiningOp<MuxPrimOp>():MuxPrimOp{};
+  if(!reg||reg.getClockVal()!=file.getArgument(0)||reg.getResult().getType()!=UIntType::get(circuit.getContext(),4)||
+     !heldMux||!dataMux||heldMux.getSel()!=dataMux.getSel()||heldMux.getLow()!=held||dataMux.getLow()!=data)
+    return reject("held W-strobe/data capture");
+  auto strb=heldMux.getHigh().getDefiningOp<SubfieldOp>();
+  auto bitsField=strb?strb.getInput().getDefiningOp<SubfieldOp>():SubfieldOp{};
+  auto w=bitsField?bitsField.getInput().getDefiningOp<SubfieldOp>():SubfieldOp{};
+  Value gate=heldMux.getSel();
+  auto ready=operand(gate,"firrtl.and",0).getDefiningOp<SubfieldOp>();
+  auto valid=operand(gate,"firrtl.and",1).getDefiningOp<SubfieldOp>();
+  auto dataField=dataMux.getHigh().getDefiningOp<SubfieldOp>();
+  auto dataBits=dataField?dataField.getInput().getDefiningOp<SubfieldOp>():SubfieldOp{};
+  auto dataW=dataBits?dataBits.getInput().getDefiningOp<SubfieldOp>():SubfieldOp{};
+  if(!strb||strb.getFieldName()!="strb"||!bitsField||bitsField.getFieldName()!="bits"||
+     !w||w.getFieldName()!="w"||w.getInput()!=file.getArgument(2)||
+     !ready||ready.getFieldName()!="ready"||!field(ready.getInput(),"w",file.getArgument(2))||
+     !valid||valid.getFieldName()!="valid"||!field(valid.getInput(),"w",file.getArgument(2))||
+     !dataField||dataField.getFieldName()!="data"||!dataBits||dataBits.getFieldName()!="bits"||
+     !dataW||dataW.getFieldName()!="w"||dataW.getInput()!=file.getArgument(2))
+    return reject("AXI W handshake strobe origin");
+  return success();
+}
+
+LogicalResult goldengate::validateF2CPUStreamWordReads(FModuleOp read,
+                                                      std::string &error) {
+  auto reject = [&](StringRef why = "metadata") {
+    error = "F2 CPU DWORD profile differs: " + why.str(); return failure();
+  };
+  auto profile = read->getAttrOfType<DictionaryAttr>("goldengate.f2CPUWordReads");
+  auto sources = read->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+  auto space = read->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits");
+  if (!profile || profile.size() != 9 || !sources || sources.empty() || !space) return reject();
+  for (auto field : {std::pair<StringRef, int64_t>{"wordBytes", 4}, {"streamBeatBytes", 64},
+                     {"ackWriteValue", 1}, {"pciRequestID", 0x20}, {"maxNativeNarrowReadBytes", 32}}) {
+    auto value = profile.getAs<IntegerAttr>(field.first);
+    if (!value || value.getInt() != field.second) return reject();
+  }
+  for (StringRef field : {"shellNormalizedSize6", "pciReadsNonDestructive", "fullWidthDMABurstsUnchanged", "explicitCountWriteAck"}) {
+    auto value = profile.getAs<BoolAttr>(field);
+    if (!value || !value.getValue()) return reject();
+  }
+  auto port = [&](StringRef name, unsigned width) -> Value {
+    for (auto [i, info] : llvm::enumerate(read.getPorts()))
+      if (info.name == name && info.direction == Direction::In &&
+          info.type == UIntType::get(read.getContext(), width)) return read.getArgument(i);
+    return {};
+  };
+  Value address = port("ar_bits_addr", 64), size = port("ar_bits_size", 3), length = port("ar_bits_len", 8);
+  Value id = port("ar_bits_id", 16), valid = port("ar_valid", 1), rready = port("r_ready", 1), reset = port("reset", 1);
+  if (!address || !size || !length || !id || !valid || !rready || !reset ||
+      read.getPortName(0) != "clock" || read.getPortType(0) != ClockType::get(read.getContext())) return reject("port interface");
+  auto operand = [&](Value value, StringRef name, unsigned index) -> Value {
+    auto *op = value ? value.getDefiningOp() : nullptr;
+    return op && op->getName().getStringRef() == name && index < op->getNumOperands() ? op->getOperand(index) : Value{};
+  };
+  auto eq = [&](Value value, Value lhs, uint64_t rhs) {
+    auto operation = value ? value.getDefiningOp<EQPrimOp>() : EQPrimOp{};
+    auto constant = operation ? operation.getRhs().getDefiningOp<ConstantOp>() : ConstantOp{};
+    return operation && operation.getLhs() == lhs && constant && constant.getValue() == rhs;
+  };
+  auto bits = [&](Value value, unsigned hi, unsigned lo) {
+    auto operation = value ? value.getDefiningOp<BitsPrimOp>() : BitsPrimOp{};
+    return operation && operation.getInput() == address && operation.getHi() == hi && operation.getLo() == lo;
+  };
+  SmallVector<StrictConnectOp> ready(sources.size());
+  for (auto connect : read.getOps<StrictConnectOp>()) {
+    auto field = connect.getDest().getDefiningOp<SubfieldOp>();
+    auto argument = field ? dyn_cast<BlockArgument>(field.getInput()) : BlockArgument{};
+    if (!argument || field.getFieldName() != "ready") continue;
+    unsigned index = argument.getArgNumber();
+    if (index < 2 || index >= 2 + sources.size() || ready[index - 2]) return reject();
+    ready[index - 2] = connect;
+  }
+  if (llvm::any_of(ready, [](auto connect) { return !connect; })) return reject("missing source handshake");
+  Value firstDMA = operand(ready.front().getSrc(), "firrtl.or", 0);
+  Value full = operand(firstDMA, "firrtl.and", 1);
+  Value fullSize = operand(full, "firrtl.and", 0), notPeek = operand(full, "firrtl.and", 1);
+  Value pci = operand(notPeek, "firrtl.not", 0);
+  auto ackType = FVectorType::get(UIntType::get(read.getContext(), 1), sources.size());
+  if (read.getNumPorts() != sources.size() + 15 || read.getPorts().back().name != "sdkReadAck" ||
+      read.getPorts().back().direction != Direction::In || read.getPorts().back().type != ackType)
+    return reject("explicit ACK input");
+  Value ack = read.getBodyBlock()->getArguments().back();
+  if (!eq(fullSize, size, 6) || !eq(pci, id, 0x20)) return reject("SDK consume predicate");
+  for (auto [i, connect] : llvm::enumerate(ready)) {
+    Value dma = operand(connect.getSrc(), "firrtl.or", 0);
+    Value legacy = operand(dma, "firrtl.and", 0);
+    Value grant = operand(legacy, "firrtl.and", 0), handshake = operand(legacy, "firrtl.and", 1);
+    auto grantEQ = grant ? grant.getDefiningOp<EQPrimOp>() : EQPrimOp{};
+    auto ackSlot = operand(connect.getSrc(), "firrtl.or", 1).getDefiningOp<SubindexOp>();
+    if (operand(dma, "firrtl.and", 1) != full || !grantEQ ||
+        !bits(grantEQ.getLhs(), 63, space.getInt()) || !eq(grant, grantEQ.getLhs(), i) ||
+        operand(handshake, "firrtl.and", 0) != valid || operand(handshake, "firrtl.and", 1) != rready ||
+        !ackSlot || ackSlot.getInput() != ack || ackSlot.getIndex() != i)
+      return reject("source grant/ACK dequeue predicate");
+  }
+  Value narrow;
+  for (auto assertion : read.getOps<AssertOp>())
+    narrow = operand(operand(assertion.getPredicate(), "firrtl.or", 1), "firrtl.or", 1);
+  Value rest = operand(narrow, "firrtl.and", 1);
+  Value single = operand(rest, "firrtl.and", 0), sizes = operand(rest, "firrtl.and", 1);
+  if (operand(narrow, "firrtl.and", 0) != pci || !eq(single, length, 0))
+    return reject("SDK single read predicate");
+  SmallVector<Value> alignmentChecks;
+  // Inspect every size/alignment branch independently. Metadata alone cannot
+  // authorize wider PCI loads or a weakened alignment/cross-line predicate.
+  for (unsigned nativeSize = 5; nativeSize >= 2; --nativeSize) {
+    Value branch = operand(sizes, "firrtl.or", 1);
+    Value sizeEQ = operand(branch, "firrtl.and", 0);
+    Value aligned = operand(branch, "firrtl.and", 1);
+    auto alignedEQ = aligned ? aligned.getDefiningOp<EQPrimOp>() : EQPrimOp{};
+    if (!eq(sizeEQ, size, nativeSize) || !alignedEQ ||
+        !bits(alignedEQ.getLhs(), nativeSize - 1, 0) ||
+        !eq(aligned, alignedEQ.getLhs(), 0))
+      return reject("SDK native narrow read size/alignment");
+    alignmentChecks.push_back(aligned);
+    sizes = operand(sizes, "firrtl.or", 0);
+  }
+  Value normalizedAlignment = operand(sizes, "firrtl.and", 1);
+  auto normalizedEQ = normalizedAlignment ? normalizedAlignment.getDefiningOp<EQPrimOp>() : EQPrimOp{};
+  if (operand(sizes, "firrtl.and", 0) != fullSize || !normalizedEQ ||
+      !bits(normalizedEQ.getLhs(), 1, 0) ||
+      !eq(normalizedAlignment, normalizedEQ.getLhs(), 0))
+    return reject("SDK shell-normalized read alignment");
+  alignmentChecks.push_back(normalizedAlignment);
+  unsigned assertions = 0;
+  for (auto assertion : read.getOps<AssertOp>()) {
+    ++assertions;
+    Value predicate = assertion.getPredicate(), alternatives = operand(predicate, "firrtl.or", 1);
+    if (assertion.getMessage() != "F2 CPU stream reads require full DMA beats or aligned PCI-ID0x20 single 4-to-64-byte peeks" ||
+        assertion.getClock() != read.getArgument(0) || operand(assertion.getEnable(), "firrtl.not", 0) != reset ||
+        operand(operand(predicate, "firrtl.or", 0), "firrtl.not", 0) != valid ||
+        operand(alternatives, "firrtl.or", 0) != full || operand(alternatives, "firrtl.or", 1) != narrow)
+      return reject("transaction assertion");
+  }
+  if (assertions != 1) return reject("assertion inventory");
+  // Keep low-address alignment tests distinct from high-address grants.
+  // Reject extra ambiguous address comparisons beyond the validated branches.
+  for (auto comparison : read.getOps<EQPrimOp>()) {
+    auto slice = comparison.getLhs().getDefiningOp<BitsPrimOp>();
+    if (slice && slice.getInput() == address && slice.getHi() != 63 && !llvm::is_contained(alignmentChecks, comparison.getResult()))
+      return reject("unexpected address comparison");
+  }
+  return validateF2CPUStreamAckRoute(read->getParentOfType<CircuitOp>(), error);
+}
+
+LogicalResult goldengate::enableF2CPUStreamWordReads(CircuitOp circuit,
+                                                    std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  FModuleOp read;
+  for (auto module : circuit.getOps<FModuleOp>())
+    if (module.getName() == "GGCPUStreamRead") read = module;
+  auto sources = read ? read->getAttrOfType<ArrayAttr>("goldengate.sourceStreams") : ArrayAttr{};
+  if (!read || !sources || sources.empty() || read->hasAttr("goldengate.f2CPUWordReads"))
+    return reject("F2 DWORD reads require one unmodified native CPU source engine");
+  auto *ctx = circuit.getContext();
+  auto port = [&](StringRef name, unsigned width) -> Value {
+    for (auto [index, info] : llvm::enumerate(read.getPorts()))
+      if (info.name == name && info.direction == Direction::In &&
+          info.type == UIntType::get(ctx, width)) return read.getArgument(index);
+    return {};
+  };
+  Value address = port("ar_bits_addr", 64), size = port("ar_bits_size", 3);
+  Value length = port("ar_bits_len", 8), valid = port("ar_valid", 1), id = port("ar_bits_id", 16);
+  if (!address || !size || !length || !valid || !id)
+    return reject("F2 DWORD reads require the native address/size/length interface");
+  SmallVector<StrictConnectOp> ready;
+  for (auto connect : read.getOps<StrictConnectOp>()) {
+    auto field = connect.getDest().getDefiningOp<SubfieldOp>();
+    auto argument = field ? dyn_cast<BlockArgument>(field.getInput()) : BlockArgument{};
+    if (!argument || field.getFieldName() != "ready") continue;
+    auto name = read.getPortName(argument.getArgNumber());
+    if (name == "stream" || name.starts_with("stream_")) ready.push_back(connect);
+  }
+  AssertOp assertion;
+  for (auto candidate : read.getOps<AssertOp>()) {
+    if (assertion || candidate.getMessage() != "CPUManagedStreamEngine requires 64-byte read beats")
+      return reject("F2 DWORD reads require the unchanged full-width transaction assertion");
+    assertion = candidate;
+  }
+  if (ready.size() != sources.size() || !assertion)
+    return reject("F2 DWORD reads require every live source dequeue and the size assertion");
+  FModuleOp bank, readWrapper, countWrapper, controlFile;
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    if (module.getName() == "GGCPUStreamCountBank") bank = module;
+    if (module.getName() == "GGCPUStreamMCRFile") controlFile = module;
+    if (module.getName() == "GGCPUStreamReadWrapper") readWrapper = module;
+    if (module.getName() == "GGCPUStreamCountWrapper") countWrapper = module;
+  }
+  if (!bank || !readWrapper || !countWrapper || !controlFile || controlFile.getNumPorts()!=4 || bank.getNumPorts() < sources.size() + 3)
+    return reject("F2 explicit ACK requires the canonical count bank and wrappers");
+  SmallVector<InstanceOp> readUses, bankUses, wrapperUses;
+  circuit.walk([&](InstanceOp instance) {
+    if (instance.getModuleName() == read.getName()) readUses.push_back(instance);
+    if (instance.getModuleName() == bank.getName()) bankUses.push_back(instance);
+    if (instance.getModuleName() == readWrapper.getName()) wrapperUses.push_back(instance);
+  });
+  if (readUses.size()!=1 || bankUses.size()!=1 || wrapperUses.size()!=1 ||
+      readUses[0]->getParentOfType<FModuleOp>() != readWrapper ||
+      bankUses[0]->getParentOfType<FModuleOp>() != countWrapper ||
+      wrapperUses[0]->getParentOfType<FModuleOp>() != countWrapper)
+    return reject("F2 explicit ACK requires unique nested read/count instances");
+  StrictConnectOp strobeConnect, dataConnect;
+  for (auto c : controlFile.getOps<StrictConnectOp>()) {
+    auto f=c.getDest().getDefiningOp<SubfieldOp>();
+    if (f && f.getInput()==controlFile.getArgument(3) && f.getFieldName()=="wstrb") {
+      if(strobeConnect) return reject("ambiguous CPU count MCR strobes"); strobeConnect=c;
+    }
+    auto reg=c.getDest().getDefiningOp<RegOp>();
+    if(reg && reg->getAttrOfType<StringAttr>("name")=="wData") dataConnect=c;
+  }
+  auto dataMux=dataConnect?dataConnect.getSrc().getDefiningOp<MuxPrimOp>():MuxPrimOp{};
+  auto oldStrobe=strobeConnect?strobeConnect.getSrc().getDefiningOp<ConstantOp>():ConstantOp{};
+  if(!dataMux||!oldStrobe||!oldStrobe.getValue().isZero())
+    return reject("F2 ACK strobes require the unchanged CPU count MCR W-data capture");
+  // Validate completely before modifying the engine. These conditions use
+  // only stable, held AR fields and add no state or payload transformation.
+  OpBuilder b(ctx); auto loc = read.getLoc(); b.setInsertionPointToStart(read.getBodyBlock());
+  auto k = [&](unsigned width, uint64_t value) -> Value {
+    return b.create<ConstantOp>(loc, UIntType::get(ctx, width), APInt(width, value));
+  };
+  // Capture WSTRB on precisely the same handshake as WDATA, including W-before-AW.
+  // The generic legacy MCRFile intentionally drives zero because old bindReg
+  // clients ignore strobes. Only this F2 explicit-ACK endpoint extends it.
+  b.setInsertionPoint(dataConnect);
+  Value heldStrobes=b.create<RegOp>(loc,UIntType::get(ctx,4),controlFile.getArgument(0),"f2AckWriteStrobe").getResult();
+  Value w=b.create<SubfieldOp>(loc,controlFile.getArgument(2),"w");
+  Value wbits=b.create<SubfieldOp>(loc,w,"bits");
+  Value strobes=b.create<SubfieldOp>(loc,wbits,"strb");
+  Value nextStrobes=b.create<MuxPrimOp>(loc,dataMux.getSel(),strobes,heldStrobes);
+  b.create<StrictConnectOp>(loc,heldStrobes,nextStrobes);
+  strobeConnect->setOperand(1,heldStrobes);
+  b.setInsertionPointToStart(read.getBodyBlock());
+  auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
+  auto either = [&](Value a, Value c) -> Value { return b.create<OrPrimOp>(loc, a, c); };
+  Value fullSize = b.create<EQPrimOp>(loc, size, k(3, 6));
+  Value single = b.create<EQPrimOp>(loc, length, k(8, 0));
+  auto aligned = [&](unsigned logBytes) -> Value {
+    return b.create<EQPrimOp>(loc,
+        b.create<BitsPrimOp>(loc, address, logBytes - 1, 0), k(logBytes, 0));
+  };
+  // The shell BFM normalizes all PCI peek widths to ARSIZE6 while retaining
+  // their low address lanes. Keep that profile and also admit naturally
+  // aligned native 4/8/16/32-byte requests. Natural alignment prevents a
+  // request crossing the 64-byte head; PCI peeks must always be single-beat.
+  // Every PCI width is non-destructive, including speculative full-line
+  // fetches generated by WC streaming loads. Only software ACK owns dequeue.
+  Value pci = b.create<EQPrimOp>(loc, id, k(16, 0x20));
+  Value sizes = both(fullSize, aligned(2));
+  for (unsigned nativeSize = 2; nativeSize <= 5; ++nativeSize)
+    sizes = either(sizes, both(b.create<EQPrimOp>(loc, size, k(3, nativeSize)), aligned(nativeSize)));
+  Value narrow = both(pci, both(single, sizes));
+  Value fullBeat = both(fullSize, b.create<NotPrimOp>(loc, pci));
+  auto ackType = FVectorType::get(UIntType::get(ctx, 1), sources.size());
+  auto append = [&](FModuleOp module, Direction direction, InstanceOp instance) {
+    unsigned old = module.getNumPorts();
+    SmallVector<std::pair<unsigned, PortInfo>> ports{{old,
+        PortInfo(b.getStringAttr("sdkReadAck"), ackType, direction)}};
+    module.insertPorts(ports);
+    auto replacement = instance.cloneAndInsertPorts(ports);
+    for (auto attr : instance->getAttrs())
+      if (!replacement->hasAttr(attr.getName())) replacement->setAttr(attr.getName(), attr.getValue());
+    for (unsigned i=0; i<old; ++i) instance.getResult(i).replaceAllUsesWith(replacement.getResult(i));
+    instance.erase(); return replacement;
+  };
+  auto readInstance = append(read, Direction::In, readUses[0]);
+  auto bankInstance = append(bank, Direction::Out, bankUses[0]);
+  auto wrapperInstance = append(readWrapper, Direction::In, wrapperUses[0]);
+  b.setInsertionPointToEnd(readWrapper.getBodyBlock());
+  b.create<StrictConnectOp>(loc, readInstance.getResults().back(), readWrapper.getBodyBlock()->getArguments().back());
+  b.setInsertionPointToEnd(countWrapper.getBodyBlock());
+  b.create<StrictConnectOp>(loc, wrapperInstance.getResults().back(), bankInstance.getResults().back());
+  b.setInsertionPointToStart(read.getBodyBlock());
+  SmallVector<Value> ackSlots;
+  for (unsigned i=0; i<sources.size(); ++i)
+    ackSlots.push_back(b.create<SubindexOp>(loc, read.getBodyBlock()->getArguments().back(), i));
+  for (auto [i, connect] : llvm::enumerate(ready)) {
+    b.setInsertionPoint(connect);
+    connect->setOperand(1, either(both(connect.getSrc(), fullBeat), ackSlots[i]));
+  }
+  // Reuse the source-count words as explicit, ordered software consume ACKs.
+  // PCI reads may speculate or coalesce: they only observe the current head.
+  b.setInsertionPointToStart(bank.getBodyBlock());
+  unsigned countSlots = bank.getNumPorts() - 4;
+  Value mcr = bank.getArgument(countSlots + 2);
+  auto field = [&](Value value, StringRef name)->Value {return b.create<SubfieldOp>(loc,value,name);};
+  auto registry = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  SmallVector<Attribute> updated(registry.begin(), registry.end());
+  SmallVector<AssertOp> oldAssertions;
+  for (auto a : bank.getOps<AssertOp>()) oldAssertions.push_back(a);
+  for (unsigned i=0; i<sources.size(); ++i) {
+    Value slot=b.create<SubindexOp>(loc,field(mcr,"write"),i);
+    Value wrValid=field(slot,"valid"), wrBits=field(slot,"bits");
+    Value dataOK=b.create<EQPrimOp>(loc,wrBits,k(32,1));
+    Value strobeOK=b.create<EQPrimOp>(loc,field(mcr,"wstrb"),k(4,15));
+    Value nonempty=b.create<NotPrimOp>(loc,b.create<EQPrimOp>(loc,bank.getArgument(i+2),
+        k(*cast<UIntType>(bank.getPortType(i+2)).getWidth(),0)));
+    Value accepted=both(both(dataOK,strobeOK),nonempty);
+    Value pulse=both(both(wrValid,accepted),b.create<NotPrimOp>(loc,bank.getArgument(1)));
+    b.create<StrictConnectOp>(loc,b.create<SubindexOp>(loc,bank.getBodyBlock()->getArguments().back(),i),pulse);
+    b.create<AssertOp>(loc,bank.getArgument(0),either(b.create<NotPrimOp>(loc,wrValid),accepted),
+        b.create<NotPrimOp>(loc,bank.getArgument(1)),"F2 CPU stream ACK requires data1, full strobes, and a nonempty source",ValueRange{},"");
+    oldAssertions[i].erase();
+    NamedAttrList word(cast<DictionaryAttr>(updated[i])); word.set("writeable",b.getBoolAttr(true));
+    updated[i]=word.getDictionary(ctx);
+  }
+  bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(updated));
+  b.setInsertionPoint(assertion);
+  Value allowed = either(b.create<NotPrimOp>(loc, valid), either(fullBeat, narrow));
+  assertion.getPredicateMutable().set(allowed);
+  assertion.setMessage("F2 CPU stream reads require full DMA beats or aligned PCI-ID0x20 single 4-to-64-byte peeks");
+  read->setAttr("goldengate.f2CPUWordReads", b.getDictionaryAttr({
+      b.getNamedAttr("wordBytes", b.getI64IntegerAttr(4)),
+      b.getNamedAttr("maxNativeNarrowReadBytes", b.getI64IntegerAttr(32)),
+      b.getNamedAttr("streamBeatBytes", b.getI64IntegerAttr(64)),
+      b.getNamedAttr("ackWriteValue", b.getI64IntegerAttr(1)),
+      b.getNamedAttr("pciRequestID", b.getI64IntegerAttr(0x20)),
+      b.getNamedAttr("shellNormalizedSize6", b.getBoolAttr(true)),
+      b.getNamedAttr("pciReadsNonDestructive", b.getBoolAttr(true)),
+      b.getNamedAttr("fullWidthDMABurstsUnchanged", b.getBoolAttr(true)),
+      b.getNamedAttr("explicitCountWriteAck", b.getBoolAttr(true))}));
+  return success();
+}
 
 LogicalResult goldengate::deriveRocketCPUStreamPorts(CircuitOp circuit,
     SmallVectorImpl<CPUStreamSourcePort> &sources,
@@ -128,10 +611,10 @@ LogicalResult goldengate::deriveCPUStreamPorts(CircuitOp circuit,
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   SmallVector<CPUStreamSourcePort> outgoing, incoming;
   SmallVector<CPUStreamCountPort> registers;
-  if (failed(deriveRocketCPUStreamPorts(circuit, outgoing, registers, error))) return failure();
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw) return reject("CPU stream catalog needs retained bridge annotations");
-  unsigned nics = 0;
+  unsigned nics = 0, tracers = 0;
+  SmallVector<std::pair<bool, unsigned>> producerOrder;
   for (auto a : raw) {
     auto d = dyn_cast<DictionaryAttr>(a);
     auto cls = d ? d.getAs<StringAttr>("class") : StringAttr{};
@@ -139,10 +622,25 @@ LogicalResult goldengate::deriveCPUStreamPorts(CircuitOp circuit,
     if (cls == "firesim.lib.bridgeutils.BridgeIOAnnotation" &&
         widget == "firechip.goldengateimplementations.SimpleNICBridgeModule") {
       if (d.get("widgetConstructorKey")) return reject("CPU catalog needs constructor-free NIC");
-      ++nics;
+      producerOrder.emplace_back(true, nics++);
+    } else if (cls == "firesim.lib.bridgeutils.BridgeIOAnnotation" &&
+        widget == "firechip.goldengateimplementations.TracerVBridgeModule") {
+      producerOrder.emplace_back(false, tracers++);
     }
   }
-  if (nics > 1) return reject("CPU catalog requires distinct bindings for multiple NICs");
+  if (tracers) {
+    if (failed(deriveRocketCPUStreamPorts(circuit, outgoing, registers, error))) return failure();
+  } else {
+    FModuleOp active;
+    for (auto module : circuit.getOps<FModuleOp>())
+      if (module.getName() == circuit.getName()) active = module;
+    if (!active) return reject("CPU stream catalog requires an active top");
+    for (auto port : active.getPorts())
+      if (port.name.getValue().starts_with("tracerv_stream"))
+        return reject("CPU stream catalog has TracerV ports without a constructor");
+  }
+  if (tracers != outgoing.size())
+    return reject("CPU catalog TracerV constructor count differs from live queues");
   if (nics) {
     auto find = [&](StringRef name) -> FModuleOp {
       for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == name) return m;
@@ -187,16 +685,24 @@ LogicalResult goldengate::deriveCPUStreamPorts(CircuitOp circuit,
       }
       return {};
     };
-    Path incomingPath, outgoingPath;
+    SmallVector<Path> queuePaths;
+    SmallVector<CPUStreamSourcePort> nicOutgoing;
+    SmallVector<CPUStreamCountPort> nicOutgoingCounts;
+    for (unsigned widget = 0; widget < nics; ++widget) {
     for (bool input : {false, true}) {
-      StringRef payloadName = input ? "nic_from_host_stream" : "nic_to_host_stream";
-      StringRef countName = input ? "nic_from_host_stream_count" : "nic_to_host_stream_count";
-      StringRef streamName = input ? "SIMPLENICBRIDGEMODULE_0_from_cpu_stream" : "SIMPLENICBRIDGEMODULE_0_to_cpu_stream";
+      std::string prefix = nics == 1 ? "nic_" : "nic" + std::to_string(widget) + "_";
+      std::string payloadName = prefix + (input ? "from_host_stream" : "to_host_stream");
+      std::string countName = payloadName + "_count";
+      std::string streamName = "SIMPLENICBRIDGEMODULE_" + std::to_string(widget) +
+          (input ? "_from_cpu_stream" : "_to_cpu_stream");
       auto payload = trace(port(payloadName, token, input ? Direction::In : Direction::Out), input);
       auto occupancy = trace(port(countName, countType, Direction::Out), false);
       if (!payload.queue || payload.path != occupancy.path ||
           payload.port != (input ? 2u : 3u) || occupancy.port != 4)
         return reject("NIC payload/count must reach the same live directional queue instance");
+      if (llvm::is_contained(queuePaths, payload.path))
+        return reject("NIC widgets and directions must use independent queue instances");
+      queuePaths.push_back(payload.path);
       auto queue = payload.queue;
       auto info = payload.path.back()->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
       auto depth = info ? info.getAs<IntegerAttr>("depth") : IntegerAttr{};
@@ -214,16 +720,30 @@ LogicalResult goldengate::deriveCPUStreamPorts(CircuitOp circuit,
           return reject("NIC CPU catalog storage differs from allocation");
       }
       if (memories != 1) return reject("NIC CPU catalog requires one native queue memory");
-      CPUStreamSourcePort stream{streamName.str(), payloadName.str(), 3072};
-      CPUStreamCountPort count{streamName.str(), countName.str(), 12};
-      if (input) { incoming.push_back(stream); registers.push_back(count); incomingPath = payload.path; }
-      else { outgoing.insert(outgoing.begin(), stream); registers.insert(registers.begin(), count); outgoingPath = payload.path; }
+      CPUStreamSourcePort stream{streamName, payloadName, 3072};
+      CPUStreamCountPort count{streamName, countName, 12};
+      if (input) { incoming.push_back(stream); registers.push_back(count); }
+      else { nicOutgoing.push_back(stream); nicOutgoingCounts.push_back(count); }
     }
-    if (incomingPath == outgoingPath) return reject("NIC directions must use independent queue instances");
+    }
+    outgoing.insert(outgoing.begin(), nicOutgoing.begin(), nicOutgoing.end());
+    registers.insert(registers.begin(), nicOutgoingCounts.begin(), nicOutgoingCounts.end());
   }
-  sources.assign(outgoing.begin(), outgoing.end());
+  // FPGATop constructs its ListMap in BridgeIO annotation order and filters
+  // that same order separately for each stream direction. Keep NIC and TracerV
+  // interleaving for read windows and source count words; sink count words then
+  // follow in the independently filtered from-host order.
+  SmallVector<CPUStreamSourcePort> orderedSources;
+  SmallVector<CPUStreamCountPort> orderedCounts;
+  for (auto [nic, index] : producerOrder) {
+    unsigned position = nic ? index : nics + index;
+    orderedSources.push_back(outgoing[position]);
+    orderedCounts.push_back(registers[position]);
+  }
+  orderedCounts.append(registers.begin() + outgoing.size(), registers.end());
+  sources.assign(orderedSources.begin(), orderedSources.end());
   sinks.assign(incoming.begin(), incoming.end());
-  counts.assign(registers.begin(), registers.end());
+  counts.assign(orderedCounts.begin(), orderedCounts.end());
   return success();
 }
 

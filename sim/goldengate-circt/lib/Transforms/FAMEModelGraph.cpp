@@ -1,0 +1,526 @@
+// See LICENSE for license details.
+#include "goldengate/FAMEModelGraph.h"
+#include "goldengate/AnnotationClasses.h"
+#include "goldengate/FAMEAnnotations.h"
+#include "goldengate/FAMEHostControl.h"
+#include "goldengate/FAMEClockEnable.h"
+#include "goldengate/FAMEClockChannel.h"
+#include "goldengate/FAMEInputChannel.h"
+#include "goldengate/FAMEOutputChannel.h"
+#include "goldengate/FAMEModelControls.h"
+#include "goldengate/FAMEPipeChannel.h"
+#include "goldengate/FAMEReadyValidChannel.h"
+#include "goldengate/RemainingFanout.h"
+#include "goldengate/TargetUtils.h"
+#include "FAMEPortAnnotations.h"
+#include "llvm/ADT/BitVector.h"
+#include "mlir/IR/BuiltinOps.h"
+#include "mlir/IR/Verifier.h"
+#include <functional>
+#include <map>
+#include <set>
+
+using namespace mlir;
+using namespace circt::firrtl;
+using namespace goldengate;
+namespace {
+struct DataEndpoint {
+  std::string model, instance, local, global, topPort;
+  SmallVector<std::string> oldPorts;
+  Direction direction;
+  BundleType type;
+};
+struct Model {
+  FModuleOp op;
+  FAMEDataSelection selection;
+  SmallVector<FAMEChannelClockDomain> assignments;
+  SmallVector<std::string> instances, unusedOutputs;
+  std::map<std::string, DictionaryAttr> instanceMetadata;
+  std::string targetClock;
+};
+FModuleOp find(CircuitOp circuit, StringRef name) {
+  for (auto model : circuit.getOps<FModuleOp>()) if (model.getName() == name) return model;
+  return {};
+}
+std::optional<unsigned> port(FModuleOp model, StringRef name) {
+  for (unsigned i = 0; i < model.getNumPorts(); ++i) if (model.getPortName(i) == name) return i;
+  return std::nullopt;
+}
+InstanceOp instance(FModuleOp top, StringRef name) {
+  for (auto value : top.getOps<InstanceOp>()) if (value.getName() == name) return value;
+  return {};
+}
+// During one shared-definition channel rewrite, instances still carrying leaf
+// ports temporarily differ in port count from the collapsed definition. The
+// graph was validated before mutation; capture only direct physical connections
+// here, until every retained instance reaches the common ABI. Primitive checks
+// retain exclusive wiring/leaf type checks, and the atomic commit verifies the
+// complete instance graph once all channel rewrites have finished.
+TopHierarchy captureChannelRewriteConnections(FModuleOp top) {
+  TopHierarchy result{top, {}};
+  top.walk([&](Operation *op) {
+    Value dest, src;
+    if (auto c=dyn_cast<ConnectOp>(op)) { dest=c.getDest(); src=c.getSrc(); }
+    else if (auto c=dyn_cast<StrictConnectOp>(op)) { dest=c.getDest(); src=c.getSrc(); }
+    else return;
+    auto argument=dyn_cast<BlockArgument>(dest); auto value=dyn_cast<OpResult>(src);
+    if (!argument || !value) { argument=dyn_cast<BlockArgument>(src); value=dyn_cast<OpResult>(dest); }
+    if (!argument || !value || argument.getOwner()!=top.getBodyBlock()) return;
+    auto child=dyn_cast<InstanceOp>(value.getOwner());
+    if (child && child->getParentOfType<FModuleOp>()==top)
+      result.connections.push_back({argument.getArgNumber(),child,value.getResultNumber()});
+  });
+  return result;
+}
+// FAMETransform promotes bridge-to-bridge identities to complete Decoupled
+// connections, independently of model firing. Capture the old SSA endpoints
+// before model rewrites invalidate port indices. Each scalar must have one
+// channel and one identity use. ChannelExcision splits bridge-source fanout
+// into independent annotated inputs before this boundary; do not silently
+// bypass that policy by sharing an unsplit scalar with a model.
+struct TopPassthrough {
+  std::string input, output;
+  PortInfo sink, source;
+  Operation *connect;
+};
+std::optional<SmallVector<TopPassthrough>> analyzeTopPassthroughs(
+    const TopHierarchy &hierarchy, ArrayRef<GGChannelConnection> channels,
+    std::map<std::string, std::string> &renames, std::set<unsigned> &claimed,
+    std::string &error) {
+  auto top = hierarchy.top;
+  auto *context = top.getContext();
+  SmallVector<TopPassthrough> result;
+  std::set<std::string> names;
+  for (auto p : top.getPorts()) names.insert(p.getName().str());
+  top.walk([&](Operation *op) {
+    if (auto name = op->getAttrOfType<StringAttr>("name")) names.insert(name.getValue().str());
+  });
+  auto channelFor = [&](unsigned port, bool source) -> const GGChannelConnection * {
+    const GGChannelConnection *found = nullptr;
+    for (const auto &channel : channels) {
+      const auto &endpoints = source ? channel.sources : channel.sinks;
+      for (const auto &endpoint : endpoints) {
+        if (endpoint.module != top || endpoint.port != port) continue;
+        if (found || endpoints.size() != 1 || endpoint.fieldID.value_or(0) != 0 ||
+            channel.kind != ChannelKind::Pipe) {
+          error = "top passthrough requires unique scalar PipeChannel endpoints";
+          return nullptr;
+        }
+        found = &channel;
+      }
+    }
+    return found;
+  };
+  for (Operation &op : *top.getBodyBlock()) {
+    Value dest, src;
+    if (auto c = dyn_cast<ConnectOp>(op)) { dest = c.getDest(); src = c.getSrc(); }
+    else if (auto c = dyn_cast<StrictConnectOp>(op)) { dest = c.getDest(); src = c.getSrc(); }
+    else continue;
+    auto output = dyn_cast<BlockArgument>(dest), input = dyn_cast<BlockArgument>(src);
+    if (!output || !input || output.getOwner() != top.getBodyBlock() ||
+        input.getOwner() != top.getBodyBlock() || isa<ClockType>(dest.getType())) continue;
+    auto sourceChannel = channelFor(output.getArgNumber(), true);
+    if (!error.empty()) return std::nullopt;
+    if (!sourceChannel) continue;
+    auto sinkChannel = channelFor(input.getArgNumber(), false);
+    if (!error.empty()) return std::nullopt;
+    if (!sinkChannel || top.getPortDirection(output.getArgNumber()) != Direction::Out ||
+        top.getPortDirection(input.getArgNumber()) != Direction::In ||
+        !isa<UIntType, SIntType>(src.getType()) || src.getType() != dest.getType() ||
+        !src.hasOneUse() || !dest.hasOneUse() ||
+        claimed.count(input.getArgNumber()) || claimed.count(output.getArgNumber()) ||
+        llvm::any_of(hierarchy.connections, [&](const TopPortConnection &connection) {
+          return connection.topPort == input.getArgNumber() || connection.topPort == output.getArgNumber();
+        })) {
+      error = "top passthrough requires exclusive ground input-to-output wiring; model/token fanout is unsupported";
+      return std::nullopt;
+    }
+    auto bit = UIntType::get(context, 1);
+    auto type = BundleType::get(context,
+        {{StringAttr::get(context, "ready"), true, bit},
+         {StringAttr::get(context, "valid"), false, bit},
+         {StringAttr::get(context, "bits"), false, cast<FIRRTLBaseType>(src.getType())}});
+    auto makePort = [&](unsigned index, StringRef name, Direction direction) -> std::optional<PortInfo> {
+      if (!names.insert(name.str()).second) {
+        error = "top passthrough channel name already exists: " + name.str();
+        return std::nullopt;
+      }
+      SmallVector<Annotation> annotations;
+      SmallVector<circt::hw::InnerSymPropertiesAttr> symbols;
+      if (failed(collectFAMEWrapperPayloadMetadata(top, index, type, {}, annotations, symbols, error))) return std::nullopt;
+      PortInfo info(StringAttr::get(context, name), type, direction);
+      info.annotations = AnnotationSet(annotations, context);
+      if (!symbols.empty()) info.sym = circt::hw::InnerSymAttr::get(context, symbols);
+      return info;
+    };
+    auto sink = makePort(input.getArgNumber(), sinkChannel->name + "_sink", Direction::In);
+    auto source = makePort(output.getArgNumber(), sourceChannel->name + "_source", Direction::Out);
+    if (!sink || !source) return std::nullopt;
+    auto oldInput = top.getPortName(input.getArgNumber()).str();
+    auto oldOutput = top.getPortName(output.getArgNumber()).str();
+    auto prefix = "~" + top->getParentOfType<CircuitOp>().getName().str() + "|" + top.getName().str() + ">";
+    renames[prefix + oldInput] = prefix + sink->getName().str() + ".bits";
+    renames[prefix + oldOutput] = prefix + source->getName().str() + ".bits";
+    claimed.insert(input.getArgNumber()); claimed.insert(output.getArgNumber());
+    result.push_back({oldInput, oldOutput, *sink, *source, &op});
+  }
+  return result;
+}
+void rewriteTopPassthroughs(FModuleOp top, ArrayRef<TopPassthrough> passthroughs) {
+  for (const auto &p : passthroughs) {
+    unsigned end = top.getNumPorts();
+    top.insertPorts({{end, p.sink}, {end, p.source}});
+    auto *block = top.getBodyBlock();
+    OpBuilder builder(p.connect);
+    builder.create<ConnectOp>(p.connect->getLoc(), block->getArgument(end + 1), block->getArgument(end));
+    p.connect->erase();
+    llvm::BitVector erase(top.getNumPorts());
+    for (unsigned i = 0; i < end; ++i)
+      if (top.getPortName(i) == p.input || top.getPortName(i) == p.output) erase.set(i);
+    top.erasePorts(erase);
+  }
+}
+std::string suffix(StringRef name, StringRef channel, unsigned size) {
+  if (size == 1) return {};
+  while (!name.empty() && !channel.empty() && name.front() == channel.front()) {
+    name = name.drop_front(); channel = channel.drop_front();
+  }
+  return "." + name.str();
+}
+LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
+                      std::string &error, bool withTransport, bool enableMultiThreading,
+                      FAME5ClockSemantics threadingClocks) {
+  auto reject = [&](const std::string &why) { error = "FAME model graph: " + why; return failure(); };
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  auto hierarchy = analyzeTopHierarchy(circuit, error);
+  if (!raw || !hierarchy) return reject("requires prepared hierarchy and retained annotations: " + error);
+  auto top = hierarchy->top;
+  bool usedTop = false;
+  circuit.walk([&](InstanceOp i) { usedTop |= i.getModuleName() == top.getName(); });
+  auto hostClock = port(top, "hostClock"), hostReset = port(top, "hostReset");
+  if (usedTop || !hostClock || !hostReset || top.getPortDirection(*hostClock) != Direction::In ||
+      top.getPortDirection(*hostReset) != Direction::In || !isa<ClockType>(top.getPortType(*hostClock)) ||
+      top.getPortType(*hostReset) != UIntType::get(circuit.getContext(), 1))
+    return reject("requires an uninstantiated top with hostClock and hostReset inputs");
+  SmallVector<Model, 0> models;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (!anno.isClass(AnnotationClasses::FAMETransform)) continue;
+    auto spelling = anno.getMember<StringAttr>("target");
+    auto resolved = spelling ? resolveAnnotationTarget(circuit, spelling.getValue(), error) : std::nullopt;
+    auto op = resolved && !resolved->port ? dyn_cast<FModuleOp>(resolved->module.getOperation()) : FModuleOp{};
+    if (!op || op == top) return reject("invalid transformed model target");
+    if (llvm::any_of(models, [&](const auto &m) { return m.op == op; })) continue;
+    auto data = analyzeFAMEDataSelection(circuit, op, error);
+    if (!data) return failure();
+    Model model; model.op = op; model.selection = std::move(*data);
+    bool promoted = true;
+    circuit.walk([&](InstanceOp i) {
+      if (i.getModuleName() != op.getName()) return;
+      promoted &= i->getParentOfType<FModuleOp>() == top;
+      model.instances.push_back(i.getName().str());
+      NamedAttrList metadata;
+      for (auto attr : i->getAttrs()) {
+        auto name = attr.getName().strref();
+        // Shape/name attributes are reconstructed by each channel rewrite;
+        // declaration identity and other instance metadata stay with this
+        // retained instance even when a primitive creates a replacement op.
+        if (name != "moduleName" && name != "name" && name != "portNames" &&
+            name != "portDirections" && name != "portAnnotations")
+          metadata.set(attr.getName(), attr.getValue());
+      }
+      model.instanceMetadata.emplace(i.getName().str(), metadata.getDictionary(circuit.getContext()));
+    });
+    if (!promoted || model.instances.empty()) return reject("models require directly promoted live instances: " + op.getName().str());
+    models.push_back(std::move(model));
+  }
+  if (models.empty()) return reject("no transformed definitions");
+  SmallVector<ModelPortGroup> groups;
+  SmallVector<GGChannelConnection, 0> channels;
+  for (auto attr : raw) {
+    Annotation anno(attr);
+    if (anno.isClass(AnnotationClasses::ChannelPorts)) {
+      auto group = analyzeModelPortGroup(circuit, anno, error); if (!group) return failure();
+      groups.push_back(std::move(*group));
+    } else if (anno.isClass(AnnotationClasses::ChannelConnection)) {
+      auto channel = analyzeChannelConnection(circuit, anno, error); if (!channel) return failure();
+      if (withTransport && channel->kind == ChannelKind::Pipe &&
+          (channel->sources.size() > 1 || channel->sinks.size() > 1))
+        return reject("aggregated PipeChannel transport is unsupported by SFC SimWrapper");
+      channels.push_back(std::move(*channel));
+    }
+  }
+  if (!validateDecoupledChannelPairs(channels, error)) return failure();
+  SmallVector<ModelChannelBinding> bindings;
+  Model *hub = nullptr;
+  std::string clockLocal, clockGlobal, clockTopPort, hubInstance;
+  SmallVector<FAMEHubClockDomain> domains;
+  for (const auto &channel : channels) {
+    auto bound = bindChannelToModels(channel, *hierarchy, groups, error); if (!bound) return failure();
+    bindings.append(bound->begin(), bound->end());
+    if (channel.kind != ChannelKind::TargetClock) continue;
+    if (hub || bound->size() != 1) return reject("requires one clock channel bound to one hub instance");
+    for (auto &model : models) if (model.op == bound->front().portGroup->module) hub = &model;
+    if (!hub || hub->instances.size() != 1) return reject("clock hub must be a selected unique definition instance");
+    auto captured = analyzeFAMEHubClockDomains(channel, *hierarchy, bound->front(), error);
+    if (!captured) return failure();
+    domains = *captured; clockLocal = bound->front().portGroup->name;
+    clockGlobal = channel.name; hubInstance = bound->front().instance.getName().str();
+  }
+  // FAMETransform permits independently scheduled scalar virtual-clock models
+  // without a clock-token hub. SimWrapper requires exactly one clock channel,
+  // so retain that requirement only when constructing simulator transport.
+  if (!hub && withTransport) return reject("simulator transport requires an explicit target clock hub");
+  for (auto &model : models) {
+    auto assignment = analyzeFAMEChannelClockDomains(circuit, model.op,
+        hub && model.op == hub->op ? ArrayRef<FAMEHubClockDomain>(domains) : ArrayRef<FAMEHubClockDomain>{}, error);
+    if (!assignment) return failure(); model.assignments = *assignment;
+    if (!hub || model.op != hub->op) {
+      for (auto p : model.op.getPorts()) if (isa<ClockType>(p.type)) {
+        if (p.direction == Direction::In) model.targetClock = p.getName().str();
+      }
+      if (model.targetClock.empty()) return reject("virtual model requires a scalar target clock");
+    }
+  }
+  SmallVector<FModuleLike> selected;
+  for (auto &model : models) selected.push_back(model.op);
+  auto plan = analyzeFAMEPorts(*hierarchy, bindings, channels, selected, error); if (!plan) return failure();
+  auto target = [&](FModuleOp model, StringRef name) {
+    return "~" + circuit.getName().str() + "|" + model.getName().str() + ">" + name.str();
+  };
+  std::map<std::string, std::string> renames;
+  SmallVector<DataEndpoint, 0> endpoints;
+  std::set<unsigned> claimedTop;
+  for (const auto &list : {plan->sinks, plan->sources}) for (const auto &endpoint : list) {
+    auto binding = *endpoint.binding; auto group = *binding.portGroup;
+    auto model = cast<FModuleOp>(group.module.getOperation());
+    if (hub && model == hub->op && group.name == clockLocal) { clockTopPort = endpoint.portName; continue; }
+    if (binding.instancePorts.size() != group.ports.size() ||
+        !llvm::all_of(group.ports, [&](unsigned i) { return isa<UIntType, SIntType>(model.getPortType(i)); }))
+      return reject("requires ground integer channel leaves");
+    SmallVector<std::string> oldPorts;
+    for (unsigned i : group.ports) {
+      auto oldModel = model.getPortName(i); oldPorts.push_back(oldModel.str());
+      auto newModel = target(model, group.name + (group.direction == Direction::In ? "_sink" : "_source")) +
+          ".bits" + suffix(oldModel, group.name, group.ports.size());
+      auto [r, fresh] = renames.emplace(target(model, oldModel), newModel);
+      if (!fresh && r->second != newModel) return reject("incompatible shared model payload identity");
+      for (const auto &connection : hierarchy->connections) if (connection.instance == binding.instance && connection.instancePort == i) {
+        claimedTop.insert(connection.topPort);
+        auto oldTop = top.getPortName(connection.topPort);
+        auto field = group.direction == Direction::Out && group.ports.size() > 1
+            ? getFAMEOutputAliasField(*hierarchy, endpoint, i, connection.topPort, error)
+            : std::optional<std::string>(suffix(oldTop, binding.globalName, group.ports.size()));
+        if (!field) return failure();
+        auto fieldSuffix = group.direction == Direction::Out && !field->empty() ? "." + *field : *field;
+        auto newTop = target(top, endpoint.portName) + ".bits" + fieldSuffix;
+        auto [r, fresh] = renames.emplace(target(top, oldTop), newTop);
+        if (!fresh && r->second != newTop) return reject("incompatible shared top payload identity");
+      }
+    }
+    endpoints.push_back({model.getName().str(), binding.instance.getName().str(), group.name,
+        binding.globalName, endpoint.portName, std::move(oldPorts), group.direction, endpoint.type});
+  }
+  // Coverage is checked per instance, before any model/port mutation. Unused
+  // output data may be internalized only when every instance leaves it unused.
+  for (auto &model : models) {
+    std::map<std::string, std::set<std::string>> coverage;
+    for (const auto &endpoint : endpoints) if (endpoint.model == model.op.getName())
+      for (const auto &name : endpoint.oldPorts) if (!coverage[endpoint.instance].insert(name).second)
+        return reject("duplicate per-instance data channel coverage");
+    for (auto p : model.op.getPorts()) {
+      if (isa<ClockType>(p.type)) continue;
+      bool missing = false, present = false;
+      for (const auto &name : model.instances) (coverage[name].count(p.getName().str()) ? present : missing) = true;
+      if (missing && (present || p.direction != Direction::Out)) {
+        std::string uncovered;
+        for (const auto &name : model.instances)
+          if (!coverage[name].count(p.getName().str())) {
+            if (!uncovered.empty()) uncovered += ",";
+            uncovered += name;
+          }
+        return reject("incomplete per-instance channel coverage: model=" +
+                      model.op.getName().str() + " port=" + p.getName().str() +
+                      " direction=" + (p.direction == Direction::In ? "input" : "output") +
+                      " missing-instances=" + uncovered);
+      }
+      if (missing) model.unusedOutputs.push_back(p.getName().str());
+    }
+  }
+  auto passthroughs = analyzeTopPassthroughs(*hierarchy, channels, renames, claimedTop, error);
+  if (!passthroughs) return failure();
+  // Reject uncovered scalar ports rather than silently leave unqueued data in
+  // an otherwise complete transformed graph.
+  for (auto [i, p] : llvm::enumerate(top.getPorts()))
+    if (p.getName() != "hostClock" && p.getName() != "hostReset" && !isa<ClockType>(p.type) && !claimedTop.count(i))
+      return reject("non-model scalar top data passthrough is unsupported: " + p.getName().str());
+  std::function<bool(Attribute)> referencesData = [&](Attribute attr) {
+    if (auto s = dyn_cast<StringAttr>(attr)) return renames.count(s.getValue().str()) != 0;
+    if (auto a = dyn_cast<ArrayAttr>(attr)) return llvm::any_of(a, referencesData);
+    if (auto d = dyn_cast<DictionaryAttr>(attr)) return llvm::any_of(d, [&](NamedAttribute m) { return referencesData(m.getValue()); });
+    return false;
+  };
+  // Local port transfer policies do not interpret instance-qualified targets.
+  // Reject selected data references through such paths before a recognized or
+  // unknown annotation can retain a stale pre-channelization port spelling.
+  std::function<bool(Attribute)> unsupportedInstanceData = [&](Attribute attr) {
+    if (auto value = dyn_cast<StringAttr>(attr)) {
+      auto spelling = value.getValue();
+      auto prefix = "~" + circuit.getName().str() + "|";
+      if (!spelling.consume_front(prefix)) return false;
+      auto [path, reference] = spelling.split('>');
+      if (!path.contains('/') || reference.empty()) return false;
+      auto module = path.rsplit(':').second;
+      auto root = reference.take_front(reference.find_first_of(".["));
+      return renames.count("~" + circuit.getName().str() + "|" + module.str() + ">" + root.str()) != 0;
+    }
+    if (auto a = dyn_cast<ArrayAttr>(attr)) return llvm::any_of(a, unsupportedInstanceData);
+    if (auto d = dyn_cast<DictionaryAttr>(attr)) return llvm::any_of(d, [&](NamedAttribute m) { return unsupportedInstanceData(m.getValue()); });
+    return false;
+  };
+  for (auto attr : raw) {
+    if (unsupportedInstanceData(attr))
+      return reject("instance-qualified selected data target has no supported channel transfer policy");
+    Annotation anno(attr);
+    if (referencesData(attr) && !anno.isClass(AnnotationClasses::ChannelPorts) &&
+        !anno.isClass(AnnotationClasses::ChannelConnection) && !anno.isClass(AnnotationClasses::DontTouch) &&
+        !anno.isClass(AnnotationClasses::CombinationalPath) && !anno.isClass(AnnotationClasses::InternalFpgaDebug))
+      return reject("data target has unsupported retained annotation metadata");
+  }
+  SmallVector<FModuleOp> selectedModels; for (auto &m : models) selectedModels.push_back(m.op);
+  if (failed(consumeFAMEModelDontTouches(circuit, selectedModels, error))) return failure();
+  for (auto &m : models) if (failed(addFAMEHostControl(circuit, m.op, error))) return failure();
+  SmallVector<FAMEHubClockControl, 0> hubControls;
+  if (hub) {
+    auto current = analyzeTopHierarchy(circuit, error); if (!current) return failure();
+    ModelPortGroup clockGroup;
+    bool foundClockGroup = false;
+    for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      Annotation anno(attr); if (!anno.isClass(AnnotationClasses::ChannelPorts)) continue;
+      auto group = analyzeModelPortGroup(circuit, anno, error); if (!group) return failure();
+      if (group->module == hub->op && group->name == clockLocal) { clockGroup = *group; foundClockGroup = true; }
+    }
+    if (!foundClockGroup) return reject("lost prepared hub clock group");
+    SmallVector<unsigned> clockIndices;
+    for (auto &domain : domains) {
+      auto modelIndex = port(hub->op, domain.modelClockName), topIndex = port(top, domain.topClockName);
+      if (!modelIndex || !topIndex) return reject("lost hub clock port");
+      domain.modelPort = *modelIndex; domain.topPort = *topIndex; clockIndices.push_back(*modelIndex);
+    }
+    auto liveHub = instance(top, hubInstance);
+    ModelChannelBinding clockBinding{clockGlobal, &clockGroup, liveHub, clockIndices};
+    // The prepared clock port type is captured before rewriting host ports.
+    BundleType clockType;
+    for (const auto &p : plan->sinks) if (p.binding->globalName == clockGlobal) clockType = p.type;
+    if (!liveHub || !clockType) return reject("lost live hub clock instance/type");
+    FAMETopChannelPort clockEndpoint{&clockBinding, clockTopPort, clockType};
+    if (failed(rewriteFAMEHubClockChannel(*current, clockEndpoint, domains, true, error))) return failure();
+    auto constructed = constructFAMEHubClockControls(circuit, hub->op, clockLocal, domains, error);
+    if (!constructed) return failure();
+    hubControls.assign(constructed->begin(), constructed->end());
+  }
+  SmallVector<FAMEModelControlPlan, 0> controls;
+  for (auto &model : models) {
+    FAMEModelControlPlan control; control.model = model.op;
+    if (hub && model.op == hub->op) { control.clockChannel = clockLocal; control.clocks = hubControls; }
+    else {
+      auto clock = constructFAMEVirtualClockControls(circuit, model.op, model.targetClock, error);
+      if (!clock) return failure(); control.clocks.push_back(*clock);
+    }
+    for (const auto &assignment : model.assignments)
+      control.channels.push_back({assignment.localName, assignment.direction,
+          assignment.hasClockDomain ? std::optional<std::string>(assignment.modelClockName) : std::nullopt});
+    for (const auto &out : model.selection.outputs) control.dependencies.push_back(out.dependency);
+    controls.push_back(std::move(control));
+  }
+  // Keep the clock constructor's schema-aware annotation transfers. Apply
+  // captured data renames only after all shared instances have their new ABI.
+  std::set<std::pair<std::string, std::string>> rewritten;
+  for (const auto &endpoint : endpoints) {
+    bool definition = rewritten.insert({endpoint.model, endpoint.local}).second;
+    auto current = captureChannelRewriteConnections(top);
+    auto model = find(circuit, endpoint.model); auto live = instance(top, endpoint.instance);
+    SmallVector<unsigned> indices;
+    // The definition can already have collapsed a grouped channel while this
+    // independent instance still has its original leaf ports. Resolve physical
+    // indices from that live instance rather than from the rewritten definition.
+    for (const auto &old : endpoint.oldPorts)
+      for (unsigned i = 0; live && i < live.getNumResults(); ++i)
+        if (live.getPortNameStr(i) == old) indices.push_back(i);
+    if (!live || indices.size() != endpoint.oldPorts.size()) return reject("lost data channel during shared-instance rewrite");
+    ModelPortGroup group{endpoint.local, model, endpoint.direction, std::nullopt, indices};
+    ModelChannelBinding binding{endpoint.global, &group, live, indices};
+    FAMETopChannelPort channel{&binding, endpoint.topPort, endpoint.type};
+    if (failed(endpoint.direction == Direction::In ? rewriteFAMEInputChannel(current, channel, error, definition)
+                                                   : rewriteFAMEOutputChannel(current, channel, error, definition))) return failure();
+  }
+  rewriteTopPassthroughs(top, *passthroughs);
+  std::function<Attribute(Attribute)> rename = [&](Attribute attr) -> Attribute {
+    if (auto s = dyn_cast<StringAttr>(attr)) { auto i = renames.find(s.getValue().str()); return i == renames.end() ? attr : StringAttr::get(circuit.getContext(), i->second); }
+    if (auto a = dyn_cast<ArrayAttr>(attr)) { SmallVector<Attribute> values; for (auto v : a) values.push_back(rename(v)); return ArrayAttr::get(circuit.getContext(), values); }
+    if (auto d = dyn_cast<DictionaryAttr>(attr)) { NamedAttrList values; for (auto v : d) values.set(v.getName(), rename(v.getValue())); return values.getDictionary(circuit.getContext()); }
+    return attr;
+  };
+  SmallVector<Attribute> annotations;
+  for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    Annotation anno(attr); annotations.push_back(anno.isClass(AnnotationClasses::InternalFpgaDebug) ? attr : rename(attr));
+  }
+  circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), annotations));
+  for (const auto &[oldTarget, payload] : renames)
+    if (failed(transferFAMEPortDebugTargets(circuit, oldTarget, payload, error))) return failure();
+  if (failed(rewriteFAMEModelControls(circuit, controls, error))) return failure();
+  for (auto &model : models) {
+    // SFC keeps unused clock outputs as local wires in every transformed
+    // definition, including virtual-clock memory and combinational models.
+    // All retained instances must reach the shared clock-free ABI together.
+    SmallVector<StringRef> instanceNames;
+    for (const auto &name : model.instances) instanceNames.push_back(name);
+    if (failed(internalizeFAMEOutputClocks(top, model.op, instanceNames, error)))
+      return failure();
+    SmallVector<StringRef> unused; for (const auto &p : model.unusedOutputs) unused.push_back(p);
+    if (failed(internalizeFAMEUnusedOutputs(circuit, model.op, unused, error)) ||
+        failed(groupFAMEChannelPorts(top, model.op, model.instances.front(),
+             hub && model.op == hub->op ? clockLocal + "_sink" : "", error))) return failure();
+  }
+  if (failed(removeFAMEStaleTopClocks(top, error))) return failure();
+  for (const auto &model : models)
+    for (const auto &[name, metadata] : model.instanceMetadata) {
+      auto retained = instance(top, name);
+      auto definition = model.op;
+      if (!retained || retained.getModuleName() != definition.getName())
+        return reject("lost retained model instance identity");
+      for (auto attr : metadata) retained->setAttr(attr.getName(), attr.getValue());
+    }
+  // Thread complete FAME hardware while the canonical model/top channel ABI is
+  // still present. SimWrapper queues and target-clock conversion must follow
+  // grouping; doing this after transport would bank queue state and lose the
+  // logical-to-physical model schedule.
+  if (enableMultiThreading) {
+    // SFC establishes residual fanout before grouping. These annotations name
+    // unchanged logical top endpoints, never the shared physical model ports.
+    if (failed(addRemainingFanoutAnnotations(circuit, error))) return failure();
+    if (failed(multiThreadFAME5Models(circuit, result.threadedGroups, error,
+                                    threadingClocks))) return failure();
+    if (auto allocation = circuit->getAttrOfType<ArrayAttr>("goldengate.fame5.groups"))
+      for (auto group : allocation)
+        result.sharedThreads += cast<DictionaryAttr>(group).getAs<IntegerAttr>("threads").getInt();
+  }
+  if (withTransport && ((!enableMultiThreading && failed(addRemainingFanoutAnnotations(circuit, error))) ||
+      failed(addFAMEBoundaryPipeChannels(circuit, error)) || failed(addFAMEPipeWrapper(circuit, error)) ||
+      failed(addFAMEBoundaryReadyValidChannels(circuit, error)) || failed(addFAMEClockChannel(circuit, error)) ||
+      failed(activateFAMEPipeWrapper(circuit, error)))) return failure();
+  result.definitions = models.size(); result.clockDomains = domains.size(); result.dataEndpoints = endpoints.size();
+  for (const auto &model : models) result.instances += model.instances.size();
+  return success();
+}
+} // namespace
+LogicalResult goldengate::rewriteFAMEModelGraph(CircuitOp circuit,
+    FAMEModelGraphResult &result, std::string &error, bool withTransport,
+    bool enableMultiThreading, FAME5ClockSemantics threadingClocks) {
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  FAMEModelGraphResult count;
+  if (failed(rewrite(*staged, count, error, withTransport, enableMultiThreading, threadingClocks))) return failure();
+  if (failed(verify(*staged))) { error = "FAME model graph produced invalid FIRRTL IR"; return failure(); }
+  circuit->setAttrs((*staged)->getAttrs()); circuit.getBody().takeBody(staged->getBody()); result = count;
+  return success();
+}

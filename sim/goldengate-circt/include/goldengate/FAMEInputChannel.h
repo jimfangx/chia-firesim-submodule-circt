@@ -107,6 +107,13 @@ mlir::LogicalResult removeFAMEVirtualClockPort(
 mlir::LogicalResult internalizeFAMEOutputClocks(
     circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
     llvm::StringRef instanceName, std::string &error);
+// All-instance form validates the complete definition-use set before mutation.
+// It creates one local clock wire per definition and removes every promoted
+// alias port together, retaining each independent instance's other ports.
+mlir::LogicalResult internalizeFAMEOutputClocks(
+    circt::firrtl::FModuleOp top, circt::firrtl::FModuleOp model,
+    llvm::ArrayRef<llvm::StringRef> instanceNames, std::string &error);
+
 
 // Outputs absent from the model channel graph (e.g. promoted passthroughs)
 // become same-name internal wires, preserving their model-side assignments.

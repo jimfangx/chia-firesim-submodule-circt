@@ -389,6 +389,38 @@ void run(MLIRContext &context, unsigned rejection) {
 // Reproduce that boundary: WrapTop creates scalar external leaves, while the
 // model still has an aggregate port. The second lowering must expose every
 // leaf to InferModelPorts and preserve its original combinational dependency.
+// Only known target schemas follow the circuit rename. The module/instance
+// portion must stay intact so ExtractModel can subsequently promote it.
+void wrappedThreadingSelections(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top() { firrtl.instance model @Worker() }
+      firrtl.module private @Worker() {}
+    }
+  })mlir", &context);
+  require(bool(root), "WrapTop threading fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context);
+  SmallVector<Attribute> annotations;
+  for (StringRef kind : {StringRef(AnnotationClasses::FAMEModel),
+                         StringRef(AnnotationClasses::EnableModelMultiThreading),
+                         StringRef("test.UnknownTarget")})
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(kind)),
+        b.getNamedAttr("target", b.getStringAttr("~Top|Top/model:Worker"))}));
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  std::string error;
+  require(succeeded(goldengate::wrapTop(circuit, error)), error);
+  auto rewritten = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  for (unsigned i = 0; i < 3; ++i) {
+    Annotation annotation(rewritten[i]);
+    require(annotation.getMember<StringAttr>("target").getValue() ==
+                (i == 2 ? "~Top|Top/model:Worker" : "~FAMETop|Top/model:Worker"),
+            "WrapTop changed the instance path or mishandled known selector schemas");
+  }
+  require(succeeded(verify(*root)), "wrapped threading selections invalid");
+}
+
 void newlySynthesizedPrintBundle(MLIRContext &context) {
   auto root = parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "PrintTarget" {
@@ -691,6 +723,7 @@ int main(int argc, char **argv) {
     for (unsigned rejection = 0; rejection <= 22; ++rejection) run(context, rejection);
     for (unsigned rejection = 0; rejection <= 7; ++rejection)
       multiportAliases(context, rejection);
+    wrappedThreadingSelections(context);
     newlySynthesizedPrintBundle(context);
     remoteModelClock(context);
     sharedHostControls(context);

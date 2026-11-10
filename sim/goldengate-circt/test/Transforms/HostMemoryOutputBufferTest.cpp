@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/HostMemoryOutputBuffer.h"
+#include "HostMemoryProfileChecks.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "mlir/IR/Builders.h"
@@ -261,6 +262,7 @@ int main(int argc,char **argv) {
       llvm::outs()<<"PASS expanded Print buffer SSA, all queue states and five independent channels\n";
       return 0;
     }
+    checkHostMemoryProfiles(ctx,[&](){return fixture(ctx);},goldengate::addHostMemoryOutputBuffer);
     auto root=fixture(ctx);auto circuit=*root->getOps<CircuitOp>().begin();
     auto wrapper=top(circuit,"GGHostMemoryReadResponseWrapper");auto annotations=circuit->getAttr("rawAnnotations");
     std::map<std::string,std::string> before;for(auto m:circuit.getOps<FModuleOp>())if(m!=wrapper)before[m.getName().str()]=dump(m);

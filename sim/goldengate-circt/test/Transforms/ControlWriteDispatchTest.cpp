@@ -15,16 +15,16 @@ using namespace circt::firrtl;
 namespace {
 void require(bool ok,llvm::StringRef s){if(!ok)throw std::runtime_error(s.str());}
 FModuleOp named(CircuitOp c,llvm::StringRef n){for(auto m:c.getOps<FModuleOp>())if(m.getName()==n)return m;throw std::runtime_error("missing module");}
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned slaveCount=11) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned slaveCount=11, unsigned addressBits=25) {
   OpBuilder b(&ctx);auto loc=b.getUnknownLoc();auto root=ModuleOp::create(loc);b.setInsertionPointToStart(root.getBody());
   auto c=b.create<CircuitOp>(loc,b.getStringAttr("GGControlWriteRouteWrapper"));b.setInsertionPointToStart(c.getBodyBlock());
   SmallVector<PortInfo> ports;auto add=[&](llvm::StringRef n,unsigned w,Direction d){ports.push_back({b.getStringAttr(n),UIntType::get(&ctx,w,false),d});};
   ports.push_back({b.getStringAttr("hostClock"),ClockType::get(&ctx),Direction::In});add("hostReset",1,Direction::In);
   for(auto n:{"ctrl_decode_aw_route","ctrl_write_route_w_route"})add(n,slaveCount,Direction::Out);
-  add("ctrl_decode_aw_addr",25,Direction::In);
+  add("ctrl_decode_aw_addr",addressBits,Direction::In);
   for(auto n:{"ctrl_write_route_aw_slave_valid","ctrl_write_route_w_slave_valid","ctrl_error_aw_ready","ctrl_error_w_ready"})add(n,1,Direction::Out);
   for(auto n:{"ctrl_write_route_w_last","ctrl_write_route_aw_slave_ready","ctrl_write_route_w_slave_ready","ctrl_error_aw_valid","ctrl_error_w_valid","ctrl_error_w_bits_last"})add(n,1,Direction::In);
-  add("ctrl_error_aw_bits_addr",25,Direction::In);add("ctrl_error_aw_bits_id",12,Direction::In);add("other",8,Direction::Out);
+  add("ctrl_error_aw_bits_addr",addressBits,Direction::In);add("ctrl_error_aw_bits_id",12,Direction::In);add("other",8,Direction::Out);
   b.create<FModuleOp>(loc,b.getStringAttr("GGControlWriteRouteWrapper"),ConventionAttr::get(&ctx,Convention::Internal),ports);
   auto decoder=b.create<FModuleOp>(loc,b.getStringAttr("GGControlAddressDecode"),ConventionAttr::get(&ctx,Convention::Internal),ArrayRef<PortInfo>{});
   SmallVector<Attribute> rows(slaveCount,b.getDictionaryAttr({}));decoder->setAttr("goldengate.controlRegions",b.getArrayAttr(rows));
@@ -50,13 +50,13 @@ struct Interpreter {
     memo[v]=n;return n;
   }
 };
-void behavior(MLIRContext &ctx, unsigned slaveCount) {
-  auto root=fixture(ctx,slaveCount);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx, unsigned slaveCount, unsigned addressBits=25) {
+  auto root=fixture(ctx,slaveCount,addressBits);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addControlWriteDispatch(c,error)),error);require(succeeded(verify(*root)),"dispatch IR invalid");
   Interpreter sim(named(c,"GGControlWriteDispatch"));std::mt19937_64 rng(178);unsigned cases=0;
   auto sample=[&](uint64_t ar,uint64_t wr,bool av,bool wv,uint64_t awr,uint64_t wwr){
     sim.memo.clear();std::map<std::string,uint64_t>input{{"aw_route",ar},{"w_route",wr},{"aw_valid",av},{"w_valid",wv}};
-    for(auto [n,width]:std::map<std::string,unsigned>{{"master_aw_bits_addr",25},{"master_aw_bits_len",8},{"master_aw_bits_id",12},{"master_w_bits_data",32},{"master_w_bits_last",1}})input[n]=rng()&((1ULL<<width)-1);
+    for(auto [n,width]:std::map<std::string,unsigned>{{"master_aw_bits_addr",addressBits},{"master_aw_bits_len",8},{"master_aw_bits_id",12},{"master_w_bits_data",32},{"master_w_bits_last",1}})input[n]=rng()&((1ULL<<width)-1);
     for(unsigned i=0;i<=slaveCount;++i) {
       std::string p=(i==slaveCount?"err_slave":"slave_"+std::to_string(i))+std::string("_");input[p+"aw_ready"]=(awr>>i)&1;input[p+"w_ready"]=(wwr>>i)&1;
     }
@@ -93,8 +93,8 @@ void behavior(MLIRContext &ctx, unsigned slaveCount) {
   sample(routeMask,routeMask,true,true,readyMask,readyMask);
   llvm::outs()<<slaveCount<<" slaves: "<<cases<<" payload/readiness/valid cases passed, including independent AW/W routes and multi-bit priority\n";
 }
-void mapping(MLIRContext &ctx, unsigned slaveCount) {
-  auto root=fixture(ctx,slaveCount);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void mapping(MLIRContext &ctx, unsigned slaveCount, unsigned addressBits=25) {
+  auto root=fixture(ctx,slaveCount,addressBits);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   auto old=named(c,"GGControlWriteRouteWrapper");require(succeeded(goldengate::addControlWriteDispatch(c,error)),error);
   auto top=named(c,"GGControlWriteDispatchWrapper"),helper=named(c,"GGControlWriteDispatch");
   require(old.getNumPorts()==18&&top.getNumPorts()==14+9*slaveCount&&helper.getNumPorts()==20+9*slaveCount,"wrong port count");
@@ -136,4 +136,4 @@ void rejection(MLIRContext &ctx) {
   llvm::outs()<<"Mapping and fourteen atomic rejection cases passed\n";
 }
 }
-int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for(unsigned n:{1,2,11,12,13,14,63}){behavior(ctx,n);mapping(ctx,n);}rejection(ctx);return 0;}catch(const std::exception&e){llvm::errs()<<e.what()<<'\n';return 1;}}
+int main(){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();for(unsigned n:{1,2,11,12,13,14,63}){behavior(ctx,n);mapping(ctx,n);}behavior(ctx,3,32);mapping(ctx,3,32);rejection(ctx);return 0;}catch(const std::exception&e){llvm::errs()<<e.what()<<'\n';return 1;}}

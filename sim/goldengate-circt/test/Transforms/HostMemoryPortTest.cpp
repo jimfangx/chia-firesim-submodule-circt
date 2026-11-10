@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/HostMemoryOutputBuffer.h"
+#include "HostMemoryProfileChecks.h"
 #include "goldengate/HostMemoryPort.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
@@ -155,6 +156,7 @@ int main(int argc,char **argv) {
       require(succeeded(verify(*mixed)),"mixed connect forms invalid");bindings(mc);
     }
     llvm::outs()<<"PASS unique ordinary/strict clock and reset combinations\n";
+    checkHostMemoryProfiles(ctx,[&](){return fixture(ctx);},goldengate::specializeHostMemoryPort);
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
     std::map<std::string,std::string> before;for(auto m:c.getOps<FModuleOp>())before[m.getName().str()]=dump(m);
     require(succeeded(goldengate::specializeHostMemoryPort(c,error)),error);require(succeeded(verify(*root)),"invalid platform IR");

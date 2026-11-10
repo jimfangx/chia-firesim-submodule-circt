@@ -1,5 +1,5 @@
 // See LICENSE for license details.
-// Requires: uninstantiated widget MCRFile wrapper, exact U250 Nasti ports,
+// Requires: uninstantiated widget MCRFile wrapper, matching platform Nasti ports,
 // retained annotations and an ordered, unique 1..63-region decoder catalog.
 // Widget.scala zips sortedWidgets with the interconnect slaves. Resolve the
 // widget by catalog name: adding a larger bank can move its slot and address.
@@ -13,6 +13,7 @@
 // are consumed or produced. Retained targets follow wrapper identity.
 // These bindings add no state and preserve host clock/reset and tracker wiring.
 #include "goldengate/SimulationMasterControl.h"
+#include "goldengate/ControlPortWidth.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 #include <map>
@@ -40,10 +41,11 @@ LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
   if (!inner || !raw || !regions || regions.empty() || regions.size() > 63)
     return reject("widget binding needs retained annotations and one to 63 regions");
-  // Validate the whole decoder contract before selecting a slave or mutating
-  // IR. Bounds match addControlAddressDecode's half-open 25-bit byte ranges;
-  // this binding does not independently reallocate or resize register banks.
-  constexpr uint64_t addressLimit = uint64_t(1) << 25;
+  auto addressWidth = goldengate::controlPortWidth(inner, spec.controlPort.str()+".aw.bits.addr");
+  if (!addressWidth) return reject("widget control address width is missing or unsupported");
+  const unsigned addressBits = *addressWidth;
+  // Validate the entire catalog against the typed control address space.
+  const uint64_t addressLimit = uint64_t(1) << addressBits;
   std::set<std::string> names;
   SmallVector<std::pair<uint64_t, uint64_t>> ranges;
   unsigned slaveIndex = regions.size();
@@ -84,7 +86,7 @@ LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   struct Field { const char *name; unsigned width; };
-  const Field addresses[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
+  const Field addresses[]{{"addr",addressBits},{"len",8},{"size",3},{"burst",2},{"lock",1},
     {"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
   const Field data[]{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}};
   const Field responses[]{{"resp",2},{"id",12},{"user",1}};
@@ -237,7 +239,7 @@ LogicalResult goldengate::bindFASEDBridgeControl(CircuitOp circuit,
        "fasedBridge_ctrl", "FASEDMemoryTimingModel_0", "goldengate.fasedSlave"}, error);
 }
 
-// Requires: an uninstantiated completed binding stage and exact U250 master
+// Requires: an uninstantiated completed binding stage and matching platform master
 // request/response boundaries. The default entry requires all platform widgets;
 // the explicit selected-host entry follows complete request/response binding.
 // Widget.scala connects the host master to the
@@ -271,10 +273,13 @@ LogicalResult goldengate::bindControlMaster(CircuitOp circuit,
   if(!inner||!raw)return reject("control master requires retained annotations and active top");
   bool used=false;circuit.walk([&](InstanceOp i){used|=i.getModuleName()==inputName;});
   if(used)return reject("control master requires an uninstantiated top");
+  auto addressWidth = controlPortWidth(inner, "ctrl_decode_aw_addr");
+  if (!addressWidth) return reject("control master requires a typed AW address boundary");
+  const unsigned addressBits = *addressWidth;
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};
   struct Field {const char *name;unsigned width;};
-  const Field addresses[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
+  const Field addresses[]{{"addr",addressBits},{"len",8},{"size",3},{"burst",2},{"lock",1},
     {"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
   const Field data[]{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}};
   const Field responses[]{{"resp",2},{"id",12},{"user",1}};

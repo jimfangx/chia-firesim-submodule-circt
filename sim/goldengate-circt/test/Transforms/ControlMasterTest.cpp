@@ -17,14 +17,14 @@ void require(bool v,llvm::StringRef s){if(!v)throw std::runtime_error(s.str());}
 std::string dump(ModuleOp m){std::string s;llvm::raw_string_ostream os(s);m.print(os);return s;}
 FModuleOp top(CircuitOp c,llvm::StringRef n){for(auto m:c.getOps<FModuleOp>())if(m.getName()==n)return m;throw std::runtime_error("missing module");}
 struct Pin {std::string name,channel,leaf;unsigned width;bool input;};
-std::vector<Pin> pins(){
+std::vector<Pin> pins(unsigned addressBits=25){
   std::vector<Pin> p;
   for(auto ch:{"aw","w","b","r"}) {
     bool request=StringRef(ch)=="aw"||StringRef(ch)=="w";
     std::string prefix=request?"ctrl_write_route_"+std::string(ch):"ctrl_"+std::string(StringRef(ch)=="r"?"read":"write")+"_arb_out";
     p.push_back({prefix+"_ready",ch,"ready",1,!request});
     p.push_back({prefix+"_valid",ch,"valid",1,request});
-    const std::pair<const char*,unsigned> aw[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},{"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
+    const std::pair<const char*,unsigned> aw[]{{"addr",addressBits},{"len",8},{"size",3},{"burst",2},{"lock",1},{"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
     const std::pair<const char*,unsigned> w[]{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}};
     const std::pair<const char*,unsigned> b[]{{"resp",2},{"id",12},{"user",1}};
     const std::pair<const char*,unsigned> r[]{{"resp",2},{"data",32},{"last",1},{"id",12},{"user",1}};
@@ -38,15 +38,15 @@ std::vector<Pin> pins(){
   }
   return p;
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0, llvm::StringRef inputName="GGFASEDBridgeBoundWrapper"){
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0, llvm::StringRef inputName="GGFASEDBridgeBoundWrapper", unsigned addressBits=25){
   std::string s="module { firrtl.circuit \"GGFASEDBridgeBoundWrapper\" { firrtl.module @GGFASEDBridgeBoundWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %diagnostic: !firrtl.uint<4>";
-  for(auto p:pins()) {
+  for(auto p:pins(addressBits)) {
     if(bad==1&&p.name=="ctrl_write_route_w_last")continue;
     if(bad==2&&p.name=="ctrl_write_dispatch_master_aw_bits_id")p.width=11;
     if(bad==3&&p.name=="ctrl_read_arb_out_ready")p.input=false;
     s+=", "+std::string(p.input?"in":"out")+" %"+p.name+": !firrtl.uint<"+std::to_string(p.width)+">";
   }
-  s+=", in %ctrl_read_dispatch_master_ar: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>>";
+  s+=", in %ctrl_read_dispatch_master_ar: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<addr: uint<"+std::to_string(addressBits)+">, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>>";
   if(bad==4)s+=", in %ctrl: !firrtl.uint<1>";
   s+=") {} } }";
   if(bad==9)s.replace(s.find("user: uint<1>>>"),std::string("user: uint<1>>>").size(),"user: uint<2>>>");
@@ -70,8 +70,9 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0, llvm::StringRef i
 int main(){
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
   try {
+    for (unsigned addressBits : {25u,32u})
     for (llvm::StringRef inputName : {"GGFASEDBridgeBoundWrapper", "GGControlWriteTrackerWrapper"}) {
-    auto root=fixture(ctx, 0, inputName);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+    auto root=fixture(ctx, 0, inputName,addressBits);auto c=*root->getOps<CircuitOp>().begin();std::string error;
     auto inner=top(c,inputName);std::string before;llvm::raw_string_ostream out(before);inner.print(out);
     auto unbound = dump(*root);
     require(failed(goldengate::bindControlMaster(c, "UnexpectedStage", error)) && dump(*root) == unbound,
@@ -92,7 +93,7 @@ int main(){
     };
     std::map<std::string,std::string> actual,expected;
     for(auto x:m.getOps<StrictConnectOp>())require(actual.emplace(key(x.getDest()),key(x.getSrc())).second,"duplicate driver");
-    for(auto p:pins()) {
+    for(auto p:pins(addressBits)) {
       auto outside="ctrl."+p.channel+"."+p.leaf,inside="sim_"+p.name;
       expected[p.input?inside:outside]=p.input?outside:inside;
     }
@@ -111,7 +112,7 @@ int main(){
       require(target.contains(i==0?"|GGControlMasterWrapper>":"|"+inputName.str()+">"),"internalized target escaped");
     }
     auto good=dump(*root);require(failed(goldengate::bindControlMaster(c,error))&&dump(*root)==good,"repeat mutated IR");
-    for(unsigned bad=1;bad<=10;++bad){auto r=fixture(ctx,bad,inputName);auto c=*r->getOps<CircuitOp>().begin();auto original=dump(*r);require(failed(goldengate::bindControlMaster(c,inputName,error)),"invalid boundary accepted");require(original==dump(*r),"rejection mutated IR");}
+    for(unsigned bad=1;bad<=10;++bad){auto r=fixture(ctx,bad,inputName,addressBits);auto c=*r->getOps<CircuitOp>().begin();auto original=dump(*r);require(failed(goldengate::bindControlMaster(c,inputName,error)),"invalid boundary accepted");require(original==dump(*r),"rejection mutated IR");}
     }
     llvm::outs()<<"Control master: both assembly stages, 32 scalar and aggregate AR connections, copied clocks, target transfer and 26 atomic rejections passed\n";
     return 0;

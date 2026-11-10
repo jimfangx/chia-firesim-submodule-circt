@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FPGATopShell.h"
+#include "llvm/ADT/APSInt.h"
 #include "goldengate/F1Shim.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/AnnotationEmission.h"
@@ -13,6 +14,7 @@
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include <algorithm>
+#include <functional>
 #include <map>
 #include <stdexcept>
 using namespace mlir;
@@ -57,9 +59,37 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
   }
   return root;
 }
-void checkShim(CircuitOp c,unsigned oldAnnotations) {
+void checkShim(CircuitOp c,unsigned oldAnnotations, bool isF2=false) {
   auto shim=top(c,"F1Shim");
-  require(c.getName()=="F1Shim"&&shim.getNumPorts()==8,"shim schema");
+  require(c.getName()=="F1Shim"&&shim.getNumPorts()==(isF2?6u:8u),"shim schema");
+  if (isF2) {
+    unsigned pcim=0;
+    for (auto p:shim.getPorts()) {
+      require(!p.name.getValue().starts_with("io_qsfp"),"F2 exposed physical QSFP");
+      if (p.name.getValue()!="io_pcim") continue;
+      ++pcim;
+      auto channels=cast<BundleType>(p.type);
+      for(auto name:{"aw","ar","w","b","r"}) {
+        auto ch=cast<BundleType>(channels.getElement(name)->type);
+        auto bits=cast<BundleType>(ch.getElement("bits")->type);
+        require(cast<UIntType>(bits.getElement("id")->type).getWidth()==6,"F2 physical PCIM ID width");
+        if(StringRef(name)=="aw"||StringRef(name)=="ar")
+          require(cast<UIntType>(bits.getElement("addr")->type).getWidth()==64,"F2 physical PCIM address width");
+        if(StringRef(name)=="w"||StringRef(name)=="r")
+          require(cast<UIntType>(bits.getElement("data")->type).getWidth()==512,"F2 physical PCIM data width");
+      }
+    }
+    require(pcim==1,"F2 physical PCIM count");
+    unsigned invalids=0, inactive=0;
+    shim.walk([&](InvalidValueOp){++invalids;});
+    shim.walk([&](StrictConnectOp c){
+      auto field=c.getDest().getDefiningOp<SubfieldOp>();
+      if(!field || (field.getFieldName()!="valid" && field.getFieldName()!="ready"))return;
+      auto zero=c.getSrc().getDefiningOp<ConstantOp>();
+      if(zero && zero.getValue().isZero())++inactive;
+    });
+    require(invalids==3 && inactive==5,"inactive F2 PCIM requests and responses");
+  }
   unsigned regs=0;
   for(auto r:shim.getOps<RegResetOp>()) {
     require(cast<UIntType>(r.getResult().getType()).getWidth()==12,"request counter width");
@@ -76,17 +106,17 @@ void checkShim(CircuitOp c,unsigned oldAnnotations) {
   auto paths=cast<DictionaryAttr>(ann[ann.size()-1]);
   require(paths.getAs<StringAttr>("class").getValue()==goldengate::AnnotationClasses::XDCPaths&&
           paths.getAs<StringAttr>("preLinkPath").getValue()=="firesim_top"&&
-          paths.getAs<StringAttr>("postLinkPath").getValue()=="firesim_top","U250 XDC paths");
+          paths.getAs<StringAttr>("postLinkPath").getValue()==(isF2?"WRAPPER/CL/firesim_top":"firesim_top"),"platform XDC paths");
   unsigned sources=0;for(auto a:ann){auto d=cast<DictionaryAttr>(a);if(d.getAs<StringAttr>("class").getValue()==goldengate::AnnotationClasses::HostClockSource){require(d.getAs<StringAttr>("target").getValue()=="~F1Shim|FPGATop>clock","retained host clock identity");++sources;}}
   require(sources==1,"host source count");
 }
-void applyShim(CircuitOp c) {
+void applyShim(CircuitOp c, bool isF2=false) {
   std::string error;
   std::map<std::string,std::string> bodies;for(auto m:c.getOps<FModuleOp>())bodies[m.getName().str()]=dump(m);
   auto count=c->getAttrOfType<ArrayAttr>("rawAnnotations").size();
-  require(succeeded(goldengate::assembleF1Shim(c,error)),error);
+  require(succeeded(goldengate::assembleF1Shim(c,error,isF2)),error);
   require(succeeded(verify(c)),"invalid shim IR");
-  checkShim(c,count);
+  checkShim(c,count,isF2);
   for(auto [n,s]:bodies)require(dump(top(c,n))==s,"retained body changed");
 }
 void emitCollateral(CircuitOp c,StringRef boundary) {
@@ -117,8 +147,33 @@ void emitCollateral(CircuitOp c,StringRef boundary) {
   require(succeeded(goldengate::emitAllAnnotations(c,json,error)),error);
   llvm::outs()<<"DDR collateral emitted; five invalid file sets rejected before writes\n";
 }
-void writeStub(CircuitOp c,StringRef name) {
+void writeStub(CircuitOp c,StringRef name, bool selfContained=false) {
   std::error_code ec;llvm::raw_fd_ostream os(name,ec);require(!ec,"cannot write fixture");
+  if (selfContained) {
+    // A passive typed stand-in permits standalone HDL syntax checks without
+    // conflating this shell test with target/bridge semantic equivalence.
+    auto child=cast<FModuleOp>(top(c,"FPGATop")->clone());
+    auto *body=child.getBodyBlock();
+    while(!body->empty())body->back().erase();
+    OpBuilder b(c.getContext());b.setInsertionPointToEnd(body);
+    std::function<void(Value,bool)> cap=[&](Value value,bool output) {
+      if(auto fields=dyn_cast<BundleType>(value.getType())) {
+        for(auto field:fields.getElements())
+          cap(b.create<SubfieldOp>(c.getLoc(),value,field.name.getValue()),output!=field.isFlip);
+      } else if(output)
+        b.create<StrictConnectOp>(c.getLoc(),value,b.create<InvalidValueOp>(c.getLoc(),value.getType()));
+    };
+    for(auto [i,p]:llvm::enumerate(child.getPorts())) cap(body->getArgument(i),p.direction==Direction::Out);
+    // Attach both modules before printing: the FIRRTL custom printer needs
+    // the parent circuit to preserve port names and signature locations.
+    auto stub=ModuleOp::create(c.getLoc());
+    b.setInsertionPointToStart(stub.getBody());
+    auto stubCircuit=b.create<CircuitOp>(c.getLoc(),b.getStringAttr("F1Shim"));
+    stubCircuit.getBodyBlock()->push_back(child);
+    stubCircuit.getBodyBlock()->push_back(top(c,"F1Shim")->clone());
+    require(succeeded(verify(stub)),"invalid standalone F2 shell fixture");
+    stub.print(os);os<<"\n";stub.erase();return;
+  }
   auto child=dump(top(c,"FPGATop"));child=child.substr(0,child.find(" {"));
   replace(child,"firrtl.module @","firrtl.extmodule private @");
   child.erase(std::remove(child.begin(),child.end(),'%'),child.end());
@@ -147,6 +202,18 @@ int main(int argc,char **argv) {
     }
     auto make=[&](){auto r=fixture(ctx);auto c=*r->getOps<CircuitOp>().begin();require(succeeded(goldengate::assembleFPGATopShell(c,error)),error);return r;};
     auto root=make();auto c=*root->getOps<CircuitOp>().begin();applyShim(c);
+    auto f2=fixture(ctx);
+    auto f2text=dump(*f2);
+    while(f2text.find("uint<25>")!=std::string::npos) replace(f2text,"uint<25>","uint<32>");
+    f2=parseSourceString<ModuleOp>(f2text,&ctx);require(bool(f2),"F2 fixture parse");
+    auto f2c=*f2->getOps<CircuitOp>().begin();
+    auto f2before=dump(*f2);
+    require(failed(goldengate::assembleFPGATopShell(f2c,error))&&f2before==dump(*f2),"F2 contract accepted as U250");
+    require(succeeded(goldengate::assembleFPGATopShell(f2c,error,true)),error);
+    f2before=dump(*f2);
+    require(failed(goldengate::assembleF1Shim(f2c,error))&&f2before==dump(*f2),"F2 shim accepted as U250");
+    applyShim(f2c,true);
+    llvm::outs()<<"F2 F1Shim: 32-bit control addresses, no physical QSFP, inactive 64/512/6 PCIM, AWS post-link hierarchy\n";
     for(unsigned mode=0;mode<11;++mode) {
       auto test=make();auto tc=*test->getOps<CircuitOp>().begin();OpBuilder b(&ctx);auto m=top(tc,"FPGATop");
       if(mode==0)tc.setName("Wrong");
@@ -163,6 +230,7 @@ int main(int argc,char **argv) {
     }
     auto before=dump(*root);require(failed(goldengate::assembleF1Shim(c,error)),"repeat accepted");require(before==dump(*root),"repeat changed IR");
     llvm::outs()<<"U250 F1Shim, two 12-bit host counters, retained bodies/clock identity; 12 atomic rejections\n";
+    if(argc==3&&StringRef(argv[1])=="--f2"){writeStub(f2c,argv[2],true);emitCollateral(f2c,argv[2]);return 0;}
     if(argc>=3){auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"real parse");auto rc=*real->getOps<CircuitOp>().begin();applyShim(rc);writeStub(rc,argv[1]);emitCollateral(rc,argv[1]);llvm::outs()<<"Real Rocket F1Shim: 8 aggregate ports; old bodies retained; DDR output annotation added\n";}
     else if(argc>=2){writeStub(c,argv[1]);emitCollateral(c,argv[1]);}
     return 0;

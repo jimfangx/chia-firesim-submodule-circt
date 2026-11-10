@@ -10,6 +10,7 @@
 #include "mlir/Pass/PassManager.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "goldengate/CPUStreamWrite.h"
+#include "goldengate/CPUStreamRead.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/LabelSRAMModels.h"
 #include "goldengate/SRAMModelChannels.h"
@@ -30,7 +31,12 @@
 #include "goldengate/RocketDriverHeader.h"
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/NICHeader.h"
+#include "goldengate/NICLoopbackControl.h"
+#include "goldengate/DeduplicateModels.h"
 #include "goldengate/FASEDHeader.h"
+#include "goldengate/FASEDFRFCFSBridge.h"
+#include "goldengate/FASEDFRFCFSBridgeMMIO.h"
+#include "goldengate/FASEDFRFCFSMMIO.h"
 #include "goldengate/XDCEmission.h"
 #include "goldengate/XilinxHostSpecialization.h"
 #include "goldengate/SimulatorRTL.h"
@@ -39,6 +45,10 @@
 #include "goldengate/AutoILAWiring.h"
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AutoCounterPrintfValues.h"
+#include "goldengate/AutoCounterSynthesis.h"
+#include "goldengate/AutoCounterPipeline.h"
+#include "goldengate/AutoCounterControl.h"
+#include "goldengate/InstrumentationControl.h"
 #include "goldengate/PrintStubs.h"
 #include "llvm/ADT/StringSet.h"
 #include <functional>
@@ -59,6 +69,12 @@
 #include "goldengate/ExtractModel.h"
 #include "goldengate/WrapTop.h"
 #include "goldengate/LabelMultiThreadedInstances.h"
+#include "goldengate/FAME5ThreadedState.h"
+#include "goldengate/FAME5Models.h"
+#include "goldengate/FAMEModelControls.h"
+#include "goldengate/FAMEModelGraph.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "goldengate/AutoCounterBridge.h"
 #include "goldengate/LowerTypes.h"
 #include "goldengate/CoerceAsyncToSyncReset.h"
 #include "goldengate/ChannelExcision.h"
@@ -179,6 +195,24 @@ static int fail(llvm::StringRef message) {
   return 1;
 }
 
+// Intermediate MLIR is diagnostic output, never an input to a later pass.
+// Avoid both serialization and empty placeholder files in normal compilation.
+static std::error_code emitDebugSnapshot(mlir::Operation *module,
+                                        llvm::StringRef path, bool enabled,
+                                        bool appendNewline = true) {
+  if (!enabled)
+    return {};
+  std::error_code ec;
+  llvm::raw_fd_ostream out(path, ec);
+  if (ec)
+    return ec;
+  module->print(out);
+  if (appendNewline)
+    out << '\n';
+  out.close();
+  return {};
+}
+
 static mlir::LogicalResult emitAutoILAAnalysis(CircuitOp circuit,
     llvm::StringRef outputDir, std::string &error) {
   llvm::SmallVector<goldengate::AutoILAProbe> probes;
@@ -247,6 +281,24 @@ int main(int argc, char **argv) {
   bool wrapTop = argc == 7 && llvm::StringRef(argv[6]) == "--wrap-top";
   bool updateBridgeClocks =
       argc == 7 && llvm::StringRef(argv[6]) == "--update-bridge-clocks";
+  bool xilinxFAME5Models = argc == 7 &&
+      llvm::StringRef(argv[6]) == "--multi-thread-fame5-models-xilinx";
+  bool multiThreadFAME5Models = xilinxFAME5Models || (argc == 7 &&
+      llvm::StringRef(argv[6]) == "--multi-thread-fame5-models");
+  bool graphBoundary = argc == 7 &&
+      llvm::StringRef(argv[6]) == "--rewrite-fame-model-graph-boundary";
+  bool rewriteModelGraph = graphBoundary || (argc == 7 &&
+      llvm::StringRef(argv[6]) == "--rewrite-fame-model-graph");
+  bool bindAutoCounterControl = argc == 7 &&
+      llvm::StringRef(argv[6]) == "--bind-autocounter-control";
+  bool bindAutoCounterHosts = bindAutoCounterControl || (argc == 7 &&
+      llvm::StringRef(argv[6]) == "--bind-autocounter-hosts");
+  bool materializeAutoCounterHosts = bindAutoCounterHosts || (argc == 7 &&
+      llvm::StringRef(argv[6]) == "--materialize-autocounter-hosts");
+  bool threadFAME5Registers = argc == 10 &&
+      llvm::StringRef(argv[6]) == "--thread-fame5-registers";
+  bool threadFAME5Memories = argc == 10 &&
+      llvm::StringRef(argv[6]) == "--thread-fame5-memories";
   bool labelMultiThreaded =
       argc == 7 &&
       (llvm::StringRef(argv[6]) == "--label-multithreaded-models=on" ||
@@ -269,6 +321,26 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--lower-types";
   bool analyzeAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-autocounter";
+  bool synthesizeInstrumentationSourceControl =
+      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-instrumentation-source-control";
+  bool synthesizeInstrumentationControl = synthesizeInstrumentationSourceControl ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-instrumentation-control");
+  bool synthesizeAutoCounterCSVControl =
+      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-csv-control";
+  bool synthesizeAutoCounterCSVBindings = synthesizeAutoCounterCSVControl ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-csv-bindings");
+  bool synthesizeAutoCounterCSVHosts =
+      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-csv-hosts";
+  bool synthesizeAutoCounterCSV = synthesizeAutoCounterCSVBindings || synthesizeAutoCounterCSVHosts ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-csv");
+  bool addNICLoopbackStreams =
+      argc == 7 && llvm::StringRef(argv[6]) == "--add-nic-loopback-streams";
+  bool addNICLoopbackControl = addNICLoopbackStreams ||
+      argc == 7 && llvm::StringRef(argv[6]) == "--add-nic-loopback-control";
+  bool addNICLoopbackTokens = addNICLoopbackControl ||
+      (argc == 7 && llvm::StringRef(argv[6]) == "--add-nic-loopback-tokens");
+  bool synthesizeNICLoopbackControl =
+      argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-nic-loopback-control";
   bool analyzeAutoILA =
       argc == 7 && llvm::StringRef(argv[6]) == "--analyze-ila";
   bool wireILAWrapper =
@@ -343,6 +415,8 @@ int main(int argc, char **argv) {
       (argc == 7 && llvm::StringRef(argv[6]) == "--synthesize-autocounter-printf");
   bool disableAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
+  bool enableSynthPrints = false;
+  bool enableMultiThreading = false;
   bool compileBaseline =
       argc >= 7 &&
       llvm::StringRef(argv[6]) == "--compile-baseline";
@@ -351,12 +425,13 @@ int main(int argc, char **argv) {
        !rewriteInputsWithOutput && !applyFAMEDefaults &&
        !promotePassthrough && !extractModels && !wrapTop &&
        !updateBridgeClocks &&
-       !labelMultiThreaded &&
+       !labelMultiThreaded && !multiThreadFAME5Models && !materializeAutoCounterHosts && !rewriteModelGraph &&
+       !threadFAME5Registers && !threadFAME5Memories &&
        !inferDefaultClocks && !exciseChannels && !inferModelPorts &&
        !promoteGroundBridges && !promoteAggregateBridges &&
        !resolveDontTouch && !lowerTypes && !labelSRAMs && !analyzeSRAMChannels && !rewriteSRAMClocks && !rewriteSRAMFAME && !rewriteSRAMTransport && !rewriteSRAMParentFAME && !rewriteSRAMModels && !rewriteSRAMHardware && !wrapRAMModel && !emitAsyncRAM && !materializeRAM && !analyzeAutoCounter && !analyzeAutoILA && !wireILAProbes && !wireILAWrapper &&
        !gateAutoCounter && !gateSelectedAutoCounter && !synthesizeAutoCounterValues && !synthesizeAutoCounterPrints &&
-       !synthesizePrintStubs && !materializePrintConstructors && !disableAutoCounter && !compileBaseline) ||
+       !synthesizePrintStubs && !materializePrintConstructors && !synthesizeInstrumentationControl && !synthesizeAutoCounterCSV && !addNICLoopbackTokens && !synthesizeNICLoopbackControl && !disableAutoCounter && !compileBaseline) ||
       llvm::StringRef(argv[2]) != "--annotation-file" ||
       llvm::StringRef(argv[4]) != "--output-dir") {
     llvm::errs() << "usage: goldengate-circt input.fir --annotation-file "
@@ -368,14 +443,14 @@ int main(int argc, char **argv) {
                     "--rewrite-fame-inputs-with-output all|channel[,channel...] | "
                     "--apply-fame-defaults | --promote-passthrough | "
                     "--rewrite-sram-models | --rewrite-sram-hardware | --extract-models | --wrap-top | --update-bridge-clocks | "
-                    "--label-multithreaded-models=on|off | "
+                    "--label-multithreaded-models=on|off | --multi-thread-fame5-models | --materialize-autocounter-hosts | --bind-autocounter-hosts | --bind-autocounter-control | --rewrite-fame-model-graph | --rewrite-fame-model-graph-boundary | --thread-fame5-registers module threads indexPort | --thread-fame5-memories module threads indexPort | "
                     "--infer-default-clocks | "
                     "--excise-channels | --infer-model-ports | "
                     "--promote-ground-bridges | "
                     "--promote-aggregate-bridges | --resolve-dont-touch | "
                     "--label-sram-models | --extract-sram-models | --analyze-sram-channels | --rewrite-sram-clocks | --rewrite-sram-fame | --rewrite-sram-parent-fame | --rewrite-sram-transport | --wrap-ram-model wrapper implementation | --emit-async-ram module | --materialize-ram-model wrapper | --lower-types | --analyze-ila | --wire-ila-probes | --wire-ila-wrapper | --analyze-autocounter | --gate-autocounter-events | "
                     "--gate-selected-autocounter-events | "
-                    "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | "
+                    "--synthesize-autocounter-printf-values | --synthesize-autocounter-printf | --synthesize-autocounter-csv | --synthesize-autocounter-csv-hosts | --synthesize-autocounter-csv-control | --synthesize-instrumentation-control | --synthesize-instrumentation-source-control | --add-nic-loopback-tokens | --add-nic-loopback-control | --synthesize-nic-loopback-control | "
                     "--synthesize-print-stubs | --synthesize-autocounter-print-stubs | "
                     "--wire-print-stubs | --complete-print-synthesis | "
                     "--wire-print-reset | --update-print-bridge-clocks | "
@@ -395,7 +470,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--platform-config config] [--output-filename-base name] [--enable-autoila] "
-                    "[--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser [--map-print-host-fased-timing-cycle]]]]]]]]]]]]]]]]]]]]]] "
+                    "[--enable-synth-prints] [--enable-autocounter-printf | --enable-autocounter-csv] [--enable-multithreading] [--nic-mode=normal|loopback] [--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser [--map-print-host-fased-timing-cycle]]]]]]]]]]]]]]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -403,7 +478,13 @@ int main(int argc, char **argv) {
   llvm::StringRef firPath(argv[1]), annoPath(argv[3]), outputDir(argv[5]);
   llvm::StringRef outputBase = "FireSim-generated";
   llvm::StringRef platformConfig = "BaseXilinxAlveoU250Config";
+  bool isF2 = false;
+  bool fasedFRFCFS = false;
+  unsigned ctrlAddressBits = 25;
   bool enableAutoILA = false;
+  bool enableAutoCounterPrintf = false;
+  bool enableAutoCounterCSV = false;
+  bool emitDebugSnapshots = !compileBaseline;
   bool stopAfterPrintHostBinding = false;
   bool mapPrintHostCPUStreams = false;
   bool mapPrintHostTracerV = false;
@@ -438,6 +519,8 @@ int main(int argc, char **argv) {
   bool mapPrintHostFASEDHistograms = false;
   bool mapPrintHostFASEDMMIOBank = false;
   bool mapPrintHostFASEDControl = false;
+  bool compileTimeNICLoopback = false;
+  bool nicModeSeen = false;
   llvm::StringRef printRocketControlCatalog;
   goldengate::ILAWrapperOptions ilaOptions;
   if (compileBaseline) {
@@ -445,9 +528,42 @@ int main(int argc, char **argv) {
     bool platformSeen = false;
     for (int i = 7; i < argc; ++i) {
       llvm::StringRef option(argv[i]);
+      if (option == "--emit-debug-snapshots") {
+        if (emitDebugSnapshots) return fail("duplicate --emit-debug-snapshots");
+        emitDebugSnapshots = true;
+        continue;
+      }
       if (option == "--enable-autoila") {
         if (enableAutoILA) return fail("duplicate --enable-autoila");
         enableAutoILA = true;
+        continue;
+      }
+      if (option == "--enable-synth-prints") {
+        if (enableSynthPrints) return fail("duplicate --enable-synth-prints");
+        enableSynthPrints = true;
+        continue;
+      }
+      if (option == "--enable-multithreading") {
+        if (enableMultiThreading) return fail("duplicate --enable-multithreading");
+        enableMultiThreading = true;
+        continue;
+      }
+      if (option.consume_front("--nic-mode=")) {
+        if (nicModeSeen) return fail("duplicate --nic-mode");
+        nicModeSeen = true;
+        if (option != "normal" && option != "loopback")
+          return fail("--nic-mode must be normal or loopback");
+        compileTimeNICLoopback = option == "loopback";
+        continue;
+      }
+      if (option == "--enable-autocounter-csv") {
+        if (enableAutoCounterCSV) return fail("duplicate --enable-autocounter-csv");
+        enableAutoCounterCSV = true;
+        continue;
+      }
+      if (option == "--enable-autocounter-printf") {
+        if (enableAutoCounterPrintf) return fail("duplicate --enable-autocounter-printf");
+        enableAutoCounterPrintf = true;
         continue;
       }
       if (option == "--stop-after-print-host-binding") {
@@ -687,11 +803,29 @@ int main(int argc, char **argv) {
     // compile a partition recipe as the unpartitioned U250 default.
     llvm::SmallVector<llvm::StringRef> fragments;
     platformConfig.split(fragments, '_', -1, false);
-    bool hasU250Base = false;
+    bool hasPlatformBase = false;
     for (auto fragment : fragments) {
-      if (fragment == "BaseXilinxAlveoU250Config") {
-        if (hasU250Base) return fail("duplicate U250 base compiler configuration");
-        hasU250Base = true;
+      if (fragment == "BaseXilinxAlveoU250Config" || fragment == "BaseF2Config") {
+        if (hasPlatformBase) return fail("duplicate or conflicting base compiler configuration");
+        hasPlatformBase = true;
+        isF2 = fragment == "BaseF2Config";
+        // midas.F2Config uses CtrlNastiKey(32,32,12); U250 inherits
+        // F1Config's (32,25,12). Propagate the actual address width through
+        // every widget, decoder and platform boundary.
+        ctrlAddressBits = isF2 ? 32 : 25;
+      } else if (fragment == "FRFCFS16GBQuadRankLLC4MB") {
+        if (fasedFRFCFS)
+          return fail("duplicate FRFCFS16GBQuadRankLLC4MB compiler configuration");
+        fasedFRFCFS = true;
+      } else if (fragment == "WithPrintfSynthesis") {
+        enableSynthPrints = true;
+      } else if (fragment == "WithAutoCounter") {
+        enableAutoCounterCSV = true;
+      } else if (fragment == "WithAutoCounterPrintf") {
+        enableAutoCounterPrintf = true;
+        enableSynthPrints = true;
+      } else if (fragment == "MTModels" || fragment == "WithModelMultiThreading") {
+        enableMultiThreading = true;
       } else if (fragment == "WithAutoILA") {
         enableAutoILA = true;
       } else if (fragment.consume_front("ILADepth")) {
@@ -704,9 +838,19 @@ int main(int argc, char **argv) {
                     platformConfig.str() + "': partition/QSFP and other compiler fragments must be ported before replay");
       }
     }
-    if (!hasU250Base)
-      return fail("Golden Gate platform configuration requires BaseXilinxAlveoU250Config");
+    if (!hasPlatformBase)
+      return fail("Golden Gate platform configuration requires BaseXilinxAlveoU250Config or BaseF2Config");
   }
+  // The selected DDR3/LLC implementation uses F2 platform geometry.
+  if (fasedFRFCFS && !isF2)
+    return fail("FRFCFS16GBQuadRankLLC4MB requires BaseF2Config in the native compiler");
+  if (enableAutoCounterCSV && enableAutoCounterPrintf)
+    return fail("AutoCounter CSV and printf implementations are mutually exclusive");
+  // WithAutoCounterPrintf also enables SynthPrints in the Scala configuration.
+  // Source selection is independent of the optional diagnostic stopping point.
+  enableSynthPrints |= enableAutoCounterPrintf || stopAfterPrintHostBinding;
+  // Explicit diagnostic stopping points retain their historical snapshots.
+  emitDebugSnapshots |= stopAfterPrintHostBinding;
   if (!printRocketControlCatalog.empty() && !stopAfterPrintHostBinding)
     return fail("--print-rocket-control-catalog requires --stop-after-print-host-binding");
   if (mapPrintHostTracerVQueue && !mapPrintHostTracerVTrigger)
@@ -789,6 +933,8 @@ int main(int argc, char **argv) {
     return fail("--map-print-host-fased-tokens requires --map-print-host-cpu-port");
   if (mapPrintHostCPUPort && !mapPrintHostCPUWriteResponseBuffer)
     return fail("--map-print-host-cpu-port requires --map-print-host-cpu-write-response-buffer");
+  if (compileBaseline && !emitDebugSnapshots)
+    llvm::outs() << "Intermediate MLIR snapshots disabled; use --emit-debug-snapshots to retain the MLIR paths named in stage diagnostics.\n";
   ilaOptions.outputBaseFilename = outputBase.str();
   if (auto error = llvm::sys::fs::create_directories(outputDir))
     return fail("cannot create output directory: " + error.message());
@@ -822,6 +968,12 @@ int main(int argc, char **argv) {
   if (!circuit)
     return fail("input did not produce a firrtl.circuit");
   const std::string originalTargetName = circuit.getName().str();
+  // Platform capacity must precede early allocation and all functional queues.
+  // maxFlight caps this capacity; it does not identify the platform model.
+  if (compileBaseline)
+    circuit->setAttr("goldengate.fasedBaseCapacity",
+        IntegerAttr::get(IntegerType::get(&context, 32), fasedFRFCFS ? 32 : 16));
+
 
   auto emitPrintPayloadBoundary = [&]() -> int {
     std::string error;
@@ -846,11 +998,11 @@ int main(int argc, char **argv) {
       return fail("PrintBridge config materialization: " + error);
     llvm::SmallVector<FModuleOp> axi;
     if (materializePrintAXI && failed(goldengate::materializePrintBridgeAXIControls(
-          circuit, configs, 25, 12, axi, error)))
+          circuit, configs, ctrlAddressBits, 12, axi, error)))
       return fail("PrintBridge AXI materialization: " + error);
     llvm::SmallVector<FModuleOp> hosts;
     if (materializePrintHosts && failed(goldengate::materializePrintBridgeHosts(
-          circuit, controls, 25, 12, hosts, error)))
+          circuit, controls, ctrlAddressBits, 12, hosts, error)))
       return fail("PrintBridge host materialization: " + error);
     if (bindPrintHostConstructors) {
       if (failed(goldengate::bindPrintBridgeHosts(circuit, hosts, error)))
@@ -1805,35 +1957,45 @@ int main(int argc, char **argv) {
       llvm::outs() << "Coerced CIRCT target resets to synchronous Bool resets\n";
     }
     unsigned removed = 0;
-    if (mlir::failed(goldengate::dropDisabledAutoCounterAnnotations(
-            circuit, removed, error)))
+    if (enableAutoCounterPrintf || enableAutoCounterCSV) {
+      mlir::PassManager lowForm(module->getContext());
+      lowForm.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+      if (failed(lowForm.run(*module)))
+        return fail("enabled AutoCounter ExpandWhens failed");
+      // User-supplied cover-module selection remains a later compiler option;
+      // explicitly annotated events follow the SFC printf implementation now.
+      auto synthesis = enableAutoCounterCSV
+          ? goldengate::synthesizeEnabledAutoCounterCSV(circuit, {}, removed, error)
+          : goldengate::synthesizeEnabledAutoCounterPrintf(circuit, {}, removed, error);
+      if (failed(synthesis)) return fail("enabled AutoCounter synthesis: " + error);
+    } else if (mlir::failed(goldengate::dropDisabledAutoCounterAnnotations(
+                   circuit, removed, error))) {
       return fail("AutoCounter cleanup: " + error);
+    }
     if (mlir::failed(mlir::verify(*module)))
-      return fail("disabled AutoCounter pipeline produced invalid FIRRTL IR");
+      return fail("AutoCounter pipeline produced invalid FIRRTL IR");
     llvm::SmallString<256> irPath(outputDir), annotationPath(outputDir);
     llvm::sys::path::append(irPath, "post-autocounter.mlir");
     llvm::sys::path::append(annotationPath, "post-autocounter-all.json");
-    std::error_code writeError;
-    llvm::raw_fd_ostream irOut(irPath, writeError);
+    std::error_code writeError = emitDebugSnapshot(
+        module->getOperation(), irPath, emitDebugSnapshots);
     if (writeError)
       return fail("cannot write post-AutoCounter MLIR: " +
                   writeError.message());
-    module->print(irOut);
-    irOut << '\n';
-    irOut.close();
     if (mlir::failed(goldengate::emitAllAnnotations(circuit, annotationPath,
                                                     error)))
       return fail("cannot export post-AutoCounter annotations: " + error);
-    llvm::outs() << "Dropped " << removed
-                 << " disabled AutoCounter annotations in " << annotationPath
-                 << "; lowered FIRRTL in " << irPath << '\n';
+    llvm::outs() << ((enableAutoCounterPrintf || enableAutoCounterCSV) ? "Synthesized " : "Dropped ") << removed
+                 << ((enableAutoCounterPrintf || enableAutoCounterCSV) ? " enabled AutoCounter domains/events in " :
+                                               " disabled AutoCounter annotations in ")
+                 << annotationPath << "; lowered FIRRTL in " << irPath << '\n';
     if (compileBaseline) {
       // The default FireSim configuration has SynthPrints=false. Scala still
       // consumes its selections before TriggerWiring, preserving printf RTL.
       // Enabled prints follow the Scala pass order through target FAME. The
       // explicit stop leaves local host interfaces for later platform mapping.
       unsigned removedPrintSelections = 0;
-      if (stopAfterPrintHostBinding) {
+      if (enableSynthPrints) {
         mlir::PassManager lowForm(module->getContext());
         lowForm.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
         if (failed(lowForm.run(*module)))
@@ -1856,15 +2018,12 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> debugIRPath(outputDir), debugAnnotationPath(outputDir);
       llvm::sys::path::append(debugIRPath, "post-debug-synthesis.mlir");
       llvm::sys::path::append(debugAnnotationPath, "post-debug-synthesis-all.json");
-      std::error_code debugEC;
-      llvm::raw_fd_ostream debugIROut(debugIRPath, debugEC);
+      std::error_code debugEC = emitDebugSnapshot(
+          module->getOperation(), debugIRPath, emitDebugSnapshots);
       if (debugEC) return fail("cannot write debug synthesis MLIR: " + debugEC.message());
-      module->print(debugIROut);
-      debugIROut << '\n';
-      debugIROut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, debugAnnotationPath, error)))
         return fail("cannot export debug synthesis annotations: " + error);
-      if (!stopAfterPrintHostBinding)
+      if (!enableSynthPrints)
         llvm::outs() << "Consumed " << removedPrintSelections
                      << " disabled SynthPrintf selections in "
                      << debugAnnotationPath << '\n';
@@ -1875,11 +2034,9 @@ int main(int argc, char **argv) {
         return fail("TriggerWiring: " + error);
       llvm::SmallString<256> triggerIRPath(outputDir);
       llvm::sys::path::append(triggerIRPath, "post-trigger-wiring.mlir");
-      std::error_code triggerEC;
-      llvm::raw_fd_ostream triggerIROut(triggerIRPath, triggerEC);
+      std::error_code triggerEC = emitDebugSnapshot(
+          module->getOperation(), triggerIRPath, emitDebugSnapshots, false);
       if (triggerEC) return fail("cannot write post-trigger wiring IR: " + triggerEC.message());
-      module->print(triggerIROut);
-      triggerIROut.close();
       llvm::SmallString<256> triggerAllAnnotationPath(outputDir);
       llvm::sys::path::append(triggerAllAnnotationPath, "post-trigger-wiring-all.json");
       if (mlir::failed(goldengate::emitAllAnnotations(
@@ -1907,11 +2064,9 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> resetIRPath(outputDir), resetAnnotationPath(outputDir);
         llvm::sys::path::append(resetIRPath, "post-global-reset-wiring.mlir");
         llvm::sys::path::append(resetAnnotationPath, "post-global-reset-wiring-all.json");
-        std::error_code resetEC;
-        llvm::raw_fd_ostream resetOut(resetIRPath, resetEC);
+        std::error_code resetEC = emitDebugSnapshot(
+            module->getOperation(), resetIRPath, emitDebugSnapshots, false);
         if (resetEC) return fail("cannot write global reset wiring IR: " + resetEC.message());
-        module->print(resetOut);
-        resetOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, resetAnnotationPath, error)))
           return fail("cannot export global reset wiring annotations: " + error);
         llvm::outs() << "Wired " << wiredResetSinks << " CIRCT global reset sinks in "
@@ -1920,7 +2075,7 @@ int main(int argc, char **argv) {
 
       // New Print bridges were absent from the initial aggregate clock map.
       // Refresh their metadata after reset wiring, as in MidasTransforms.
-      if (stopAfterPrintHostBinding &&
+      if ((enableSynthPrints || enableAutoCounterCSV) &&
           failed(goldengate::analyzeChannelClocksAndUpdateBridges(circuit, error)))
         return fail("enabled Print bridge clock analysis: " + error);
       if (mlir::failed(goldengate::wrapTop(circuit, error)))
@@ -1933,31 +2088,32 @@ int main(int argc, char **argv) {
       // Scala still runs this pass, consuming candidate threading annotations
       // before its post-wrap boundary.
       if (mlir::failed(goldengate::labelMultiThreadedInstances(
-              circuit, false, error)))
+              circuit, enableMultiThreading, error)))
         return fail("LabelMultiThreadedInstances: " + error);
       if (mlir::failed(mlir::verify(*module)))
         return fail("WrapTop produced invalid FIRRTL IR");
       llvm::SmallString<256> wrapIRPath(outputDir), wrapAnnotationPath(outputDir);
       llvm::sys::path::append(wrapIRPath, "post-wrap-top.mlir");
       llvm::sys::path::append(wrapAnnotationPath, "post-wrap-top-all.json");
-      std::error_code wrapWriteError;
-      llvm::raw_fd_ostream irOut(wrapIRPath, wrapWriteError);
+      std::error_code wrapWriteError = emitDebugSnapshot(
+          module->getOperation(), wrapIRPath, emitDebugSnapshots);
       if (wrapWriteError)
         return fail("cannot write wrapped MLIR: " +
                     wrapWriteError.message());
-      module->print(irOut);
-      irOut << '\n';
-      irOut.close();
       if (mlir::failed(goldengate::emitAllAnnotations(
               circuit, wrapAnnotationPath, error)))
         return fail("cannot export wrapped annotations: " + error);
       llvm::outs() << "Wrapped CIRCT top in " << wrapIRPath << '\n';
 
-      // Retained FirrtlMemModel selections are executable compiler requests.
-      // Label before ExtractModel, then lower the newly introduced interfaces,
-      // following the optional target-transform ordering in MidasTransforms.
+      // MidasTransforms gates LabelSRAMModels on GenerateMultiCycleRamModels,
+      // whose default is false. None of the supported platform fragments sets
+      // it: FirrtlMemModel annotations only select memories if that optional
+      // transform is enabled. Keep the selections and inline memory behavior
+      // in baseline builds. Explicit SRAM diagnostic modes remain available.
+      constexpr bool generateMultiCycleRamModels = false;
       unsigned selectedSRAMs = 0;
-      if (failed(goldengate::labelSRAMModels(circuit, selectedSRAMs, error)))
+      if (generateMultiCycleRamModels &&
+          failed(goldengate::labelSRAMModels(circuit, selectedSRAMs, error)))
         return fail("LabelSRAMModels: " + error);
       unsigned promotedModels = 0;
       if (mlir::failed(goldengate::extractModels(circuit, promotedModels,
@@ -1969,14 +2125,11 @@ int main(int argc, char **argv) {
       llvm::sys::path::append(modelIRPath, "post-extract-model.mlir");
       llvm::sys::path::append(modelAnnotationPath,
                               "post-extract-model-all.json");
-      std::error_code modelWriteError;
-      llvm::raw_fd_ostream modelOut(modelIRPath, modelWriteError);
+      std::error_code modelWriteError = emitDebugSnapshot(
+          module->getOperation(), modelIRPath, emitDebugSnapshots);
       if (modelWriteError)
         return fail("cannot write extracted-model MLIR: " +
                     modelWriteError.message());
-      module->print(modelOut);
-      modelOut << '\n';
-      modelOut.close();
       if (mlir::failed(goldengate::emitAllAnnotations(
               circuit, modelAnnotationPath, error)))
         return fail("cannot export extracted-model annotations: " + error);
@@ -1986,9 +2139,26 @@ int main(int argc, char **argv) {
       // SRAM labeling and PrintSynthesis introduce aggregate ports after the
       // first lowering. Match Scala's post-ExtractModel lowering so each
       // leaf has a direct model/top connection for InferModelPorts.
-      if ((stopAfterPrintHostBinding || selectedSRAMs) &&
+      if ((enableSynthPrints || enableAutoCounterCSV || enableMultiThreading || selectedSRAMs) &&
           failed(goldengate::lowerTypesWithRetainedTargets(*module, circuit, error)))
         return fail("post-ExtractModel LowerTypes: " + error);
+
+      // SFC deduplicates promoted target definitions before FAME scheduling.
+      // Repeated elaborated tiles may have distinct definition names despite
+      // identical hardware; grouping must see their canonical shared identity.
+      if (enableMultiThreading) {
+        unsigned removed = 0;
+        if (failed(goldengate::deduplicateModels(circuit, removed, error)))
+          return fail("threaded model deduplication: " + error);
+        llvm::SmallString<256> dedupIR(outputDir), dedupAnnotations(outputDir);
+        llvm::sys::path::append(dedupIR, "post-model-dedup.mlir");
+        llvm::sys::path::append(dedupAnnotations, "post-model-dedup-all.json");
+        auto ec = emitDebugSnapshot(module->getOperation(), dedupIR, emitDebugSnapshots);
+        if (ec) return fail("cannot write model deduplication MLIR: " + ec.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, dedupAnnotations, error)))
+          return fail("cannot write model deduplication annotations: " + error);
+        llvm::outs() << "Deduplicated " << removed << " native target definitions\n";
+      }
 
       unsigned promotedConnections = 0;
       if (mlir::failed(goldengate::promotePassthroughConnections(
@@ -2002,15 +2172,11 @@ int main(int argc, char **argv) {
                               "post-promote-passthrough.mlir");
       llvm::sys::path::append(passthroughAnnotationPath,
                               "post-promote-passthrough.json");
-      std::error_code passthroughWriteError;
-      llvm::raw_fd_ostream passthroughOut(passthroughIRPath,
-                                           passthroughWriteError);
+      std::error_code passthroughWriteError = emitDebugSnapshot(
+          module->getOperation(), passthroughIRPath, emitDebugSnapshots);
       if (passthroughWriteError)
         return fail("cannot write promoted passthrough MLIR: " +
                     passthroughWriteError.message());
-      module->print(passthroughOut);
-      passthroughOut << '\n';
-      passthroughOut.close();
       if (mlir::failed(goldengate::emitFAMEAnnotations(
               circuit, passthroughAnnotationPath, error)))
         return fail("cannot export passthrough annotations: " + error);
@@ -2027,14 +2193,11 @@ int main(int argc, char **argv) {
       llvm::sys::path::append(defaultsIRPath, "post-fame-defaults.mlir");
       llvm::sys::path::append(defaultsAnnotationPath,
                               "post-fame-defaults.json");
-      std::error_code defaultsWriteError;
-      llvm::raw_fd_ostream defaultsOut(defaultsIRPath, defaultsWriteError);
+      std::error_code defaultsWriteError = emitDebugSnapshot(
+          module->getOperation(), defaultsIRPath, emitDebugSnapshots);
       if (defaultsWriteError)
         return fail("cannot write FAMEDefaults MLIR: " +
                     defaultsWriteError.message());
-      module->print(defaultsOut);
-      defaultsOut << '\n';
-      defaultsOut.close();
       if (mlir::failed(goldengate::emitFAMEAnnotations(
               circuit, defaultsAnnotationPath, error)))
         return fail("cannot export FAMEDefaults annotations: " + error);
@@ -2063,14 +2226,11 @@ int main(int argc, char **argv) {
       llvm::sys::path::append(excisionIRPath, "post-channel-excision.mlir");
       llvm::sys::path::append(excisionAnnotationPath,
                               "post-channel-excision.json");
-      std::error_code excisionWriteError;
-      llvm::raw_fd_ostream excisionOut(excisionIRPath, excisionWriteError);
+      std::error_code excisionWriteError = emitDebugSnapshot(
+          module->getOperation(), excisionIRPath, emitDebugSnapshots);
       if (excisionWriteError)
         return fail("cannot write ChannelExcision MLIR: " +
                     excisionWriteError.message());
-      module->print(excisionOut);
-      excisionOut << '\n';
-      excisionOut.close();
       if (mlir::failed(goldengate::emitFAMEAnnotations(
               circuit, excisionAnnotationPath, error)))
         return fail("cannot export ChannelExcision annotations: " + error);
@@ -2086,21 +2246,27 @@ int main(int argc, char **argv) {
                               "post-infer-model-ports.mlir");
       llvm::sys::path::append(inferredPortsAnnotationPath,
                               "post-infer-model-ports.json");
-      std::error_code inferredPortsWriteError;
-      llvm::raw_fd_ostream inferredPortsOut(inferredPortsIRPath,
-                                           inferredPortsWriteError);
+      std::error_code inferredPortsWriteError = emitDebugSnapshot(
+          module->getOperation(), inferredPortsIRPath, emitDebugSnapshots);
       if (inferredPortsWriteError)
         return fail("cannot write InferModelPorts MLIR: " +
                     inferredPortsWriteError.message());
-      module->print(inferredPortsOut);
-      inferredPortsOut << '\n';
-      inferredPortsOut.close();
       if (mlir::failed(goldengate::emitFAMEAnnotations(
               circuit, inferredPortsAnnotationPath, error)))
         return fail("cannot export InferModelPorts annotations: " + error);
       llvm::outs() << "Inferred CIRCT model ports in "
                    << inferredPortsIRPath << '\n';
 
+      llvm::SmallPtrSet<Operation *, 4> selectedGraphDefinitions;
+      for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+        Annotation annotation(attr);
+        if (!annotation.isClass(goldengate::AnnotationClasses::FAMETransform)) continue;
+        auto target = annotation.getMember<StringAttr>("target");
+        if (!target) return fail("FAME graph selection needs a model target");
+        auto resolved = goldengate::resolveAnnotationTarget(circuit, target.getValue(), error);
+        if (!resolved || resolved->port) return fail("invalid FAME graph selection: " + error);
+        selectedGraphDefinitions.insert(resolved->module.getOperation());
+      }
       if (selectedSRAMs) {
         unsigned materialized = 0;
         if (failed(goldengate::rewriteSRAMTimingHardware(circuit, materialized, error)))
@@ -2110,10 +2276,9 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> memoryIR(outputDir), memoryAnnos(outputDir);
         llvm::sys::path::append(memoryIR, "post-sram-simulator-hardware.mlir");
         llvm::sys::path::append(memoryAnnos, "post-sram-simulator-hardware-all.json");
-        std::error_code memoryEC;
-        llvm::raw_fd_ostream memoryOut(memoryIR, memoryEC);
+        std::error_code memoryEC = emitDebugSnapshot(
+            module->getOperation(), memoryIR, emitDebugSnapshots);
         if (memoryEC) return fail("cannot write selected SRAM simulator hardware: " + memoryEC.message());
-        module->print(memoryOut); memoryOut << '\n'; memoryOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, memoryAnnos, error)))
           return fail("cannot write selected SRAM simulator annotations: " + error);
         llvm::outs() << "Materialized " << materialized
@@ -2122,6 +2287,42 @@ int main(int argc, char **argv) {
         // transport wrapper. External Print channels retain latency-zero
         // Decoupled endpoints on that wrapper, which the constructor binder
         // joins exactly as it joins the single-hub target's output tokens.
+        if (stopAfterPrintHostBinding) return emitPrintPayloadBoundary();
+      } else if (selectedGraphDefinitions.size() > 1 || enableMultiThreading) {
+        goldengate::FAMEModelGraphResult graph;
+        if (failed(goldengate::rewriteFAMEModelGraph(circuit, graph, error,
+                                                     !stopAfterPrintHostBinding,
+                                                     enableMultiThreading,
+                                                     goldengate::FAME5ClockSemantics::XilinxBUFGCE)))
+          return fail("generalized FAME model graph: " + error);
+        if (failed(verify(*module))) return fail("FAME model graph produced invalid IR");
+        llvm::SmallString<256> graphIR(outputDir), graphAnnotations(outputDir);
+        llvm::sys::path::append(graphIR, "post-fame-model-graph.mlir");
+        llvm::sys::path::append(graphAnnotations, "post-fame-model-graph-all.json");
+        auto graphEC = emitDebugSnapshot(module->getOperation(), graphIR, emitDebugSnapshots);
+        if (graphEC) return fail("cannot write FAME model graph: " + graphEC.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, graphAnnotations, error)))
+          return fail("cannot write FAME model graph annotations: " + error);
+        // Keep physical sharing and its startup/reset obligations in normal
+        // compiler products; diagnostic MLIR snapshots are optional.
+        OpBuilder graphBuilder(circuit.getContext());
+        auto groups = circuit->getAttrOfType<ArrayAttr>("goldengate.fame5.groups");
+        llvm::SmallString<256> graphMetadata(outputDir);
+        llvm::sys::path::append(graphMetadata, "fame-model-graph.json");
+        auto metadata = graphBuilder.getDictionaryAttr({
+            graphBuilder.getNamedAttr("schema_version", graphBuilder.getI32IntegerAttr(1)),
+            graphBuilder.getNamedAttr("definitions", graphBuilder.getI32IntegerAttr(graph.definitions)),
+            graphBuilder.getNamedAttr("instances", graphBuilder.getI32IntegerAttr(graph.instances)),
+            graphBuilder.getNamedAttr("clock_domains", graphBuilder.getI32IntegerAttr(graph.clockDomains)),
+            graphBuilder.getNamedAttr("data_endpoints", graphBuilder.getI32IntegerAttr(graph.dataEndpoints)),
+            graphBuilder.getNamedAttr("threading_requested", graphBuilder.getBoolAttr(enableMultiThreading)),
+            graphBuilder.getNamedAttr("threaded_groups", graphBuilder.getI32IntegerAttr(graph.threadedGroups)),
+            graphBuilder.getNamedAttr("shared_threads", graphBuilder.getI32IntegerAttr(graph.sharedThreads)),
+            graphBuilder.getNamedAttr("groups", groups ? groups : graphBuilder.getArrayAttr({}))});
+        if (failed(goldengate::emitJSONAttribute(metadata, graphMetadata, error)))
+          return fail("cannot write FAME model graph metadata: " + error);
+        llvm::outs() << "Composed " << graph.definitions << " FAME definitions, "
+                     << graph.instances << " instances and " << graph.clockDomains << " domains\n";
         if (stopAfterPrintHostBinding) return emitPrintPayloadBoundary();
       } else {
       // Snapshot annotation-selected inputs, outputs and data dependencies
@@ -2227,15 +2428,11 @@ int main(int argc, char **argv) {
         return fail("FAME host control produced invalid FIRRTL IR");
       llvm::SmallString<256> hostControlIRPath(outputDir);
       llvm::sys::path::append(hostControlIRPath, "post-fame-host-control.mlir");
-      std::error_code hostControlWriteError;
-      llvm::raw_fd_ostream hostControlOut(hostControlIRPath,
-                                         hostControlWriteError);
+      std::error_code hostControlWriteError = emitDebugSnapshot(
+          module->getOperation(), hostControlIRPath, emitDebugSnapshots);
       if (hostControlWriteError)
         return fail("cannot write FAME host-control MLIR: " +
                     hostControlWriteError.message());
-      module->print(hostControlOut);
-      hostControlOut << '\n';
-      hostControlOut.close();
       llvm::outs() << "Added CIRCT FAME host controls in "
                    << hostControlIRPath << '\n';
 
@@ -2340,14 +2537,11 @@ int main(int argc, char **argv) {
       llvm::sys::path::append(clockIRPath, "post-fame-clock-channel.mlir");
       llvm::sys::path::append(clockAnnotationPath,
                               "post-fame-clock-channel.json");
-      std::error_code clockWriteError;
-      llvm::raw_fd_ostream clockOut(clockIRPath, clockWriteError);
+      std::error_code clockWriteError = emitDebugSnapshot(
+          module->getOperation(), clockIRPath, emitDebugSnapshots);
       if (clockWriteError)
         return fail("cannot write FAME clock-channel MLIR: " +
                     clockWriteError.message());
-      module->print(clockOut);
-      clockOut << '\n';
-      clockOut.close();
       if (failed(goldengate::emitFAMEAnnotations(
               circuit, clockAnnotationPath, error)))
         return fail("cannot export FAME clock annotations: " + error);
@@ -2370,15 +2564,11 @@ int main(int argc, char **argv) {
         return fail("FAME target clock gate produced invalid FIRRTL IR");
       llvm::SmallString<256> clockGateIRPath(outputDir);
       llvm::sys::path::append(clockGateIRPath, "post-fame-clock-gate.mlir");
-      std::error_code clockGateWriteError;
-      llvm::raw_fd_ostream clockGateOut(clockGateIRPath,
-                                       clockGateWriteError);
+      std::error_code clockGateWriteError = emitDebugSnapshot(
+          module->getOperation(), clockGateIRPath, emitDebugSnapshots);
       if (clockGateWriteError)
         return fail("cannot write FAME clock-gate MLIR: " +
                     clockGateWriteError.message());
-      module->print(clockGateOut);
-      clockGateOut << '\n';
-      clockGateOut.close();
       llvm::outs() << "Gated the CIRCT FAME target clock in "
                    << clockGateIRPath << '\n';
 
@@ -2562,14 +2752,11 @@ int main(int argc, char **argv) {
           dataIRPath, "post-fame-" + ordinal + "-input-channel.mlir");
       llvm::sys::path::append(
           dataAnnotationPath, "post-fame-" + ordinal + "-input-channel.json");
-      std::error_code dataWriteError;
-      llvm::raw_fd_ostream dataOut(dataIRPath, dataWriteError);
+      std::error_code dataWriteError = emitDebugSnapshot(
+          module->getOperation(), dataIRPath, emitDebugSnapshots);
       if (dataWriteError)
         return fail("cannot write FAME data-channel MLIR: " +
                     dataWriteError.message());
-      module->print(dataOut);
-      dataOut << '\n';
-      dataOut.close();
       if (failed(goldengate::emitFAMEAnnotations(
               circuit, dataAnnotationPath, error)))
         return fail("cannot export FAME data annotations: " + error);
@@ -2604,15 +2791,11 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> dataControlIRPath(outputDir);
       llvm::sys::path::append(dataControlIRPath,
                               "post-fame-" + ordinal + "-input-control.mlir");
-      std::error_code dataControlWriteError;
-      llvm::raw_fd_ostream dataControlOut(dataControlIRPath,
-                                          dataControlWriteError);
+      std::error_code dataControlWriteError = emitDebugSnapshot(
+          module->getOperation(), dataControlIRPath, emitDebugSnapshots);
       if (dataControlWriteError)
         return fail("cannot write FAME input control MLIR: " +
                     dataControlWriteError.message());
-      module->print(dataControlOut);
-      dataControlOut << '\n';
-      dataControlOut.close();
       llvm::outs() << "Added CIRCT FAME input controls for "
                    << dataChannel->name << " in " << dataControlIRPath << '\n';
       convertedInputs.push_back(dataGroup.name);
@@ -2634,15 +2817,11 @@ int main(int argc, char **argv) {
                               convertedInputs.size() == 17
                                   ? "post-fame-seventeen-input-finishing.mlir"
                                   : "post-fame-input-finishing.mlir");
-      std::error_code finishingWriteError;
-      llvm::raw_fd_ostream finishingOut(finishingIRPath,
-                                        finishingWriteError);
+      std::error_code finishingWriteError = emitDebugSnapshot(
+          module->getOperation(), finishingIRPath, emitDebugSnapshots);
       if (finishingWriteError)
         return fail("cannot write partial FAME finishing MLIR: " +
                     finishingWriteError.message());
-      module->print(finishingOut);
-      finishingOut << '\n';
-      finishingOut.close();
       llvm::outs() << "Wired partial CIRCT FAME cycle completion in "
                    << finishingIRPath << '\n';
 
@@ -2805,14 +2984,11 @@ int main(int argc, char **argv) {
                               "post-fame-" + outputOrdinal + "-output-channel.mlir");
       llvm::sys::path::append(outputAnnotationPath,
                               "post-fame-" + outputOrdinal + "-output-channel.json");
-      std::error_code outputWriteError;
-      llvm::raw_fd_ostream outputOut(outputIRPath, outputWriteError);
+      std::error_code outputWriteError = emitDebugSnapshot(
+          module->getOperation(), outputIRPath, emitDebugSnapshots);
       if (outputWriteError)
         return fail("cannot write FAME output MLIR: " +
                     outputWriteError.message());
-      module->print(outputOut);
-      outputOut << '\n';
-      outputOut.close();
       if (failed(goldengate::emitFAMEAnnotations(
               circuit, outputAnnotationPath, error)))
         return fail("cannot export FAME output annotations: " + error);
@@ -2851,15 +3027,11 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> outputControlIRPath(outputDir);
       llvm::sys::path::append(outputControlIRPath,
                               "post-fame-" + outputOrdinal + "-output-control.mlir");
-      std::error_code outputControlWriteError;
-      llvm::raw_fd_ostream outputControlOut(outputControlIRPath,
-                                            outputControlWriteError);
+      std::error_code outputControlWriteError = emitDebugSnapshot(
+          module->getOperation(), outputControlIRPath, emitDebugSnapshots);
       if (outputControlWriteError)
         return fail("cannot write FAME output controls: " +
                     outputControlWriteError.message());
-      module->print(outputControlOut);
-      outputControlOut << '\n';
-      outputControlOut.close();
       llvm::outs() << "Added CIRCT FAME output controls for "
                    << outputChannel->name << " in " << outputControlIRPath << '\n';
       }
@@ -2883,14 +3055,11 @@ int main(int argc, char **argv) {
         return fail("FAME simulator PipeChannel produced invalid FIRRTL IR");
       llvm::SmallString<256> pipeIRPath(outputDir);
       llvm::sys::path::append(pipeIRPath, "post-fame-first-pipe.mlir");
-      std::error_code pipeWriteError;
-      llvm::raw_fd_ostream pipeOut(pipeIRPath, pipeWriteError);
+      std::error_code pipeWriteError = emitDebugSnapshot(
+          module->getOperation(), pipeIRPath, emitDebugSnapshots);
       if (pipeWriteError)
         return fail("cannot write FAME simulator PipeChannel: " +
                     pipeWriteError.message());
-      module->print(pipeOut);
-      pipeOut << '\n';
-      pipeOut.close();
       llvm::outs() << "Materialized CIRCT FAME boundary PipeChannels in "
                    << pipeIRPath << '\n';
       if (failed(goldengate::addFAMEPipeWrapper(circuit, error)))
@@ -2900,14 +3069,11 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> wrapperIRPath(outputDir);
       llvm::sys::path::append(wrapperIRPath,
                               "post-fame-first-pipe-wrapper.mlir");
-      std::error_code wrapperWriteError;
-      llvm::raw_fd_ostream wrapperOut(wrapperIRPath, wrapperWriteError);
+      std::error_code wrapperWriteError = emitDebugSnapshot(
+          module->getOperation(), wrapperIRPath, emitDebugSnapshots);
       if (wrapperWriteError)
         return fail("cannot write FAME PipeChannel wrapper: " +
                     wrapperWriteError.message());
-      module->print(wrapperOut);
-      wrapperOut << '\n';
-      wrapperOut.close();
       llvm::outs() << "Connected CIRCT FAME boundary PipeChannels in "
                    << wrapperIRPath << '\n';
       if (failed(goldengate::addFAMEBoundaryReadyValidChannels(circuit, error)))
@@ -2916,13 +3082,10 @@ int main(int argc, char **argv) {
         return fail("FAME ReadyValidChannel produced invalid FIRRTL IR");
       llvm::SmallString<256> readyValidIRPath(outputDir);
       llvm::sys::path::append(readyValidIRPath, "post-fame-ready-valid-wrapper.mlir");
-      std::error_code readyValidWriteError;
-      llvm::raw_fd_ostream readyValidOut(readyValidIRPath, readyValidWriteError);
+      std::error_code readyValidWriteError = emitDebugSnapshot(
+          module->getOperation(), readyValidIRPath, emitDebugSnapshots);
       if (readyValidWriteError)
         return fail("cannot write ReadyValidChannel wrapper: " + readyValidWriteError.message());
-      module->print(readyValidOut);
-      readyValidOut << '\n';
-      readyValidOut.close();
       llvm::outs() << "Connected CIRCT FAME boundary ReadyValidChannels in "
                    << readyValidIRPath << '\n';
       if (failed(goldengate::addFAMEClockChannel(circuit, error)))
@@ -2931,13 +3094,10 @@ int main(int argc, char **argv) {
         return fail("FAME clock channel produced invalid FIRRTL IR");
       llvm::SmallString<256> clockWrapperIRPath(outputDir);
       llvm::sys::path::append(clockWrapperIRPath, "post-fame-clock-wrapper.mlir");
-      std::error_code clockWrapperWriteError;
-      llvm::raw_fd_ostream clockWrapperOut(clockWrapperIRPath, clockWrapperWriteError);
+      std::error_code clockWrapperWriteError = emitDebugSnapshot(
+          module->getOperation(), clockWrapperIRPath, emitDebugSnapshots);
       if (clockWrapperWriteError)
         return fail("cannot write clock channel wrapper: " + clockWrapperWriteError.message());
-      module->print(clockWrapperOut);
-      clockWrapperOut << '\n';
-      clockWrapperOut.close();
       llvm::outs() << "Connected CIRCT FAME Boolean clock tokens in "
                    << clockWrapperIRPath << '\n';
       if (failed(goldengate::activateFAMEPipeWrapper(circuit, error)))
@@ -2949,20 +3109,43 @@ int main(int argc, char **argv) {
                               "post-fame-first-pipe-active-wrapper.mlir");
       llvm::sys::path::append(activeAnnotationPath,
                               "post-fame-first-pipe-active-wrapper-all.json");
-      std::error_code activeWriteError;
-      llvm::raw_fd_ostream activeOut(activeIRPath, activeWriteError);
+      std::error_code activeWriteError = emitDebugSnapshot(
+          module->getOperation(), activeIRPath, emitDebugSnapshots);
       if (activeWriteError)
         return fail("cannot write active FAME PipeChannel wrapper: " +
                     activeWriteError.message());
-      module->print(activeOut);
-      activeOut << '\n';
-      activeOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, activeAnnotationPath,
                                                 error)))
         return fail("cannot write active FAME wrapper annotations: " + error);
       llvm::outs() << "Activated CIRCT FAME PipeChannel wrapper in "
                    << activeIRPath << '\n';
       } // Selected SRAM and baseline FAME paths share all host/platform stages.
+      llvm::SmallVector<FModuleOp> productionCSVHosts;
+      if (enableAutoCounterCSV) {
+        if (failed(goldengate::materializeAutoCounterBridgeHosts(
+                circuit, ctrlAddressBits, 12, productionCSVHosts, error)) ||
+            failed(goldengate::bindAutoCounterBridgeHosts(circuit, productionCSVHosts, error)))
+          return fail("production AutoCounter CSV host construction: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("production AutoCounter CSV hosts produced invalid FIRRTL IR");
+        llvm::outs() << "Bound " << productionCSVHosts.size()
+                     << " AutoCounter CSV hosts to the complete simulator transport\n";
+      }
+      llvm::SmallVector<FModuleOp> productionPrintHosts;
+      if (enableSynthPrints) {
+        llvm::SmallVector<FModuleOp> payloads, stages, controls;
+        if (failed(goldengate::materializePrintBridgePayloads(circuit, payloads, error)) ||
+            failed(goldengate::materializePrintBridgeTokenStages(circuit, payloads, stages, error)) ||
+            failed(goldengate::materializePrintBridgeControls(circuit, payloads, stages, controls, error)) ||
+            failed(goldengate::materializePrintBridgeHosts(circuit, controls, ctrlAddressBits, 12,
+                                                         productionPrintHosts, error)) ||
+            failed(goldengate::bindPrintBridgeHosts(circuit, productionPrintHosts, error)))
+          return fail("production Print host construction: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("production Print hosts produced invalid FIRRTL IR");
+        llvm::outs() << "Bound " << productionPrintHosts.size()
+                     << " Print hosts to the complete simulator transport\n";
+      }
       if (failed(goldengate::addClockBridge(circuit, error)))
         return fail("rational ClockBridge mapping: " + error);
       if (failed(mlir::verify(*module)))
@@ -2970,33 +3153,27 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> clockBridgeIRPath(outputDir), clockBridgeAnnotationPath(outputDir);
       llvm::sys::path::append(clockBridgeIRPath, "post-fame-clock-bridge.mlir");
       llvm::sys::path::append(clockBridgeAnnotationPath, "post-fame-clock-bridge-all.json");
-      std::error_code clockBridgeWriteError;
-      llvm::raw_fd_ostream clockBridgeOut(clockBridgeIRPath, clockBridgeWriteError);
+      std::error_code clockBridgeWriteError = emitDebugSnapshot(
+          module->getOperation(), clockBridgeIRPath, emitDebugSnapshots);
       if (clockBridgeWriteError)
         return fail("cannot write ClockBridge mapping: " + clockBridgeWriteError.message());
-      module->print(clockBridgeOut);
-      clockBridgeOut << '\n';
-      clockBridgeOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, clockBridgeAnnotationPath, error)))
         return fail("cannot write ClockBridge annotations: " + error);
       llvm::outs() << "Mapped CIRCT single-clock ClockBridge token producer in "
                    << clockBridgeIRPath << '\n';
-      // Current baseline is the recorded U250 CtrlNastiKey(32,25,12).
-      // Platform configuration and the widget crossbar are subsequent ports.
-      if (failed(goldengate::mapClockBridgeControl(circuit, 25, 12, error)))
+      // Preserve the selected platform's control bus geometry at each
+      // widget adapter, including the full F2 32-bit address space.
+      if (failed(goldengate::mapClockBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("ClockBridge MCRFile mapping: " + error);
       if (failed(mlir::verify(*module)))
         return fail("ClockBridge MCRFile mapping produced invalid FIRRTL IR");
       llvm::SmallString<256> controlIRPath(outputDir), controlAnnotationPath(outputDir);
       llvm::sys::path::append(controlIRPath, "post-fame-clock-bridge-control.mlir");
       llvm::sys::path::append(controlAnnotationPath, "post-fame-clock-bridge-control-all.json");
-      std::error_code controlWriteError;
-      llvm::raw_fd_ostream controlOut(controlIRPath, controlWriteError);
+      std::error_code controlWriteError = emitDebugSnapshot(
+          module->getOperation(), controlIRPath, emitDebugSnapshots);
       if (controlWriteError)
         return fail("cannot write ClockBridge control mapping: " + controlWriteError.message());
-      module->print(controlOut);
-      controlOut << '\n';
-      controlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlAnnotationPath, error)))
         return fail("cannot write ClockBridge control annotations: " + error);
       llvm::outs() << "Mapped CIRCT ClockBridge MCRFile transactions in " << controlIRPath << '\n';
@@ -3007,30 +3184,24 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> resetIRPath(outputDir), resetAnnotationPath(outputDir);
       llvm::sys::path::append(resetIRPath, "post-fame-reset-pulse-bridge.mlir");
       llvm::sys::path::append(resetAnnotationPath, "post-fame-reset-pulse-bridge-all.json");
-      std::error_code resetWriteError;
-      llvm::raw_fd_ostream resetOut(resetIRPath, resetWriteError);
+      std::error_code resetWriteError = emitDebugSnapshot(
+          module->getOperation(), resetIRPath, emitDebugSnapshots);
       if (resetWriteError)
         return fail("cannot write ResetPulseBridge mapping: " + resetWriteError.message());
-      module->print(resetOut);
-      resetOut << '\n';
-      resetOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, resetAnnotationPath, error)))
         return fail("cannot write ResetPulseBridge annotations: " + error);
       llvm::outs() << "Mapped CIRCT ResetPulseBridge token producer in " << resetIRPath << '\n';
-      if (failed(goldengate::mapResetPulseBridgeControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapResetPulseBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("ResetPulseBridge MCRFile mapping: " + error);
       if (failed(mlir::verify(*module)))
         return fail("ResetPulseBridge MCRFile mapping produced invalid FIRRTL IR");
       llvm::SmallString<256> resetControlIRPath(outputDir), resetControlAnnotationPath(outputDir);
       llvm::sys::path::append(resetControlIRPath, "post-fame-reset-pulse-bridge-control.mlir");
       llvm::sys::path::append(resetControlAnnotationPath, "post-fame-reset-pulse-bridge-control-all.json");
-      std::error_code resetControlWriteError;
-      llvm::raw_fd_ostream resetControlOut(resetControlIRPath, resetControlWriteError);
+      std::error_code resetControlWriteError = emitDebugSnapshot(
+          module->getOperation(), resetControlIRPath, emitDebugSnapshots);
       if (resetControlWriteError)
         return fail("cannot write ResetPulseBridge control mapping: " + resetControlWriteError.message());
-      module->print(resetControlOut);
-      resetControlOut << '\n';
-      resetControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, resetControlAnnotationPath, error)))
         return fail("cannot write ResetPulseBridge control annotations: " + error);
       llvm::outs() << "Mapped CIRCT ResetPulseBridge MCRFile transactions in "
@@ -3042,13 +3213,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> uartIRPath(outputDir), uartAnnotationPath(outputDir);
       llvm::sys::path::append(uartIRPath, "post-fame-uart-serial.mlir");
       llvm::sys::path::append(uartAnnotationPath, "post-fame-uart-serial-all.json");
-      std::error_code uartWriteError;
-      llvm::raw_fd_ostream uartOut(uartIRPath, uartWriteError);
+      std::error_code uartWriteError = emitDebugSnapshot(
+          module->getOperation(), uartIRPath, emitDebugSnapshots);
       if (uartWriteError)
         return fail("cannot write UART serial mapping: " + uartWriteError.message());
-      module->print(uartOut);
-      uartOut << '\n';
-      uartOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, uartAnnotationPath, error)))
         return fail("cannot write UART serial annotations: " + error);
       llvm::outs() << "Mapped CIRCT UART serial engine in " << uartIRPath << '\n';
@@ -3059,13 +3227,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> uartQueuesIRPath(outputDir), uartQueuesAnnotationPath(outputDir);
       llvm::sys::path::append(uartQueuesIRPath, "post-fame-uart-byte-queues.mlir");
       llvm::sys::path::append(uartQueuesAnnotationPath, "post-fame-uart-byte-queues-all.json");
-      std::error_code uartQueuesWriteError;
-      llvm::raw_fd_ostream uartQueuesOut(uartQueuesIRPath, uartQueuesWriteError);
+      std::error_code uartQueuesWriteError = emitDebugSnapshot(
+          module->getOperation(), uartQueuesIRPath, emitDebugSnapshots);
       if (uartQueuesWriteError)
         return fail("cannot write UART byte queues: " + uartQueuesWriteError.message());
-      module->print(uartQueuesOut);
-      uartQueuesOut << '\n';
-      uartQueuesOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, uartQueuesAnnotationPath, error)))
         return fail("cannot write UART byte queue annotations: " + error);
       llvm::outs() << "Mapped CIRCT UART byte queues in " << uartQueuesIRPath << '\n';
@@ -3076,30 +3241,24 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> uartMMIOIRPath(outputDir), uartMMIOAnnotationPath(outputDir);
       llvm::sys::path::append(uartMMIOIRPath, "post-fame-uart-mmio.mlir");
       llvm::sys::path::append(uartMMIOAnnotationPath, "post-fame-uart-mmio-all.json");
-      std::error_code uartMMIOWriteError;
-      llvm::raw_fd_ostream uartMMIOOut(uartMMIOIRPath, uartMMIOWriteError);
+      std::error_code uartMMIOWriteError = emitDebugSnapshot(
+          module->getOperation(), uartMMIOIRPath, emitDebugSnapshots);
       if (uartMMIOWriteError)
         return fail("cannot write UART MMIO bank: " + uartMMIOWriteError.message());
-      module->print(uartMMIOOut);
-      uartMMIOOut << '\n';
-      uartMMIOOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, uartMMIOAnnotationPath, error)))
         return fail("cannot write UART MMIO bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT UART MMIO bank in " << uartMMIOIRPath << '\n';
-      if (failed(goldengate::mapUARTBridgeControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapUARTBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("UART MCRFile transactions: " + error);
       if (failed(mlir::verify(*module)))
         return fail("UART MCRFile transactions produced invalid FIRRTL IR");
       llvm::SmallString<256> uartControlIRPath(outputDir), uartControlAnnotationPath(outputDir);
       llvm::sys::path::append(uartControlIRPath, "post-fame-uart-control.mlir");
       llvm::sys::path::append(uartControlAnnotationPath, "post-fame-uart-control-all.json");
-      std::error_code uartControlWriteError;
-      llvm::raw_fd_ostream uartControlOut(uartControlIRPath, uartControlWriteError);
+      std::error_code uartControlWriteError = emitDebugSnapshot(
+          module->getOperation(), uartControlIRPath, emitDebugSnapshots);
       if (uartControlWriteError)
         return fail("cannot write UART MCRFile transactions: " + uartControlWriteError.message());
-      module->print(uartControlOut);
-      uartControlOut << '\n';
-      uartControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, uartControlAnnotationPath, error)))
         return fail("cannot write UART MCRFile transactions annotations: " + error);
       llvm::outs() << "Mapped CIRCT UART MCRFile transactions in " << uartControlIRPath << '\n';
@@ -3109,11 +3268,10 @@ int main(int argc, char **argv) {
         return fail("PeekPoke cycle engine produced invalid FIRRTL IR");
       llvm::SmallString<256> peekPokeIRPath(outputDir);
       llvm::sys::path::append(peekPokeIRPath, "post-fame-peek-poke-cycle.mlir");
-      std::error_code peekPokeWriteError;
-      llvm::raw_fd_ostream peekPokeOut(peekPokeIRPath, peekPokeWriteError);
+      std::error_code peekPokeWriteError = emitDebugSnapshot(
+          module->getOperation(), peekPokeIRPath, emitDebugSnapshots);
       if (peekPokeWriteError)
         return fail("cannot write PeekPoke cycle engine: " + peekPokeWriteError.message());
-      module->print(peekPokeOut); peekPokeOut << '\n'; peekPokeOut.close();
       llvm::SmallString<256> peekPokeAnnotationPath(outputDir);
       llvm::sys::path::append(peekPokeAnnotationPath, "post-fame-peek-poke-cycle-all.json");
       if (failed(goldengate::emitAllAnnotations(circuit, peekPokeAnnotationPath, error)))
@@ -3126,26 +3284,24 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> peekPokeMMIOPath(outputDir), peekPokeMMIOAnnotations(outputDir);
       llvm::sys::path::append(peekPokeMMIOPath, "post-fame-peek-poke-mmio.mlir");
       llvm::sys::path::append(peekPokeMMIOAnnotations, "post-fame-peek-poke-mmio-all.json");
-      std::error_code peekPokeMMIOError;
-      llvm::raw_fd_ostream peekPokeMMIOOut(peekPokeMMIOPath, peekPokeMMIOError);
+      std::error_code peekPokeMMIOError = emitDebugSnapshot(
+          module->getOperation(), peekPokeMMIOPath, emitDebugSnapshots);
       if (peekPokeMMIOError)
         return fail("cannot write PeekPoke MMIO: " + peekPokeMMIOError.message());
-      module->print(peekPokeMMIOOut); peekPokeMMIOOut << '\n'; peekPokeMMIOOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, peekPokeMMIOAnnotations, error)))
         return fail("PeekPoke MMIO annotations: " + error);
       llvm::outs() << "Mapped CIRCT PeekPoke STEP queue and MMIO bank in " << peekPokeMMIOPath << '\n';
-      if (failed(goldengate::mapPeekPokeBridgeControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapPeekPokeBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("PeekPoke MCRFile transactions: " + error);
       if (failed(mlir::verify(*module)))
         return fail("PeekPoke MCRFile transactions produced invalid FIRRTL IR");
       llvm::SmallString<256> peekPokeControlPath(outputDir), peekPokeControlAnnotations(outputDir);
       llvm::sys::path::append(peekPokeControlPath, "post-fame-peek-poke-control.mlir");
       llvm::sys::path::append(peekPokeControlAnnotations, "post-fame-peek-poke-control-all.json");
-      std::error_code peekPokeControlError;
-      llvm::raw_fd_ostream peekPokeControlOut(peekPokeControlPath, peekPokeControlError);
+      std::error_code peekPokeControlError = emitDebugSnapshot(
+          module->getOperation(), peekPokeControlPath, emitDebugSnapshots);
       if (peekPokeControlError)
         return fail("cannot write PeekPoke MCRFile transactions: " + peekPokeControlError.message());
-      module->print(peekPokeControlOut); peekPokeControlOut << '\n'; peekPokeControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, peekPokeControlAnnotations, error)))
         return fail("PeekPoke MCRFile transactions annotations: " + error);
       llvm::outs() << "Mapped CIRCT PeekPoke MCRFile transactions in " << peekPokeControlPath << '\n';
@@ -3156,11 +3312,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tracerTokenPath(outputDir), tracerTokenAnnotations(outputDir);
       llvm::sys::path::append(tracerTokenPath, "post-fame-tracerv-token.mlir");
       llvm::sys::path::append(tracerTokenAnnotations, "post-fame-tracerv-token-all.json");
-      std::error_code tracerTokenError;
-      llvm::raw_fd_ostream tracerTokenOut(tracerTokenPath, tracerTokenError);
+      std::error_code tracerTokenError = emitDebugSnapshot(
+          module->getOperation(), tracerTokenPath, emitDebugSnapshots);
       if (tracerTokenError)
         return fail("cannot write TracerV token engine: " + tracerTokenError.message());
-      module->print(tracerTokenOut); tracerTokenOut << '\n'; tracerTokenOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tracerTokenAnnotations, error)))
         return fail("TracerV token engine annotations: " + error);
       llvm::outs() << "Mapped CIRCT TracerV token acceptance and stream packing in " << tracerTokenPath << '\n';
@@ -3171,26 +3326,24 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tracerConfigPath(outputDir), tracerConfigAnnotations(outputDir);
       llvm::sys::path::append(tracerConfigPath, "post-fame-tracerv-trigger.mlir");
       llvm::sys::path::append(tracerConfigAnnotations, "post-fame-tracerv-trigger-all.json");
-      std::error_code tracerConfigError;
-      llvm::raw_fd_ostream tracerConfigOut(tracerConfigPath, tracerConfigError);
+      std::error_code tracerConfigError = emitDebugSnapshot(
+          module->getOperation(), tracerConfigPath, emitDebugSnapshots);
       if (tracerConfigError)
         return fail("cannot write TracerV trigger configuration: " + tracerConfigError.message());
-      module->print(tracerConfigOut); tracerConfigOut << '\n'; tracerConfigOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tracerConfigAnnotations, error)))
         return fail("TracerV trigger configuration annotations: " + error);
       llvm::outs() << "Mapped CIRCT TracerV trigger configuration in " << tracerConfigPath << '\n';
-      if (failed(goldengate::mapTracerVBridgeControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapTracerVBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("TracerV MCRFile transactions: " + error);
       if (failed(mlir::verify(*module)))
         return fail("TracerV MCRFile transactions produced invalid FIRRTL IR");
       llvm::SmallString<256> tracerControlPath(outputDir), tracerControlAnnotations(outputDir);
       llvm::sys::path::append(tracerControlPath, "post-fame-tracerv-control.mlir");
       llvm::sys::path::append(tracerControlAnnotations, "post-fame-tracerv-control-all.json");
-      std::error_code tracerControlError;
-      llvm::raw_fd_ostream tracerControlOut(tracerControlPath, tracerControlError);
+      std::error_code tracerControlError = emitDebugSnapshot(
+          module->getOperation(), tracerControlPath, emitDebugSnapshots);
       if (tracerControlError)
         return fail("cannot write TracerV MCRFile transactions: " + tracerControlError.message());
-      module->print(tracerControlOut); tracerControlOut << '\n'; tracerControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tracerControlAnnotations, error)))
         return fail("TracerV MCRFile transaction annotations: " + error);
       llvm::outs() << "Mapped CIRCT TracerV MCRFile transactions in " << tracerControlPath << '\n';
@@ -3201,25 +3354,25 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tracerQueuePath(outputDir), tracerQueueAnnotations(outputDir);
       llvm::sys::path::append(tracerQueuePath, "post-fame-tracerv-stream-queue.mlir");
       llvm::sys::path::append(tracerQueueAnnotations, "post-fame-tracerv-stream-queue-all.json");
-      std::error_code tracerQueueError;
-      llvm::raw_fd_ostream tracerQueueOut(tracerQueuePath, tracerQueueError);
+      std::error_code tracerQueueError = emitDebugSnapshot(
+          module->getOperation(), tracerQueuePath, emitDebugSnapshots);
       if (tracerQueueError)
         return fail("cannot write TracerV stream queue: " + tracerQueueError.message());
-      module->print(tracerQueueOut); tracerQueueOut << '\n'; tracerQueueOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tracerQueueAnnotations, error)))
         return fail("TracerV stream queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TracerV CPU stream in " << tracerQueuePath << '\n';
-      if (failed(goldengate::addNICTokenQueues(circuit, error)))
+      if (failed(compileTimeNICLoopback
+                     ? goldengate::addNICLoopbackPlatformQueues(circuit, error)
+                     : goldengate::addNICTokenQueues(circuit, error)))
         return fail("NIC token queues: " + error);
       if (circuit.getName() == "GGNICTokenQueuesWrapper") {
         if (failed(mlir::verify(*module))) return fail("NIC token queues produced invalid FIRRTL IR");
         llvm::SmallString<256> nicPath(outputDir), nicAnnotations(outputDir);
         llvm::sys::path::append(nicPath, "post-fame-nic-token-queues.mlir");
         llvm::sys::path::append(nicAnnotations, "post-fame-nic-token-queues-all.json");
-        std::error_code nicError;
-        llvm::raw_fd_ostream nicOut(nicPath, nicError);
+        std::error_code nicError = emitDebugSnapshot(
+            module->getOperation(), nicPath, emitDebugSnapshots);
         if (nicError) return fail("cannot write NIC token queues: " + nicError.message());
-        module->print(nicOut); nicOut << '\n'; nicOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, nicAnnotations, error)))
           return fail("NIC token queue annotations: " + error);
         if (failed(goldengate::addNICPacketAdapters(circuit, error)))
@@ -3228,10 +3381,9 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> packetPath(outputDir), packetAnnotations(outputDir);
         llvm::sys::path::append(packetPath, "post-fame-nic-packet-adapters.mlir");
         llvm::sys::path::append(packetAnnotations, "post-fame-nic-packet-adapters-all.json");
-        std::error_code packetError;
-        llvm::raw_fd_ostream packetOut(packetPath, packetError);
+        std::error_code packetError = emitDebugSnapshot(
+            module->getOperation(), packetPath, emitDebugSnapshots);
         if (packetError) return fail("cannot write NIC packet adapters: " + packetError.message());
-        module->print(packetOut); packetOut << '\n'; packetOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, packetAnnotations, error)))
           return fail("NIC packet adapter annotations: " + error);
         if (failed(goldengate::addNICCPUStreamQueues(circuit, error)))
@@ -3240,10 +3392,9 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> streamQueuePath(outputDir), streamQueueAnnotations(outputDir);
         llvm::sys::path::append(streamQueuePath, "post-fame-nic-cpu-stream-queues.mlir");
         llvm::sys::path::append(streamQueueAnnotations, "post-fame-nic-cpu-stream-queues-all.json");
-        std::error_code streamQueueError;
-        llvm::raw_fd_ostream streamQueueOut(streamQueuePath, streamQueueError);
+        std::error_code streamQueueError = emitDebugSnapshot(
+            module->getOperation(), streamQueuePath, emitDebugSnapshots);
         if (streamQueueError) return fail("cannot write NIC CPU stream queues: " + streamQueueError.message());
-        module->print(streamQueueOut); streamQueueOut << '\n'; streamQueueOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, streamQueueAnnotations, error)))
           return fail("NIC CPU stream queue annotations: " + error);
       }
@@ -3251,6 +3402,9 @@ int main(int argc, char **argv) {
       SmallVector<goldengate::CPUStreamCountPort> rocketCounts;
       if (failed(goldengate::deriveCPUStreamPorts(circuit, rocketStreams, cpuSinks, rocketCounts, error)))
         return fail("CPU stream catalog: " + error);
+      if (!productionPrintHosts.empty() &&
+          failed(goldengate::appendPrintBridgeCPUStreamPorts(circuit, rocketStreams, rocketCounts, error)))
+        return fail("shared Print CPU stream catalog: " + error);
       if (failed(goldengate::addCPUStreamRead(circuit, rocketStreams, error)))
         return fail("CPU stream read transport: " + error);
       if (failed(mlir::verify(*module)))
@@ -3258,11 +3412,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> cpuReadPath(outputDir), cpuReadAnnotations(outputDir);
       llvm::sys::path::append(cpuReadPath, "post-fame-cpu-stream-read.mlir");
       llvm::sys::path::append(cpuReadAnnotations, "post-fame-cpu-stream-read-all.json");
-      std::error_code cpuReadError;
-      llvm::raw_fd_ostream cpuReadOut(cpuReadPath, cpuReadError);
+      std::error_code cpuReadError = emitDebugSnapshot(
+          module->getOperation(), cpuReadPath, emitDebugSnapshots);
       if (cpuReadError)
         return fail("cannot write CPU stream read transport: " + cpuReadError.message());
-      module->print(cpuReadOut); cpuReadOut << '\n'; cpuReadOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, cpuReadAnnotations, error)))
         return fail("CPU stream read transport annotations: " + error);
       llvm::outs() << "Mapped CIRCT CPU stream read transport in " << cpuReadPath << '\n';
@@ -3273,11 +3426,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> cpuCountPath(outputDir), cpuCountAnnotations(outputDir);
       llvm::sys::path::append(cpuCountPath, "post-fame-cpu-stream-count.mlir");
       llvm::sys::path::append(cpuCountAnnotations, "post-fame-cpu-stream-count-all.json");
-      std::error_code cpuCountError;
-      llvm::raw_fd_ostream cpuCountOut(cpuCountPath, cpuCountError);
+      std::error_code cpuCountError = emitDebugSnapshot(
+          module->getOperation(), cpuCountPath, emitDebugSnapshots);
       if (cpuCountError)
         return fail("cannot write CPU stream count bank: " + cpuCountError.message());
-      module->print(cpuCountOut); cpuCountOut << '\n'; cpuCountOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, cpuCountAnnotations, error)))
         return fail("CPU stream count bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT CPU stream count MMIO bank in " << cpuCountPath << '\n';
@@ -3289,10 +3441,9 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> writePath(outputDir), writeAnnotations(outputDir);
         llvm::sys::path::append(writePath, "post-fame-cpu-stream-write.mlir");
         llvm::sys::path::append(writeAnnotations, "post-fame-cpu-stream-write-all.json");
-        std::error_code writeError;
-        llvm::raw_fd_ostream writeOut(writePath, writeError);
+        std::error_code writeError = emitDebugSnapshot(
+            module->getOperation(), writePath, emitDebugSnapshots);
         if (writeError) return fail("cannot write CPU stream write transport: " + writeError.message());
-        module->print(writeOut); writeOut << '\n'; writeOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, writeAnnotations, error)))
           return fail("CPU stream write transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT CPU stream write transport in " << writePath << '\n';
@@ -3311,10 +3462,9 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> bufferedPath(outputDir), bufferedAnnotations(outputDir);
         llvm::sys::path::append(bufferedPath, "post-fame-nic-cpu-write-buffered.mlir");
         llvm::sys::path::append(bufferedAnnotations, "post-fame-nic-cpu-write-buffered-all.json");
-        std::error_code bufferedError;
-        llvm::raw_fd_ostream bufferedOut(bufferedPath, bufferedError);
+        std::error_code bufferedError = emitDebugSnapshot(
+            module->getOperation(), bufferedPath, emitDebugSnapshots);
         if (bufferedError) return fail("cannot write NIC buffered CPU transport: " + bufferedError.message());
-        module->print(bufferedOut); bufferedOut << '\n'; bufferedOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, bufferedAnnotations, error)))
           return fail("NIC buffered CPU transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC CPU AW/W/B buffers in " << bufferedPath << '\n';
@@ -3339,71 +3489,71 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> duplexPath(outputDir), duplexAnnotations(outputDir);
         llvm::sys::path::append(duplexPath, "post-fame-nic-cpu-buffered.mlir");
         llvm::sys::path::append(duplexAnnotations, "post-fame-nic-cpu-buffered-all.json");
-        std::error_code duplexError;
-        llvm::raw_fd_ostream duplexOut(duplexPath, duplexError);
+        std::error_code duplexError = emitDebugSnapshot(
+            module->getOperation(), duplexPath, emitDebugSnapshots);
         if (duplexError) return fail("cannot write NIC buffered CPU transport: " + duplexError.message());
-        module->print(duplexOut); duplexOut << '\n'; duplexOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, duplexAnnotations, error)))
           return fail("NIC buffered CPU transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC CPU AW/W/B/AR/R buffers in " << duplexPath << '\n';
-        if (failed(goldengate::addNICMMIOBank(circuit, error)))
+        if (failed(compileTimeNICLoopback
+                       ? goldengate::addNICLoopbackMMIOBank(circuit, error)
+                       : goldengate::addNICMMIOBank(circuit, error)))
           return fail("NIC decoded MMIO bank: " + error);
         if (failed(mlir::verify(*module)))
           return fail("NIC decoded MMIO bank produced invalid FIRRTL IR");
         llvm::SmallString<256> nicMMIOPath(outputDir), nicMMIOAnnotations(outputDir);
         llvm::sys::path::append(nicMMIOPath, "post-fame-nic-mmio.mlir");
         llvm::sys::path::append(nicMMIOAnnotations, "post-fame-nic-mmio-all.json");
-        std::error_code nicMMIOError;
-        llvm::raw_fd_ostream nicMMIOOut(nicMMIOPath, nicMMIOError);
+        std::error_code nicMMIOError = emitDebugSnapshot(
+            module->getOperation(), nicMMIOPath, emitDebugSnapshots);
         if (nicMMIOError) return fail("cannot write NIC decoded MMIO bank: " + nicMMIOError.message());
-        module->print(nicMMIOOut); nicMMIOOut << '\n'; nicMMIOOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, nicMMIOAnnotations, error)))
           return fail("NIC decoded MMIO annotations: " + error);
-        llvm::outs() << "Mapped CIRCT NIC five configuration registers and sampled done MMIO in " << nicMMIOPath << '\n';
-        if (failed(goldengate::mapNICBridgeControl(circuit, 25, 12, error)))
+        llvm::outs() << "Mapped CIRCT NIC "
+                     << (compileTimeNICLoopback ? "loopback done MMIO in " :
+                         "five configuration registers and sampled done MMIO in ")
+                     << nicMMIOPath << '\n';
+        if (failed(goldengate::mapNICBridgeControl(circuit, ctrlAddressBits, 12, error)))
           return fail("NIC MCRFile transactions: " + error);
         if (failed(mlir::verify(*module)))
           return fail("NIC MCRFile produced invalid FIRRTL IR");
         llvm::SmallString<256> nicControlPath(outputDir), nicControlAnnotations(outputDir);
         llvm::sys::path::append(nicControlPath, "post-fame-nic-control.mlir");
         llvm::sys::path::append(nicControlAnnotations, "post-fame-nic-control-all.json");
-        std::error_code nicControlError;
-        llvm::raw_fd_ostream nicControlOut(nicControlPath, nicControlError);
+        std::error_code nicControlError = emitDebugSnapshot(
+            module->getOperation(), nicControlPath, emitDebugSnapshots);
         if (nicControlError) return fail("cannot write NIC control transport: " + nicControlError.message());
-        module->print(nicControlOut); nicControlOut << '\n'; nicControlOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, nicControlAnnotations, error)))
           return fail("NIC control transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC Nasti control transactions in " << nicControlPath << '\n';
         if (failed(goldengate::attachCPUStreamControl(circuit,
                 "GGNICBridgeControlWrapper", "GGNICCPUStreamControlWrapper",
-                25, 12, error)))
+                ctrlAddressBits, 12, error)))
           return fail("NIC CPU stream MCRFile transactions: " + error);
         if (failed(mlir::verify(*module)))
           return fail("NIC CPU stream MCRFile produced invalid FIRRTL IR");
         llvm::SmallString<256> nicCPUControlPath(outputDir), nicCPUControlAnnotations(outputDir);
         llvm::sys::path::append(nicCPUControlPath, "post-fame-nic-cpu-control.mlir");
         llvm::sys::path::append(nicCPUControlAnnotations, "post-fame-nic-cpu-control-all.json");
-        std::error_code nicCPUControlError;
-        llvm::raw_fd_ostream nicCPUControlOut(nicCPUControlPath, nicCPUControlError);
+        std::error_code nicCPUControlError = emitDebugSnapshot(
+            module->getOperation(), nicCPUControlPath, emitDebugSnapshots);
         if (nicCPUControlError)
           return fail("cannot write NIC CPU control transport: " + nicCPUControlError.message());
-        module->print(nicCPUControlOut); nicCPUControlOut << '\n'; nicCPUControlOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, nicCPUControlAnnotations, error)))
           return fail("NIC CPU control transport annotations: " + error);
         llvm::outs() << "Mapped CIRCT NIC ordered CPU stream occupancy Nasti control in " << nicCPUControlPath << '\n';
       } else {
-        if (failed(goldengate::mapCPUStreamControl(circuit, 25, 12, error)))
+        if (failed(goldengate::mapCPUStreamControl(circuit, ctrlAddressBits, 12, error)))
           return fail("CPU stream MCRFile transactions: " + error);
         if (failed(mlir::verify(*module)))
           return fail("CPU stream MCRFile produced invalid FIRRTL IR");
         llvm::SmallString<256> cpuControlPath(outputDir), cpuControlAnnotations(outputDir);
         llvm::sys::path::append(cpuControlPath, "post-fame-cpu-stream-control.mlir");
         llvm::sys::path::append(cpuControlAnnotations, "post-fame-cpu-stream-control-all.json");
-        std::error_code cpuControlError;
-        llvm::raw_fd_ostream cpuControlOut(cpuControlPath, cpuControlError);
+        std::error_code cpuControlError = emitDebugSnapshot(
+            module->getOperation(), cpuControlPath, emitDebugSnapshots);
         if (cpuControlError)
           return fail("cannot write CPU stream MCRFile: " + cpuControlError.message());
-        module->print(cpuControlOut); cpuControlOut << '\n'; cpuControlOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, cpuControlAnnotations, error)))
           return fail("CPU stream MCRFile annotations: " + error);
         llvm::outs() << "Mapped CIRCT CPU stream MCRFile transactions in " << cpuControlPath << '\n';
@@ -3414,11 +3564,10 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> cpuWritePath(outputDir), cpuWriteAnnotations(outputDir);
         llvm::sys::path::append(cpuWritePath, "post-fame-cpu-stream-write.mlir");
         llvm::sys::path::append(cpuWriteAnnotations, "post-fame-cpu-stream-write-all.json");
-        std::error_code cpuWriteError;
-        llvm::raw_fd_ostream cpuWriteOut(cpuWritePath, cpuWriteError);
+        std::error_code cpuWriteError = emitDebugSnapshot(
+            module->getOperation(), cpuWritePath, emitDebugSnapshots);
         if (cpuWriteError)
           return fail("cannot write empty CPU stream write boundary: " + cpuWriteError.message());
-        module->print(cpuWriteOut); cpuWriteOut << '\n'; cpuWriteOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteAnnotations, error)))
           return fail("empty CPU stream write annotations: " + error);
         llvm::outs() << "Mapped CIRCT empty CPU stream write boundary in " << cpuWritePath << '\n';
@@ -3429,11 +3578,10 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> cpuWriteBufferPath(outputDir), cpuWriteBufferAnnotations(outputDir);
         llvm::sys::path::append(cpuWriteBufferPath, "post-fame-cpu-stream-write-buffer.mlir");
         llvm::sys::path::append(cpuWriteBufferAnnotations, "post-fame-cpu-stream-write-buffer-all.json");
-        std::error_code cpuWriteBufferError;
-        llvm::raw_fd_ostream cpuWriteBufferOut(cpuWriteBufferPath, cpuWriteBufferError);
+        std::error_code cpuWriteBufferError = emitDebugSnapshot(
+            module->getOperation(), cpuWriteBufferPath, emitDebugSnapshots);
         if (cpuWriteBufferError)
           return fail("cannot write CPU stream AW/W buffer: " + cpuWriteBufferError.message());
-        module->print(cpuWriteBufferOut); cpuWriteBufferOut << '\n'; cpuWriteBufferOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteBufferAnnotations, error)))
           return fail("CPU stream AW/W buffer annotations: " + error);
         llvm::outs() << "Buffered CIRCT CPU stream AW/W requests in " << cpuWriteBufferPath << '\n';
@@ -3444,11 +3592,10 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> cpuReadBufferPath(outputDir), cpuReadBufferAnnotations(outputDir);
         llvm::sys::path::append(cpuReadBufferPath, "post-fame-cpu-stream-read-buffer.mlir");
         llvm::sys::path::append(cpuReadBufferAnnotations, "post-fame-cpu-stream-read-buffer-all.json");
-        std::error_code cpuReadBufferError;
-        llvm::raw_fd_ostream cpuReadBufferOut(cpuReadBufferPath, cpuReadBufferError);
+        std::error_code cpuReadBufferError = emitDebugSnapshot(
+            module->getOperation(), cpuReadBufferPath, emitDebugSnapshots);
         if (cpuReadBufferError)
           return fail("cannot write CPU stream AR buffer: " + cpuReadBufferError.message());
-        module->print(cpuReadBufferOut); cpuReadBufferOut << '\n'; cpuReadBufferOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, cpuReadBufferAnnotations, error)))
           return fail("CPU stream AR buffer annotations: " + error);
         llvm::outs() << "Buffered CIRCT CPU stream AR requests in " << cpuReadBufferPath << '\n';
@@ -3459,11 +3606,10 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> cpuResponseBufferPath(outputDir), cpuResponseBufferAnnotations(outputDir);
         llvm::sys::path::append(cpuResponseBufferPath, "post-fame-cpu-stream-response-buffer.mlir");
         llvm::sys::path::append(cpuResponseBufferAnnotations, "post-fame-cpu-stream-response-buffer-all.json");
-        std::error_code cpuResponseBufferError;
-        llvm::raw_fd_ostream cpuResponseBufferOut(cpuResponseBufferPath, cpuResponseBufferError);
+        std::error_code cpuResponseBufferError = emitDebugSnapshot(
+            module->getOperation(), cpuResponseBufferPath, emitDebugSnapshots);
         if (cpuResponseBufferError)
           return fail("cannot write CPU stream R response buffer: " + cpuResponseBufferError.message());
-        module->print(cpuResponseBufferOut); cpuResponseBufferOut << '\n'; cpuResponseBufferOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, cpuResponseBufferAnnotations, error)))
           return fail("CPU stream R response buffer annotations: " + error);
         llvm::outs() << "Buffered CIRCT CPU stream R response beats in " << cpuResponseBufferPath << '\n';
@@ -3474,11 +3620,10 @@ int main(int argc, char **argv) {
         llvm::SmallString<256> cpuWriteResponseBufferPath(outputDir), cpuWriteResponseBufferAnnotations(outputDir);
         llvm::sys::path::append(cpuWriteResponseBufferPath, "post-fame-cpu-stream-write-response-buffer.mlir");
         llvm::sys::path::append(cpuWriteResponseBufferAnnotations, "post-fame-cpu-stream-write-response-buffer-all.json");
-        std::error_code cpuWriteResponseBufferError;
-        llvm::raw_fd_ostream cpuWriteResponseBufferOut(cpuWriteResponseBufferPath, cpuWriteResponseBufferError);
+        std::error_code cpuWriteResponseBufferError = emitDebugSnapshot(
+            module->getOperation(), cpuWriteResponseBufferPath, emitDebugSnapshots);
         if (cpuWriteResponseBufferError)
           return fail("cannot write CPU stream B response buffer: " + cpuWriteResponseBufferError.message());
-        module->print(cpuWriteResponseBufferOut); cpuWriteResponseBufferOut << '\n'; cpuWriteResponseBufferOut.close();
         if (failed(goldengate::emitAllAnnotations(circuit, cpuWriteResponseBufferAnnotations, error)))
           return fail("CPU stream B response buffer annotations: " + error);
         llvm::outs() << "Buffered CIRCT CPU stream B responses in " << cpuWriteResponseBufferPath << '\n';
@@ -3492,11 +3637,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> loadMemWriterPath(outputDir), loadMemWriterAnnotations(outputDir);
       llvm::sys::path::append(loadMemWriterPath, "post-fame-loadmem-writer.mlir");
       llvm::sys::path::append(loadMemWriterAnnotations, "post-fame-loadmem-writer-all.json");
-      std::error_code loadMemWriterError;
-      llvm::raw_fd_ostream loadMemWriterOut(loadMemWriterPath, loadMemWriterError);
+      std::error_code loadMemWriterError = emitDebugSnapshot(
+          module->getOperation(), loadMemWriterPath, emitDebugSnapshots);
       if (loadMemWriterError)
         return fail("cannot write LoadMem writer: " + loadMemWriterError.message());
-      module->print(loadMemWriterOut); loadMemWriterOut << '\n'; loadMemWriterOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, loadMemWriterAnnotations, error)))
         return fail("LoadMem writer annotations: " + error);
       llvm::outs() << "Mapped CIRCT LoadMem writer bursts in " << loadMemWriterPath << '\n';
@@ -3507,11 +3651,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> loadMemRequestsPath(outputDir), loadMemRequestsAnnotations(outputDir);
       llvm::sys::path::append(loadMemRequestsPath, "post-fame-loadmem-requests.mlir");
       llvm::sys::path::append(loadMemRequestsAnnotations, "post-fame-loadmem-requests-all.json");
-      std::error_code loadMemRequestsError;
-      llvm::raw_fd_ostream loadMemRequestsOut(loadMemRequestsPath, loadMemRequestsError);
+      std::error_code loadMemRequestsError = emitDebugSnapshot(
+          module->getOperation(), loadMemRequestsPath, emitDebugSnapshots);
       if (loadMemRequestsError)
         return fail("cannot write LoadMem requests: " + loadMemRequestsError.message());
-      module->print(loadMemRequestsOut); loadMemRequestsOut << '\n'; loadMemRequestsOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, loadMemRequestsAnnotations, error)))
         return fail("LoadMem requests annotations: " + error);
       llvm::outs() << "Queued CIRCT LoadMem writes and zero-fill requests in " << loadMemRequestsPath << '\n';
@@ -3522,11 +3665,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> loadMemWriteMMIOPath(outputDir), loadMemWriteMMIOAnnotations(outputDir);
       llvm::sys::path::append(loadMemWriteMMIOPath, "post-fame-loadmem-write-mmio.mlir");
       llvm::sys::path::append(loadMemWriteMMIOAnnotations, "post-fame-loadmem-write-mmio-all.json");
-      std::error_code loadMemWriteMMIOError;
-      llvm::raw_fd_ostream loadMemWriteMMIOOut(loadMemWriteMMIOPath, loadMemWriteMMIOError);
+      std::error_code loadMemWriteMMIOError = emitDebugSnapshot(
+          module->getOperation(), loadMemWriteMMIOPath, emitDebugSnapshots);
       if (loadMemWriteMMIOError)
         return fail("cannot write LoadMem write MMIO: " + loadMemWriteMMIOError.message());
-      module->print(loadMemWriteMMIOOut); loadMemWriteMMIOOut << '\n'; loadMemWriteMMIOOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, loadMemWriteMMIOAnnotations, error)))
         return fail("LoadMem write MMIO annotations: " + error);
       llvm::outs() << "Mapped CIRCT LoadMem write-address MMIO bank in " << loadMemWriteMMIOPath << '\n';
@@ -3537,11 +3679,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> loadMemWriteDataPath(outputDir), loadMemWriteDataAnnotations(outputDir);
       llvm::sys::path::append(loadMemWriteDataPath, "post-fame-loadmem-write-data.mlir");
       llvm::sys::path::append(loadMemWriteDataAnnotations, "post-fame-loadmem-write-data-all.json");
-      std::error_code loadMemWriteDataError;
-      llvm::raw_fd_ostream loadMemWriteDataOut(loadMemWriteDataPath, loadMemWriteDataError);
+      std::error_code loadMemWriteDataError = emitDebugSnapshot(
+          module->getOperation(), loadMemWriteDataPath, emitDebugSnapshots);
       if (loadMemWriteDataError)
         return fail("cannot write LoadMem write data: " + loadMemWriteDataError.message());
-      module->print(loadMemWriteDataOut); loadMemWriteDataOut << '\n'; loadMemWriteDataOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, loadMemWriteDataAnnotations, error)))
         return fail("LoadMem write data annotations: " + error);
       llvm::outs() << "Mapped CIRCT LoadMem write-data FIFO in " << loadMemWriteDataPath << '\n';
@@ -3552,11 +3693,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> loadMemReadRequestsPath(outputDir), loadMemReadRequestsAnnotations(outputDir);
       llvm::sys::path::append(loadMemReadRequestsPath, "post-fame-loadmem-read-requests.mlir");
       llvm::sys::path::append(loadMemReadRequestsAnnotations, "post-fame-loadmem-read-requests-all.json");
-      std::error_code loadMemReadRequestsError;
-      llvm::raw_fd_ostream loadMemReadRequestsOut(loadMemReadRequestsPath, loadMemReadRequestsError);
+      std::error_code loadMemReadRequestsError = emitDebugSnapshot(
+          module->getOperation(), loadMemReadRequestsPath, emitDebugSnapshots);
       if (loadMemReadRequestsError)
         return fail("cannot write LoadMem read requests: " + loadMemReadRequestsError.message());
-      module->print(loadMemReadRequestsOut); loadMemReadRequestsOut << '\n'; loadMemReadRequestsOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, loadMemReadRequestsAnnotations, error)))
         return fail("LoadMem read requests annotations: " + error);
       llvm::outs() << "Queued CIRCT LoadMem read-address requests in " << loadMemReadRequestsPath << '\n';
@@ -3567,41 +3707,38 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> loadMemReadDataPath(outputDir), loadMemReadDataAnnotations(outputDir);
       llvm::sys::path::append(loadMemReadDataPath, "post-fame-loadmem-read-data.mlir");
       llvm::sys::path::append(loadMemReadDataAnnotations, "post-fame-loadmem-read-data-all.json");
-      std::error_code loadMemReadDataError;
-      llvm::raw_fd_ostream loadMemReadDataOut(loadMemReadDataPath, loadMemReadDataError);
+      std::error_code loadMemReadDataError = emitDebugSnapshot(
+          module->getOperation(), loadMemReadDataPath, emitDebugSnapshots);
       if (loadMemReadDataError)
         return fail("cannot write LoadMem read data: " + loadMemReadDataError.message());
-      module->print(loadMemReadDataOut); loadMemReadDataOut << '\n'; loadMemReadDataOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, loadMemReadDataAnnotations, error)))
         return fail("LoadMem read data annotations: " + error);
       llvm::outs() << "Mapped CIRCT LoadMem read-data FIFO in " << loadMemReadDataPath << '\n';
-      if (failed(goldengate::mapLoadMemControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapLoadMemControl(circuit, ctrlAddressBits, 12, error)))
         return fail("LoadMem control: " + error);
       if (failed(mlir::verify(*module)))
         return fail("LoadMem control produced invalid FIRRTL IR");
       llvm::SmallString<256> loadMemControlPath(outputDir), loadMemControlAnnotations(outputDir);
       llvm::sys::path::append(loadMemControlPath, "post-fame-loadmem-control.mlir");
       llvm::sys::path::append(loadMemControlAnnotations, "post-fame-loadmem-control-all.json");
-      std::error_code loadMemControlError;
-      llvm::raw_fd_ostream loadMemControlOut(loadMemControlPath, loadMemControlError);
+      std::error_code loadMemControlError = emitDebugSnapshot(
+          module->getOperation(), loadMemControlPath, emitDebugSnapshots);
       if (loadMemControlError)
         return fail("cannot write LoadMem control: " + loadMemControlError.message());
-      module->print(loadMemControlOut); loadMemControlOut << '\n'; loadMemControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, loadMemControlAnnotations, error)))
         return fail("LoadMem control annotations: " + error);
       llvm::outs() << "Mapped CIRCT LoadMem MCRFile transactions in " << loadMemControlPath << '\n';
-      if (failed(goldengate::addControlErrorSlave(circuit, 25, 12, error)))
+      if (failed(goldengate::addControlErrorSlave(circuit, ctrlAddressBits, 12, error)))
         return fail("control error slave: " + error);
       if (failed(mlir::verify(*module)))
         return fail("control error slave produced invalid FIRRTL IR");
       llvm::SmallString<256> controlErrorPath(outputDir), controlErrorAnnotations(outputDir);
       llvm::sys::path::append(controlErrorPath, "post-fame-control-error-slave.mlir");
       llvm::sys::path::append(controlErrorAnnotations, "post-fame-control-error-slave-all.json");
-      std::error_code controlErrorWriteError;
-      llvm::raw_fd_ostream controlErrorOut(controlErrorPath, controlErrorWriteError);
+      std::error_code controlErrorWriteError = emitDebugSnapshot(
+          module->getOperation(), controlErrorPath, emitDebugSnapshots);
       if (controlErrorWriteError)
         return fail("cannot write control error slave: " + controlErrorWriteError.message());
-      module->print(controlErrorOut); controlErrorOut << '\n'; controlErrorOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlErrorAnnotations, error)))
         return fail("control error slave annotations: " + error);
       llvm::outs() << "Mapped CIRCT control decode-error endpoint in " << controlErrorPath << '\n';
@@ -3616,11 +3753,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> masterBankPath(outputDir), masterBankAnnotations(outputDir);
       llvm::sys::path::append(masterBankPath, "post-fame-simulation-master-bank.mlir");
       llvm::sys::path::append(masterBankAnnotations, "post-fame-simulation-master-bank-all.json");
-      std::error_code masterBankWriteError;
-      llvm::raw_fd_ostream masterBankOut(masterBankPath, masterBankWriteError);
+      std::error_code masterBankWriteError = emitDebugSnapshot(
+          module->getOperation(), masterBankPath, emitDebugSnapshots);
       if (masterBankWriteError)
         return fail("cannot write SimulationMaster materialization: " + masterBankWriteError.message());
-      module->print(masterBankOut); masterBankOut << '\n'; masterBankOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, masterBankAnnotations, error)))
         return fail("SimulationMaster materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT SimulationMaster bank before control allocation in " << masterBankPath << '\n';
@@ -3634,11 +3770,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tsiBankPath(outputDir), tsiBankAnnotations(outputDir);
       llvm::sys::path::append(tsiBankPath, "post-fame-tsi-mmio-bank.mlir");
       llvm::sys::path::append(tsiBankAnnotations, "post-fame-tsi-mmio-bank-all.json");
-      std::error_code tsiBankWriteError;
-      llvm::raw_fd_ostream tsiBankOut(tsiBankPath, tsiBankWriteError);
+      std::error_code tsiBankWriteError = emitDebugSnapshot(
+          module->getOperation(), tsiBankPath, emitDebugSnapshots);
       if (tsiBankWriteError)
         return fail("cannot write TSI MMIO materialization: " + tsiBankWriteError.message());
-      module->print(tsiBankOut); tsiBankOut << '\n'; tsiBankOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tsiBankAnnotations, error)))
         return fail("TSI MMIO materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT TSI MMIO bank before control allocation in " << tsiBankPath << '\n';
@@ -3652,146 +3787,154 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevBankPath(outputDir), blockDevBankAnnotations(outputDir);
       llvm::sys::path::append(blockDevBankPath, "post-fame-blockdev-mmio-bank.mlir");
       llvm::sys::path::append(blockDevBankAnnotations, "post-fame-blockdev-mmio-bank-all.json");
-      std::error_code blockDevBankWriteError;
-      llvm::raw_fd_ostream blockDevBankOut(blockDevBankPath, blockDevBankWriteError);
+      std::error_code blockDevBankWriteError = emitDebugSnapshot(
+          module->getOperation(), blockDevBankPath, emitDebugSnapshots);
       if (blockDevBankWriteError)
         return fail("cannot write BlockDev MMIO materialization: " + blockDevBankWriteError.message());
-      module->print(blockDevBankOut); blockDevBankOut << '\n'; blockDevBankOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevBankAnnotations, error)))
         return fail("BlockDev MMIO materialization annotations: " + error);
       llvm::outs() << "Materialized CIRCT BlockDev MMIO bank before control allocation in " << blockDevBankPath << '\n';
-      // FASED host register fragments: allocate their state independently
-      // of the later timing-model wrappers. Remaining fragments still attach late.
-      FModuleOp fasedLatencyBank;
-      if (failed(goldengate::materializeFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
-        return fail("FASED latency materialization: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("FASED latency materialization produced invalid FIRRTL IR");
-      goldengate::ControlMMIOWidget fasedLatencyWidget;
-      if (failed(goldengate::deriveControlMMIOWidget(circuit, "FASED latency fragment",
-              fasedLatencyBank.getName(), {fasedLatencyBank.getName()}, fasedLatencyWidget,
-              error, Direction::Out)))
-        return fail("FASED latency register registry: " + error);
-      llvm::SmallString<256> fasedLatencyBankPath(outputDir), fasedLatencyBankAnnotations(outputDir);
-      llvm::sys::path::append(fasedLatencyBankPath, "post-fame-fased-latency-bank.mlir");
-      llvm::sys::path::append(fasedLatencyBankAnnotations, "post-fame-fased-latency-bank-all.json");
-      std::error_code fasedLatencyBankWriteError;
-      llvm::raw_fd_ostream fasedLatencyBankOut(fasedLatencyBankPath, fasedLatencyBankWriteError);
-      if (fasedLatencyBankWriteError)
-        return fail("cannot write FASED latency materialization: " + fasedLatencyBankWriteError.message());
-      module->print(fasedLatencyBankOut); fasedLatencyBankOut << '\n'; fasedLatencyBankOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyBankAnnotations, error)))
-        return fail("FASED latency materialization annotations: " + error);
-      llvm::outs() << "Materialized CIRCT FASED latency bank before control allocation in " << fasedLatencyBankPath << '\n';
-      // Preserve global words 2/3 in this fragment's registry. It is not a
-      // standalone widget; validate its offsets against the complete FASED
-      // registry and typed adapter after all fragments have been assembled.
-      FModuleOp fasedRequestLimitsBank;
-      if (failed(goldengate::materializeFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
-        return fail("FASED request-limit materialization: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("FASED request-limit materialization produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedRequestLimitsBankPath(outputDir), fasedRequestLimitsBankAnnotations(outputDir);
-      llvm::sys::path::append(fasedRequestLimitsBankPath, "post-fame-fased-request-limits-bank.mlir");
-      llvm::sys::path::append(fasedRequestLimitsBankAnnotations, "post-fame-fased-request-limits-bank-all.json");
-      std::error_code fasedRequestLimitsBankWriteError;
-      llvm::raw_fd_ostream fasedRequestLimitsBankOut(fasedRequestLimitsBankPath, fasedRequestLimitsBankWriteError);
-      if (fasedRequestLimitsBankWriteError)
-        return fail("cannot write FASED request-limit materialization: " + fasedRequestLimitsBankWriteError.message());
-      module->print(fasedRequestLimitsBankOut); fasedRequestLimitsBankOut << '\n'; fasedRequestLimitsBankOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsBankAnnotations, error)))
-        return fail("FASED request-limit materialization annotations: " + error);
-      llvm::outs() << "Materialized CIRCT FASED request-limit bank before control allocation in " << fasedRequestLimitsBankPath << '\n';
-      // This sparse fragment retains global word 18; validate it with the
-      // complete FASED registry and typed adapter after fragment assembly.
-      FModuleOp fasedFunctionalModelBank;
-      if (failed(goldengate::materializeFASEDFunctionalModelRegister(circuit, fasedFunctionalModelBank, error)))
-        return fail("FASED functional-model materialization: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("FASED functional-model materialization produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedFunctionalModelBankPath(outputDir), fasedFunctionalModelBankAnnotations(outputDir);
-      llvm::sys::path::append(fasedFunctionalModelBankPath, "post-fame-fased-functional-model-bank.mlir");
-      llvm::sys::path::append(fasedFunctionalModelBankAnnotations, "post-fame-fased-functional-model-bank-all.json");
-      std::error_code fasedFunctionalModelBankWriteError;
-      llvm::raw_fd_ostream fasedFunctionalModelBankOut(fasedFunctionalModelBankPath, fasedFunctionalModelBankWriteError);
-      if (fasedFunctionalModelBankWriteError)
-        return fail("cannot write FASED functional-model materialization: " + fasedFunctionalModelBankWriteError.message());
-      module->print(fasedFunctionalModelBankOut); fasedFunctionalModelBankOut << '\n'; fasedFunctionalModelBankOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelBankAnnotations, error)))
-        return fail("FASED functional-model materialization annotations: " + error);
-      llvm::outs() << "Materialized CIRCT FASED functional-model bank before control allocation in " << fasedFunctionalModelBankPath << '\n';
-      // This sparse fragment retains global words 19/20; validate it with the
-      // complete FASED registry and typed adapter after fragment assembly.
-      FModuleOp fasedResponseErrorsBank;
-      if (failed(goldengate::materializeFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
-        return fail("FASED response-error materialization: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("FASED response-error materialization produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedResponseErrorsBankPath(outputDir), fasedResponseErrorsBankAnnotations(outputDir);
-      llvm::sys::path::append(fasedResponseErrorsBankPath, "post-fame-fased-response-errors-bank.mlir");
-      llvm::sys::path::append(fasedResponseErrorsBankAnnotations, "post-fame-fased-response-errors-bank-all.json");
-      std::error_code fasedResponseErrorsBankWriteError;
-      llvm::raw_fd_ostream fasedResponseErrorsBankOut(fasedResponseErrorsBankPath, fasedResponseErrorsBankWriteError);
-      if (fasedResponseErrorsBankWriteError)
-        return fail("cannot write FASED response-error materialization: " + fasedResponseErrorsBankWriteError.message());
-      module->print(fasedResponseErrorsBankOut); fasedResponseErrorsBankOut << '\n'; fasedResponseErrorsBankOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsBankAnnotations, error)))
-        return fail("FASED response-error materialization annotations: " + error);
-      llvm::outs() << "Materialized CIRCT FASED response-error bank before control allocation in " << fasedResponseErrorsBankPath << '\n';
-      // This sparse fragment retains global words 14-17; combine its registry
-      // with the other FASED banks after the final fragment is materialized.
-      FModuleOp fasedStatisticsBank;
-      if (failed(goldengate::materializeFASEDStatistics(circuit, fasedStatisticsBank, error)))
-        return fail("FASED statistics materialization: " + error);
-      if (failed(mlir::verify(*module)))
-        return fail("FASED statistics materialization produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedStatisticsBankPath(outputDir), fasedStatisticsBankAnnotations(outputDir);
-      llvm::sys::path::append(fasedStatisticsBankPath, "post-fame-fased-statistics-bank.mlir");
-      llvm::sys::path::append(fasedStatisticsBankAnnotations, "post-fame-fased-statistics-bank-all.json");
-      std::error_code fasedStatisticsBankWriteError;
-      llvm::raw_fd_ostream fasedStatisticsBankOut(fasedStatisticsBankPath, fasedStatisticsBankWriteError);
-      if (fasedStatisticsBankWriteError)
-        return fail("cannot write FASED statistics materialization: " + fasedStatisticsBankWriteError.message());
-      module->print(fasedStatisticsBankOut); fasedStatisticsBankOut << '\n'; fasedStatisticsBankOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsBankAnnotations, error)))
-        return fail("FASED statistics materialization annotations: " + error);
-      llvm::outs() << "Materialized CIRCT FASED statistics bank before control allocation in " << fasedStatisticsBankPath << '\n';
-      FModuleOp fasedHistogramsBank;
-      if (failed(goldengate::materializeFASEDHistograms(circuit, fasedHistogramsBank, error)))
-        return fail("FASED histogram materialization: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED histogram materialization produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedHistogramsBankPath(outputDir), fasedHistogramsBankAnnotations(outputDir);
-      llvm::sys::path::append(fasedHistogramsBankPath, "post-fame-fased-histograms-bank.mlir");
-      llvm::sys::path::append(fasedHistogramsBankAnnotations, "post-fame-fased-histograms-bank-all.json");
-      std::error_code fasedHistogramsBankError;
-      llvm::raw_fd_ostream fasedHistogramsBankOut(fasedHistogramsBankPath, fasedHistogramsBankError);
-      if (fasedHistogramsBankError) return fail("cannot write FASED histogram bank: " + fasedHistogramsBankError.message());
-      module->print(fasedHistogramsBankOut); fasedHistogramsBankOut << '\n'; fasedHistogramsBankOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsBankAnnotations, error)))
-        return fail("FASED histogram materialization annotations: " + error);
-      llvm::outs() << "Materialized CIRCT FASED histogram bank before control allocation in " << fasedHistogramsBankPath << '\n';
+      FModuleOp fasedFRFCFSBank, fasedLatencyBank, fasedRequestLimitsBank,
+          fasedFunctionalModelBank, fasedResponseErrorsBank, fasedStatisticsBank,
+          fasedHistogramsBank;
+      if (fasedFRFCFS) {
+        if (failed(goldengate::materializeFASEDFRFCFSMMIO(circuit, fasedFRFCFSBank, error)))
+          return fail("FASED FRFCFS MMIO materialization: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED FRFCFS MMIO materialization produced invalid FIRRTL IR");
+        llvm::SmallString<256> bankPath(outputDir), bankAnnotations(outputDir);
+        llvm::sys::path::append(bankPath, "post-fame-fased-frfcfs-mmio-bank.mlir");
+        llvm::sys::path::append(bankAnnotations, "post-fame-fased-frfcfs-mmio-bank-all.json");
+        if (auto ec = emitDebugSnapshot(module->getOperation(), bankPath, emitDebugSnapshots))
+          return fail("cannot write FASED FRFCFS MMIO bank: " + ec.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, bankAnnotations, error)))
+          return fail("FASED FRFCFS MMIO bank annotations: " + error);
+        llvm::outs() << "Materialized CIRCT FASED FRFCFS 68-word bank before control allocation\n";
+      } else {
+        // FASED host register fragments: allocate their state independently
+        // of the later timing-model wrappers. Remaining fragments still attach late.
+        if (failed(goldengate::materializeFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
+          return fail("FASED latency materialization: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED latency materialization produced invalid FIRRTL IR");
+        goldengate::ControlMMIOWidget fasedLatencyWidget;
+        if (failed(goldengate::deriveControlMMIOWidget(circuit, "FASED latency fragment",
+                fasedLatencyBank.getName(), {fasedLatencyBank.getName()}, fasedLatencyWidget,
+                error, Direction::Out)))
+          return fail("FASED latency register registry: " + error);
+        llvm::SmallString<256> fasedLatencyBankPath(outputDir), fasedLatencyBankAnnotations(outputDir);
+        llvm::sys::path::append(fasedLatencyBankPath, "post-fame-fased-latency-bank.mlir");
+        llvm::sys::path::append(fasedLatencyBankAnnotations, "post-fame-fased-latency-bank-all.json");
+        std::error_code fasedLatencyBankWriteError = emitDebugSnapshot(
+            module->getOperation(), fasedLatencyBankPath, emitDebugSnapshots);
+        if (fasedLatencyBankWriteError)
+          return fail("cannot write FASED latency materialization: " + fasedLatencyBankWriteError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyBankAnnotations, error)))
+          return fail("FASED latency materialization annotations: " + error);
+        llvm::outs() << "Materialized CIRCT FASED latency bank before control allocation in " << fasedLatencyBankPath << '\n';
+        // Preserve global words 2/3 in this fragment's registry. It is not a
+        // standalone widget; validate its offsets against the complete FASED
+        // registry and typed adapter after all fragments have been assembled.
+        if (failed(goldengate::materializeFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
+          return fail("FASED request-limit materialization: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED request-limit materialization produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedRequestLimitsBankPath(outputDir), fasedRequestLimitsBankAnnotations(outputDir);
+        llvm::sys::path::append(fasedRequestLimitsBankPath, "post-fame-fased-request-limits-bank.mlir");
+        llvm::sys::path::append(fasedRequestLimitsBankAnnotations, "post-fame-fased-request-limits-bank-all.json");
+        std::error_code fasedRequestLimitsBankWriteError = emitDebugSnapshot(
+            module->getOperation(), fasedRequestLimitsBankPath, emitDebugSnapshots);
+        if (fasedRequestLimitsBankWriteError)
+          return fail("cannot write FASED request-limit materialization: " + fasedRequestLimitsBankWriteError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsBankAnnotations, error)))
+          return fail("FASED request-limit materialization annotations: " + error);
+        llvm::outs() << "Materialized CIRCT FASED request-limit bank before control allocation in " << fasedRequestLimitsBankPath << '\n';
+        // This sparse fragment retains global word 18; validate it with the
+        // complete FASED registry and typed adapter after fragment assembly.
+        if (failed(goldengate::materializeFASEDFunctionalModelRegister(circuit, fasedFunctionalModelBank, error)))
+          return fail("FASED functional-model materialization: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED functional-model materialization produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedFunctionalModelBankPath(outputDir), fasedFunctionalModelBankAnnotations(outputDir);
+        llvm::sys::path::append(fasedFunctionalModelBankPath, "post-fame-fased-functional-model-bank.mlir");
+        llvm::sys::path::append(fasedFunctionalModelBankAnnotations, "post-fame-fased-functional-model-bank-all.json");
+        std::error_code fasedFunctionalModelBankWriteError = emitDebugSnapshot(
+            module->getOperation(), fasedFunctionalModelBankPath, emitDebugSnapshots);
+        if (fasedFunctionalModelBankWriteError)
+          return fail("cannot write FASED functional-model materialization: " + fasedFunctionalModelBankWriteError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelBankAnnotations, error)))
+          return fail("FASED functional-model materialization annotations: " + error);
+        llvm::outs() << "Materialized CIRCT FASED functional-model bank before control allocation in " << fasedFunctionalModelBankPath << '\n';
+        // This sparse fragment retains global words 19/20; validate it with the
+        // complete FASED registry and typed adapter after fragment assembly.
+        if (failed(goldengate::materializeFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
+          return fail("FASED response-error materialization: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED response-error materialization produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedResponseErrorsBankPath(outputDir), fasedResponseErrorsBankAnnotations(outputDir);
+        llvm::sys::path::append(fasedResponseErrorsBankPath, "post-fame-fased-response-errors-bank.mlir");
+        llvm::sys::path::append(fasedResponseErrorsBankAnnotations, "post-fame-fased-response-errors-bank-all.json");
+        std::error_code fasedResponseErrorsBankWriteError = emitDebugSnapshot(
+            module->getOperation(), fasedResponseErrorsBankPath, emitDebugSnapshots);
+        if (fasedResponseErrorsBankWriteError)
+          return fail("cannot write FASED response-error materialization: " + fasedResponseErrorsBankWriteError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsBankAnnotations, error)))
+          return fail("FASED response-error materialization annotations: " + error);
+        llvm::outs() << "Materialized CIRCT FASED response-error bank before control allocation in " << fasedResponseErrorsBankPath << '\n';
+        // This sparse fragment retains global words 14-17; combine its registry
+        // with the other FASED banks after the final fragment is materialized.
+        if (failed(goldengate::materializeFASEDStatistics(circuit, fasedStatisticsBank, error)))
+          return fail("FASED statistics materialization: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED statistics materialization produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedStatisticsBankPath(outputDir), fasedStatisticsBankAnnotations(outputDir);
+        llvm::sys::path::append(fasedStatisticsBankPath, "post-fame-fased-statistics-bank.mlir");
+        llvm::sys::path::append(fasedStatisticsBankAnnotations, "post-fame-fased-statistics-bank-all.json");
+        std::error_code fasedStatisticsBankWriteError = emitDebugSnapshot(
+            module->getOperation(), fasedStatisticsBankPath, emitDebugSnapshots);
+        if (fasedStatisticsBankWriteError)
+          return fail("cannot write FASED statistics materialization: " + fasedStatisticsBankWriteError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsBankAnnotations, error)))
+          return fail("FASED statistics materialization annotations: " + error);
+        llvm::outs() << "Materialized CIRCT FASED statistics bank before control allocation in " << fasedStatisticsBankPath << '\n';
+        if (failed(goldengate::materializeFASEDHistograms(circuit, fasedHistogramsBank, error)))
+          return fail("FASED histogram materialization: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED histogram materialization produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedHistogramsBankPath(outputDir), fasedHistogramsBankAnnotations(outputDir);
+        llvm::sys::path::append(fasedHistogramsBankPath, "post-fame-fased-histograms-bank.mlir");
+        llvm::sys::path::append(fasedHistogramsBankAnnotations, "post-fame-fased-histograms-bank-all.json");
+        std::error_code fasedHistogramsBankError = emitDebugSnapshot(
+            module->getOperation(), fasedHistogramsBankPath, emitDebugSnapshots);
+        if (fasedHistogramsBankError) return fail("cannot write FASED histogram bank: " + fasedHistogramsBankError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsBankAnnotations, error)))
+          return fail("FASED histogram materialization annotations: " + error);
+        llvm::outs() << "Materialized CIRCT FASED histogram bank before control allocation in " << fasedHistogramsBankPath << '\n';
+      }
       // HasWidgets registration order is independent of IR module order. All
       // FASED fragments now exist, so derive its size from their complete
       // registry. Validate the assembled typed MCR port again before binding.
-      const llvm::StringRef fasedRegisterModules[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
-          "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"};
+      SmallVector<llvm::StringRef> fasedRegisterModules;
+      if (fasedFRFCFS)
+        fasedRegisterModules = {"GGFASEDFRFCFSMMIO"};
+      else
+        fasedRegisterModules = {"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
+            "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister", "GGFASEDResponseErrors"};
       SmallVector<goldengate::ControlMMIOWidget> controlWidgets;
       SmallVector<goldengate::ControlMMIORegion> controlRegions;
-      if (failed(goldengate::allocateRocketControlMMIORegions(circuit, 25, {},
+      if (failed(goldengate::allocateRocketControlMMIORegions(circuit, ctrlAddressBits, productionPrintHosts,
               controlWidgets, controlRegions, error)))
         return fail("control address allocation: " + error);
-      if (failed(goldengate::addControlAddressDecode(circuit, 25, controlRegions, error)))
+      if (failed(goldengate::addControlAddressDecode(circuit, ctrlAddressBits, controlRegions, error)))
         return fail("control address decoder: " + error);
       if (failed(mlir::verify(*module)))
         return fail("control address decoder produced invalid FIRRTL IR");
       llvm::SmallString<256> controlDecodePath(outputDir), controlDecodeAnnotations(outputDir);
       llvm::sys::path::append(controlDecodePath, "post-fame-control-address-decode.mlir");
       llvm::sys::path::append(controlDecodeAnnotations, "post-fame-control-address-decode-all.json");
-      std::error_code controlDecodeWriteError;
-      llvm::raw_fd_ostream controlDecodeOut(controlDecodePath, controlDecodeWriteError);
+      std::error_code controlDecodeWriteError = emitDebugSnapshot(
+          module->getOperation(), controlDecodePath, emitDebugSnapshots);
       if (controlDecodeWriteError)
         return fail("cannot write control address decoder: " + controlDecodeWriteError.message());
-      module->print(controlDecodeOut); controlDecodeOut << '\n'; controlDecodeOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlDecodeAnnotations, error)))
         return fail("control decoder annotations: " + error);
       llvm::outs() << "Mapped CIRCT control address decoder in " << controlDecodePath << '\n';
@@ -3804,11 +3947,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> controlRoutePath(outputDir), controlRouteAnnotations(outputDir);
       llvm::sys::path::append(controlRoutePath, "post-fame-control-write-route.mlir");
       llvm::sys::path::append(controlRouteAnnotations, "post-fame-control-write-route-all.json");
-      std::error_code controlRouteWriteError;
-      llvm::raw_fd_ostream controlRouteOut(controlRoutePath, controlRouteWriteError);
+      std::error_code controlRouteWriteError = emitDebugSnapshot(
+          module->getOperation(), controlRoutePath, emitDebugSnapshots);
       if (controlRouteWriteError)
         return fail("cannot write control write route: " + controlRouteWriteError.message());
-      module->print(controlRouteOut); controlRouteOut << '\n'; controlRouteOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlRouteAnnotations, error)))
         return fail("control write route annotations: " + error);
       llvm::outs() << "Queued CIRCT control AW routes through accepted W.last in " << controlRoutePath << '\n';
@@ -3819,11 +3961,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> controlDispatchPath(outputDir), controlDispatchAnnotations(outputDir);
       llvm::sys::path::append(controlDispatchPath, "post-fame-control-write-dispatch.mlir");
       llvm::sys::path::append(controlDispatchAnnotations, "post-fame-control-write-dispatch-all.json");
-      std::error_code controlDispatchWriteError;
-      llvm::raw_fd_ostream controlDispatchOut(controlDispatchPath, controlDispatchWriteError);
+      std::error_code controlDispatchWriteError = emitDebugSnapshot(
+          module->getOperation(), controlDispatchPath, emitDebugSnapshots);
       if (controlDispatchWriteError)
         return fail("cannot write control write dispatch: " + controlDispatchWriteError.message());
-      module->print(controlDispatchOut); controlDispatchOut << '\n'; controlDispatchOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlDispatchAnnotations, error)))
         return fail("control dispatch annotations: " + error);
       llvm::outs() << "Dispatched CIRCT control AW/W requests and connected the error endpoint in " << controlDispatchPath << '\n';
@@ -3834,11 +3975,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> widgetWritesPath(outputDir), widgetWritesAnnotations(outputDir);
       llvm::sys::path::append(widgetWritesPath, "post-fame-control-widget-writes.mlir");
       llvm::sys::path::append(widgetWritesAnnotations, "post-fame-control-widget-writes-all.json");
-      std::error_code widgetWritesWriteError;
-      llvm::raw_fd_ostream widgetWritesOut(widgetWritesPath, widgetWritesWriteError);
+      std::error_code widgetWritesWriteError = emitDebugSnapshot(
+          module->getOperation(), widgetWritesPath, emitDebugSnapshots);
       if (widgetWritesWriteError)
         return fail("cannot write control widget writes: " + widgetWritesWriteError.message());
-      module->print(widgetWritesOut); widgetWritesOut << '\n'; widgetWritesOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, widgetWritesAnnotations, error)))
         return fail("control widget write annotations: " + error);
       llvm::outs() << "Bound CIRCT control AW/W requests to allocated widgets in " << widgetWritesPath << '\n';
@@ -3852,11 +3992,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> controlReadsPath(outputDir), controlReadsAnnotations(outputDir);
       llvm::sys::path::append(controlReadsPath, "post-fame-control-read-dispatch.mlir");
       llvm::sys::path::append(controlReadsAnnotations, "post-fame-control-read-dispatch-all.json");
-      std::error_code controlReadsWriteError;
-      llvm::raw_fd_ostream controlReadsOut(controlReadsPath, controlReadsWriteError);
+      std::error_code controlReadsWriteError = emitDebugSnapshot(
+          module->getOperation(), controlReadsPath, emitDebugSnapshots);
       if (controlReadsWriteError)
         return fail("cannot write control read dispatch: " + controlReadsWriteError.message());
-      module->print(controlReadsOut); controlReadsOut << '\n'; controlReadsOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlReadsAnnotations, error)))
         return fail("control read annotations: " + error);
       llvm::outs() << "Dispatched CIRCT control AR requests to allocated widgets and the error endpoint in " << controlReadsPath << '\n';
@@ -3867,11 +4006,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> readTrackerPath(outputDir), readTrackerAnnotations(outputDir);
       llvm::sys::path::append(readTrackerPath, "post-fame-control-read-tracker.mlir");
       llvm::sys::path::append(readTrackerAnnotations, "post-fame-control-read-tracker-all.json");
-      std::error_code readTrackerWriteError;
-      llvm::raw_fd_ostream readTrackerOut(readTrackerPath, readTrackerWriteError);
+      std::error_code readTrackerWriteError = emitDebugSnapshot(
+          module->getOperation(), readTrackerPath, emitDebugSnapshots);
       if (readTrackerWriteError)
         return fail("cannot write control read tracker: " + readTrackerWriteError.message());
-      module->print(readTrackerOut); readTrackerOut << '\n'; readTrackerOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, readTrackerAnnotations, error)))
         return fail("control read tracker annotations: " + error);
       llvm::outs() << "Tracked CIRCT control AR transactions and accepted final R beats in " << readTrackerPath << '\n';
@@ -3882,11 +4020,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> readArbiterPath(outputDir), readArbiterAnnotations(outputDir);
       llvm::sys::path::append(readArbiterPath, "post-fame-control-read-arbiter.mlir");
       llvm::sys::path::append(readArbiterAnnotations, "post-fame-control-read-arbiter-all.json");
-      std::error_code readArbiterWriteError;
-      llvm::raw_fd_ostream readArbiterOut(readArbiterPath, readArbiterWriteError);
+      std::error_code readArbiterWriteError = emitDebugSnapshot(
+          module->getOperation(), readArbiterPath, emitDebugSnapshots);
       if (readArbiterWriteError)
         return fail("cannot write control read arbiter: " + readArbiterWriteError.message());
-      module->print(readArbiterOut); readArbiterOut << '\n'; readArbiterOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, readArbiterAnnotations, error)))
         return fail("control read arbiter annotations: " + error);
       llvm::outs() << "Arbitrated CIRCT control R bursts and connected tracker retirement in " << readArbiterPath << '\n';
@@ -3897,11 +4034,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> writeArbiterPath(outputDir), writeArbiterAnnotations(outputDir);
       llvm::sys::path::append(writeArbiterPath, "post-fame-control-write-arbiter.mlir");
       llvm::sys::path::append(writeArbiterAnnotations, "post-fame-control-write-arbiter-all.json");
-      std::error_code writeArbiterWriteError;
-      llvm::raw_fd_ostream writeArbiterOut(writeArbiterPath, writeArbiterWriteError);
+      std::error_code writeArbiterWriteError = emitDebugSnapshot(
+          module->getOperation(), writeArbiterPath, emitDebugSnapshots);
       if (writeArbiterWriteError)
         return fail("cannot write control write arbiter: " + writeArbiterWriteError.message());
-      module->print(writeArbiterOut); writeArbiterOut << '\n'; writeArbiterOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, writeArbiterAnnotations, error)))
         return fail("control write arbiter annotations: " + error);
       llvm::outs() << "Arbitrated CIRCT control B responses and exposed write retirement in " << writeArbiterPath << '\n';
@@ -3912,11 +4048,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> writeTrackerPath(outputDir), writeTrackerAnnotations(outputDir);
       llvm::sys::path::append(writeTrackerPath, "post-fame-control-write-tracker.mlir");
       llvm::sys::path::append(writeTrackerAnnotations, "post-fame-control-write-tracker-all.json");
-      std::error_code writeTrackerWriteError;
-      llvm::raw_fd_ostream writeTrackerOut(writeTrackerPath, writeTrackerWriteError);
+      std::error_code writeTrackerWriteError = emitDebugSnapshot(
+          module->getOperation(), writeTrackerPath, emitDebugSnapshots);
       if (writeTrackerWriteError)
         return fail("cannot write control write tracker: " + writeTrackerWriteError.message());
-      module->print(writeTrackerOut); writeTrackerOut << '\n'; writeTrackerOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, writeTrackerAnnotations, error)))
         return fail("control write tracker annotations: " + error);
       llvm::outs() << "Tracked CIRCT control AW transactions and accepted B responses in " << writeTrackerPath << '\n';
@@ -3927,15 +4062,14 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> masterPath(outputDir), masterAnnotations(outputDir);
       llvm::sys::path::append(masterPath, "post-fame-simulation-master.mlir");
       llvm::sys::path::append(masterAnnotations, "post-fame-simulation-master-all.json");
-      std::error_code masterWriteError;
-      llvm::raw_fd_ostream masterOut(masterPath, masterWriteError);
+      std::error_code masterWriteError = emitDebugSnapshot(
+          module->getOperation(), masterPath, emitDebugSnapshots);
       if (masterWriteError)
         return fail("cannot write SimulationMaster bank: " + masterWriteError.message());
-      module->print(masterOut); masterOut << '\n'; masterOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, masterAnnotations, error)))
         return fail("SimulationMaster bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT SimulationMaster initialization and presence registers in " << masterPath << '\n';
-      if (failed(goldengate::mapSimulationMasterControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapSimulationMasterControl(circuit, ctrlAddressBits, 12, error)))
         return fail("SimulationMaster MCRFile: " + error);
       goldengate::ControlMMIOWidget mappedMaster;
       if (failed(goldengate::deriveControlMMIOWidget(circuit, "SimulationMaster_0",
@@ -3951,10 +4085,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> masterControlPath(outputDir), masterControlAnnotations(outputDir);
       llvm::sys::path::append(masterControlPath, "post-fame-simulation-master-control.mlir");
       llvm::sys::path::append(masterControlAnnotations, "post-fame-simulation-master-control-all.json");
-      std::error_code masterControlError;
-      llvm::raw_fd_ostream masterControlOut(masterControlPath, masterControlError);
+      std::error_code masterControlError = emitDebugSnapshot(
+          module->getOperation(), masterControlPath, emitDebugSnapshots);
       if (masterControlError) return fail("cannot write SimulationMaster MCRFile: " + masterControlError.message());
-      module->print(masterControlOut); masterControlOut << '\n'; masterControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, masterControlAnnotations, error)))
         return fail("SimulationMaster MCRFile annotations: " + error);
       llvm::outs() << "Mapped CIRCT SimulationMaster MCRFile transactions in " << masterControlPath << '\n';
@@ -3965,10 +4098,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> masterBoundPath(outputDir), masterBoundAnnotations(outputDir);
       llvm::sys::path::append(masterBoundPath, "post-fame-simulation-master-bound.mlir");
       llvm::sys::path::append(masterBoundAnnotations, "post-fame-simulation-master-bound-all.json");
-      std::error_code masterBoundError;
-      llvm::raw_fd_ostream masterBoundOut(masterBoundPath, masterBoundError);
+      std::error_code masterBoundError = emitDebugSnapshot(
+          module->getOperation(), masterBoundPath, emitDebugSnapshots);
       if (masterBoundError) return fail("cannot write SimulationMaster binding: " + masterBoundError.message());
-      module->print(masterBoundOut); masterBoundOut << '\n'; masterBoundOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, masterBoundAnnotations, error)))
         return fail("SimulationMaster binding annotations: " + error);
       llvm::outs() << "Bound CIRCT SimulationMaster requests and responses using the control decoder catalog in " << masterBoundPath << '\n';
@@ -3978,10 +4110,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tsiPath(outputDir), tsiAnnotations(outputDir);
       llvm::sys::path::append(tsiPath, "post-fame-tsi-token.mlir");
       llvm::sys::path::append(tsiAnnotations, "post-fame-tsi-token-all.json");
-      std::error_code tsiWriteError;
-      llvm::raw_fd_ostream tsiOut(tsiPath, tsiWriteError);
+      std::error_code tsiWriteError = emitDebugSnapshot(
+          module->getOperation(), tsiPath, emitDebugSnapshots);
       if (tsiWriteError) return fail("cannot write TSI token mapping: " + tsiWriteError.message());
-      module->print(tsiOut); tsiOut << '\n'; tsiOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tsiAnnotations, error)))
         return fail("TSI token mapping annotations: " + error);
       llvm::outs() << "Mapped CIRCT TSI cycle scheduling and queue token gates in " << tsiPath << '\n';
@@ -3991,10 +4122,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tsiQueuesPath(outputDir), tsiQueuesAnnotations(outputDir);
       llvm::sys::path::append(tsiQueuesPath, "post-fame-tsi-word-queues.mlir");
       llvm::sys::path::append(tsiQueuesAnnotations, "post-fame-tsi-word-queues-all.json");
-      std::error_code tsiQueuesWriteError;
-      llvm::raw_fd_ostream tsiQueuesOut(tsiQueuesPath, tsiQueuesWriteError);
+      std::error_code tsiQueuesWriteError = emitDebugSnapshot(
+          module->getOperation(), tsiQueuesPath, emitDebugSnapshots);
       if (tsiQueuesWriteError) return fail("cannot write TSI word queues: " + tsiQueuesWriteError.message());
-      module->print(tsiQueuesOut); tsiQueuesOut << '\n'; tsiQueuesOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tsiQueuesAnnotations, error)))
         return fail("TSI word queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TSI words in two 16-entry queues in " << tsiQueuesPath << '\n';
@@ -4004,14 +4134,13 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tsiMMIOPath(outputDir), tsiMMIOAnnotations(outputDir);
       llvm::sys::path::append(tsiMMIOPath, "post-fame-tsi-mmio.mlir");
       llvm::sys::path::append(tsiMMIOAnnotations, "post-fame-tsi-mmio-all.json");
-      std::error_code tsiMMIOWriteError;
-      llvm::raw_fd_ostream tsiMMIOOut(tsiMMIOPath, tsiMMIOWriteError);
+      std::error_code tsiMMIOWriteError = emitDebugSnapshot(
+          module->getOperation(), tsiMMIOPath, emitDebugSnapshots);
       if (tsiMMIOWriteError) return fail("cannot write TSI MMIO bank: " + tsiMMIOWriteError.message());
-      module->print(tsiMMIOOut); tsiMMIOOut << '\n'; tsiMMIOOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tsiMMIOAnnotations, error)))
         return fail("TSI MMIO bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT TSI queue and scheduler MMIO registers in " << tsiMMIOPath << '\n';
-      if (failed(goldengate::mapTSIBridgeControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapTSIBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("TSI MCRFile control: " + error);
       goldengate::ControlMMIOWidget mappedTSI;
       if (failed(goldengate::deriveControlMMIOWidget(circuit, "TSIBridgeModule_0",
@@ -4026,10 +4155,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tsiControlPath(outputDir), tsiControlAnnotations(outputDir);
       llvm::sys::path::append(tsiControlPath, "post-fame-tsi-control.mlir");
       llvm::sys::path::append(tsiControlAnnotations, "post-fame-tsi-control-all.json");
-      std::error_code tsiControlWriteError;
-      llvm::raw_fd_ostream tsiControlOut(tsiControlPath, tsiControlWriteError);
+      std::error_code tsiControlWriteError = emitDebugSnapshot(
+          module->getOperation(), tsiControlPath, emitDebugSnapshots);
       if (tsiControlWriteError) return fail("cannot write TSI MCRFile control: " + tsiControlWriteError.message());
-      module->print(tsiControlOut); tsiControlOut << '\n'; tsiControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tsiControlAnnotations, error)))
         return fail("TSI MCRFile control annotations: " + error);
       llvm::outs() << "Mapped CIRCT TSI MCRFile transactions in " << tsiControlPath << '\n';
@@ -4039,10 +4167,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> tsiBoundPath(outputDir), tsiBoundAnnotations(outputDir);
       llvm::sys::path::append(tsiBoundPath, "post-fame-tsi-bound.mlir");
       llvm::sys::path::append(tsiBoundAnnotations, "post-fame-tsi-bound-all.json");
-      std::error_code tsiBoundError;
-      llvm::raw_fd_ostream tsiBoundOut(tsiBoundPath, tsiBoundError);
+      std::error_code tsiBoundError = emitDebugSnapshot(
+          module->getOperation(), tsiBoundPath, emitDebugSnapshots);
       if (tsiBoundError) return fail("cannot write TSI binding: " + tsiBoundError.message());
-      module->print(tsiBoundOut); tsiBoundOut << '\n'; tsiBoundOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, tsiBoundAnnotations, error)))
         return fail("TSI binding annotations: " + error);
       llvm::outs() << "Bound CIRCT TSI requests and responses to control slave 3 in " << tsiBoundPath << '\n';
@@ -4054,10 +4181,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevPath(outputDir), blockDevAnnotations(outputDir);
       llvm::sys::path::append(blockDevPath, "post-fame-blockdev-token.mlir");
       llvm::sys::path::append(blockDevAnnotations, "post-fame-blockdev-token-all.json");
-      std::error_code blockDevError;
-      llvm::raw_fd_ostream blockDevOut(blockDevPath, blockDevError);
+      std::error_code blockDevError = emitDebugSnapshot(
+          module->getOperation(), blockDevPath, emitDebugSnapshots);
       if (blockDevError) return fail("cannot write BlockDev token engine: " + blockDevError.message());
-      module->print(blockDevOut); blockDevOut << '\n'; blockDevOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevAnnotations, error)))
         return fail("BlockDev token annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev token gates, target cycle counter and write-beat tracking in " << blockDevPath << '\n';
@@ -4067,10 +4193,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevQueuePath(outputDir), blockDevQueueAnnotations(outputDir);
       llvm::sys::path::append(blockDevQueuePath, "post-fame-blockdev-request-queue.mlir");
       llvm::sys::path::append(blockDevQueueAnnotations, "post-fame-blockdev-request-queue-all.json");
-      std::error_code blockDevQueueError;
-      llvm::raw_fd_ostream blockDevQueueOut(blockDevQueuePath, blockDevQueueError);
+      std::error_code blockDevQueueError = emitDebugSnapshot(
+          module->getOperation(), blockDevQueuePath, emitDebugSnapshots);
       if (blockDevQueueError) return fail("cannot write BlockDev request queue: " + blockDevQueueError.message());
-      module->print(blockDevQueueOut); blockDevQueueOut << '\n'; blockDevQueueOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevQueueAnnotations, error)))
         return fail("BlockDev request queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT BlockDev requests in a 10-entry queue in " << blockDevQueuePath << '\n';
@@ -4080,10 +4205,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevDataPath(outputDir), blockDevDataAnnotations(outputDir);
       llvm::sys::path::append(blockDevDataPath, "post-fame-blockdev-data-queue.mlir");
       llvm::sys::path::append(blockDevDataAnnotations, "post-fame-blockdev-data-queue-all.json");
-      std::error_code blockDevDataError;
-      llvm::raw_fd_ostream blockDevDataOut(blockDevDataPath, blockDevDataError);
+      std::error_code blockDevDataError = emitDebugSnapshot(
+          module->getOperation(), blockDevDataPath, emitDebugSnapshots);
       if (blockDevDataError) return fail("cannot write BlockDev data queue: " + blockDevDataError.message());
-      module->print(blockDevDataOut); blockDevDataOut << '\n'; blockDevDataOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevDataAnnotations, error)))
         return fail("BlockDev data queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT BlockDev data in a 32-entry queue in " << blockDevDataPath << '\n';
@@ -4093,10 +4217,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevReadResponsePath(outputDir), blockDevReadResponseAnnotations(outputDir);
       llvm::sys::path::append(blockDevReadResponsePath, "post-fame-blockdev-read-response-queue.mlir");
       llvm::sys::path::append(blockDevReadResponseAnnotations, "post-fame-blockdev-read-response-queue-all.json");
-      std::error_code blockDevReadResponseError;
-      llvm::raw_fd_ostream blockDevReadResponseOut(blockDevReadResponsePath, blockDevReadResponseError);
+      std::error_code blockDevReadResponseError = emitDebugSnapshot(
+          module->getOperation(), blockDevReadResponsePath, emitDebugSnapshots);
       if (blockDevReadResponseError) return fail("cannot write BlockDev read-response queue: " + blockDevReadResponseError.message());
-      module->print(blockDevReadResponseOut); blockDevReadResponseOut << '\n'; blockDevReadResponseOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevReadResponseAnnotations, error)))
         return fail("BlockDev read-response queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT BlockDev read responses in a 32-entry queue in " << blockDevReadResponsePath << '\n';
@@ -4106,10 +4229,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevWriteAckPath(outputDir), blockDevWriteAckAnnotations(outputDir);
       llvm::sys::path::append(blockDevWriteAckPath, "post-fame-blockdev-write-ack-queue.mlir");
       llvm::sys::path::append(blockDevWriteAckAnnotations, "post-fame-blockdev-write-ack-queue-all.json");
-      std::error_code blockDevWriteAckError;
-      llvm::raw_fd_ostream blockDevWriteAckOut(blockDevWriteAckPath, blockDevWriteAckError);
+      std::error_code blockDevWriteAckError = emitDebugSnapshot(
+          module->getOperation(), blockDevWriteAckPath, emitDebugSnapshots);
       if (blockDevWriteAckError) return fail("cannot write BlockDev write-ack queue: " + blockDevWriteAckError.message());
-      module->print(blockDevWriteAckOut); blockDevWriteAckOut << '\n'; blockDevWriteAckOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevWriteAckAnnotations, error)))
         return fail("BlockDev write-ack queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT BlockDev write acknowledgements in a 4-entry queue in " << blockDevWriteAckPath << '\n';
@@ -4119,14 +4241,13 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevMMIOPath(outputDir), blockDevMMIOAnnotations(outputDir);
       llvm::sys::path::append(blockDevMMIOPath, "post-fame-blockdev-mmio.mlir");
       llvm::sys::path::append(blockDevMMIOAnnotations, "post-fame-blockdev-mmio-all.json");
-      std::error_code blockDevMMIOError;
-      llvm::raw_fd_ostream blockDevMMIOOut(blockDevMMIOPath, blockDevMMIOError);
+      std::error_code blockDevMMIOError = emitDebugSnapshot(
+          module->getOperation(), blockDevMMIOPath, emitDebugSnapshots);
       if (blockDevMMIOError) return fail("cannot write BlockDev MMIO bank: " + blockDevMMIOError.message());
-      module->print(blockDevMMIOOut); blockDevMMIOOut << '\n'; blockDevMMIOOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevMMIOAnnotations, error)))
         return fail("BlockDev MMIO bank annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev 26-word MMIO bank in " << blockDevMMIOPath << '\n';
-      if (failed(goldengate::mapBlockDevBridgeControl(circuit, 25, 12, error)))
+      if (failed(goldengate::mapBlockDevBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("BlockDev control transport: " + error);
       goldengate::ControlMMIOWidget mappedBlockDev;
       if (failed(goldengate::deriveControlMMIOWidget(circuit, "BlockDevBridgeModule_0",
@@ -4141,10 +4262,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevControlPath(outputDir), blockDevControlAnnotations(outputDir);
       llvm::sys::path::append(blockDevControlPath, "post-fame-blockdev-control.mlir");
       llvm::sys::path::append(blockDevControlAnnotations, "post-fame-blockdev-control-all.json");
-      std::error_code blockDevControlError;
-      llvm::raw_fd_ostream blockDevControlOut(blockDevControlPath, blockDevControlError);
+      std::error_code blockDevControlError = emitDebugSnapshot(
+          module->getOperation(), blockDevControlPath, emitDebugSnapshots);
       if (blockDevControlError) return fail("cannot write BlockDev control transport: " + blockDevControlError.message());
-      module->print(blockDevControlOut); blockDevControlOut << '\n'; blockDevControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevControlAnnotations, error)))
         return fail("BlockDev control transport annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev MCRFile transactions in " << blockDevControlPath << '\n';
@@ -4154,10 +4274,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevBoundPath(outputDir), blockDevBoundAnnotations(outputDir);
       llvm::sys::path::append(blockDevBoundPath, "post-fame-blockdev-bound.mlir");
       llvm::sys::path::append(blockDevBoundAnnotations, "post-fame-blockdev-bound-all.json");
-      std::error_code blockDevBoundError;
-      llvm::raw_fd_ostream blockDevBoundOut(blockDevBoundPath, blockDevBoundError);
+      std::error_code blockDevBoundError = emitDebugSnapshot(
+          module->getOperation(), blockDevBoundPath, emitDebugSnapshots);
       if (blockDevBoundError) return fail("cannot write BlockDev control binding: " + blockDevBoundError.message());
-      module->print(blockDevBoundOut); blockDevBoundOut << '\n'; blockDevBoundOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevBoundAnnotations, error)))
         return fail("BlockDev control binding annotations: " + error);
       llvm::outs() << "Bound CIRCT BlockDev requests and responses to control slave 0 in " << blockDevBoundPath << '\n';
@@ -4167,10 +4286,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevWriteLatencyPath(outputDir), blockDevWriteLatencyAnnotations(outputDir);
       llvm::sys::path::append(blockDevWriteLatencyPath, "post-fame-blockdev-write-latency.mlir");
       llvm::sys::path::append(blockDevWriteLatencyAnnotations, "post-fame-blockdev-write-latency-all.json");
-      std::error_code blockDevWriteLatencyError;
-      llvm::raw_fd_ostream blockDevWriteLatencyOut(blockDevWriteLatencyPath, blockDevWriteLatencyError);
+      std::error_code blockDevWriteLatencyError = emitDebugSnapshot(
+          module->getOperation(), blockDevWriteLatencyPath, emitDebugSnapshots);
       if (blockDevWriteLatencyError) return fail("cannot write BlockDev write latency: " + blockDevWriteLatencyError.message());
-      module->print(blockDevWriteLatencyOut); blockDevWriteLatencyOut << '\n'; blockDevWriteLatencyOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevWriteLatencyAnnotations, error)))
         return fail("BlockDev write latency annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev one-entry write latency pipe in " << blockDevWriteLatencyPath << '\n';
@@ -4180,10 +4298,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevReadLatencyPath(outputDir), blockDevReadLatencyAnnotations(outputDir);
       llvm::sys::path::append(blockDevReadLatencyPath, "post-fame-blockdev-read-latency.mlir");
       llvm::sys::path::append(blockDevReadLatencyAnnotations, "post-fame-blockdev-read-latency-all.json");
-      std::error_code blockDevReadLatencyError;
-      llvm::raw_fd_ostream blockDevReadLatencyOut(blockDevReadLatencyPath, blockDevReadLatencyError);
+      std::error_code blockDevReadLatencyError = emitDebugSnapshot(
+          module->getOperation(), blockDevReadLatencyPath, emitDebugSnapshots);
       if (blockDevReadLatencyError) return fail("cannot write BlockDev read latency: " + blockDevReadLatencyError.message());
-      module->print(blockDevReadLatencyOut); blockDevReadLatencyOut << '\n'; blockDevReadLatencyOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevReadLatencyAnnotations, error)))
         return fail("BlockDev read latency annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev one-entry read latency pipe in " << blockDevReadLatencyPath << '\n';
@@ -4193,10 +4310,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> blockDevResponseSchedulerPath(outputDir), blockDevResponseSchedulerAnnotations(outputDir);
       llvm::sys::path::append(blockDevResponseSchedulerPath, "post-fame-blockdev-response-scheduler.mlir");
       llvm::sys::path::append(blockDevResponseSchedulerAnnotations, "post-fame-blockdev-response-scheduler-all.json");
-      std::error_code blockDevResponseSchedulerError;
-      llvm::raw_fd_ostream blockDevResponseSchedulerOut(blockDevResponseSchedulerPath, blockDevResponseSchedulerError);
+      std::error_code blockDevResponseSchedulerError = emitDebugSnapshot(
+          module->getOperation(), blockDevResponseSchedulerPath, emitDebugSnapshots);
       if (blockDevResponseSchedulerError) return fail("cannot write BlockDev response scheduler: " + blockDevResponseSchedulerError.message());
-      module->print(blockDevResponseSchedulerOut); blockDevResponseSchedulerOut << '\n'; blockDevResponseSchedulerOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, blockDevResponseSchedulerAnnotations, error)))
         return fail("BlockDev response scheduler annotations: " + error);
       llvm::outs() << "Mapped CIRCT BlockDev response scheduler in " << blockDevResponseSchedulerPath << '\n';
@@ -4206,10 +4322,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedTokenPath(outputDir), fasedTokenAnnotations(outputDir);
       llvm::sys::path::append(fasedTokenPath, "post-fame-fased-token.mlir");
       llvm::sys::path::append(fasedTokenAnnotations, "post-fame-fased-token-all.json");
-      std::error_code fasedTokenError;
-      llvm::raw_fd_ostream fasedTokenOut(fasedTokenPath, fasedTokenError);
+      std::error_code fasedTokenError = emitDebugSnapshot(
+          module->getOperation(), fasedTokenPath, emitDebugSnapshots);
       if (fasedTokenError) return fail("cannot write FASED token engine: " + fasedTokenError.message());
-      module->print(fasedTokenOut); fasedTokenOut << '\n'; fasedTokenOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedTokenAnnotations, error)))
         return fail("FASED token engine annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED token engine in " << fasedTokenPath << '\n';
@@ -4219,10 +4334,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedHostPath(outputDir), fasedHostAnnotations(outputDir);
       llvm::sys::path::append(fasedHostPath, "post-fame-fased-host-outstanding.mlir");
       llvm::sys::path::append(fasedHostAnnotations, "post-fame-fased-host-outstanding-all.json");
-      std::error_code fasedHostError;
-      llvm::raw_fd_ostream fasedHostOut(fasedHostPath, fasedHostError);
+      std::error_code fasedHostError = emitDebugSnapshot(
+          module->getOperation(), fasedHostPath, emitDebugSnapshots);
       if (fasedHostError) return fail("cannot write FASED host outstanding: " + fasedHostError.message());
-      module->print(fasedHostOut); fasedHostOut << '\n'; fasedHostOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedHostAnnotations, error)))
         return fail("FASED host outstanding annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host outstanding counters in " << fasedHostPath << '\n';
@@ -4232,23 +4346,21 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedAWPath(outputDir), fasedAWAnnotations(outputDir);
       llvm::sys::path::append(fasedAWPath, "post-fame-fased-ingress-aw.mlir");
       llvm::sys::path::append(fasedAWAnnotations, "post-fame-fased-ingress-aw-all.json");
-      std::error_code fasedAWError;
-      llvm::raw_fd_ostream fasedAWOut(fasedAWPath, fasedAWError);
+      std::error_code fasedAWError = emitDebugSnapshot(
+          module->getOperation(), fasedAWPath, emitDebugSnapshots);
       if (fasedAWError) return fail("cannot write FASED AW ingress: " + fasedAWError.message());
-      module->print(fasedAWOut); fasedAWOut << '\n'; fasedAWOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedAWAnnotations, error)))
         return fail("FASED AW ingress annotations: " + error);
-      llvm::outs() << "Buffered CIRCT FASED AW requests in a 10-entry ingress queue in " << fasedAWPath << '\n';
+      llvm::outs() << "Buffered CIRCT FASED AW requests in a constructor-sized ingress queue in " << fasedAWPath << '\n';
       if (failed(goldengate::addFASEDIngressWQueue(circuit, error)))
         return fail("FASED W ingress queue: " + error);
       if (failed(mlir::verify(*module))) return fail("FASED W ingress produced invalid FIRRTL IR");
       llvm::SmallString<256> fasedWPath(outputDir), fasedWAnnotations(outputDir);
       llvm::sys::path::append(fasedWPath, "post-fame-fased-ingress-w.mlir");
       llvm::sys::path::append(fasedWAnnotations, "post-fame-fased-ingress-w-all.json");
-      std::error_code fasedWError;
-      llvm::raw_fd_ostream fasedWOut(fasedWPath, fasedWError);
+      std::error_code fasedWError = emitDebugSnapshot(
+          module->getOperation(), fasedWPath, emitDebugSnapshots);
       if (fasedWError) return fail("cannot write FASED W ingress: " + fasedWError.message());
-      module->print(fasedWOut); fasedWOut << '\n'; fasedWOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWAnnotations, error)))
         return fail("FASED W ingress annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED W beats in a 16-entry ingress queue in " << fasedWPath << '\n';
@@ -4258,10 +4370,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedARPath(outputDir), fasedARAnnotations(outputDir);
       llvm::sys::path::append(fasedARPath, "post-fame-fased-ingress-ar.mlir");
       llvm::sys::path::append(fasedARAnnotations, "post-fame-fased-ingress-ar-all.json");
-      std::error_code fasedARError;
-      llvm::raw_fd_ostream fasedAROut(fasedARPath, fasedARError);
+      std::error_code fasedARError = emitDebugSnapshot(
+          module->getOperation(), fasedARPath, emitDebugSnapshots);
       if (fasedARError) return fail("cannot write FASED AR ingress: " + fasedARError.message());
-      module->print(fasedAROut); fasedAROut << '\n'; fasedAROut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedARAnnotations, error)))
         return fail("FASED AR ingress annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED AR requests in a 4-entry ingress queue in " << fasedARPath << '\n';
@@ -4271,10 +4382,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedCreditsPath(outputDir), fasedCreditsAnnotations(outputDir);
       llvm::sys::path::append(fasedCreditsPath, "post-fame-fased-ingress-credits.mlir");
       llvm::sys::path::append(fasedCreditsAnnotations, "post-fame-fased-ingress-credits-all.json");
-      std::error_code fasedCreditsError;
-      llvm::raw_fd_ostream fasedCreditsOut(fasedCreditsPath, fasedCreditsError);
+      std::error_code fasedCreditsError = emitDebugSnapshot(
+          module->getOperation(), fasedCreditsPath, emitDebugSnapshots);
       if (fasedCreditsError) return fail("cannot write FASED ingress credits: " + fasedCreditsError.message());
-      module->print(fasedCreditsOut); fasedCreditsOut << '\n'; fasedCreditsOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedCreditsAnnotations, error)))
         return fail("FASED ingress credit annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED ingress credits and completed-write detection in " << fasedCreditsPath << '\n';
@@ -4284,10 +4394,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedOrderPath(outputDir), fasedOrderAnnotations(outputDir);
       llvm::sys::path::append(fasedOrderPath, "post-fame-fased-ingress-order.mlir");
       llvm::sys::path::append(fasedOrderAnnotations, "post-fame-fased-ingress-order-all.json");
-      std::error_code fasedOrderError;
-      llvm::raw_fd_ostream fasedOrderOut(fasedOrderPath, fasedOrderError);
+      std::error_code fasedOrderError = emitDebugSnapshot(
+          module->getOperation(), fasedOrderPath, emitDebugSnapshots);
       if (fasedOrderError) return fail("cannot write FASED ingress order: " + fasedOrderError.message());
-      module->print(fasedOrderOut); fasedOrderOut << '\n'; fasedOrderOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedOrderAnnotations, error)))
         return fail("FASED ingress order annotations: " + error);
       llvm::outs() << "Queued CIRCT FASED transaction order in two constructor-sized banks in " << fasedOrderPath << '\n';
@@ -4297,10 +4406,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedIssuePath(outputDir), fasedIssueAnnotations(outputDir);
       llvm::sys::path::append(fasedIssuePath, "post-fame-fased-ingress-issue.mlir");
       llvm::sys::path::append(fasedIssueAnnotations, "post-fame-fased-ingress-issue-all.json");
-      std::error_code fasedIssueError;
-      llvm::raw_fd_ostream fasedIssueOut(fasedIssuePath, fasedIssueError);
+      std::error_code fasedIssueError = emitDebugSnapshot(
+          module->getOperation(), fasedIssuePath, emitDebugSnapshots);
       if (fasedIssueError) return fail("cannot write FASED ingress issue: " + fasedIssueError.message());
-      module->print(fasedIssueOut); fasedIssueOut << '\n'; fasedIssueOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedIssueAnnotations, error)))
         return fail("FASED ingress issue annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED host request issue and accepted order retirement in " << fasedIssuePath << '\n';
@@ -4310,10 +4418,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedDeadlockPath(outputDir), fasedDeadlockAnnotations(outputDir);
       llvm::sys::path::append(fasedDeadlockPath, "post-fame-fased-ingress-deadlock.mlir");
       llvm::sys::path::append(fasedDeadlockAnnotations, "post-fame-fased-ingress-deadlock-all.json");
-      std::error_code fasedDeadlockError;
-      llvm::raw_fd_ostream fasedDeadlockOut(fasedDeadlockPath, fasedDeadlockError);
+      std::error_code fasedDeadlockError = emitDebugSnapshot(
+          module->getOperation(), fasedDeadlockPath, emitDebugSnapshots);
       if (fasedDeadlockError) return fail("cannot write FASED ingress deadlock: " + fasedDeadlockError.message());
-      module->print(fasedDeadlockOut); fasedDeadlockOut << '\n'; fasedDeadlockOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedDeadlockAnnotations, error)))
         return fail("FASED ingress deadlock annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED ingress enqueue deadlock assertions in " << fasedDeadlockPath << '\n';
@@ -4323,10 +4430,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedReadBufferPath(outputDir), fasedReadBufferAnnotations(outputDir);
       llvm::sys::path::append(fasedReadBufferPath, "post-fame-fased-read-buffer.mlir");
       llvm::sys::path::append(fasedReadBufferAnnotations, "post-fame-fased-read-buffer-all.json");
-      std::error_code fasedReadBufferError;
-      llvm::raw_fd_ostream fasedReadBufferOut(fasedReadBufferPath, fasedReadBufferError);
+      std::error_code fasedReadBufferError = emitDebugSnapshot(
+          module->getOperation(), fasedReadBufferPath, emitDebugSnapshots);
       if (fasedReadBufferError) return fail("cannot write FASED read buffer: " + fasedReadBufferError.message());
-      module->print(fasedReadBufferOut); fasedReadBufferOut << '\n'; fasedReadBufferOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedReadBufferAnnotations, error)))
         return fail("FASED read buffer annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED read responses in sixteen 8-beat ID queues in " << fasedReadBufferPath << '\n';
@@ -4336,10 +4442,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedReadSchedulerPath(outputDir), fasedReadSchedulerAnnotations(outputDir);
       llvm::sys::path::append(fasedReadSchedulerPath, "post-fame-fased-read-scheduler.mlir");
       llvm::sys::path::append(fasedReadSchedulerAnnotations, "post-fame-fased-read-scheduler-all.json");
-      std::error_code fasedReadSchedulerError;
-      llvm::raw_fd_ostream fasedReadSchedulerOut(fasedReadSchedulerPath, fasedReadSchedulerError);
+      std::error_code fasedReadSchedulerError = emitDebugSnapshot(
+          module->getOperation(), fasedReadSchedulerPath, emitDebugSnapshots);
       if (fasedReadSchedulerError) return fail("cannot write FASED read scheduler: " + fasedReadSchedulerError.message());
-      module->print(fasedReadSchedulerOut); fasedReadSchedulerOut << '\n'; fasedReadSchedulerOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedReadSchedulerAnnotations, error)))
         return fail("FASED read scheduler annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED read request scheduling and buffer retirement in " << fasedReadSchedulerPath << '\n';
@@ -4352,229 +4457,231 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedWriteEgressPath(outputDir), fasedWriteEgressAnnotations(outputDir);
       llvm::sys::path::append(fasedWriteEgressPath, "post-fame-fased-write-egress.mlir");
       llvm::sys::path::append(fasedWriteEgressAnnotations, "post-fame-fased-write-egress-all.json");
-      std::error_code fasedWriteEgressError;
-      llvm::raw_fd_ostream fasedWriteEgressOut(fasedWriteEgressPath, fasedWriteEgressError);
+      std::error_code fasedWriteEgressError = emitDebugSnapshot(
+          module->getOperation(), fasedWriteEgressPath, emitDebugSnapshots);
       if (fasedWriteEgressError) return fail("cannot write FASED write egress: " + fasedWriteEgressError.message());
-      module->print(fasedWriteEgressOut); fasedWriteEgressOut << '\n'; fasedWriteEgressOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteEgressAnnotations, error)))
         return fail("FASED write egress annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED per-ID write acknowledgements and token readiness in " << fasedWriteEgressPath << '\n';
-      // NIC and no-NIC models share AXI4Releaser's pipe occupancy queues.
-      // Advance their native state and model reset only on a target token.
-      if (failed(goldengate::addFASEDResponseReleaser(circuit, error)))
-        return fail("FASED response releaser: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED response releaser produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedResponseReleaserPath(outputDir), fasedResponseReleaserAnnotations(outputDir);
-      llvm::sys::path::append(fasedResponseReleaserPath, "post-fame-fased-response-releaser.mlir");
-      llvm::sys::path::append(fasedResponseReleaserAnnotations, "post-fame-fased-response-releaser-all.json");
-      std::error_code fasedResponseReleaserError;
-      llvm::raw_fd_ostream fasedResponseReleaserOut(fasedResponseReleaserPath, fasedResponseReleaserError);
-      if (fasedResponseReleaserError) return fail("cannot write FASED response releaser: " + fasedResponseReleaserError.message());
-      module->print(fasedResponseReleaserOut); fasedResponseReleaserOut << '\n'; fasedResponseReleaserOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseReleaserAnnotations, error)))
-        return fail("FASED response releaser annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED target response release and egress request binding in " << fasedResponseReleaserPath << '\n';
-      // The NIC model shares the targetFire-qualified cycle counter and
-      // runtime latency arithmetic with the no-NIC FASED model.
-      if (failed(goldengate::addFASEDTimingCycle(circuit, error)))
-        return fail("FASED timing cycle: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED timing cycle produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedTimingCyclePath(outputDir), fasedTimingCycleAnnotations(outputDir);
-      llvm::sys::path::append(fasedTimingCyclePath, "post-fame-fased-timing-cycle.mlir");
-      llvm::sys::path::append(fasedTimingCycleAnnotations, "post-fame-fased-timing-cycle-all.json");
-      std::error_code fasedTimingCycleError;
-      llvm::raw_fd_ostream fasedTimingCycleOut(fasedTimingCyclePath, fasedTimingCycleError);
-      if (fasedTimingCycleError) return fail("cannot write FASED timing cycle: " + fasedTimingCycleError.message());
-      module->print(fasedTimingCycleOut); fasedTimingCycleOut << '\n'; fasedTimingCycleOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedTimingCycleAnnotations, error)))
-        return fail("FASED timing cycle annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED timing cycle and latency release-cycle arithmetic in " << fasedTimingCyclePath << '\n';
-      if (failed(goldengate::addFASEDReadLatency(circuit, error)))
-        return fail("FASED read latency: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED read latency produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedReadLatencyPath(outputDir), fasedReadLatencyAnnotations(outputDir);
-      llvm::sys::path::append(fasedReadLatencyPath, "post-fame-fased-read-latency.mlir");
-      llvm::sys::path::append(fasedReadLatencyAnnotations, "post-fame-fased-read-latency-all.json");
-      std::error_code fasedReadLatencyError;
-      llvm::raw_fd_ostream fasedReadLatencyOut(fasedReadLatencyPath, fasedReadLatencyError);
-      if (fasedReadLatencyError) return fail("cannot write FASED read latency: " + fasedReadLatencyError.message());
-      module->print(fasedReadLatencyOut); fasedReadLatencyOut << '\n'; fasedReadLatencyOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedReadLatencyAnnotations, error)))
-        return fail("FASED read latency annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED ten-entry read latency queue and completion retirement in " << fasedReadLatencyPath << '\n';
-      if (failed(goldengate::addFASEDWriteLatency(circuit, error)))
-        return fail("FASED write latency: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED write latency produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedWriteLatencyPath(outputDir), fasedWriteLatencyAnnotations(outputDir);
-      llvm::sys::path::append(fasedWriteLatencyPath, "post-fame-fased-write-latency.mlir");
-      llvm::sys::path::append(fasedWriteLatencyAnnotations, "post-fame-fased-write-latency-all.json");
-      std::error_code fasedWriteLatencyError;
-      llvm::raw_fd_ostream fasedWriteLatencyOut(fasedWriteLatencyPath, fasedWriteLatencyError);
-      if (fasedWriteLatencyError) return fail("cannot write FASED write latency: " + fasedWriteLatencyError.message());
-      module->print(fasedWriteLatencyOut); fasedWriteLatencyOut << '\n'; fasedWriteLatencyOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteLatencyAnnotations, error)))
-        return fail("FASED write latency annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED ten-entry write latency queue and completion boundary in " << fasedWriteLatencyPath << '\n';
-      if (failed(goldengate::addFASEDTimingAWQueue(circuit, error)))
-        return fail("FASED timing AW queue: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED timing AW queue produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedTimingAWQueuePath(outputDir), fasedTimingAWQueueAnnotations(outputDir);
-      llvm::sys::path::append(fasedTimingAWQueuePath, "post-fame-fased-timing-aw-queue.mlir");
-      llvm::sys::path::append(fasedTimingAWQueueAnnotations, "post-fame-fased-timing-aw-queue-all.json");
-      std::error_code fasedTimingAWQueueError;
-      llvm::raw_fd_ostream fasedTimingAWQueueOut(fasedTimingAWQueuePath, fasedTimingAWQueueError);
-      if (fasedTimingAWQueueError) return fail("cannot write FASED timing AW queue: " + fasedTimingAWQueueError.message());
-      module->print(fasedTimingAWQueueOut); fasedTimingAWQueueOut << '\n'; fasedTimingAWQueueOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedTimingAWQueueAnnotations, error)))
-        return fail("FASED timing AW queue annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED ten-entry timing AW metadata queue and completion ID binding in " << fasedTimingAWQueuePath << '\n';
-      if (failed(goldengate::addFASEDWritePairing(circuit, error)))
-        return fail("FASED write pairing: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED write pairing produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedWritePairingPath(outputDir), fasedWritePairingAnnotations(outputDir);
-      llvm::sys::path::append(fasedWritePairingPath, "post-fame-fased-write-pairing.mlir");
-      llvm::sys::path::append(fasedWritePairingAnnotations, "post-fame-fased-write-pairing-all.json");
-      std::error_code fasedWritePairingError;
-      llvm::raw_fd_ostream fasedWritePairingOut(fasedWritePairingPath, fasedWritePairingError);
-      if (fasedWritePairingError) return fail("cannot write FASED write pairing: " + fasedWritePairingError.message());
-      module->print(fasedWritePairingOut); fasedWritePairingOut << '\n'; fasedWritePairingOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedWritePairingAnnotations, error)))
-        return fail("FASED write pairing annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED pending AW/W counters and completion pairing in " << fasedWritePairingPath << '\n';
-      if (failed(goldengate::bindFASEDWriteRetirement(circuit, error)))
-        return fail("FASED write retirement: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED write retirement produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedWriteRetirementPath(outputDir), fasedWriteRetirementAnnotations(outputDir);
-      llvm::sys::path::append(fasedWriteRetirementPath, "post-fame-fased-write-retirement.mlir");
-      llvm::sys::path::append(fasedWriteRetirementAnnotations, "post-fame-fased-write-retirement-all.json");
-      std::error_code fasedWriteRetirementError;
-      llvm::raw_fd_ostream fasedWriteRetirementOut(fasedWriteRetirementPath, fasedWriteRetirementError);
-      if (fasedWriteRetirementError) return fail("cannot write FASED write retirement: " + fasedWriteRetirementError.message());
-      module->print(fasedWriteRetirementOut); fasedWriteRetirementOut << '\n'; fasedWriteRetirementOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteRetirementAnnotations, error)))
-        return fail("FASED write retirement annotations: " + error);
-      llvm::outs() << "Bound CIRCT FASED accepted target B responses to pending write counters in " << fasedWriteRetirementPath << '\n';
-      if (failed(goldengate::bindFASEDWriteAdmission(circuit, error)))
-        return fail("FASED write admission: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED write admission produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedWriteAdmissionPath(outputDir), fasedWriteAdmissionAnnotations(outputDir);
-      llvm::sys::path::append(fasedWriteAdmissionPath, "post-fame-fased-write-admission.mlir");
-      llvm::sys::path::append(fasedWriteAdmissionAnnotations, "post-fame-fased-write-admission-all.json");
-      std::error_code fasedWriteAdmissionError;
-      llvm::raw_fd_ostream fasedWriteAdmissionOut(fasedWriteAdmissionPath, fasedWriteAdmissionError);
-      if (fasedWriteAdmissionError) return fail("cannot write FASED write admission: " + fasedWriteAdmissionError.message());
-      module->print(fasedWriteAdmissionOut); fasedWriteAdmissionOut << '\n'; fasedWriteAdmissionOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteAdmissionAnnotations, error)))
-        return fail("FASED write admission annotations: " + error);
-      llvm::outs() << "Bound CIRCT FASED target AW/W readiness to pending write counters in " << fasedWriteAdmissionPath << '\n';
-      if (failed(goldengate::bindFASEDReadAdmission(circuit, error)))
-        return fail("FASED read admission: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED read admission produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedReadAdmissionPath(outputDir), fasedReadAdmissionAnnotations(outputDir);
-      llvm::sys::path::append(fasedReadAdmissionPath, "post-fame-fased-read-admission.mlir");
-      llvm::sys::path::append(fasedReadAdmissionAnnotations, "post-fame-fased-read-admission-all.json");
-      std::error_code fasedReadAdmissionError;
-      llvm::raw_fd_ostream fasedReadAdmissionOut(fasedReadAdmissionPath, fasedReadAdmissionError);
-      if (fasedReadAdmissionError) return fail("cannot write FASED read admission: " + fasedReadAdmissionError.message());
-      module->print(fasedReadAdmissionOut); fasedReadAdmissionOut << '\n'; fasedReadAdmissionOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedReadAdmissionAnnotations, error)))
-        return fail("FASED read admission annotations: " + error);
-      llvm::outs() << "Bound CIRCT FASED pending reads, final R retirement and AR admission in " << fasedReadAdmissionPath << '\n';
-      // NIC now closes AR admission and retires accepted final R beats.
-      if (failed(goldengate::attachFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
-        return fail("FASED request limits: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED request limits produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedRequestLimitsPath(outputDir), fasedRequestLimitsAnnotations(outputDir);
-      llvm::sys::path::append(fasedRequestLimitsPath, "post-fame-fased-request-limits.mlir");
-      llvm::sys::path::append(fasedRequestLimitsAnnotations, "post-fame-fased-request-limits-all.json");
-      std::error_code fasedRequestLimitsError;
-      llvm::raw_fd_ostream fasedRequestLimitsOut(fasedRequestLimitsPath, fasedRequestLimitsError);
-      if (fasedRequestLimitsError) return fail("cannot write FASED request limits: " + fasedRequestLimitsError.message());
-      module->print(fasedRequestLimitsOut); fasedRequestLimitsOut << '\n'; fasedRequestLimitsOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsAnnotations, error)))
-        return fail("FASED request limits annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED host-clock request-limit registers and admission binding in " << fasedRequestLimitsPath << '\n';
-      if (failed(goldengate::attachFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
-        return fail("FASED latency registers: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED latency registers produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedLatencyRegistersPath(outputDir), fasedLatencyRegistersAnnotations(outputDir);
-      llvm::sys::path::append(fasedLatencyRegistersPath, "post-fame-fased-latency-registers.mlir");
-      llvm::sys::path::append(fasedLatencyRegistersAnnotations, "post-fame-fased-latency-registers-all.json");
-      std::error_code fasedLatencyRegistersError;
-      llvm::raw_fd_ostream fasedLatencyRegistersOut(fasedLatencyRegistersPath, fasedLatencyRegistersError);
-      if (fasedLatencyRegistersError) return fail("cannot write FASED latency registers: " + fasedLatencyRegistersError.message());
-      module->print(fasedLatencyRegistersOut); fasedLatencyRegistersOut << '\n'; fasedLatencyRegistersOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyRegistersAnnotations, error)))
-        return fail("FASED latency registers annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED host-clock latency registers and timing binding in " << fasedLatencyRegistersPath << '\n';
-      if (failed(goldengate::attachFASEDFunctionalModelRegister(circuit, fasedFunctionalModelBank, error)))
-        return fail("FASED functional model register: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED functional model register produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedFunctionalModelRegisterPath(outputDir), fasedFunctionalModelRegisterAnnotations(outputDir);
-      llvm::sys::path::append(fasedFunctionalModelRegisterPath, "post-fame-fased-functional-model-register.mlir");
-      llvm::sys::path::append(fasedFunctionalModelRegisterAnnotations, "post-fame-fased-functional-model-register-all.json");
-      std::error_code fasedFunctionalModelRegisterError;
-      llvm::raw_fd_ostream fasedFunctionalModelRegisterOut(fasedFunctionalModelRegisterPath, fasedFunctionalModelRegisterError);
-      if (fasedFunctionalModelRegisterError) return fail("cannot write FASED functional model register: " + fasedFunctionalModelRegisterError.message());
-      module->print(fasedFunctionalModelRegisterOut); fasedFunctionalModelRegisterOut << '\n'; fasedFunctionalModelRegisterOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelRegisterAnnotations, error)))
-        return fail("FASED functional model register annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED host-clock functional model register and ingress binding in " << fasedFunctionalModelRegisterPath << '\n';
-      if (failed(goldengate::attachFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
-        return fail("FASED response error registers: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED response error registers produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedResponseErrorsPath(outputDir), fasedResponseErrorsAnnotations(outputDir);
-      llvm::sys::path::append(fasedResponseErrorsPath, "post-fame-fased-response-errors.mlir");
-      llvm::sys::path::append(fasedResponseErrorsAnnotations, "post-fame-fased-response-errors-all.json");
-      std::error_code fasedResponseErrorsError;
-      llvm::raw_fd_ostream fasedResponseErrorsOut(fasedResponseErrorsPath, fasedResponseErrorsError);
-      if (fasedResponseErrorsError) return fail("cannot write FASED response error registers: " + fasedResponseErrorsError.message());
-      module->print(fasedResponseErrorsOut); fasedResponseErrorsOut << '\n'; fasedResponseErrorsOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsAnnotations, error)))
-        return fail("FASED response error registers annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED host-clock response error registers and response handshake binding in " << fasedResponseErrorsPath << '\n';
-      if (failed(goldengate::attachFASEDStatistics(circuit, fasedStatisticsBank, error)))
-        return fail("FASED transaction and beat counters: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED transaction and beat counters produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedStatisticsPath(outputDir), fasedStatisticsAnnotations(outputDir);
-      llvm::sys::path::append(fasedStatisticsPath, "post-fame-fased-statistics.mlir");
-      llvm::sys::path::append(fasedStatisticsAnnotations, "post-fame-fased-statistics-all.json");
-      std::error_code fasedStatisticsError;
-      llvm::raw_fd_ostream fasedStatisticsOut(fasedStatisticsPath, fasedStatisticsError);
-      if (fasedStatisticsError) return fail("cannot write FASED transaction and beat counters: " + fasedStatisticsError.message());
-      module->print(fasedStatisticsOut); fasedStatisticsOut << '\n'; fasedStatisticsOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsAnnotations, error)))
-        return fail("FASED transaction and beat counters annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED target-clock transaction and beat counters and read-only MMIO in " << fasedStatisticsPath << '\n';
-      if (failed(goldengate::attachFASEDHistograms(circuit, fasedHistogramsBank, error)))
-        return fail("FASED outstanding occupancy histograms: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED outstanding occupancy histograms produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedHistogramsPath(outputDir), fasedHistogramsAnnotations(outputDir);
-      llvm::sys::path::append(fasedHistogramsPath, "post-fame-fased-histograms.mlir");
-      llvm::sys::path::append(fasedHistogramsAnnotations, "post-fame-fased-histograms-all.json");
-      std::error_code fasedHistogramsError;
-      llvm::raw_fd_ostream fasedHistogramsOut(fasedHistogramsPath, fasedHistogramsError);
-      if (fasedHistogramsError) return fail("cannot write FASED outstanding occupancy histograms: " + fasedHistogramsError.message());
-      module->print(fasedHistogramsOut); fasedHistogramsOut << '\n'; fasedHistogramsOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsAnnotations, error)))
-        return fail("FASED outstanding occupancy histograms annotations: " + error);
-      llvm::outs() << "Mapped CIRCT FASED target-clock occupancy histograms and read-only MMIO in " << fasedHistogramsPath << '\n';
-      // The same six decoded register fragments implement the recorded NIC
-      // and no-NIC FASED profile. Assemble their lanes before control transport.
-      if (failed(goldengate::addFASEDMMIOBank(circuit, error)))
-        return fail("FASED MMIO bank: " + error);
-      if (failed(mlir::verify(*module))) return fail("FASED MMIO bank produced invalid FIRRTL IR");
-      llvm::SmallString<256> fasedMMIOPath(outputDir), fasedMMIOAnnotations(outputDir);
-      llvm::sys::path::append(fasedMMIOPath, "post-fame-fased-mmio.mlir");
-      llvm::sys::path::append(fasedMMIOAnnotations, "post-fame-fased-mmio-all.json");
-      std::error_code fasedMMIOError;
-      llvm::raw_fd_ostream fasedMMIOOut(fasedMMIOPath, fasedMMIOError);
-      if (fasedMMIOError) return fail("cannot write FASED MMIO bank: " + fasedMMIOError.message());
-      module->print(fasedMMIOOut); fasedMMIOOut << '\n'; fasedMMIOOut.close();
-      if (failed(goldengate::emitAllAnnotations(circuit, fasedMMIOAnnotations, error)))
-        return fail("FASED MMIO bank annotations: " + error);
-      llvm::outs() << "Assembled CIRCT FASED 21-word MMIO bank in " << fasedMMIOPath << '\n';
-      if (failed(goldengate::mapFASEDBridgeControl(circuit, 25, 12, error)))
+      if (fasedFRFCFS) {
+        if (failed(goldengate::addFASEDFRFCFSBridge(circuit, error)))
+          return fail("FASED FRFCFS timing/functional attachment: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED FRFCFS bridge produced invalid FIRRTL IR");
+        if (failed(goldengate::attachFASEDFRFCFSMMIO(circuit, fasedFRFCFSBank, error)))
+          return fail("FASED FRFCFS MMIO attachment: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("FASED FRFCFS MMIO attachment produced invalid FIRRTL IR");
+        llvm::SmallString<256> modelPath(outputDir), modelAnnotations(outputDir);
+        llvm::sys::path::append(modelPath, "post-fame-fased-frfcfs-mmio.mlir");
+        llvm::sys::path::append(modelAnnotations, "post-fame-fased-frfcfs-mmio-all.json");
+        if (auto ec = emitDebugSnapshot(module->getOperation(), modelPath, emitDebugSnapshots))
+          return fail("cannot write FASED FRFCFS attachment: " + ec.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, modelAnnotations, error)))
+          return fail("FASED FRFCFS attachment annotations: " + error);
+        llvm::outs() << "Attached CIRCT FASED FRFCFS DDR3/LLC model and 68-word MMIO bank\n";
+      } else {
+        // NIC and no-NIC models share AXI4Releaser's pipe occupancy queues.
+        // Advance their native state and model reset only on a target token.
+        if (failed(goldengate::addFASEDResponseReleaser(circuit, error)))
+          return fail("FASED response releaser: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED response releaser produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedResponseReleaserPath(outputDir), fasedResponseReleaserAnnotations(outputDir);
+        llvm::sys::path::append(fasedResponseReleaserPath, "post-fame-fased-response-releaser.mlir");
+        llvm::sys::path::append(fasedResponseReleaserAnnotations, "post-fame-fased-response-releaser-all.json");
+        std::error_code fasedResponseReleaserError = emitDebugSnapshot(
+            module->getOperation(), fasedResponseReleaserPath, emitDebugSnapshots);
+        if (fasedResponseReleaserError) return fail("cannot write FASED response releaser: " + fasedResponseReleaserError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseReleaserAnnotations, error)))
+          return fail("FASED response releaser annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED target response release and egress request binding in " << fasedResponseReleaserPath << '\n';
+        // The NIC model shares the targetFire-qualified cycle counter and
+        // runtime latency arithmetic with the no-NIC FASED model.
+        if (failed(goldengate::addFASEDTimingCycle(circuit, error)))
+          return fail("FASED timing cycle: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED timing cycle produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedTimingCyclePath(outputDir), fasedTimingCycleAnnotations(outputDir);
+        llvm::sys::path::append(fasedTimingCyclePath, "post-fame-fased-timing-cycle.mlir");
+        llvm::sys::path::append(fasedTimingCycleAnnotations, "post-fame-fased-timing-cycle-all.json");
+        std::error_code fasedTimingCycleError = emitDebugSnapshot(
+            module->getOperation(), fasedTimingCyclePath, emitDebugSnapshots);
+        if (fasedTimingCycleError) return fail("cannot write FASED timing cycle: " + fasedTimingCycleError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedTimingCycleAnnotations, error)))
+          return fail("FASED timing cycle annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED timing cycle and latency release-cycle arithmetic in " << fasedTimingCyclePath << '\n';
+        if (failed(goldengate::addFASEDReadLatency(circuit, error)))
+          return fail("FASED read latency: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED read latency produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedReadLatencyPath(outputDir), fasedReadLatencyAnnotations(outputDir);
+        llvm::sys::path::append(fasedReadLatencyPath, "post-fame-fased-read-latency.mlir");
+        llvm::sys::path::append(fasedReadLatencyAnnotations, "post-fame-fased-read-latency-all.json");
+        std::error_code fasedReadLatencyError = emitDebugSnapshot(
+            module->getOperation(), fasedReadLatencyPath, emitDebugSnapshots);
+        if (fasedReadLatencyError) return fail("cannot write FASED read latency: " + fasedReadLatencyError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedReadLatencyAnnotations, error)))
+          return fail("FASED read latency annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED ten-entry read latency queue and completion retirement in " << fasedReadLatencyPath << '\n';
+        if (failed(goldengate::addFASEDWriteLatency(circuit, error)))
+          return fail("FASED write latency: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED write latency produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedWriteLatencyPath(outputDir), fasedWriteLatencyAnnotations(outputDir);
+        llvm::sys::path::append(fasedWriteLatencyPath, "post-fame-fased-write-latency.mlir");
+        llvm::sys::path::append(fasedWriteLatencyAnnotations, "post-fame-fased-write-latency-all.json");
+        std::error_code fasedWriteLatencyError = emitDebugSnapshot(
+            module->getOperation(), fasedWriteLatencyPath, emitDebugSnapshots);
+        if (fasedWriteLatencyError) return fail("cannot write FASED write latency: " + fasedWriteLatencyError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteLatencyAnnotations, error)))
+          return fail("FASED write latency annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED ten-entry write latency queue and completion boundary in " << fasedWriteLatencyPath << '\n';
+        if (failed(goldengate::addFASEDTimingAWQueue(circuit, error)))
+          return fail("FASED timing AW queue: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED timing AW queue produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedTimingAWQueuePath(outputDir), fasedTimingAWQueueAnnotations(outputDir);
+        llvm::sys::path::append(fasedTimingAWQueuePath, "post-fame-fased-timing-aw-queue.mlir");
+        llvm::sys::path::append(fasedTimingAWQueueAnnotations, "post-fame-fased-timing-aw-queue-all.json");
+        std::error_code fasedTimingAWQueueError = emitDebugSnapshot(
+            module->getOperation(), fasedTimingAWQueuePath, emitDebugSnapshots);
+        if (fasedTimingAWQueueError) return fail("cannot write FASED timing AW queue: " + fasedTimingAWQueueError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedTimingAWQueueAnnotations, error)))
+          return fail("FASED timing AW queue annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED ten-entry timing AW metadata queue and completion ID binding in " << fasedTimingAWQueuePath << '\n';
+        if (failed(goldengate::addFASEDWritePairing(circuit, error)))
+          return fail("FASED write pairing: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED write pairing produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedWritePairingPath(outputDir), fasedWritePairingAnnotations(outputDir);
+        llvm::sys::path::append(fasedWritePairingPath, "post-fame-fased-write-pairing.mlir");
+        llvm::sys::path::append(fasedWritePairingAnnotations, "post-fame-fased-write-pairing-all.json");
+        std::error_code fasedWritePairingError = emitDebugSnapshot(
+            module->getOperation(), fasedWritePairingPath, emitDebugSnapshots);
+        if (fasedWritePairingError) return fail("cannot write FASED write pairing: " + fasedWritePairingError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedWritePairingAnnotations, error)))
+          return fail("FASED write pairing annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED pending AW/W counters and completion pairing in " << fasedWritePairingPath << '\n';
+        if (failed(goldengate::bindFASEDWriteRetirement(circuit, error)))
+          return fail("FASED write retirement: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED write retirement produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedWriteRetirementPath(outputDir), fasedWriteRetirementAnnotations(outputDir);
+        llvm::sys::path::append(fasedWriteRetirementPath, "post-fame-fased-write-retirement.mlir");
+        llvm::sys::path::append(fasedWriteRetirementAnnotations, "post-fame-fased-write-retirement-all.json");
+        std::error_code fasedWriteRetirementError = emitDebugSnapshot(
+            module->getOperation(), fasedWriteRetirementPath, emitDebugSnapshots);
+        if (fasedWriteRetirementError) return fail("cannot write FASED write retirement: " + fasedWriteRetirementError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteRetirementAnnotations, error)))
+          return fail("FASED write retirement annotations: " + error);
+        llvm::outs() << "Bound CIRCT FASED accepted target B responses to pending write counters in " << fasedWriteRetirementPath << '\n';
+        if (failed(goldengate::bindFASEDWriteAdmission(circuit, error)))
+          return fail("FASED write admission: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED write admission produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedWriteAdmissionPath(outputDir), fasedWriteAdmissionAnnotations(outputDir);
+        llvm::sys::path::append(fasedWriteAdmissionPath, "post-fame-fased-write-admission.mlir");
+        llvm::sys::path::append(fasedWriteAdmissionAnnotations, "post-fame-fased-write-admission-all.json");
+        std::error_code fasedWriteAdmissionError = emitDebugSnapshot(
+            module->getOperation(), fasedWriteAdmissionPath, emitDebugSnapshots);
+        if (fasedWriteAdmissionError) return fail("cannot write FASED write admission: " + fasedWriteAdmissionError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteAdmissionAnnotations, error)))
+          return fail("FASED write admission annotations: " + error);
+        llvm::outs() << "Bound CIRCT FASED target AW/W readiness to pending write counters in " << fasedWriteAdmissionPath << '\n';
+        if (failed(goldengate::bindFASEDReadAdmission(circuit, error)))
+          return fail("FASED read admission: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED read admission produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedReadAdmissionPath(outputDir), fasedReadAdmissionAnnotations(outputDir);
+        llvm::sys::path::append(fasedReadAdmissionPath, "post-fame-fased-read-admission.mlir");
+        llvm::sys::path::append(fasedReadAdmissionAnnotations, "post-fame-fased-read-admission-all.json");
+        std::error_code fasedReadAdmissionError = emitDebugSnapshot(
+            module->getOperation(), fasedReadAdmissionPath, emitDebugSnapshots);
+        if (fasedReadAdmissionError) return fail("cannot write FASED read admission: " + fasedReadAdmissionError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedReadAdmissionAnnotations, error)))
+          return fail("FASED read admission annotations: " + error);
+        llvm::outs() << "Bound CIRCT FASED pending reads, final R retirement and AR admission in " << fasedReadAdmissionPath << '\n';
+        // NIC now closes AR admission and retires accepted final R beats.
+        if (failed(goldengate::attachFASEDRequestLimits(circuit, fasedRequestLimitsBank, error)))
+          return fail("FASED request limits: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED request limits produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedRequestLimitsPath(outputDir), fasedRequestLimitsAnnotations(outputDir);
+        llvm::sys::path::append(fasedRequestLimitsPath, "post-fame-fased-request-limits.mlir");
+        llvm::sys::path::append(fasedRequestLimitsAnnotations, "post-fame-fased-request-limits-all.json");
+        std::error_code fasedRequestLimitsError = emitDebugSnapshot(
+            module->getOperation(), fasedRequestLimitsPath, emitDebugSnapshots);
+        if (fasedRequestLimitsError) return fail("cannot write FASED request limits: " + fasedRequestLimitsError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedRequestLimitsAnnotations, error)))
+          return fail("FASED request limits annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED host-clock request-limit registers and admission binding in " << fasedRequestLimitsPath << '\n';
+        if (failed(goldengate::attachFASEDLatencyRegisters(circuit, fasedLatencyBank, error)))
+          return fail("FASED latency registers: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED latency registers produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedLatencyRegistersPath(outputDir), fasedLatencyRegistersAnnotations(outputDir);
+        llvm::sys::path::append(fasedLatencyRegistersPath, "post-fame-fased-latency-registers.mlir");
+        llvm::sys::path::append(fasedLatencyRegistersAnnotations, "post-fame-fased-latency-registers-all.json");
+        std::error_code fasedLatencyRegistersError = emitDebugSnapshot(
+            module->getOperation(), fasedLatencyRegistersPath, emitDebugSnapshots);
+        if (fasedLatencyRegistersError) return fail("cannot write FASED latency registers: " + fasedLatencyRegistersError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedLatencyRegistersAnnotations, error)))
+          return fail("FASED latency registers annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED host-clock latency registers and timing binding in " << fasedLatencyRegistersPath << '\n';
+        if (failed(goldengate::attachFASEDFunctionalModelRegister(circuit, fasedFunctionalModelBank, error)))
+          return fail("FASED functional model register: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED functional model register produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedFunctionalModelRegisterPath(outputDir), fasedFunctionalModelRegisterAnnotations(outputDir);
+        llvm::sys::path::append(fasedFunctionalModelRegisterPath, "post-fame-fased-functional-model-register.mlir");
+        llvm::sys::path::append(fasedFunctionalModelRegisterAnnotations, "post-fame-fased-functional-model-register-all.json");
+        std::error_code fasedFunctionalModelRegisterError = emitDebugSnapshot(
+            module->getOperation(), fasedFunctionalModelRegisterPath, emitDebugSnapshots);
+        if (fasedFunctionalModelRegisterError) return fail("cannot write FASED functional model register: " + fasedFunctionalModelRegisterError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedFunctionalModelRegisterAnnotations, error)))
+          return fail("FASED functional model register annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED host-clock functional model register and ingress binding in " << fasedFunctionalModelRegisterPath << '\n';
+        if (failed(goldengate::attachFASEDResponseErrors(circuit, fasedResponseErrorsBank, error)))
+          return fail("FASED response error registers: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED response error registers produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedResponseErrorsPath(outputDir), fasedResponseErrorsAnnotations(outputDir);
+        llvm::sys::path::append(fasedResponseErrorsPath, "post-fame-fased-response-errors.mlir");
+        llvm::sys::path::append(fasedResponseErrorsAnnotations, "post-fame-fased-response-errors-all.json");
+        std::error_code fasedResponseErrorsError = emitDebugSnapshot(
+            module->getOperation(), fasedResponseErrorsPath, emitDebugSnapshots);
+        if (fasedResponseErrorsError) return fail("cannot write FASED response error registers: " + fasedResponseErrorsError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedResponseErrorsAnnotations, error)))
+          return fail("FASED response error registers annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED host-clock response error registers and response handshake binding in " << fasedResponseErrorsPath << '\n';
+        if (failed(goldengate::attachFASEDStatistics(circuit, fasedStatisticsBank, error)))
+          return fail("FASED transaction and beat counters: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED transaction and beat counters produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedStatisticsPath(outputDir), fasedStatisticsAnnotations(outputDir);
+        llvm::sys::path::append(fasedStatisticsPath, "post-fame-fased-statistics.mlir");
+        llvm::sys::path::append(fasedStatisticsAnnotations, "post-fame-fased-statistics-all.json");
+        std::error_code fasedStatisticsError = emitDebugSnapshot(
+            module->getOperation(), fasedStatisticsPath, emitDebugSnapshots);
+        if (fasedStatisticsError) return fail("cannot write FASED transaction and beat counters: " + fasedStatisticsError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedStatisticsAnnotations, error)))
+          return fail("FASED transaction and beat counters annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED target-clock transaction and beat counters and read-only MMIO in " << fasedStatisticsPath << '\n';
+        if (failed(goldengate::attachFASEDHistograms(circuit, fasedHistogramsBank, error)))
+          return fail("FASED outstanding occupancy histograms: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED outstanding occupancy histograms produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedHistogramsPath(outputDir), fasedHistogramsAnnotations(outputDir);
+        llvm::sys::path::append(fasedHistogramsPath, "post-fame-fased-histograms.mlir");
+        llvm::sys::path::append(fasedHistogramsAnnotations, "post-fame-fased-histograms-all.json");
+        std::error_code fasedHistogramsError = emitDebugSnapshot(
+            module->getOperation(), fasedHistogramsPath, emitDebugSnapshots);
+        if (fasedHistogramsError) return fail("cannot write FASED outstanding occupancy histograms: " + fasedHistogramsError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedHistogramsAnnotations, error)))
+          return fail("FASED outstanding occupancy histograms annotations: " + error);
+        llvm::outs() << "Mapped CIRCT FASED target-clock occupancy histograms and read-only MMIO in " << fasedHistogramsPath << '\n';
+        // The same six decoded register fragments implement the recorded NIC
+        // and no-NIC FASED profile. Assemble their lanes before control transport.
+        if (failed(goldengate::addFASEDMMIOBank(circuit, error)))
+          return fail("FASED MMIO bank: " + error);
+        if (failed(mlir::verify(*module))) return fail("FASED MMIO bank produced invalid FIRRTL IR");
+        llvm::SmallString<256> fasedMMIOPath(outputDir), fasedMMIOAnnotations(outputDir);
+        llvm::sys::path::append(fasedMMIOPath, "post-fame-fased-mmio.mlir");
+        llvm::sys::path::append(fasedMMIOAnnotations, "post-fame-fased-mmio-all.json");
+        std::error_code fasedMMIOError = emitDebugSnapshot(
+            module->getOperation(), fasedMMIOPath, emitDebugSnapshots);
+        if (fasedMMIOError) return fail("cannot write FASED MMIO bank: " + fasedMMIOError.message());
+        if (failed(goldengate::emitAllAnnotations(circuit, fasedMMIOAnnotations, error)))
+          return fail("FASED MMIO bank annotations: " + error);
+        llvm::outs() << "Assembled CIRCT FASED 21-word MMIO bank in " << fasedMMIOPath << '\n';
+      }
+      if (failed(goldengate::mapFASEDBridgeControl(circuit, ctrlAddressBits, 12, error)))
         return fail("FASED MCRFile control: " + error);
       goldengate::ControlMMIOWidget mappedFASED;
       if (failed(goldengate::deriveControlMMIOWidget(circuit, "FASEDMemoryTimingModel_0",
@@ -4590,10 +4697,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedControlPath(outputDir), fasedControlAnnotations(outputDir);
       llvm::sys::path::append(fasedControlPath, "post-fame-fased-control.mlir");
       llvm::sys::path::append(fasedControlAnnotations, "post-fame-fased-control-all.json");
-      std::error_code fasedControlError;
-      llvm::raw_fd_ostream fasedControlOut(fasedControlPath, fasedControlError);
+      std::error_code fasedControlError = emitDebugSnapshot(
+          module->getOperation(), fasedControlPath, emitDebugSnapshots);
       if (fasedControlError) return fail("cannot write FASED MCRFile control: " + fasedControlError.message());
-      module->print(fasedControlOut); fasedControlOut << '\n'; fasedControlOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedControlAnnotations, error)))
         return fail("FASED MCRFile control annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED MCRFile transactions in " << fasedControlPath << '\n';
@@ -4603,10 +4709,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> fasedBoundPath(outputDir), fasedBoundAnnotations(outputDir);
       llvm::sys::path::append(fasedBoundPath, "post-fame-fased-bound.mlir");
       llvm::sys::path::append(fasedBoundAnnotations, "post-fame-fased-bound-all.json");
-      std::error_code fasedBoundError;
-      llvm::raw_fd_ostream fasedBoundOut(fasedBoundPath, fasedBoundError);
+      std::error_code fasedBoundError = emitDebugSnapshot(
+          module->getOperation(), fasedBoundPath, emitDebugSnapshots);
       if (fasedBoundError) return fail("cannot write FASED control binding: " + fasedBoundError.message());
-      module->print(fasedBoundOut); fasedBoundOut << '\n'; fasedBoundOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fasedBoundAnnotations, error)))
         return fail("FASED control binding annotations: " + error);
       llvm::outs() << "Bound CIRCT FASED requests and responses to its catalog-selected control slave in " << fasedBoundPath << '\n';
@@ -4618,10 +4723,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> controlMasterPath(outputDir), controlMasterAnnotations(outputDir);
       llvm::sys::path::append(controlMasterPath, "post-fame-control-master.mlir");
       llvm::sys::path::append(controlMasterAnnotations, "post-fame-control-master-all.json");
-      std::error_code controlMasterError;
-      llvm::raw_fd_ostream controlMasterOut(controlMasterPath, controlMasterError);
+      std::error_code controlMasterError = emitDebugSnapshot(
+          module->getOperation(), controlMasterPath, emitDebugSnapshots);
       if (controlMasterError) return fail("cannot write host control master binding: " + controlMasterError.message());
-      module->print(controlMasterOut); controlMasterOut << '\n'; controlMasterOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, controlMasterAnnotations, error)))
         return fail("host control master annotations: " + error);
       llvm::outs() << "Assembled CIRCT host control master in " << controlMasterPath << '\n';
@@ -4633,10 +4737,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostMemoryPath(outputDir), hostMemoryAnnotations(outputDir);
       llvm::sys::path::append(hostMemoryPath, "post-fame-fased-host-memory.mlir");
       llvm::sys::path::append(hostMemoryAnnotations, "post-fame-fased-host-memory-all.json");
-      std::error_code hostMemoryError;
-      llvm::raw_fd_ostream hostMemoryOut(hostMemoryPath, hostMemoryError);
+      std::error_code hostMemoryError = emitDebugSnapshot(
+          module->getOperation(), hostMemoryPath, emitDebugSnapshots);
       if (hostMemoryError) return fail("cannot write FASED host memory binding: " + hostMemoryError.message());
-      module->print(hostMemoryOut); hostMemoryOut << '\n'; hostMemoryOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostMemoryAnnotations, error)))
         return fail("FASED host memory annotations: " + error);
       llvm::outs() << "Assembled CIRCT FASED host memory master in " << hostMemoryPath << '\n';
@@ -4646,10 +4749,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> translationPath(outputDir), translationAnnotations(outputDir);
       llvm::sys::path::append(translationPath, "post-fame-fased-address-translation.mlir");
       llvm::sys::path::append(translationAnnotations, "post-fame-fased-address-translation-all.json");
-      std::error_code translationError;
-      llvm::raw_fd_ostream translationOut(translationPath, translationError);
+      std::error_code translationError = emitDebugSnapshot(
+          module->getOperation(), translationPath, emitDebugSnapshots);
       if (translationError) return fail("cannot write FASED address translation: " + translationError.message());
-      module->print(translationOut); translationOut << '\n'; translationOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, translationAnnotations, error)))
         return fail("FASED address translation annotations: " + error);
       llvm::outs() << "Translated CIRCT FASED addresses and host-clock bounds assertions in " << translationPath << '\n';
@@ -4659,10 +4761,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> deinterleavePath(outputDir), deinterleaveAnnotations(outputDir);
       llvm::sys::path::append(deinterleavePath, "post-fame-fased-read-deinterleaver.mlir");
       llvm::sys::path::append(deinterleaveAnnotations, "post-fame-fased-read-deinterleaver-all.json");
-      std::error_code deinterleaveError;
-      llvm::raw_fd_ostream deinterleaveOut(deinterleavePath, deinterleaveError);
+      std::error_code deinterleaveError = emitDebugSnapshot(
+          module->getOperation(), deinterleavePath, emitDebugSnapshots);
       if (deinterleaveError) return fail("cannot write FASED read deinterleaver: " + deinterleaveError.message());
-      module->print(deinterleaveOut); deinterleaveOut << '\n'; deinterleaveOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, deinterleaveAnnotations, error)))
         return fail("FASED read deinterleaver annotations: " + error);
       llvm::outs() << "Deinterleaved CIRCT FASED responses with sixteen eight-beat queues in " << deinterleavePath << '\n';
@@ -4672,10 +4773,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> memoryBufferPath(outputDir), memoryBufferAnnotations(outputDir);
       llvm::sys::path::append(memoryBufferPath, "post-fame-fased-host-memory-buffer.mlir");
       llvm::sys::path::append(memoryBufferAnnotations, "post-fame-fased-host-memory-buffer-all.json");
-      std::error_code memoryBufferError;
-      llvm::raw_fd_ostream memoryBufferOut(memoryBufferPath, memoryBufferError);
+      std::error_code memoryBufferError = emitDebugSnapshot(
+          module->getOperation(), memoryBufferPath, emitDebugSnapshots);
       if (memoryBufferError) return fail("cannot write FASED host memory buffer: " + memoryBufferError.message());
-      module->print(memoryBufferOut); memoryBufferOut << '\n'; memoryBufferOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, memoryBufferAnnotations, error)))
         return fail("FASED host memory buffer annotations: " + error);
       llvm::outs() << "Buffered CIRCT FASED host memory with five two-entry queues in " << memoryBufferPath << '\n';
@@ -4685,10 +4785,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostMemoryWriteArbiterPath(outputDir), hostMemoryWriteArbiterAnnotations(outputDir);
       llvm::sys::path::append(hostMemoryWriteArbiterPath, "post-fame-host-memory-write-arbiter.mlir");
       llvm::sys::path::append(hostMemoryWriteArbiterAnnotations, "post-fame-host-memory-write-arbiter-all.json");
-      std::error_code hostMemoryWriteArbiterError;
-      llvm::raw_fd_ostream hostMemoryWriteArbiterOut(hostMemoryWriteArbiterPath, hostMemoryWriteArbiterError);
+      std::error_code hostMemoryWriteArbiterError = emitDebugSnapshot(
+          module->getOperation(), hostMemoryWriteArbiterPath, emitDebugSnapshots);
       if (hostMemoryWriteArbiterError) return fail("cannot write host memory write arbiter: " + hostMemoryWriteArbiterError.message());
-      module->print(hostMemoryWriteArbiterOut); hostMemoryWriteArbiterOut << '\n'; hostMemoryWriteArbiterOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostMemoryWriteArbiterAnnotations, error)))
         return fail("host memory write arbiter annotations: " + error);
       llvm::outs() << "Arbitrated CIRCT LoadMem and FASED AW/W with a two-entry source queue in " << hostMemoryWriteArbiterPath << '\n';
@@ -4698,10 +4797,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostWriteResponsePath(outputDir), hostWriteResponseAnnotations(outputDir);
       llvm::sys::path::append(hostWriteResponsePath, "post-fame-host-memory-write-responses.mlir");
       llvm::sys::path::append(hostWriteResponseAnnotations, "post-fame-host-memory-write-responses-all.json");
-      std::error_code hostWriteResponseError;
-      llvm::raw_fd_ostream hostWriteResponseOut(hostWriteResponsePath, hostWriteResponseError);
+      std::error_code hostWriteResponseError = emitDebugSnapshot(
+          module->getOperation(), hostWriteResponsePath, emitDebugSnapshots);
       if (hostWriteResponseError) return fail("cannot write host memory write responses: " + hostWriteResponseError.message());
-      module->print(hostWriteResponseOut); hostWriteResponseOut << '\n'; hostWriteResponseOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostWriteResponseAnnotations, error)))
         return fail("host memory write response annotations: " + error);
       llvm::outs() << "Routed CIRCT host B responses to LoadMem ID 16 and FASED IDs 0..15 in " << hostWriteResponsePath << '\n';
@@ -4711,10 +4809,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostReadArbiterPath(outputDir), hostReadArbiterAnnotations(outputDir);
       llvm::sys::path::append(hostReadArbiterPath, "post-fame-host-memory-read-arbiter.mlir");
       llvm::sys::path::append(hostReadArbiterAnnotations, "post-fame-host-memory-read-arbiter-all.json");
-      std::error_code hostReadArbiterError;
-      llvm::raw_fd_ostream hostReadArbiterOut(hostReadArbiterPath, hostReadArbiterError);
+      std::error_code hostReadArbiterError = emitDebugSnapshot(
+          module->getOperation(), hostReadArbiterPath, emitDebugSnapshots);
       if (hostReadArbiterError) return fail("cannot write host memory read arbiter: " + hostReadArbiterError.message());
-      module->print(hostReadArbiterOut); hostReadArbiterOut << '\n'; hostReadArbiterOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostReadArbiterAnnotations, error)))
         return fail("host memory read arbiter annotations: " + error);
       llvm::outs() << "Arbitrated CIRCT LoadMem and FASED AR requests in " << hostReadArbiterPath << '\n';
@@ -4724,10 +4821,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostReadResponsePath(outputDir), hostReadResponseAnnotations(outputDir);
       llvm::sys::path::append(hostReadResponsePath, "post-fame-host-memory-read-responses.mlir");
       llvm::sys::path::append(hostReadResponseAnnotations, "post-fame-host-memory-read-responses-all.json");
-      std::error_code hostReadResponseError;
-      llvm::raw_fd_ostream hostReadResponseOut(hostReadResponsePath, hostReadResponseError);
+      std::error_code hostReadResponseError = emitDebugSnapshot(
+          module->getOperation(), hostReadResponsePath, emitDebugSnapshots);
       if (hostReadResponseError) return fail("cannot write host memory read responses: " + hostReadResponseError.message());
-      module->print(hostReadResponseOut); hostReadResponseOut << '\n'; hostReadResponseOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostReadResponseAnnotations, error)))
         return fail("host memory read response annotations: " + error);
       llvm::outs() << "Routed CIRCT host R responses to LoadMem ID16 and FASED IDs0..15 in " << hostReadResponsePath << '\n';
@@ -4737,10 +4833,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostOutputBufferPath(outputDir), hostOutputBufferAnnotations(outputDir);
       llvm::sys::path::append(hostOutputBufferPath, "post-fame-host-memory-output-buffer.mlir");
       llvm::sys::path::append(hostOutputBufferAnnotations, "post-fame-host-memory-output-buffer-all.json");
-      std::error_code hostOutputBufferError;
-      llvm::raw_fd_ostream hostOutputBufferOut(hostOutputBufferPath, hostOutputBufferError);
+      std::error_code hostOutputBufferError = emitDebugSnapshot(
+          module->getOperation(), hostOutputBufferPath, emitDebugSnapshots);
       if (hostOutputBufferError) return fail("cannot write host memory output buffer: " + hostOutputBufferError.message());
-      module->print(hostOutputBufferOut); hostOutputBufferOut << '\n'; hostOutputBufferOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostOutputBufferAnnotations, error)))
         return fail("host memory output buffer annotations: " + error);
       llvm::outs() << "Buffered CIRCT host memory output with five two-entry queues in " << hostOutputBufferPath << '\n';
@@ -4750,10 +4845,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostPlatformPath(outputDir), hostPlatformAnnotations(outputDir);
       llvm::sys::path::append(hostPlatformPath, "post-fame-host-memory-platform.mlir");
       llvm::sys::path::append(hostPlatformAnnotations, "post-fame-host-memory-platform-all.json");
-      std::error_code hostPlatformError;
-      llvm::raw_fd_ostream hostPlatformOut(hostPlatformPath, hostPlatformError);
+      std::error_code hostPlatformError = emitDebugSnapshot(
+          module->getOperation(), hostPlatformPath, emitDebugSnapshots);
       if (hostPlatformError) return fail("cannot write host memory platform port: " + hostPlatformError.message());
-      module->print(hostPlatformOut); hostPlatformOut << '\n'; hostPlatformOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostPlatformAnnotations, error)))
         return fail("host memory platform annotations: " + error);
       llvm::outs() << "Adapted CIRCT host memory to the sixteen-bit mem_0 ID interface in " << hostPlatformPath << '\n';
@@ -4763,52 +4857,52 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> cpuPlatformPath(outputDir), cpuPlatformAnnotations(outputDir);
       llvm::sys::path::append(cpuPlatformPath, "post-fame-cpu-stream-platform.mlir");
       llvm::sys::path::append(cpuPlatformAnnotations, "post-fame-cpu-stream-platform-all.json");
-      std::error_code cpuPlatformError;
-      llvm::raw_fd_ostream cpuPlatformOut(cpuPlatformPath, cpuPlatformError);
+      std::error_code cpuPlatformError = emitDebugSnapshot(
+          module->getOperation(), cpuPlatformPath, emitDebugSnapshots);
       if (cpuPlatformError) return fail("cannot write CPU stream platform port: " + cpuPlatformError.message());
-      module->print(cpuPlatformOut); cpuPlatformOut << '\n'; cpuPlatformOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, cpuPlatformAnnotations, error)))
         return fail("CPU stream platform annotations: " + error);
       llvm::outs() << "Assembled CIRCT CPU-managed AXI4 slave in " << cpuPlatformPath << '\n';
-      if (failed(goldengate::assembleFPGATopShell(circuit, error)))
+      if (isF2 && failed(goldengate::enableF2CPUStreamWordReads(circuit, error)))
+        return fail("F2 CPU-managed DWORD reads: " + error);
+      if (failed(goldengate::assembleFPGATopShell(circuit, error, isF2)))
         return fail("FPGA top shell: " + error);
       if (failed(mlir::verify(*module))) return fail("FPGA top shell produced invalid FIRRTL IR");
       llvm::SmallString<256> fpgaTopPath(outputDir), fpgaTopAnnotations(outputDir);
       llvm::sys::path::append(fpgaTopPath, "post-fame-fpga-top.mlir");
       llvm::sys::path::append(fpgaTopAnnotations, "post-fame-fpga-top-all.json");
-      std::error_code fpgaTopError;
-      llvm::raw_fd_ostream fpgaTopOut(fpgaTopPath, fpgaTopError);
+      std::error_code fpgaTopError = emitDebugSnapshot(
+          module->getOperation(), fpgaTopPath, emitDebugSnapshots);
       if (fpgaTopError) return fail("cannot write FPGA top shell: " + fpgaTopError.message());
-      module->print(fpgaTopOut); fpgaTopOut << '\n'; fpgaTopOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, fpgaTopAnnotations, error)))
         return fail("FPGA top shell annotations: " + error);
       llvm::outs() << "Assembled CIRCT FPGATop clock/reset and three AXI4 interfaces in " << fpgaTopPath << '\n';
-      if (failed(goldengate::assembleF1Shim(circuit, error)))
-        return fail("U250 F1 shim: " + error);
-      if (failed(mlir::verify(*module))) return fail("U250 F1 shim produced invalid FIRRTL IR");
+      if (failed(goldengate::assembleF1Shim(circuit, error, isF2)))
+        return fail("platform F1 shim: " + error);
+      if (failed(mlir::verify(*module))) return fail("platform F1 shim produced invalid FIRRTL IR");
       // Scala SimulationMapping generates the platform header before AutoILA
       // appends internal probe/Clock export ports. Capture that same boundary;
       // the metasim interface describes physical ports, not debug routes.
       if (cpuSinks.empty() &&
-          failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error)))
+          failed(goldengate::prepareMetasimInterfaceHeader(circuit, originalTargetName, error, isF2)))
         return fail("metasim interface header: " + error);
       llvm::SmallString<256> shimPath(outputDir), shimAnnotations(outputDir);
       llvm::sys::path::append(shimPath, "post-fame-f1-shim.mlir");
       llvm::sys::path::append(shimAnnotations, "post-fame-f1-shim-all.json");
-      std::error_code shimError;
-      llvm::raw_fd_ostream shimOut(shimPath, shimError);
+      std::error_code shimError = emitDebugSnapshot(
+          module->getOperation(), shimPath, emitDebugSnapshots);
       if (shimError) return fail("cannot write F1 shim: " + shimError.message());
-      module->print(shimOut); shimOut << '\n'; shimOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, shimAnnotations, error)))
         return fail("F1 shim annotations: " + error);
-      llvm::outs() << "Assembled CIRCT U250 F1Shim and accepted control request ID counters in " << shimPath << '\n';
+      llvm::outs() << "Assembled CIRCT " << (isF2 ? "F2" : "U250")
+                   << " F1Shim and accepted control request ID counters in " << shimPath << '\n';
       if (!cpuSinks.empty()) {
         // SimulationMapping derives interface constants from the physical
         // platform ports, independently of the NIC bridge constructors.
         // Keep this partial header in its own directory until the complete
         // driver header and RTL are available for publication together.
         if (failed(goldengate::prepareMetasimInterfaceHeader(
-                circuit, originalTargetName, error)))
+                circuit, originalTargetName, error, isF2)))
           return fail("NIC metasim interface header: " + error);
         llvm::SmallString<256> headerAnnotations(outputDir), headerDirectory(outputDir);
         llvm::sys::path::append(headerAnnotations, "post-fame-metasim-header-all.json");
@@ -4889,7 +4983,7 @@ int main(int argc, char **argv) {
       // MMIO header analysis uses the assembled aggregate banks. Capture its
       // result before debug payload lowering, then publish it at the existing
       // collateral boundary without changing annotation order.
-      mlir::DictionaryAttr ilaDriverHeader;
+      mlir::DictionaryAttr ilaDriverHeader, ilaPeerMap, ilaF2StreamProtocol;
       auto isDriverHeader = [](mlir::DictionaryAttr dict) {
         auto suffix = dict ? dict.getAs<mlir::StringAttr>("fileSuffix")
                            : mlir::StringAttr();
@@ -4905,8 +4999,19 @@ int main(int argc, char **argv) {
           auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
           if (isDriverHeader(dict))
             ilaDriverHeader = dict;
+          if (dict && dict.getAs<mlir::StringAttr>("class") == goldengate::AnnotationClasses::OutputFile &&
+              dict.getAs<mlir::StringAttr>("fileSuffix") == ".peer2peer.const.yaml")
+            ilaPeerMap = dict;
+          if (dict && dict.getAs<mlir::StringAttr>("class") == goldengate::AnnotationClasses::OutputFile &&
+              dict.getAs<mlir::StringAttr>("fileSuffix") == ".f2-cpu-stream-protocol.json") {
+            if (ilaF2StreamProtocol) return fail("duplicate F2 source-count ACK protocol capture");
+            ilaF2StreamProtocol = dict;
+          }
         }
-        if (!ilaDriverHeader) return fail("AutoILA driver header capture failed");
+        if (isF2 && !ilaF2StreamProtocol)
+          return fail("F2 source-count ACK protocol capture failed");
+        if (!ilaDriverHeader || !ilaPeerMap)
+          return fail("AutoILA driver header/peer map capture failed");
         circuit->setAttr("rawAnnotations", original);
       }
       if (enableAutoILA && failed(goldengate::prepareAutoILAAnnotations(
@@ -4933,10 +5038,9 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> hostClockPath(outputDir), hostClockAnnotations(outputDir);
       llvm::sys::path::append(hostClockPath, "post-host-clock-wiring.mlir");
       llvm::sys::path::append(hostClockAnnotations, "post-host-clock-wiring-all.json");
-      std::error_code hostClockError;
-      llvm::raw_fd_ostream hostClockOut(hostClockPath, hostClockError);
+      std::error_code hostClockError = emitDebugSnapshot(
+          module->getOperation(), hostClockPath, emitDebugSnapshots);
       if (hostClockError) return fail("cannot write host clock wiring: " + hostClockError.message());
-      module->print(hostClockOut); hostClockOut << '\n'; hostClockOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, hostClockAnnotations, error)))
         return fail("host clock wiring annotations: " + error);
       llvm::outs() << "Wired " << wiredHostClocks << " CIRCT host clock sinks in " << hostClockPath << '\n';
@@ -4947,11 +5051,10 @@ int main(int argc, char **argv) {
       llvm::SmallString<256> xilinxPath(outputDir), xilinxAnnotations(outputDir);
       llvm::sys::path::append(xilinxPath, "post-xilinx-host-specialization.mlir");
       llvm::sys::path::append(xilinxAnnotations, "post-xilinx-host-specialization-all.json");
-      std::error_code xilinxError;
-      llvm::raw_fd_ostream xilinxOut(xilinxPath, xilinxError);
+      std::error_code xilinxError = emitDebugSnapshot(
+          module->getOperation(), xilinxPath, emitDebugSnapshots);
       if (xilinxError)
         return fail("cannot write Xilinx host specialization: " + xilinxError.message());
-      module->print(xilinxOut); xilinxOut << '\n'; xilinxOut.close();
       if (failed(goldengate::emitAllAnnotations(circuit, xilinxAnnotations, error)))
         return fail("Xilinx host specialization annotations: " + error);
       llvm::outs() << "Specialized CIRCT abstract clocks to Xilinx BUFGCE in " << xilinxPath << '\n';
@@ -4968,10 +5071,9 @@ int main(int argc, char **argv) {
         return fail("host hierarchy normalization: " + error);
       llvm::SmallString<256> normalizedHierarchyPath(outputDir);
       llvm::sys::path::append(normalizedHierarchyPath, "post-host-hierarchy-normalization.mlir");
-      std::error_code hierarchyError;
-      llvm::raw_fd_ostream hierarchyOut(normalizedHierarchyPath, hierarchyError);
+      std::error_code hierarchyError = emitDebugSnapshot(
+          module->getOperation(), normalizedHierarchyPath, emitDebugSnapshots);
       if (hierarchyError) return fail("cannot write normalized host hierarchy: " + hierarchyError.message());
-      module->print(hierarchyOut); hierarchyOut << '\n'; hierarchyOut.close();
       llvm::outs() << "Inlined " << inlinedHostWrappers
                    << " CIRCT host assembly wrappers in " << normalizedHierarchyPath << '\n';
       if (failed(goldengate::prepareXDCOutput(circuit, error)))
@@ -4985,7 +5087,23 @@ int main(int argc, char **argv) {
             attr = ilaDriverHeader;
           updated.push_back(attr);
         }
+        // CPU stream geometry was validated before payload lowering. Publish
+        // its map with the captured header after restoring the same archive.
+        updated.push_back(ilaPeerMap);
+        if (isF2) updated.push_back(ilaF2StreamProtocol);
         circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(&context, updated));
+      }
+      if (isF2) {
+        unsigned protocols = 0;
+        for (auto attr : circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations")) {
+          auto dict = mlir::dyn_cast<mlir::DictionaryAttr>(attr);
+          if (!dict || dict.getAs<mlir::StringAttr>("class") != goldengate::AnnotationClasses::OutputFile ||
+              dict.getAs<mlir::StringAttr>("fileSuffix") != ".f2-cpu-stream-protocol.json") continue;
+          auto body = dict.getAs<mlir::StringAttr>("body");
+          if (!body || body.getValue().empty()) return fail("F2 source-count ACK protocol body missing");
+          ++protocols;
+        }
+        if (protocols != 1) return fail("F2 source-count ACK protocol output inventory differs");
       }
       llvm::SmallString<256> xdcAnnotations(outputDir);
       llvm::sys::path::append(xdcAnnotations, "post-fame-xdc-all.json");
@@ -4996,7 +5114,11 @@ int main(int argc, char **argv) {
       llvm::outs() << "Emitted CIRCT Golden Gate annotated collateral with base " << outputBase << '\n';
       llvm::SmallString<256> rtlPath(outputDir);
       llvm::sys::path::append(rtlPath, outputBase + ".sv");
-      if (failed(goldengate::emitSimulatorRTL(*module, firPath, rtlPath, error)))
+      llvm::SmallString<256> memoryOriginsPath(outputDir);
+      llvm::sys::path::append(memoryOriginsPath,
+                             outputBase + ".memory-origins.json");
+      if (failed(goldengate::emitSimulatorRTL(*module, firPath, rtlPath, error,
+                                             memoryOriginsPath)))
         return fail("simulator RTL: " + error);
       llvm::outs() << "Emitted CIRCT simulator RTL in " << rtlPath << '\n';
     }
@@ -5732,6 +5854,7 @@ int main(int argc, char **argv) {
       if (isSelected(*moduleName))
         byModule[moduleName->str()].push_back(std::move(dependency));
     }
+    llvm::SmallVector<goldengate::FAMEModelControlPlan, 0> controlPlans;
     for (auto &[moduleName, dependencies] : byModule) {
       FModuleOp model;
       for (auto &op : circuit.getBodyBlock()->getOperations())
@@ -5785,6 +5908,10 @@ int main(int argc, char **argv) {
       llvm::StringRef clockName = virtualClock ? llvm::StringRef()
                                                : *clockChannelPorts.begin();
       mlir::Value inputEnable, outputEnable;
+      goldengate::FAMEModelControlPlan controlPlan;
+      controlPlan.model = model;
+      controlPlan.clockChannel = clockName.str();
+      controlPlan.dependencies.assign(dependencies.begin(), dependencies.end());
       mlir::OpBuilder builder(&model.getBodyBlock()->front());
       if (virtualClock) {
         std::set<std::string> clocks;
@@ -5810,17 +5937,13 @@ int main(int argc, char **argv) {
         if (!targetClock || (!clocks.empty() && *clocks.begin() != *targetClock))
           return fail("virtual-clock model lacks its associated target clock: " +
                       moduleName);
-        if (failed(goldengate::addFAMEClockEnable(
-                model, *targetClock, {}, rewriteError)) ||
-            failed(goldengate::addFAMEClockGate(
-                circuit, model, *targetClock, rewriteError)) ||
-            failed(goldengate::removeFAMEVirtualClockPort(
-                circuit, model, *targetClock, rewriteError)))
+        auto controls = goldengate::constructFAMEVirtualClockControls(
+            circuit, model, *targetClock, rewriteError);
+        if (!controls)
           return fail("FAME virtual-clock construction: " + rewriteError);
-        // Keep control operands before the newly prepended declarations.
-        builder.setInsertionPoint(&model.getBodyBlock()->front());
-        inputEnable = builder.create<ConstantOp>(
-            model.getLoc(), UIntType::get(&context, 1), llvm::APInt(1, 1));
+        inputEnable = controls->inputEnable;
+        outputEnable = controls->outputEnable;
+        controlPlan.clocks.push_back(*controls);
       } else {
         std::string clockSinkName = (clockName + "_sink").str();
         mlir::Value clockPort;
@@ -5837,6 +5960,7 @@ int main(int argc, char **argv) {
             builder.create<SubfieldOp>(model.getLoc(), clockPort, "bits");
         inputEnable =
             builder.create<AsUIntPrimOp>(model.getLoc(), clockBits).getResult();
+        controlPlan.clocks.push_back({clockName.str(), inputEnable, outputEnable});
       }
       llvm::SmallVector<goldengate::FAMEFiredChannel> firedChannels;
       auto addFiredChannel = [&](const std::string &name, bool isInput) {
@@ -5858,6 +5982,7 @@ int main(int argc, char **argv) {
           }
         }
         firedChannels.push_back({name, isInput, enable, bool(clock)});
+        controlPlan.channels.push_back({name, isInput ? Direction::In : Direction::Out, clock});
         return true;
       };
       for (const auto &name : inputsByModule[moduleName])
@@ -5866,23 +5991,11 @@ int main(int argc, char **argv) {
       for (const auto &name : outputsByModule[moduleName])
         if (!addFiredChannel(name, false))
           return fail("FAME fired-state metadata: " + rewriteError);
-      if (mlir::failed(goldengate::ensureFAMEFiredRegisters(
-              model, firedChannels, rewriteError)))
-        return fail("FAME fired-register creation: " + rewriteError);
-      if (mlir::failed(goldengate::rewriteFAMEOutputValids(
-              model, dependencies, rewriteError)))
-        return fail("FAME output-valid rewrite: " + rewriteError);
-      if (mlir::failed(goldengate::rewriteFAMEInputReadies(
-              model, inputsByModule[moduleName], rewriteError)))
-        return fail("FAME input-ready rewrite: " + rewriteError);
-      if (mlir::failed(goldengate::rewriteFAMEFiredStates(
-              model, firedChannels, rewriteError)))
-        return fail("FAME fired-state rewrite: " + rewriteError);
-      if (mlir::failed(goldengate::rewriteFAMEFinishing(
-              model, inputsByModule[moduleName], outputsByModule[moduleName],
-              clockName, rewriteError)))
-        return fail("FAME finishing rewrite: " + rewriteError);
+      controlPlans.push_back(std::move(controlPlan));
     }
+    std::string controlError;
+    if (failed(goldengate::rewriteFAMEModelControls(circuit, controlPlans, controlError)))
+      return fail("FAME model-control composition: " + controlError);
     if (mlir::failed(mlir::verify(*module)))
       return fail("FAME channel-control rewrites produced invalid FIRRTL IR");
     llvm::SmallString<256> rewrittenPath(outputDir);
@@ -6025,6 +6138,339 @@ int main(int argc, char **argv) {
                                                     error)))
       return fail("bridge clock annotation emission: " + error);
     llvm::outs() << "Resolved bridge clocks in " << annotationPath << '\n';
+    return 0;
+  }
+
+  if (rewriteModelGraph) {
+    std::string error;
+    goldengate::FAMEModelGraphResult graph;
+    if (failed(goldengate::rewriteFAMEModelGraph(circuit, graph, error, !graphBoundary)))
+      return fail("generalized FAME model graph: " + error);
+    if (failed(verify(*module))) return fail("FAME model graph produced invalid IR");
+    auto stem = graphBoundary ? "post-fame-model-graph-boundary" : "post-fame-model-graph";
+    llvm::SmallString<256> ir(outputDir), annos(outputDir), rtl(outputDir);
+    llvm::sys::path::append(ir, std::string(stem) + ".mlir");
+    llvm::sys::path::append(annos, std::string(stem) + "-all.json");
+    llvm::sys::path::append(rtl, std::string(stem) + ".sv");
+    auto ec = emitDebugSnapshot(module->getOperation(), ir, true);
+    if (ec) return fail("cannot write FAME model graph: " + ec.message());
+    if (failed(goldengate::emitAllAnnotations(circuit, annos, error)) ||
+        failed(goldengate::emitSimulatorRTL(*module, firPath, rtl, error)))
+      return fail("cannot emit FAME model graph: " + error);
+    llvm::outs() << "Composed " << graph.definitions << " FAME definitions, "
+                 << graph.instances << " instances and " << graph.clockDomains << " domains\n";
+    return 0;
+  }
+
+  if (synthesizeNICLoopbackControl) {
+    std::string header, peerMap, error;
+    if (failed(goldengate::compileNICLoopbackControl(circuit, 32, header, peerMap, error)))
+      return fail("NIC loopback shared control/CPU transport: " + error);
+    llvm::SmallString<256> ir(outputDir), annos(outputDir), rtl(outputDir);
+    llvm::sys::path::append(ir, "post-nic-loopback-control.mlir");
+    llvm::sys::path::append(annos, "post-nic-loopback-control-all.json");
+    llvm::sys::path::append(rtl, "post-nic-loopback-control.sv");
+    auto ec = emitDebugSnapshot(module->getOperation(), ir, true);
+    if (ec) return fail("cannot write NIC loopback control IR: " + ec.message());
+    if (failed(goldengate::emitAllAnnotations(circuit, annos, error)) ||
+        failed(goldengate::emitSimulatorRTL(*module, firPath, rtl, error)))
+      return fail("cannot emit NIC loopback control: " + error);
+    for (const auto &product : {
+             std::make_pair("post-nic-loopback-control.h", &header),
+             std::make_pair("post-nic-loopback-control.peer2peer.const.yaml", &peerMap)}) {
+      llvm::SmallString<256> path(outputDir);
+      llvm::sys::path::append(path, product.first);
+      std::error_code writeError;
+      llvm::raw_fd_ostream stream(path, writeError);
+      if (writeError) return fail("cannot write NIC loopback collateral: " + writeError.message());
+      stream << *product.second;
+    }
+    llvm::outs() << "Bound compile-time NIC loopback global control and buffered CPU transport\n";
+    return 0;
+  }
+
+  if (addNICLoopbackTokens) {
+    std::string error;
+    if (failed(goldengate::addNICLoopbackTokenQueues(circuit, error)))
+      return fail("NIC loopback token binding: " + error);
+    if (circuit.getName() != "GGNICLoopbackTokenQueuesWrapper")
+      return fail("NIC loopback diagnostic requires at least one NIC at the stream boundary");
+    if (addNICLoopbackStreams &&
+        failed(goldengate::addNICLoopbackCPUStreamQueues(circuit, error)))
+      return fail("NIC loopback CPU stream allocation: " + error);
+    if (addNICLoopbackControl &&
+        (failed(goldengate::addNICLoopbackMMIOBank(circuit, error)) ||
+         failed(goldengate::mapNICBridgeControl(circuit, 32, 12, error))))
+      return fail("NIC loopback one-word F2 control binding: " + error);
+    if (failed(verify(*module))) return fail("NIC loopback produced invalid IR");
+    std::string header;
+    if (addNICLoopbackStreams &&
+        failed(goldengate::emitNICLoopbackHeader(circuit, header, error)))
+      return fail("NIC compile-time loopback driver contract: " + error);
+    llvm::SmallString<256> ir(outputDir), annos(outputDir), rtl(outputDir);
+    llvm::sys::path::append(ir, "post-nic-loopback.mlir");
+    llvm::sys::path::append(annos, "post-nic-loopback-all.json");
+    llvm::sys::path::append(rtl, "post-nic-loopback.sv");
+    auto ec = emitDebugSnapshot(module->getOperation(), ir, true);
+    if (ec) return fail("cannot write NIC loopback IR: " + ec.message());
+    if (failed(goldengate::emitAllAnnotations(circuit, annos, error)) ||
+        failed(goldengate::emitSimulatorRTL(*module, firPath, rtl, error)))
+      return fail("cannot emit NIC loopback boundary: " + error);
+    if (addNICLoopbackStreams) {
+      llvm::SmallString<256> path(outputDir);
+      llvm::sys::path::append(path, "post-nic-loopback.h");
+      std::error_code headerError;
+      llvm::raw_fd_ostream stream(path, headerError);
+      if (headerError) return fail("cannot write NIC loopback header: " + headerError.message());
+      stream << header;
+    }
+    llvm::outs() << "Bound compile-time NIC loopback token queues and scheduler\n";
+    return 0;
+  }
+
+  if (synthesizeInstrumentationControl) {
+    std::string header, decoder, peerMap, error;
+    goldengate::AutoCounterPipelineResult pipeline;
+    auto compiled = synthesizeInstrumentationSourceControl
+        ? goldengate::compileInstrumentationSourceToControl(
+              circuit, {}, 32, 12, pipeline, header, decoder, peerMap, error)
+        : goldengate::compileInstrumentationControl(
+              circuit, 32, 12, header, decoder, peerMap, error);
+    if (failed(compiled))
+      return fail("mixed AutoCounter/Print control: " + error);
+    if (failed(verify(*module))) return fail("instrumentation control produced invalid IR");
+    llvm::SmallString<256> ir(outputDir), annos(outputDir), rtl(outputDir);
+    llvm::sys::path::append(ir, "post-instrumentation-control.mlir");
+    llvm::sys::path::append(annos, "post-instrumentation-control-all.json");
+    llvm::sys::path::append(rtl, "post-instrumentation-control.sv");
+    auto ec = emitDebugSnapshot(module->getOperation(), ir, true);
+    if (ec) return fail("cannot write instrumentation control IR: " + ec.message());
+    if (failed(goldengate::emitAllAnnotations(circuit, annos, error)) ||
+        failed(goldengate::emitSimulatorRTL(*module, firPath, rtl, error)))
+      return fail("cannot emit instrumentation control: " + error);
+    for (const auto &product : {
+             std::make_pair("post-instrumentation-control.h", &header),
+             std::make_pair("print-bridge-decoders.h", &decoder),
+             std::make_pair("post-instrumentation-control.peer2peer.const.yaml", &peerMap)}) {
+      llvm::SmallString<256> path(outputDir);
+      llvm::sys::path::append(path, product.first);
+      std::error_code headerError;
+      llvm::raw_fd_ostream stream(path, headerError);
+      if (headerError) return fail("cannot write instrumentation collateral: " + headerError.message());
+      stream << *product.second;
+    }
+    llvm::outs() << "Bound enabled AutoCounter/Print global control and CPU transport\n";
+    return 0;
+  }
+
+  if (synthesizeAutoCounterCSV) {
+    std::string error;
+    // This explicit diagnostic consumes scalar LowerTypes/ExpandWhens output.
+    // AutoCounter selection precedes retained-target checks in the SFC oracle:
+    // excluded generated covers may contain unresolved targets. Full production
+    // staging must select them before global normalization, not validate them
+    // here as though they were live events.
+    llvm::SmallVector<std::string> coverNames;
+    llvm::SmallString<256> coverPath(outputDir);
+    llvm::sys::path::append(coverPath, "autocounter-covermodules.txt");
+    if (llvm::sys::fs::exists(coverPath)) {
+      auto cover = llvm::MemoryBuffer::getFile(coverPath);
+      if (!cover) return fail("cannot read AutoCounter cover modules");
+      // Match scala.io.Source.getLines without trimming module spellings.
+      llvm::StringRef remaining = cover.get()->getBuffer();
+      while (!remaining.empty()) {
+        auto end = remaining.find_first_of("\r\n");
+        coverNames.push_back(remaining.take_front(end).str());
+        if (end == llvm::StringRef::npos) break;
+        bool cr = remaining[end] == '\r';
+        remaining = remaining.drop_front(end + 1);
+        if (cr) remaining.consume_front("\n");
+      }
+    }
+    llvm::SmallVector<llvm::StringRef> coverRefs;
+    for (const auto &name : coverNames) coverRefs.push_back(name);
+    if (synthesizeAutoCounterCSVBindings) {
+      goldengate::AutoCounterPipelineResult result;
+      std::string header;
+      auto compiled = synthesizeAutoCounterCSVControl ?
+          goldengate::compileAutoCounterCSVToControl(
+              circuit, coverRefs, 32, 12, result, header, error) :
+          goldengate::compileAutoCounterCSVToBoundHosts(
+              circuit, coverRefs, 32, 12, result, error);
+      if (failed(compiled))
+        return fail("enabled AutoCounter CSV pipeline: " + error);
+      if (failed(verify(*module))) return fail("bound AutoCounter CSV pipeline produced invalid IR");
+      llvm::SmallString<256> ir(outputDir), annos(outputDir), rtl(outputDir);
+      std::string stem = synthesizeAutoCounterCSVControl ?
+          "post-autocounter-csv-control" : "post-autocounter-csv-bindings";
+      llvm::sys::path::append(ir, stem + ".mlir");
+      llvm::sys::path::append(annos, stem + "-all.json");
+      llvm::sys::path::append(rtl, stem + ".sv");
+      auto ec = emitDebugSnapshot(module->getOperation(), ir, true);
+      if (ec) return fail("cannot write bound AutoCounter CSV IR: " + ec.message());
+      if (failed(goldengate::emitAllAnnotations(circuit, annos, error)) ||
+          failed(goldengate::emitSimulatorRTL(*module, firPath, rtl, error)))
+        return fail("cannot emit bound AutoCounter CSV pipeline: " + error);
+      if (synthesizeAutoCounterCSVControl) {
+        llvm::SmallString<256> path(outputDir);
+        llvm::sys::path::append(path, stem + ".h");
+        std::error_code headerError;
+        llvm::raw_fd_ostream stream(path, headerError);
+        if (headerError) return fail("cannot write AutoCounter control header: " + headerError.message());
+        stream << header;
+      }
+      llvm::outs() << "Bound " << result.widgets << " enabled CSV widgets to "
+                   << result.models.instances << " FAME model instances\n";
+      return 0;
+    }
+    unsigned synthesized = 0;
+    if (failed(goldengate::synthesizeEnabledAutoCounterCSV(
+            circuit, coverRefs, synthesized, error)))
+      return fail("enabled AutoCounter CSV synthesis: " + error);
+    llvm::SmallVector<FModuleOp> csvHosts;
+    if (synthesizeAutoCounterCSVHosts &&
+        failed(goldengate::materializeAutoCounterBridgeHosts(
+            circuit, 32, 12, csvHosts, error)))
+      return fail("synthesized AutoCounter CSV host materialization: " + error);
+    if (synthesizeAutoCounterCSVHosts && csvHosts.size() != synthesized)
+      return fail("synthesized AutoCounter CSV host count differs from clock domains");
+    if (failed(verify(*module))) return fail("AutoCounter CSV produced invalid FIRRTL IR");
+    llvm::SmallString<256> ir(outputDir), annos(outputDir), rtl(outputDir);
+    llvm::sys::path::append(ir, "post-autocounter-csv.mlir");
+    llvm::sys::path::append(annos, "post-autocounter-csv-all.json");
+    llvm::sys::path::append(rtl, "post-autocounter-csv.sv");
+    auto ec = emitDebugSnapshot(module->getOperation(), ir, true);
+    if (ec) return fail("cannot write AutoCounter CSV IR: " + ec.message());
+    if (failed(goldengate::emitAllAnnotations(circuit, annos, error)) ||
+        failed(goldengate::emitSimulatorRTL(*module, firPath, rtl, error)))
+      return fail("cannot emit AutoCounter CSV boundary: " + error);
+    // The source boundary and independently rooted hosts are emitted together.
+    // Token binding/global allocation still require the FAME channel stage.
+    for (auto [i, host] : llvm::enumerate(csvHosts)) {
+      OwningOpRef<ModuleOp> hostIR = cast<ModuleOp>(module->clone());
+      auto hostCircuit = *hostIR->getOps<CircuitOp>().begin();
+      hostCircuit.setName(host.getName());
+      llvm::SmallString<256> hostRTL(outputDir);
+      llvm::sys::path::append(hostRTL, "post-autocounter-csv-host-" + std::to_string(i) + ".sv");
+      if (failed(goldengate::emitSimulatorRTL(*hostIR, firPath, hostRTL, error)))
+        return fail("synthesized AutoCounter CSV host RTL output: " + error);
+    }
+    llvm::outs() << "Synthesized " << synthesized << " AutoCounter CSV clock domains";
+    if (synthesizeAutoCounterCSVHosts)
+      llvm::outs() << " and " << csvHosts.size() << " ordered local F2 AXI hosts";
+    llvm::outs() << '\n';
+    return 0;
+  }
+
+  if (multiThreadFAME5Models || materializeAutoCounterHosts) {
+    std::string error;
+    // FAME5 consumes aggregate Decoupled bulk connects; LowerTypes here would
+    // destroy the topology required by the unchanged SFC grouping contract.
+    if (materializeAutoCounterHosts && !bindAutoCounterHosts &&
+        failed(goldengate::normalizeFAMEInput(*module, circuit, error)))
+      return fail("feature materialization normalization: " + error);
+    unsigned groups = 0;
+    llvm::SmallVector<FModuleOp> hosts;
+    if (multiThreadFAME5Models) {
+      if (failed(goldengate::multiThreadFAME5Models(circuit, groups, error,
+              xilinxFAME5Models ? goldengate::FAME5ClockSemantics::XilinxBUFGCE :
+                                  goldengate::FAME5ClockSemantics::Abstract)))
+        return fail("MultiThreadFAME5Models: " + error);
+    } else if (failed(goldengate::materializeAutoCounterBridgeHosts(
+                   circuit, 32, 12, hosts, error)))
+      return fail("AutoCounter host materialization: " + error);
+    if (materializeAutoCounterHosts && hosts.empty())
+      return fail("AutoCounter host diagnostic requires at least one retained constructor");
+    if (bindAutoCounterHosts && failed(goldengate::bindAutoCounterBridgeHosts(circuit,hosts,error)))
+      return fail("AutoCounter host token binding: " + error);
+    std::string controlHeader;
+    if (bindAutoCounterControl) {
+      llvm::SmallVector<goldengate::ControlMMIOWidget> widgets;
+      llvm::SmallVector<goldengate::ControlMMIORegion> regions;
+      if (failed(goldengate::deriveAutoCounterControlMMIOCatalog(circuit, hosts, widgets, error)) ||
+          failed(goldengate::allocateControlMMIORegions(32, widgets, regions, error)) ||
+          failed(goldengate::assembleAutoCounterControl(circuit, hosts, regions, controlHeader, error)))
+        return fail("AutoCounter global control: " + error);
+    }
+    if (failed(mlir::verify(*module)))
+      return fail("feature materialization produced invalid FIRRTL IR");
+    auto stem = multiThreadFAME5Models ? "post-fame5-models" :
+        bindAutoCounterControl ? "post-autocounter-control" :
+        bindAutoCounterHosts ? "post-autocounter-bindings" : "post-autocounter-hosts";
+    llvm::SmallString<256> irPath(outputDir), annotationPath(outputDir), rtlPath(outputDir);
+    llvm::sys::path::append(irPath, std::string(stem) + ".mlir");
+    llvm::sys::path::append(annotationPath, std::string(stem) + "-all.json");
+    llvm::sys::path::append(rtlPath, std::string(stem) + ".sv");
+    auto ec = emitDebugSnapshot(module->getOperation(), irPath, true);
+    if (ec) return fail("cannot write feature MLIR: " + ec.message());
+    if (failed(goldengate::emitAllAnnotations(circuit, annotationPath, error)))
+      return fail("feature annotation output: " + error);
+    if (bindAutoCounterControl) {
+      llvm::SmallString<256> path(outputDir);
+      llvm::sys::path::append(path, std::string(stem) + ".h");
+      std::error_code headerError;
+      llvm::raw_fd_ostream stream(path, headerError);
+      if (headerError) return fail("cannot write AutoCounter control header: " + headerError.message());
+      stream << controlHeader;
+    }
+    if (multiThreadFAME5Models || bindAutoCounterHosts) {
+      if (failed(goldengate::emitSimulatorRTL(*module, firPath, rtlPath, error)))
+        return fail("bound feature RTL output: " + error);
+    } else {
+      // Constructor materialization does not yet bind these hosts into the
+      // target. Root a separate diagnostic circuit at each returned widget so
+      // lowering cannot silently discard its state as an unused helper.
+      for (auto [i, host] : llvm::enumerate(hosts)) {
+        OwningOpRef<ModuleOp> hostIR = cast<ModuleOp>(module->clone());
+        auto hostCircuit = *hostIR->getOps<CircuitOp>().begin();
+        hostCircuit.setName(host.getName());
+        llvm::SmallString<256> hostRTL(outputDir);
+        llvm::sys::path::append(hostRTL, std::string(stem) + "-" + std::to_string(i) + ".sv");
+        if (failed(goldengate::emitSimulatorRTL(*hostIR, firPath, hostRTL, error)))
+          return fail("AutoCounter widget RTL output: " + error);
+      }
+    }
+    llvm::outs() << "Materialized " << (multiThreadFAME5Models ? groups : hosts.size())
+                 << " feature modules in " << (multiThreadFAME5Models ? rtlPath : irPath) << '\n';
+    return 0;
+  }
+
+  if (threadFAME5Registers || threadFAME5Memories) {
+    unsigned threads = 0;
+    if (llvm::StringRef(argv[8]).getAsInteger(10, threads) || threads < 2)
+      return fail("FAME5 state threading requires at least two threads");
+    std::string error;
+    if (failed(goldengate::normalizeFAMEInput(*module, circuit, error)))
+      return fail("FAME5 state normalization: " + error);
+    FModuleOp selected;
+    for (auto m : circuit.getOps<FModuleOp>())
+      if (m.getName() == argv[7]) selected = m;
+    Value index;
+    if (selected)
+      for (unsigned p = 0; p < selected.getNumPorts(); ++p)
+        if (selected.getPortName(p) == argv[9]) index = selected.getArgument(p);
+    if (!selected || !index)
+      return fail("FAME5 state module or thread-index port not found");
+    auto result = threadFAME5Registers
+        ? goldengate::threadFAME5Registers(selected, threads, index, error)
+        : goldengate::threadFAME5Memories(selected, threads, index, error);
+    if (failed(result))
+      return fail("FAME5 state: " + error);
+    if (failed(mlir::verify(*module)))
+      return fail("FAME5 state produced invalid FIRRTL IR");
+    llvm::SmallString<256> irPath(outputDir), annotationPath(outputDir), rtlPath(outputDir);
+    auto stem = threadFAME5Registers ? "post-fame5-registers" : "post-fame5-memories";
+    llvm::sys::path::append(irPath, std::string(stem) + ".mlir");
+    llvm::sys::path::append(annotationPath, std::string(stem) + "-all.json");
+    llvm::sys::path::append(rtlPath, std::string(stem) + ".sv");
+    std::error_code ec = emitDebugSnapshot(module->getOperation(), irPath, true);
+    if (ec) return fail("cannot write FAME5 state MLIR: " + ec.message());
+    if (failed(goldengate::emitAllAnnotations(circuit, annotationPath, error)) ||
+        failed(goldengate::emitSimulatorRTL(*module, firPath, rtlPath, error)))
+      return fail("FAME5 state output: " + error);
+    llvm::outs() << "Banked " << (threadFAME5Registers ? "register" : "memory")
+                 << " state for " << threads << " threads in " << rtlPath
+                 << "; caller retains scheduling and grouping responsibility\n";
     return 0;
   }
 

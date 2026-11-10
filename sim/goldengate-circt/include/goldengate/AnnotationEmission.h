@@ -7,6 +7,11 @@
 #include <string>
 
 namespace goldengate {
+// Serialize compiler metadata with the same validated JSON attribute encoding
+// as retained annotations. Unsupported values fail before opening the file.
+mlir::LogicalResult emitJSONAttribute(mlir::Attribute value,
+                                     llvm::StringRef path,
+                                     std::string &error);
 // Emit the annotation attributes retained and retargeted by CIRCT's FAME
 // rewrite. This is the post-FAME annotation boundary consumed by later passes.
 mlir::LogicalResult emitFAMEAnnotations(circt::firrtl::CircuitOp circuit,

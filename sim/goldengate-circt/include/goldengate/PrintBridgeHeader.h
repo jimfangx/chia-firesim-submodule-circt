@@ -19,8 +19,12 @@ mlir::LogicalResult preparePrintBridgeDecoderHeader(
 // transport. Resolve addresses and stream indices from the live
 // allocation, validate the complete collection, and preserve IR/text on error.
 // The fragment uses print-bridge-decoders.h and the standard GET_* guards.
+// Optional peerMap receives the same validated CPU stream allocation as YAML;
+// Optional f2StreamProtocol receives the exact validated OutputFile annotation;
+// all caller outputs are preserved on error.
 mlir::LogicalResult preparePrintBridgeAllocatedHeader(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> hosts,
-    std::string &header, std::string &error);
+    std::string &header, std::string &error, std::string *peerMap = nullptr,
+    mlir::DictionaryAttr *f2StreamProtocol = nullptr);
 }

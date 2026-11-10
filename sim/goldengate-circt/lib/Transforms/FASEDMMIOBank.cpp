@@ -9,12 +9,10 @@
 // Annotations consumed/produced: none; retained constructor is inspected.
 // Analyses required: fragment port/map identity. No cached analysis is used;
 // existing model/channel/clock identities and module bodies are preserved.
-// Scope: default timing/histogram register profile at any supported positive
-// maxFlight; capacity changes occupancy widths, never the 21 UInt32 MCR words.
-// MMIO transport is separate.
+// Scope: default LatencyPipe/register and occupancy-histogram profile;
+// maxFlight sizes the request machinery, not this register catalog.
 #include "goldengate/FASEDMMIOBank.h"
 #include "goldengate/ControlAddressDecode.h"
-#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 using namespace mlir;
@@ -46,12 +44,11 @@ LogicalResult goldengate::addFASEDMMIOBank(CircuitOp circuit, std::string &error
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if(!inner || !raw)return reject("FASED MMIO bank needs a top and retained annotations");
-  if(!engine)return reject("FASED MMIO bank needs the mapped token engine");
-  // The mapped engine constructor remains authoritative. Request capacity sizes
-  // the producer counts, while Widget.attachIO binds the same UInt32 registers
-  // and fixed five-bin vectors for every default BaseConfig capacity.
-  unsigned limit,width;
-  if(failed(getFASEDRequestLimitProfile(circuit,limit,width,error)))return failure();
+  auto key=engine?engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"):DictionaryAttr();
+  auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
+  auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
+  if(!flight || flight.getValue().getBitWidth()>64 || flight.getInt()<=0)
+    return reject("FASED MMIO bank requires a positive 64-bit maxFlight constructor");
   ControlMMIOWidget registry;
   if(failed(deriveControlMMIORegistry(circuit,"FASEDMemoryTimingModel_0",modules,registry,error)))
     return failure();

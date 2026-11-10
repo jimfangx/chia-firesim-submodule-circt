@@ -26,6 +26,34 @@ bool hasPortAnnotations(FModuleOp module, unsigned port) {
          !cast<ArrayAttr>(annotations[port]).empty();
 }
 
+// Shared by the primitive gate rewrite and the atomic virtual-clock
+// constructor. Validate the external ABI before creating any host state.
+LogicalResult checkAbstractClockGateDefinition(CircuitOp circuit,
+                                               std::string &error) {
+  auto *existing = SymbolTable::lookupSymbolIn(circuit, "AbstractClockGate");
+  if (!existing) return success();
+  auto gate = dyn_cast<FExtModuleOp>(existing);
+  if (!gate || gate.getDefname() != "AbstractClockGate" ||
+      gate.getConvention() != Convention::Internal ||
+      !gate.getParameters().empty() || !gate.getLayers().empty() ||
+      gate.getNumPorts() != 3) {
+    error = "AbstractClockGate requires an unlayered external definition "
+            "with internal convention, matching defname and no parameters";
+    return failure();
+  }
+  const StringRef names[]{"I", "CE", "O"};
+  const Direction directions[]{Direction::In, Direction::In, Direction::Out};
+  auto *ctx = circuit.getContext();
+  const Type types[]{ClockType::get(ctx), UIntType::get(ctx, 1), ClockType::get(ctx)};
+  for (unsigned i = 0; i < 3; ++i)
+    if (gate.getPortName(i) != names[i] || gate.getPortType(i) != types[i] ||
+        gate.getPortDirection(i) != directions[i]) {
+      error = "AbstractClockGate requires I:Clock, CE:UInt<1>, O:Clock";
+      return failure();
+    }
+  return success();
+}
+
 llvm::StringRef removeCommonPrefix(llvm::StringRef name,
                                    llvm::StringRef channel) {
   while (!name.empty() && !channel.empty() && name.front() == channel.front()) {
@@ -37,7 +65,8 @@ llvm::StringRef removeCommonPrefix(llvm::StringRef name,
 
 LogicalResult rewriteMultiportInputChannel(
     const goldengate::TopHierarchy &hierarchy,
-    const goldengate::FAMETopChannelPort &channel, std::string &error) {
+    const goldengate::FAMETopChannelPort &channel, std::string &error,
+    bool rewriteModel) {
   const auto &binding = *channel.binding;
   auto top = hierarchy.top;
   auto modelModule = binding.portGroup->module;
@@ -67,14 +96,14 @@ LogicalResult rewriteMultiportInputChannel(
   llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
   std::set<unsigned> topPorts;
   for (unsigned modelPort : binding.instancePorts) {
-    auto modelName = model.getPortName(modelPort);
+    auto modelName = instance.getPortNameStr(modelPort);
     auto field = removeCommonPrefix(modelName, binding.portGroup->name);
     auto fieldIndex = payload.getElementIndex(field);
     if (field.empty() || !fieldIndex ||
         payload.getElements()[*fieldIndex].isFlip ||
         payload.getElements()[*fieldIndex].type !=
-            model.getPorts()[modelPort].type ||
-        hasPortAnnotations(model, modelPort)) {
+            instance.getResult(modelPort).getType() ||
+        (rewriteModel && hasPortAnnotations(model, modelPort))) {
       error = "FAME input bundle field does not match a model port";
       return failure();
     }
@@ -90,7 +119,7 @@ LogicalResult rewriteMultiportInputChannel(
       }
     if (!topPort || !topPorts.insert(*topPort).second ||
         top.getPortDirection(*topPort) != Direction::In ||
-        top.getPorts()[*topPort].type != model.getPorts()[modelPort].type ||
+        top.getPorts()[*topPort].type != instance.getResult(modelPort).getType() ||
         removeCommonPrefix(top.getPortName(*topPort), binding.globalName) !=
             field) {
       error = "FAME input bundle field has no matching top port";
@@ -99,8 +128,8 @@ LogicalResult rewriteMultiportInputChannel(
     if (failed(goldengate::collectFAMEWrapperPayloadMetadata(
             top, *topPort, channel.type, field, wrapperAnnotations,
             wrapperSymbols, error)) ||
-        failed(goldengate::collectFAMEPayloadSymbols(
-            model, modelPort, channel.type, field, modelSymbols, error)))
+        (rewriteModel && failed(goldengate::collectFAMEPayloadSymbols(
+            model, modelPort, channel.type, field, modelSymbols, error))))
       return failure();
     Value oldTop = top.getBodyBlock()->getArgument(*topPort);
     Value oldInstance = instance.getResult(modelPort);
@@ -128,11 +157,18 @@ LogicalResult rewriteMultiportInputChannel(
   }
 
   std::string modelName = binding.portGroup->name + "_sink";
+  bool matchedDefinition = false;
   for (const auto &port : model.getPorts())
     if (port.getName() == modelName) {
+      matchedDefinition = port.type == channel.type && port.direction == binding.portGroup->direction;
+      if (!rewriteModel) continue;
       error = "FAME model channel port already exists: " + modelName;
       return failure();
     }
+  if (!rewriteModel && !matchedDefinition) {
+    error = "shared FAME bundle definition does not match the instance channel ABI";
+    return failure();
+  }
   for (const auto &port : top.getPorts())
     if (port.getName() == channel.portName) {
       error = "FAME top channel port already exists: " + channel.portName;
@@ -160,6 +196,7 @@ LogicalResult rewriteMultiportInputChannel(
     });
     topInfo.sym = circt::hw::InnerSymAttr::get(context, wrapperSymbols);
   }
+  if (rewriteModel) {
   model.insertPorts({{modelInsert, modelInfo}});
   OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
   Value bits = body.create<SubfieldOp>(
@@ -173,6 +210,8 @@ LogicalResult rewriteMultiportInputChannel(
   for (const auto &leaf : leaves)
     eraseModel.set(leaf.modelPort + 1);
   model.erasePorts(eraseModel);
+
+  }
 
   top.insertPorts({{topInsert, topInfo}});
   Value newTop = top.getBodyBlock()->getArgument(topInsert);
@@ -221,12 +260,8 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
   auto modelModule = binding.portGroup->module;
   auto model = dyn_cast<FModuleOp>(modelModule.getOperation());
   auto instance = binding.instance;
-  if (binding.instancePorts.size() > 1 && !rewriteModel) {
-    error = "additional FAME instance rewrite requires a scalar channel";
-    return failure();
-  }
   if (binding.instancePorts.size() > 1)
-    return rewriteMultiportInputChannel(hierarchy, channel, error);
+    return rewriteMultiportInputChannel(hierarchy, channel, error, rewriteModel);
   if (!model || binding.portGroup->direction != Direction::In ||
       binding.instancePorts.size() != 1 ||
       instance->getParentOfType<FModuleOp>() != top) {
@@ -243,8 +278,11 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
     return failure();
   }
   std::string modelName = binding.portGroup->name + "_sink";
-  if ((!rewriteModel && (model.getPortName(modelPort) != modelName ||
-                         model.getPortType(modelPort) != channel.type)) ||
+  bool sharedDefinitionMatches = llvm::any_of(model.getPorts(), [&](const PortInfo &p) {
+    return p.getName() == modelName && p.type == channel.type &&
+           p.direction == binding.portGroup->direction;
+  });
+  if ((!rewriteModel && !sharedDefinitionMatches) ||
       (rewriteModel && model.getPortType(modelPort) != payloadType)) {
     error = "FAME scalar definition does not match the instance rewrite stage";
     return failure();
@@ -255,7 +293,7 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
         error = "FAME model channel port already exists: " + modelName;
         return failure();
       }
-  if (hasPortAnnotations(model, modelPort)) {
+  if (rewriteModel && hasPortAnnotations(model, modelPort)) {
     error = "FAME input port has annotations requiring a field transfer";
     return failure();
   }
@@ -665,24 +703,11 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
   // DefineAbstractClockGate in the Scala oracle defines one shared blackbox;
   // FAMETransformer creates an independent buffer instance for each domain.
   // Resolve and check an existing definition before mutating the model.
+  if (failed(checkAbstractClockGateDefinition(circuit, error)))
+    return failure();
   FExtModuleOp gate;
   if (auto *existing = SymbolTable::lookupSymbolIn(circuit, "AbstractClockGate")) {
-    gate = dyn_cast<FExtModuleOp>(existing);
-    if (!gate || gate.getDefname() != "AbstractClockGate" ||
-        gate.getConvention() != Convention::Internal ||
-        !gate.getParameters().empty() || !gate.getLayers().empty() ||
-        gate.getNumPorts() != ports.size()) {
-      error = "AbstractClockGate requires an unlayered external definition "
-              "with internal convention, matching defname and no parameters";
-      return failure();
-    }
-    for (auto [index, port] : llvm::enumerate(ports))
-      if (gate.getPortName(index) != port.name.getValue() ||
-          gate.getPortType(index) != port.type ||
-          gate.getPortDirection(index) != port.direction) {
-        error = "AbstractClockGate requires I:Clock, CE:UInt<1>, O:Clock";
-        return failure();
-      }
+    gate = cast<FExtModuleOp>(existing);
   } else {
     OpBuilder circuitBuilder(context);
     circuitBuilder.setInsertionPointToEnd(circuit.getBodyBlock());
@@ -716,10 +741,11 @@ LogicalResult goldengate::addFAMEClockGate(CircuitOp circuit, FModuleOp model,
   return success();
 }
 
-LogicalResult goldengate::removeFAMEVirtualClockPort(
-    CircuitOp circuit, FModuleOp model, llvm::StringRef modelClockName,
-    std::string &error) {
-  std::optional<unsigned> clockPort;
+namespace {
+LogicalResult analyzeVirtualClockRemoval(
+    CircuitOp circuit, FModuleOp model, StringRef modelClockName,
+    bool allowTargetUses, std::optional<unsigned> &clockPort,
+    SmallVectorImpl<InstanceOp> &instances, std::string &error) {
   auto ports = model.getPorts();
   for (unsigned i = 0; i < ports.size(); ++i)
     if (ports[i].getName() == modelClockName)
@@ -728,13 +754,12 @@ LogicalResult goldengate::removeFAMEVirtualClockPort(
       ports[*clockPort].direction != Direction::In ||
       !isa<ClockType>(ports[*clockPort].type) ||
       hasPortAnnotations(model, *clockPort) || ports[*clockPort].sym ||
-      !model.getBodyBlock()->getArgument(*clockPort).use_empty()) {
+      (!allowTargetUses && !model.getBodyBlock()->getArgument(*clockPort).use_empty())) {
     error = "virtual target clock must be an unused, unannotated, "
             "unsymbolized scalar input in the supplied circuit";
     return failure();
   }
 
-  SmallVector<InstanceOp> instances;
   {
     circt::igraph::InstanceGraph graph(circuit);
     auto *node = graph.lookup(model);
@@ -775,6 +800,18 @@ LogicalResult goldengate::removeFAMEVirtualClockPort(
     }
   }
 
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::removeFAMEVirtualClockPort(
+    CircuitOp circuit, FModuleOp model, llvm::StringRef modelClockName,
+    std::string &error) {
+  std::optional<unsigned> clockPort;
+  SmallVector<InstanceOp> instances;
+  if (failed(analyzeVirtualClockRemoval(circuit, model, modelClockName, false,
+                                        clockPort, instances, error)))
+    return failure();
   // Every use has been checked before changing any model or instance.
   for (auto instance : instances) {
     Value clock = instance.getResult(*clockPort);
@@ -801,6 +838,68 @@ LogicalResult goldengate::removeFAMEVirtualClockPort(
   removed.set(*clockPort);
   model.erasePorts(removed);
   return success();
+}
+
+std::optional<goldengate::FAMEHubClockControl>
+goldengate::constructFAMEVirtualClockControls(
+    CircuitOp circuit, FModuleOp model, StringRef modelClockName,
+    std::string &error) {
+  auto reject = [&](StringRef message) -> std::optional<FAMEHubClockControl> {
+    error = "FAME virtual clock controls: " + message.str();
+    return std::nullopt;
+  };
+  if (!model || model->getParentOp() != circuit.getOperation() ||
+      modelClockName.empty() || modelClockName == "hostClock")
+    return reject("missing model or original target clock identity");
+
+  Value hostClock, hostReset, finishing;
+  unsigned targetClocks = 0, finishingWires = 0;
+  for (unsigned i = 0; i < model.getNumPorts(); ++i) {
+    if (model.getPortDirection(i) != Direction::In) continue;
+    Value port = model.getArgument(i);
+    StringRef name = model.getPortName(i);
+    if (name == "hostClock") hostClock = port;
+    else if (isa<ClockType>(port.getType())) ++targetClocks;
+    if (name == "hostReset") hostReset = port;
+  }
+  model.walk([&](WireOp wire) {
+    if (wire.getName() == "targetCycleFinishing") {
+      finishing = wire.getResult();
+      ++finishingWires;
+    }
+  });
+  auto bit = UIntType::get(model.getContext(), 1);
+  if (targetClocks != 1 || !hostClock ||
+      !isa<ClockType>(hostClock.getType()) || !hostReset ||
+      hostReset.getType() != bit || !finishing || finishingWires != 1 ||
+      finishing.getType() != bit)
+    return reject("requires host controls, one finishing wire and one scalar target clock");
+
+  FAMEClockEnableIndex enables;
+  FAMEClockGateIndex gates;
+  if (failed(enables.collect(model, error)) || failed(gates.collect(model, error)))
+    return std::nullopt;
+  if (enables.lookup(modelClockName, false) || gates.lookup(modelClockName, false))
+    return reject("target clock already has native enable or gate state");
+  std::optional<unsigned> clockPort;
+  SmallVector<InstanceOp> instances;
+  if (failed(checkAbstractClockGateDefinition(circuit, error)) ||
+      failed(analyzeVirtualClockRemoval(circuit, model, modelClockName, true,
+                                         clockPort, instances, error)))
+    return std::nullopt;
+
+  // All rejections, including every shared-definition instance's clock
+  // metadata and wiring, precede mutation. Construction uses the same tagged
+  // state and gate primitives as hub domains; non-hubs receive no XDC hints.
+  if (failed(addFAMEClockEnable(model, modelClockName, {}, error)) ||
+      failed(addFAMEClockGate(circuit, model, modelClockName, error)) ||
+      failed(removeFAMEVirtualClockPort(circuit, model, modelClockName, error)))
+    return std::nullopt;
+  Value enabled = lookupFAMEClockEnable(model, modelClockName, error);
+  if (!enabled) return std::nullopt;
+  OpBuilder builder(model.getBodyBlock(), model.getBodyBlock()->begin());
+  Value one = builder.create<ConstantOp>(model.getLoc(), bit, APInt(1, 1));
+  return FAMEHubClockControl{modelClockName.str(), one, enabled};
 }
 
 LogicalResult goldengate::removeFAMETargetClockPort(
@@ -905,162 +1004,139 @@ LogicalResult goldengate::removeFAMETargetClockPort(
 LogicalResult goldengate::internalizeFAMEOutputClocks(
     FModuleOp top, FModuleOp model, llvm::StringRef instanceName,
     std::string &error) {
-  InstanceOp instance;
-  for (auto candidate : top.getOps<InstanceOp>())
-    if (candidate.getName() == instanceName &&
-        candidate.getModuleName() == model.getName()) {
-      if (instance) {
-        error = "FAME model instance is not unique";
-        return failure();
-      }
-      instance = candidate;
-    }
-  if (!instance || instance.getNumResults() != model.getNumPorts()) {
-    error = "FAME model instance has incompatible ports";
+  return internalizeFAMEOutputClocks(top, model,
+                                    ArrayRef<StringRef>{instanceName}, error);
+}
+
+LogicalResult goldengate::internalizeFAMEOutputClocks(
+    FModuleOp top, FModuleOp model, ArrayRef<StringRef> instanceNames,
+    std::string &error) {
+  auto reject = [&](const std::string &why) {
+    error = "FAME output clocks: " + why;
     return failure();
+  };
+  if (!top || !model || top->getParentOp() != model->getParentOp() ||
+      instanceNames.empty())
+    return reject("missing top, definition or complete instance list");
+  std::set<std::string> names;
+  SmallVector<InstanceOp> instances;
+  for (auto name : instanceNames) {
+    if (name.empty() || !names.insert(name.str()).second)
+      return reject("empty or repeated instance identity");
+    InstanceOp instance;
+    for (auto candidate : top.getOps<InstanceOp>())
+      if (candidate.getName() == name &&
+          candidate.getModuleName() == model.getName()) {
+        if (instance) return reject("instance identity is not unique");
+        instance = candidate;
+      }
+    if (!instance || instance.getNumResults() != model.getNumPorts())
+      return reject("model instance has incompatible ports: " + name.str());
+    instances.push_back(instance);
   }
 
   struct ClockOutput {
     unsigned modelPort;
-    unsigned topPort;
-    Operation *connection;
     circt::hw::InnerSymAttr symbol;
   };
+  struct ClockConnection {
+    unsigned topPort;
+    Operation *connection;
+  };
   SmallVector<ClockOutput> clocks;
+  SmallVector<ClockConnection> connections;
   std::set<unsigned> topPorts;
   for (unsigned modelPort = 0; modelPort < model.getNumPorts(); ++modelPort) {
     if (model.getPortDirection(modelPort) != Direction::Out ||
-        !isa<ClockType>(model.getPorts()[modelPort].type))
-      continue;
+        !isa<ClockType>(model.getPortType(modelPort))) continue;
     auto name = model.getPortName(modelPort);
-    std::optional<unsigned> topPort;
-    // ChannelExcision gives promoted clock aliases their instance prefix and
-    // source suffix. Resolve their identity from SSA rather than port spelling.
-    for (OpOperand &use : instance.getResult(modelPort).getUses()) {
-      auto strict = dyn_cast<StrictConnectOp>(use.getOwner());
-      auto ordinary = dyn_cast<ConnectOp>(use.getOwner());
-      Value source = strict ? strict.getSrc() : ordinary ? ordinary.getSrc() : Value();
-      Value destination = strict ? strict.getDest() : ordinary ? ordinary.getDest() : Value();
-      auto dest = dyn_cast_or_null<BlockArgument>(destination);
-      if (source != instance.getResult(modelPort) ||
-          !dest || dest.getOwner() != top.getBodyBlock() || topPort) {
-        error = "FAME output clock has nontrivial top wiring: " + name.str();
-        return failure();
-      }
-      topPort = dest.getArgNumber();
-    }
-    if (!topPort || !topPorts.insert(*topPort).second ||
-        top.getPortDirection(*topPort) != Direction::Out ||
-        top.getPorts()[*topPort].type != model.getPorts()[modelPort].type ||
-        instance.getPortNameStr(modelPort) != name ||
-        hasPortAnnotations(top, *topPort) ||
-        hasPortAnnotations(model, modelPort) || top.getPorts()[*topPort].sym ||
-        !cast<ArrayAttr>(instance.getPortAnnotationsAttr()[modelPort]).empty()) {
-      error = "FAME output clock metadata has no transfer policy: " +
-              name.str();
-      return failure();
-    }
+    if (hasPortAnnotations(model, modelPort))
+      return reject("model clock annotation has no transfer policy: " + name.str());
     auto symbol = model.getPorts()[modelPort].sym;
     if (symbol)
       for (auto property : symbol)
-        if (property.getFieldID() != 0) {
-          error = "FAME ground clock output symbol has a nonzero field ID";
-          return failure();
-        }
+        if (property.getFieldID() != 0)
+          return reject("ground clock output symbol has a nonzero field ID");
     for (auto &op : *model.getBodyBlock())
       if (auto localName = op.getAttrOfType<StringAttr>("name"))
-        if (localName.getValue() == name) {
-          error = "FAME output clock wire name collides with a declaration: " +
-                  name.str();
-          return failure();
-        }
-    Value topClock = top.getBodyBlock()->getArgument(*topPort);
-    Value instanceClock = instance.getResult(modelPort);
-    Operation *connection = nullptr;
-    for (OpOperand &use : instanceClock.getUses()) {
-      auto strict = dyn_cast<StrictConnectOp>(use.getOwner());
-      auto ordinary = dyn_cast<ConnectOp>(use.getOwner());
-      Value source = strict ? strict.getSrc() : ordinary ? ordinary.getSrc() : Value();
-      Value destination = strict ? strict.getDest() : ordinary ? ordinary.getDest() : Value();
-      if (source != instanceClock || destination != topClock || connection) {
-        error = "FAME output clock has nontrivial top wiring: " + name.str();
-        return failure();
+        if (localName.getValue() == name)
+          return reject("clock wire name collides with a declaration: " + name.str());
+    // Validate the complete cross product before changing the shared ABI.
+    // Each promoted alias still has its independent top output and metadata.
+    for (auto instance : instances) {
+      if (instance.getPortNameStr(modelPort) != name ||
+          instance.getResult(modelPort).getType() != model.getPortType(modelPort) ||
+          instance.getPortDirection(modelPort) != Direction::Out ||
+          !cast<ArrayAttr>(instance.getPortAnnotationsAttr()[modelPort]).empty())
+        return reject("instance clock metadata has no transfer policy: " + name.str());
+      Value instanceClock = instance.getResult(modelPort);
+      std::optional<unsigned> topPort;
+      Operation *connection = nullptr;
+      for (OpOperand &use : instanceClock.getUses()) {
+        auto strict = dyn_cast<StrictConnectOp>(use.getOwner());
+        auto ordinary = dyn_cast<ConnectOp>(use.getOwner());
+        Value source = strict ? strict.getSrc() : ordinary ? ordinary.getSrc() : Value();
+        Value destination = strict ? strict.getDest() : ordinary ? ordinary.getDest() : Value();
+        auto dest = dyn_cast_or_null<BlockArgument>(destination);
+        if (source != instanceClock || !dest ||
+            dest.getOwner() != top.getBodyBlock() || connection)
+          return reject("clock has nontrivial top wiring: " + name.str());
+        topPort = dest.getArgNumber();
+        connection = use.getOwner();
       }
-      connection = use.getOwner();
+      if (!topPort || !connection || !topPorts.insert(*topPort).second ||
+          top.getPortDirection(*topPort) != Direction::Out ||
+          top.getPortType(*topPort) != model.getPortType(modelPort) ||
+          hasPortAnnotations(top, *topPort) || top.getPorts()[*topPort].sym ||
+          !top.getArgument(*topPort).hasOneUse())
+        return reject("clock is not exclusively wired to an unannotated top port: " + name.str());
+      connections.push_back({*topPort, connection});
     }
-    if (!connection || !topClock.hasOneUse()) {
-      error = "FAME output clock is not exclusively wired to its top port: " +
-              name.str();
-      return failure();
-    }
-    clocks.push_back({modelPort, *topPort, connection, symbol});
+    clocks.push_back({modelPort, symbol});
   }
-  if (clocks.empty())
-    return success();
-
-  // The model interface can only be changed here when this is its only use.
-  // Refresh the instance graph after the rewrite, like port/symbol analyses.
-  if (top->getParentOp() != model->getParentOp()) {
-    error = "FAME output clock model is outside the wrapper circuit";
-    return failure();
-  }
+  if (clocks.empty()) return success();
+  // No definition use may retain the old port layout. Validate nested and
+  // omitted instances through the real instance graph, not only top names.
   {
     circt::igraph::InstanceGraph graph(top->getParentOp());
     auto *node = graph.lookup(model);
-    if (!node) {
-      error = "FAME output clock model is absent from the instance graph";
-      return failure();
-    }
+    if (!node) return reject("model is absent from the instance graph");
     unsigned uses = 0;
     for (auto *record : node->uses()) {
-      if (record->getInstance<InstanceOp>() != instance) {
-        error = "FAME output clock model has another instance";
-        return failure();
-      }
+      if (!llvm::is_contained(instances, record->getInstance<InstanceOp>()))
+        return reject("complete definition instance list is required");
       ++uses;
     }
-    if (uses != 1) {
-      error = "FAME output clock model instance is absent from the graph";
-      return failure();
-    }
+    if (uses != instances.size()) return reject("instance graph coverage differs");
   }
 
-  // SFC's unusedOutputsAsWires preserves model-body connects to these
-  // former clock ports. The MLIR block argument has the same role until the
-  // replacement wire takes over all its uses.
   OpBuilder declarations(model.getBodyBlock(), model.getBodyBlock()->begin());
-  llvm::BitVector eraseModel(model.getNumPorts());
-  llvm::BitVector eraseTop(top.getNumPorts());
-  llvm::BitVector eraseInstance(instance.getNumResults());
+  llvm::BitVector eraseModel(model.getNumPorts()), eraseTop(top.getNumPorts());
   for (auto &clock : clocks) {
-    auto name = model.getPortName(clock.modelPort);
     auto wire = declarations.create<WireOp>(
-        model.getLoc(), model.getPorts()[clock.modelPort].type, name);
-    if (clock.symbol)
-      wire.setInnerSymAttr(clock.symbol);
-    model.getBodyBlock()->getArgument(clock.modelPort)
-        .replaceAllUsesWith(wire.getResult());
-    clock.connection->erase();
+        model.getLoc(), model.getPortType(clock.modelPort),
+        model.getPortName(clock.modelPort));
+    if (clock.symbol) wire.setInnerSymAttr(clock.symbol);
+    model.getArgument(clock.modelPort).replaceAllUsesWith(wire.getResult());
     eraseModel.set(clock.modelPort);
-    eraseTop.set(clock.topPort);
-    eraseInstance.set(clock.modelPort);
   }
-
-  OpBuilder builder(instance);
-  InstanceOp replacement = instance.erasePorts(builder, eraseInstance);
-  for (auto attr : instance->getAttrs())
-    if (attr.getName() != "portNames" &&
-        attr.getName() != "portDirections" &&
-        attr.getName() != "portAnnotations")
-      replacement->setAttr(attr.getName(), attr.getValue());
-  unsigned replacementPort = 0;
-  for (unsigned oldPort = 0; oldPort < instance.getNumResults(); ++oldPort) {
-    if (eraseInstance.test(oldPort))
-      continue;
-    instance.getResult(oldPort).replaceAllUsesWith(
-        replacement.getResult(replacementPort++));
+  for (auto &connection : connections) {
+    connection.connection->erase();
+    eraseTop.set(connection.topPort);
   }
-  instance.erase();
+  for (auto instance : instances) {
+    OpBuilder builder(instance);
+    auto replacement = instance.erasePorts(builder, eraseModel);
+    for (auto attr : instance->getAttrs())
+      if (attr.getName() != "portNames" && attr.getName() != "portDirections" &&
+          attr.getName() != "portAnnotations")
+        replacement->setAttr(attr.getName(), attr.getValue());
+    unsigned next = 0;
+    for (unsigned old = 0; old < instance.getNumResults(); ++old)
+      if (!eraseModel.test(old))
+        instance.getResult(old).replaceAllUsesWith(replacement.getResult(next++));
+    instance.erase();
+  }
   model.erasePorts(eraseModel);
   top.erasePorts(eraseTop);
   return success();

@@ -24,11 +24,12 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false,uint64_t maxFlight=10) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false,uint64_t maxFlight=10, unsigned baseCapacity=16) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressCreditsWrapper\" { firrtl.module @GGFASEDIngressCreditsWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();(*c.getOps<FModuleOp>().begin()).erase();
   OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=uint(1);
-  unsigned depth=std::min<uint64_t>(16,maxFlight), cw=llvm::Log2_64_Ceil(depth+1);
+  if (baseCapacity != 16) c->setAttr("goldengate.fasedBaseCapacity", b.getI64IntegerAttr(baseCapacity));
+  unsigned depth=std::min<uint64_t>(baseCapacity,maxFlight), cw=llvm::Log2_64_Ceil(depth+1);
   if(mode==23)cw++;
   auto status=BundleType::get(&ctx,{{b.getStringAttr("awValue"),false,uint(cw)},{b.getStringAttr("wValue"),false,uint(cw)},{b.getStringAttr("awEmpty"),false,bit},{b.getStringAttr("wEmpty"),false,bit},{b.getStringAttr("writeReqDone"),mode==8,bit}});
   SmallVector<PortInfo> ports{{b.getStringAttr("hostClock"),ClockType::get(&ctx),Direction::In},{b.getStringAttr("fased_ingress_reset"),bit,Direction::Out},{b.getStringAttr("fased_ingress_ar_enq_fire"),bit,Direction::Out},{b.getStringAttr("fased_ingress_credits"),status,Direction::Out},{b.getStringAttr("other"),uint(8),Direction::Out}};
@@ -71,9 +72,9 @@ struct Interpreter {
   std::map<std::string, std::string> links;
   std::map<std::string, APInt> memo;
   llvm::DenseMap<Value, APInt> state;
-  Interpreter(FModuleOp m) : module(m) {
+  Interpreter(FModuleOp m, unsigned expectedDepth = 0) : module(m) {
     for(auto ram:m.getOps<MemOp>()) {
-      require(ram.getDepth()>=1 && ram.getDepth()<=16 && ram.getDataType()==UIntType::get(m.getContext(),1,false) && ram.getReadLatency()==0 && ram.getWriteLatency()==1 && ram.getRuw()==RUWAttr::Undefined && ram.getNumResults()==2 && ram.getPortKind(size_t(0))==MemOp::PortKind::Read && ram.getPortKind(size_t(1))==MemOp::PortKind::Write,"bank RAM geometry differs");
+      require(expectedDepth>=1 && ram.getDepth()==expectedDepth && ram.getDataType()==UIntType::get(m.getContext(),1,false) && ram.getReadLatency()==0 && ram.getWriteLatency()==1 && ram.getRuw()==RUWAttr::Undefined && ram.getNumResults()==2 && ram.getPortKind(size_t(0))==MemOp::PortKind::Read && ram.getPortKind(size_t(1))==MemOp::PortKind::Write,"bank RAM geometry differs");
       auto name=key(ram.getResult(0));rams.emplace(name,ram);
       for(unsigned j=0;j<ram.getDepth();++j)memory[name].push_back(APInt(1,j&1));
     }
@@ -92,6 +93,9 @@ struct Interpreter {
     for (auto r : m.getOps<RegOp>()) state[r.getResult()] = APInt(width(r.getResult()), 0);
   }
   unsigned width(Value v) { return *cast<UIntType>(v.getType()).getWidth(); }
+  unsigned addressWidth(MemOp ram) {
+    return std::max(1u, llvm::Log2_64_Ceil(ram.getDepth()));
+  }
   std::string key(Value v) {
     if (auto f = v.getDefiningOp<SubfieldOp>()) return key(f.getInput()) + "." + f.getFieldName().str();
     if (auto f = v.getDefiningOp<SubindexOp>()) return key(f.getInput()) + "[" + std::to_string(f.getIndex()) + "]";
@@ -103,7 +107,7 @@ struct Interpreter {
     if (memo.count(k)) return memo.at(k).zextOrTrunc(w);
     for(auto [name,ram]:rams)if(k==name+".data") {
       require(read(name+".en",1).getBoolValue(),"async read disabled");
-      return memory.at(name).at(read(name+".addr",4).getZExtValue()).zextOrTrunc(w);
+      return memory.at(name).at(read(name+".addr",addressWidth(ram)).getZExtValue()).zextOrTrunc(w);
     }
     if (drivers.count(k)) return eval(drivers.at(k)).zextOrTrunc(w);
     if (links.count(k)) return read(links.at(k), w);
@@ -150,17 +154,17 @@ struct Interpreter {
     for(auto [name,ram]:rams) {
       auto writer=key(ram.getResult(1));
       if(read(writer+".en",1).getBoolValue()&&read(writer+".mask",1).getBoolValue())
-        memory[name].at(read(writer+".addr",4).getZExtValue())=read(writer+".data",1);
+        memory[name].at(read(writer+".addr",addressWidth(ram)).getZExtValue())=read(writer+".data",1);
     }
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx,bool selected,uint64_t maxFlight) {
-  unsigned depth=std::min<uint64_t>(16,maxFlight);
+void behavior(MLIRContext &ctx,bool selected,uint64_t maxFlight, unsigned baseCapacity = 16) {
+  unsigned depth=std::min<uint64_t>(baseCapacity,maxFlight);
   std::string helperName="GGFASEDIngressOrder"+std::to_string(2*depth);
-  auto root=fixture(ctx,0,selected,maxFlight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+  auto root=fixture(ctx,0,selected,maxFlight,baseCapacity);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDIngressOrder(c,error)),error);require(succeeded(verify(*root)),"invalid order IR");
-  Interpreter sim(named(c,helperName));require(sim.rams.size()==2&&sim.state.size()==8,"bank RAM/state missing");
+  Interpreter sim(named(c,helperName),depth);require(sim.rams.size()==2&&sim.state.size()==8,"bank RAM/state missing");
   std::deque<bool> bank[2];bool ep=false,dp=false;std::mt19937_64 random(213);
   unsigned cycles=0,dual=0,partial=0,full=0,empty=0,resetWrites=0,wraps=0;
   auto cycle=[&](bool reset,bool av,bool bv,bool ready){
@@ -173,7 +177,7 @@ void behavior(MLIRContext &ctx,bool selected,uint64_t maxFlight) {
     dual+=ap&&bp;partial+=av&&bv&&(ap!=bp);full+=(!ar&&av)||(!br&&bv);empty+=ready&&!dv;
     auto expectedMemory=sim.memory;
     for(auto [name,ram]:sim.rams){auto w=sim.key(ram.getResult(1));if(sim.read(w+".en",1).getBoolValue()){
-      auto address=sim.read(w+".addr",4).getZExtValue();require(address<depth,"pointer escaped bank depth");
+      auto address=sim.read(w+".addr",sim.addressWidth(ram)).getZExtValue();require(address<depth,"pointer escaped bank depth");
       expectedMemory[name][address]=sim.read(w+".data",1);resetWrites+=reset;wraps+=!reset&&address==depth-1;}}
     if(pop)bank[dp].pop_front();if(ap)bank[ai].push_back(true);if(bp)bank[bi].push_back(false);
     if(ap!=bp)ep=!ep;if(pop)dp=!dp;if(reset){bank[0].clear();bank[1].clear();ep=dp=false;}
@@ -223,7 +227,27 @@ int main(int argc,char **argv){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,cir
     std::error_code ec;llvm::raw_fd_ostream out(argv[2],ec);require(!ec,"cannot export order helper");isolated.print(out);out<<'\n';out.close();isolated.erase();return 0;
   }
   require(argc==1,"usage: goldengate-fased-ingress-order-test [ingress-order.mlir helper.mlir]");
-  for(bool selected:{false,true}){
+  for (bool selected : {false, true}) {
+      OpBuilder b(&ctx);
+      for (Attribute bad : {Attribute(b.getStringAttr("32")), Attribute(b.getF64FloatAttr(32)),
+          Attribute(b.getI64IntegerAttr(0)), Attribute(b.getI64IntegerAttr(-1)),
+          Attribute(b.getI64IntegerAttr(20)),
+          Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 32)))}) {
+        auto root = fixture(ctx, 0, selected);
+        auto c = *root->getOps<CircuitOp>().begin();
+        c->setAttr("goldengate.fasedBaseCapacity", bad);
+        std::string before, after, error;
+        { llvm::raw_string_ostream out(before); root->print(out); }
+        require(failed(goldengate::addFASEDIngressOrder(c, error)) && !error.empty(), "invalid functional capacity accepted");
+        { llvm::raw_string_ostream out(after); root->print(out); }
+        require(before == after, "invalid functional capacity mutated IR");
+      }
+    }
+    for (bool selected : {false, true}) {
+      for (uint64_t flight : {uint64_t(10), uint64_t(20), uint64_t(64)})
+        behavior(ctx, selected, flight, 32);
+    }
+    for(bool selected:{false,true}){
     for(uint64_t flight:{uint64_t(1),uint64_t(2),uint64_t(3),uint64_t(8),uint64_t(10),uint64_t(16),uint64_t(20),uint64_t(INT64_MAX)})behavior(ctx,selected,flight);
     rejection(ctx,selected,10);rejection(ctx,selected,16);
   }

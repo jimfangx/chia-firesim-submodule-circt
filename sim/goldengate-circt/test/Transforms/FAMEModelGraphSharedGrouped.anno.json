@@ -1,0 +1,221 @@
+[
+  {
+    "class": "midas.passes.fame.FAMEHostClock",
+    "target": "~Top|Top>hostClock"
+  },
+  {
+    "class": "midas.passes.fame.FAMEHostReset",
+    "target": "~Top|Top>hostReset"
+  },
+  {
+    "class": "midas.passes.fame.FAMETransformAnnotation",
+    "target": "~Top|Hub"
+  },
+  {
+    "class": "midas.passes.fame.FAMETransformAnnotation",
+    "target": "~Top|Worker"
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelPortsAnnotation",
+    "localName": "tick",
+    "ports": [
+      "~Top|Hub>c0",
+      "~Top|Hub>c1"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "tick",
+    "channelInfo": {
+      "class": "midas.passes.fame.TargetClockChannel",
+      "clockInfo": [
+        {
+          "name": "d0",
+          "multiplier": 1,
+          "divisor": 2
+        },
+        {
+          "name": "d1",
+          "multiplier": 1,
+          "divisor": 3
+        }
+      ],
+      "perClockMFMR": [
+        2,
+        3
+      ]
+    },
+    "sinks": [
+      "~Top|Top>c0",
+      "~Top|Top>c1"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelPortsAnnotation",
+    "localName": "data",
+    "clockPort": "~Top|Hub>alias0",
+    "ports": [
+      "~Top|Hub>data"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelPortsAnnotation",
+    "localName": "right",
+    "clockPort": "~Top|Hub>alias1",
+    "ports": [
+      "~Top|Hub>right"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelPortsAnnotation",
+    "localName": "out",
+    "clockPort": "~Top|Hub>alias0",
+    "ports": [
+      "~Top|Hub>out"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelPortsAnnotation",
+    "localName": "otherOut",
+    "clockPort": "~Top|Hub>alias1",
+    "ports": [
+      "~Top|Hub>otherOut"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelPortsAnnotation",
+    "localName": "w1_input",
+    "ports": [
+      "~Top|Worker>w1_input_a",
+      "~Top|Worker>w1_input_b"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelPortsAnnotation",
+    "localName": "w1_output",
+    "ports": [
+      "~Top|Worker>w1_output_a",
+      "~Top|Worker>w1_output_b"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "h_input",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias0",
+    "sinks": [
+      "~Top|Top>h_data"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "h_right",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias1",
+    "sinks": [
+      "~Top|Top>h_right"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "h_output",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias0",
+    "sources": [
+      "~Top|Top>h_out"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "h_alias0",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 1
+    },
+    "clock": "~Top|Top>h_alias1",
+    "sources": [
+      "~Top|Top>h_other0"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "h_alias1",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias1",
+    "sources": [
+      "~Top|Top>h_other1"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "w0_output",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias1",
+    "sources": [
+      "~Top|Top>w0_output_a",
+      "~Top|Top>w0_output_b"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "w1_output",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias1",
+    "sources": [
+      "~Top|Top>w1_output_a",
+      "~Top|Top>w1_output_b"
+    ]
+  },
+  {
+    "class": "firrtl.transforms.DontTouchAnnotation",
+    "target": "~Top|Worker>state"
+  },
+  {
+    "class": "firrtl.transforms.DontTouchAnnotation",
+    "target": "~Top|Top>h_data"
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "w0_input",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias1",
+    "sinks": [
+      "~Top|Top>w0_input_a",
+      "~Top|Top>w0_input_b"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "w1_input",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>h_alias1",
+    "sinks": [
+      "~Top|Top>w1_input_a",
+      "~Top|Top>w1_input_b"
+    ]
+  }
+]

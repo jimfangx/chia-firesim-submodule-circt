@@ -8,8 +8,6 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
-#include <cstdint>
-#include <limits>
 #include <functional>
 #include <stdexcept>
 using namespace mlir;
@@ -32,7 +30,7 @@ unsigned globalWord(unsigned j,unsigned k,unsigned order) {
   unsigned local=order==1?lengths[j]-1-k:order==2?(3*k+1)%lengths[j]:k;
   return starts[j]+local;
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned order=0,bool selected=false,int64_t flight=10) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned order=0,bool selected=false,unsigned maxFlight=10) {
   auto root=parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGFASEDHistogramsWrapper" {
     firrtl.module @GGFASEDTokenEngine() {} firrtl.module @GGFASEDHistogramsWrapper() {} } })",&ctx);
   require(bool(root),"fixture parse failed");auto c=*root->getOps<CircuitOp>().begin();
@@ -58,7 +56,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned order=0,bool selected=fa
   }
   b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDHistogramsWrapper"),ConventionAttr::get(&ctx,Convention::Internal),ports);
   named(c,"GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
-      b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(flight))}))}));
+      b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI32IntegerAttr(maxFlight))}))}));
   SmallVector<Attribute> annos;
   auto add=[&](std::string old,std::string expected){annos.push_back(b.getDictionaryAttr({
       b.getNamedAttr("class",b.getStringAttr("test.Annotation")),b.getNamedAttr("target",b.getStringAttr(old)),
@@ -104,8 +102,8 @@ std::string valueName(Value v,FModuleOp top) {
   auto inst=v.getDefiningOp<InstanceOp>();require(bool(inst),"unexpected wiring value");
   return inst.getName().str()+"."+cast<StringAttr>(inst.getPortNames()[cast<OpResult>(v).getResultNumber()]).getValue().str();
 }
-void mapping(MLIRContext &ctx,unsigned order,bool selected,int64_t flight) {
-  auto root=fixture(ctx,order,selected,flight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void mapping(MLIRContext &ctx,unsigned order,bool selected,unsigned maxFlight) {
+  auto root=fixture(ctx,order,selected,maxFlight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDMMIOBank(c,error)),error);
   require(succeeded(verify(*root)),"assembled bank failed verifier");
   auto top=named(c,selected?"GGSelectedPrintFASEDMMIOWrapper":"GGFASEDMMIOWrapper");require(top.getNumPorts()==4,"fragments were not consumed");
@@ -134,7 +132,7 @@ void mapping(MLIRContext &ctx,unsigned order,bool selected,int64_t flight) {
   for(auto a:annos){auto row=cast<DictionaryAttr>(a);require(row.getAs<StringAttr>("target")==row.getAs<StringAttr>("expected"),"lane annotation target transfer failed");}
 }
 void rejection(MLIRContext &ctx,bool selected) {
-  for(unsigned mode=0;mode<99;++mode) {
+  for(unsigned mode=0;mode<97;++mode) {
     auto root=fixture(ctx,0,selected);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
     auto top=named(c,selected?"GGSelectedPrintFASEDHistogramsWrapper":"GGFASEDHistogramsWrapper"),engine=named(c,"GGFASEDTokenEngine");
     if(mode==0)c.setName("WrongTop");if(mode==1)c->removeAttr("rawAnnotations");
@@ -185,13 +183,14 @@ void rejection(MLIRContext &ctx,bool selected) {
     }
     if(mode==93)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
         b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getIntegerAttr(b.getIntegerType(128),APInt(128,10)))}))}));
-    if(mode==94)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
-        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(-1))}))}));
-    if(mode==95)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",
-        b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getStringAttr("20"))}))}));
-    if(mode==96)engine.erase();
-    if(mode==97)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({}));
-    if(mode==98)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",b.getStringAttr("invalid"))}));
+    if(mode>=94) {
+      Attribute flight = mode==94 ? Attribute(b.getI64IntegerAttr(-1)) :
+          mode==95 ? Attribute(b.getStringAttr("10")) : Attribute();
+      NamedAttrList edge;
+      if(flight)edge.set("maxFlight",flight);
+      engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({
+          b.getNamedAttr("axi4Edge",edge.getDictionary(&ctx))}));
+    }
     std::string before,after;llvm::raw_string_ostream original(before);root->print(original);original.flush();std::string error;
     require(failed(goldengate::addFASEDMMIOBank(c,error)) && !error.empty(),"invalid fragment accepted");
     llvm::raw_string_ostream updated(after);root->print(updated);updated.flush();require(before==after,"rejected bank mutated IR");
@@ -246,9 +245,9 @@ int main(int argc,char **argv){try{MLIRContext ctx;ctx.loadDialect<FIRRTLDialect
   require(argc==1||argc==3,"usage: goldengate-fased-mmio-bank-test [boundary.mlir probe.mlir]");
   if(argc==3){exportProduction(ctx,argv[1],argv[2]);return 0;}
   for(bool selected:{false,true}) {
-    for(int64_t flight:{int64_t(1),int64_t(9),int64_t(10),int64_t(16),int64_t(20),std::numeric_limits<int64_t>::max()})
-      for(unsigned order=0;order<3;++order)mapping(ctx,order,selected,flight);
+    for(unsigned maxFlight:{1u,2u,8u,9u,10u,16u,32u,64u})
+      for(unsigned order=0;order<3;++order)mapping(ctx,order,selected,maxFlight);
     rejection(ctx,selected);
   }
-  llvm::outs()<<"FASED MMIO bank: legacy/selected profiles, six capacities and three lane orders each, 21 lanes, six strobe routes, 59 annotation targets and 198 atomic rejections passed\n";return 0;
+  llvm::outs()<<"FASED MMIO bank: legacy/selected profiles, eight maxFlight values, three lane orders each, 21 lanes, six strobe routes, 59 annotation targets and 194 atomic rejections passed\n";return 0;
 }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}}

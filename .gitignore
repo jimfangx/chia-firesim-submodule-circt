@@ -16,3 +16,7 @@ scala-doc-env.sh
 vivado*.log
 vivado*.jou
 __pycache__
+# Generated local manager configuration and verification workloads
+/deploy/config_*.yaml
+/deploy/workloads/chia-*
+*.pyc

@@ -3,5 +3,6 @@
 #include "circt/Dialect/FIRRTL/FIRRTLOps.h"
 #include <string>
 namespace goldengate {
-mlir::LogicalResult assembleF1Shim(circt::firrtl::CircuitOp circuit, std::string &error);
+mlir::LogicalResult assembleF1Shim(circt::firrtl::CircuitOp circuit, std::string &error,
+                                   bool isF2 = false);
 }

@@ -2,7 +2,7 @@
 // Requires: active uninstantiated GGFASEDHostOutstandingWrapper and retained
 // annotations, a positive constructor maxFlight and exact request/reset ports.
 // Consumes: fased_ingress; copies its qualified reset and every other port.
-// Produces: a min(16, maxFlight)-entry AW FIFO with 69-bit payload; W/AR enqueue boundaries and
+// Produces: a platform/constructor-sized AW FIFO with 69-bit payload; W/AR enqueue boundaries and
 // raw AW dequeue before host ordering/credit policy. Host-clocked async RAM.
 // Enqueue predicates exclude their own queue ready. Reset flushes pointer state
 // but does not clear memory or suppress a pre-edge accepted memory write.
@@ -10,6 +10,7 @@
 // Mutates: hierarchy/ports; preserves annotation classes/constructor/clocks.
 // Oracle: IngressUnit.scala 66-69, 81-86, 126-137 and SFC Queue_7.
 #include "goldengate/FASEDIngressAWQueue.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
@@ -26,14 +27,10 @@ LogicalResult goldengate::addFASEDIngressAWQueue(CircuitOp circuit, std::string 
   FModuleOp inner, engine;
   for (auto m : circuit.getOps<FModuleOp>())
     if (m.getName() == "GGFASEDTokenEngine") engine = m;
-  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
-  auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
-  auto maxFlight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!maxFlight || maxFlight.getValue().getBitWidth() > 64 || maxFlight.getInt() <= 0)
-    return reject("FASED AW ingress needs a positive 64-bit maxFlight constructor");
-  // WithDefaultMemModel supplies 16 write slots, narrowed by the AXI edge.
-  // IngressModuleParameters sets ingressAWQdepth to this effective maxWrites.
-  const uint64_t depth = std::min<uint64_t>(16, maxFlight.getInt());
+  if (!engine) return reject("FASED ingress requires the mapped token engine");
+  unsigned depth, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, depth, countWidth, error)))
+    return failure();
   const unsigned pointerWidth = std::max(1u, llvm::Log2_64_Ceil(depth));
   const std::string queueName = "GGFASEDIngressAWQueue" + std::to_string(depth);
   for (auto m : circuit.getOps<FModuleLike>()) {

@@ -20,6 +20,7 @@
 #include "goldengate/CPUManagedStreamHeader.h"
 #include "goldengate/FASEDHeader.h"
 #include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/AutoCounterBridge.h"
 #include "goldengate/AnnotationClasses.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -75,8 +76,9 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
       if (!host) return reject("Rocket Print driver host is missing from the live catalog");
       hosts.push_back(host);
     }
-    std::string fragment, decoder;
-    if (failed(preparePrintBridgeAllocatedHeader(*staged, hosts, fragment, error)) ||
+    std::string fragment, decoder, peerMap;
+    DictionaryAttr f2StreamProtocol;
+    if (failed(preparePrintBridgeAllocatedHeader(*staged, hosts, fragment, error, &peerMap, &f2StreamProtocol)) ||
         failed(preparePrintBridgeDecoderHeader(*staged, hosts, decoder, error))) return failure();
     // Embed the decoder under GET_INCLUDES so the ordinary OutputFile emitter
     // needs no special filename or driver build dependency. This header is
@@ -104,6 +106,77 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
       output.set("goldengate.printBridgeHeader", b.getBoolAttr(true)); row = output.getDictionary(circuit.getContext());
     }
     if (!found) return reject("Rocket Print driver interface header is missing");
+    updated.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::OutputFile)),
+        b.getNamedAttr("fileSuffix", b.getStringAttr(".peer2peer.const.yaml")),
+        b.getNamedAttr("body", b.getStringAttr(peerMap))}));
+    if (f2StreamProtocol) {
+      for (auto attr : updated) {
+        auto d = dyn_cast<DictionaryAttr>(attr);
+        if (d && d.getAs<StringAttr>("class") == AnnotationClasses::OutputFile &&
+            d.getAs<StringAttr>("fileSuffix") == ".f2-cpu-stream-protocol.json")
+          return reject("Rocket Print driver has duplicate F2 ACK protocol output");
+      }
+      updated.push_back(f2StreamProtocol);
+    }
+    staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(updated));
+  }
+  // CSV widgets share this same allocation and constructor header. Discover
+  // their original binding registry after platform wrapping; never allocate
+  // a second CSV-only address space or infer addresses from widget indices.
+  SmallVector<FModuleOp> csvHosts;
+  if (failed(discoverBoundAutoCounterBridgeHosts(*staged, csvHosts, error))) return failure();
+  if (!csvHosts.empty()) {
+    SmallVector<FModuleOp> printHosts;
+    if (printWrapper) {
+      auto rows = printWrapper->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+      for (auto attr : rows) {
+        auto row = cast<DictionaryAttr>(attr);
+        auto name = row.getAs<StringAttr>("hostModule");
+        for (auto module : staged->getOps<FModuleOp>())
+          if (module.getName() == name) printHosts.push_back(module);
+      }
+    }
+    auto info = csvHosts.front()->getAttrOfType<DictionaryAttr>("goldengate.autocounterHost");
+    unsigned addressBits = info.getAs<IntegerAttr>("addressBits").getInt();
+    SmallVector<ControlMMIOWidget> widgets;
+    SmallVector<ControlMMIORegion> regions;
+    if (failed(allocateRocketControlMMIORegions(*staged, addressBits, printHosts, widgets, regions, error)))
+      return failure();
+    FModuleOp decoder;
+    for (auto module : staged->getOps<FModuleOp>())
+      if (module.getName() == "GGControlAddressDecode") decoder = module;
+    auto actual = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
+    if (!actual || actual.size() != regions.size())
+      return reject("Rocket CSV driver requires the complete shared MMIO allocation");
+    for (auto [i, region] : llvm::enumerate(regions)) {
+      auto row = dyn_cast<DictionaryAttr>(actual[i]);
+      if (!row || row.getAs<StringAttr>("name") != region.name ||
+          !row.getAs<IntegerAttr>("start") || row.getAs<IntegerAttr>("start").getInt() != int64_t(region.start) ||
+          !row.getAs<IntegerAttr>("size") || row.getAs<IntegerAttr>("size").getInt() != int64_t(region.size) ||
+          !row.getAs<IntegerAttr>("slave") || row.getAs<IntegerAttr>("slave").getInt() != int64_t(i))
+        return reject("Rocket CSV driver allocation differs from the live platform");
+    }
+    std::string fragment;
+    if (failed(prepareAutoCounterBridgeHeader(*staged, csvHosts, regions, fragment, error))) return failure();
+    OpBuilder b(circuit.getContext());
+    auto annotations = staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> updated(annotations.begin(), annotations.end());
+    bool found = false;
+    for (auto &attr : updated) {
+      auto row = dyn_cast<DictionaryAttr>(attr);
+      if (!row || row.getAs<StringAttr>("class") != AnnotationClasses::OutputFile ||
+          row.getAs<StringAttr>("fileSuffix") != ".const.h") continue;
+      auto body = row.getAs<StringAttr>("body");
+      if (found || !body || row.get("goldengate.autocounterBridgeHeader"))
+        return reject("Rocket CSV driver requires one unextended AutoCounter header");
+      found = true;
+      NamedAttrList next(row);
+      next.set("body", b.getStringAttr(body.getValue().str() + fragment));
+      next.set("goldengate.autocounterBridgeHeader", b.getBoolAttr(true));
+      attr = next.getDictionary(circuit.getContext());
+    }
+    if (!found) return reject("Rocket CSV driver interface header is missing");
     staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(updated));
   }
   // SimpleNIC constructor stream indices belong to the shared CPU catalog.

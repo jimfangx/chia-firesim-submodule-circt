@@ -3,6 +3,7 @@
 // binding with CIRCT FIRRTL operations. Requests and tracker enqueues fire
 // together, even under independent slave and response-tracker backpressure.
 #include "goldengate/ControlReadDispatch.h"
+#include "goldengate/ControlPortWidth.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
@@ -27,6 +28,9 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
   if(!inner||!raw||!regions||regions.empty()||regions.size()>63||!bindings)
     return reject("control read dispatch needs retained annotations, write bindings and one to 63 decoded regions");
   const unsigned slaveCount=regions.size();
+  auto addressWidth = controlPortWidth(inner, "ctrl_decode_ar_addr");
+  if (!addressWidth) return reject("control read dispatch requires a typed AR address boundary");
+  const unsigned addressBits = *addressWidth;
   const unsigned targetWidth=llvm::Log2_64_Ceil(slaveCount+1);
   SmallVector<StringAttr> regionNames;
   std::set<std::string> uniqueNames;
@@ -47,7 +51,7 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
   auto token=[&](FIRRTLBaseType bits){return bundle({{b.getStringAttr("ready"),true,uint(1)},
     {b.getStringAttr("valid"),false,uint(1)},{b.getStringAttr("bits"),false,bits}});};
   struct Field {const char *name;unsigned width;};
-  const Field addressFields[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
+  const Field addressFields[]{{"addr",addressBits},{"len",8},{"size",3},{"burst",2},{"lock",1},
     {"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
   SmallVector<BundleType::BundleElement> address;
   for(auto f:addressFields)address.push_back({b.getStringAttr(f.name),false,uint(f.width)});
@@ -68,14 +72,14 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
   }
   struct Required {const char *name;unsigned width;Direction dir;};
   const Required required[]{{"ctrl_decode_ar_route",slaveCount,Direction::Out},
-    {"ctrl_decode_ar_target",targetWidth,Direction::Out},{"ctrl_decode_ar_addr",25,Direction::In},
+    {"ctrl_decode_ar_target",targetWidth,Direction::Out},{"ctrl_decode_ar_addr",addressBits,Direction::In},
     {"ctrl_error_ar_ready",1,Direction::Out},{"ctrl_error_ar_valid",1,Direction::In},
-    {"ctrl_error_ar_bits_addr",25,Direction::In},{"ctrl_error_ar_bits_len",8,Direction::In},
+    {"ctrl_error_ar_bits_addr",addressBits,Direction::In},{"ctrl_error_ar_bits_len",8,Direction::In},
     {"ctrl_error_ar_bits_id",12,Direction::In}};
   for(auto r:required) {
     auto it=old.find(r.name);
     if(it==old.end()||inner.getPorts()[it->second].type!=uint(r.width)||inner.getPorts()[it->second].direction!=r.dir)
-      return reject("control read dispatch requires catalog-sized U250 decoder/error boundaries");
+      return reject("control read dispatch requires catalog-sized decoder/error boundaries");
   }
   for(auto a:bindings) {
     auto d=dyn_cast<DictionaryAttr>(a);auto name=d?d.getAs<StringAttr>("name"):StringAttr();

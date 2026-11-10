@@ -28,6 +28,21 @@ constructFAMEHubClockControls(circt::firrtl::CircuitOp circuit,
                              llvm::ArrayRef<FAMEHubClockDomain> domains,
                              std::string &error);
 
+// Construct SFC's non-hub VirtualClockChannel controls after host controls and
+// data channelization. Require one remaining scalar target input Clock besides
+// hostClock. Validate host controls, finishing, existing gate ABI/identities and
+// every instance's removable clock wiring before mutation. Buffer constant one,
+// gate original target state, and erase the scalar clock at every instance.
+// Returns raw constant-one and buffered enable operands; optional associated
+// channel clocks still determine input fired reset (Some=one, None=zero).
+// Consumes/produces no retained annotations or XDC. Invalidates hierarchy/port
+// analyses and state scans. Parents' clock sources and unrelated metadata stay.
+std::optional<FAMEHubClockControl>
+constructFAMEVirtualClockControls(circt::firrtl::CircuitOp circuit,
+                                 circt::firrtl::FModuleOp model,
+                                 llvm::StringRef modelClockName,
+                                 std::string &error);
+
 // Generated host state is identified by its original model clock, independent
 // of declaration uniquing/renaming. Requires a module body; consumes/produces
 // no annotations and does not mutate IR. Recollect after state creation.

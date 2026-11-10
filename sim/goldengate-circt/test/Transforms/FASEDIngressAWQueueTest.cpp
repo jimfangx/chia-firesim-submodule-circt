@@ -98,7 +98,7 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false, uint64_t maxFlight = 10) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool selected = false, uint64_t maxFlight = 10, unsigned baseCapacity = 16) {
   std::string text = R"(module {
     firrtl.circuit "GGFASEDHostOutstandingWrapper" {
       firrtl.module @GGFASEDHostOutstandingWrapper(
@@ -129,6 +129,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
   auto root = parseSourceString<ModuleOp>(text, &context);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin(); OpBuilder b(&context);
   auto inner = *c.getOps<FModuleOp>().begin();
+  if (baseCapacity != 16) c->setAttr("goldengate.fasedBaseCapacity", b.getI64IntegerAttr(baseCapacity));
   if (variant == 10) { b.setInsertionPointToStart(inner.getBodyBlock()); b.create<InstanceOp>(c.getLoc(), inner, "used"); }
   if (variant == 11) { b.setInsertionPointToEnd(c.getBodyBlock()); b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDIngressAW"), ConventionAttr::get(&context, Convention::Internal), SmallVector<PortInfo>{}); }
   SmallVector<Attribute> annos;
@@ -153,16 +154,16 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
     engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({b.getNamedAttr("axi4Edge", badEdge)}));
   }
   if (variant == 22) {
-    b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDIngressAWQueue" + std::to_string(std::min<uint64_t>(16, maxFlight))),
+    b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGFASEDIngressAWQueue" + std::to_string(std::min<uint64_t>(baseCapacity, maxFlight))),
         ConventionAttr::get(&context, Convention::Internal), SmallVector<PortInfo>{});
   }
   if (variant != 12) c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
-void behavior(MLIRContext &context, bool selected, uint64_t maxFlight) {
-  auto root = fixture(context, 0, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void behavior(MLIRContext &context, bool selected, uint64_t maxFlight, unsigned baseCapacity = 16) {
+  auto root = fixture(context, 0, selected, maxFlight, baseCapacity); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDIngressAWQueue(c, error)), error);
   require(succeeded(verify(*root)), "queue IR verification failed");
-  const unsigned depth = std::min<uint64_t>(16, maxFlight);
+  const unsigned depth = std::min<uint64_t>(baseCapacity, maxFlight);
   Interpreter sim(named(c, "GGFASEDIngressAWQueue" + std::to_string(depth)), depth); std::deque<APInt> expected;
   std::mt19937_64 random(209);
   unsigned pushes = 0, pops = 0, fullBlocked = 0, emptyBlocked = 0, resetWrites = 0, simultaneous = 0, wraps = 0, cycles = 0;
@@ -285,8 +286,8 @@ struct GateInterpreter {
     state = std::move(next);
   }
 };
-void gates(MLIRContext &context, bool selected, uint64_t maxFlight) {
-  auto root = fixture(context, 0, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+void gates(MLIRContext &context, bool selected, uint64_t maxFlight, unsigned baseCapacity = 16) {
+  auto root = fixture(context, 0, selected, maxFlight, baseCapacity); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDIngressAWQueue(c, error)), error);
   GateInterpreter sim(named(c, "GGFASEDIngressAW")); auto fifo = *sim.module.getOps<InstanceOp>().begin();
   std::mt19937_64 rng(209);
@@ -347,6 +348,26 @@ void rejection(MLIRContext &ctx, bool selected, uint64_t maxFlight) {
 int main(int argc, char **argv) {
   MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
+    if (argc == 5 && llvm::StringRef(argv[1]) == "--fixture") {
+      const uint64_t maxFlight = std::stoull(argv[2]);
+      const unsigned baseCapacity = std::stoul(argv[3]);
+      auto root = fixture(ctx, 0, false, maxFlight, baseCapacity);
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      std::string error;
+      require(succeeded(goldengate::addFASEDIngressAWQueue(circuit, error)), error);
+      require(succeeded(verify(*root)), "functional fixture boundary invalid");
+      const std::string symbol = "GGFASEDIngressAWQueue" + std::to_string(std::min<uint64_t>(baseCapacity, maxFlight));
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr(symbol));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper = cast<FModuleOp>(b.insert(named(circuit, symbol)->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)), "exported functional fixture invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[4], ec);
+      require(!ec, "cannot export functional fixture"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
     if (argc == 3) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
       require(bool(root) && succeeded(verify(*root)), "production AW boundary invalid");
@@ -368,6 +389,26 @@ int main(int argc, char **argv) {
       out.close(); isolated.erase(); return 0;
     }
     require(argc == 1, "usage: goldengate-fased-ingress-aw-test [ingress-aw.mlir helpers.mlir]");
+    for (bool selected : {false, true}) {
+      OpBuilder b(&ctx);
+      for (Attribute bad : {Attribute(b.getStringAttr("32")), Attribute(b.getF64FloatAttr(32)),
+          Attribute(b.getI64IntegerAttr(0)), Attribute(b.getI64IntegerAttr(-1)),
+          Attribute(b.getI64IntegerAttr(20)),
+          Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 32)))}) {
+        auto root = fixture(ctx, 0, selected);
+        auto c = *root->getOps<CircuitOp>().begin();
+        c->setAttr("goldengate.fasedBaseCapacity", bad);
+        std::string before, after, error;
+        { llvm::raw_string_ostream out(before); root->print(out); }
+        require(failed(goldengate::addFASEDIngressAWQueue(c, error)) && !error.empty(), "invalid functional capacity accepted");
+        { llvm::raw_string_ostream out(after); root->print(out); }
+        require(before == after, "invalid functional capacity mutated IR");
+      }
+    }
+    for (bool selected : {false, true}) {
+      for (uint64_t flight : {uint64_t(10), uint64_t(20), uint64_t(64)})
+        behavior(ctx, selected, flight, 32);
+    }
     for (bool selected : {false, true})
       for (uint64_t maxFlight : {uint64_t(1), uint64_t(2), uint64_t(3), uint64_t(8), uint64_t(10), uint64_t(16), uint64_t(20), uint64_t(INT64_MAX)}) {
         behavior(ctx, selected, maxFlight); gates(ctx, selected, maxFlight); rejection(ctx, selected, maxFlight);

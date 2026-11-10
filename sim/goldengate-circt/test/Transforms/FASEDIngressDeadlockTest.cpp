@@ -18,16 +18,17 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false, uint64_t maxFlight=10) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false, uint64_t maxFlight=10, unsigned baseCapacity=16) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressIssueWrapper\" { firrtl.module @GGFASEDIngressIssueWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse");
   auto c=*root->getOps<CircuitOp>().begin();(*c.getOps<FModuleOp>().begin()).erase();
   if (selected) c.setName("GGSelectedPrintFASEDIngressIssueWrapper");
   OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());
+  if (baseCapacity != 16) c->setAttr("goldengate.fasedBaseCapacity", b.getI64IntegerAttr(baseCapacity));
   auto bit=UIntType::get(&ctx,1,false); auto clock=ClockType::get(&ctx);
   auto token=BundleType::get(&ctx,{{b.getStringAttr("ready"),true,bit},
       {b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,bit}});
-  const unsigned depth=std::min<uint64_t>(16,maxFlight);
+  const unsigned depth=std::min<uint64_t>(baseCapacity,maxFlight);
   const unsigned countWidth=llvm::Log2_64_Ceil(depth+1)+(mode==24);
   auto credits=BundleType::get(&ctx,{{b.getStringAttr("awValue"),false,UIntType::get(&ctx,countWidth,false)},
       {b.getStringAttr("wValue"),false,UIntType::get(&ctx,countWidth,false)},
@@ -96,8 +97,8 @@ struct Eval {
     throw std::runtime_error("unsupported predicate");
   }
 };
-void behavior(MLIRContext &ctx, bool selected, uint64_t maxFlight) {
-  auto root=fixture(ctx,0,selected,maxFlight);auto c=*root->getOps<CircuitOp>().begin();
+void behavior(MLIRContext &ctx, bool selected, uint64_t maxFlight, unsigned baseCapacity = 16) {
+  auto root=fixture(ctx,0,selected,maxFlight,baseCapacity);auto c=*root->getOps<CircuitOp>().begin();
   auto raw=c->getAttr("rawAnnotations");auto top=named(c,c.getName());auto oldPorts=top.getPorts();
   std::string error;require(succeeded(goldengate::addFASEDIngressDeadlock(c,error)),error);
   require(succeeded(verify(*root)),"invalid deadlock IR");
@@ -187,6 +188,26 @@ int main(int argc, char **argv) {
       out.close(); isolated.erase(); return 0;
     }
     require(argc == 1, "usage: goldengate-fased-ingress-deadlock-test [deadlock.mlir helpers.mlir]");
+    for (bool selected : {false, true}) {
+      OpBuilder b(&ctx);
+      for (Attribute bad : {Attribute(b.getStringAttr("32")), Attribute(b.getF64FloatAttr(32)),
+          Attribute(b.getI64IntegerAttr(0)), Attribute(b.getI64IntegerAttr(-1)),
+          Attribute(b.getI64IntegerAttr(20)),
+          Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 32)))}) {
+        auto root = fixture(ctx, 0, selected);
+        auto c = *root->getOps<CircuitOp>().begin();
+        c->setAttr("goldengate.fasedBaseCapacity", bad);
+        std::string before, after, error;
+        { llvm::raw_string_ostream out(before); root->print(out); }
+        require(failed(goldengate::addFASEDIngressDeadlock(c, error)) && !error.empty(), "invalid functional capacity accepted");
+        { llvm::raw_string_ostream out(after); root->print(out); }
+        require(before == after, "invalid functional capacity mutated IR");
+      }
+    }
+    for (bool selected : {false, true}) {
+      for (uint64_t flight : {uint64_t(10), uint64_t(20), uint64_t(64)})
+        behavior(ctx, selected, flight, 32);
+    }
     for (bool selected : {false, true}) {
       for (uint64_t flight : {uint64_t(1),uint64_t(2),uint64_t(3),uint64_t(8),
           uint64_t(10),uint64_t(16),uint64_t(20),uint64_t(std::numeric_limits<int64_t>::max())})

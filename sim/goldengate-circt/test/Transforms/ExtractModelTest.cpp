@@ -8,6 +8,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
+#include <set>
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
@@ -99,6 +100,43 @@ void run(MLIRContext &context) {
   circuit->setAttr("rawAnnotations", b.getArrayAttr({topLabel, port}));
   require(succeeded(goldengate::extractModels(circuit, promoted, error)) &&
           promoted == 0 && dump(*root) == after, "already-top models are complete");
+
+  // The enabled production platform retains the selector while promoting its
+  // corresponding model. SFC fans both identities through every parent use.
+  auto threaded = parseSourceString<ModuleOp>(fixture, &context);
+  auto threadedCircuit = *threaded->getOps<CircuitOp>().begin();
+  auto selector = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::EnableModelMultiThreading)),
+      b.getNamedAttr("target", b.getStringAttr("~Top|Parent/ram:Ram"))});
+  threadedCircuit->setAttr("rawAnnotations", b.getArrayAttr({model, selector, port}));
+  error.clear();
+  require(succeeded(goldengate::extractModels(threadedCircuit, promoted, error)) &&
+          promoted == 3 && succeeded(verify(*threaded)), "threading selector promotion: " + error);
+  std::set<std::string> peerTargets, selectedTargets;
+  threadedCircuit.walk([&](InstanceOp instance) {
+    if (instance.getModuleName() == "Ram" &&
+        instance->getParentOfType<FModuleOp>().getName() == "Top")
+      peerTargets.insert("~Top|Top/" + instance.getName().str() + ":Ram");
+  });
+  for (Attribute attr : threadedCircuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    Annotation annotation(attr);
+    if (annotation.isClass(goldengate::AnnotationClasses::EnableModelMultiThreading))
+      selectedTargets.insert(annotation.getMember<StringAttr>("target").getValue().str());
+    else
+      require(attr == port, "unexpected retained annotation after selector promotion");
+  }
+  require(peerTargets.size() == 4 && peerTargets == selectedTargets,
+          "threading selector lost one-to-many promoted instance identity");
+  auto malformed = parseSourceString<ModuleOp>(fixture, &context);
+  auto malformedCircuit = *malformed->getOps<CircuitOp>().begin();
+  auto fieldSelector = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::EnableModelMultiThreading)),
+      b.getNamedAttr("target", b.getStringAttr("~Top|Parent/ram:Ram>r.data"))});
+  malformedCircuit->setAttr("rawAnnotations", b.getArrayAttr({model, fieldSelector}));
+  auto malformedBefore = dump(*malformed);
+  require(failed(goldengate::extractModels(malformedCircuit, promoted, error)) &&
+          promoted == 0 && dump(*malformed) == malformedBefore,
+          "field-qualified threading selection was accepted or mutated IR");
 
   // An analog leaf is unsupported even when it is nested in a bundle.
   // Detect it before removing the selected instance or adding parent ports.

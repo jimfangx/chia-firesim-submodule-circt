@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/CPUStreamQueue.h"
+#include "goldengate/CPUStreamWrite.h"
 #include "goldengate/NICCPUStreamQueues.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
@@ -9,6 +10,7 @@
 #include "mlir/Parser/Parser.h"
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
+#include <algorithm>
 using namespace mlir;
 using namespace circt::firrtl;
 using goldengate::CPUStreamSourcePort;
@@ -19,7 +21,7 @@ static FModuleOp named(CircuitOp c, llvm::StringRef name) {
   throw std::runtime_error("missing module " + name.str());
 }
 static std::string dump(Operation *op) { std::string s; llvm::raw_string_ostream out(s); op->print(out); return s; }
-static OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned banks = 1, bool nic = true) {
+static OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned banks = 1, unsigned nics = 1) {
   auto root = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGNICPacketAdaptersWrapper" {
     firrtl.module @GGNICPacketAdaptersWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
       in %nic_from_host_stream: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<512>>,
@@ -36,6 +38,19 @@ static OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned banks = 1, bool 
     unsigned n = top.getNumPorts();
     top.insertPorts({{n, PortInfo(b.getStringAttr("tracerv_stream" + suffix), token, Direction::Out)},
         {n, PortInfo(b.getStringAttr("tracerv_stream_count" + suffix), UIntType::get(&ctx,13), Direction::Out)}});
+  }
+  if (nics > 1) {
+    SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end());
+    names[2] = b.getStringAttr("nic0_from_host_stream");
+    names[3] = b.getStringAttr("nic0_to_host_stream");
+    top.setPortNames(names);
+    for (unsigned widget = 1; widget < nics; ++widget) {
+      unsigned n = top.getNumPorts(); auto prefix = "nic" + std::to_string(widget);
+      top.insertPorts({{n, PortInfo(b.getStringAttr(prefix + "_from_host_stream"), token, Direction::In)},
+          {n, PortInfo(b.getStringAttr(prefix + "_to_host_stream"), token, Direction::Out)}});
+      b.setInsertionPointToEnd(top.getBodyBlock());
+      b.create<ConnectOp>(c.getLoc(), top.getArgument(n+1), top.getArgument(n));
+    }
   }
   b.setInsertionPointToEnd(top.getBodyBlock());
   b.create<ConnectOp>(c.getLoc(),top.getArgument(3),top.getArgument(2));
@@ -54,11 +69,22 @@ static OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned banks = 1, bool 
     b.create<ConnectOp>(c.getLoc(),top.getArgument(port),q.getResult(3));
     b.create<StrictConnectOp>(c.getLoc(),top.getArgument(port+1),q.getResult(4));
   }
-  c->setAttr("rawAnnotations",b.getArrayAttr({b.getDictionaryAttr({
+  SmallVector<Attribute> annotations, bindings;
+  for (unsigned widget = 0; widget < nics; ++widget) {
+    annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class",b.getStringAttr("firesim.lib.bridgeutils.BridgeIOAnnotation")),
+        b.getNamedAttr("widgetClass",b.getStringAttr("firechip.goldengateimplementations.SimpleNICBridgeModule"))}));
+    auto prefix = nics == 1 ? "nic" : "nic" + std::to_string(widget);
+    bindings.push_back(b.getDictionaryAttr({b.getNamedAttr("widget", b.getI64IntegerAttr(widget)),
+        b.getNamedAttr("fromHostStream", b.getStringAttr(prefix + "_from_host_stream")),
+        b.getNamedAttr("toHostStream", b.getStringAttr(prefix + "_to_host_stream"))}));
+  }
+  for (unsigned i=0;i<banks;++i) annotations.push_back(b.getDictionaryAttr({
       b.getNamedAttr("class",b.getStringAttr("firesim.lib.bridgeutils.BridgeIOAnnotation")),
-      b.getNamedAttr("widgetClass",b.getStringAttr("firechip.goldengateimplementations.SimpleNICBridgeModule"))})}));
-  if (!nic) c->setAttr("rawAnnotations",b.getArrayAttr({}));
-  std::string error; if (nic) require(succeeded(goldengate::addNICCPUStreamQueues(c,error)),error);
+      b.getNamedAttr("widgetClass",b.getStringAttr("firechip.goldengateimplementations.TracerVBridgeModule"))}));
+  c->setAttr("rawAnnotations",b.getArrayAttr(annotations));
+  top->setAttr("goldengate.nicPacketBindings", b.getArrayAttr(bindings));
+  std::string error; if (nics) require(succeeded(goldengate::addNICCPUStreamQueues(c,error)),error);
   // Exercise incoming and outgoing discovery across an additional wrapper.
   top = named(c,c.getName()); b.setInsertionPointToEnd(c.getBodyBlock());
   auto outer = b.create<FModuleOp>(c.getLoc(),b.getStringAttr("CatalogTop"),top.getConventionAttr(),top.getPorts());
@@ -84,6 +110,93 @@ int main(int argc, char **argv) {
     require(counts.size()==3 && counts[0].streamName==sources[0].streamName && counts[0].countBits==12 &&
       counts[1].streamName==sources[1].streamName && counts[1].countBits==13 &&
       counts[2].streamName==sinks[0].streamName && counts[2].countBits==12,"source then sink counts");
+    // All widget directions have distinct live queue paths. NIC sources precede
+    // TracerV sources, then the count bank appends NIC sinks in widget order.
+    for (unsigned traces : {1u,4u}) {
+      auto multi=fixture(ctx,traces,2); auto mc=*multi->getOps<CircuitOp>().begin();
+      SmallVector<CPUStreamSourcePort> ms,mk; SmallVector<CPUStreamCountPort> mr;
+      auto saved=dump(multi->getOperation());
+      require(succeeded(goldengate::deriveCPUStreamPorts(mc,ms,mk,mr,error)),error);
+      require(dump(multi->getOperation())==saved && ms.size()==traces+2 && mk.size()==2 && mr.size()==traces+4,
+          "two-widget catalog read-only/sizes");
+      for(unsigned widget=0;widget<2;++widget) {
+        auto prefix="SIMPLENICBRIDGEMODULE_"+std::to_string(widget);
+        require(ms[widget].streamName==prefix+"_to_cpu_stream" &&
+            mk[widget].streamName==prefix+"_from_cpu_stream" &&
+            mr[widget].streamName==ms[widget].streamName &&
+            mr[traces+2+widget].streamName==mk[widget].streamName,"two-widget source/sink/count order");
+      }
+      require(succeeded(goldengate::addCPUStreamRead(mc,ms,error)),error);
+      require(succeeded(goldengate::addCPUStreamWrite(mc,mk,error)),error);
+      require(succeeded(goldengate::addCPUStreamCountBank(mc,mr,error)),error);
+      require(succeeded(verify(*multi)),"two-widget duplex/count composition");
+      auto src=named(mc,"GGCPUStreamRead")->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+      auto sink=named(mc,"GGCPUStreamWrite")->getAttrOfType<ArrayAttr>("goldengate.sinkStreams");
+      require(src.size()==traces+2 && sink.size()==2,"two-widget allocated streams");
+      for(unsigned i=0;i<src.size();++i)
+        require(cast<DictionaryAttr>(src[i]).getAs<IntegerAttr>("bufferBaseAddress").getInt()==int64_t(i)*524288,
+            "two-widget read windows");
+      for(unsigned i=0;i<sink.size();++i)
+        require(cast<DictionaryAttr>(sink[i]).getAs<IntegerAttr>("bufferBaseAddress").getInt()==int64_t(i)*262144,
+            "two-widget independent write windows");
+    }
+    // All six class interleavings of two NICs and two TracerVs preserve
+    // SFC ListMap/filter order, including TracerV-before-NIC and N/T/N/T.
+    std::vector<unsigned> order{0,0,1,1};
+    do {
+      auto mixed=fixture(ctx,2,2);auto mc=*mixed->getOps<CircuitOp>().begin();
+      auto raw=mc->getAttrOfType<ArrayAttr>("rawAnnotations");OpBuilder b(&ctx);
+      SmallVector<Attribute> reordered;unsigned nic=0,tracer=0;
+      for(auto kind:order)reordered.push_back(raw[kind?2+tracer++:nic++]);
+      mc->setAttr("rawAnnotations",b.getArrayAttr(reordered));
+      SmallVector<CPUStreamSourcePort> ms,mk;SmallVector<CPUStreamCountPort> mr;
+      auto saved=dump(mixed->getOperation());
+      require(succeeded(goldengate::deriveCPUStreamPorts(mc,ms,mk,mr,error)),error);
+      require(dump(mixed->getOperation())==saved && ms.size()==4 && mk.size()==2 && mr.size()==6,
+          "interleaved catalog changed IR or cardinality");
+      nic=0;tracer=0;
+      for(unsigned i=0;i<order.size();++i) {
+        auto expected=order[i]?"TRACERVBRIDGEMODULE_"+std::to_string(tracer++):
+            "SIMPLENICBRIDGEMODULE_"+std::to_string(nic++);
+        require(ms[i].streamName==expected+"_to_cpu_stream" && mr[i].streamName==ms[i].streamName,
+            "annotation-ordered source/count allocation");
+      }
+      for(unsigned i=0;i<2;++i)require(mr[4+i].streamName==mk[i].streamName,"source then sink count order");
+      require(succeeded(goldengate::addCPUStreamRead(mc,ms,error)),error);
+      auto allocated=named(mc,"GGCPUStreamRead")->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+      for(unsigned i=0;i<4;++i)require(cast<DictionaryAttr>(allocated[i]).getAs<StringAttr>("name").getValue()==ms[i].streamName &&
+          cast<DictionaryAttr>(allocated[i]).getAs<IntegerAttr>("bufferBaseAddress").getInt()==int64_t(i)*524288,
+          "interleaved read window identities");
+    } while(std::next_permutation(order.begin(),order.end()));
+    // A retained constructor/live-queue mismatch must not publish any prefix.
+    {
+      auto bad=fixture(ctx,2,2);auto bc=*bad->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
+      auto raw=bc->getAttrOfType<ArrayAttr>("rawAnnotations");
+      bc->setAttr("rawAnnotations",b.getArrayAttr(raw.getValue().drop_back()));auto saved=dump(bad->getOperation());
+      require(failed(goldengate::deriveCPUStreamPorts(bc,sources,sinks,counts,error)) &&
+          dump(bad->getOperation())==saved && sources.size()==2 && sinks.size()==1 && counts.size()==3,
+          "constructor mismatch published partial catalog");
+    }
+    for (unsigned badMode=0;badMode<3;++badMode) {
+      auto bad=fixture(ctx,1,2);auto bc=*bad->getOps<CircuitOp>().begin();
+      auto queues=named(bc,"GGNICCPUStreamQueuesWrapper");InstanceOp first,last;
+      for(auto inst:queues.getOps<InstanceOp>()) {
+        if(inst.getName()=="SIMPLENICBRIDGEMODULE_0_to_cpu_stream_outgoingQueueIO_q") first=inst;
+        if(inst.getName()=="SIMPLENICBRIDGEMODULE_1_to_cpu_stream_outgoingQueueIO_q") last=inst;
+      }
+      require(first&&last,"two-widget queue fixtures");OpBuilder b(&ctx);
+      if(badMode==0) for(auto op:queues.getOps<StrictConnectOp>())
+        if(op.getSrc()==last.getResult(4)) op->setOperand(1,first.getResult(4));
+      if(badMode==1) {NamedAttrList attrs(last->getAttrOfType<DictionaryAttr>("goldengate.streamParameters"));
+        attrs.set("name",b.getStringAttr("SIMPLENICBRIDGEMODULE_0_to_cpu_stream"));
+        last->setAttr("goldengate.streamParameters",attrs.getDictionary(&ctx));}
+      if(badMode==2) for(auto op:queues.getOps<ConnectOp>())
+        if(op.getSrc()==last.getResult(3)) op->setOperand(1,first.getResult(3));
+      auto saved=dump(bad->getOperation());
+      require(failed(goldengate::deriveCPUStreamPorts(bc,sources,sinks,counts,error)) &&
+          dump(bad->getOperation())==saved && sources.size()==2 && sinks.size()==1 && counts.size()==3,
+          "late widget corruption published partial catalog");
+    }
     for (unsigned mode=0;mode<4;++mode) {
       auto bad=fixture(ctx); auto bc=*bad->getOps<CircuitOp>().begin(); auto top=named(bc,"GGNICCPUStreamQueuesWrapper");
       InstanceOp incoming,outgoing;

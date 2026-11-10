@@ -6,8 +6,9 @@
 // readiness. Read=true and write=false, read precedes write on dual enqueue.
 // Host issue policy will consume the dequeue. Enqueue readiness is observable
 // but does not gate already accepted requests, matching the Scala ingress.
-// Two min(16,maxFlight)-entry asynchronous one-bit RAM banks; reset flushes pointers only.
+// Two platform/constructor-sized asynchronous one-bit RAM banks; reset flushes pointers only.
 #include "goldengate/FASEDIngressOrder.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
@@ -29,17 +30,10 @@ LogicalResult goldengate::addFASEDIngressOrder(CircuitOp circuit,std::string &er
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if(!inner||!engine||!raw)return reject("FASED ingress order needs top, engine and annotations");
-  auto key=engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
-  auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
-  auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
-  if(!flight || flight.getValue().getBitWidth()>64 || flight.getInt()<=0)
-    return reject("FASED ingress order needs a positive 64-bit maxFlight constructor");
-  // WithDefaultMemModel supplies sixteen slots each for reads and writes;
-  // FASEDMemoryTimingModelConfig narrows both by the AXI edge. DualQueue splits
-  // their sum evenly between banks. Counter status includes the saturation value.
-  const unsigned depth=std::min<uint64_t>(16,flight.getInt());
+  unsigned depth, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, depth, countWidth, error)))
+    return failure();
   const unsigned pointerWidth=std::max(1u,llvm::Log2_64_Ceil(depth));
-  const unsigned countWidth=llvm::Log2_64_Ceil(depth+1);
   const std::string helperName="GGFASEDIngressOrder"+std::to_string(2*depth);
   for(auto m:circuit.getOps<FModuleLike>())if(m.getModuleName()==helperName)
     return reject("FASED ingress order helper already exists");

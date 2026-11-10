@@ -9,9 +9,14 @@
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
+#include "llvm/ADT/ScopeExit.h"
+#include "llvm/Support/FileSystem.h"
+#include "llvm/Support/JSON.h"
+#include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+#include <limits>
 #include <set>
 #include <stdexcept>
 using namespace mlir;
@@ -77,6 +82,137 @@ std::set<std::string> lines(StringRef body) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();OpBuilder b(&ctx);std::string error;
+    {
+      // Real annotation payloads include nested constructor data, escaped
+      // source text and large inline blackboxes. JSON borrowing must retain
+      // their values, preserve filtering, and never reuse a previous boundary.
+      llvm::SmallString<256> directory;
+      require(!llvm::sys::fs::createUniqueDirectory("goldengate-annotations", directory),
+              "annotation temporary directory");
+      auto cleanup = llvm::make_scope_exit([&] { llvm::sys::fs::remove_directories(directory); });
+      auto root = fixture(ctx);auto c = *root->getOps<CircuitOp>().begin();
+      std::string body = "\"quoted\"\\path\n\t\r";
+      body.append(1024 * 1024, 'x');body.push_back('\0');body += u8"λ";
+      auto data = b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::BridgeIO)),
+          b.getNamedAttr("body", b.getStringAttr(body)),
+          b.getNamedAttr("empty", b.getArrayAttr({b.getArrayAttr({}), b.getDictionaryAttr({})})),
+          b.getNamedAttr("limits", b.getArrayAttr({
+              b.getI64IntegerAttr(std::numeric_limits<int64_t>::min()),
+              b.getI64IntegerAttr(std::numeric_limits<int64_t>::max()),
+              b.getF64FloatAttr(-0.0)})),
+          b.getNamedAttr("nested", b.getArrayAttr({b.getUnitAttr(), b.getBoolAttr(true),
+              b.getI64IntegerAttr(-42), b.getF64FloatAttr(0.125),
+              b.getDictionaryAttr({b.getNamedAttr(u8"κ\\\"", b.getStringAttr(u8"λ\n"))})}))});
+      c->setAttr("rawAnnotations", b.getArrayAttr({data,
+          b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Preserved"))})}));
+      auto raw = c->getAttr("rawAnnotations");
+      auto read = [&](StringRef path) {
+        auto bytes = llvm::MemoryBuffer::getFile(path);require(bool(bytes), "annotation output read");
+        auto value = llvm::json::parse((*bytes)->getBuffer());
+        require(bool(value), "annotation output JSON syntax");return std::move(*value);
+      };
+      auto allPath = (directory + "/all.json").str();
+      require(succeeded(goldengate::emitAllAnnotations(c, allPath, error)), error);
+      auto all = read(allPath);auto array = all.getAsArray();
+      require(array && array->size() == 2, "all annotation membership");
+      auto first = (*array)[0].getAsObject();
+      auto expected = llvm::json::parse(u8R"json([null,true,-42,0.125,{"κ\\\"":"λ\n"}])json");
+      require(first && first->getString("body") == StringRef(body) && expected &&
+              *first->get("nested") == *expected, "nested or escaped annotation payload changed");
+      auto emptyExpected = llvm::json::parse("[[],{}]");
+      auto limitsExpected = llvm::json::parse("[-9223372036854775808,9223372036854775807,-0.0]");
+      require(emptyExpected && limitsExpected && *first->get("empty") == *emptyExpected &&
+              *first->get("limits") == *limitsExpected, "empty containers or numeric limits changed");
+      auto famePath = (directory + "/fame.json").str();
+      require(succeeded(goldengate::emitFAMEAnnotations(c, famePath, error)), error);
+      auto fame = read(famePath);
+      require(fame.getAsArray() && fame.getAsArray()->size() == 1 &&
+              fame.getAsArray()->front() == array->front() && c->getAttr("rawAnnotations") == raw,
+              "FAME filtering or source preservation");
+      c->setAttr("rawAnnotations", b.getArrayAttr({}));
+      require(succeeded(goldengate::emitAllAnnotations(c, allPath, error)), error);
+      auto empty = read(allPath);
+      require(empty.getAsArray() && empty.getAsArray()->empty(), "stale annotation serialization reused");
+
+      // The streaming writer must validate the complete selected payload
+      // before opening an existing output, even after many valid values.
+      for (unsigned mode = 0; mode < 8; ++mode) {
+        Attribute bad;
+        StringRef expectedError;
+        if (mode < 2) {
+          bad = mode == 0 ? Attribute(b.getStringAttr("not a dictionary"))
+                          : Attribute(b.getDictionaryAttr({}));
+          expectedError = mode == 0 ? "FAME annotation is not a dictionary"
+                                    : "annotation has no class name";
+        } else {
+          Attribute value;
+          if (mode == 2 || mode == 3) {
+            value = b.getF64FloatAttr(mode == 2 ? std::numeric_limits<double>::infinity()
+                                               : std::numeric_limits<double>::quiet_NaN());
+            expectedError = "annotation float is not a finite JSON number";
+          } else if (mode == 4) {
+            value = b.getIntegerAttr(IntegerType::get(&ctx, 65), llvm::APInt(65, 1));
+            expectedError = "annotation integer exceeds JSON's 64-bit range";
+          } else {
+            value = TypeAttr::get(b.getI32Type());
+            expectedError = "unsupported attribute in FAME annotation";
+            if (mode == 6)
+              value = b.getArrayAttr({b.getI64IntegerAttr(1), value});
+            if (mode == 7)
+              value = b.getDictionaryAttr({b.getNamedAttr("inner", b.getArrayAttr({value}))});
+          }
+          bad = b.getDictionaryAttr({
+              b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::BridgeIO)),
+              b.getNamedAttr("bad", value)});
+        }
+        c->setAttr("rawAnnotations", b.getArrayAttr({data, bad}));
+        auto before = dump(*root);
+        { std::error_code ec;llvm::raw_fd_ostream sentinel(allPath, ec);
+          require(!ec, "sentinel write");sentinel << "existing output\n"; }
+        require(failed(goldengate::emitAllAnnotations(c, allPath, error)) &&
+                error == expectedError && dump(*root) == before,
+                "invalid annotation accepted or altered source");
+        auto sentinel = llvm::MemoryBuffer::getFile(allPath);
+        require(sentinel && (*sentinel)->getBuffer() == "existing output\n",
+                "invalid annotation truncated existing output");
+      }
+
+      auto ignored = b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr("test.Ignored")),
+          b.getNamedAttr("unsupported", TypeAttr::get(b.getI32Type()))});
+      c->setAttr("rawAnnotations", b.getArrayAttr({ignored, data}));
+      require(succeeded(goldengate::emitFAMEAnnotations(c, famePath, error)) &&
+              read(famePath).getAsArray()->size() == 1,
+              "FAME writer validated a filtered payload");
+      require(failed(goldengate::emitAllAnnotations(c, allPath, error)),
+              "unfiltered unsupported payload accepted");
+      c->setAttr("rawAnnotations", b.getArrayAttr({data}));
+      require(failed(goldengate::emitAllAnnotations(c, directory, error)) &&
+              StringRef(error).starts_with("cannot write FAME annotations:"),
+              "unwritable annotation path accepted");
+      if (llvm::sys::fs::exists("/dev/full"))
+        require(failed(goldengate::emitAllAnnotations(c, "/dev/full", error)) &&
+                StringRef(error).starts_with("cannot finish FAME annotations:"),
+                "annotation write failure reported success");
+#ifdef NDEBUG
+      // LLVM's release fallback replaces invalid UTF-8 keys. Preserve the
+      // original object's ordering and collision semantics in that rare path.
+      auto invalidKeys = b.getDictionaryAttr({
+          b.getNamedAttr(StringRef("\x80", 1), b.getI64IntegerAttr(1)),
+          b.getNamedAttr(StringRef("\x81", 1), b.getI64IntegerAttr(2))});
+      c->setAttr("rawAnnotations", b.getArrayAttr({b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::BridgeIO)),
+          b.getNamedAttr("payload", invalidKeys)})}));
+      require(succeeded(goldengate::emitAllAnnotations(c, allPath, error)), error);
+      auto invalid = read(allPath);
+      auto payload = invalid.getAsArray()->front().getAsObject()->getObject("payload");
+      require(payload && payload->size() == 1 && payload->begin()->second.getAsInteger() == 2,
+              "invalid UTF-8 key collision behavior changed");
+      llvm::outs() << "Release invalid-UTF-8 key normalization/collision check passed\n";
+#endif
+      llvm::outs() << "Annotation JSON: nested values, empty containers, numeric limits, Unicode/NUL/large strings, filtering, changed boundaries, eight validation rejections and I/O failures passed\n";
+    }
     auto make=[&](){return fixture(ctx);};
     auto root=make();auto c=*root->getOps<CircuitOp>().begin();
     append(c,snippet(b,false,"{}",{"~Top|A>clock"}));

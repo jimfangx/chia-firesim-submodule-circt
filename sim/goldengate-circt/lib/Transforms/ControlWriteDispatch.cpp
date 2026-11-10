@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // Port NastiRouter's AW/W dispatch as FIRRTL mux, bit-select and connect ops.
 #include "goldengate/ControlWriteDispatch.h"
+#include "goldengate/ControlPortWidth.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 #include <map>
@@ -22,16 +23,19 @@ LogicalResult goldengate::addControlWriteDispatch(CircuitOp circuit, std::string
   if(!inner||!raw||!catalog||catalog.empty()||catalog.size()>63)
     return reject("control write dispatch needs retained annotations and one to 63 decoded regions");
   const unsigned slaveCount=catalog.size();
+  auto addressWidth = controlPortWidth(inner, "ctrl_decode_aw_addr");
+  if (!addressWidth) return reject("control write dispatch requires a typed AW address boundary");
+  const unsigned addressBits = *addressWidth;
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};
   struct Required {const char *name;unsigned width;Direction direction;};
   const Required required[]{
-    {"ctrl_decode_aw_route",slaveCount,Direction::Out},{"ctrl_decode_aw_addr",25,Direction::In},
+    {"ctrl_decode_aw_route",slaveCount,Direction::Out},{"ctrl_decode_aw_addr",addressBits,Direction::In},
     {"ctrl_write_route_w_route",slaveCount,Direction::Out},{"ctrl_write_route_aw_slave_valid",1,Direction::Out},
     {"ctrl_write_route_w_slave_valid",1,Direction::Out},{"ctrl_write_route_w_last",1,Direction::In},
     {"ctrl_write_route_aw_slave_ready",1,Direction::In},{"ctrl_write_route_w_slave_ready",1,Direction::In},
     {"ctrl_error_aw_ready",1,Direction::Out},{"ctrl_error_w_ready",1,Direction::Out},
-    {"ctrl_error_aw_valid",1,Direction::In},{"ctrl_error_aw_bits_addr",25,Direction::In},
+    {"ctrl_error_aw_valid",1,Direction::In},{"ctrl_error_aw_bits_addr",addressBits,Direction::In},
     {"ctrl_error_aw_bits_id",12,Direction::In},{"ctrl_error_w_valid",1,Direction::In},
     {"ctrl_error_w_bits_last",1,Direction::In}};
   std::map<std::string,unsigned> old;
@@ -42,7 +46,7 @@ LogicalResult goldengate::addControlWriteDispatch(CircuitOp circuit, std::string
   for(auto r:required) {
     auto found=old.find(r.name);if(found==old.end())return reject("control write dispatch is missing a route/error boundary");
     auto p=inner.getPorts()[found->second];
-    if(p.type!=uint(r.width)||p.direction!=r.direction)return reject("control write dispatch requires exact U250 boundary types and directions");
+    if(p.type!=uint(r.width)||p.direction!=r.direction)return reject("control write dispatch requires matching boundary types and directions");
   }
   bool used=false;circuit.walk([&](InstanceOp i){used|=i.getModuleName()==inner.getName();});
   if(used)return reject("control write dispatch requires an uninstantiated top");
@@ -52,13 +56,13 @@ LogicalResult goldengate::addControlWriteDispatch(CircuitOp circuit, std::string
   auto port=[&](std::string name,unsigned w,Direction d){hi[name]=hp.size();hp.push_back({b.getStringAttr(name),uint(w),d});};
   for(auto n:{"aw_route","w_route"})port(n,slaveCount,Direction::In);
   for(auto n:{"aw_valid","w_valid"})port(n,1,Direction::In);
-  port("master_aw_bits_addr",25,Direction::In);port("master_aw_bits_len",8,Direction::In);port("master_aw_bits_id",12,Direction::In);
+  port("master_aw_bits_addr",addressBits,Direction::In);port("master_aw_bits_len",8,Direction::In);port("master_aw_bits_id",12,Direction::In);
   port("master_w_bits_data",32,Direction::In);port("master_w_bits_last",1,Direction::In);
   for(unsigned i=0;i<=slaveCount;++i)for(auto ch:{"aw","w"})port((i==slaveCount?"err_slave":"slave_"+std::to_string(i))+std::string("_")+ch+"_ready",1,Direction::In);
   for(auto n:{"aw_ready","w_ready"})port(n,1,Direction::Out);
   for(unsigned i=0;i<=slaveCount;++i) {
     std::string prefix=(i==slaveCount?"err_slave":"slave_"+std::to_string(i))+std::string("_");
-    port(prefix+"aw_valid",1,Direction::Out);port(prefix+"aw_bits_addr",25,Direction::Out);
+    port(prefix+"aw_valid",1,Direction::Out);port(prefix+"aw_bits_addr",addressBits,Direction::Out);
     port(prefix+"aw_bits_len",8,Direction::Out);port(prefix+"aw_bits_id",12,Direction::Out);
     port(prefix+"w_valid",1,Direction::Out);port(prefix+"w_bits_data",32,Direction::Out);port(prefix+"w_bits_last",1,Direction::Out);
   }

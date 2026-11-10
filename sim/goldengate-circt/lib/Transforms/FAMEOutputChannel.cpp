@@ -29,7 +29,8 @@ llvm::StringRef removeCommonPrefix(llvm::StringRef name,
 
 LogicalResult rewriteMultiportOutputChannel(
     const goldengate::TopHierarchy &hierarchy,
-    const goldengate::FAMETopChannelPort &channel, std::string &error) {
+    const goldengate::FAMETopChannelPort &channel, std::string &error,
+    bool rewriteModel) {
   const auto &binding = *channel.binding;
   auto top = hierarchy.top;
   auto modelModule = binding.portGroup->module;
@@ -63,14 +64,14 @@ LogicalResult rewriteMultiportOutputChannel(
   llvm::SmallVector<circt::hw::InnerSymPropertiesAttr> wrapperSymbols, modelSymbols;
   std::set<unsigned> topPorts;
   for (unsigned modelPort : binding.instancePorts) {
-    auto modelName = model.getPortName(modelPort);
+    auto modelName = instance.getPortNameStr(modelPort);
     auto field = removeCommonPrefix(modelName, binding.portGroup->name);
     auto fieldIndex = payload.getElementIndex(field);
     if (field.empty() || !fieldIndex ||
         payload.getElements()[*fieldIndex].isFlip ||
         payload.getElements()[*fieldIndex].type !=
-            model.getPorts()[modelPort].type ||
-        hasPortAnnotations(model, modelPort)) {
+            instance.getResult(modelPort).getType() ||
+        (rewriteModel && hasPortAnnotations(model, modelPort))) {
       error = "FAME output bundle field does not match a model port";
       return failure();
     }
@@ -83,8 +84,8 @@ LogicalResult rewriteMultiportOutputChannel(
       error = "FAME output bundle field has no matching top port";
       return failure();
     }
-    if (failed(goldengate::collectFAMEPayloadSymbols(
-            model, modelPort, channel.type, field, modelSymbols, error)))
+    if ((rewriteModel && failed(goldengate::collectFAMEPayloadSymbols(
+            model, modelPort, channel.type, field, modelSymbols, error))))
       return failure();
     llvm::SmallVector<Operation *> connections;
     Value oldInstance = instance.getResult(modelPort);
@@ -94,7 +95,7 @@ LogicalResult rewriteMultiportOutputChannel(
       if (!aliasField || *aliasField != field ||
           !topPorts.insert(topPort).second ||
           top.getPortDirection(topPort) != Direction::Out ||
-          top.getPorts()[topPort].type != model.getPorts()[modelPort].type) {
+          top.getPorts()[topPort].type != instance.getResult(modelPort).getType()) {
         if (error.empty()) error = "FAME output bundle alias has incompatible payload";
         return failure();
       }
@@ -134,11 +135,18 @@ LogicalResult rewriteMultiportOutputChannel(
   }
 
   std::string modelName = binding.portGroup->name + "_source";
+  bool matchedDefinition = false;
   for (const auto &port : model.getPorts())
     if (port.getName() == modelName) {
+      matchedDefinition = port.type == channel.type && port.direction == binding.portGroup->direction;
+      if (!rewriteModel) continue;
       error = "FAME model source port already exists";
       return failure();
     }
+  if (!rewriteModel && !matchedDefinition) {
+    error = "shared FAME bundle definition does not match the instance channel ABI";
+    return failure();
+  }
   for (const auto &port : top.getPorts())
     if (port.getName() == channel.portName) {
       error = "FAME top source port already exists";
@@ -166,6 +174,7 @@ LogicalResult rewriteMultiportOutputChannel(
     });
     topInfo.sym = circt::hw::InnerSymAttr::get(context, wrapperSymbols);
   }
+  if (rewriteModel) {
   model.insertPorts({{modelInsert, modelInfo}});
   OpBuilder body(model.getBodyBlock(), model.getBodyBlock()->begin());
   Value bits = body.create<SubfieldOp>(
@@ -179,6 +188,8 @@ LogicalResult rewriteMultiportOutputChannel(
   for (const auto &leaf : leaves)
     eraseModel.set(leaf.modelPort + 1);
   model.erasePorts(eraseModel);
+
+  }
 
   top.insertPorts({{topInsert, topInfo}});
   Value newTop = top.getBodyBlock()->getArgument(topInsert);
@@ -226,6 +237,7 @@ std::optional<std::string> goldengate::getFAMEOutputAliasField(
     unsigned modelPort, unsigned topPort, std::string &error) {
   const auto &binding = *channel.binding;
   auto top = hierarchy.top;
+  auto liveInstance = binding.instance;
   auto model = binding.portGroup->module;
   auto circuit = top->getParentOfType<CircuitOp>();
   auto target = [&](unsigned port) {
@@ -233,7 +245,7 @@ std::optional<std::string> goldengate::getFAMEOutputAliasField(
            ">" + top.getPortName(port).str();
   };
   std::string expected = removeCommonPrefix(
-      model.getPortName(modelPort),
+      liveInstance.getPortNameStr(modelPort),
       binding.portGroup->name).str();
   auto type = channel.type;
   auto bits = type.getElementIndex("bits");
@@ -248,7 +260,7 @@ std::optional<std::string> goldengate::getFAMEOutputAliasField(
   llvm::SmallVector<unsigned> orderedPorts;
   for (const auto &leaf : payload.getElements()) {
     auto port = llvm::find_if(binding.instancePorts, [&](unsigned index) {
-      return removeCommonPrefix(model.getPortName(index), binding.portGroup->name) ==
+      return removeCommonPrefix(liveInstance.getPortNameStr(index), binding.portGroup->name) ==
              leaf.name.getValue();
     });
     if (port == binding.instancePorts.end()) {
@@ -282,7 +294,7 @@ std::optional<std::string> goldengate::getFAMEOutputAliasField(
           auto field = removeCommonPrefix(top.getPortName(connection.topPort),
                                           name.getValue());
           auto modelField = removeCommonPrefix(
-              model.getPortName(orderedPorts[i]),
+              liveInstance.getPortNameStr(orderedPorts[i]),
               binding.portGroup->name);
           matched |= !field.empty() && field == modelField;
         }
@@ -314,12 +326,8 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
   auto model = dyn_cast<FModuleOp>(modelModule.getOperation());
   auto instance = binding.instance;
   auto channelType = channel.type;
-  if (binding.instancePorts.size() > 1 && !rewriteModel) {
-    error = "additional FAME instance rewrite requires a scalar channel";
-    return failure();
-  }
   if (binding.instancePorts.size() > 1)
-    return rewriteMultiportOutputChannel(hierarchy, channel, error);
+    return rewriteMultiportOutputChannel(hierarchy, channel, error, rewriteModel);
   if (!model || binding.portGroup->direction != Direction::Out ||
       binding.instancePorts.size() != 1 ||
       instance->getParentOfType<FModuleOp>() != top) {
@@ -337,13 +345,16 @@ LogicalResult goldengate::rewriteFAMEOutputChannel(
       channel.type.getElements()[*bitsIndex].type != payloadType ||
       !channel.type.getElements()[*readyIndex].isFlip ||
       channel.type.getElements()[*validIndex].isFlip ||
-      hasPortAnnotations(model, modelPort)) {
+      (rewriteModel && hasPortAnnotations(model, modelPort))) {
     error = "FAME output channel payload or port annotations are incompatible";
     return failure();
   }
   std::string modelName = binding.portGroup->name + "_source";
-  if ((!rewriteModel && (model.getPortName(modelPort) != modelName ||
-                         model.getPortType(modelPort) != channel.type)) ||
+  bool sharedDefinitionMatches = llvm::any_of(model.getPorts(), [&](const PortInfo &p) {
+    return p.getName() == modelName && p.type == channel.type &&
+           p.direction == binding.portGroup->direction;
+  });
+  if ((!rewriteModel && !sharedDefinitionMatches) ||
       (rewriteModel && model.getPortType(modelPort) != payloadType)) {
     error = "FAME scalar definition does not match the instance rewrite stage";
     return failure();

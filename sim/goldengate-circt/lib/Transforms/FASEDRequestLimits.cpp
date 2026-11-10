@@ -20,6 +20,33 @@ using namespace circt::firrtl;
 
 namespace {
 constexpr llvm::StringLiteral bankName = "GGFASEDRequestLimits";
+LogicalResult baseCapacity(CircuitOp circuit, unsigned &capacity,
+                           std::string &error) {
+  auto raw = circuit->getAttr("goldengate.fasedBaseCapacity");
+  if (!raw) {
+    capacity = 16;
+    return success();
+  }
+  auto value = dyn_cast<IntegerAttr>(raw);
+  if (!value || value.getValue().getBitWidth() > 64 ||
+      (value.getInt() != 16 && value.getInt() != 32)) {
+    error = "FASED base capacity must be an explicit integer 16 or 32";
+    return failure();
+  }
+  capacity = value.getInt();
+  return success();
+}
+LogicalResult requireLatencyPipeBank(CircuitOp circuit, std::string &error) {
+  unsigned capacity;
+  if (failed(baseCapacity(circuit, capacity, error)))
+    return failure();
+  if (capacity != 16) {
+    error = "FASED request-limit MMIO bank requires the base-16 LatencyPipe "
+            "profile; FRFCFS has no programmable read/write maximum words";
+    return failure();
+  }
+  return success();
+}
 llvm::StringRef wrapperName(CircuitOp circuit) {
   return circuit.getName() == "GGSelectedPrintFASEDReadAdmissionWrapper"
       ? "GGSelectedPrintFASEDRequestLimitsWrapper" : "GGFASEDRequestLimitsWrapper";
@@ -43,6 +70,7 @@ SmallVector<PortInfo> requestLimitPorts(MLIRContext *ctx, unsigned width) {
 LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
     unsigned (&indices)[4], std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
+  if (failed(requireLatencyPipeBank(circuit, error))) return failure();
   if (circuit.getName() != "GGFASEDReadAdmissionWrapper" &&
       circuit.getName() != "GGSelectedPrintFASEDReadAdmissionWrapper")
     return reject("FASED request limits require the active read admission wrapper");
@@ -78,10 +106,12 @@ LogicalResult attachmentTop(CircuitOp circuit, FModuleOp &inner,
 }
 } // namespace
 
-// BaseConfig.maxReads/maxWrites cap edge.maxFlight at default BaseParams=16.
-// Custom BaseParams are not represented by the supported constructor handoff.
+// BaseConfig.maxReads/maxWrites cap edge.maxFlight at platform BaseParams.
+// CompleteConfig retains the target edge but not the platform BaseParams.
 LogicalResult goldengate::getFASEDRequestLimitProfile(CircuitOp circuit, unsigned &limit,
     unsigned &width, std::string &error) {
+  unsigned capacity;
+  if (failed(baseCapacity(circuit, capacity, error))) return failure();
   FModuleOp engine;
   for (auto m : circuit.getOps<FModuleOp>())
     if (m.getName() == "GGFASEDTokenEngine") engine = m;
@@ -113,13 +143,14 @@ LogicalResult goldengate::getFASEDRequestLimitProfile(CircuitOp circuit, unsigne
     error = "FASED request limits need a positive 64-bit maxFlight constructor";
     return failure();
   }
-  limit = std::min<uint64_t>(16, flight.getInt());
+  limit = std::min<uint64_t>(capacity, flight.getInt());
   width = llvm::Log2_64_Ceil(limit + 1);
   return success();
 }
 
 LogicalResult goldengate::materializeFASEDRequestLimits(CircuitOp circuit,
     FModuleOp &result, std::string &error) {
+  if (failed(requireLatencyPipeBank(circuit, error))) return failure();
   for (auto module : circuit.getOps<FModuleLike>())
     if (module.getName() == bankName) {
       error = "FASED request limit module already exists";

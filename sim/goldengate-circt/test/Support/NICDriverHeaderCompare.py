@@ -24,12 +24,19 @@ def normalize(text):
 
 
 def constructors(text):
-    result = {}
+    result, occurrences = {}, {}
     for guard, block in re.findall(r'#ifdef (GET_(?:CORE|BRIDGE|MANAGED_STREAM)_CONSTRUCTOR)\n'
                                   r'(.*?)#endif // \1', text, re.S):
-        cls, args = re.findall(r'registry.add_widget\(new (\w+)\((.*?)\)\);', block, re.S)[0]
-        assert cls not in result, cls
-        result[cls] = (guard, normalize(args))
+        entries = re.findall(r'registry.add_widget\(new (\w+)\((.*?)\)\);', block, re.S)
+        assert entries, "constructor guard has no widget registration"
+        for cls, args in entries:
+            # Widget type is not a unique identity: multiple NICs/UARTs/etc.
+            # use the same real driver class with distinct widget/stream/MMIO
+            # arguments. Preserve every constructor and its per-type order.
+            index = occurrences.get(cls, 0)
+            key = cls if index == 0 else f"{cls}[{index}]"
+            occurrences[cls] = index + 1
+            result[key] = (guard, normalize(args))
     assert text.count('registry.add_widget(new ') == len(result)
     return result
 

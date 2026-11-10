@@ -44,7 +44,7 @@ std::string regionName(unsigned count,unsigned i) {
   const char *names[]{"BlockDevBridgeModule_0","FASEDMemoryTimingModel_0","TracerVBridgeModule_0","TSIBridgeModule_0","LoadMemWidget_0","PeekPokeBridgeModule_0","UARTBridgeModule_0","ClockBridgeModule_0","SimulationMaster_0","ResetPulseBridgeModule_0","CPUManagedStreamEngine_0"};
   return names[i];
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned count=11,bool empty=false) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned count=11,bool empty=false,unsigned addressBits=25) {
   unsigned width=llvm::Log2_64_Ceil(count+1);
   std::string address="bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>";
   auto token=[](std::string bits){return "bundle<ready flip: uint<1>, valid: uint<1>, bits: "+bits+">";};
@@ -64,6 +64,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0,unsigned count=11,
   }
   if(bad==4)text+=", in %ctrl_read_dispatch_master_ar: !firrtl.uint<1>";
   text+=") {} firrtl.module @GGControlAddressDecode() {} } }";
+  if (addressBits == 32) for (size_t at=0;(at=text.find("uint<25>",at))!=std::string::npos;at+=8) text.replace(at,8,"uint<32>");
   auto root=parseSourceString<ModuleOp>(text,&ctx);require(bool(root),"fixture parse failed");auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
   SmallVector<Attribute> rows,binding,annos;
   unsigned catalogCount=bad==11?0:bad==12?64:count;
@@ -126,8 +127,8 @@ bool fieldPath(Value v,Value base,std::initializer_list<const char*> names) {
   }
   return v==base;
 }
-unsigned test(MLIRContext &ctx,unsigned count,bool empty=false) {
-  auto root=fixture(ctx,0,count,empty);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+unsigned test(MLIRContext &ctx,unsigned count,bool empty=false,unsigned addressBits=25) {
+  auto root=fixture(ctx,0,count,empty,addressBits);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   auto original=named(c,oldTop)->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
   require(succeeded(goldengate::addControlReadDispatch(c,error)),error);require(succeeded(verify(*root)),"invalid AR dispatch IR");
   auto helper=named(c,"GGControlReadDispatch"),top=named(c,newTop);
@@ -141,7 +142,7 @@ unsigned test(MLIRContext &ctx,unsigned count,bool empty=false) {
   auto sample=[&](uint64_t route,bool valid,bool capacity,uint64_t mask,bool payloadCheck) {
     uint64_t target=rng()&((1ULL<<width)-1);sim.memo={{"route",route},{"target",target},{"tracker_ready",capacity},{"master_ar.valid",valid}};
     std::map<std::string,uint64_t> payload;
-    for(auto [n,w]:fields)sim.memo["master_ar.bits."+n]=payload[n]=rng()&((1ULL<<w)-1);
+    for(auto [n,w]:fields) { if(n=="addr") w=addressBits; sim.memo["master_ar.bits."+n]=payload[n]=rng()&((1ULL<<w)-1); }
     bool ready=false;
     for(unsigned i=0;i<=count;++i){auto n=i==count?"err_slave_ar":"slave_"+std::to_string(i)+"_ar";sim.memo[n+".ready"]=(mask>>i)&1;if((i==count&&route==0)||(i<count&&(route&(1ULL<<i))))ready=(mask>>i)&1;}
     require(sim.get("master_ar.ready")==bool(capacity&&ready),"master readiness differs from DecoupledHelper");
@@ -242,6 +243,7 @@ int main(int argc,char **argv){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,cir
   unsigned cases=0;
   for(unsigned count:{1,2,3,11,12,13,14,31,63})cases+=test(ctx,count);
   cases+=test(ctx,3,true);
+  cases+=test(ctx,3,false,32);
   for(unsigned bad=1;bad<=28;++bad){auto r=fixture(ctx,bad);auto circuit=*r->getOps<CircuitOp>().begin();auto s=dump(*r);std::string error;require(failed(goldengate::addControlReadDispatch(circuit,error)),"malformed boundary accepted");require(!error.empty()&&dump(*r)==s,"rejection mutated IR or omitted diagnostic");}
   llvm::outs()<<"Control AR dispatch: "<<cases<<" independent backpressure/route cases across 1/2/3/11/12/13/14/31/63 regions (including NIC allocation) and empty bindings; wrapper wiring, targets and 38 atomic rejections passed\n";
   return 0;}catch(const std::exception &e){llvm::errs()<<e.what()<<'\n';return 1;}}

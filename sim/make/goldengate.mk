@@ -7,6 +7,8 @@
 # Simulation memory map emitted by the MIDAS compiler
 header := $(GENERATED_DIR)/$(BASE_FILE_NAME).const.h
 verilog_header := $(GENERATED_DIR)/$(BASE_FILE_NAME).const.vh
+partition_header := $(GENERATED_DIR)/$(BASE_FILE_NAME).partition.const.h
+peer2peer_map := $(GENERATED_DIR)/$(BASE_FILE_NAME).peer2peer.const.yaml
 
 # The midas-generated simulator RTL which will be baked into the FPGA shell project
 simulator_verilog := $(GENERATED_DIR)/$(BASE_FILE_NAME).sv
@@ -19,12 +21,14 @@ fame_annos := $(GENERATED_DIR)/post-bridge-extraction.json
 # Keep the Scala implementation available as the reference while the CIRCT
 # compiler is brought up. The normal compiler selection is CIRCT.
 GOLDENGATE_COMPILER ?= circt
+GOLDENGATE_CIRCT_BUILD_TYPE ?= Release
 GOLDENGATE_CIRCT_PREFIX ?= $(abspath $(dir $(shell which firtool))/..)
 goldengate_circt_build := $(GENERATED_DIR)/goldengate-circt-build
-# The base FireSim compiler configs inherit EnableAutoCounter=false. Until
-# enabled counter synthesis is ported, an explicit enabled request must fail.
-GOLDENGATE_CIRCT_AUTOCOUNTER ?= disabled
+# Enabled CSV and printf counters use the ordinary full-platform MMIO/driver path.
+GOLDENGATE_CIRCT_AUTOCOUNTER ?= $(if $(filter WithAutoCounter,$(subst _, ,$(PLATFORM_CONFIG))),csv,disabled)
 GOLDENGATE_CIRCT_MULTITHREADING ?= disabled
+# Compile-time LoopbackNIC is distinct from the driver's +nic-loopbackN option.
+GOLDENGATE_CIRCT_NIC_MODE ?= normal
 # Translate the standard AutoILA compiler fragments; explicit variables also
 # support native invocations without a Scala compiler configuration instance.
 goldengate_circt_config_fragments := $(subst _, ,$(PLATFORM_CONFIG))
@@ -45,28 +49,31 @@ goldengate_circt_ila_flags := --enable-autoila --ila-depth $(GOLDENGATE_CIRCT_IL
 else ifneq ($(GOLDENGATE_CIRCT_AUTOILA),disabled)
 $(error GOLDENGATE_CIRCT_AUTOILA must be enabled or disabled)
 endif
-ifneq ($(findstring WithAutoCounter,$(PLATFORM_CONFIG)),)
-$(error CIRCT Golden Gate has not ported the WithAutoCounter compiler config)
+ifeq ($(GOLDENGATE_CIRCT_AUTOCOUNTER),printf)
+goldengate_circt_feature_flags += --enable-autocounter-printf
+else ifeq ($(GOLDENGATE_CIRCT_AUTOCOUNTER),csv)
+goldengate_circt_feature_flags += --enable-autocounter-csv
+else ifneq ($(GOLDENGATE_CIRCT_AUTOCOUNTER),disabled)
+$(error GOLDENGATE_CIRCT_AUTOCOUNTER must be disabled, csv or printf)
 endif
-ifneq ($(GOLDENGATE_CIRCT_AUTOCOUNTER),disabled)
-$(error CIRCT Golden Gate currently supports GOLDENGATE_CIRCT_AUTOCOUNTER=disabled only)
+ifeq ($(GOLDENGATE_CIRCT_MULTITHREADING),enabled)
+goldengate_circt_feature_flags += --enable-multithreading
+else ifneq ($(GOLDENGATE_CIRCT_MULTITHREADING),disabled)
+$(error GOLDENGATE_CIRCT_MULTITHREADING must be enabled or disabled)
 endif
-ifneq ($(findstring WithModelMultiThreading,$(PLATFORM_CONFIG)),)
-$(error CIRCT Golden Gate has not ported model multithreading)
-endif
-ifneq ($(findstring MTModels,$(PLATFORM_CONFIG)),)
-$(error CIRCT Golden Gate has not ported model multithreading)
-endif
-ifneq ($(GOLDENGATE_CIRCT_MULTITHREADING),disabled)
-$(error CIRCT Golden Gate currently supports GOLDENGATE_CIRCT_MULTITHREADING=disabled only)
+ifeq ($(GOLDENGATE_CIRCT_NIC_MODE),loopback)
+goldengate_circt_feature_flags += --nic-mode=loopback
+else ifneq ($(GOLDENGATE_CIRCT_NIC_MODE),normal)
+$(error GOLDENGATE_CIRCT_NIC_MODE must be normal or loopback)
 endif
 .PHONY: goldengate-circt-force
 goldengate-circt-force:
 
 # An existing SFC .sv must never make the CIRCT selection appear successful.
-$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) goldengate-circt-force
+$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(partition_header) $(peer2peer_map) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) goldengate-circt-force
 	cmake -S $(firesim_base_dir)/goldengate-circt -B $(goldengate_circt_build) -G Ninja \
 		-DCIRCT_DIR=$(GOLDENGATE_CIRCT_PREFIX)/lib/cmake/circt \
+		-DCMAKE_BUILD_TYPE=$(GOLDENGATE_CIRCT_BUILD_TYPE) \
 		-DZLIB_ROOT=$(abspath $(GOLDENGATE_CIRCT_PREFIX)/..)
 	# Build the compiler here; CTest executables are built by focused validation.
 	cmake --build $(goldengate_circt_build) --target goldengate-circt
@@ -76,7 +83,7 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) 
 	$(goldengate_circt_build)/goldengate-circt $(FIRRTL_FILE) \
 		--annotation-file $(ANNO_FILE) --output-dir $(GENERATED_DIR)/circt-ingestion \
 		--compile-baseline --platform-config $(PLATFORM_CONFIG) \
-		--output-filename-base $(BASE_FILE_NAME) $(goldengate_circt_ila_flags)
+		--output-filename-base $(BASE_FILE_NAME) $(goldengate_circt_ila_flags) $(goldengate_circt_feature_flags)
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).sv $(simulator_verilog)
 	@if test -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; then \
 		while IFS= read -r blackbox || test -n "$$blackbox"; do \
@@ -86,17 +93,20 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) 
 			fi; \
 		done < $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; \
 	fi
+	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).memory-origins.json $(GENERATED_DIR)/$(BASE_FILE_NAME).memory-origins.json
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).synthesis.xdc $(simulator_xdc)
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).implementation.xdc $(GENERATED_DIR)/$(BASE_FILE_NAME).implementation.xdc
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).defines.vh $(GENERATED_DIR)/$(BASE_FILE_NAME).defines.vh
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).const.h $(header)
 	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).const.vh $(verilog_header)
+	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).partition.const.h $(partition_header)
+	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).peer2peer.const.yaml $(peer2peer_map)
 	@for collateral in $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl; do \
 		if test -f "$$collateral"; then cp "$$collateral" $(GENERATED_DIR)/; fi; \
 	done
 	cp $(GENERATED_DIR)/circt-ingestion/post-bridge-extraction-all.json $(fame_annos)
 else ifeq ($(GOLDENGATE_COMPILER),sfc)
-$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
+$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(partition_header) $(peer2peer_map) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) $(FIRESIM_MAIN_CP)
 	$(call run_jar_scala_main,$(firesim_base_dir),$(FIRESIM_MAIN_CP),midas.stage.GoldenGateMain,\
 		-i $(FIRRTL_FILE) \
 		-td $(GENERATED_DIR) \

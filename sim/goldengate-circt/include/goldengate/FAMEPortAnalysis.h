@@ -47,8 +47,16 @@ struct FAMEChannelClockDomain {
   std::string localName;
   circt::firrtl::Direction direction;
   std::string modelClockName;
+  // False only for unassociated channels of a non-hub model. SFC uses a
+  // constant-one enable and reset-to-zero fired state for those channels.
+  bool hasClockDomain = true;
 };
 
+// Nonempty domains describe an explicit hub clock channel. Empty domains select
+// VirtualClockChannel and require exactly one scalar target input clock. A
+// virtual channel without clockPort has an empty modelClockName. Shared model
+// instances retain one assignment per local group; every global binding is
+// checked before deduplication. Does not mutate the input IR.
 std::optional<llvm::SmallVector<FAMEChannelClockDomain>>
 analyzeFAMEChannelClockDomains(circt::firrtl::CircuitOp circuit,
                               circt::firrtl::FModuleOp model,

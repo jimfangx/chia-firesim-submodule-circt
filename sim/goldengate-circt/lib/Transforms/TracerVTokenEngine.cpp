@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // TracerVBridge.scala HostPort consumption, stream packing and trigger history.
 #include "goldengate/TracerVTokenEngine.h"
+#include "goldengate/TracerVConfig.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
@@ -36,11 +37,12 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
   struct BridgePlan {
     unsigned annotationIndex;
     DictionaryAttr key, mapping;
-    std::array<unsigned, 12> channelIndices{}, tokenPorts{};
+    SmallVector<unsigned> channelIndices, tokenPorts;
+    TracerVConfig config;
     std::string engineName, controlName, streamName;
     FModuleOp engine;
   };
-  SmallVector<BridgePlan> plans;
+  SmallVector<BridgePlan, 0> plans;
   for (auto [i, attr] : llvm::enumerate(raw)) {
     Annotation a(attr);
     if (!a.isClass(AnnotationClasses::BridgeIO) ||
@@ -49,34 +51,25 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
     auto bridge = cast<DictionaryAttr>(attr);
     std::string suffix = plans.empty() ? "" : "_" + std::to_string(plans.size());
     plans.push_back({static_cast<unsigned>(i), bridge.getAs<DictionaryAttr>("widgetConstructorKey"),
-        bridge.getAs<DictionaryAttr>("channelMapping"), {}, {},
+        bridge.getAs<DictionaryAttr>("channelMapping"), {}, {}, {},
         engineName.str() + suffix, "tracerv_control" + suffix, "tracerv_stream" + suffix, {}});
   }
   if (plans.empty()) return reject("TracerV token mapping needs a TracerVBridgeModule constructor");
   auto *context = circuit.getContext();
   auto bit = UIntType::get(context, 1, false);
-  const llvm::StringRef localNames[]{"tiletrace_reset", "tiletrace_trace_retiredinsns_0_valid",
-      "tiletrace_trace_retiredinsns_0_iaddr", "tiletrace_trace_retiredinsns_0_insn",
-      "tiletrace_trace_retiredinsns_0_priv", "tiletrace_trace_retiredinsns_0_exception",
-      "tiletrace_trace_retiredinsns_0_interrupt", "tiletrace_trace_retiredinsns_0_cause",
-      "tiletrace_trace_retiredinsns_0_tval", "tiletrace_trace_time", "triggerCredit", "triggerDebit"};
-  const unsigned widths[]{1, 1, 40, 32, 3, 1, 1, 64, 40, 64, 1, 1};
   SmallVector<unsigned> allTokenPorts;
   for (auto &plan : plans) {
     auto key = plan.key;
     auto mapping = plan.mapping;
-    auto keyWidth = [&](llvm::StringRef name, int64_t expected) {
-      auto width = key ? key.getAs<IntegerAttr>(name) : IntegerAttr();
-      return width && width.getInt() == expected;
-    };
-    if (!key || key.getAs<StringAttr>("class") != "firechip.bridgeinterfaces.TraceBundleWidths" ||
-        !keyWidth("retireWidth", 1) || !keyWidth("iaddrWidth", 40) ||
-        !keyWidth("insnWidth", 32) || !keyWidth("causeWidth", 64) || !keyWidth("tvalWidth", 40) ||
-        !mapping || mapping.size() != 12)
-      return reject("TracerV token engine requires the Rocket TraceBundleWidths constructor and twelve channels");
+    if (!plan.config.parse(key) || !mapping || mapping.size() != plan.config.names.size())
+      return reject("TracerV token engine requires one to seven 40-bit PC retirement lanes and matching channels");
+    auto &localNames = plan.config.names;
+    auto &widths = plan.config.widths;
+    unsigned inputs = plan.config.inputs(), count = localNames.size();
+    plan.channelIndices.resize(count); plan.tokenPorts.resize(count);
     auto &channelIndices = plan.channelIndices;
     auto &tokenPorts = plan.tokenPorts;
-    for (unsigned j = 0; j < 12; ++j) {
+    for (unsigned j = 0; j < count; ++j) {
       auto name = mapping.getAs<StringAttr>(localNames[j]);
       if (!name) return reject("TracerV channel mapping is incomplete");
       DictionaryAttr channel;
@@ -89,8 +82,8 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
       }
       auto info = channel ? channel.getAs<DictionaryAttr>("channelInfo") : DictionaryAttr();
       auto latency = info ? info.getAs<IntegerAttr>("latency") : IntegerAttr();
-      auto endpoints = channel ? channel.getAs<ArrayAttr>(j >= 10 ? "sinks" : "sources") : ArrayAttr();
-      auto opposite = channel ? channel.getAs<ArrayAttr>(j >= 10 ? "sources" : "sinks") : ArrayAttr();
+      auto endpoints = channel ? channel.getAs<ArrayAttr>(j >= inputs ? "sinks" : "sources") : ArrayAttr();
+      auto opposite = channel ? channel.getAs<ArrayAttr>(j >= inputs ? "sources" : "sinks") : ArrayAttr();
       if (!info || info.getAs<StringAttr>("class") != AnnotationClasses::PipeChannel ||
           !latency || latency.getInt() != 1 || !endpoints || endpoints.size() != 1 ||
           (opposite && !opposite.empty()))
@@ -108,7 +101,7 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
           !token.getElement("ready") || !token.getElement("valid") ||
           token.getElement("ready")->type != bit || !token.getElement("ready")->isFlip ||
           token.getElement("valid")->type != bit || token.getElement("valid")->isFlip ||
-          inner.getPortDirection(port) != (j >= 10 ? Direction::In : Direction::Out))
+          inner.getPortDirection(port) != (j >= inputs ? Direction::In : Direction::Out))
         return reject("TracerV channel needs a Decoupled UInt port with correct direction");
       tokenPorts[j] = port;
       if (llvm::is_contained(allTokenPorts, port))
@@ -142,22 +135,24 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
   auto notv = [&](Value v) -> Value { return b.create<NotPrimOp>(loc, v); };
   auto mux = [&](Value pred, Value yes, Value no) -> Value { return b.create<MuxPrimOp>(loc, pred, yes, no); };
   auto connect = [&](Value dest, Value src) { b.create<StrictConnectOp>(loc, dest, src); };
-  SmallVector<BundleType::BundleElement> payload;
-  for (unsigned j = 0; j < 12; ++j)
-    payload.push_back({b.getStringAttr(localNames[j]), j >= 10, uint(widths[j])});
   auto toHost = BundleType::get(context, {{b.getStringAttr("hReady"), true, bit}, {b.getStringAttr("hValid"), false, bit}});
   auto fromHost = BundleType::get(context, {{b.getStringAttr("hReady"), false, bit}, {b.getStringAttr("hValid"), true, bit}});
-  auto hPort = BundleType::get(context, {{b.getStringAttr("hBits"), false, BundleType::get(context, payload)},
-      {b.getStringAttr("toHost"), false, toHost}, {b.getStringAttr("fromHost"), false, fromHost}});
   auto control = BundleType::get(context, {{b.getStringAttr("initDone"), true, bit},
       {b.getStringAttr("traceEnable"), true, bit}, {b.getStringAttr("trigger"), true, bit},
       {b.getStringAttr("tCycle"), false, uint(64)}});
   auto stream = BundleType::get(context, {{b.getStringAttr("ready"), true, bit},
       {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, uint(512)}});
-  SmallVector<PortInfo> enginePorts{{b.getStringAttr("clock"), ClockType::get(context), Direction::In},
-      {b.getStringAttr("reset"), bit, Direction::In}, {b.getStringAttr("hPort"), hPort, Direction::In},
-      {b.getStringAttr("control"), control, Direction::Out}, {b.getStringAttr("stream"), stream, Direction::Out}};
   for (auto &plan : plans) {
+    auto &localNames = plan.config.names;
+    auto &widths = plan.config.widths;
+    unsigned inputs = plan.config.inputs(), count = localNames.size();
+    SmallVector<BundleType::BundleElement> payload;
+    for(unsigned j=0;j<count;++j) payload.push_back({b.getStringAttr(localNames[j]),j>=inputs,uint(widths[j])});
+    auto hPort = BundleType::get(context, {{b.getStringAttr("hBits"), false, BundleType::get(context,payload)},
+        {b.getStringAttr("toHost"),false,toHost},{b.getStringAttr("fromHost"),false,fromHost}});
+    SmallVector<PortInfo> enginePorts{{b.getStringAttr("clock"),ClockType::get(context),Direction::In},
+        {b.getStringAttr("reset"),bit,Direction::In},{b.getStringAttr("hPort"),hPort,Direction::In},
+        {b.getStringAttr("control"),control,Direction::Out},{b.getStringAttr("stream"),stream,Direction::Out}};
     b.setInsertionPointToStart(circuit.getBodyBlock());
     auto engine = b.create<FModuleOp>(loc, b.getStringAttr(plan.engineName), ConventionAttr::get(context, Convention::Internal), enginePorts);
     plan.engine = engine;
@@ -170,7 +165,12 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
     Value cycle = reg(64, "trace_cycle_counter"), counter = reg(1, "counter"), previous = reg(1, "triggerReg");
     Value hb = field(arg(2), "hBits"), th = field(arg(2), "toHost"), fh = field(arg(2), "fromHost");
     Value trigger = field(arg(3), "trigger"), init = field(arg(3), "initDone");
-    Value traceValid = both(field(hb, localNames[1]), notv(field(hb, localNames[0])));
+    SmallVector<Value> traceValids;
+    Value traceValid = constant(1,0);
+    for(unsigned lane=0;lane<plan.config.retireWidth;++lane) {
+      auto valid=both(field(hb,TracerVConfig::lane(lane,"valid")),notv(field(hb,"tiletrace_reset")));
+      traceValids.push_back(valid);traceValid=b.create<OrPrimOp>(loc,traceValid,valid);
+    }
     // Keep the one-bit arm register as in SFC, including its unreachable value.
     // The stream payload always selects the sole arm; an invalid arm suppresses
     // stream-valid and still permits HostPort consumption.
@@ -196,9 +196,12 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
     Value nextCycle = b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, cycle, constant(64, 1)), 63, 0);
     connect(cycle, mux(advance, nextCycle, cycle));
     connect(field(arg(3), "tCycle"), cycle);
-    Value pc = b.create<PadPrimOp>(loc, field(hb, localNames[2]), 63);
-    Value record = b.create<CatPrimOp>(loc, traceValid, pc);
-    Value packet = b.create<CatPrimOp>(loc, record, cycle);
+    Value packet = cycle;
+    for(unsigned lane=0;lane<plan.config.retireWidth;++lane) {
+      Value pc=b.create<PadPrimOp>(loc,field(hb,TracerVConfig::lane(lane,"iaddr")),63);
+      Value record=b.create<CatPrimOp>(loc,traceValids[lane],pc);
+      packet=b.create<CatPrimOp>(loc,record,packet);
+    }
     connect(field(arg(4), "bits"), b.create<PadPrimOp>(loc, packet, 512));
   }
 
@@ -225,22 +228,24 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
   for (auto [bridgeNumber, plan] : llvm::enumerate(plans)) {
     auto tracer = tracers[bridgeNumber];
     auto &tokenPorts = plan.tokenPorts;
+    auto &localNames = plan.config.names;
+    unsigned inputs=plan.config.inputs(), count=localNames.size();
     connect(tracer.getResult(0), outerArg(*hostClock)); connect(tracer.getResult(1), outerArg(*hostReset));
     Value hb = field(tracer.getResult(2), "hBits"), th = field(tracer.getResult(2), "toHost"), fh = field(tracer.getResult(2), "fromHost");
     Value allValid = constant(1, 1), allReady = constant(1, 1);
-    for (unsigned j = 0; j < 10; ++j) allValid = both(allValid, field(sim.getResult(tokenPorts[j]), "valid"));
-    for (unsigned j = 10; j < 12; ++j) allReady = both(allReady, field(sim.getResult(tokenPorts[j]), "ready"));
+    for (unsigned j = 0; j < inputs; ++j) allValid = both(allValid, field(sim.getResult(tokenPorts[j]), "valid"));
+    for (unsigned j = inputs; j < count; ++j) allReady = both(allReady, field(sim.getResult(tokenPorts[j]), "ready"));
     connect(field(th, "hValid"), allValid); connect(field(fh, "hReady"), allReady);
     // FPGATop HostPortIOConnectChannels2Port: exclude each channel's own valid
     // or ready predicate so a channel can advertise readiness/validity first.
-    for (unsigned j = 0; j < 12; ++j) {
+    for (unsigned j = 0; j < count; ++j) {
       Value token = sim.getResult(tokenPorts[j]);
-      Value gate = field(j < 10 ? th : fh, j < 10 ? "hReady" : "hValid");
-      for (unsigned k = j < 10 ? 0 : 10; k < (j < 10 ? 10 : 12); ++k)
-        if (j != k) gate = both(gate, field(sim.getResult(tokenPorts[k]), j < 10 ? "valid" : "ready"));
-      connect(field(token, j < 10 ? "ready" : "valid"), gate);
-      connect(j < 10 ? field(hb, localNames[j]) : field(token, "bits"),
-              j < 10 ? field(token, "bits") : field(hb, localNames[j]));
+      Value gate = field(j < inputs ? th : fh, j < inputs ? "hReady" : "hValid");
+      for (unsigned k = j < inputs ? 0 : inputs; k < (j < inputs ? inputs : count); ++k)
+        if (j != k) gate = both(gate, field(sim.getResult(tokenPorts[k]), j < inputs ? "valid" : "ready"));
+      connect(field(token, j < inputs ? "ready" : "valid"), gate);
+      connect(j < inputs ? field(hb, localNames[j]) : field(token, "bits"),
+              j < inputs ? field(token, "bits") : field(hb, localNames[j]));
     }
     b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArgument(copied.size() + 2 * bridgeNumber), tracer.getResult(3));
     b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArgument(copied.size() + 2 * bridgeNumber + 1), tracer.getResult(4));
@@ -271,12 +276,14 @@ LogicalResult goldengate::attachTracerVTokenEngine(CircuitOp circuit,
   };
   SmallVector<Attribute> annotations; for (auto a : raw) annotations.push_back(retarget(a));
   for (const auto &plan : plans) {
+    auto &localNames=plan.config.names;
+    unsigned inputs=plan.config.inputs(), count=localNames.size();
     NamedAttrList newBridge(cast<DictionaryAttr>(annotations[plan.annotationIndex]));
     newBridge.set("target", b.getStringAttr(newPrefix + "|" + plan.engineName + ">hPort"));
     annotations[plan.annotationIndex] = newBridge.getDictionary(context);
-    for (unsigned j = 0; j < 12; ++j) {
+    for (unsigned j = 0; j < count; ++j) {
       NamedAttrList channel(cast<DictionaryAttr>(annotations[plan.channelIndices[j]]));
-      channel.set(j >= 10 ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(newPrefix + "|" + plan.engineName + ">hPort.hBits." + localNames[j].str())}));
+      channel.set(j >= inputs ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(newPrefix + "|" + plan.engineName + ">hPort.hBits." + localNames[j])}));
       annotations[plan.channelIndices[j]] = channel.getDictionary(context);
     }
   }

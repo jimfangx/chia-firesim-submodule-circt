@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FASEDReadDeinterleaver.h"
+#include "HostMemoryProfileChecks.h"
 #include "goldengate/FASEDAddressTranslation.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
@@ -222,6 +223,9 @@ int main(int argc,char **argv) {
       llvm::outs()<<"PASS expanded Print/Rocket deinterleaver SSA behavior\n";
       return 0;
     }
+    checkHostMemoryProfiles(ctx,[&](){auto r=fixture(ctx);std::string error;
+      require(succeeded(goldengate::addFASEDAddressTranslation(*r->getOps<CircuitOp>().begin(),error)),error);return r;},
+      goldengate::addFASEDReadDeinterleaver);
     auto root=fixture(ctx);auto circuit=*root->getOps<CircuitOp>().begin();std::string error;
     require(succeeded(goldengate::addFASEDAddressTranslation(circuit,error)),error);
     auto wrapper=top(circuit,"GGFASEDAddressTranslationWrapper");auto annotations=circuit->getAttr("rawAnnotations");
@@ -239,7 +243,7 @@ int main(int argc,char **argv) {
       auto t=top(c,"GGFASEDAddressTranslationWrapper");OpBuilder b(&ctx);
       if(bad<6){auto e=top(c,"GGFASEDTokenEngine");auto key=e->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
         bool width=bad<3;StringRef ns[]{"addrBits","dataBits","idBits","maxReadTransfer","idReuse","maxFlight"};
-        StringRef dict=width?"axi4Widths":"axi4Edge";NamedAttrList d(key.getAs<DictionaryAttr>(dict));d.set(ns[bad],b.getI64IntegerAttr(99));
+        StringRef dict=width?"axi4Widths":"axi4Edge";NamedAttrList d(key.getAs<DictionaryAttr>(dict));d.set(ns[bad],b.getI64IntegerAttr(bad==5?0:99));
         NamedAttrList k(key);k.set(dict,d.getDictionary(&ctx));e->setAttr("goldengate.bridgeConstructor",k.getDictionary(&ctx));
       } else if(bad==6)c->removeAttr("rawAnnotations");
       else if(bad==7){for(auto x:t.getOps<ConnectOp>())if(auto i=x.getDest().getDefiningOp<InstanceOp>())if(i.getName()=="translation"&&cast<OpResult>(x.getDest()).getResultNumber()==2){x.erase();break;}}

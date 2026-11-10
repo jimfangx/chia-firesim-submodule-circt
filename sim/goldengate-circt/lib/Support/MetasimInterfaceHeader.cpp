@@ -69,7 +69,7 @@ std::string cString(StringRef text) {
 } // namespace
 
 LogicalResult goldengate::prepareMetasimInterfaceHeader(
-    CircuitOp circuit, StringRef targetName, std::string &error) {
+    CircuitOp circuit, StringRef targetName, std::string &error, bool isF2) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw || targetName.empty() || targetName.contains('\0'))
@@ -80,7 +80,7 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
     if (module.getName() == "F1Shim") shim = module;
   }
   if (circuit.getName() != "F1Shim" || !top || !shim || top.getNumPorts() != 5)
-    return reject("metasim header requires the U250 F1Shim/FPGATop boundary");
+    return reject("metasim header requires the F1Shim/FPGATop boundary");
   AXIConfig ctrl{}, memory{}, cpu{};
   unsigned clocks = 0, resets = 0, controls = 0, memories = 0, cpus = 0;
   for (auto port : top.getPorts()) {
@@ -126,7 +126,22 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
       return reject("inconsistent physical QSFP payload width or direction");
     qsfpWidth = bits->second.width; ++qsfpPorts;
   }
-  if (qsfpPorts != 2) return reject("missing physical QSFP width for metasim header");
+  if (isF2) {
+    if (qsfpPorts) return reject("F2 must not expose physical QSFP ports");
+    unsigned pcimPorts = 0;
+    for (auto port : shim.getPorts()) {
+      if (port.name.getValue() != "io_pcim") continue;
+      AXIConfig pcim{};
+      if (!analyzeAXI(port, true, pcim) || pcim.id != 6 ||
+          pcim.addr != 64 || pcim.data != 512)
+        return reject("invalid F2 physical PCIM geometry");
+      ++pcimPorts;
+    }
+    if (pcimPorts != 1) return reject("F2 requires one physical PCIM port");
+    // FPGATopQSFPBitWidth retains its default even with no physical ports.
+    qsfpWidth = 256;
+  } else if (qsfpPorts != 2)
+    return reject("missing physical QSFP width for metasim header");
   for (auto annotation : raw) {
     auto dict = dyn_cast<DictionaryAttr>(annotation);
     auto cls = dict ? dict.getAs<StringAttr>("class") : StringAttr();
@@ -134,7 +149,8 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
     if (cls.getValue() == AnnotationClasses::OutputFile) {
       auto suffix = dict.getAs<StringAttr>("fileSuffix");
       if (suffix && (suffix.getValue() == ".const.h" ||
-                     suffix.getValue() == ".const.vh"))
+                     suffix.getValue() == ".const.vh" ||
+                     suffix.getValue() == ".partition.const.h"))
         return reject("metasim header output already exists");
     }
   }
@@ -185,6 +201,15 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
   verilog.flush();
   OpBuilder builder(circuit.getContext());
   SmallVector<Attribute> annotations(raw.begin(), raw.end());
+  // The supported physical boundary is unpartitioned (five FPGATop ports).
+  // SimulationMapping still emits this header when no widget contributes
+  // partition constants. Never depend on a stale Scala-generated sidecar.
+  annotations.push_back(builder.getDictionaryAttr({
+      builder.getNamedAttr("class", builder.getStringAttr(AnnotationClasses::OutputFile)),
+      builder.getNamedAttr("fileSuffix", builder.getStringAttr(".partition.const.h")),
+      builder.getNamedAttr("body", builder.getStringAttr(
+          "// Golden Gate-generated Partition Switch Header\n"
+          "// This file encodes partition interface widths.\n"))}));
   annotations.push_back(builder.getDictionaryAttr({
       builder.getNamedAttr("class", builder.getStringAttr(AnnotationClasses::OutputFile)),
       builder.getNamedAttr("fileSuffix", builder.getStringAttr(".const.vh")),

@@ -263,11 +263,14 @@ void mapping(MLIRContext &context, bool clockFirst) {
   require(hostConnections == 2 && tokenConnections == 1 && mcrConnections == 1, "clock producer is disconnected");
   auto regs = producer->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
   require(regs && regs.size() == 6, "MCR map missing");
+  static constexpr llvm::StringRef expectedNames[] = {
+      "hCycle_0", "hCycle_1", "hCycle_latch", "tCycle_0", "tCycle_1", "tCycle_latch"};
   for (auto [i, entry] : llvm::enumerate(regs)) {
     auto d = cast<DictionaryAttr>(entry);
-    require(d.getAs<IntegerAttr>("offset").getInt() == i * 4 &&
+    require(d.getAs<StringAttr>("name").getValue() == expectedNames[i] &&
+            d.getAs<IntegerAttr>("offset").getInt() == i * 4 &&
             d.getAs<BoolAttr>("readable").getValue() == (i % 3 != 2) &&
-            d.getAs<BoolAttr>("writeable").getValue() == (i % 3 == 2), "MCR offsets/permissions mismatch");
+            d.getAs<BoolAttr>("writeable").getValue() == (i % 3 == 2), "MCR names/offsets/permissions mismatch");
   }
   auto after = c->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto channel = cast<DictionaryAttr>(after[0]);

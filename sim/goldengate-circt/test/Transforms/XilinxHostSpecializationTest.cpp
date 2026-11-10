@@ -179,7 +179,25 @@ int main(int argc, char **argv) {
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::chirrtl::CHIRRTLDialect, circt::hw::HWDialect>();
     auto root = fixture(context); auto circuit = *root->getOps<CircuitOp>().begin(); checkSpecialization(circuit);
     std::string error; auto before = dump(*root);
-    require(failed(goldengate::specializeXilinxClockGates(circuit, error)) && before == dump(*root), "repeat specialization changed IR");
+    require(succeeded(goldengate::specializeXilinxClockGates(circuit, error)) && before == dump(*root), "repeat specialization changed IR");
+    // A later pipeline stage may add another abstract gate after FAME5 already
+    // created BUFGCE. Reuse the exact generated primitive, without duplicating
+    // definitions or disturbing existing specialized instances.
+    bool restoredGate = false;
+    circuit.walk([&](InstanceOp instance) {
+      if (!restoredGate && instance.getModuleName() == "BUFGCE") {
+        instance.setModuleName("Alias"); restoredGate = true;
+      }
+    });
+    require(restoredGate, "missing specialized gate for incremental check");
+    checkSpecialization(circuit);
+    auto generated = external(circuit, "BUFGCE");
+    auto defname = generated->getAttr("defname");
+    generated->setAttr("defname", StringAttr::get(&context, "UnknownBuffer"));
+    before = dump(*root);
+    require(failed(goldengate::specializeXilinxClockGates(circuit, error)) && before == dump(*root),
+            "malformed marked buffer reused or mutated on rejection");
+    generated->setAttr("defname", defname);
     for (unsigned mode = 0; mode < 5; ++mode) {
       auto bad = fixture(context); auto bc = *bad->getOps<CircuitOp>().begin(); OpBuilder b(&context); auto alias = external(bc, "Alias");
       if (mode < 2) {
@@ -200,7 +218,7 @@ int main(int argc, char **argv) {
     auto empty = parseSourceString<ModuleOp>("module { firrtl.circuit \"Empty\" { firrtl.module @Empty() {} } }", &context);
     require(bool(empty), "empty parse"); auto ec = *empty->getOps<CircuitOp>().begin();
     require(succeeded(goldengate::specializeXilinxClockGates(ec, error)) && succeeded(verify(*empty)) && external(ec, "BUFGCE"), "zero-instance declaration");
-    llvm::outs() << "Aliased/nested instances, unrelated defname, empty circuit; six atomic rejections passed\n";
+    llvm::outs() << "Aliased/nested instances, canonical repeated specialization, unrelated defname, empty circuit; six atomic rejections passed\n";
     if (argc == 3) {
       auto real = parseSourceFile<ModuleOp>(argv[1], &context); require(bool(real), "real boundary parse"); auto rc = *real->getOps<CircuitOp>().begin();
       checkSpecialization(rc); llvm::SmallString<256> path(argv[2]);

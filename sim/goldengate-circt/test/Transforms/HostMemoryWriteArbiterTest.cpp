@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/HostMemoryWriteArbiter.h"
+#include "HostMemoryProfileChecks.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "mlir/IR/Builders.h"
@@ -229,6 +230,7 @@ int main(int argc,char **argv) {
       llvm::outs()<<"PASS actual expanded Print host write arbiter SSA and source queue\n";
       return 0;
     }
+    checkHostMemoryProfiles(ctx,[&](){return fixture(ctx);},goldengate::addHostMemoryWriteArbiter);
     auto before=dump(top(c,"GGFASEDAddressTranslationWrapper"));std::string error;
     require(succeeded(goldengate::addHostMemoryWriteArbiter(c,error)),error);require(succeeded(verify(*root)),"IR verifier");
     require(before==dump(top(c,"GGFASEDAddressTranslationWrapper")),"inner module changed");

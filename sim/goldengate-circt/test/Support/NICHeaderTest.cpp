@@ -48,50 +48,69 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
 // The bank is produced by the native hardware transform. Synthetic bindings
 // isolate header allocation from the much larger platform; production replay
 // below uses the complete independently validated CPU/MMIO transport instead.
-OwningOpRef<ModuleOp> allocated(MLIRContext &ctx) {
+OwningOpRef<ModuleOp> allocated(MLIRContext &ctx, unsigned nics = 1) {
   auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin();
   OpBuilder b(&ctx); std::string error;
+  if (nics > 1) {
+    auto old=named(c,c.getName()); auto original=old.getPorts();
+    SmallVector<PortInfo> ports{original[0],original[1]};
+    for(unsigned i=0;i<nics;++i)for(unsigned j=2;j<10;++j) {
+      auto p=original[j]; p.name=b.getStringAttr("nic"+std::to_string(i)+"_"+p.name.getValue().drop_front(4).str()); ports.push_back(p);
+    }
+    old.erase(); b.setInsertionPointToEnd(c.getBodyBlock());
+    b.create<FModuleOp>(c.getLoc(),b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ports);
+  }
   auto output = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::OutputFile)),
     b.getNamedAttr("fileSuffix",b.getStringAttr(".const.h")),b.getNamedAttr("body",b.getStringAttr("previous\n")),
     b.getNamedAttr("goldengate.cpuManagedStreamHeader",b.getBoolAttr(true))});
   auto nic = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::BridgeIO)),
     b.getNamedAttr("widgetClass",b.getStringAttr("firechip.goldengateimplementations.SimpleNICBridgeModule"))});
-  c->setAttr("rawAnnotations",b.getArrayAttr({output,nic}));
+  SmallVector<Attribute> raw{output}; for(unsigned i=0;i<nics;++i)raw.push_back(nic);
+  c->setAttr("rawAnnotations",b.getArrayAttr(raw));
   require(succeeded(goldengate::addNICMMIOBank(c,error)),error);
   auto top = named(c,c.getName());
   auto queue = goldengate::createCPUStreamQueue3072(c,"GGNICCPUStreamQueue3072");
   b.setInsertionPointToEnd(c.getBodyBlock());
   auto owner = b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGNICCPUStreamQueuesWrapper"),top.getConventionAttr(),ArrayRef<PortInfo>{});
   b.setInsertionPointToStart(owner.getBodyBlock());
-  for (bool incoming : {false,true}) {
-    auto inst = b.create<InstanceOp>(c.getLoc(),queue,incoming ? "incoming" : "outgoing");
+  for (unsigned i=0;i<nics;++i) for (bool incoming : {false,true}) {
+    auto index=nics==1?3:i*4+3;
+    auto stream="SIMPLENICBRIDGEMODULE_"+std::to_string(index)+(incoming?"_from_cpu_stream":"_to_cpu_stream");
+    auto inst = b.create<InstanceOp>(c.getLoc(),queue,(incoming ? "incoming" : "outgoing")+std::to_string(i));
     inst->setAttr("goldengate.streamParameters",b.getDictionaryAttr({
-      b.getNamedAttr("name",b.getStringAttr(incoming ? "SIMPLENICBRIDGEMODULE_3_from_cpu_stream" : "SIMPLENICBRIDGEMODULE_3_to_cpu_stream")),
+      b.getNamedAttr("name",b.getStringAttr(stream)),
       b.getNamedAttr("direction",b.getStringAttr(incoming ? "fromHostCPU" : "toHostCPU")),
       b.getNamedAttr("depth",b.getI64IntegerAttr(3072)),b.getNamedAttr("widthBytes",b.getI64IntegerAttr(64))}));
   }
   b.setInsertionPointToEnd(c.getBodyBlock());
   auto decoder = b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGControlAddressDecode"),top.getConventionAttr(),ArrayRef<PortInfo>{
     {b.getStringAttr("addr"),UIntType::get(&ctx,25,false),Direction::In}});
-  auto region = b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr("SimpleNICBridgeModule_3")),
-    b.getNamedAttr("slave",b.getI32IntegerAttr(0)),b.getNamedAttr("start",b.getI64IntegerAttr(4096)),b.getNamedAttr("size",b.getI64IntegerAttr(32))});
-  decoder->setAttr("goldengate.controlRegions",b.getArrayAttr({region}));
+  SmallVector<Attribute> regions, bindings;
+  for(unsigned i=0;i<nics;++i) {
+    auto widget="SimpleNICBridgeModule_"+std::to_string(nics==1?3:i*4+3);
+    regions.push_back(b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(widget)),
+      b.getNamedAttr("slave",b.getI32IntegerAttr(i)),b.getNamedAttr("start",b.getI64IntegerAttr(4096+i*64)),b.getNamedAttr("size",b.getI64IntegerAttr(32))}));
+    bindings.push_back(b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(widget)),
+      b.getNamedAttr("port",b.getStringAttr(nics==1?"nicBridge_ctrl":"nicBridge_"+std::to_string(i)+"_ctrl")),b.getNamedAttr("slave",b.getI32IntegerAttr(i))}));
+  }
+  decoder->setAttr("goldengate.controlRegions",b.getArrayAttr(regions));
   SmallVector<FModuleOp> helpers{decoder,owner};
-  auto binding = b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr("SimpleNICBridgeModule_3")),
-    b.getNamedAttr("port",b.getStringAttr("nicBridge_ctrl")),b.getNamedAttr("slave",b.getI32IntegerAttr(0))});
   for (auto pair : {std::make_pair("GGControlWidgetWriteWrapper","goldengate.controlWriteBindings"),
       std::make_pair("GGControlReadDispatchWrapper","goldengate.controlReadBindings")}) {
     auto m = b.create<FModuleOp>(c.getLoc(),b.getStringAttr(pair.first),top.getConventionAttr(),ArrayRef<PortInfo>{});
-    m->setAttr(pair.second,b.getArrayAttr({binding})); helpers.push_back(m);
+    m->setAttr(pair.second,b.getArrayAttr(bindings)); helpers.push_back(m);
   }
   for (bool incoming : {false,true}) {
     auto m = b.create<FModuleOp>(c.getLoc(),b.getStringAttr(incoming ? "GGCPUStreamWrite" : "GGCPUStreamRead"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     SmallVector<Attribute> streams;
-    // NIC indices deliberately differ between directions and are nonzero.
-    for (unsigned i = 0; i <= (incoming ? 2U : 1U); ++i) {
-      bool last = i == (incoming ? 2U : 1U);
+    // Per-direction indices deliberately differ, with unrelated sources.
+    unsigned count=incoming?3:(nics==1?2:4);
+    for (unsigned i=0;i<count;++i) {
+      std::string name="other"+std::to_string(i);
+      if((incoming&&i==2)||(!incoming&&i==1))name="SIMPLENICBRIDGEMODULE_3"+std::string(incoming?"_from_cpu_stream":"_to_cpu_stream");
+      if(nics==2&&((incoming&&i==0)||(!incoming&&i==3)))name="SIMPLENICBRIDGEMODULE_7"+std::string(incoming?"_from_cpu_stream":"_to_cpu_stream");
       streams.push_back(b.getDictionaryAttr({
-        b.getNamedAttr("name",b.getStringAttr(last ? (incoming ? "SIMPLENICBRIDGEMODULE_3_from_cpu_stream" : "SIMPLENICBRIDGEMODULE_3_to_cpu_stream") : "other")),
+        b.getNamedAttr("name",b.getStringAttr(name)),
         b.getNamedAttr("index",b.getI64IntegerAttr(i)),b.getNamedAttr("depth",b.getI64IntegerAttr(3072)),b.getNamedAttr("widthBytes",b.getI64IntegerAttr(64))}));
     }
     m->setAttr(incoming ? "goldengate.sinkStreams" : "goldengate.sourceStreams",b.getArrayAttr(streams)); helpers.push_back(m);
@@ -100,6 +119,37 @@ OwningOpRef<ModuleOp> allocated(MLIRContext &ctx) {
   for (auto m : helpers) b.create<InstanceOp>(c.getLoc(),m,m.getName());
   return root;
 }
+void multi(MLIRContext &ctx) {
+  std::string error;
+  for(unsigned bad=0;bad<7;++bad) {
+    auto root=allocated(ctx,2);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
+    if(bad==1) {
+      auto m=named(c,"GGControlReadDispatchWrapper"); auto rows=llvm::to_vector(m->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings"));
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));row.set("name",b.getStringAttr("SimpleNICBridgeModule_3"));rows[1]=row.getDictionary(&ctx);m->setAttr("goldengate.controlReadBindings",b.getArrayAttr(rows));
+    }
+    if(bad==2) {
+      auto m=named(c,"GGControlAddressDecode");auto rows=llvm::to_vector(m->getAttrOfType<ArrayAttr>("goldengate.controlRegions"));
+      NamedAttrList row(cast<DictionaryAttr>(rows[1]));row.set("start",b.getI64IntegerAttr(4100));rows[1]=row.getDictionary(&ctx);m->setAttr("goldengate.controlRegions",b.getArrayAttr(rows));
+    }
+    if(bad==3||bad==4) {
+      auto m=named(c,bad==3?"GGCPUStreamRead":"GGCPUStreamWrite");StringRef key=bad==3?"goldengate.sourceStreams":"goldengate.sinkStreams";
+      auto rows=llvm::to_vector(m->getAttrOfType<ArrayAttr>(key));unsigned i=bad==3?3:0;
+      NamedAttrList row(cast<DictionaryAttr>(rows[i]));row.set("name",b.getStringAttr("missing"));rows[i]=row.getDictionary(&ctx);m->setAttr(key,b.getArrayAttr(rows));
+    }
+    if(bad==5) {auto m=named(c,"GGNICCPUStreamQueuesWrapper");auto it=m.getOps<InstanceOp>().begin();++it;++it;(*it).erase();}
+    if(bad==6) {
+      auto rows=llvm::to_vector(c->getAttrOfType<ArrayAttr>("rawAnnotations"));NamedAttrList row(cast<DictionaryAttr>(rows.back()));row.set("widgetConstructorKey",b.getStringAttr("unsupported"));rows.back()=row.getDictionary(&ctx);c->setAttr("rawAnnotations",b.getArrayAttr(rows));
+    }
+    auto before=dump(*root);auto result=goldengate::prepareNICHeader(c,error);
+    if(bad){require(failed(result)&&dump(*root)==before,"multi header late failure accepted or mutated IR");continue;}
+    require(succeeded(result),error);require(succeeded(verify(*root)),"multi header verify");
+    auto body=cast<DictionaryAttr>(c->getAttrOfType<ArrayAttr>("rawAnnotations")[0]).getAs<StringAttr>("body").getValue();
+    require(body.contains(".macaddr_upper = 4096")&&body.contains(".macaddr_upper = 4160")&&
+      body.contains("},\n  3,\n  args,\n  1,\n  3072,\n  2,\n  3072")&&
+      body.contains("},\n  7,\n  args,\n  3,\n  3072,\n  0,\n  3072"),"multi constructor indices/address mismatch");
+  }
+}
+
 void mutate(CircuitOp c, unsigned bad) {
   OpBuilder b(c.getContext()); auto bank = named(c,"GGNICMMIOBank");
   if (bad < 24) {
@@ -194,6 +244,7 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS recorded NIC header; hardware preserved, verified FIRRTL, atomic duplicate rejection\n";
       return 0;
     }
+    multi(ctx);
     auto root = allocated(ctx); auto c = *root->getOps<CircuitOp>().begin(); auto before = c->getAttrOfType<ArrayAttr>("rawAnnotations");
     require(succeeded(goldengate::prepareNICHeader(c,error)),error);
     auto after = c->getAttrOfType<ArrayAttr>("rawAnnotations");

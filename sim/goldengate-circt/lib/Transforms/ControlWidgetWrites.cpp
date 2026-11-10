@@ -3,7 +3,9 @@
 // Connect requests and readiness through FIRRTL operations; preserve the
 // independent AW/W routes and the MCRFile's independent request capture.
 #include "goldengate/ControlWidgetWrites.h"
+#include "goldengate/ControlPortWidth.h"
 #include "goldengate/ControlAddressDecode.h"
+#include "goldengate/AutoCounterBridge.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 #include <map>
@@ -23,9 +25,6 @@ constexpr WidgetPort widgetPorts[]{
   {"CPUManagedStreamEngine_0", "cpuStream_ctrl"}};
 struct Binding { std::string widget; std::string port; unsigned slave; };
 struct Field { const char *name; unsigned width; };
-constexpr Field addressFields[]{
-  {"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
-  {"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
 constexpr Field dataFields[]{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}};
 bool dispatched(llvm::StringRef channel, llvm::StringRef field) {
   return channel == "aw" ? field == "addr" || field == "len" || field == "id"
@@ -54,15 +53,14 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr{};
   if (!top || !regions) return reject("Rocket request binding requires an active top and allocation");
   std::set<std::string> allocatedPrints, allocatedTracers;
-  bool allocatedNIC = false;
+  std::set<std::string> allocatedNICs;
   for (auto attr : regions) {
     auto row = dyn_cast<DictionaryAttr>(attr);
     auto name = row ? row.getAs<StringAttr>("name") : StringAttr{};
     if (!name) return reject("Rocket request allocation lacks a widget identity");
     if (name.getValue().starts_with("SimpleNICBridgeModule_")) {
-      if (name.getValue() != "SimpleNICBridgeModule_0" || allocatedNIC)
-        return reject("Rocket request binding supports one normal-mode NIC bank");
-      allocatedNIC = true;
+      if (!allocatedNICs.insert(name.getValue().str()).second)
+        return reject("Rocket request allocation duplicates a NIC bank");
     }
     if (name.getValue().starts_with("TracerVBridgeModule_") &&
         !allocatedTracers.insert(name.getValue().str()).second)
@@ -202,28 +200,43 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
     }
   }
   if (!allocatedPrints.empty()) return reject("Rocket request allocation contains unbound Print banks");
-  if (allocatedNIC) {
+  std::map<unsigned, FModuleOp> nics;
+  for (auto module : circuit.getOps<FModuleLike>()) {
+    auto name = module.getName();
+    if (!name.starts_with("GGNICMCRFile")) continue;
+    auto suffix = name.drop_front(StringRef("GGNICMCRFile").size()); unsigned i = 0;
+    auto native = dyn_cast<FModuleOp>(module.getOperation());
+    if ((!suffix.empty() && (!suffix.consume_front("_") || suffix.getAsInteger(10, i) ||
+         !i || suffix != std::to_string(i))) || !native || i >= 63 ||
+        !nics.emplace(i, native).second)
+      return reject("Rocket NIC request binding needs canonical independent adapter indices");
+  }
+  if (nics.size() != allocatedNICs.size())
+    return reject("Rocket request allocation must identify every instantiated NIC bank");
+  for (unsigned i = 0; i < nics.size(); ++i) {
+    auto widget = "SimpleNICBridgeModule_" + std::to_string(i);
+    auto port = nics.size() == 1 ? std::string("nicBridge_ctrl") : "nicBridge_" + std::to_string(i) + "_ctrl";
+    auto it = nics.find(i);
+    if (it == nics.end() || !allocatedNICs.erase(widget))
+      return reject("Rocket request binding requires contiguous allocated NIC identities");
     ControlMMIOWidget registry;
-    const StringRef banks[]{"GGNICMMIOBank"};
-    if (failed(deriveControlMMIOWidget(circuit, "SimpleNICBridgeModule_0",
-            "GGNICMCRFile", banks, registry, error)))
+    if (failed(deriveControlMMIOWidget(circuit, widget,
+            it->second.getName(), {"GGNICMMIOBank"}, registry, error))) return failure();
+    if (failed(validateNICControlMMIOMode(circuit, nics.size(), registry.registerCount, error)))
       return failure();
-    if (registry.registerCount != 6)
-      return reject("Rocket request binding requires the six-word normal-mode NIC bank");
     auto find = [&](StringRef name) -> FModuleOp {
-      auto it = modules.find(name.str());
-      return it == modules.end() ? FModuleOp{} : it->second;
+      auto found = modules.find(name.str());
+      return found == modules.end() ? FModuleOp{} : found->second;
     };
-    auto adapter = find("GGNICMCRFile"), owner = top;
-    if (!adapter || adapter.getNumPorts() != 4 || adapter.getPortName(2) != "nasti" ||
+    auto adapter = it->second, owner = top;
+    if (adapter.getNumPorts() != 4 || adapter.getPortName(2) != "nasti" ||
         adapter.getPortDirection(2) != Direction::In)
       return reject("Rocket NIC request binding requires the instantiated Nasti adapter");
-    // A matching bundle type alone could bind a detached port or another bank.
-    // Follow the production wrapper forwarding to the NIC adapter operand.
+    // Follow the exact constructor's crFile; identical types cannot identify
+    // independent register state. Reject aliases, detached ports and fanout.
     Value value;
     for (unsigned p = 0; p < top.getNumPorts(); ++p)
-      if (top.getPortName(p) == "nicBridge_ctrl" &&
-          top.getPortDirection(p) == Direction::In &&
+      if (top.getPortName(p) == port && top.getPortDirection(p) == Direction::In &&
           top.getPortType(p) == adapter.getPortType(2)) value = top.getArgument(p);
     bool reachesAdapter = false;
     std::set<std::pair<Operation *, unsigned>> visited;
@@ -244,7 +257,9 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
       if (!child || result.getResultNumber() >= child.getNumPorts() ||
           child.getPortDirection(result.getResultNumber()) != Direction::In) break;
       if (child == adapter) {
-        reachesAdapter = owner.getName() == "GGNICBridgeControlWrapper" &&
+        auto expectedWrapper = "GGNICBridgeControlWrapper" +
+            (i + 1 == nics.size() ? "" : "_" + std::to_string(i));
+        reachesAdapter = owner.getName() == expectedWrapper &&
                          instance.getName() == "crFile" && result.getResultNumber() == 2;
         break;
       }
@@ -252,9 +267,58 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
     }
     if (!reachesAdapter)
       return reject("Rocket NIC request port does not reach its instantiated NIC bank");
-    widgets.push_back({"SimpleNICBridgeModule_0", "nicBridge_ctrl"});
-  } else if (modules.count("GGNICMCRFile")) {
-    return reject("Rocket request allocation omits the instantiated NIC bank");
+    widgets.push_back({widget, port});
+  }
+  SmallVector<FModuleOp> csvHosts;
+  if (failed(discoverBoundAutoCounterBridgeHosts(circuit, csvHosts, error))) return failure();
+  std::set<std::string> allocatedCSV;
+  for (auto attr : regions) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr();
+    if (name && name.getValue().starts_with("AutoCounterBridgeModule_") &&
+        !allocatedCSV.insert(name.getValue().str()).second)
+      return reject("Rocket request allocation duplicates a CSV bank");
+  }
+  if (allocatedCSV.size() != csvHosts.size())
+    return reject("Rocket request allocation must identify every instantiated CSV bank");
+  for (auto [index, host] : llvm::enumerate(csvHosts)) {
+    auto widget = "AutoCounterBridgeModule_" + std::to_string(index);
+    auto port = "autocounter_" + std::to_string(index) + "_ctrl";
+    if (!allocatedCSV.erase(widget)) return reject("Rocket request allocation omits a CSV bank");
+    Value value;
+    for (unsigned p = 0; p < top.getNumPorts(); ++p)
+      if (top.getPortName(p) == port && top.getPortDirection(p) == Direction::In &&
+          top.getPortType(p) == host.getPortType(7)) value = top.getArgument(p);
+    // A matching AXI type is insufficient: prove the port reaches this exact
+    // logical widget through unique, whole-bundle forwarding at every wrapper.
+    FModuleOp owner = top;
+    bool reachesHost = false;
+    std::set<std::pair<Operation *, unsigned>> visited;
+    for (unsigned depth = 0; value && depth < 4096; ++depth) {
+      auto argument = dyn_cast<BlockArgument>(value);
+      if (!argument || !visited.emplace(owner.getOperation(), argument.getArgNumber()).second) break;
+      Value dest; unsigned drivers = 0;
+      for (auto &op : *owner.getBodyBlock()) {
+        if (auto connect = dyn_cast<ConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+        if (auto connect = dyn_cast<StrictConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+      }
+      auto result = dyn_cast_or_null<OpResult>(dest);
+      auto instance = result ? dyn_cast<InstanceOp>(result.getOwner()) : InstanceOp();
+      if (drivers != 1 || !instance) break;
+      auto found = modules.find(instance.getModuleName().str());
+      if (found == modules.end() || result.getResultNumber() >= found->second.getNumPorts() ||
+          found->second.getPortDirection(result.getResultNumber()) != Direction::In) break;
+      if (found->second == host) {
+        reachesHost = owner->hasAttr("goldengate.autocounterHostBindings") &&
+            instance.getName() == widget && result.getResultNumber() == 7;
+        break;
+      }
+      owner = found->second; value = owner.getArgument(result.getResultNumber());
+    }
+    if (!reachesHost) return reject("Rocket request port does not reach its instantiated CSV bank");
+    widgets.push_back({widget, port});
   }
   return bindControlWidgetWrites(circuit, widgets, error);
 }
@@ -291,6 +355,12 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
   SmallVector<Binding> bindings;
   std::set<std::string> widgetNames, portNames;
   if (widgets.empty()) return reject("widget write bindings must not be empty");
+  auto addressWidth = controlPortWidth(inner, widgets.front().port+".aw.bits.addr");
+  if (!addressWidth) return reject("widget writes require a typed control address boundary");
+  const unsigned addressBits = *addressWidth;
+  const Field addressFields[]{
+    {"addr",addressBits},{"len",8},{"size",3},{"burst",2},{"lock",1},
+    {"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
   for(auto widget:widgets) {
     if (widget.widget.empty() || widget.port.empty() ||
         !widgetNames.insert(widget.widget).second || !portNames.insert(widget.port).second)
@@ -332,11 +402,11 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
     auto found=old.find(binding.port);
     if(found==old.end()||inner.getPorts()[found->second].type!=controlType||
        inner.getPorts()[found->second].direction!=Direction::In)
-      return reject("widget writes require exact U250 Nasti control bundles");
+      return reject("widget writes require matching Nasti control bundles");
     controls.insert(binding.port);
     std::string prefix="ctrl_write_dispatch_slave_"+std::to_string(binding.slave)+"_";
     const Field fields[]{{"aw_ready",1},{"w_ready",1},{"aw_valid",1},
-      {"aw_bits_addr",25},{"aw_bits_len",8},{"aw_bits_id",12},
+      {"aw_bits_addr",addressBits},{"aw_bits_len",8},{"aw_bits_id",12},
       {"w_valid",1},{"w_bits_data",32},{"w_bits_last",1}};
     for(auto f:fields) {
       auto n=prefix+f.name;auto it=old.find(n);

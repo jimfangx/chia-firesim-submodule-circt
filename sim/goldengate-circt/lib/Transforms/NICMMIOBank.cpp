@@ -7,18 +7,24 @@
 // Copied targets transfer recursively; consumed control/status owners remain
 // on the retained inner module. Other module bodies and annotations survive.
 #include "goldengate/NICMMIOBank.h"
+#include "goldengate/AnnotationClasses.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
+#include <set>
+#include <map>
 using namespace mlir;
 using namespace circt::firrtl;
 
-LogicalResult goldengate::addNICMMIOBank(CircuitOp circuit, std::string &error) {
+namespace {
+LogicalResult addNICMMIOBankImpl(CircuitOp circuit, bool loopback, std::string &error) {
   constexpr llvm::StringLiteral bankName = "GGNICMMIOBank";
   constexpr llvm::StringLiteral wrapperName = "GGNICMMIOWrapper";
-  constexpr llvm::StringLiteral portName = "nicBridge_mcr";
   auto reject = [&](llvm::StringRef why) { error = why.str(); return failure(); };
-  if (circuit.getName() != "GGNICCPUStreamResponseBufferWrapper")
-    return reject("NIC MMIO requires the active buffered duplex CPU boundary");
+  if (loopback ? (circuit.getName() != "GGNICLoopbackTokenQueuesWrapper" &&
+                  circuit.getName() != "GGNICCPUStreamQueuesWrapper" &&
+                  circuit.getName() != "GGNICCPUStreamResponseBufferWrapper") :
+                 circuit.getName() != "GGNICCPUStreamResponseBufferWrapper")
+    return reject("NIC MMIO requires the active matching token/CPU boundary");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getName() == bankName || m.getName() == wrapperName)
@@ -28,26 +34,85 @@ LogicalResult goldengate::addNICMMIOBank(CircuitOp circuit, std::string &error) 
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!inner || !raw) return reject("NIC MMIO needs a top and retained annotations");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
+  SmallVector<DictionaryAttr> bridges;
+  for (auto attr : raw) {
+    auto annotation = dyn_cast<DictionaryAttr>(attr);
+    if (annotation && annotation.getAs<StringAttr>("class") == goldengate::AnnotationClasses::BridgeIO &&
+        annotation.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.SimpleNICBridgeModule") {
+      if (annotation.get("widgetConstructorKey"))
+        return reject("NIC MMIO requires constructor-free widgets");
+      bridges.push_back(annotation);
+    }
+  }
+  // The annotation-free decoded-bank unit fixture retains the original ABI.
+  unsigned nics = bridges.empty() ? 1 : bridges.size();
+  if (loopback) {
+    // Production attaches MMIO after shared CPU transport/buffers. The token
+    // owner then remains nested, rather than being the immediate active top.
+    // Resolve exactly one live owner; an unused lookalike is not evidence.
+    FModuleOp token;
+    std::map<Operation *, unsigned> counts;
+    std::set<Operation *> active;
+    bool recursive = false;
+    std::function<unsigned(FModuleOp)> count = [&](FModuleOp module) {
+      if (!active.insert(module).second) { recursive = true; return 0U; }
+      auto found = counts.find(module);
+      if (found != counts.end()) { active.erase(module); return found->second; }
+      unsigned n = module.getName() == "GGNICLoopbackTokenQueuesWrapper";
+      if (n) token = module;
+      for (auto instance : module.getOps<InstanceOp>())
+        for (auto child : circuit.getOps<FModuleOp>())
+          if (child.getName() == instance.getModuleName())
+            n = std::min(2U, n + count(child));
+      active.erase(module); counts[module] = n; return n;
+    };
+    if (count(inner) != 1 || recursive || !token)
+      return reject("NIC loopback MMIO requires a unique live token owner");
+    auto bindings = token->getAttrOfType<ArrayAttr>("goldengate.nicTokenBindings");
+    if (!bindings || bindings.size() != nics)
+      return reject("NIC loopback MMIO requires every token binding");
+    for (auto [widget, a] : llvm::enumerate(bindings)) {
+      auto row = dyn_cast<DictionaryAttr>(a);
+      auto index = row ? row.getAs<IntegerAttr>("widget") : IntegerAttr();
+      auto mode = row ? row.getAs<StringAttr>("mode") : StringAttr();
+      if (!index || index.getInt() != widget || !mode || mode != "compile_time_loopback")
+        return reject("NIC loopback MMIO requires ordered compile-time loopback widgets");
+    }
+  }
+  auto controlName = [&](unsigned widget) {
+    return nics == 1 ? std::string("nicBridge_mcr") : "nicBridge_" + std::to_string(widget) + "_mcr";
+  };
+  auto externalName = [&](unsigned widget, StringRef original) {
+    return nics == 1 ? original.str() : "nic" + std::to_string(widget) + original.drop_front(3).str();
+  };
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   auto bit = uint(1);
   const llvm::StringRef signals[]{"nic_macAddr", "nic_rlimit_inc", "nic_rlimit_period",
       "nic_rlimit_size", "nic_pauser_threshold", "nic_pauser_quanta", "nic_pauser_refresh", "nic_done"};
   const unsigned widths[]{48, 8, 8, 8, 16, 16, 16, 1};
-  SmallVector<unsigned> consumed;
-  for (unsigned j = 0; j < 8; ++j) {
+  std::set<unsigned> consumed;
+  SmallVector<SmallVector<unsigned>> widgets;
+  for (unsigned widget = 0; widget < nics; ++widget) {
+  SmallVector<unsigned> ports;
+  for (unsigned j = loopback ? 7 : 0; j < 8; ++j) {
     std::optional<unsigned> found;
-    for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (p.name == signals[j]) {
+    for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (p.name == externalName(widget, signals[j])) {
       if (found || p.type != uint(widths[j]) ||
           p.direction != (j == 7 ? Direction::Out : Direction::In))
         return reject("NIC MMIO control/status width or direction differs");
       found = i;
     }
     if (!found) return reject("NIC MMIO control/status port is missing");
-    consumed.push_back(*found);
+    if (!consumed.insert(*found).second)
+      return reject("NIC MMIO widgets share a control/status port");
+    ports.push_back(*found);
+  }
+  widgets.push_back(std::move(ports));
   }
   std::optional<unsigned> clock, reset;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
-    if (p.name == portName) return reject("NIC decoded MCR port already exists");
+    for (unsigned widget = 0; widget < nics; ++widget)
+      if (p.name == controlName(widget)) return reject("NIC decoded MCR port already exists");
     if (p.name == "hostClock" && isa<ClockType>(p.type) && p.direction == Direction::In) clock = i;
     if (p.name == "hostReset" && p.type == bit && p.direction == Direction::In) reset = i;
   }
@@ -59,12 +124,14 @@ LogicalResult goldengate::addNICMMIOBank(CircuitOp circuit, std::string &error) 
   // Validate the entire boundary before introducing FIRRTL operations.
   auto token = BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit},
       {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, uint(32)}});
-  auto words = FVectorType::get(token, 6);
+  unsigned count = loopback ? 1 : 6;
+  unsigned doneWord = count - 1, donePort = loopback ? 2 : 9, mcrPort = donePort + 1;
+  auto words = FVectorType::get(token, count);
   auto mcr = BundleType::get(ctx, {{b.getStringAttr("read"), false, words},
       {b.getStringAttr("write"), true, words}, {b.getStringAttr("wstrb"), true, uint(4)}});
   SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
       {b.getStringAttr("reset"), bit, Direction::In}};
-  for (unsigned j = 0; j < 8; ++j)
+  for (unsigned j = loopback ? 7 : 0; j < 8; ++j)
     bankPorts.push_back({b.getStringAttr(signals[j]), uint(widths[j]), j == 7 ? Direction::In : Direction::Out});
   bankPorts.push_back({b.getStringAttr("mcr"), mcr, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
@@ -72,57 +139,76 @@ LogicalResult goldengate::addNICMMIOBank(CircuitOp circuit, std::string &error) 
       ConventionAttr::get(ctx, Convention::Internal), bankPorts);
   const llvm::StringRef names[]{"macaddr_upper", "macaddr_lower", "rlimit_settings", "pause_threshold", "pause_times", "done"};
   SmallVector<Attribute> registers;
-  for (unsigned i = 0; i < 6; ++i)
-    registers.push_back(b.getDictionaryAttr({b.getNamedAttr("name", b.getStringAttr(names[i])),
+  for (unsigned i = 0; i < count; ++i)
+    registers.push_back(b.getDictionaryAttr({b.getNamedAttr("name", b.getStringAttr(loopback ? "done" : names[i])),
         b.getNamedAttr("offset", b.getI32IntegerAttr(4*i)),
-        b.getNamedAttr("readable", b.getBoolAttr(i == 5)), b.getNamedAttr("writeable", b.getBoolAttr(true))}));
+        b.getNamedAttr("readable", b.getBoolAttr(i == doneWord)), b.getNamedAttr("writeable", b.getBoolAttr(true))}));
   bank->setAttr("goldengate.mmioRegisters", b.getArrayAttr(registers));
   b.setInsertionPointToStart(bank.getBodyBlock());
   auto arg = [&](unsigned i) { return bank.getBodyBlock()->getArgument(i); };
   auto field = [&](Value v, llvm::StringRef n) -> Value { return b.create<SubfieldOp>(loc, v, n); };
   auto slot = [&](llvm::StringRef group, unsigned i) -> Value {
-    return b.create<SubindexOp>(loc, field(arg(10), group), i);
+    return b.create<SubindexOp>(loc, field(arg(mcrPort), group), i);
   };
   auto connect = [&](Value d, Value s) { b.create<StrictConnectOp>(loc, d, s); };
   Value one = b.create<ConstantOp>(loc, bit, APInt(1, 1));
   Value zero32 = b.create<ConstantOp>(loc, uint(32), APInt(32, 0));
   SmallVector<Value> values;
-  for (unsigned i = 0; i < 6; ++i) {
-    Value reg = b.create<RegOp>(loc, uint(i == 5 ? 1 : 32), arg(0), names[i]).getResult();
+  for (unsigned i = 0; i < count; ++i) {
+    Value reg = b.create<RegOp>(loc, uint(i == doneWord ? 1 : 32), arg(0), loopback ? "done" : names[i]).getResult();
     values.push_back(reg);
     Value write = slot("write", i), read = slot("read", i);
     Value data = field(write, "bits");
-    if (i == 5) data = b.create<BitsPrimOp>(loc, data, 0, 0);
-    connect(reg, b.create<MuxPrimOp>(loc, field(write, "valid"), data, i == 5 ? arg(9) : reg));
-    connect(field(read, "bits"), i == 5 ? b.create<PadPrimOp>(loc, reg, 32).getResult() : zero32);
+    if (i == doneWord) data = b.create<BitsPrimOp>(loc, data, 0, 0);
+    connect(reg, b.create<MuxPrimOp>(loc, field(write, "valid"), data, i == doneWord ? arg(donePort) : reg));
+    connect(field(read, "bits"), i == doneWord ? b.create<PadPrimOp>(loc, reg, 32).getResult() : zero32);
     connect(field(read, "valid"), one); connect(field(write, "ready"), one);
-    if (i < 5) b.create<AssertOp>(loc, arg(0), b.create<NotPrimOp>(loc, field(read, "ready")),
+    if (i < doneWord) b.create<AssertOp>(loc, arg(0), b.create<NotPrimOp>(loc, field(read, "ready")),
         b.create<NotPrimOp>(loc, arg(1)), "NIC register is write only", ValueRange{}, "");
   }
   auto bits = [&](Value v, unsigned hi, unsigned lo) -> Value { return b.create<BitsPrimOp>(loc, v, hi, lo); };
+  if (!loopback) {
   connect(arg(2), b.create<CatPrimOp>(loc, bits(values[0], 15, 0), values[1]));
   connect(arg(3), bits(values[2], 23, 16)); connect(arg(4), bits(values[2], 15, 8)); connect(arg(5), bits(values[2], 7, 0));
   connect(arg(6), bits(values[3], 15, 0)); connect(arg(7), bits(values[4], 15, 0)); connect(arg(8), bits(values[4], 31, 16));
+  }
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) if (!llvm::is_contained(consumed, i)) {
     copied.push_back(i); ports.push_back(p);
   }
-  ports.push_back({b.getStringAttr(portName), mcr, Direction::Out});
+  unsigned firstMCR = ports.size();
+  for (unsigned widget = 0; widget < nics; ++widget)
+    ports.push_back({b.getStringAttr(controlName(widget)), mcr, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
-  auto sim = b.create<InstanceOp>(loc, inner, "sim"), mmio = b.create<InstanceOp>(loc, bank, "nicRegisters");
+  auto sim = b.create<InstanceOp>(loc, inner, "sim");
   for (auto [j, i] : llvm::enumerate(copied)) {
     auto p = inner.getPorts()[i]; Value external = wrapper.getBodyBlock()->getArgument(j);
     b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : external,
         p.direction == Direction::In ? external : sim.getResult(i));
   }
   auto outer = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(llvm::find(copied, i) - copied.begin()); };
-  connect(mmio.getResult(0), outer(*clock)); connect(mmio.getResult(1), outer(*reset));
-  for (unsigned i = 0; i < 7; ++i) connect(sim.getResult(consumed[i]), mmio.getResult(i+2));
-  connect(mmio.getResult(9), sim.getResult(consumed[7]));
-  b.create<ConnectOp>(loc, wrapper.getBodyBlock()->getArguments().back(), mmio.getResult(10));
+  SmallVector<Attribute> bindings;
+  for (auto [widget, consumedPorts] : llvm::enumerate(widgets)) {
+    auto instanceName = nics == 1 ? std::string("nicRegisters") : "nicRegisters_" + std::to_string(widget);
+    auto mmio = b.create<InstanceOp>(loc, bank, instanceName);
+    connect(mmio.getResult(0), outer(*clock)); connect(mmio.getResult(1), outer(*reset));
+    if (!loopback)
+      for (unsigned i = 0; i < 7; ++i) connect(sim.getResult(consumedPorts[i]), mmio.getResult(i+2));
+    connect(mmio.getResult(donePort), sim.getResult(consumedPorts.back()));
+    b.create<ConnectOp>(loc, wrapper.getArgument(firstMCR + widget), mmio.getResult(mcrPort));
+    NamedAttrList binding;
+    binding.set("mode", b.getStringAttr(loopback ? "compile_time_loopback" : "normal"));
+    binding.set("widget", b.getI64IntegerAttr(widget));
+    binding.set("mcr", b.getStringAttr(controlName(widget)));
+    binding.set("registers", b.getStringAttr(instanceName));
+    if (!bridges.empty()) {
+      if (auto target = bridges[widget].getAs<StringAttr>("target")) binding.set("bridgeTarget", target);
+    }
+    bindings.push_back(binding.getDictionary(ctx));
+  }
 
   std::string oldPrefix = "~" + circuit.getName().str(), newPrefix = "~" + wrapperName.str();
   std::string modulePrefix = "|" + inner.getName().str() + ">";
@@ -144,6 +230,20 @@ LogicalResult goldengate::addNICMMIOBank(CircuitOp circuit, std::string &error) 
     if (auto d = dyn_cast<DictionaryAttr>(a)) { NamedAttrList vs; for (auto v : d) vs.set(v.getName(), retarget(v.getValue())); return vs.getDictionary(ctx); }
     return a;
   };
+  wrapper->setAttr("goldengate.nicMMIOBindings", retarget(b.getArrayAttr(bindings)));
+  for (auto module : circuit.getOps<FModuleOp>())
+    for (auto key : {"goldengate.nicTokenBindings", "goldengate.nicPacketBindings",
+                     "goldengate.nicCPUStreamBindings"})
+      if (auto metadata = module->getAttr(key)) module->setAttr(key, retarget(metadata));
   circuit->setAttr("rawAnnotations", retarget(raw)); circuit.setName(wrapperName);
   return success();
+}
+
+} // namespace
+
+LogicalResult goldengate::addNICMMIOBank(CircuitOp circuit, std::string &error) {
+  return addNICMMIOBankImpl(circuit, false, error);
+}
+LogicalResult goldengate::addNICLoopbackMMIOBank(CircuitOp circuit, std::string &error) {
+  return addNICMMIOBankImpl(circuit, true, error);
 }

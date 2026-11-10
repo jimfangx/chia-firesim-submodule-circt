@@ -8,10 +8,11 @@
 namespace goldengate {
 // FPGATopImp.genHeader's GET_METASIM_INTERFACE_CONFIG section and genVHeader.
 // Analyze aggregate FPGATop/F1Shim ports before adding .const.h and .const.vh
-// output annotations. The current U250 shell has one memory channel,
-// CPU-managed AXI4, and no target QSFP/FPGA-managed endpoints. Bridge
+// output annotations. The supported U250 and F2 shells have one memory channel,
+// CPU-managed AXI4, and no target QSFP/FPGA-managed endpoints. F2 exposes
+// an inactive physical PCIM port and no physical QSFP ports. Bridge
 // constructors are emitted by separate header preparation functions.
 mlir::LogicalResult prepareMetasimInterfaceHeader(
     circt::firrtl::CircuitOp circuit, llvm::StringRef targetName,
-    std::string &error);
+    std::string &error, bool isF2 = false);
 } // namespace goldengate

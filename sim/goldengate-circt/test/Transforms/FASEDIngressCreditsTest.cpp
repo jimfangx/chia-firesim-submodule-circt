@@ -21,11 +21,12 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false, uint64_t maxFlight=10) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, bool selected=false, uint64_t maxFlight=10, unsigned baseCapacity=16) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressARQueueWrapper\" { firrtl.module @GGFASEDIngressARQueueWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse"); auto c=*root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
   OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());
+  if (baseCapacity != 16) c->setAttr("goldengate.fasedBaseCapacity", b.getI64IntegerAttr(baseCapacity));
   auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> fields){
     SmallVector<BundleType::BundleElement> e;for(auto [n,w]:fields)e.push_back({b.getStringAttr(n),false,uint(w)});
@@ -166,14 +167,14 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx, bool selected, uint64_t maxFlight) {
-  auto root=fixture(ctx,0,selected,maxFlight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx, bool selected, uint64_t maxFlight, unsigned baseCapacity = 16) {
+  auto root=fixture(ctx,0,selected,maxFlight,baseCapacity);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDIngressCredits(c,error)),error);
   require(succeeded(verify(*root)),"invalid credit IR");
   Interpreter sim(named(c,"GGFASEDIngressCredits"));SmallVector<Value> regs;
   for(auto r:sim.module.getOps<RegResetOp>())regs.push_back(r.getResult());
   require(regs.size()==2,"counter state missing");unsigned cases=0;
-  const unsigned limit=std::min<uint64_t>(16,maxFlight);
+  const unsigned limit=std::min<uint64_t>(baseCapacity,maxFlight);
   unsigned width=1;while((uint64_t(1)<<width)<=limit)++width;
   for(auto r:regs)require(sim.width(r)==width,"constructor-derived counter width differs");
   auto status=cast<BundleType>(sim.arg(7).getType());
@@ -263,6 +264,26 @@ int main(int argc, char **argv) {
       isolated.print(out);out<<'\n';out.close();isolated.erase();return 0;
     }
     require(argc==1,"usage: goldengate-fased-ingress-credits-test [ingress-credits.mlir helper.mlir]");
+    for (bool selected : {false, true}) {
+      OpBuilder b(&ctx);
+      for (Attribute bad : {Attribute(b.getStringAttr("32")), Attribute(b.getF64FloatAttr(32)),
+          Attribute(b.getI64IntegerAttr(0)), Attribute(b.getI64IntegerAttr(-1)),
+          Attribute(b.getI64IntegerAttr(20)),
+          Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 32)))}) {
+        auto root = fixture(ctx, 0, selected);
+        auto c = *root->getOps<CircuitOp>().begin();
+        c->setAttr("goldengate.fasedBaseCapacity", bad);
+        std::string before, after, error;
+        { llvm::raw_string_ostream out(before); root->print(out); }
+        require(failed(goldengate::addFASEDIngressCredits(c, error)) && !error.empty(), "invalid functional capacity accepted");
+        { llvm::raw_string_ostream out(after); root->print(out); }
+        require(before == after, "invalid functional capacity mutated IR");
+      }
+    }
+    for (bool selected : {false, true}) {
+      for (uint64_t flight : {uint64_t(10), uint64_t(20), uint64_t(64)})
+        behavior(ctx, selected, flight, 32);
+    }
     for(bool selected:{false,true}) {
       for(uint64_t maxFlight:{uint64_t(1),uint64_t(2),uint64_t(3),uint64_t(8),uint64_t(10),uint64_t(16),uint64_t(20),uint64_t(INT64_MAX)})
         behavior(ctx,selected,maxFlight);

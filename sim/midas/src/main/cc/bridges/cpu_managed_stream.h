@@ -4,6 +4,9 @@
 #define __BRIDGES_CPU_MANAGED_STREAM_H
 
 #include <functional>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
 #include <string>
 
 #include "core/stream_engine.h"
@@ -26,6 +29,20 @@ public:
   virtual uint32_t mmio_read(size_t addr) = 0;
 
   /**
+   * True only when payload reads retain the queue head and the control-bus
+   * acknowledgement below is its sole consumer. Merely supporting MMIO writes
+   * is insufficient: legacy DMA reads already dequeue their data.
+   */
+  virtual bool supports_explicit_ack() const { return false; }
+
+  /** Explicit stream acknowledgements use the control bus, never BAR data reads.
+   * Existing backends reject this optional protocol until they implement it.
+   */
+  virtual void mmio_write(size_t, uint32_t) {
+    throw std::runtime_error("CPU-managed stream explicit acknowledgement is unsupported by this backend");
+  }
+
+  /**
    * Writes a buffer to the CPU-managed AXI interface.
    */
   virtual size_t
@@ -36,6 +53,14 @@ public:
    */
   virtual size_t
   cpu_managed_axi4_read(size_t addr, char *data, size_t size) = 0;
+
+  /** Read a non-destructive head selected by an explicit-ACK stream.
+   * Backends may optimize this operation with speculative WC reads. Legacy
+   * streams never call this method; the default preserves existing providers.
+   */
+  virtual size_t cpu_managed_axi4_read_acked(size_t addr, char *data, size_t size) {
+    return cpu_managed_axi4_read(addr, data, size);
+  }
 
   /**
    * Returns the number of bytes to read in an axi4 transaction beat.
@@ -58,15 +83,18 @@ struct StreamParameters {
   uint64_t count_addr;
   uint32_t fpga_buffer_size;
   uint32_t fpga_buffer_width_bytes;
+  bool explicit_ack;
 
   StreamParameters(const std::string &stream_name,
                    uint64_t dma_addr,
                    uint64_t count_addr,
                    uint32_t fpga_buffer_size,
-                   uint32_t fpga_buffer_width_bytes)
+                   uint32_t fpga_buffer_width_bytes,
+                   bool explicit_ack = false)
       : stream_name(stream_name), dma_addr(dma_addr), count_addr(count_addr),
         fpga_buffer_size(fpga_buffer_size),
-        fpga_buffer_width_bytes(fpga_buffer_width_bytes) {}
+        fpga_buffer_width_bytes(fpga_buffer_width_bytes),
+        explicit_ack(explicit_ack) {}
 };
 
 /**
@@ -96,6 +124,7 @@ private:
 
 public:
   size_t mmio_read(size_t addr) { return io.mmio_read(addr); }
+  void mmio_write(size_t addr, uint32_t value) { io.mmio_write(addr, value); }
 
   size_t cpu_managed_axi4_write(size_t addr, const char *data, size_t size) {
     return io.cpu_managed_axi4_write(addr, data, size);
@@ -105,10 +134,16 @@ public:
     return io.cpu_managed_axi4_read(addr, data, size);
   }
 
+  size_t cpu_managed_axi4_read_acked(size_t addr, char *data, size_t size) {
+    return io.cpu_managed_axi4_read_acked(addr, data, size);
+  }
+
   // Accessors to avoid directly operating on params
   uint32_t fpga_buffer_size() { return params.fpga_buffer_size; };
   uint64_t dma_addr() { return params.dma_addr; };
   uint64_t count_addr() { return params.count_addr; };
+  bool explicit_ack() const { return params.explicit_ack; }
+  bool explicit_ack_supported() const { return io.supports_explicit_ack(); }
   uint64_t fpga_buffer_width_bytes() const {
     return params.fpga_buffer_width_bytes;
   }
@@ -144,6 +179,11 @@ public:
  */
 class CPUToFPGADriver final : public CPUManagedDriver,
                               public CPUToFPGAStreamDriver {
+  uint64_t accepted_beats = 0;
+  uint64_t blocked_pushes = 0;
+  bool reported_backpressure = false;
+  bool reported_recovery = false;
+
 public:
   CPUToFPGADriver(StreamParameters &&params, CPUManagedStreamIO &io)
       : CPUManagedDriver(std::move(params), io) {}

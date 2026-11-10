@@ -28,7 +28,7 @@ struct BindingSpec {
   LogicalResult (*bindControl)(CircuitOp, std::string &);
 };
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
-                            unsigned bad = 0, unsigned count = 11) {
+                            unsigned bad = 0, unsigned count = 11, unsigned addressBits = 25) {
   const auto &stem = spec.stem;
   const auto &widget = spec.widget;
   const std::string slot = std::to_string(spec.slave);
@@ -47,7 +47,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
     if (bad == 23 && n == "ctrl_write_dispatch_master_aw_bits_prot") input = false;
     text += ", "+std::string(input ? "in" : "out")+" %"+n+": !firrtl.uint<"+std::to_string(w)+">";
   };
-  const std::pair<const char*,unsigned> address[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
+  const std::pair<const char*,unsigned> address[]{{"addr",addressBits},{"len",8},{"size",3},{"burst",2},{"lock",1},
     {"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
   const std::pair<const char*,unsigned> data[]{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}};
   for (auto ch : {"aw","w"}) {
@@ -95,12 +95,13 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
     }
     owner->setAttr("goldengate.mmioRegisters",b.getArrayAttr(registers));
   }
-  require(succeeded(spec.mapControl(c,25,12,error)),error);
+  require(succeeded(spec.mapControl(c,addressBits,12,error)),error);
   SmallVector<Attribute> rows;
   // Moving a widget and changing its base/region size must still select the
   // matching decoder slot. Distinct rows also exercise whole-catalog checks.
-  // Large catalogs end exactly at 2^25, a legal half-open decoder endpoint.
-  const uint64_t base = count >= 31 ? (uint64_t(1)<<25)-count*0x80 : 0x1000;
+  // Large catalogs and F2 fixtures reach the typed half-open address limit.
+  const uint64_t base = count >= 31 || addressBits == 32 ?
+      (uint64_t(1)<<addressBits)-count*0x80 : 0x1000;
   for (unsigned i = 0; i < (bad == 32 ? 64 : count); ++i) rows.push_back(b.getDictionaryAttr({
     b.getNamedAttr("name",b.getStringAttr(i == spec.slave ? spec.catalogName : "Other_"+std::to_string(i))),
     b.getNamedAttr("slave",b.getI32IntegerAttr(i)),
@@ -155,12 +156,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, const BindingSpec &spec,
   return root;
 }
 void test(MLIRContext &ctx, const BindingSpec &spec, unsigned count = 11,
-          bool rejections = true) {
+          bool rejections = true, unsigned addressBits = 25) {
   const auto &stem = spec.stem;
   const std::string slot = std::to_string(spec.slave);
   const auto &widget = spec.widget;
   auto bind = spec.bindControl;
-  auto root = fixture(ctx,spec,0,count); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto root = fixture(ctx,spec,0,count,addressBits); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   auto catalog = named(c,"GGControlAddressDecode")->getAttr("goldengate.controlRegions");
   auto before = named(c,stem+"ControlWrapper"); auto portCount = before.getNumPorts();
   require(succeeded(bind(c,error)),error);
@@ -181,7 +182,7 @@ void test(MLIRContext &ctx, const BindingSpec &spec, unsigned count = 11,
   std::map<std::string,std::string> wires, expected;
   for (auto x : top.getOps<StrictConnectOp>()) require(wires.emplace(key(x.getDest()),key(x.getSrc())).second,"duplicate scalar driver");
   const std::string ctrl = "sim_"+widget+"_ctrl";
-  const std::pair<const char*,unsigned> address[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},
+  const std::pair<const char*,unsigned> address[]{{"addr",addressBits},{"len",8},{"size",3},{"burst",2},{"lock",1},
     {"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
   const std::pair<const char*,unsigned> data[]{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}};
   for (auto ch : {"aw","w"}) {
@@ -305,6 +306,7 @@ int main(int argc, char **argv) {
     unsigned cases = 0;
     for (const auto &spec : specs) {
       test(ctx,spec); ++cases;
+      test(ctx,spec,11,false,32); ++cases;
       for (unsigned count : {1u,2u,3u,11u,12u,13u,31u,63u})
         for (unsigned slot : std::set<unsigned>{0,count/2,count-1}) {
           auto shifted = spec; shifted.slave = slot;

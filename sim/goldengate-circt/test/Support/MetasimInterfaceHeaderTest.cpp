@@ -4,6 +4,7 @@
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 #include "mlir/Parser/Parser.h"
@@ -42,19 +43,23 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned bad = 0) {
   auto module = parseSourceString<ModuleOp>(text, &context);
   require(bool(module), "fixture parse"); return module;
 }
-std::string run(CircuitOp circuit, StringRef name) {
+std::string run(CircuitOp circuit, StringRef name, bool isF2=false) {
   SmallVector<std::string> bodies;
   for (auto module : circuit.getOps<FModuleLike>()) bodies.push_back(dump(module.getOperation()));
   auto archive = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   std::string error;
-  require(succeeded(goldengate::prepareMetasimInterfaceHeader(circuit, name, error)), error);
+  require(succeeded(goldengate::prepareMetasimInterfaceHeader(circuit, name, error, isF2)), error);
   auto result = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  require(result.size() == archive.size() + 2, "header annotation count");
+  require(result.size() == archive.size() + 3, "header annotation count");
   for (unsigned i = 0; i < archive.size(); ++i)
     require(archive[i] == result[i], "changed existing annotation");
   unsigned i = 0;
   for (auto module : circuit.getOps<FModuleLike>())
     require(bodies[i++] == dump(module.getOperation()), "changed circuit semantics");
+  auto partition = cast<DictionaryAttr>(result[archive.size()]);
+  require(partition.getAs<StringAttr>("fileSuffix") == ".partition.const.h" &&
+      partition.getAs<StringAttr>("body") == "// Golden Gate-generated Partition Switch Header\n"
+          "// This file encodes partition interface widths.\n", "unpartitioned header differs");
   auto verilog = cast<DictionaryAttr>(result[result.size() - 2]);
   require(verilog.getAs<StringAttr>("class").getValue() == goldengate::AnnotationClasses::OutputFile &&
           verilog.getAs<StringAttr>("fileSuffix").getValue() == ".const.vh", "Verilog header output annotation");
@@ -92,21 +97,57 @@ int main(int argc, char **argv) {
          ".fpga_managed = std::nullopt", ".qsfp = FPGATopQSFPConfig{512, 0}",
          ".target_name = \"Quoted\\\"\\\\\\012Target\"", "#undef GET_METASIM_INTERFACE_CONFIG"})
       require(StringRef(body).contains(expected), "typed configuration or C string escaping");
+    auto f2 = fixture(context);
+    auto f2c = *f2->getOps<CircuitOp>().begin();
+    FModuleOp oldShim;
+    for(auto m:f2c.getOps<FModuleOp>())if(m.getName()=="F1Shim")oldShim=m;
+    oldShim.erase();
+    OpBuilder builder(&context);builder.setInsertionPointToEnd(f2c.getBodyBlock());
+    // The no-peer-stream FPGA top still has no FPGA-managed endpoint; only
+    // the physical shell exposes the inactive PCIM interface.
+    auto pcimType = parseType(axi(6,64,512,0), &context);
+    require(bool(pcimType),"F2 PCIM fixture type");
+    SmallVector<PortInfo> pcimPorts{{builder.getStringAttr("io_pcim"),pcimType,Direction::Out}};
+    auto f2shim=builder.create<FModuleOp>(f2c.getLoc(),builder.getStringAttr("F1Shim"),
+        ConventionAttr::get(&context,Convention::Internal),pcimPorts);
+    std::string f2error, f2before=dump(*f2);
+    require(failed(goldengate::prepareMetasimInterfaceHeader(f2c,"F2Target",f2error)) &&
+            f2before==dump(*f2),"F2 header accepted as U250 or mutated on failure");
+    auto missingPcim=cast<ModuleOp>(f2->clone());
+    auto missingCircuit=*missingPcim.getOps<CircuitOp>().begin();
+    for(auto m:missingCircuit.getOps<FModuleOp>())if(m.getName()=="F1Shim") {
+      m.erase(); break;
+    }
+    builder.setInsertionPointToEnd(missingCircuit.getBodyBlock());
+    builder.create<FModuleOp>(missingCircuit.getLoc(),builder.getStringAttr("F1Shim"),
+        ConventionAttr::get(&context,Convention::Internal),ArrayRef<PortInfo>{});
+    auto missingBefore=dump(missingPcim);
+    require(failed(goldengate::prepareMetasimInterfaceHeader(missingCircuit,"F2Target",f2error,true)) &&
+            missingBefore==dump(missingPcim),"missing F2 PCIM accepted or mutated on failure");
+    missingPcim.erase();
+    auto f2body=run(f2c,"F2Target",true);
+    require(StringRef(f2body).contains(".qsfp = FPGATopQSFPConfig{256, 0}") &&
+            StringRef(f2body).contains(".fpga_managed = std::nullopt"),"F2 default QSFP width and absent peer stream endpoint");
+    auto f2raw=f2c->getAttrOfType<ArrayAttr>("rawAnnotations");
+    auto f2vh=cast<DictionaryAttr>(f2raw[f2raw.size()-2]).getAs<StringAttr>("body").getValue();
+    require(f2vh.contains("`define QSFP_DATA_BITS 256\n") &&
+            !f2vh.contains("FPGA_MANAGED_AXI4_PRESENT") && !f2vh.contains("QSFP_HAS_CHANNEL"),"F2 no-peer-stream macros");
     std::string error, before = dump(*positive);
     require(failed(goldengate::prepareMetasimInterfaceHeader(circuit, "FireSim", error)) &&
             dump(*positive) == before, "duplicate output changed IR");
-    for (unsigned bad = 1; bad <= 8; ++bad) {
+    for (unsigned bad = 1; bad <= 9; ++bad) {
       auto negative = fixture(context, bad);
       auto c = *negative->getOps<CircuitOp>().begin();
       if (bad == 4) c->removeAttr("rawAnnotations");
       if (bad == 5) c.setNameAttr(StringAttr::get(&context, "OtherTop"));
-      if (bad == 7 || bad == 8) {
+      if (bad == 7 || bad == 8 || bad == 9) {
         OpBuilder builder(&context);
         auto raw = c->getAttrOfType<ArrayAttr>("rawAnnotations");
         SmallVector<Attribute> retained(raw.begin(), raw.end());
         retained.push_back(builder.getDictionaryAttr({
             builder.getNamedAttr("class", builder.getStringAttr(goldengate::AnnotationClasses::OutputFile)),
-            builder.getNamedAttr("fileSuffix", builder.getStringAttr(bad == 7 ? ".const.vh" : ".const.h")),
+            builder.getNamedAttr("fileSuffix", builder.getStringAttr(
+                bad == 9 ? ".partition.const.h" : bad == 7 ? ".const.vh" : ".const.h")),
             builder.getNamedAttr("body", builder.getStringAttr("existing\n"))}));
         c->setAttr("rawAnnotations", builder.getArrayAttr(retained));
       }
@@ -115,7 +156,10 @@ int main(int argc, char **argv) {
               dump(*negative) == before, "invalid input changed IR");
     }
     llvm::outs() << "Metasim header: varied typed widths, original target escaping, zero target QSFP endpoints; ID/data/QSFP mismatches and missing metadata fail without mutation\n";
-    if (argc == 3) {
+    if (argc == 3 && StringRef(argv[1]) == "--f2-collateral") {
+      require(succeeded(goldengate::emitOutputFiles(
+          f2c, argv[2], "FireSim-generated", error)), error);
+    } else if (argc == 3) {
       auto boundary = parseSourceFile<ModuleOp>(argv[1], &context);
       require(bool(boundary), "boundary parse");
       require(succeeded(verify(*boundary)), "invalid production input IR");

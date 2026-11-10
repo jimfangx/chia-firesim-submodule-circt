@@ -113,6 +113,14 @@ mlir::LogicalResult bindPrintBridgeTracerV(
 // each Print's implemented six-word MCR bank before allocation. Stage both
 // transport and count binding so a failure leaves the entire circuit unchanged.
 // Global MMIO dispatch, CPU write transport and driver assembly follow later.
+// Append bound Print sources to a complete production DMA catalog without
+// constructing transport. Counts already contain preceding source counts then
+// sink counts; insert Print counts between those groups, preserving sink order.
+// Validate live host forwarding and leave both lists and IR unchanged on failure.
+mlir::LogicalResult appendPrintBridgeCPUStreamPorts(
+    circt::firrtl::CircuitOp circuit,
+    llvm::SmallVectorImpl<CPUStreamSourcePort> &sources,
+    llvm::SmallVectorImpl<CPUStreamCountPort> &counts, std::string &error);
 mlir::LogicalResult mapPrintBridgeCPUStreams(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<CPUStreamSourcePort> precedingSources,
@@ -128,7 +136,8 @@ mlir::LogicalResult mapPrintBridgeTracerVControl(
 // Allocate implemented Print configuration banks and the live CPU count bank
 // through native MMIO AW/W/AR dispatch. Input: GGCPUStreamCountWrapper.
 // Stage and verify the whole composition; response arbitration and driver
-// address collateral remain separate boundaries. Fixed U250 Nasti widths.
+// address collateral remain separate boundaries. Preserve the live host AXI
+// address width: U250 25 bits or F2 32 bits.
 mlir::LogicalResult mapPrintBridgeControlDispatch(
     circt::firrtl::CircuitOp circuit, std::string &error);
 // Consume every selected Print/count bank and optional live TracerV bank's
@@ -520,11 +529,13 @@ mlir::LogicalResult mapPrintBridgeRocketCPUStreamWriteResponseBuffer(
 /// Atomic; preserve existing IR and CPU scalar targets, transfer copied ports.
 mlir::LogicalResult mapPrintBridgeRocketCPUStreamPort(
     circt::firrtl::CircuitOp circuit, std::string &error);
-/// Assemble the five-port U250 shell around the expanded Print CPU platform.
+/// Assemble the five-port platform shell around the expanded Print CPU platform.
+/// Preserve the validated U250/F2 control width from the actual Print hosts.
 /// Requires FAME host identities; preserve all old IR and private targets.
 mlir::LogicalResult mapPrintBridgeRocketFPGATopShell(
     circt::firrtl::CircuitOp circuit, std::string &error);
-/// Specialize the expanded Print shell for the one-channel U250 platform.
+/// Specialize the expanded Print shell for the selected one-channel platform.
+/// F2 keeps its 32-bit control boundary and physical PCIM tieoffs.
 /// Preserve old IR; add host request ID counters and DDR/XDC annotations.
 mlir::LogicalResult mapPrintBridgeRocketF1Shim(
     circt::firrtl::CircuitOp circuit, std::string &error);

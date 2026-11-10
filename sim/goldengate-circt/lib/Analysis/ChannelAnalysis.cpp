@@ -119,21 +119,49 @@ goldengate::analyzeChannelConnection(CircuitOp circuit, Annotation annotation,
                       result.handshake.count("validSource");
     bool sinkPair = result.handshake.count("readySource") &&
                     result.handshake.count("validSink");
-    if (result.handshake.size() != 2 || sourcePair == sinkPair) {
-      error = "forward channel needs exactly one ready/valid endpoint pair";
+    if ((!sourcePair && !sinkPair) ||
+        result.handshake.size() != unsigned(sourcePair + sinkPair) * 2 ||
+        sourcePair != !result.sources.empty() ||
+        sinkPair != !result.sinks.empty()) {
+      error = "forward channel needs a complete ready/valid pair for each data endpoint side";
       return std::nullopt;
     }
-    const auto &valid = result.handshake.at(sourcePair ? "validSource"
-                                                  : "validSink");
-    const auto &endpoints = sourcePair ? result.sources : result.sinks;
-    bool found = std::any_of(endpoints.begin(), endpoints.end(),
-                             [&](const GGTarget &endpoint) {
-                               return endpoint.module == valid.module &&
-                                      endpoint.port == valid.port;
-                             });
-    if (!found) {
-      error = "forward channel valid is not one of its data endpoints";
-      return std::nullopt;
+    for (const auto &[name, target] : result.handshake) {
+      auto module = target.module;
+      mlir::Type type = module.getPorts()[*target.port].type;
+      uint64_t field = target.fieldID.value_or(0);
+      while (field) {
+        if (auto bundle = mlir::dyn_cast<BundleType>(type)) {
+          auto child = bundle.getSubTypeByFieldID(field);
+          type = child.first; field = child.second;
+        } else if (auto vector = mlir::dyn_cast<FVectorType>(type)) {
+          auto child = vector.getSubTypeByFieldID(field);
+          type = child.first; field = child.second;
+        } else {
+          error = "forward handshake target has an invalid field identity: " + name;
+          return std::nullopt;
+        }
+      }
+      auto bit = mlir::dyn_cast<UIntType>(type);
+      if (!bit || bit.getWidth() != 1) {
+        error = "forward handshake target must be UInt<1>: " + name;
+        return std::nullopt;
+      }
+    }
+    for (bool source : {true, false}) {
+      if (!(source ? sourcePair : sinkPair)) continue;
+      const auto &valid = result.handshake.at(source ? "validSource" : "validSink");
+      const auto &endpoints = source ? result.sources : result.sinks;
+      bool found = std::any_of(endpoints.begin(), endpoints.end(),
+                               [&](const GGTarget &endpoint) {
+                                 return endpoint.module == valid.module &&
+                                        endpoint.port == valid.port &&
+                                        endpoint.fieldID == valid.fieldID;
+                               });
+      if (!found) {
+        error = "forward channel valid is not one of its data endpoints";
+        return std::nullopt;
+      }
     }
   }
   if (result.kind == ChannelKind::TargetClock &&
@@ -150,18 +178,28 @@ bool goldengate::validateDecoupledChannelPairs(
   for (const auto &forward : channels) {
     if (forward.kind != ChannelKind::DecoupledForward)
       continue;
-    const bool sourceSide = forward.handshake.count("readySink");
-    const auto &ready = forward.handshake.at(sourceSide ? "readySink"
-                                                    : "readySource");
+    // A target-to-target link has two independent endpoint pairs, both owned
+    // by one reverse channel. Match the complete pair rather than finding only
+    // the producer's ready sink or counting the same reverse channel twice.
     unsigned matches = 0;
     for (auto [index, reverse] : llvm::enumerate(channels)) {
       if (reverse.kind != ChannelKind::DecoupledReverse)
         continue;
-      const auto &endpoints = sourceSide ? reverse.sinks : reverse.sources;
-      const bool hasReady = std::any_of(
-          endpoints.begin(), endpoints.end(), [&](const GGTarget &endpoint) {
-            return endpoint.module == ready.module && endpoint.port == ready.port;
-          });
+      bool hasReady = true;
+      for (bool sourceSide : {true, false}) {
+        auto ready = forward.handshake.find(sourceSide ? "readySink" : "readySource");
+        const auto &endpoints = sourceSide ? reverse.sinks : reverse.sources;
+        if (ready == forward.handshake.end()) {
+          hasReady &= endpoints.empty();
+          continue;
+        }
+        hasReady &= endpoints.size() == 1 && std::any_of(
+            endpoints.begin(), endpoints.end(), [&](const GGTarget &endpoint) {
+              return endpoint.module == ready->second.module &&
+                     endpoint.port == ready->second.port &&
+                     endpoint.fieldID == ready->second.fieldID;
+            });
+      }
       if (hasReady) {
         ++matches;
         ++reverseUses[index];

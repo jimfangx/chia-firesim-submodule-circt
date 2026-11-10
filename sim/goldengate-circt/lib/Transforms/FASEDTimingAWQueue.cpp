@@ -5,7 +5,7 @@
 // completion bundles. Only ID is used from AW metadata in this no-LLC model.
 // Annotations consumed/produced: none. Retained targets on copied ports move to
 // the new top; consumed completion targets stay on the instantiated inner top.
-// IR mutations: add a ten-entry flow-through ID RAM queue; bind enqueue to
+// IR mutations: add a min(16,maxFlight)-entry flow-through ID RAM queue; bind enqueue to
 // AW.fire and its head to write completion ID; replace external completion
 // metadata with an external pairing pulse. No request admission is changed.
 // Analyses required/preserved: retained bridge constructor; no cached analyses.
@@ -13,13 +13,17 @@
 // only on targetFire. Capacity is diagnostic, never an AW acceptance gate.
 // Pending AW/W counters will supply the pairing pulse in a subsequent pass.
 #include "goldengate/FASEDTimingAWQueue.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
+#include <algorithm>
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDTimingAWQueue(CircuitOp circuit,
                                              std::string &error) {
+  // Retain the historical helper symbol; its storage follows the constructor.
   constexpr llvm::StringLiteral helperName = "GGFASEDTimingAWQueue10";
   bool selectedPrint = circuit.getName() == "GGSelectedPrintFASEDWriteLatencyWrapper";
   llvm::StringRef wrapperName = selectedPrint ? "GGSelectedPrintFASEDTimingAWQueueWrapper"
@@ -43,6 +47,9 @@ LogicalResult goldengate::addFASEDTimingAWQueue(CircuitOp circuit,
   };
   if (!has("addrBits", 35) || !has("dataBits", 64) || !has("idBits", 4))
     return reject("FASED timing AW queue requires the recorded 35/64/4-bit profile");
+  unsigned depth, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, depth, countWidth, error))) return failure();
+  const unsigned pointerWidth = std::max(1u, llvm::Log2_64_Ceil(depth));
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); }; auto bit = uint(1);
   auto payload = [&](std::initializer_list<std::pair<llvm::StringRef, unsigned>> fields) {
@@ -96,13 +103,13 @@ LogicalResult goldengate::addFASEDTimingAWQueue(CircuitOp circuit,
   auto reg = [&](unsigned w, llvm::StringRef n)->Value {
     return b.create<RegResetOp>(loc,uint(w),arg(0),enabledReset,constant(w,0),n).getResult();
   };
-  Value ep = reg(4,"enq_ptr_value"), dp = reg(4,"deq_ptr_value"), mf = reg(1,"maybe_full");
+  Value ep = reg(pointerWidth,"enq_ptr_value"), dp = reg(pointerWidth,"deq_ptr_value"), mf = reg(1,"maybe_full");
   Value equal = b.create<EQPrimOp>(loc,ep,dp), empty = both(equal,neg(mf)), full = both(equal,mf);
   Value ready = neg(full), ev = field(arg(3),"valid"), dr = field(arg(4),"ready"), eb = field(arg(3),"bits");
-  SmallVector<Type> memoryTypes{MemOp::getTypeForPort(10,uint(4),MemOp::PortKind::Read),
-      MemOp::getTypeForPort(10,uint(4),MemOp::PortKind::Write)};
+  SmallVector<Type> memoryTypes{MemOp::getTypeForPort(depth,uint(4),MemOp::PortKind::Read),
+      MemOp::getTypeForPort(depth,uint(4),MemOp::PortKind::Write)};
   SmallVector<Attribute> memoryNames{b.getStringAttr("read"),b.getStringAttr("write")};
-  auto ram = b.create<MemOp>(loc,memoryTypes,0,1,10,RUWAttr::Undefined,memoryNames,"ram");
+  auto ram = b.create<MemOp>(loc,memoryTypes,0,1,depth,RUWAttr::Undefined,memoryNames,"ram");
   Value reader=ram.getResult(0),writer=ram.getResult(1);
   connect(field(reader,"clk"),arg(0));connect(field(reader,"en"),constant(1,1));connect(field(reader,"addr"),dp);
   Value packed=field(reader,"data");
@@ -113,8 +120,8 @@ LogicalResult goldengate::addFASEDTimingAWQueue(CircuitOp circuit,
   Value push=both(both(ready,ev),neg(both(empty,dr)));
   Value pop=both(neg(empty),both(valid,dr));
   auto increment = [&](Value pointer)->Value {
-    return mux(b.create<EQPrimOp>(loc,pointer,constant(4,9)),constant(4,0),
-      b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,pointer,constant(4,1)),3,0));
+    return mux(b.create<EQPrimOp>(loc,pointer,constant(pointerWidth,depth-1)),constant(pointerWidth,0),
+      b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,pointer,constant(pointerWidth,1)),pointerWidth-1,0));
   };
   connect(ep,mux(both(arg(2),push),increment(ep),ep));connect(dp,mux(both(arg(2),pop),increment(dp),dp));
   connect(mf,mux(both(arg(2),b.create<XorPrimOp>(loc,push,pop)),push,mf));

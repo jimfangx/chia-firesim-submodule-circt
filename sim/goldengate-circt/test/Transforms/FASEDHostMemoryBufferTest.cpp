@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FASEDReadDeinterleaver.h"
+#include "HostMemoryProfileChecks.h"
 #include "goldengate/FASEDHostMemoryBuffer.h"
 #include "goldengate/FASEDAddressTranslation.h"
 #include "circt/Dialect/HW/HWDialect.h"
@@ -236,6 +237,7 @@ int main(int argc,char **argv) {
     auto setup=[&](){auto r=fixture(ctx);auto c=*r->getOps<CircuitOp>().begin();
       require(succeeded(goldengate::addFASEDAddressTranslation(c,error)),error);
       require(succeeded(goldengate::addFASEDReadDeinterleaver(c,error)),error);return r;};
+    checkHostMemoryProfiles(ctx,setup,goldengate::addFASEDHostMemoryBuffer);
     auto root=setup();auto circuit=*root->getOps<CircuitOp>().begin();
     auto wrapper=top(circuit,"GGFASEDAddressTranslationWrapper");auto annotations=circuit->getAttr("rawAnnotations");
     std::map<std::string,std::string> before;for(auto m:circuit.getOps<FModuleOp>())if(m!=wrapper)before[m.getName().str()]=dump(m);

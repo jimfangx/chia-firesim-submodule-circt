@@ -5,8 +5,8 @@
 // unchanged. Qualified ingress reset disables assertions on the host clock.
 // All hierarchy, boundary and collision checks precede mutation.
 #include "goldengate/FASEDIngressDeadlock.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
-#include "llvm/Support/MathExtras.h"
 #include <tuple>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -44,16 +44,10 @@ LogicalResult goldengate::addFASEDIngressDeadlock(CircuitOp circuit,
   FModuleOp engine;
   for (auto m : circuit.getOps<FModuleOp>())
     if (m.getName() == "GGFASEDTokenEngine") engine = m;
-  auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
-  auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
-  auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
-    return reject("FASED deadlock checks need positive maxFlight representable in 64 bits");
-  // Match the AW FIFO and SatUpDownCounter contracts from the upstream
-  // passes. FASED caps maxWrites at sixteen; deadlock predicates consume
-  // empty flags, independently of the derived counter value width.
-  const unsigned depth = std::min<int64_t>(16, flight.getInt());
-  const unsigned countWidth = llvm::Log2_64_Ceil(depth + 1);
+  if (!engine) return reject("FASED ingress requires the mapped token engine");
+  unsigned depth, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, depth, countWidth, error)))
+    return failure();
   const std::string queueName = "GGFASEDIngressAWQueue" + std::to_string(depth);
   SmallVector<InstanceOp> chain;
   for (unsigned j = 0; j < modules.size(); ++j) {

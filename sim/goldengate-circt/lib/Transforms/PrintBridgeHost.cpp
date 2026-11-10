@@ -20,15 +20,24 @@ LogicalResult goldengate::mapPrintBridgeRocketCPUStreams(CircuitOp circuit,
   return mapPrintBridgeCPUStreams(circuit, sources, counts, error);
 }
 
-LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
-    ArrayRef<CPUStreamSourcePort> precedingSources,
-    ArrayRef<CPUStreamCountPort> precedingCounts, std::string &error) {
+LogicalResult goldengate::appendPrintBridgeCPUStreamPorts(CircuitOp circuit,
+    SmallVectorImpl<CPUStreamSourcePort> &precedingSources,
+    SmallVectorImpl<CPUStreamCountPort> &precedingCounts, std::string &error) {
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
-  if (precedingSources.size() != precedingCounts.size())
-    return reject("Print CPU allocation requires one ordered count per preceding stream");
+  if (precedingSources.size() > precedingCounts.size())
+    return reject("Print CPU allocation requires one ordered count per preceding source");
   for (unsigned i = 0; i < precedingSources.size(); ++i)
     if (precedingSources[i].streamName != precedingCounts[i].streamName)
       return reject("Print CPU allocation preceding stream/count identities differ");
+  llvm::StringSet<> streamIdentities, countPorts, sourcePorts;
+  for (const auto &count : precedingCounts)
+    if (count.streamName.empty() || count.portName.empty() ||
+        !streamIdentities.insert(count.streamName).second ||
+        !countPorts.insert(count.portName).second)
+      return reject("Print CPU allocation requires distinct preceding count identities and ports");
+  for (const auto &source : precedingSources)
+    if (source.portName.empty() || !sourcePorts.insert(source.portName).second)
+      return reject("Print CPU allocation requires distinct preceding source ports");
   FModuleOp top;
   auto find = [&](StringRef name) -> FModuleOp {
     for (auto m : circuit.getOps<FModuleOp>()) if (m.getName() == name) return m;
@@ -85,8 +94,14 @@ LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
   };
   if (!forwarded("hostClock") || !forwarded("hostReset"))
     return reject("Print CPU allocation requires unchanged host clock/reset forwarding");
-  SmallVector<CPUStreamSourcePort> sources(precedingSources);
-  SmallVector<CPUStreamCountPort> counts(precedingCounts);
+  SmallVector<CPUStreamSourcePort> sources(precedingSources.begin(), precedingSources.end());
+  // CPUManagedStreamEngine registers every source count before every sink
+  // count, even though the incoming and outgoing DMA engines are independent.
+  // Do not append Print counts after NIC sinks or build an outgoing-only
+  // transport here: either choice changes the shared driver/MMIO identities.
+  const unsigned precedingSourceCount = precedingSources.size();
+  SmallVector<CPUStreamCountPort> counts(precedingCounts.begin(),
+      precedingCounts.begin() + precedingSourceCount);
   llvm::StringSet<> hostNames, widgetNames;
   for (auto attr : bindings) {
     auto binding = dyn_cast<DictionaryAttr>(attr);
@@ -124,9 +139,29 @@ LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
           {config.getValue()}, widget, error))) return failure();
     if (widget.registerCount != 6) return reject("Print CPU allocation requires six control words");
     std::string streamName = widgetName.getValue().upper() + "_to_cpu_stream";
+    if (!streamIdentities.insert(streamName).second ||
+        !countPorts.insert(count.getValue()).second ||
+        !sourcePorts.insert(stream.getValue()).second)
+      return reject("Print CPU allocation aliases an existing stream/count identity or port");
     sources.push_back({streamName, stream.getValue().str(), 6144});
     counts.push_back({streamName, count.getValue().str(), 13});
   }
+  counts.append(precedingCounts.begin() + precedingSourceCount, precedingCounts.end());
+  precedingSources.assign(sources.begin(), sources.end());
+  precedingCounts.assign(counts.begin(), counts.end());
+  return success();
+}
+
+LogicalResult goldengate::mapPrintBridgeCPUStreams(CircuitOp circuit,
+    ArrayRef<CPUStreamSourcePort> precedingSources,
+    ArrayRef<CPUStreamCountPort> precedingCounts, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  if (precedingSources.size() != precedingCounts.size())
+    return reject("Print CPU allocation requires one ordered count per preceding stream");
+  SmallVector<CPUStreamSourcePort> sources(precedingSources);
+  SmallVector<CPUStreamCountPort> counts(precedingCounts);
+  if (failed(appendPrintBridgeCPUStreamPorts(circuit, sources, counts, error)))
+    return failure();
   // The read builder may succeed before the count builder discovers a malformed
   // boundary. Commit only the new wrappers and both target retargetings together.
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));

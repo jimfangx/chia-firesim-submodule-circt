@@ -4,6 +4,7 @@
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/BitVector.h"
 #include <functional>
 #include <limits>
 #include <map>
@@ -64,13 +65,15 @@ struct Pair {
   bool targetSource;
   BundleType externalType;
   SmallVector<PayloadLeaf, 0> excluded;
+  std::optional<unsigned> sinkForward, sinkReverse;
+  SmallVector<PayloadLeaf> sinkLeaves;
+  SmallVector<PayloadLeaf, 0> sinkExcluded;
 };
 
-LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
+LogicalResult findBoundaryPairs(CircuitOp circuit, ArrayAttr raw, FModuleOp &top,
                         SmallVectorImpl<Pair> &pairs, std::string &error) {
   for (auto m : circuit.getOps<FModuleOp>())
     if (m.getName() == circuit.getName()) top = m;
-  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!top || !raw) {
     error = "ReadyValidChannel needs a top module and retained annotations";
     return failure();
@@ -288,6 +291,83 @@ LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
   }
   return success();
 }
+// Validate both ends of an internal link through the same typed boundary
+// contract used for bridge channels. These temporary annotation views never
+// replace rawAnnotations. Each arm must select the same normalized payload ABI;
+// the final wiring retains each model's original leaf identity.
+LogicalResult findPairs(CircuitOp circuit, FModuleOp &top,
+                        SmallVectorImpl<Pair> &pairs, std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) { error = "ReadyValidChannel needs retained annotations"; return failure(); }
+  auto *ctx = circuit.getContext();
+  std::map<std::string, DictionaryAttr> internal;
+  std::map<std::string, DictionaryAttr> reverse;
+  for (auto attr : raw) {
+    Annotation a(attr);
+    if (!a.isClass(goldengate::AnnotationClasses::ChannelConnection)) continue;
+    auto info = a.getMember<DictionaryAttr>("channelInfo");
+    auto name = a.getMember<StringAttr>("globalName");
+    if (!info || !name) continue;
+    if (info.getAs<StringAttr>("class") == goldengate::AnnotationClasses::DecoupledForwardChannel &&
+        info.getAs<StringAttr>("validSource") && info.getAs<StringAttr>("validSink")) {
+      if (!name.getValue().ends_with("_fwd") ||
+          !internal.emplace(name.getValue().drop_back(4).str(), cast<DictionaryAttr>(attr)).second) {
+        error = "ReadyValidChannel internal forward name is malformed or duplicated"; return failure();
+      }
+    }
+    if (info.getAs<StringAttr>("class") == goldengate::AnnotationClasses::DecoupledReverseChannel &&
+        !reverse.emplace(name.getValue().str(), cast<DictionaryAttr>(attr)).second) {
+      error = "ReadyValidChannel duplicate reverse name"; return failure();
+    }
+  }
+  auto arm = [&](DictionaryAttr row, bool source, bool forward) {
+    NamedAttrList value(row);
+    value.erase(source ? "sinks" : "sources");
+    if (!forward) { value = NamedAttrList(row); value.erase(source ? "sources" : "sinks"); }
+    else {
+      NamedAttrList info(row.getAs<DictionaryAttr>("channelInfo"));
+      info.erase(source ? "validSink" : "validSource");
+      info.erase(source ? "readySource" : "readySink");
+      value.set("channelInfo", info.getDictionary(ctx));
+    }
+    return value.getDictionary(ctx);
+  };
+  SmallVector<Attribute> sourceRows;
+  for (auto attr : raw) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("globalName") : StringAttr();
+    if (name && name.getValue().ends_with("_fwd") && internal.count(name.getValue().drop_back(4).str()))
+      sourceRows.push_back(arm(row, true, true));
+    else if (name && name.getValue().ends_with("_rev") && internal.count(name.getValue().drop_back(4).str()))
+      sourceRows.push_back(arm(row, true, false));
+    else sourceRows.push_back(attr);
+  }
+  if (failed(findBoundaryPairs(circuit, ArrayAttr::get(ctx, sourceRows), top, pairs, error))) return failure();
+  std::set<unsigned> used;
+  for (const auto &p : pairs) { used.insert(p.forward); used.insert(p.reverse); }
+  for (auto &p : pairs) {
+    auto found = internal.find(p.name);
+    if (found == internal.end()) continue;
+    auto rev = reverse.find(p.name + "_rev");
+    if (rev == reverse.end()) { error = "ReadyValidChannel missing internal reverse"; return failure(); }
+    SmallVector<Attribute> rows{arm(found->second, false, true), arm(rev->second, false, false)};
+    SmallVector<Pair, 0> sinks;
+    if (failed(findBoundaryPairs(circuit, ArrayAttr::get(ctx, rows), top, sinks, error))) return failure();
+    if (sinks.size() != 1 || sinks[0].externalType != p.externalType ||
+        sinks[0].width != p.width || !used.insert(sinks[0].forward).second ||
+        !used.insert(sinks[0].reverse).second) {
+      error = "ReadyValidChannel internal endpoints have shared ports or incompatible payload ABI"; return failure();
+    }
+    p.sinkForward = sinks[0].forward; p.sinkReverse = sinks[0].reverse;
+    p.sinkLeaves = std::move(sinks[0].leaves); p.sinkExcluded = std::move(sinks[0].excluded);
+  }
+  return success();
+}
+SmallVector<unsigned> ports(const Pair &p) {
+  SmallVector<unsigned> result{p.forward, p.reverse};
+  if (p.sinkForward) { result.push_back(*p.sinkForward); result.push_back(*p.sinkReverse); }
+  return result;
+}
 } // namespace
 
 LogicalResult goldengate::addFAMEReadyValidChannel(CircuitOp circuit,
@@ -374,7 +454,7 @@ LogicalResult goldengate::addFAMEReadyValidChannel(CircuitOp circuit,
 LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
                                                           std::string &error) {
   FModuleOp top, wrapper;
-  SmallVector<Pair> pairs;
+  SmallVector<Pair, 0> pairs;
   if (failed(findPairs(circuit, top, pairs, error))) return failure();
   for (auto m : circuit.getOps<FModuleOp>())
     if (m.getName() == "GGFAMEPipeWrapper") wrapper = m;
@@ -393,7 +473,7 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
   if (!clock || !reset) { error = "ReadyValidChannel wrapper lacks host controls"; return failure(); }
   std::map<unsigned, unsigned> wrapperPorts;
   for (const auto &pair : pairs)
-    for (unsigned port : {pair.forward, pair.reverse}) {
+    for (unsigned port : ports(pair)) {
       std::optional<unsigned> external;
       for (unsigned i = 0; i < wrapper.getNumPorts(); ++i)
         if (wrapper.getPortName(i) == top.getPortName(port) &&
@@ -416,7 +496,7 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
   SmallVector<ConnectOp> passthroughs;
   for (const auto &p : pairs) {
     widths.insert(p.width);
-    for (unsigned port : {p.forward, p.reverse}) {
+    for (unsigned port : ports(p)) {
       Value internal = child.getResult(port), external = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(port));
       ConnectOp found;
       for (auto c : wrapper.getOps<ConnectOp>())
@@ -444,6 +524,7 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
   NamedAttrList renames;
   std::set<std::string> internalTargetNames;
   for (const auto &p : pairs) {
+    if (p.sinkForward) continue;
     unsigned port = wrapperPorts.at(p.forward);
     portTypes[port] = TypeAttr::get(p.externalType);
     wrapper.getArgument(port).setType(p.externalType);
@@ -488,7 +569,8 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     Value fExternal = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(p.forward));
     Value rExternal = wrapper.getBodyBlock()->getArgument(wrapperPorts.at(p.reverse));
     Value enqF = p.targetSource ? fInternal : fExternal, enqR = p.targetSource ? rInternal : rExternal;
-    Value deqF = p.targetSource ? fExternal : fInternal, deqR = p.targetSource ? rExternal : rInternal;
+    Value deqF = p.sinkForward ? child.getResult(*p.sinkForward) : (p.targetSource ? fExternal : fInternal);
+    Value deqR = p.sinkReverse ? child.getResult(*p.sinkReverse) : (p.targetSource ? rExternal : rInternal);
     connect(arg(0), wrapper.getBodyBlock()->getArgument(*clock));
     connect(arg(1), wrapper.getBodyBlock()->getArgument(*reset));
     connect(field(enqR, "bits"), arg(2));
@@ -508,15 +590,15 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
     // SimulationMapping.initStmt invalidates target-instance inputs before
     // attaching the selected channels. Unselected output leaves are unused;
     // unselected input leaves must not consume external token bits.
-    if (!p.targetSource)
-      for (const auto &leaf : p.excluded) {
-        Value dest = field(fInternal, "bits");
+    if (!p.targetSource || p.sinkForward)
+      for (const auto &leaf : p.sinkForward ? p.sinkExcluded : p.excluded) {
+        Value dest = field(deqF, "bits");
         for (auto name : leaf.path) dest = field(dest, name.getValue());
         connect(dest, b.create<InvalidValueOp>(loc, leaf.type));
       }
     Value packed;
     unsigned offset = p.width;
-    for (const auto &leaf : p.leaves) {
+    for (auto [leafIndex, leaf] : llvm::enumerate(p.leaves)) {
       unsigned width = leaf.type.getWidthOrSentinel();
       auto payloadLeaf = [&](Value port, bool external) {
         Value value = field(port, "bits");
@@ -526,7 +608,11 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
         return value;
       };
       Value input = payloadLeaf(enqF, !p.targetSource);
-      Value output = payloadLeaf(deqF, p.targetSource);
+      Value output;
+      if (p.sinkForward) {
+        output = field(deqF, "bits");
+        for (auto name : p.sinkLeaves[leafIndex].path) output = field(output, name.getValue());
+      } else output = payloadLeaf(deqF, p.targetSource);
       if (!width) {
         // Zero-width fields carry no token information; FIRRTL retains their
         // target identity until normal type lowering removes them.
@@ -544,5 +630,11 @@ LogicalResult goldengate::addFAMEBoundaryReadyValidChannels(CircuitOp circuit,
                                     APInt(0u, uint64_t(0)));
     connect(arg(4), packed);
   }
+  // Internal links have no bridge-facing interface. Removing these now-unused
+  // wrapper arguments also makes activation retain their annotations on Top.
+  llvm::BitVector internalPorts(wrapper.getNumPorts());
+  for (const auto &p : pairs) if (p.sinkForward)
+    for (unsigned port : ports(p)) internalPorts.set(wrapperPorts.at(port));
+  wrapper.erasePorts(internalPorts);
   return success();
 }

@@ -9,6 +9,7 @@
 // and metadata are deliberately ignored as in the executable Scala oracle.
 // Output: local Nasti slave; global widget allocation/crossbar remain pending.
 #include "goldengate/ClockBridgeControl.h"
+#include "goldengate/AutoCounterBridge.h"
 #include "goldengate/CPUStreamCountBank.h"
 #include "goldengate/NICMMIOBank.h"
 #include "goldengate/ControlAddressDecode.h"
@@ -287,7 +288,7 @@ LogicalResult mapBridgeControl(CircuitOp circuit, unsigned addressBits,
 
 } // namespace
 
-// Requires: active, uninstantiated GGNICMMIOWrapper with the normal-mode
+// Requires: active, uninstantiated GGNICMMIOWrapper with the matching-mode
 // NIC registry and matching decoded bank. Annotations consumed/produced: none;
 // copied port targets transfer recursively, internal identities are preserved.
 // Mutates: adds an MCRFile and wrapper, replaces the public decoded bank with
@@ -304,10 +305,57 @@ LogicalResult goldengate::mapNICBridgeControl(CircuitOp circuit,
     error = "NIC register count exceeds the supported MCR lane count";
     return failure();
   }
-  return mapBridgeControl(circuit, addressBits, idBits,
-      static_cast<unsigned>(registry.registerCount),
-      "GGNICMMIOWrapper", "GGNICBridgeControlWrapper",
-      "GGNICMCRFile", "nicBridge_mcr", "nicBridge_ctrl", error);
+  if (circuit.getName() != "GGNICMMIOWrapper") {
+    error = "NIC MCRFile control needs the active decoded wrapper";
+    return failure();
+  }
+  FModuleOp top;
+  for (auto m : circuit.getOps<FModuleOp>())
+    if (m.getName() == circuit.getName()) top = m;
+  if (!top) { error = "NIC MCRFile control needs a top"; return failure(); }
+  SmallVector<std::string> banks;
+  for (auto p : top.getPorts())
+    if (p.name.getValue().starts_with("nicBridge") && p.name.getValue().ends_with("_mcr"))
+      banks.push_back(p.name.str());
+  auto bindings = top->getAttrOfType<ArrayAttr>("goldengate.nicMMIOBindings");
+  if (banks.empty() || (bindings && bindings.size() != banks.size()) ||
+      (banks.size() > 1 && !bindings)) {
+    error = "NIC MCRFile control needs every indexed decoded bank binding";
+    return failure();
+  }
+  struct Plan { std::string bank, control, adapter, wrapper; };
+  SmallVector<Plan> plans;
+  for (unsigned i = 0; i < banks.size(); ++i) {
+    auto portPrefix = banks.size() == 1 ? std::string("nicBridge") : "nicBridge_" + std::to_string(i);
+    if (banks[i] != portPrefix + "_mcr") {
+      error = "NIC decoded banks must retain contiguous constructor order";
+      return failure();
+    }
+    if (bindings) {
+      auto row = dyn_cast<DictionaryAttr>(bindings[i]);
+      auto widget = row ? row.getAs<IntegerAttr>("widget") : IntegerAttr();
+      if (!widget || widget.getInt() != i || row.getAs<StringAttr>("mcr") != banks[i]) {
+        error = "NIC decoded bank bindings differ from live ports";
+        return failure();
+      }
+    }
+    plans.push_back({banks[i], portPrefix + "_ctrl",
+        "GGNICMCRFile" + (i ? "_" + std::to_string(i) : ""),
+        "GGNICBridgeControlWrapper" + (i + 1 == banks.size() ? "" : "_" + std::to_string(i))});
+  }
+  // Check all banks against the unchanged boundary before wrapping any bank.
+  // Every wrapper forwards the remaining banks with their original types.
+  for (auto &p : plans)
+    if (failed(mapBridgeControl(circuit, addressBits, idBits,
+            static_cast<unsigned>(registry.registerCount), "", p.wrapper,
+            p.adapter, p.bank, p.control, error, {}, top, true))) return failure();
+  for (auto &p : plans) {
+    auto input = circuit.getName().str();
+    if (failed(mapBridgeControl(circuit, addressBits, idBits,
+            static_cast<unsigned>(registry.registerCount), input, p.wrapper,
+            p.adapter, p.bank, p.control, error))) return failure();
+  }
+  return success();
 }
 
 LogicalResult goldengate::mapClockBridgeControl(CircuitOp circuit,
@@ -326,20 +374,7 @@ LogicalResult goldengate::mapResetPulseBridgeControl(CircuitOp circuit,
 
 LogicalResult goldengate::mapUARTBridgeControl(CircuitOp circuit,
     unsigned addressBits, unsigned idBits, std::string &error) {
-  // Widget.genCRFile sizes the transport from its registered MMIO words.
-  // Validate both the registry and bank lanes before creating any hardware;
-  // mapBridgeControl also checks the wrapper's matching decoded boundary.
-  ControlMMIOWidget registry;
-  const llvm::StringRef modules[]{"GGUARTMMIOBank"};
-  if (failed(deriveControlMMIOWidget(circuit, "UARTBridgeModule_0",
-          modules[0], modules, registry, error, Direction::Out)))
-    return failure();
-  if (registry.registerCount > std::numeric_limits<unsigned>::max()) {
-    error = "UART register count exceeds the supported MCR lane count";
-    return failure();
-  }
-  return mapBridgeControl(circuit, addressBits, idBits,
-      static_cast<unsigned>(registry.registerCount),
+  return mapBridgeControl(circuit, addressBits, idBits, 6,
       "GGUARTMMIOWrapper", "GGUARTBridgeControlWrapper",
       "GGUARTMCRFile", "uartBridge_mcr", "uartBridge_ctrl", error);
 }
@@ -654,4 +689,18 @@ LogicalResult goldengate::materializePrintBridgeStreamAXI(CircuitOp circuit,
     std::string &error) {
   return mapBridgeControl(circuit, addressBits, idBits, 6, "", wrapperName,
       adapterName, "mcr", "ctrl", error, {}, config, false, &host);
+}
+
+LogicalResult goldengate::materializeAutoCounterBridgeAXI(CircuitOp circuit,
+    FModuleOp bank, unsigned addressBits, unsigned idBits,
+    StringRef wrapperName, StringRef adapterName, FModuleOp &host,
+    std::string &error) {
+  auto rows = bank ? bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters")
+                   : ArrayAttr();
+  if (!rows || rows.empty() || rows.size() > std::numeric_limits<unsigned>::max()) {
+    error = "AutoCounter AXI requires a nonempty decoded register catalog";
+    return failure();
+  }
+  return mapBridgeControl(circuit, addressBits, idBits, rows.size(), "",
+      wrapperName, adapterName, "mcr", "ctrl", error, {}, bank, false, &host);
 }

@@ -1,0 +1,43 @@
+[
+  {
+    "class":"firesim.lib.bridgeutils.BridgeIOAnnotation",
+    "target":"~Top|Top>autocounter0",
+    "channelMapping":{
+      "trigger":"trigger",
+      "globalReset":"globalReset",
+      "event0":"event0",
+      "event1":"event1"
+    },
+    "widgetClass":"midas.widgets.AutoCounterBridgeModule",
+    "widgetConstructorKey":{
+      "class":"midas.widgets.AutoCounterParameters",
+      "eventMetadata":[
+        {
+          "class":"midas.widgets.EventMetadata",
+          "portName":"event0",
+          "label":"count",
+          "description":"fixture event",
+          "width":64,
+          "opType":{
+            "class":"midas.targetutils.PerfCounterOps$Accumulate$"
+          }
+        },
+        {
+          "class":"midas.widgets.EventMetadata",
+          "portName":"event1",
+          "label":"value",
+          "description":"fixture event",
+          "width":64,
+          "opType":{
+            "class":"midas.targetutils.PerfCounterOps$Identity$"
+          }
+        }
+      ],
+      "triggerName":"trigger",
+      "resetPortName":"globalReset"
+    }
+  },
+  {
+    "class":"midas.widgets.AutoCounterBridgeOracle$ConstructorHints"
+  }
+]

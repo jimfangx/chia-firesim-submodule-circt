@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/HostMemoryWriteResponses.h"
+#include "HostMemoryProfileChecks.h"
 #include "goldengate/HostMemoryWriteArbiter.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
@@ -155,6 +156,7 @@ int main(int argc,char **argv) {
       require(c.getName()=="GGHostMemoryWriteResponseWrapper","expanded B boundary top");
       compare(c);bindings(c);return 0;
     }
+    checkHostMemoryProfiles(ctx,[&](){return fixture(ctx);},goldengate::routeHostMemoryWriteResponses);
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
     std::map<std::string,std::string> before;for(auto m:c.getOps<FModuleOp>())before[m.getName().str()]=dump(m);
     std::string error;require(succeeded(goldengate::routeHostMemoryWriteResponses(c,error)),error);

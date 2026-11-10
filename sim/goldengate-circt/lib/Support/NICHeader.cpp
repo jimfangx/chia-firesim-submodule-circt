@@ -11,6 +11,7 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <functional>
 using namespace mlir;
@@ -26,7 +27,7 @@ LogicalResult goldengate::prepareNICHeader(CircuitOp circuit, std::string &error
     if (!cls) return reject("malformed SimpleNIC header annotation");
     if (cls == AnnotationClasses::BridgeIO && d.getAs<StringAttr>("widgetClass") ==
         "firechip.goldengateimplementations.SimpleNICBridgeModule") {
-      if (d.get("widgetConstructorKey")) return reject("SimpleNIC header requires the constructor-free normal-mode widget");
+      if (d.get("widgetConstructorKey")) return reject("SimpleNIC header requires constructor-free NIC widgets");
       ++nics;
     }
     if (cls == AnnotationClasses::OutputFile && d.getAs<StringAttr>("fileSuffix") == ".const.h") {
@@ -36,12 +37,12 @@ LogicalResult goldengate::prepareNICHeader(CircuitOp circuit, std::string &error
   }
   auto previous = output ? output.getAs<StringAttr>("body") : StringAttr();
   auto cpuHeader = output ? output.getAs<BoolAttr>("goldengate.cpuManagedStreamHeader") : BoolAttr();
-  if (nics != 1 || !previous || !cpuHeader || !cpuHeader.getValue() || output.get("goldengate.nicHeader"))
-    return reject("SimpleNIC needs one unextended driver header with validated CPU streams and one NIC");
+  if (!nics || !previous || !cpuHeader || !cpuHeader.getValue() || output.get("goldengate.nicHeader"))
+    return reject("SimpleNIC needs one unextended driver header with validated CPU streams and NICs");
   InstanceGraph graph(circuit);
   auto *top = graph.lookup(StringAttr::get(circuit.getContext(), circuit.getName()));
   if (!top || !top->noUses()) return reject("invalid SimpleNIC header top");
-  auto live = [&](StringRef name) -> FModuleOp {
+  auto live = [&](StringRef name, unsigned expected = 1) -> FModuleOp {
     auto *target = graph.lookup(StringAttr::get(circuit.getContext(), name));
     if (!target) return {};
     llvm::DenseMap<circt::igraph::InstanceGraphNode *, unsigned> counts;
@@ -51,29 +52,73 @@ LogicalResult goldengate::prepareNICHeader(CircuitOp circuit, std::string &error
       if (active.count(node)) { recursive = true; return 0U; }
       auto it = counts.find(node); if (it != counts.end()) return it->second;
       active.insert(node); unsigned n = node == target;
-      for (auto *record : *node) n = std::min(2U, n + count(record->getTarget()));
+      for (auto *record : *node) n = std::min(expected + 1, n + count(record->getTarget()));
       active.erase(node); counts[node] = n; return n;
     };
-    if (count(top) != 1 || recursive) return {};
+    if (count(top) != expected || recursive) return {};
     return dyn_cast<FModuleOp>(target->getModule().getOperation());
   };
-  auto bank = live("GGNICMMIOBank"), decoder = live("GGControlAddressDecode");
+  auto bank = live("GGNICMMIOBank", nics), decoder = live("GGControlAddressDecode");
   auto writes = live("GGControlWidgetWriteWrapper"), reads = live("GGControlReadDispatchWrapper");
   auto transportOut = live("GGCPUStreamRead"), transportIn = live("GGCPUStreamWrite");
   if (!bank || !decoder || !writes || !reads || !transportOut || !transportIn)
     return reject("SimpleNIC bank, decoder, bindings and duplex transports need unique live paths");
-  auto binding = [&](FModuleOp m, StringRef key) -> DictionaryAttr {
+  auto binding = [&](FModuleOp m, StringRef key, StringRef controlPort) -> DictionaryAttr {
     auto rows = m->getAttrOfType<ArrayAttr>(key); DictionaryAttr found;
     if (!rows) return {};
     for (auto attr : rows) {
       auto d = dyn_cast<DictionaryAttr>(attr);
-      if (!d || d.getAs<StringAttr>("port") != "nicBridge_ctrl") continue;
+      if (!d || d.getAs<StringAttr>("port") != controlPort) continue;
       if (found) return {}; found = d;
     }
     return found;
   };
-  auto bound = binding(writes,"goldengate.controlWriteBindings");
-  if (!bound || bound != binding(reads,"goldengate.controlReadBindings"))
+  if (live("GGNICLoopbackTokenQueuesWrapper")) {
+    // The normal full-platform driver assembler uses this same entry point.
+    // Select mode from the actual token/bank/queue owners, never a command-line
+    // label or a stale annotation. Preserve all preceding widget constructors.
+    std::string snippet;
+    if (failed(emitNICLoopbackHeader(circuit, snippet, error))) return failure();
+    auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
+    llvm::DenseSet<unsigned> slaves;
+    if (!regions) return reject("LoopbackNIC global control allocation is missing");
+    for (unsigned i = 0; i < nics; ++i) {
+      auto port = nics == 1 ? std::string("nicBridge_ctrl") :
+          "nicBridge_" + std::to_string(i) + "_ctrl";
+      auto bound = binding(writes, "goldengate.controlWriteBindings", port);
+      if (!bound || bound != binding(reads, "goldengate.controlReadBindings", port))
+        return reject("LoopbackNIC read/write control identities differ");
+      auto slave = bound.getAs<IntegerAttr>("slave");
+      auto expected = "SimpleNICBridgeModule_" + std::to_string(i);
+      auto boundName = bound.getAs<StringAttr>("name");
+      if (!slave || slave.getInt() < 0 || uint64_t(slave.getInt()) >= regions.size() ||
+          !slaves.insert(slave.getInt()).second || !boundName || boundName != expected)
+        return reject("LoopbackNIC global widget identity differs");
+      auto region = dyn_cast<DictionaryAttr>(regions[slave.getInt()]);
+      auto start = region ? region.getAs<IntegerAttr>("start") : IntegerAttr();
+      auto size = region ? region.getAs<IntegerAttr>("size") : IntegerAttr();
+      auto regionName = region ? region.getAs<StringAttr>("name") : StringAttr();
+      if (!region || !regionName || regionName != expected ||
+          region.getAs<IntegerAttr>("slave") != slave || !start || start.getInt() < 0 ||
+          start.getInt() % 4 || !size || size.getInt() < 4)
+        return reject("LoopbackNIC singleton done bank allocation differs");
+    }
+    OpBuilder b(circuit.getContext()); NamedAttrList updated(output);
+    updated.set("body", b.getStringAttr(previous.getValue().str() + snippet));
+    updated.set("goldengate.nicHeader", b.getBoolAttr(true));
+    updated.set("goldengate.nicHeaderMode", b.getStringAttr("compile_time_loopback"));
+    SmallVector<Attribute> annotations(raw.begin(), raw.end());
+    annotations[outputIndex] = updated.getDictionary(circuit.getContext());
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+    return success();
+  }
+  std::string snippet; llvm::raw_string_ostream out(snippet);
+  llvm::DenseSet<unsigned> widgetIndices;
+  for (unsigned slotIndex = 0; slotIndex < nics; ++slotIndex) {
+  auto controlPort = nics == 1 ? std::string("nicBridge_ctrl") :
+      "nicBridge_" + std::to_string(slotIndex) + "_ctrl";
+  auto bound = binding(writes,"goldengate.controlWriteBindings", controlPort);
+  if (!bound || bound != binding(reads,"goldengate.controlReadBindings", controlPort))
     return reject("SimpleNIC read/write control identities differ");
   auto slave = bound.getAs<IntegerAttr>("slave");
   auto regions = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
@@ -90,6 +135,8 @@ LogicalResult goldengate::prepareNICHeader(CircuitOp circuit, std::string &error
       identity.getAsInteger(10,widgetIndex) || !regionSlave || regionSlave != slave ||
       !start || start.getInt() < 0 || start.getInt() % 4 || !size || size.getInt() < 24)
     return reject("invalid SimpleNIC widget identity or MMIO allocation");
+  if (!widgetIndices.insert(widgetIndex).second)
+    return reject("SimpleNIC header duplicates a widget identity");
   auto address = decoder.getNumPorts() ? dyn_cast<UIntType>(decoder.getPortType(0)) : UIntType();
   if (!address || !address.getWidth() || *address.getWidth() < 1 || *address.getWidth() > 63)
     return reject("SimpleNIC control address width is unsupported");
@@ -255,7 +302,6 @@ LogicalResult goldengate::prepareNICHeader(CircuitOp circuit, std::string &error
     if (updates[i] != 1 || readbacks[i] != 1 || valids[i] != 1 || readies[i] != 1 || (i < 5 && assertions[i] != 1))
       return reject("SimpleNIC register drivers/assertions are missing or ambiguous");
   for (auto n : outputs) if (n != 1) return reject("SimpleNIC control output driver is missing or ambiguous");
-  std::string snippet; llvm::raw_string_ostream out(snippet);
   out << "\n#ifdef GET_INCLUDES\n#include \"bridges/simplenic.h\"\n#endif // GET_INCLUDES\n#ifdef GET_SUBSTRUCT_CHECKS\n";
   for (unsigned i = 0; i < 6; ++i)
     out << "static_assert(offsetof(SIMPLENICBRIDGEMODULE_struct, " << words[i] << ") == " << i
@@ -266,8 +312,185 @@ LogicalResult goldengate::prepareNICHeader(CircuitOp circuit, std::string &error
   for (unsigned i = 0; i < 6; ++i) out << "    ." << words[i] << " = " << addresses[i] << ",\n";
   out << "},\n  " << widgetIndex << ",\n  args,\n  " << indices[0] << ",\n  " << depths[0]
       << ",\n  " << indices[1] << ",\n  " << depths[1] << "\n));\n#endif // GET_BRIDGE_CONSTRUCTOR\n";
+  }
   out.flush(); OpBuilder b(circuit.getContext()); NamedAttrList updated(output);
   updated.set("body",b.getStringAttr(previous.getValue().str()+snippet)); updated.set("goldengate.nicHeader",b.getBoolAttr(true));
   SmallVector<Attribute> annotations(raw.begin(),raw.end()); annotations[outputIndex] = updated.getDictionary(circuit.getContext());
   circuit->setAttr("rawAnnotations",b.getArrayAttr(annotations)); return success();
+}
+
+LogicalResult goldengate::emitNICLoopbackHeader(CircuitOp circuit,
+    std::string &header, std::string &error) {
+  auto reject = [&](StringRef why) { error = why.str(); return failure(); };
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) return reject("LoopbackNIC driver requires retained bridge annotations");
+  unsigned nics = 0;
+  for (auto a : raw) {
+    auto d = dyn_cast<DictionaryAttr>(a);
+    if (!d) return reject("malformed LoopbackNIC annotation");
+    if (d.getAs<StringAttr>("class") == AnnotationClasses::BridgeIO &&
+        d.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.SimpleNICBridgeModule") {
+      if (d.get("widgetConstructorKey")) return reject("LoopbackNIC driver needs constructor-free NIC annotations");
+      ++nics;
+    }
+  }
+  if (!nics) return reject("LoopbackNIC driver requires an enabled NIC");
+  InstanceGraph graph(circuit);
+  auto *top = graph.lookup(StringAttr::get(circuit.getContext(), circuit.getName()));
+  if (!top || !top->noUses()) return reject("LoopbackNIC driver requires a unique top");
+  llvm::DenseMap<circt::igraph::InstanceGraphNode *, unsigned> counts;
+  llvm::DenseSet<circt::igraph::InstanceGraphNode *> active;
+  bool recursive = false;
+  std::function<void(circt::igraph::InstanceGraphNode *)> visit = [&](auto *node) {
+    if (!active.insert(node).second) { recursive = true; return; }
+    ++counts[node];
+    for (auto *edge : *node) visit(edge->getTarget());
+    active.erase(node);
+  };
+  visit(top);
+  if (recursive) return reject("LoopbackNIC driver cannot describe recursive hardware");
+  auto live = [&](StringRef name, unsigned instances = 1) -> FModuleOp {
+    auto *node = graph.lookup(StringAttr::get(circuit.getContext(), name));
+    return node && counts.lookup(node) == instances ?
+        dyn_cast<FModuleOp>(node->getModule().getOperation()) : FModuleOp();
+  };
+  auto token = live("GGNICLoopbackTokenQueuesWrapper");
+  auto queues = live("GGNICCPUStreamQueuesWrapper");
+  auto mmio = live("GGNICMMIOWrapper");
+  auto bank = live("GGNICMMIOBank", nics);
+  if (!token || !queues || !mmio || !bank)
+    return reject("LoopbackNIC driver requires live token, CPU queue and singleton MMIO owners");
+  for (auto pair : {std::make_pair(token,"goldengate.nicTokenBindings"),
+                    std::make_pair(queues,"goldengate.nicCPUStreamBindings"),
+                    std::make_pair(mmio,"goldengate.nicMMIOBindings")}) {
+    auto rows = pair.first->getAttrOfType<ArrayAttr>(pair.second);
+    if (!rows || rows.size() != nics) return reject("LoopbackNIC driver binding count differs");
+    for (auto [i,a] : llvm::enumerate(rows)) {
+      auto row = dyn_cast<DictionaryAttr>(a);
+      auto widget = row ? row.getAs<IntegerAttr>("widget") : IntegerAttr();
+      auto mode = row ? row.getAs<StringAttr>("mode") : StringAttr();
+      if (!widget || widget.getInt() != int64_t(i) || !mode ||
+          mode != "compile_time_loopback")
+        return reject("LoopbackNIC driver requires ordered compile-time loopback bindings");
+    }
+  }
+  auto uint = [&](unsigned w) { return UIntType::get(circuit.getContext(),w,false); };
+  auto registers = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  auto reg = registers && registers.size() == 1 ? dyn_cast<DictionaryAttr>(registers[0]) : DictionaryAttr();
+  auto offset = reg ? reg.getAs<IntegerAttr>("offset") : IntegerAttr();
+  auto readable = reg ? reg.getAs<BoolAttr>("readable") : BoolAttr();
+  auto writable = reg ? reg.getAs<BoolAttr>("writeable") : BoolAttr();
+  if (!reg || reg.getAs<StringAttr>("name") != "done" || !offset || offset.getInt() ||
+      !readable || !readable.getValue() || !writable || !writable.getValue() ||
+      bank.getNumPorts() != 4 || bank.getPortName(2) != "nic_done" ||
+      bank.getPortType(0) != ClockType::get(circuit.getContext()) ||
+      bank.getPortType(1) != uint(1) || bank.getPortType(2) != uint(1))
+    return reject("LoopbackNIC driver needs the singleton one-bit done register ABI");
+  for (unsigned i = 0; i < 4; ++i)
+    if (bank.getPortDirection(i) != (i == 3 ? Direction::Out : Direction::In))
+      return reject("LoopbackNIC done bank port direction differs");
+  auto fieldType = [](Type t,StringRef name) -> Type {
+    auto bundle = dyn_cast<BundleType>(t); auto f = bundle ? bundle.getElement(name) : std::nullopt;
+    return f ? f->type : Type();
+  };
+  for (StringRef group : {"read","write"}) {
+    auto words = dyn_cast_or_null<FVectorType>(fieldType(bank.getPortType(3),group));
+    if (!words || words.getNumElements() != 1 ||
+        fieldType(words.getElementType(),"bits") != uint(32) ||
+        fieldType(words.getElementType(),"valid") != uint(1) ||
+        fieldType(words.getElementType(),"ready") != uint(1))
+      return reject("LoopbackNIC done bank requires one 32-bit MMIO lane");
+  }
+  Value state; unsigned states = 0;
+  for (auto r : bank.getOps<RegOp>()) {
+    if (r.getName() != "done" || r.getResult().getType() != uint(1) ||
+        r.getClockVal() != bank.getArgument(0)) return reject("LoopbackNIC done state differs");
+    state = r.getResult(); ++states;
+  }
+  if (states != 1 || !bank.getOps<RegResetOp>().empty())
+    return reject("LoopbackNIC done must remain one unreset sample register");
+  auto slot = [&](Value v,StringRef group,StringRef leaf) {
+    auto f = v ? v.getDefiningOp<SubfieldOp>() : SubfieldOp();
+    auto i = f ? f.getInput().getDefiningOp<SubindexOp>() : SubindexOp();
+    auto g = i ? i.getInput().getDefiningOp<SubfieldOp>() : SubfieldOp();
+    return f && f.getFieldName() == leaf && i && i.getIndex() == 0 && g &&
+        g.getFieldName() == group && g.getInput() == bank.getArgument(3);
+  };
+  unsigned updates = 0, reads = 0, valids = 0, readies = 0;
+  for (auto c : bank.getOps<StrictConnectOp>()) {
+    auto dest = c.getDest(), src = c.getSrc();
+    if (dest == state) {
+      auto mux = src.getDefiningOp<MuxPrimOp>();
+      auto bits = mux ? mux.getHigh().getDefiningOp<BitsPrimOp>() : BitsPrimOp();
+      if (!mux || !slot(mux.getSel(),"write","valid") || mux.getLow() != bank.getArgument(2) ||
+          !bits || bits.getHi() || bits.getLo() || !slot(bits.getInput(),"write","bits"))
+        return reject("LoopbackNIC done write/sample relation differs");
+      ++updates;
+    }
+    if (slot(dest,"read","bits")) {
+      auto pad = src.getDefiningOp<PadPrimOp>();
+      if (!pad || pad.getInput() != state || pad.getAmount() != 32)
+        return reject("LoopbackNIC done readback differs");
+      ++reads;
+    }
+    if (slot(dest,"read","valid") || slot(dest,"write","ready")) {
+      auto one = src.getDefiningOp<ConstantOp>();
+      if (!one || !one.getValue().isOne()) return reject("LoopbackNIC done handshake differs");
+      if (slot(dest,"read","valid")) ++valids; else ++readies;
+    }
+  }
+  if (updates != 1 || reads != 1 || valids != 1 || readies != 1)
+    return reject("LoopbackNIC done drivers are missing or ambiguous");
+  llvm::StringSet<> streams;
+  for (auto i : queues.getOps<InstanceOp>()) {
+    auto info = i->getAttrOfType<DictionaryAttr>("goldengate.streamParameters");
+    if (!info) continue;
+    auto name = info.getAs<StringAttr>("name"), dir = info.getAs<StringAttr>("direction");
+    auto depth = info.getAs<IntegerAttr>("depth"), bytes = info.getAs<IntegerAttr>("widthBytes");
+    if (!name || !dir || !depth || depth.getInt() != 3072 || !bytes || bytes.getInt() != 64 ||
+        !streams.insert(name.getValue().str()).second)
+      return reject("LoopbackNIC CPU stream geometry or identity differs");
+    bool incoming = dir == "fromHostCPU";
+    if (!incoming && dir != "toHostCPU") return reject("LoopbackNIC CPU stream direction differs");
+    auto *queueNode = graph.lookup(StringAttr::get(circuit.getContext(),i.getModuleName()));
+    auto queue = queueNode ? dyn_cast<FModuleOp>(queueNode->getModule().getOperation()) : FModuleOp();
+    if (!queue || queue.getNumPorts() != 5 || queue.getPortType(4) != uint(12))
+      return reject("LoopbackNIC queue occupancy width differs");
+    unsigned memories = 0;
+    for (auto m : queue.getOps<MemOp>()) {
+      if (m.getDepth() != 3072 || m.getDataType() != uint(512) ||
+          m.getReadLatency() != 0 || m.getWriteLatency() != 1)
+        return reject("LoopbackNIC queue storage differs from its retained allocation");
+      ++memories;
+    }
+    if (memories != 1) return reject("LoopbackNIC queue requires one allocated memory");
+    Value disabled;
+    if (i.getNumResults() != 5) return reject("LoopbackNIC queue port count differs");
+    for (auto f : queues.getOps<SubfieldOp>())
+      if (f.getInput() == i.getResult(incoming ? 3 : 2) &&
+          f.getFieldName() == (incoming ? "ready" : "valid")) {
+        if (disabled) return reject("LoopbackNIC queue endpoint is ambiguous");
+        disabled = f;
+      }
+    unsigned drivers = 0;
+    for (auto c : queues.getOps<StrictConnectOp>()) if (disabled && c.getDest() == disabled) {
+      auto zero = c.getSrc().getDefiningOp<ConstantOp>();
+      if (!zero || !zero.getValue().isZero()) return reject("LoopbackNIC CPU adapter must remain disabled");
+      ++drivers;
+    }
+    if (drivers != 1) return reject("LoopbackNIC disabled CPU adapter driver is missing or ambiguous");
+  }
+  if (streams.size() != 2*nics) return reject("LoopbackNIC must retain two allocated CPU streams per widget");
+  for (unsigned i = 0; i < nics; ++i)
+    for (StringRef suffix : {"_from_cpu_stream","_to_cpu_stream"})
+      if (!streams.count("SIMPLENICBRIDGEMODULE_" + std::to_string(i) + suffix.str()))
+        return reject("LoopbackNIC CPU stream binding differs from widget index");
+  std::string result; llvm::raw_string_ostream out(result);
+  out << "// Native compile-time LoopbackNIC driver; hardware token/MMIO ABI retained.\n"
+         "#ifdef GET_INCLUDES\n#include \"bridges/simplenic_loopback.h\"\n#endif\n"
+         "#ifdef GET_BRIDGE_CONSTRUCTOR\n";
+  for (unsigned i = 0; i < nics; ++i)
+    out << "registry.add_widget(new simplenic_loopback_t(simif, " << i << ", args));\n";
+  out << "#endif // GET_BRIDGE_CONSTRUCTOR\n";
+  out.flush(); header = std::move(result); return success();
 }

@@ -1,12 +1,12 @@
 // See LICENSE for license details.
 // Oracle: F1Shim.scala and AXI4NastiAssigner.toAXI4Slave.
-// Invariant: exact U250 FPGATop five-port boundary, one memory channel,
+// Invariant: exact U250/F2 FPGATop five-port boundary, one memory channel,
 // CPU-managed AXI4 enabled, no QSFP target endpoints. Unsupported schemas
 // fail before mutation. All existing module bodies and local targets remain.
 // Produces one F1Shim and FPGATop instance, leaf PCIS/control bindings,
 // two host-clock synchronous-reset modulo-4096 request ID counters, and
-// inactive QSFP outputs. No target-cycle state or buffering is introduced.
-// Produces DDR GoldenGateOutputFileAnnotation and U250 XDC circuit paths.
+// inactive U250 QSFP or F2 PCIM outputs. No target-cycle state or buffering is introduced.
+// Produces DDR GoldenGateOutputFileAnnotation and platform XDC circuit paths.
 // Circuit identity is retargeted; HostClockSource stays on FPGATop.clock.
 #include "goldengate/F1Shim.h"
 #include "goldengate/AnnotationClasses.h"
@@ -28,7 +28,7 @@ bool flatten(Type t, std::string path, bool input, Contract &out) {
   auto u = dyn_cast<UIntType>(t);
   return u && u.getWidth() && out.emplace(path, std::make_pair(*u.getWidth(), input)).second;
 }
-Contract expected(StringRef root) {
+Contract expected(StringRef root, bool isF2) {
   Contract out;
   using Fields = ArrayRef<std::pair<StringRef, unsigned>>;
   bool master = root == "mem_0";
@@ -41,7 +41,7 @@ Contract expected(StringRef root) {
     for (auto [f,w] : fields) out[prefix + ".bits." + f.str()] = {w,input};
   };
   if (root == "ctrl") {
-    const std::pair<StringRef,unsigned> address[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},{"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
+    const std::pair<StringRef,unsigned> address[]{{"addr",isF2?32u:25u},{"len",8},{"size",3},{"burst",2},{"lock",1},{"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
     channel("aw",address); channel("ar",address);
     channel("w",{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}});
     channel("b",{{"resp",2},{"id",12},{"user",1}});
@@ -56,7 +56,7 @@ Contract expected(StringRef root) {
   return out;
 }
 } // namespace
-LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) {
+LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error, bool isF2) {
   auto reject=[&](StringRef s){error=s.str();return failure();};
   FModuleOp inner;
   for(auto m:circuit.getOps<FModuleLike>()) {
@@ -65,7 +65,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if(circuit.getName()!="FPGATop"||!inner||!raw||inner.getNumPorts()!=5)
-    return reject("F1Shim requires the five-port U250 FPGATop and annotations");
+    return reject("F1Shim requires the five-port FPGATop and annotations");
   std::map<std::string,unsigned> indices;
   for(auto [i,p]:llvm::enumerate(inner.getPorts())) {
     auto n=p.name.getValue();
@@ -77,8 +77,8 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
       if(!u||u.getWidth()!=1||p.direction!=Direction::In) return reject("invalid FPGATop reset");
     } else if(n=="ctrl"||n=="mem_0"||n=="cpu_managed_axi4") {
       Contract actual;
-      if(!flatten(p.type,n.str(),p.direction==Direction::In,actual)||actual!=expected(n))
-        return reject("unsupported U250 FPGATop AXI4 contract");
+      if(!flatten(p.type,n.str(),p.direction==Direction::In,actual)||actual!=expected(n, isF2))
+        return reject("unsupported platform FPGATop AXI4 contract");
     } else return reject("unsupported FPGATop port (QSFP/PCIM/additional memory)");
   }
   for(auto n:{"clock","reset","ctrl","mem_0","cpu_managed_axi4"})
@@ -90,7 +90,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
     auto d=dyn_cast<DictionaryAttr>(a); auto cls=d?d.getAs<StringAttr>("class"):StringAttr();
     if(!cls) return reject("malformed FPGATop annotation");
     if(cls.getValue()==AnnotationClasses::XDCPaths)
-      return reject("U250 XDC circuit paths already exist");
+      return reject("platform XDC circuit paths already exist");
     if(cls.getValue()==AnnotationClasses::OutputFile) {
       auto suffix=d.getAs<StringAttr>("fileSuffix");
       if(suffix&&suffix.getValue()==".defines.vh")
@@ -118,16 +118,32 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
     }
     return n=="addr"?u(64):n=="id"?u(16):n=="data"?u(512):n=="strb"?u(64):t;
   };
-  auto decoupled=BundleType::get(ctx,{{b.getStringAttr("ready"),true,u(1)},
-    {b.getStringAttr("valid"),false,u(1)},{b.getStringAttr("bits"),false,u(256)}});
   SmallVector<PortInfo> ports{{b.getStringAttr("clock"),type("clock"),Direction::In},
-    {b.getStringAttr("reset"),type("reset"),Direction::In},
-    {b.getStringAttr("io_qsfp_channel_up"),FVectorType::get(u(1),2),Direction::In},
-    {b.getStringAttr("io_qsfp_tx"),FVectorType::get(decoupled,2),Direction::Out},
-    {b.getStringAttr("io_qsfp_rx"),FVectorType::get(decoupled,2),Direction::In},
-    {b.getStringAttr("io_master"),type("ctrl"),Direction::In},
-    {b.getStringAttr("io_pcis"),pcisType(type("ctrl"),""),Direction::In},
-    {b.getStringAttr("io_slave"),FVectorType::get(cast<FIRRTLBaseType>(type("mem_0")),1),Direction::Out}};
+    {b.getStringAttr("reset"),type("reset"),Direction::In}};
+  if (!isF2) {
+    auto decoupled=BundleType::get(ctx,{{b.getStringAttr("ready"),true,u(1)},
+      {b.getStringAttr("valid"),false,u(1)},{b.getStringAttr("bits"),false,u(256)}});
+    ports.push_back({b.getStringAttr("io_qsfp_channel_up"),FVectorType::get(u(1),2),Direction::In});
+    ports.push_back({b.getStringAttr("io_qsfp_tx"),FVectorType::get(decoupled,2),Direction::Out});
+    ports.push_back({b.getStringAttr("io_qsfp_rx"),FVectorType::get(decoupled,2),Direction::In});
+  }
+  unsigned masterIndex=ports.size(), pcisIndex=masterIndex+1, slaveIndex=masterIndex+2;
+  ports.push_back({b.getStringAttr("io_master"),type("ctrl"),Direction::In});
+  ports.push_back({b.getStringAttr("io_pcis"),pcisType(type("ctrl"),""),Direction::In});
+  ports.push_back({b.getStringAttr("io_slave"),FVectorType::get(cast<FIRRTLBaseType>(type("mem_0")),1),Direction::Out});
+  // EC2F2Config includes WithPCIMPorts even when there are no peer streams.
+  // CreateNastiParameters uses the 64/512/6 physical FPGA-managed geometry.
+  if (isF2) {
+    std::function<Type(Type,StringRef)> pcimType=[&](Type t,StringRef n)->Type {
+      if(auto xs=dyn_cast<BundleType>(t)) {
+        SmallVector<BundleType::BundleElement> es;
+        for(auto x:xs.getElements()) es.push_back({x.name,x.isFlip,cast<FIRRTLBaseType>(pcimType(x.type,x.name.getValue()))});
+        return BundleType::get(ctx,es);
+      }
+      return n=="id"?u(6):t;
+    };
+    ports.push_back({b.getStringAttr("io_pcim"),pcimType(ports[pcisIndex].type,""),Direction::Out});
+  }
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto shim=b.create<FModuleOp>(loc,b.getStringAttr("F1Shim"),inner.getConventionAttr(),ports);
   b.setInsertionPointToStart(shim.getBodyBlock());
@@ -139,7 +155,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
   auto k=[&](unsigned w,unsigned v)->Value{return b.create<ConstantOp>(loc,u(w),APInt(w,v));};
   connect(child("clock"),arg(0)); connect(child("reset"),arg(1));
   auto counter=[&](StringRef channel,StringRef name)->Value {
-    auto request=f(arg(5),channel);
+    auto request=f(arg(masterIndex),channel);
     Value fire=b.create<AndPrimOp>(loc,f(request,"valid"),f(request,"ready"));
     Value r=b.create<RegResetOp>(loc,u(12),arg(0),arg(1),k(12,0),name).getResult();
     Value sum=b.create<AddPrimOp>(loc,r,k(12,1));
@@ -158,15 +174,27 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
         connect(dst,path==".aw.bits.id"?writeID:readID);
       else connect(input?dst:src,input?src:dst);
     };
-  bind(child("ctrl"),arg(5),true,"",true);
-  bind(child("cpu_managed_axi4"),arg(6),true,"",false);
+  bind(child("ctrl"),arg(masterIndex),true,"",true);
+  bind(child("cpu_managed_axi4"),arg(pcisIndex),true,"",false);
   // SFC DontCare response user bits lower to zero in the recorded RTL.
-  for(auto ch:{"b","r"}) connect(f(f(f(arg(6),ch),"bits"),"user"),k(1,0));
-  Value memory=b.create<SubindexOp>(loc,arg(7),0);
+  for(auto ch:{"b","r"}) connect(f(f(f(arg(pcisIndex),ch),"bits"),"user"),k(1,0));
+  Value memory=b.create<SubindexOp>(loc,arg(slaveIndex),0);
   b.create<ConnectOp>(loc,memory,child("mem_0"));
-  for(unsigned i=0;i<2;++i) {
+  if (!isF2) for(unsigned i=0;i<2;++i) {
     Value tx=b.create<SubindexOp>(loc,arg(3),i),rx=b.create<SubindexOp>(loc,arg(4),i);
     connect(f(tx,"valid"),k(1,0)); connect(f(tx,"bits"),k(256,0)); connect(f(rx,"ready"),k(1,0));
+  }
+  if (isF2) {
+    Value pcim=arg(slaveIndex+1);
+    for (auto ch : {"aw", "ar", "w"}) {
+      auto request=f(pcim,ch);
+      connect(f(request,"valid"),k(1,0));
+      // F1Shim leaves the inactive payload DontCare; an invalid value keeps
+      // that contract explicit until normal FIRRTL lowering resolves it.
+      auto bits=f(request,"bits");
+      connect(bits,b.create<InvalidValueOp>(loc,bits.getType()));
+    }
+    for (auto ch : {"r", "b"}) connect(f(f(pcim,ch),"ready"),k(1,0));
   }
   std::function<Attribute(Attribute)> retarget=[&](Attribute a)->Attribute {
     if(auto s=dyn_cast<StringAttr>(a)) {
@@ -180,7 +208,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
   };
   // Scala F1Shim.channelInUse uses FPGATop.dramChannelsRequired. The
   // corresponding CIRCT boundary is the validated io_slave vector length.
-  unsigned channels=cast<FVectorType>(ports[7].type).getNumElements();
+  unsigned channels=cast<FVectorType>(ports[slaveIndex].type).getNumElements();
   std::string defines="// Optionally instantiate additional memory channels if required.\n"
                       "// The first channel (C) is provided by the shell and is not optional.\n";
   for(auto [index,name]:{std::pair<unsigned,StringRef>{1,"A"},{2,"B"},{3,"D"}})
@@ -191,12 +219,11 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error) 
     b.getNamedAttr("class",b.getStringAttr(AnnotationClasses::OutputFile)),
     b.getNamedAttr("body",b.getStringAttr(defines)),
     b.getNamedAttr("fileSuffix",b.getStringAttr(".defines.vh"))}));
-  // PlatformShim supplies these from XilinxAlveoU250Config. This pass already
-  // validates only that platform's exact interface; other profiles fail above.
+  // PlatformShim supplies these paths from the exact selected platform.
   updated.push_back(b.getDictionaryAttr({
     b.getNamedAttr("class",b.getStringAttr(AnnotationClasses::XDCPaths)),
     b.getNamedAttr("preLinkPath",b.getStringAttr("firesim_top")),
-    b.getNamedAttr("postLinkPath",b.getStringAttr("firesim_top"))}));
+    b.getNamedAttr("postLinkPath",b.getStringAttr(isF2?"WRAPPER/CL/firesim_top":"firesim_top"))}));
   circuit->setAttr("rawAnnotations",b.getArrayAttr(updated)); circuit.setNameAttr(b.getStringAttr("F1Shim"));
   return success();
 }

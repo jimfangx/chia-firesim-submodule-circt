@@ -39,6 +39,11 @@ mlir::LogicalResult deriveControlMMIOWidget(circt::firrtl::CircuitOp circuit,
     llvm::StringRef widgetName, llvm::StringRef mcrModule,
     llvm::ArrayRef<llvm::StringRef> registerModules, ControlMMIOWidget &widget,
     std::string &error, circt::firrtl::Direction mcrDirection = circt::firrtl::Direction::In);
+// Accept the six-word normal NIC ABI, or the singleton done ABI
+// only with ordered live compile-time-loopback MMIO bindings. This validates
+// bank/mode identity; callers still validate each MCR type and actual routes.
+mlir::LogicalResult validateNICControlMMIOMode(circt::firrtl::CircuitOp circuit,
+    unsigned widgets, uint64_t registerCount, std::string &error);
 // Rocket platform registration order from FPGATop.scala: SimulationMaster,
 // original bridges, synthesized Print bridges, LoadMem, then CPU streams.
 // Derive every size from implemented FIRRTL register banks. TracerV banks
@@ -48,6 +53,8 @@ mlir::LogicalResult deriveControlMMIOWidget(circt::firrtl::CircuitOp circuit,
 // supplied in constructor order; their queued metadata identifies each bank.
 // This pre-binding catalog does not imply CPU stream or control attachment.
 // Leave the result and IR unchanged on failure; names borrow MLIR attributes.
+// FASED explicit base32 selects the materialized 68-word FRFCFS bank; absent
+// or base16 selects the six LatencyPipe fragments. Mixed profiles reject.
 mlir::LogicalResult deriveRocketControlMMIOCatalog(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> printHosts,

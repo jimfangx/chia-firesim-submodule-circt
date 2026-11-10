@@ -9,7 +9,8 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
-#include <array>
+#include <vector>
+#include <algorithm>
 #include <deque>
 #include <functional>
 #include <random>
@@ -25,7 +26,7 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0, int64_t maxFlight=10) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDReadLatencyWrapper\" { firrtl.module @GGFASEDReadLatencyWrapper() {} } }",&ctx);
   require(bool(root),"fixture parse");auto c=*root->getOps<CircuitOp>().begin();c.setName(oldRoot());
   (*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());auto loc=c.getLoc();
@@ -47,7 +48,8 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode=0) {
   auto top=b.create<FModuleOp>(loc,b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ps);
   if(mode!=11){auto engine=b.create<FModuleOp>(loc,b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     if(mode!=17)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({
-      b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==16?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));}
+      b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(mode==16?32:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))})),
+      b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("maxFlight",b.getI64IntegerAttr(maxFlight))}))}));}
   if(mode==13||mode==14)b.create<FModuleOp>(loc,b.getStringAttr(mode==13?llvm::StringRef("GGFASEDWriteLatency10"):newRoot()),top.getConventionAttr(),ArrayRef<PortInfo>{});
   if(mode==15){b.setInsertionPointToStart(top.getBodyBlock());b.create<InstanceOp>(loc,top,"used");}
   if(mode==18)c.setName("wrong");
@@ -66,7 +68,7 @@ struct Interpreter {
   std::map<std::string, APInt> memo;
   llvm::DenseMap<Value, APInt> state;
   MemOp ram;
-  std::array<APInt, 10> memory;
+  std::vector<APInt> memory;
   Interpreter(FModuleOp m) : module(m) {
     auto link = [&](Value d, Value z) {
       if (!isa<BundleType>(d.getType())) { require(drivers.emplace(key(d), z).second, "multiple drivers"); return; }
@@ -82,7 +84,7 @@ struct Interpreter {
     for (auto r : m.getOps<RegResetOp>()) state[r.getResult()] = APInt(width(r.getResult()), 0);
     for (auto r : m.getOps<RegOp>()) state[r.getResult()] = APInt(width(r.getResult()), 0);
     for (auto mem : m.getOps<MemOp>()) { require(!ram, "multiple memories"); ram = mem; }
-    for (auto &word : memory) word = APInt(68, 0);
+    if (ram) memory.assign(ram.getDepth(), APInt(68, 0));
   }
   unsigned width(Value v) { return *cast<UIntType>(v.getType()).getWidth(); }
   std::string key(Value v) {
@@ -149,18 +151,19 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx) {
-  auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+void behavior(MLIRContext &ctx, unsigned maxFlight) {
+  const unsigned depth = std::min(16u, maxFlight);
+  auto root=fixture(ctx,0,maxFlight);auto c=*root->getOps<CircuitOp>().begin();std::string error;
   require(succeeded(goldengate::addFASEDWriteLatency(c,error)),error);require(succeeded(verify(*root)),"invalid write latency IR");
   Interpreter sim(named(c,"GGFASEDWriteLatency10"));auto assertion=*sim.module.getOps<AssertOp>().begin();
-  require(sim.ram.getDepth()==10 && sim.ram.getReadLatency()==0 && sim.ram.getWriteLatency()==1,"RAM geometry differs");
+  require(sim.ram.getDepth()==depth && sim.ram.getReadLatency()==0 && sim.ram.getWriteLatency()==1,"RAM geometry differs");
   std::map<std::string,Value> regs;for(auto r:sim.module.getOps<RegResetOp>())regs[r.getName().str()]=r.getResult();
   require(regs.size()==3,"queue state differs");
   struct Entry { uint64_t deadline; unsigned id; };std::deque<Entry> queue;
   std::mt19937_64 random(222);unsigned cases=0,flows=0,fullPops=0,stalls=0,stalledResets=0,wraps=0,resetWrites=0;
   unsigned ep=0,dp=0;bool mf=false;
   auto sample=[&](bool reset,bool fire,uint64_t cycle,bool ev,bool ready,Entry incoming) {
-    bool empty=queue.empty(),full=queue.size()==10;auto head=empty?incoming:queue.front();bool due=head.deadline<=cycle;
+    bool empty=queue.empty(),full=queue.size()==depth;auto head=empty?incoming:queue.front();bool due=head.deadline<=cycle;
     bool valid=(!empty||ev)&&due,push=!full&&ev&&!(empty&&ready&&due),pop=!empty&&valid&&ready;
     sim.memo.clear();sim.put(sim.arg(1),"",reset);sim.put(sim.arg(2),"",fire);sim.put(sim.arg(3),"",cycle);
     sim.put(sim.arg(4),"valid",ev);sim.put(sim.arg(4),"bits.releaseCycle",incoming.deadline);
@@ -174,23 +177,23 @@ void behavior(MLIRContext &ctx) {
     auto memory=sim.memory;if(fire&&push)memory[ep]=APInt(64,incoming.deadline).concat(APInt(4,incoming.id));
     sim.edge();require(memory==sim.memory,"RAM payload/reset/stall differs");
     flows+=fire&&empty&&ev&&ready&&due;fullPops+=fire&&full&&pop;stalls+=!fire;stalledResets+=reset&&!fire;
-    resetWrites+=reset&&fire&&push;wraps+=fire&&!reset&&((push&&ep==9)||(pop&&dp==9));
+    resetWrites+=reset&&fire&&push;wraps+=fire&&!reset&&((push&&ep==depth-1)||(pop&&dp==depth-1));
     if(fire){if(reset){ep=dp=0;mf=false;queue.clear();}else{
-      if(pop){queue.pop_front();dp=(dp+1)%10;}if(push){queue.push_back(incoming);ep=(ep+1)%10;}if(push!=pop)mf=push;}}
+      if(pop){queue.pop_front();dp=(dp+1)%depth;}if(push){queue.push_back(incoming);ep=(ep+1)%depth;}if(push!=pop)mf=push;}}
     require(sim.state.lookup(regs.at("enq_ptr_value")).getZExtValue()==ep && sim.state.lookup(regs.at("deq_ptr_value")).getZExtValue()==dp && sim.state.lookup(regs.at("maybe_full")).getZExtValue()==mf,"enabled pointers/full/reset differ");++cases;
   };
   sample(true,true,0,false,false,{0,0});
   sample(false,true,0,true,true,{0,3});sample(false,true,0,true,true,{UINT64_MAX,15});
   sample(true,false,UINT64_MAX,true,true,{0,1});sample(true,true,0,true,false,{1,2});
   for(unsigned round=0;round<4;++round){sample(true,true,0,false,false,{0,0});
-    for(unsigned i=0;i<10;++i)sample(false,true,0,true,false,{i,i%16});
+    for(unsigned i=0;i<depth;++i)sample(false,true,0,true,false,{i,i%16});
     sample(false,true,UINT64_MAX,true,true,{0,1});
-    for(unsigned i=0;i<10;++i)sample(false,true,UINT64_MAX,false,true,{0,0});}
+    for(unsigned i=0;i<depth;++i)sample(false,true,UINT64_MAX,false,true,{0,0});}
   for(unsigned i=0;i<30000;++i){uint64_t cycle=i%17==0?UINT64_MAX:i;
     uint64_t deadline=i%11==0?UINT64_MAX:i%13==0?0:cycle+(random()%8)-3;
     sample(i%997==0||(random()%113==0),random()%3!=0,cycle,random()%4!=0,random()%2,{deadline,unsigned(random()%16)});}
   require(flows&&fullPops&&stalls&&stalledResets&&wraps&&resetWrites,"queue coverage missing");
-  llvm::outs()<<cases<<" write latency transitions passed; flow="<<flows<<", full pops="<<fullPops<<", stalls="<<stalls<<", stalled resets="<<stalledResets<<", wraps="<<wraps<<", reset writes="<<resetWrites<<"\n";
+  llvm::outs()<<"maxFlight="<<maxFlight<<", depth="<<depth<<": "<<cases<<" write latency transitions passed; flow="<<flows<<", full pops="<<fullPops<<", stalls="<<stalls<<", stalled resets="<<stalledResets<<", wraps="<<wraps<<", reset writes="<<resetWrites<<"\n";
 }
 void mapping(MLIRContext &ctx) {
   auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDWriteLatency(c,error)),error);
@@ -213,12 +216,20 @@ void mapping(MLIRContext &ctx) {
   for(unsigned i=0;i<5;++i)require(cast<StringAttr>(ts[i]).getValue()==expected[i],"target transfer differs");llvm::outs()<<"16 wrapper mapping cases and five target transfers passed\n";
 }
 void rejection(MLIRContext &ctx) {
+  for (int64_t flight : {int64_t(0), int64_t(-1)}) {
+    auto root=fixture(ctx,0,flight); auto c=*root->getOps<CircuitOp>().begin();
+    std::string before,after,error;
+    {llvm::raw_string_ostream out(before);root->print(out);}
+    require(failed(goldengate::addFASEDWriteLatency(c,error))&&!error.empty(),"invalid capacity accepted");
+    {llvm::raw_string_ostream out(after);root->print(out);}
+    require(before==after,"capacity rejection mutated IR");
+  }
   for(unsigned mode=1;mode<=20;++mode){auto root=fixture(ctx,mode);auto c=*root->getOps<CircuitOp>().begin();std::string before,after,error;
     {llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteLatency(c,error))&&!error.empty(),"invalid boundary accepted");
     {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"rejection mutated IR");}
   auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();std::string error,before,after;require(succeeded(goldengate::addFASEDWriteLatency(c,error)),error);
   {llvm::raw_string_ostream out(before);root->print(out);}require(failed(goldengate::addFASEDWriteLatency(c,error)),"repeat accepted");
-  {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"21 atomic rejection cases passed\n";
+  {llvm::raw_string_ostream out(after);root->print(out);}require(before==after,"repeat mutated IR");llvm::outs()<<"23 atomic rejection cases passed\n";
 }
 }
 int main(int argc, char **argv) {
@@ -247,7 +258,8 @@ int main(int argc, char **argv) {
     require(argc == 1, "usage: goldengate-fased-write-latency-test [boundary.mlir helper.mlir]");
     for (bool selected : {false,true}) {
       selectedPrint=selected; llvm::outs()<<oldRoot()<<"\n";
-      behavior(ctx); mapping(ctx); rejection(ctx);
+      for (unsigned flight : {1u, 3u, 10u, 16u, 32u}) behavior(ctx,flight);
+      mapping(ctx); rejection(ctx);
     }
   } catch (const std::exception &e) { llvm::errs()<<e.what()<<"\n"; return 1; }
   return 0;

@@ -1,6 +1,8 @@
 // See LICENSE for license details.
 #include "goldengate/AnnotationEmission.h"
 #include "goldengate/AnnotationClasses.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "mlir/IR/BuiltinAttributes.h"
 #include "llvm/Support/JSON.h"
 #include "llvm/Support/Path.h"
@@ -51,8 +53,15 @@ bool isFAMEAnnotation(llvm::StringRef name) {
 
 std::optional<llvm::json::Value> toJSON(Attribute attr,
                                         std::string &error) {
+  // CIRCT imports explicit JSON null (including Scala Option.None constructor
+  // fields) as UnitAttr. Preserve it at every retained annotation boundary.
+  if (isa<UnitAttr>(attr))
+    return llvm::json::Value(nullptr);
+  // Borrow immutable context-owned strings, including inline blackbox payloads.
+  // The JSON tree is serialized and destroyed synchronously in emitAnnotations,
+  // while the circuit/context still own every value and dictionary key.
   if (auto value = dyn_cast<StringAttr>(attr))
-    return llvm::json::Value(value.getValue().str());
+    return llvm::json::Value(value.getValue());
   if (auto value = dyn_cast<BoolAttr>(attr))
     return llvm::json::Value(value.getValue());
   if (auto value = dyn_cast<FloatAttr>(attr)) {
@@ -88,14 +97,116 @@ std::optional<llvm::json::Value> toJSON(Attribute attr,
       auto converted = toJSON(member.getValue(), error);
       if (!converted)
         return std::nullopt;
-      object[member.getName().str()] = std::move(*converted);
+      object[member.getName().getValue()] = std::move(*converted);
     }
     return llvm::json::Value(std::move(object));
   }
   error = "unsupported attribute in FAME annotation";
   return std::nullopt;
 }
+
+// Validate before touching the destination, without allocating a second tree
+// for the immutable MLIR attributes. Keep the same accepted values and errors
+// as toJSON, including validation of every value in an invalid-key dictionary
+// before JSON's normalized-key overwrite behavior can discard any member.
+LogicalResult validateJSON(Attribute attr, std::string &error) {
+  if (isa<UnitAttr, BoolAttr>(attr))
+    return success();
+  if (auto value = dyn_cast<StringAttr>(attr)) {
+#ifndef NDEBUG
+    // Keep LLVM's malformed-UTF-8 assertions before destination creation too.
+    (void)llvm::json::Value(value.getValue());
+#endif
+    return success();
+  }
+  if (auto value = dyn_cast<FloatAttr>(attr)) {
+    if (std::isfinite(value.getValueAsDouble()))
+      return success();
+    error = "annotation float is not a finite JSON number";
+  } else if (auto value = dyn_cast<IntegerAttr>(attr)) {
+    if (value.getValue().getBitWidth() <= 64)
+      return success();
+    error = "annotation integer exceeds JSON's 64-bit range";
+  } else if (auto value = dyn_cast<ArrayAttr>(attr)) {
+    for (Attribute element : value)
+      if (failed(validateJSON(element, error)))
+        return failure();
+    return success();
+  } else if (auto value = dyn_cast<DictionaryAttr>(attr)) {
+    for (NamedAttribute member : value) {
+      if (failed(validateJSON(member.getValue(), error)))
+        return failure();
+#ifndef NDEBUG
+      (void)llvm::json::ObjectKey(member.getName().getValue());
+#endif
+    }
+    return success();
+  } else {
+    error = "unsupported attribute in FAME annotation";
+  }
+  return failure();
+}
+
+void streamJSON(Attribute attr, llvm::json::OStream &out) {
+  if (auto value = dyn_cast<ArrayAttr>(attr)) {
+    out.array([&] {
+      for (Attribute element : value)
+        streamJSON(element, out);
+    });
+    return;
+  }
+  if (auto value = dyn_cast<DictionaryAttr>(attr)) {
+    // DictionaryAttr already has the lexicographic key order used by LLVM's
+    // JSON object writer. On malformed UTF-8, retain ObjectKey's normalization,
+    // reordering and last-member-wins behavior through the original converter.
+    // That exceptional path is also subject to LLVM's original debug assertion.
+    bool invalidKey = llvm::any_of(value, [](NamedAttribute member) {
+      return !llvm::json::isUTF8(member.getName().getValue());
+    });
+    if (!invalidKey) {
+      out.object([&] {
+        for (NamedAttribute member : value) {
+          out.attributeBegin(member.getName().getValue());
+          streamJSON(member.getValue(), out);
+          out.attributeEnd();
+        }
+      });
+      return;
+    }
+  }
+  // LLVM retains responsibility for escaping, UTF-8 fallback and numeric
+  // formatting. Ordinary scalars borrow strings and allocate no JSON containers.
+  std::string unusedError;
+  auto converted = toJSON(attr, unusedError);
+  assert(converted && "annotation value was validated before streaming");
+  out.value(*converted);
+}
 } // namespace
+
+LogicalResult goldengate::emitJSONAttribute(Attribute value,
+                                           llvm::StringRef path,
+                                           std::string &error) {
+  if (!value || failed(validateJSON(value, error)))
+    return failure();
+  std::error_code writeError;
+  llvm::raw_fd_ostream out(path, writeError);
+  if (writeError) {
+    error = "cannot write compiler metadata: " + writeError.message();
+    return failure();
+  }
+  {
+    llvm::json::OStream json(out, 2);
+    streamJSON(value, json);
+  }
+  out << '\n';
+  out.close();
+  if (out.has_error()) {
+    error = "cannot finish compiler metadata: " + out.error().message();
+    out.clear_error();
+    return failure();
+  }
+  return success();
+}
 
 static LogicalResult emitAnnotations(circt::firrtl::CircuitOp circuit,
                                      llvm::StringRef path, bool fameOnly,
@@ -105,7 +216,7 @@ static LogicalResult emitAnnotations(circt::firrtl::CircuitOp circuit,
     error = "circuit has no retained annotations";
     return failure();
   }
-  llvm::json::Array annotations;
+  llvm::SmallVector<Attribute> annotations;
   for (Attribute attr : raw) {
     auto dict = dyn_cast<DictionaryAttr>(attr);
     if (!dict) {
@@ -119,10 +230,9 @@ static LogicalResult emitAnnotations(circt::firrtl::CircuitOp circuit,
     }
     if (fameOnly && !isFAMEAnnotation(className.getValue()))
       continue;
-    auto converted = toJSON(attr, error);
-    if (!converted)
+    if (failed(validateJSON(attr, error)))
       return failure();
-    annotations.push_back(std::move(*converted));
+    annotations.push_back(attr);
   }
   std::error_code writeError;
   llvm::raw_fd_ostream out(path, writeError);
@@ -130,7 +240,20 @@ static LogicalResult emitAnnotations(circt::firrtl::CircuitOp circuit,
     error = "cannot write FAME annotations: " + writeError.message();
     return failure();
   }
-  out << llvm::formatv("{0:2}\n", llvm::json::Value(std::move(annotations)));
+  {
+    llvm::json::OStream json(out, 2);
+    json.array([&] {
+      for (Attribute attr : annotations)
+        streamJSON(attr, json);
+    });
+  }
+  out << '\n';
+  out.close();
+  if (out.has_error()) {
+    error = "cannot finish FAME annotations: " + out.error().message();
+    out.clear_error();
+    return failure();
+  }
   return success();
 }
 

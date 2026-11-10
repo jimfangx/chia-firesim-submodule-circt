@@ -9,8 +9,8 @@
 // AW acceptance wins over accepted final W in the strict write-data register.
 // Qualified ingress reset clears that register, but never suppresses requests.
 #include "goldengate/FASEDIngressIssue.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
-#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -29,15 +29,9 @@ LogicalResult goldengate::addFASEDIngressIssue(CircuitOp circuit,std::string &er
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if(!inner||!engine||!raw)return reject("FASED ingress issue needs top, engine and annotations");
-  auto key=engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
-  auto edge=key?key.getAs<DictionaryAttr>("axi4Edge"):DictionaryAttr();
-  auto flight=edge?edge.getAs<IntegerAttr>("maxFlight"):IntegerAttr();
-  if(!flight || flight.getType().getIntOrFloatBitWidth()>64 || flight.getInt()<=0)
-    return reject("FASED ingress issue needs positive maxFlight representable in 64 bits");
-  // FASEDMemoryTimingModelConfig caps maxWrites at the default sixteen.
-  // SatUpDownCounter exposes log2Ceil(maxWrites + 1) credit value bits;
-  // host issue itself depends only on the counters' empty flags.
-  const unsigned countWidth=llvm::Log2_64_Ceil(std::min<int64_t>(16,flight.getInt())+1);
+  unsigned limit, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, limit, countWidth, error)))
+    return failure();
   auto *context=circuit.getContext();OpBuilder b(context);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(context,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> fields){

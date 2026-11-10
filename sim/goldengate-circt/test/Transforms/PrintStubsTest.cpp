@@ -37,7 +37,7 @@ void check(CircuitOp circuit, ArrayRef<goldengate::PrintStub> stubs, ArrayAttr b
         fields[0].name.getValue() == "enable" &&
         fields[0].type == UIntType::get(circuit.getContext(), 1), "print enable bundle mismatch");
     llvm::DenseMap<unsigned, Value> drivers;
-    bundleOp->getParentOfType<FModuleOp>().walk([&](StrictConnectOp connect) {
+    bundleOp->getParentOfType<FModuleOp>().walk([&](ConnectOp connect) {
       auto field = connect.getDest().getDefiningOp<SubfieldOp>();
       if (field && field.getInput() == bundleOp.getResult())
         require(drivers.try_emplace(field.getFieldIndex(), connect.getSrc()).second,
@@ -47,7 +47,7 @@ void check(CircuitOp circuit, ArrayRef<goldengate::PrintStub> stubs, ArrayAttr b
             "print enable does not drive bundle");
     for (auto [index,arg] : llvm::enumerate(print.getSubstitutions()))
       require(fields[index+1].name.getValue() == "args_"+std::to_string(index) &&
-          !fields[index+1].isFlip && fields[index+1].type == arg.getType() &&
+          !fields[index+1].isFlip && fields[index+1].type == cast<FIRRTLBaseType>(arg.getType()).getAllConstDroppedType() &&
           drivers.lookup(index+1) == arg, "argument order/type/SSA identity mismatch");
     require(!fields[0].isFlip && stub.formatString == print.getFormatString() &&
         stub.clock == print.getClock(), "print clock/format changed");
@@ -140,6 +140,22 @@ void run(MLIRContext &context) {
       unselected->getBlock()==module.getBodyBlock(),"name collision or unselected print changed");
   check(circuit,stubs,raw);
   require(succeeded(verify(*root)),"invalid print stub FIRRTL");
+  // Literal enables and signed/unsigned literal arguments are legal selected
+  // print sources. Synthesized channel fields must remain ordinary mutable
+  // ground types, with exactly the same bits and signedness as the literals.
+  b.setInsertionPointToEnd(module.getBodyBlock());
+  auto one=b.create<ConstantOp>(loc,UIntType::get(&context,1,true),APInt(1,1));
+  auto signedArg=b.create<ConstantOp>(loc,SIntType::get(&context,9,true),APInt(9,-7,true));
+  auto unsignedArg=b.create<ConstantOp>(loc,UIntType::get(&context,8,true),APInt(8,173));
+  b.create<PrintFOp>(loc,arg(0),one.getResult(),"constants %d %x\n",
+      ValueRange{signedArg.getResult(),unsignedArg.getResult()},"literals");
+  auto literalRaw=b.getArrayAttr({anno("~Top|Top>literals")});
+  circuit->setAttr("rawAnnotations",literalRaw);
+  SmallVector<goldengate::PrintStub> literals;
+  require(succeeded(goldengate::synthesizePrintStubs(circuit,literals,error)),error);
+  require(literals.size()==1,"literal print was not selected");
+  check(circuit,literals,literalRaw);
+  require(succeeded(verify(*root)),"constant print source produced invalid FIRRTL");
 }
 void runGolden(MLIRContext &context, StringRef path) {
   auto root=parseSourceFile<ModuleOp>(path,&context);

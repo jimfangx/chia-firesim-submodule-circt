@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/AutoCounterPrintfValues.h"
+#include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
@@ -24,15 +25,15 @@ bool matchesValue(CircuitOp circuit, StringRef target, Value value) {
 }
 } // namespace
 
-LogicalResult goldengate::synthesizeAutoCounterPrintfValues(
-    CircuitOp circuit, ArrayRef<AutoCounterEvent> selected,
-    SmallVectorImpl<AutoCounterPrintfValue> &values, std::string &error) {
+namespace {
+LogicalResult validatePrintfEvents(
+    CircuitOp circuit, ArrayRef<goldengate::AutoCounterEvent> selected,
+    SmallVectorImpl<goldengate::AutoCounterMode> &modes, std::string &error) {
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!raw) {
     error = "AutoCounter printf values need retained annotations";
     return failure();
   }
-  SmallVector<AutoCounterMode> modes;
   llvm::DenseSet<unsigned> seen;
   for (auto event : selected) {
     auto module = event.module;
@@ -54,8 +55,8 @@ LogicalResult goldengate::synthesizeAutoCounterPrintfValues(
       return failure();
     }
     Annotation annotation(raw[event.annotationIndex]);
-    if ((!annotation.isClass(AnnotationClasses::AutoCounter) &&
-         !annotation.isClass(AnnotationClasses::InternalAutoCounter)) ||
+    if ((!annotation.isClass(goldengate::AnnotationClasses::AutoCounter) &&
+         !annotation.isClass(goldengate::AnnotationClasses::InternalAutoCounter)) ||
         annotation.getMember<StringAttr>("target") != StringAttr::get(circuit.getContext(), event.target) ||
         annotation.getMember<StringAttr>("clock") != StringAttr::get(circuit.getContext(), event.clockTarget) ||
         annotation.getMember<StringAttr>("reset") != StringAttr::get(circuit.getContext(), event.resetTarget) ||
@@ -71,16 +72,26 @@ LogicalResult goldengate::synthesizeAutoCounterPrintfValues(
     // Missing opType uses the annotation's default Accumulate. Present values
     // must use the serialized PerfCounterOps class, as in the SFC handoff.
     if (!annotation.getDict().get("opType") ||
-        (mode && mode.getValue() == AnnotationClasses::AutoCounterAccumulate))
-      modes.push_back(AutoCounterMode::Accumulate);
-    else if (mode && mode.getValue() == AnnotationClasses::AutoCounterIdentity)
-      modes.push_back(AutoCounterMode::Identity);
+        (mode && mode.getValue() == goldengate::AnnotationClasses::AutoCounterAccumulate))
+      modes.push_back(goldengate::AutoCounterMode::Accumulate);
+    else if (mode && mode.getValue() == goldengate::AnnotationClasses::AutoCounterIdentity)
+      modes.push_back(goldengate::AutoCounterMode::Identity);
     else {
       error = "unsupported AutoCounter opType: " + event.target;
       return failure();
     }
   }
 
+  return success();
+}
+} // namespace
+
+LogicalResult goldengate::synthesizeAutoCounterPrintfValues(
+    CircuitOp circuit, ArrayRef<AutoCounterEvent> selected,
+    SmallVectorImpl<AutoCounterPrintfValue> &values, std::string &error) {
+  SmallVector<AutoCounterMode> modes;
+  if (failed(validatePrintfEvents(circuit, selected, modes, error)))
+    return failure();
   std::map<Operation *, circt::Namespace> namespaces;
   for (auto [index, event] : llvm::enumerate(selected)) {
     auto module = event.module;
@@ -171,5 +182,39 @@ LogicalResult goldengate::synthesizeAutoCounterPrintf(
     prints.push_back({value, trigger, print});
   }
   circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), annotations));
+  return success();
+}
+
+
+LogicalResult goldengate::synthesizeEnabledAutoCounterPrintf(
+    CircuitOp circuit, ArrayRef<StringRef> coverModuleNames,
+    unsigned &synthesized, std::string &error) {
+  SmallVector<AutoCounterEvent> events;
+  if (failed(analyzeSelectedAutoCounterEvents(
+          circuit, coverModuleNames, events, error)))
+    return failure();
+  // Validate operation modes, widths and dominance before reset gating creates
+  // any hardware. A malformed late event must not partially instrument a design.
+  SmallVector<AutoCounterMode> modes;
+  if (failed(validatePrintfEvents(circuit, events, modes, error)))
+    return failure();
+  if (failed(gateAutoCounterEventsWithReset(circuit, events, error)))
+    return failure();
+  // Gating retargets selected annotations; resolve the new gates rather than
+  // reusing the old source SSA values (which would bypass reset suppression).
+  events.clear();
+  if (failed(analyzeSelectedAutoCounterEvents(
+          circuit, coverModuleNames, events, error)))
+    return failure();
+  SmallVector<AutoCounterPrintf> prints;
+  if (failed(synthesizeAutoCounterPrintf(circuit, events, prints, error)))
+    return failure();
+  // AutoCounterTransform always consumes selected and unselected AutoCounter
+  // records, including the empty-selection case. Keep the new trigger sinks and
+  // SynthPrintf selections for TriggerWiring and the enabled PrintSynthesis.
+  unsigned removed = 0;
+  if (failed(dropDisabledAutoCounterAnnotations(circuit, removed, error)))
+    return failure();
+  synthesized = prints.size();
   return success();
 }

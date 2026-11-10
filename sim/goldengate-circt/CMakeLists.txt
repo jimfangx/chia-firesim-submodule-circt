@@ -41,6 +41,7 @@ add_executable(goldengate-circt
   lib/Transforms/FindDefaultClocks.cpp
   lib/Transforms/PromotePassthroughConnections.cpp
   lib/Transforms/ExtractModel.cpp
+  lib/Transforms/DeduplicateModels.cpp
   lib/Transforms/WrapTop.cpp
   lib/Transforms/LabelSRAMModels.cpp
   lib/Transforms/SRAMModelChannels.cpp
@@ -49,6 +50,10 @@ add_executable(goldengate-circt
   lib/Transforms/LowerTypes.cpp
   lib/Transforms/AutoCounterResetGate.cpp
   lib/Transforms/AutoCounterPrintfValues.cpp
+  lib/Transforms/AutoCounterSynthesis.cpp
+  lib/Transforms/AutoCounterPipeline.cpp
+  lib/Transforms/AutoCounterControl.cpp
+  lib/Transforms/InstrumentationControl.cpp
   lib/Transforms/PrintStubs.cpp
   lib/Transforms/PrintWiring.cpp
   lib/Transforms/PrintBridgePayload.cpp
@@ -66,6 +71,12 @@ add_executable(goldengate-circt
   lib/Analysis/PrintClockSources.cpp
   lib/Transforms/CoerceAsyncToSyncReset.cpp
   lib/Transforms/LabelMultiThreadedInstances.cpp
+  lib/Transforms/FAME5ThreadedState.cpp
+  lib/Transforms/FAME5Models.cpp
+  lib/Transforms/FAMEModelControls.cpp
+  lib/Transforms/FAMEModelGraph.cpp
+  lib/Transforms/AutoCounterBridgeBinding.cpp
+  lib/Transforms/AutoCounterBridge.cpp
   lib/Transforms/TriggerWiring.cpp
   lib/Transforms/ChannelExcision.cpp
   lib/Transforms/InferModelPorts.cpp
@@ -120,6 +131,23 @@ add_executable(goldengate-circt
   lib/Transforms/FASEDWriteEgress.cpp
   lib/Transforms/FASEDResponseReleaser.cpp
   lib/Transforms/FASEDTimingCycle.cpp
+  lib/Transforms/FASEDBankStateTracker.cpp
+  lib/Transforms/FASEDRankStateTracker.cpp
+  lib/Transforms/FASEDRefreshUnit.cpp
+  lib/Transforms/FASEDCollapsingBuffer.cpp
+  lib/Transforms/FASEDFRFCFSCommandScheduler.cpp
+  lib/Transforms/FASEDDRAMBackend.cpp
+  lib/Transforms/FASEDUnifiedTransactionScheduler.cpp
+  lib/Transforms/FASEDFRFCFSController.cpp
+  lib/Transforms/FASEDLLCMetadata.cpp
+  lib/Transforms/FASEDLLCMSHRTable.cpp
+  lib/Transforms/FASEDLLCModel.cpp
+  lib/Transforms/FASEDAXI4Releaser.cpp
+  lib/Transforms/FASEDTimingMonitor.cpp
+  lib/Transforms/FASEDFRFCFSTimingModel.cpp
+  lib/Transforms/FASEDFRFCFSBridge.cpp
+  lib/Transforms/FASEDFRFCFSMMIO.cpp
+  lib/Transforms/FASEDFRFCFSBridgeMMIO.cpp
   lib/Transforms/FASEDReadLatency.cpp
   lib/Transforms/FASEDWriteLatency.cpp
   lib/Transforms/FASEDTimingAWQueue.cpp
@@ -152,6 +180,7 @@ add_executable(goldengate-circt
   lib/Transforms/NICPacketAdapters.cpp
   lib/Transforms/NICCPUStreamQueues.cpp
   lib/Transforms/NICMMIOBank.cpp
+  lib/Transforms/NICLoopbackControl.cpp
   lib/Transforms/TSIMMIOBank.cpp
   lib/Transforms/ControlReadArbiter.cpp
   lib/Transforms/ControlWriteArbiter.cpp
@@ -189,6 +218,46 @@ target_link_libraries(goldengate-circt PRIVATE
   MLIRIR MLIRSupport LLVMSupport)
 
 include(CTest)
+if(BUILD_TESTING)
+  add_test(NAME goldengate-debug-snapshot-policy
+    COMMAND ${CMAKE_COMMAND}
+      -DCOMPILER=$<TARGET_FILE:goldengate-circt>
+      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/debug-snapshot-policy
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/DebugSnapshotPolicyTest.cmake)
+endif()
+if(BUILD_TESTING)
+  add_test(NAME goldengate-annotation-null-round-trip
+    COMMAND ${CMAKE_COMMAND}
+      -DCOMPILER=$<TARGET_FILE:goldengate-circt>
+      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/annotation-null-round-trip
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/AnnotationNullRoundTripTest.cmake)
+endif()
+if(BUILD_TESTING)
+  find_package(Python3 QUIET COMPONENTS Interpreter)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME goldengate-enabled-autocounter-printf-cli
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/EnabledAutoCounterPrintfCLI.py
+        $<TARGET_FILE:goldengate-circt>
+        ${CMAKE_CURRENT_BINARY_DIR}/enabled-autocounter-printf-cli)
+    add_test(NAME goldengate-enabled-autocounter-printf-f2-cli
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/EnabledAutoCounterPrintfCLI.py
+        $<TARGET_FILE:goldengate-circt>
+        ${CMAKE_CURRENT_BINARY_DIR}/enabled-autocounter-printf-f2-cli
+        --platform-config BaseF2Config)
+  endif()
+  add_test(NAME goldengate-f2-compiler-config
+    COMMAND ${CMAKE_COMMAND}
+      -DCOMPILER=$<TARGET_FILE:goldengate-circt>
+      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/f2-compiler-config-test
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/F2CompilerConfigTest.cmake)
+  add_test(NAME goldengate-baseline-sram-config
+    COMMAND ${CMAKE_COMMAND}
+      -DCOMPILER=$<TARGET_FILE:goldengate-circt>
+      -DWORK=${CMAKE_CURRENT_BINARY_DIR}/baseline-sram-config-test
+      -P ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/BaselineSRAMConfigTest.cmake)
+endif()
 if(BUILD_TESTING)
   add_executable(goldengate-bridge-promotion-test
     test/Analysis/BridgePromotionTest.cpp lib/Analysis/BridgeAnalysis.cpp
@@ -246,6 +315,16 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-extract-model-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-extract-model COMMAND goldengate-extract-model-test)
+  add_executable(goldengate-deduplicate-models-test
+    test/Transforms/DeduplicateModelsTest.cpp lib/Transforms/DeduplicateModels.cpp)
+  target_compile_features(goldengate-deduplicate-models-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-deduplicate-models-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-deduplicate-models-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-deduplicate-models-test PRIVATE
+    CIRCTFIRRTLTransforms CIRCTFIRRTL CIRCTHW CIRCTSupport
+    MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-deduplicate-models COMMAND goldengate-deduplicate-models-test)
   add_executable(goldengate-label-sram-models-test
     test/Transforms/LabelSRAMModelsTest.cpp lib/Transforms/LabelSRAMModels.cpp)
   target_compile_features(goldengate-label-sram-models-test PRIVATE cxx_std_17)
@@ -400,6 +479,7 @@ if(BUILD_TESTING)
     lib/Support/NICHeader.cpp
     lib/Analysis/BridgeClockInfo.cpp
     lib/Support/TracerVHeader.cpp
+    lib/Transforms/FASEDFRFCFSMMIO.cpp
     lib/Support/FASEDHeader.cpp
     lib/Support/PrintBridgeHeader.cpp
     lib/Support/CPUManagedStreamHeader.cpp
@@ -486,6 +566,30 @@ if(BUILD_TESTING)
     lib/Transforms/CPUStreamWriteResponseBuffer.cpp
     lib/Transforms/CPUStreamPort.cpp lib/Transforms/FPGATopShell.cpp
     lib/Transforms/F1Shim.cpp)
+  # Reuse the complete Print transport source inventory for the mixed-widget
+  # integration test; the compiler and test exercise the same implementations.
+  get_target_property(instrumentationSources goldengate-print-binding-test SOURCES)
+  list(REMOVE_ITEM instrumentationSources test/Transforms/PrintBridgeBindingTest.cpp)
+  add_executable(goldengate-instrumentation-control-test
+    test/Transforms/InstrumentationControlTest.cpp ${instrumentationSources}
+    lib/Transforms/AutoCounterBridge.cpp
+    lib/Transforms/AutoCounterBridgeBinding.cpp
+    lib/Transforms/AutoCounterControl.cpp
+    lib/Transforms/InstrumentationControl.cpp)
+  target_compile_features(goldengate-instrumentation-control-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-instrumentation-control-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-instrumentation-control-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-instrumentation-control-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-instrumentation-control
+    COMMAND goldengate-instrumentation-control-test
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/InstrumentationControl)
+  add_test(NAME goldengate-instrumentation-control-cli COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/InstrumentationControl.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/InstrumentationControl.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/test/Transforms/InstrumentationControl
+    --synthesize-instrumentation-control)
   target_compile_features(goldengate-print-binding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-print-binding-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-print-binding-test PRIVATE
@@ -493,6 +597,8 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-print-binding-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-print-binding COMMAND goldengate-print-binding-test)
+  add_test(NAME goldengate-print-f2-control COMMAND goldengate-print-binding-test
+    --f2-control ${CMAKE_CURRENT_BINARY_DIR}/print-f2-control)
   add_test(NAME goldengate-print-nested-cpu-allocation
     COMMAND goldengate-print-binding-test --nested-cpu-allocation-test)
   add_executable(goldengate-print-axi-test
@@ -519,6 +625,26 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-print-stubs-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-print-stubs COMMAND goldengate-print-stubs-test)
+  add_executable(goldengate-fame5-threaded-state-test
+    test/Transforms/FAME5ThreadedStateTest.cpp
+    lib/Transforms/FAME5ThreadedState.cpp)
+  target_compile_features(goldengate-fame5-threaded-state-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame5-threaded-state-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame5-threaded-state-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame5-threaded-state-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame5-threaded-state COMMAND goldengate-fame5-threaded-state-test)
+  add_executable(goldengate-fame5-threaded-memory-test
+    test/Transforms/FAME5ThreadedMemoryTest.cpp lib/Transforms/FAME5ThreadedState.cpp)
+  target_compile_features(goldengate-fame5-threaded-memory-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame5-threaded-memory-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame5-threaded-memory-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame5-threaded-memory-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame5-threaded-memory COMMAND goldengate-fame5-threaded-memory-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAME5ThreadedMemory.fir)
   add_executable(goldengate-autocounter-printf-values-test
     test/Transforms/AutoCounterPrintfValuesTest.cpp
     lib/Transforms/AutoCounterPrintfValues.cpp
@@ -789,6 +915,17 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-fame-fired-state-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fame-fired-state COMMAND goldengate-fame-fired-state-test)
+  add_executable(goldengate-fame-virtual-clock-controls-test
+    test/Transforms/FAMEVirtualClockControlsTest.cpp lib/Transforms/FAMEInputChannel.cpp
+    lib/Transforms/FAMEFiredState.cpp lib/Transforms/FAMEFinishing.cpp
+    lib/Transforms/FAMEInputReady.cpp lib/Transforms/FAMEOutputValid.cpp)
+  target_compile_features(goldengate-fame-virtual-clock-controls-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-virtual-clock-controls-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-virtual-clock-controls-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-virtual-clock-controls-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-virtual-clock-construction COMMAND goldengate-fame-virtual-clock-controls-test)
   add_test(NAME goldengate-fame-virtual-clock-controls COMMAND goldengate-circt
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.fir
     --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEVirtualClock.anno.json
@@ -815,9 +952,12 @@ if(BUILD_TESTING)
   add_executable(goldengate-fased-header-test
     test/Support/FASEDHeaderTest.cpp
     lib/Support/FASEDHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
+    lib/Transforms/FASEDFRFCFSMMIO.cpp
+    lib/Transforms/FASEDFRFCFSBridgeMMIO.cpp
+    lib/Transforms/FASEDRequestLimits.cpp
     lib/Support/AnnotationEmission.cpp
     lib/Transforms/FASEDMMIOBank.cpp lib/Transforms/ControlAddressDecode.cpp
-    lib/Transforms/FASEDRequestLimits.cpp lib/Transforms/ClockBridgeControl.cpp)
+    lib/Transforms/ClockBridgeControl.cpp)
   target_compile_features(goldengate-fased-header-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-header-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-header-test PRIVATE
@@ -843,7 +983,7 @@ if(BUILD_TESTING)
     test/Support/NICHeaderTest.cpp lib/Support/NICHeader.cpp
     lib/Support/CPUManagedStreamHeader.cpp lib/Support/MetasimInterfaceHeader.cpp
     lib/Support/AnnotationEmission.cpp lib/Transforms/NICMMIOBank.cpp
-    lib/Transforms/CPUStreamQueue.cpp)
+    lib/Transforms/CPUStreamQueue.cpp lib/Transforms/CPUStreamRead.cpp)
   target_compile_features(goldengate-nic-header-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-nic-header-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-nic-header-test PRIVATE
@@ -1031,7 +1171,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-xdc-emission COMMAND goldengate-xdc-emission-test)
   add_executable(goldengate-fased-mmio-bank-test
     test/Transforms/FASEDMMIOBankTest.cpp lib/Transforms/FASEDMMIOBank.cpp
-    lib/Transforms/ControlAddressDecode.cpp lib/Transforms/FASEDRequestLimits.cpp)
+    lib/Transforms/ControlAddressDecode.cpp)
   target_compile_features(goldengate-fased-mmio-bank-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-mmio-bank-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-mmio-bank-test PRIVATE
@@ -1086,6 +1226,15 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-fased-latency-registers-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-latency-registers COMMAND goldengate-fased-latency-registers-test)
+  add_executable(goldengate-fased-request-profile-test
+    test/Transforms/FASEDRequestProfileTest.cpp lib/Transforms/FASEDRequestLimits.cpp)
+  target_compile_features(goldengate-fased-request-profile-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-request-profile-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-request-profile-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-request-profile-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fased-request-profile COMMAND goldengate-fased-request-profile-test)
   add_executable(goldengate-fased-request-limits-test
     test/Transforms/FASEDRequestLimitsTest.cpp lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-request-limits-test PRIVATE cxx_std_17)
@@ -1135,7 +1284,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-write-pairing COMMAND goldengate-fased-write-pairing-test)
   add_executable(goldengate-fased-timing-aw-queue-test
-    test/Transforms/FASEDTimingAWQueueTest.cpp lib/Transforms/FASEDTimingAWQueue.cpp)
+    test/Transforms/FASEDTimingAWQueueTest.cpp lib/Transforms/FASEDTimingAWQueue.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-timing-aw-queue-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-timing-aw-queue-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-timing-aw-queue-test PRIVATE
@@ -1144,7 +1294,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-timing-aw-queue COMMAND goldengate-fased-timing-aw-queue-test)
   add_executable(goldengate-fased-write-latency-test
-    test/Transforms/FASEDWriteLatencyTest.cpp lib/Transforms/FASEDWriteLatency.cpp)
+    test/Transforms/FASEDWriteLatencyTest.cpp lib/Transforms/FASEDWriteLatency.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-write-latency-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-write-latency-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-write-latency-test PRIVATE
@@ -1152,8 +1303,28 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-fased-write-latency-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-write-latency COMMAND goldengate-fased-write-latency-test)
+  add_executable(goldengate-fased-bank-state-tracker-test
+    test/Transforms/FASEDBankStateTrackerTest.cpp lib/Transforms/FASEDBankStateTracker.cpp)
+  target_compile_features(goldengate-fased-bank-state-tracker-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-bank-state-tracker-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-bank-state-tracker-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-bank-state-tracker-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fased-bank-state-tracker COMMAND goldengate-fased-bank-state-tracker-test)
+  add_executable(goldengate-fased-rank-state-tracker-test
+    test/Transforms/FASEDRankStateTrackerTest.cpp
+    lib/Transforms/FASEDRankStateTracker.cpp lib/Transforms/FASEDBankStateTracker.cpp)
+  target_compile_features(goldengate-fased-rank-state-tracker-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-rank-state-tracker-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-rank-state-tracker-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-rank-state-tracker-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fased-rank-state-tracker COMMAND goldengate-fased-rank-state-tracker-test)
   add_executable(goldengate-fased-read-latency-test
-    test/Transforms/FASEDReadLatencyTest.cpp lib/Transforms/FASEDReadLatency.cpp)
+    test/Transforms/FASEDReadLatencyTest.cpp lib/Transforms/FASEDReadLatency.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-read-latency-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-read-latency-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-read-latency-test PRIVATE
@@ -1207,7 +1378,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-read-buffer COMMAND goldengate-fased-read-buffer-test)
   add_executable(goldengate-fased-ingress-issue-test
-    test/Transforms/FASEDIngressIssueTest.cpp lib/Transforms/FASEDIngressIssue.cpp)
+    test/Transforms/FASEDIngressIssueTest.cpp lib/Transforms/FASEDIngressIssue.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-ingress-issue-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-ingress-issue-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-ingress-issue-test PRIVATE
@@ -1216,7 +1388,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-ingress-issue COMMAND goldengate-fased-ingress-issue-test)
   add_executable(goldengate-fased-ingress-deadlock-test
-    test/Transforms/FASEDIngressDeadlockTest.cpp lib/Transforms/FASEDIngressDeadlock.cpp)
+    test/Transforms/FASEDIngressDeadlockTest.cpp lib/Transforms/FASEDIngressDeadlock.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-ingress-deadlock-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-ingress-deadlock-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-ingress-deadlock-test PRIVATE
@@ -1225,7 +1398,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-ingress-deadlock COMMAND goldengate-fased-ingress-deadlock-test)
   add_executable(goldengate-fased-ingress-order-test
-    test/Transforms/FASEDIngressOrderTest.cpp lib/Transforms/FASEDIngressOrder.cpp)
+    test/Transforms/FASEDIngressOrderTest.cpp lib/Transforms/FASEDIngressOrder.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-ingress-order-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-ingress-order-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-ingress-order-test PRIVATE
@@ -1234,7 +1408,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-ingress-order COMMAND goldengate-fased-ingress-order-test)
   add_executable(goldengate-fased-ingress-credits-test
-    test/Transforms/FASEDIngressCreditsTest.cpp lib/Transforms/FASEDIngressCredits.cpp)
+    test/Transforms/FASEDIngressCreditsTest.cpp lib/Transforms/FASEDIngressCredits.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-ingress-credits-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-ingress-credits-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-ingress-credits-test PRIVATE
@@ -1261,7 +1436,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-fased-ingress-w COMMAND goldengate-fased-ingress-w-test)
   add_executable(goldengate-fased-ingress-aw-test
-    test/Transforms/FASEDIngressAWQueueTest.cpp lib/Transforms/FASEDIngressAWQueue.cpp)
+    test/Transforms/FASEDIngressAWQueueTest.cpp lib/Transforms/FASEDIngressAWQueue.cpp
+    lib/Transforms/FASEDRequestLimits.cpp)
   target_compile_features(goldengate-fased-ingress-aw-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-ingress-aw-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-ingress-aw-test PRIVATE
@@ -1271,6 +1447,7 @@ if(BUILD_TESTING)
   add_test(NAME goldengate-fased-ingress-aw COMMAND goldengate-fased-ingress-aw-test)
   add_executable(goldengate-fased-host-outstanding-test
     test/Transforms/FASEDHostOutstandingTest.cpp lib/Transforms/FASEDHostOutstanding.cpp
+    lib/Transforms/FASEDRequestLimits.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-fased-host-outstanding-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-host-outstanding-test PRIVATE -fno-rtti)
@@ -1475,7 +1652,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-host-memory-write-arbiter COMMAND goldengate-host-memory-write-arbiter-test)
   add_executable(goldengate-cpu-stream-port-test
-    test/Transforms/CPUStreamPortTest.cpp lib/Transforms/CPUStreamPort.cpp)
+    test/Transforms/CPUStreamPortTest.cpp lib/Transforms/CPUStreamPort.cpp
+    lib/Transforms/CPUStreamRead.cpp lib/Transforms/CPUStreamWrite.cpp)
   target_compile_features(goldengate-cpu-stream-port-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-cpu-stream-port-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-cpu-stream-port-test PRIVATE
@@ -1840,6 +2018,19 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-cpu-stream-read-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-cpu-stream-read COMMAND goldengate-cpu-stream-read-test)
+  add_executable(goldengate-f2-cpu-stream-word-read-test
+    test/Transforms/F2CPUStreamWordReadTest.cpp
+    lib/Transforms/CPUStreamRead.cpp
+    lib/Transforms/CPUStreamCountBank.cpp
+    lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
+  target_compile_features(goldengate-f2-cpu-stream-word-read-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-f2-cpu-stream-word-read-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-f2-cpu-stream-word-read-test PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-f2-cpu-stream-word-read-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-f2-cpu-stream-word-read COMMAND goldengate-f2-cpu-stream-word-read-test)
   add_executable(goldengate-empty-cpu-stream-write-test
     test/Transforms/EmptyCPUStreamWriteTest.cpp
     lib/Transforms/EmptyCPUStreamWrite.cpp)
@@ -2058,6 +2249,16 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-nic-packet-adapters-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-nic-packet-adapters COMMAND goldengate-nic-packet-adapters-test)
+  add_executable(goldengate-nic-multi-widget-pipeline-test
+    test/Transforms/NICMultiWidgetPipelineTest.cpp lib/Transforms/NICPacketAdapters.cpp
+    lib/Transforms/NICCPUStreamQueues.cpp lib/Transforms/CPUStreamQueue.cpp)
+  target_compile_features(goldengate-nic-multi-widget-pipeline-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-multi-widget-pipeline-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-multi-widget-pipeline-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-multi-widget-pipeline-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-multi-widget-pipeline COMMAND goldengate-nic-multi-widget-pipeline-test)
 endif()
 
 if(BUILD_TESTING)
@@ -2076,6 +2277,7 @@ endif()
 if(BUILD_TESTING)
   add_executable(goldengate-cpu-stream-catalog-test
     test/Transforms/CPUStreamCatalogTest.cpp lib/Transforms/CPUStreamRead.cpp
+    lib/Transforms/CPUStreamWrite.cpp
     lib/Transforms/CPUStreamCountBank.cpp lib/Transforms/CPUStreamQueue.cpp
     lib/Transforms/NICCPUStreamQueues.cpp)
   target_compile_features(goldengate-cpu-stream-catalog-test PRIVATE cxx_std_17)
@@ -2097,6 +2299,17 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-nic-mmio-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-nic-mmio COMMAND goldengate-nic-mmio-test)
+  add_executable(goldengate-nic-multi-mmio-test
+    test/Transforms/NICMultiMMIOTest.cpp lib/Transforms/NICMMIOBank.cpp
+    lib/Transforms/ClockBridgeControl.cpp lib/Transforms/CPUStreamCountBank.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
+  target_compile_features(goldengate-nic-multi-mmio-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-multi-mmio-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-multi-mmio-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-multi-mmio-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-multi-mmio COMMAND goldengate-nic-multi-mmio-test)
   add_executable(goldengate-nic-control-test
     test/Transforms/NICControlTest.cpp lib/Transforms/NICMMIOBank.cpp
     lib/Transforms/ClockBridgeControl.cpp lib/Transforms/CPUStreamCountBank.cpp
@@ -2133,4 +2346,497 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-nic-cpu-stream-control-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-nic-cpu-stream-control COMMAND goldengate-nic-cpu-stream-control-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-fased-refresh-unit-test
+    test/Transforms/FASEDRefreshUnitTest.cpp lib/Transforms/FASEDRefreshUnit.cpp)
+  target_compile_features(goldengate-fased-refresh-unit-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-refresh-unit-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-refresh-unit-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-refresh-unit-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fased-refresh-unit COMMAND goldengate-fased-refresh-unit-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-fased-collapsing-buffer-test
+    test/Transforms/FASEDCollapsingBufferTest.cpp lib/Transforms/FASEDCollapsingBuffer.cpp)
+  target_compile_features(goldengate-fased-collapsing-buffer-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-collapsing-buffer-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-collapsing-buffer-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-collapsing-buffer-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fased-collapsing-buffer COMMAND goldengate-fased-collapsing-buffer-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-fased-frfcfs-command-scheduler-test
+    test/Transforms/FASEDFRFCFSCommandSchedulerTest.cpp
+    lib/Transforms/FASEDFRFCFSCommandScheduler.cpp
+    lib/Transforms/FASEDRankStateTracker.cpp lib/Transforms/FASEDBankStateTracker.cpp
+    lib/Transforms/FASEDRefreshUnit.cpp lib/Transforms/FASEDCollapsingBuffer.cpp)
+  target_compile_features(goldengate-fased-frfcfs-command-scheduler-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-frfcfs-command-scheduler-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-frfcfs-command-scheduler-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-frfcfs-command-scheduler-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fased-frfcfs-command-scheduler COMMAND goldengate-fased-frfcfs-command-scheduler-test)
+  foreach(component IN ITEMS dram-backend unified-transaction-scheduler frfcfs-controller)
+    if(component STREQUAL "dram-backend")
+      set(component_source FASEDDRAMBackend)
+      set(component_dependencies "")
+    elseif(component STREQUAL "unified-transaction-scheduler")
+      set(component_source FASEDUnifiedTransactionScheduler)
+      set(component_dependencies "")
+    else()
+      set(component_source FASEDFRFCFSController)
+      set(component_dependencies
+        lib/Transforms/FASEDDRAMBackend.cpp
+        lib/Transforms/FASEDUnifiedTransactionScheduler.cpp
+        lib/Transforms/FASEDFRFCFSCommandScheduler.cpp
+        lib/Transforms/FASEDRankStateTracker.cpp lib/Transforms/FASEDBankStateTracker.cpp
+        lib/Transforms/FASEDRefreshUnit.cpp lib/Transforms/FASEDCollapsingBuffer.cpp)
+    endif()
+    add_executable(goldengate-fased-${component}-test
+      test/Transforms/${component_source}Test.cpp
+      lib/Transforms/${component_source}.cpp ${component_dependencies})
+    target_compile_features(goldengate-fased-${component}-test PRIVATE cxx_std_17)
+    target_compile_options(goldengate-fased-${component}-test PRIVATE -fno-rtti)
+    target_include_directories(goldengate-fased-${component}-test PRIVATE
+      include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+    target_link_libraries(goldengate-fased-${component}-test PRIVATE
+      CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport)
+    add_test(NAME goldengate-fased-${component}
+      COMMAND goldengate-fased-${component}-test)
+  endforeach()
+
+endif()
+
+if(BUILD_TESTING)
+  foreach(component IN ITEMS llc-metadata llc-mshr-table llc-model axi4-releaser timing-monitor frfcfs-timing-model)
+    if(component STREQUAL "llc-metadata")
+      set(component_source FASEDLLCMetadata)
+      set(component_dependencies "")
+    elseif(component STREQUAL "llc-mshr-table")
+      set(component_source FASEDLLCMSHRTable)
+      set(component_dependencies "")
+    elseif(component STREQUAL "llc-model")
+      set(component_source FASEDLLCModel)
+      set(component_dependencies lib/Transforms/FASEDLLCMetadata.cpp lib/Transforms/FASEDLLCMSHRTable.cpp)
+    elseif(component STREQUAL "axi4-releaser")
+      set(component_source FASEDAXI4Releaser)
+      set(component_dependencies "")
+    elseif(component STREQUAL "timing-monitor")
+      set(component_source FASEDTimingMonitor)
+      set(component_dependencies "")
+    else()
+      set(component_source FASEDFRFCFSTimingModel)
+      set(component_dependencies
+        lib/Transforms/FASEDAXI4Releaser.cpp lib/Transforms/FASEDTimingMonitor.cpp
+        lib/Transforms/FASEDLLCModel.cpp lib/Transforms/FASEDLLCMetadata.cpp
+        lib/Transforms/FASEDLLCMSHRTable.cpp lib/Transforms/FASEDFRFCFSController.cpp
+        lib/Transforms/FASEDDRAMBackend.cpp lib/Transforms/FASEDUnifiedTransactionScheduler.cpp
+        lib/Transforms/FASEDFRFCFSCommandScheduler.cpp
+        lib/Transforms/FASEDRankStateTracker.cpp lib/Transforms/FASEDBankStateTracker.cpp
+        lib/Transforms/FASEDRefreshUnit.cpp lib/Transforms/FASEDCollapsingBuffer.cpp)
+    endif()
+    add_executable(goldengate-fased-${component}-test
+      test/Transforms/${component_source}Test.cpp
+      lib/Transforms/${component_source}.cpp ${component_dependencies})
+    target_compile_features(goldengate-fased-${component}-test PRIVATE cxx_std_17)
+    target_compile_options(goldengate-fased-${component}-test PRIVATE -fno-rtti)
+    target_include_directories(goldengate-fased-${component}-test PRIVATE
+      include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+    target_link_libraries(goldengate-fased-${component}-test PRIVATE
+      CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+    add_test(NAME goldengate-fased-${component} COMMAND goldengate-fased-${component}-test)
+  endforeach()
+endif()
+
+if(BUILD_TESTING)
+  set(frfcfs_bridge_dependencies
+    lib/Transforms/FASEDFRFCFSBridge.cpp lib/Transforms/FASEDFRFCFSTimingModel.cpp
+    lib/Transforms/FASEDAXI4Releaser.cpp lib/Transforms/FASEDTimingMonitor.cpp
+    lib/Transforms/FASEDLLCModel.cpp lib/Transforms/FASEDLLCMetadata.cpp
+    lib/Transforms/FASEDLLCMSHRTable.cpp lib/Transforms/FASEDFRFCFSController.cpp
+    lib/Transforms/FASEDDRAMBackend.cpp lib/Transforms/FASEDUnifiedTransactionScheduler.cpp
+    lib/Transforms/FASEDFRFCFSCommandScheduler.cpp lib/Transforms/FASEDRankStateTracker.cpp
+    lib/Transforms/FASEDBankStateTracker.cpp lib/Transforms/FASEDRefreshUnit.cpp
+    lib/Transforms/FASEDCollapsingBuffer.cpp)
+  foreach(component IN ITEMS mmio bridge integration pipeline)
+    if(component STREQUAL "mmio")
+      set(frfcfs_test_source FASEDFRFCFSMMIOTest)
+      set(frfcfs_test_dependencies lib/Transforms/FASEDFRFCFSMMIO.cpp)
+    elseif(component STREQUAL "bridge")
+      set(frfcfs_test_source FASEDFRFCFSBridgeTest)
+      set(frfcfs_test_dependencies ${frfcfs_bridge_dependencies})
+    else()
+      set(frfcfs_test_source FASEDFRFCFSIntegrationTest)
+      set(frfcfs_test_dependencies ${frfcfs_bridge_dependencies}
+        lib/Transforms/FASEDFRFCFSMMIO.cpp lib/Transforms/FASEDFRFCFSBridgeMMIO.cpp
+        lib/Transforms/FASEDRequestLimits.cpp lib/Transforms/ControlAddressDecode.cpp
+        lib/Transforms/ClockBridgeControl.cpp)
+      if(component STREQUAL "pipeline")
+        set(frfcfs_test_source FASEDFRFCFSPipelineTest)
+        list(APPEND frfcfs_test_dependencies
+          lib/Support/TargetUtils.cpp lib/Transforms/FASEDTokenEngine.cpp
+          lib/Transforms/FASEDHostOutstanding.cpp lib/Transforms/FASEDIngressAWQueue.cpp
+          lib/Transforms/FASEDIngressWQueue.cpp lib/Transforms/FASEDIngressARQueue.cpp
+          lib/Transforms/FASEDIngressCredits.cpp lib/Transforms/FASEDIngressOrder.cpp
+          lib/Transforms/FASEDIngressIssue.cpp lib/Transforms/FASEDIngressDeadlock.cpp
+          lib/Transforms/FASEDReadBuffer.cpp lib/Transforms/FASEDReadScheduler.cpp
+          lib/Transforms/FASEDWriteEgress.cpp)
+      endif()
+    endif()
+    add_executable(goldengate-fased-frfcfs-${component}-test
+      test/Transforms/${frfcfs_test_source}.cpp ${frfcfs_test_dependencies})
+    target_compile_features(goldengate-fased-frfcfs-${component}-test PRIVATE cxx_std_17)
+    target_compile_options(goldengate-fased-frfcfs-${component}-test PRIVATE -fno-rtti)
+    target_include_directories(goldengate-fased-frfcfs-${component}-test PRIVATE
+      include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+    target_link_libraries(goldengate-fased-frfcfs-${component}-test PRIVATE
+      CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+    add_test(NAME goldengate-fased-frfcfs-${component}
+      COMMAND goldengate-fased-frfcfs-${component}-test)
+  endforeach()
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-fame-model-controls-test
+    test/Transforms/FAMEModelControlsTest.cpp
+    lib/Transforms/FAMEModelControls.cpp lib/Transforms/FAMEInputChannel.cpp
+    lib/Transforms/FAMEHubClockControls.cpp lib/Transforms/FAMEFiredState.cpp
+    lib/Transforms/FAMEFinishing.cpp lib/Transforms/FAMEInputReady.cpp
+    lib/Transforms/FAMEOutputValid.cpp lib/Support/XDCEmission.cpp)
+  add_executable(goldengate-fame5-grouped-models-test
+    test/Transforms/FAME5GroupedModelsTest.cpp lib/Transforms/FAME5Models.cpp
+    lib/Transforms/XilinxHostSpecialization.cpp
+    lib/Transforms/FAME5ThreadedState.cpp)
+  foreach(feature_target goldengate-fame-model-controls-test goldengate-fame5-grouped-models-test)
+    target_compile_features(${feature_target} PRIVATE cxx_std_17)
+    target_compile_options(${feature_target} PRIVATE -fno-rtti)
+    target_include_directories(${feature_target} PRIVATE
+      include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+    target_link_libraries(${feature_target} PRIVATE
+      CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  endforeach()
+  add_test(NAME goldengate-fame-model-controls COMMAND goldengate-fame-model-controls-test)
+  add_test(NAME goldengate-fame5-grouped-models COMMAND goldengate-fame5-grouped-models-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAME5GroupedModels.fir)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-autocounter-bridge-test
+    test/Transforms/AutoCounterBridgeTest.cpp lib/Transforms/AutoCounterBridge.cpp
+    lib/Transforms/ClockBridgeControl.cpp lib/Transforms/ControlAddressDecode.cpp)
+  target_compile_features(goldengate-autocounter-bridge-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autocounter-bridge-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autocounter-bridge-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autocounter-bridge-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autocounter-bridge COMMAND goldengate-autocounter-bridge-test)
+endif()
+
+if(BUILD_TESTING)
+  add_test(NAME goldengate-fame5-grouped-models-cli
+    COMMAND goldengate-circt
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAME5GroupedModels.fir
+      --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAME5GroupedModels.anno.json
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/fame5-grouped-models-cli
+      --multi-thread-fame5-models)
+  set_tests_properties(goldengate-fame5-grouped-models-cli PROPERTIES
+    PASS_REGULAR_EXPRESSION "Materialized 1 feature modules")
+  add_test(NAME goldengate-autocounter-hosts-cli
+    COMMAND goldengate-circt
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridge.fir
+      --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridge.anno.json
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/autocounter-hosts-cli
+      --materialize-autocounter-hosts)
+  set_tests_properties(goldengate-autocounter-hosts-cli PROPERTIES
+    PASS_REGULAR_EXPRESSION "Materialized 1 feature modules")
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-autocounter-control-test
+    test/Transforms/AutoCounterControlTest.cpp
+    lib/Transforms/AutoCounterBridge.cpp lib/Transforms/AutoCounterBridgeBinding.cpp
+    lib/Transforms/AutoCounterControl.cpp lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp lib/Transforms/ControlErrorSlave.cpp
+    lib/Transforms/ControlWriteRoute.cpp lib/Transforms/ControlWriteDispatch.cpp
+    lib/Transforms/ControlWidgetWrites.cpp lib/Transforms/ControlReadDispatch.cpp
+    lib/Transforms/ControlReadTracker.cpp lib/Transforms/ControlReadArbiter.cpp
+    lib/Transforms/ControlTransactionTracker.cpp
+    lib/Transforms/ControlWriteArbiter.cpp lib/Transforms/ControlWriteTracker.cpp
+    lib/Transforms/SimulationMasterControl.cpp lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-autocounter-control-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autocounter-control-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autocounter-control-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autocounter-control-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autocounter-control COMMAND goldengate-autocounter-control-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridgeBinding)
+  add_executable(goldengate-autocounter-binding-test
+    test/Transforms/AutoCounterBridgeBindingTest.cpp
+    lib/Transforms/AutoCounterBridge.cpp lib/Transforms/AutoCounterBridgeBinding.cpp
+    lib/Transforms/ClockBridgeControl.cpp lib/Transforms/ControlAddressDecode.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-autocounter-binding-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autocounter-binding-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autocounter-binding-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autocounter-binding-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autocounter-binding COMMAND goldengate-autocounter-binding-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridgeBinding)
+  add_test(NAME goldengate-autocounter-binding-cli COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridgeBinding.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridgeBinding.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/autocounter-binding-cli --bind-autocounter-hosts)
+  set_tests_properties(goldengate-autocounter-binding-cli PROPERTIES
+    PASS_REGULAR_EXPRESSION "Materialized 2 feature modules")
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-fame-model-graph-test
+    test/Transforms/FAMEModelGraphTest.cpp
+    lib/Transforms/FAMEModelGraph.cpp
+    lib/Transforms/FAMEModelControls.cpp
+    lib/Transforms/FAMEInputChannel.cpp
+    lib/Transforms/FAMEOutputChannel.cpp
+    lib/Transforms/FAMEHubClockChannel.cpp
+    lib/Transforms/FAMEHubClockControls.cpp
+    lib/Transforms/FAMEHostControl.cpp
+    lib/Transforms/FAMEAnnotations.cpp
+    lib/Transforms/FAMEFiredState.cpp
+    lib/Transforms/FAMEFinishing.cpp
+    lib/Transforms/FAMEInputReady.cpp
+    lib/Transforms/FAMEOutputValid.cpp
+    lib/Transforms/RemainingFanout.cpp
+    lib/Transforms/FAMEPipeChannel.cpp
+    lib/Transforms/FAMEReadyValidChannel.cpp
+    lib/Transforms/FAMEClockChannel.cpp
+    lib/Analysis/HierarchyAnalysis.cpp
+    lib/Analysis/ModelAnalysis.cpp
+    lib/Analysis/ChannelAnalysis.cpp
+    lib/Analysis/FAMEPortAnalysis.cpp
+    lib/Analysis/FAMEOutputSelection.cpp
+    lib/Analysis/FAMEChannelClockDomains.cpp
+    lib/Analysis/CombDependencyAnalysis.cpp
+    lib/Support/TargetUtils.cpp
+    lib/Support/XDCEmission.cpp
+    lib/Transforms/FAME5Models.cpp
+    lib/Transforms/FAME5ThreadedState.cpp
+    lib/Transforms/XilinxHostSpecialization.cpp)
+  target_compile_features(goldengate-fame-model-graph-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fame-model-graph-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fame-model-graph-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fame-model-graph-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-fame-model-graph COMMAND goldengate-fame-model-graph-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.fir
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.anno.json)
+  add_test(NAME goldengate-fame-model-graph-ready-valid
+    COMMAND goldengate-fame-model-graph-test
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphReadyValid.fir
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphReadyValid.anno.json
+      ${CMAKE_CURRENT_BINARY_DIR}/fame-model-graph-ready-valid.mlir ready-valid)
+  foreach(graph_mode graph graph-boundary)
+    add_test(NAME goldengate-fame-model-${graph_mode}-cli COMMAND goldengate-circt
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.fir
+      --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.anno.json
+      --output-dir ${CMAKE_CURRENT_BINARY_DIR}/fame-model-${graph_mode}-cli
+      --rewrite-fame-model-${graph_mode})
+    set_tests_properties(goldengate-fame-model-${graph_mode}-cli PROPERTIES
+      PASS_REGULAR_EXPRESSION "Composed 2 FAME definitions, 3 instances and 2 domains")
+    add_test(NAME goldengate-fame-model-ready-valid-${graph_mode}-cli
+      COMMAND goldengate-circt
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphReadyValid.fir
+        --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphReadyValid.anno.json
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/fame-model-ready-valid-${graph_mode}-cli
+        --rewrite-fame-model-${graph_mode})
+    set_tests_properties(goldengate-fame-model-ready-valid-${graph_mode}-cli PROPERTIES
+      PASS_REGULAR_EXPRESSION "Composed 2 FAME definitions, 2 instances and 2 domains")
+  endforeach()
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-autocounter-synthesis-test
+    test/Transforms/AutoCounterSynthesisTest.cpp
+    lib/Transforms/AutoCounterSynthesis.cpp lib/Analysis/AutoCounterAnalysis.cpp
+    lib/Transforms/AutoCounterResetGate.cpp lib/Analysis/PrintClockSources.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-autocounter-synthesis-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-autocounter-synthesis-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-autocounter-synthesis-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-autocounter-synthesis-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-autocounter-synthesis COMMAND goldengate-autocounter-synthesis-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterSynthesis)
+  add_test(NAME goldengate-autocounter-csv-cli COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterSynthesis.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterSynthesis.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/autocounter-csv-cli --synthesize-autocounter-csv)
+  set_tests_properties(goldengate-autocounter-csv-cli PROPERTIES
+    PASS_REGULAR_EXPRESSION "Synthesized 2 AutoCounter CSV clock domains")
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-loopback-test
+    test/Transforms/NICLoopbackTest.cpp
+    lib/Transforms/NICTokenQueues.cpp lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-nic-loopback-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-loopback-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-loopback-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-loopback-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-loopback COMMAND goldengate-nic-loopback-test)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-loopback-control-test
+    test/Transforms/NICLoopbackControlTest.cpp
+    lib/Transforms/NICTokenQueues.cpp lib/Transforms/NICMMIOBank.cpp
+    lib/Transforms/ClockBridgeControl.cpp lib/Transforms/ControlAddressDecode.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-nic-loopback-control-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-loopback-control-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-loopback-control-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-loopback-control-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-loopback-control COMMAND goldengate-nic-loopback-control-test)
+endif()
+
+if(BUILD_TESTING)
+  add_test(NAME goldengate-fame-model-graph-shared-grouped
+    COMMAND goldengate-fame-model-graph-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphSharedGrouped.fir
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphSharedGrouped.anno.json
+    ${CMAKE_CURRENT_BINARY_DIR}/test-fame-model-graph-shared-grouped.mlir)
+endif()
+
+if(BUILD_TESTING)
+  add_test(NAME goldengate-autocounter-csv-hosts-cli COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterSynthesis.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterSynthesis.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/autocounter-csv-hosts-cli
+    --synthesize-autocounter-csv-hosts)
+  set_tests_properties(goldengate-autocounter-csv-hosts-cli PROPERTIES
+    PASS_REGULAR_EXPRESSION "2 ordered local F2 AXI hosts")
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-nic-loopback-composition-test
+    test/Transforms/NICLoopbackCompositionTest.cpp
+    lib/Transforms/NICLoopbackControl.cpp
+    lib/Support/NICHeader.cpp lib/Support/CPUManagedStreamHeader.cpp
+    lib/Support/TargetUtils.cpp lib/Transforms/NICTokenQueues.cpp
+    lib/Transforms/NICCPUStreamQueues.cpp lib/Transforms/CPUStreamQueue.cpp
+    lib/Transforms/NICMMIOBank.cpp lib/Transforms/CPUStreamRead.cpp
+    lib/Transforms/CPUStreamWrite.cpp lib/Transforms/CPUStreamCountBank.cpp
+    lib/Transforms/ClockBridgeControl.cpp lib/Transforms/ControlAddressDecode.cpp
+    lib/Transforms/ControlErrorSlave.cpp lib/Transforms/ControlWriteRoute.cpp
+    lib/Transforms/ControlWriteDispatch.cpp lib/Transforms/ControlWidgetWrites.cpp
+    lib/Transforms/ControlReadDispatch.cpp lib/Transforms/ControlReadTracker.cpp
+    lib/Transforms/ControlTransactionTracker.cpp
+    lib/Transforms/ControlReadArbiter.cpp lib/Transforms/ControlWriteArbiter.cpp
+    lib/Transforms/ControlWriteTracker.cpp lib/Transforms/SimulationMasterControl.cpp
+    lib/Transforms/CPUStreamWriteBuffer.cpp lib/Transforms/CPUStreamReadBuffer.cpp
+    lib/Transforms/CPUStreamResponseBuffer.cpp lib/Transforms/CPUStreamWriteResponseBuffer.cpp
+    lib/Transforms/CPUStreamPort.cpp)
+  target_compile_features(goldengate-nic-loopback-composition-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-loopback-composition-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-loopback-composition-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-loopback-composition-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-loopback-composition COMMAND goldengate-nic-loopback-composition-test)
+
+  add_executable(goldengate-nic-loopback-cpu-streams-test
+    test/Transforms/NICLoopbackCPUStreamsTest.cpp
+    lib/Support/NICHeader.cpp lib/Transforms/NICTokenQueues.cpp
+    lib/Support/TargetUtils.cpp lib/Transforms/NICCPUStreamQueues.cpp
+    lib/Transforms/CPUStreamQueue.cpp lib/Transforms/CPUStreamRead.cpp
+    lib/Transforms/NICMMIOBank.cpp lib/Transforms/ClockBridgeControl.cpp
+    lib/Transforms/ControlAddressDecode.cpp)
+  target_compile_features(goldengate-nic-loopback-cpu-streams-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-nic-loopback-cpu-streams-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-nic-loopback-cpu-streams-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-nic-loopback-cpu-streams-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-nic-loopback-cpu-streams COMMAND goldengate-nic-loopback-cpu-streams-test)
+  file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/test/Transforms/AutoCounterPipeline)
+  add_test(NAME goldengate-autocounter-csv-bindings-cli COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterPipeline.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterPipeline.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/test/Transforms/AutoCounterPipeline
+    --synthesize-autocounter-csv-bindings)
+  add_test(NAME goldengate-autocounter-csv-control-cli COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterPipeline.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterPipeline.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/test/Transforms/AutoCounterControlPipeline
+    --synthesize-autocounter-csv-control)
+  add_test(NAME goldengate-autocounter-control-cli COMMAND goldengate-circt
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridgeBinding.fir
+    --annotation-file ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AutoCounterBridgeBinding.anno.json
+    --output-dir ${CMAKE_CURRENT_BINARY_DIR}/test/Transforms/AutoCounterControl
+    --bind-autocounter-control)
+  add_test(NAME goldengate-fame-model-graph-memory COMMAND goldengate-fame-model-graph-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphMemory.fir
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphMemory.anno.json
+    ${CMAKE_CURRENT_BINARY_DIR}/fame-model-memory.mlir memory aliases)
+  add_test(NAME goldengate-fame-model-graph-repeated-aliases COMMAND goldengate-fame-model-graph-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphRepeatedAliases.fir
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphRepeatedAliases.anno.json
+    ${CMAKE_CURRENT_BINARY_DIR}/fame-model-repeated-aliases.mlir repeated aliases all)
+
+endif()
+
+if(BUILD_TESTING)
+  add_test(NAME goldengate-fame-model-graph-virtual COMMAND goldengate-fame-model-graph-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphVirtual.fir
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraphVirtual.anno.json
+    ${CMAKE_CURRENT_BINARY_DIR}/fame-model-virtual.mlir virtual graph boundary only)
+  add_test(NAME goldengate-enabled-instrumentation-source-cli
+    COMMAND ${Python3_EXECUTABLE}
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/EnabledInstrumentationPipelineCLI.py
+      $<TARGET_FILE:goldengate-circt>
+      ${CMAKE_CURRENT_BINARY_DIR}/enabled-instrumentation-source-cli)
+  set_tests_properties(goldengate-enabled-instrumentation-source-cli PROPERTIES
+    PASS_REGULAR_EXPRESSION "PASS enabled source-to-FAME/shared-control/CPU compiler")
+endif()
+
+# Production control allocation/request binding now validates the shared CSV
+# catalog. Standalone test executables compile these implementation files
+# directly, so retain their transitive CSV/target-resolution dependencies too.
+# Add each source once; source-list fixtures with CSV already linked are unchanged.
+if(BUILD_TESTING)
+  get_property(goldengate_control_targets DIRECTORY PROPERTY BUILDSYSTEM_TARGETS)
+  foreach(goldengate_control_target IN LISTS goldengate_control_targets)
+    get_target_property(goldengate_control_sources ${goldengate_control_target} SOURCES)
+    if("lib/Transforms/ControlAddressDecode.cpp" IN_LIST goldengate_control_sources OR
+       "lib/Transforms/ControlWidgetWrites.cpp" IN_LIST goldengate_control_sources OR
+       "lib/Support/RocketDriverHeader.cpp" IN_LIST goldengate_control_sources)
+      foreach(goldengate_control_dependency IN ITEMS
+          lib/Transforms/ControlAddressDecode.cpp
+          lib/Transforms/CPUStreamRead.cpp
+          lib/Transforms/AutoCounterBridgeBinding.cpp
+          lib/Support/TargetUtils.cpp)
+        if(NOT goldengate_control_dependency IN_LIST goldengate_control_sources)
+          target_sources(${goldengate_control_target} PRIVATE ${goldengate_control_dependency})
+          list(APPEND goldengate_control_sources ${goldengate_control_dependency})
+        endif()
+      endforeach()
+    endif()
+  endforeach()
 endif()

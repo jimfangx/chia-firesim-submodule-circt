@@ -7,14 +7,12 @@
 // Transfers: circuit/copied-port targets and consumed readiness leaf targets.
 // Mutates: hierarchy and ports; preserves constructor/channel/clock metadata.
 // Oracle: FASEDMemoryTimingModel.scala 329-340 and widgets/Lib.scala counter.
-// The supported default-memory platform uses BaseParams(16,16), capped by
-// edge.maxFlight (BaseConfig.maxReads/maxWrites). Custom BaseParams are not
-// represented by this boundary. Target reset and targetFire never gate or
-// clear host transactions.
+// The platform-derived functional capacity is capped by edge.maxFlight
+// (BaseConfig.maxReads/maxWrites), shared with ingress counters and queues.
+// Target reset and targetFire never gate or clear host transactions.
 #include "goldengate/FASEDHostOutstanding.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
-#include "llvm/Support/MathExtras.h"
-#include <algorithm>
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -35,15 +33,9 @@ LogicalResult goldengate::addFASEDHostOutstanding(CircuitOp circuit, std::string
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!inner || !engine || !raw) return reject("FASED host outstanding needs top, token engine and annotations");
-  auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
-  auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
-  auto maxFlight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!maxFlight || maxFlight.getValue().getBitWidth() > 64 || maxFlight.getInt() <= 0)
-    return reject("FASED host outstanding needs a positive 64-bit maxFlight constructor");
-  // WithDefaultMemModel supplies 16 read and write slots. Cap before computing
-  // n+1 so even a large edge maximum cannot overflow the counter width.
-  const uint64_t limit = std::min<uint64_t>(16, maxFlight.getInt());
-  const unsigned countWidth = llvm::Log2_64_Ceil(limit + 1);
+  unsigned limit, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, limit, countWidth, error)))
+    return failure();
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto bit = UIntType::get(ctx, 1, false), countType = UIntType::get(ctx, countWidth, false);
   auto readiness = BundleType::get(ctx, {{b.getStringAttr("readValid"), false, bit},

@@ -20,6 +20,7 @@
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include <functional>
 
 using namespace mlir;
@@ -31,7 +32,9 @@ LogicalResult goldengate::addClockBridge(CircuitOp circuit,
   constexpr llvm::StringLiteral wrapperName = "GGClockBridgeWrapper";
   constexpr llvm::StringLiteral controlName = "clockBridge_mcr";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
-  if (circuit.getName() != "GGFAMEPipeWrapper")
+  bool printBoundary = circuit.getName() == "GGPrintBridgeHostWrapper";
+  bool csvBoundary = circuit.getName() == "GGAutoCounterBridgeHostWrapper";
+  if (circuit.getName() != "GGFAMEPipeWrapper" && !printBoundary && !csvBoundary)
     return reject("clock bridge requires the active FAME PipeChannel wrapper");
   FModuleOp inner;
   for (auto &op : circuit.getBodyBlock()->getOperations()) {
@@ -43,6 +46,34 @@ LogicalResult goldengate::addClockBridge(CircuitOp circuit,
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!inner || !raw) return reject("clock bridge requires a top and retained annotations");
+  // Instrumentation wrappers preserve the clock-token port and host controls.
+  // Validate each actual binding registry and its simulator child before using
+  // the outer boundary; accepting arbitrary wrapper names would hide a broken
+  // transport composition.
+  FModuleOp boundary = inner;
+  llvm::SmallPtrSet<Operation *, 4> visited;
+  while (boundary.getName() != "GGFAMEPipeWrapper") {
+    if (!visited.insert(boundary.getOperation()).second)
+      return reject("clock bridge instrumentation wrapper cycle");
+    StringRef registry;
+    if (boundary.getName() == "GGPrintBridgeHostWrapper")
+      registry = "goldengate.printHostBindings";
+    else if (boundary.getName() == "GGAutoCounterBridgeHostWrapper")
+      registry = "goldengate.autocounterHostBindings";
+    else return reject("clock bridge instrumentation child is not the active simulator transport");
+    auto bindings = boundary->getAttrOfType<ArrayAttr>(registry);
+    InstanceOp sim;
+    for (auto instance : boundary.getOps<InstanceOp>())
+      if (instance.getName() == "sim") sim = instance;
+    if (!bindings || bindings.empty() || !sim)
+      return reject("clock bridge requires bound instrumentation hosts and a simulator child");
+    FModuleOp child;
+    for (auto candidate : circuit.getOps<FModuleOp>())
+      if (candidate.getName() == sim.getModuleName()) child = candidate;
+    if (!child) return reject("clock bridge instrumentation simulator child is missing");
+    boundary = child;
+  }
+
   DictionaryAttr bridge, channel;
   unsigned bridgeIndex = 0, channelIndex = 0;
   for (auto [i, attr] : llvm::enumerate(raw)) {
@@ -166,9 +197,11 @@ LogicalResult goldengate::addClockBridge(CircuitOp circuit,
       ConventionAttr::get(context, Convention::Internal), producerPorts);
   producer->setAttr("goldengate.bridgeConstructor", key);
   // MCRFileMap.allocate assigns one four-byte word per entry in this order.
+  // enumerate(ArrayRef{...}) would outlive its backing initializer-list array.
+  static constexpr llvm::StringRef registerNames[] = {
+      "hCycle_0", "hCycle_1", "hCycle_latch", "tCycle_0", "tCycle_1", "tCycle_latch"};
   SmallVector<Attribute> registerMap;
-  for (auto [i, name] : llvm::enumerate(ArrayRef<llvm::StringRef>{
-           "hCycle_0", "hCycle_1", "hCycle_latch", "tCycle_0", "tCycle_1", "tCycle_latch"})) {
+  for (auto [i, name] : llvm::enumerate(registerNames)) {
     bool latch = i % 3 == 2;
     registerMap.push_back(b.getDictionaryAttr({
         b.getNamedAttr("name", b.getStringAttr(name)),
@@ -207,6 +240,10 @@ LogicalResult goldengate::addClockBridge(CircuitOp circuit,
     Value counter = group == 0 ? hCycle : tCycle;
     Value shadow = b.create<RegOp>(loc, wide, arg(0),
         group == 0 ? "hCycle_mmreg" : "tCycle_mmreg").getResult();
+    // Preserve this source register identity for the backend's scoped SFC
+    // initialization contract. CIRCT packs random bits across physical regs;
+    // SFC initializes each wide shadow with one repeated 32-bit random word.
+    shadow.getDefiningOp()->setAttr("goldengate.clockSnapshot", b.getUnitAttr());
     Value write = slot("write", group * 3 + 2);
     Value lowBit = b.create<BitsPrimOp>(loc, field(write, "bits"), 0, 0);
     Value latch = b.create<AndPrimOp>(loc, field(write, "valid"), lowBit);

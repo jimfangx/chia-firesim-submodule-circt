@@ -2,7 +2,8 @@
 // Oracle: FPGATop.cpuManagedAXI4NodeTuple and cpu_managed_axi4 IO <> node.out.
 // Required boundary: selected uninstantiated platform or selected/expanded Print B
 // wrapper. CPU scalars forward uniquely to the retained child or B queue.
-// Required engines: buffered outgoing streams; zero or one incoming NIC stream.
+// Required engines: buffered outgoing streams and independently allocated NIC
+// sinks. Directional address windows derive from the live stream catalogs.
 // Mutation: aggregate 64/512/16 AXI4 slave plus combinational leaf adapter.
 // AW/AR metadata and W last are unused; W data is live for the NIC writer.
 // No state, buffering, ID adaptation, or protocol gating is added here.
@@ -13,7 +14,10 @@
 #include "goldengate/CPUStreamPort.h"
 #include "mlir/IR/Builders.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
+#include "llvm/ADT/StringSet.h"
+#include "llvm/Support/MathExtras.h"
 #include <functional>
+#include <limits>
 #include <map>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -27,7 +31,8 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
     StringRef oldName, StringRef newName, std::string &error) {
   bool selected = oldName == "GGSelectedPrintCPUStreamWriteResponseBufferWrapper";
   bool print = selected || oldName == "GGPrintCPUStreamWriteResponseBufferWrapper";
-  if (oldName != "GGHostMemoryPlatformWrapper" && !print) {
+  bool nic = oldName == "GGNICLoopbackCPUStreamWriteResponseBufferWrapper";
+  if (oldName != "GGHostMemoryPlatformWrapper" && !print && !nic) {
     error = "CPU stream platform adapter requires a supported selected boundary";
     return failure();
   }
@@ -41,18 +46,70 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
     // Catalog composition preserves the writer's module identity. Its
     // stream contract, rather than its generated name, identifies this engine.
     if(auto count=f->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount")) {
-      if(write||count.getInt()<0||count.getInt()>1)return reject("CPU stream platform adapter requires one writer with zero or one sink");
+      if(write||count.getInt()<0)return reject("CPU stream platform adapter requires one writer with a nonnegative sink count");
       write=f;
     }
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto addr=read?read->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits"):IntegerAttr();
   auto sinks=write?write->getAttrOfType<IntegerAttr>("goldengate.fromHostCPUStreamCount"):IntegerAttr();
-  bool incoming = sinks && sinks.getInt() == 1;
+  bool incoming = sinks && sinks.getInt() > 0;
   auto writeAddr=write?write->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits"):IntegerAttr();
-  if(circuit.getName()!=oldName||!inner||!raw||!addr||addr.getInt()!=19||!sinks||
-      (incoming && (print || !writeAddr || writeAddr.getInt()!=18)))
+  if(circuit.getName()!=oldName||!inner||!raw||!addr||!sinks||
+      (incoming && (print || !writeAddr)))
     return reject("CPU stream platform adapter requires the recorded buffered Rocket/NIC boundary and annotations");
+  auto sources=read->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
+  auto targets=write->getAttrOfType<ArrayAttr>("goldengate.sinkStreams");
+  // New platform compositions carry the actual transport allocation. Validate
+  // each direction independently: a mixed TracerV/Print/NIC source list need
+  // not have the NIC sink count, ordering, or address-window size.
+  auto validCatalog=[&](ArrayAttr rows,IntegerAttr bits,bool required)->bool {
+    if(!rows||rows.empty())return !required;
+    if(!bits||bits.getInt()<6||bits.getInt()>31)return false;
+    uint64_t window=uint64_t(1)<<bits.getInt(),maxDepth=0;
+    llvm::StringSet<> names,ports;
+    for(auto [i,a]:llvm::enumerate(rows)) {
+      auto row=dyn_cast<DictionaryAttr>(a);
+      auto name=row?row.getAs<StringAttr>("name"):StringAttr{};
+      auto port=row?row.getAs<StringAttr>("port"):StringAttr{};
+      auto index=row?row.getAs<IntegerAttr>("index"):IntegerAttr{};
+      auto depth=row?row.getAs<IntegerAttr>("depth"):IntegerAttr{};
+      auto bytes=row?row.getAs<IntegerAttr>("widthBytes"):IntegerAttr{};
+      auto base=row?row.getAs<IntegerAttr>("bufferBaseAddress"):IntegerAttr{};
+      if(!name||name.getValue().empty()||!names.insert(name.getValue()).second||
+          !port||port.getValue().empty()||!ports.insert(port.getValue()).second||
+          !index||index.getInt()!=int64_t(i)||!depth||depth.getInt()<=0||
+          uint64_t(depth.getInt())>uint64_t(std::numeric_limits<int32_t>::max())/64||
+          !bytes||bytes.getInt()!=64||!base||
+          i>uint64_t(std::numeric_limits<int32_t>::max())/window||
+          base.getInt()!=int64_t(i*window))return false;
+      maxDepth=std::max(maxDepth,uint64_t(depth.getInt()));
+    }
+    return llvm::Log2_64_Ceil(maxDepth*64)==unsigned(bits.getInt());
+  };
+  if(sources||targets) {
+    if(!validCatalog(sources,addr,true)||!validCatalog(targets,writeAddr,incoming)||
+        (targets&&targets.size()!=uint64_t(sinks.getInt())))
+      return reject("CPU stream platform requires complete independent live directional allocations");
+  } else if(addr.getInt()!=(nic?18:19)||sinks.getInt()>1||
+      (incoming&&writeAddr.getInt()!=18)) {
+    // Retain the historical scalar-only profile for old saved boundaries;
+    // expanded designs must supply allocation metadata, never infer it.
+    return reject("expanded CPU stream platform requires live directional catalogs");
+  }
+  if(nic) {
+    if(!incoming||!sources||!targets||sources.size()!=targets.size()||targets.size()!=uint64_t(sinks.getInt()))
+      return reject("selected NIC platform requires a complete paired directional stream catalog");
+    for(bool from:{false,true})for(auto [i,a]:llvm::enumerate(from?targets:sources)) {
+      auto row=dyn_cast<DictionaryAttr>(a);auto index=row?row.getAs<IntegerAttr>("index"):IntegerAttr{};
+      auto depth=row?row.getAs<IntegerAttr>("depth"):IntegerAttr{};
+      auto bytes=row?row.getAs<IntegerAttr>("widthBytes"):IntegerAttr{};
+      auto name=row?row.getAs<StringAttr>("name"):StringAttr{};
+      if(!index||index.getInt()!=int64_t(i)||!depth||depth.getInt()!=3072||!bytes||bytes.getInt()!=64||
+          !name||name.getValue()!="SIMPLENICBRIDGEMODULE_"+std::to_string(i)+(from?"_from_cpu_stream":"_to_cpu_stream"))
+        return reject("selected NIC platform stream identity, order or geometry differs");
+    }
+  }
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};
   struct Leaf {StringRef name;unsigned width;Direction direction;};
@@ -80,7 +137,7 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
       if(!found)return reject("CPU stream platform adapter requires exact U250 scalar widths/directions and no extra stream fields");
     }
   }
-  if(consumed.size()!=std::size(leaves)||!old.count("hostClock")||!old.count("hostReset")||(!selected && !old.count("mem_0")))
+  if(consumed.size()!=std::size(leaves)||!old.count("hostClock")||!old.count("hostReset")||(!selected && !nic && !old.count("mem_0")))
     return reject("CPU stream platform adapter requires all profile CPU scalar fields, host clock/reset and memory");
   auto cp=inner.getPorts()[old.at("hostClock")],rp=inner.getPorts()[old.at("hostReset")];
   if(cp.type!=ClockType::get(ctx)||cp.direction!=Direction::In||rp.type!=uint(1)||rp.direction!=Direction::In)
@@ -89,10 +146,10 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
   InstanceOp sim,companion;unsigned instances=0;
   for(auto i:inner.getOps<InstanceOp>()) {
     ++instances;
-    if(i.getName()=="sim" && i.getModuleName()==(print ?
+    if(i.getName()=="sim" && i.getModuleName()==(nic ? "GGNICLoopbackCPUStreamResponseBufferWrapper" : print ?
         (selected ? "GGSelectedPrintCPUStreamResponseBufferWrapper" : "GGPrintCPUStreamResponseBufferWrapper") : "GGHostMemoryReadResponseWrapper")) sim=i;
-    if(i.getName()==(print ? "bQueue" : "memory_port") &&
-        i.getModuleName()==(print ? "GGCPUStreamBQueue2" : "GGHostMemoryPortAdapter")) companion=i;
+    if(i.getName()==(print||nic ? "bQueue" : "memory_port") &&
+        i.getModuleName()==(print||nic ? "GGCPUStreamBQueue2" : "GGHostMemoryPortAdapter")) companion=i;
   }
   if(used||instances!=2||!sim||!companion)
     return reject("CPU stream platform adapter requires the unique selected wrapper and retained companion");
@@ -109,7 +166,7 @@ LogicalResult goldengate::attachCPUStreamPort(CircuitOp circuit,
     auto n="cpu_stream_"+leaf.name.str();Value a=arg(inner,consumed.at(n));
     if(!a.hasOneUse())return reject("CPU stream scalar requires one exact forwarding connection");
     Value peerRoot=childPort(sim,n);unsigned fieldID=0;
-    if(print && leaf.name.starts_with("b_")) {
+    if((print||nic) && leaf.name.starts_with("b_")) {
       peerRoot=childPort(companion,"deq");
       if(!peerRoot)return reject("CPU stream platform requires the retained B dequeue bundle");
       Type type=peerRoot.getType();

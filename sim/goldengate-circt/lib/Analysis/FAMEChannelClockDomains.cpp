@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEPortAnalysis.h"
 #include "goldengate/AnnotationClasses.h"
+#include <map>
 #include <set>
 
 using namespace mlir;
@@ -12,11 +13,26 @@ goldengate::analyzeFAMEChannelClockDomains(
     std::string &error) {
   auto hierarchy = analyzeTopHierarchy(circuit, error);
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if (!hierarchy || !raw || domains.empty()) {
-    if (error.empty()) error = "channel clock domains need hierarchy, annotations and a hub";
+  if (!hierarchy || !raw || !model ||
+      model->getParentOp() != circuit.getOperation()) {
+    if (error.empty()) error = "channel clock domains need hierarchy, annotations and a model";
     return std::nullopt;
   }
+  // Empty domain metadata selects SFC's non-hub VirtualClockChannel. That
+  // channel substitutes one for the sole target clock; it does not project a
+  // remote hub's clock token into this independently scheduled model.
+  bool virtualClock = domains.empty();
   std::set<unsigned> hubPorts;
+  if (virtualClock) {
+    for (unsigned i = 0; i < model.getNumPorts(); ++i)
+      if (model.getPortDirection(i) == Direction::In &&
+          isa<ClockType>(model.getPortType(i)))
+        hubPorts.insert(i);
+    if (hubPorts.size() != 1) {
+      error = "non-hub FAME model requires one scalar target clock";
+      return std::nullopt;
+    }
+  }
   for (const auto &domain : domains) {
     if (domain.modelPort >= model.getNumPorts() ||
         model.getPortName(domain.modelPort) != domain.modelClockName ||
@@ -37,8 +53,13 @@ goldengate::analyzeFAMEChannelClockDomains(
   }
   SmallVector<FAMEChannelClockDomain> result;
   std::set<std::string> globals;
-  std::set<std::pair<std::string, Direction>> locals;
-  std::set<const ModelPortGroup *> outputGroups;
+  struct LocalClock {
+    const ModelPortGroup *group;
+    std::string clockName;
+    bool hasClockDomain;
+    llvm::SmallVector<InstanceOp> instances;
+  };
+  std::map<std::pair<std::string, Direction>, LocalClock> locals;
   for (auto attr : raw) {
     Annotation anno(attr);
     if (!anno.isClass(AnnotationClasses::ChannelConnection)) continue;
@@ -54,26 +75,43 @@ goldengate::analyzeFAMEChannelClockDomains(
     for (const auto &binding : *bindings) {
       const auto &group = *binding.portGroup;
       if (group.module != model) continue;
-      // Shared output branches use one local producer FSM and therefore one
-      // domain assignment. bindChannelToModels checks each branch's clock.
-      if (group.direction == Direction::Out &&
-          !outputGroups.insert(binding.portGroup).second)
+      std::string clockName;
+      if (group.clockPort) {
+        auto source = analyzeLocalChannelClockSource(model, *group.clockPort, error);
+        if (!source) {
+          error = "channel " + group.name + ": " + error;
+          return std::nullopt;
+        }
+        if (!hubPorts.count(*source)) {
+          error = "channel clock source is outside the FAME hub: " + group.name;
+          return std::nullopt;
+        }
+        clockName = model.getPortName(*source).str();
+      } else if (!virtualClock) {
+        error = "missing associated channel clock: " + group.name;
+        return std::nullopt;
+      }
+      // A definition has one local FSM per group even when instantiated more
+      // than once. Validate every global branch before sharing that FSM: each
+      // branch still has to bind to its own instance and associated clock.
+      auto [previous, inserted] = locals.emplace(
+          std::make_pair(group.name, group.direction),
+          LocalClock{binding.portGroup, clockName, bool(group.clockPort),
+                     {binding.instance}});
+      if (!inserted) {
+        auto &local = previous->second;
+        if (local.group != binding.portGroup || local.clockName != clockName ||
+            local.hasClockDomain != bool(group.clockPort) ||
+            (group.direction == Direction::In &&
+             llvm::is_contained(local.instances, binding.instance))) {
+          error = "incompatible shared FAME channel clock: " + group.name;
+          return std::nullopt;
+        }
+        local.instances.push_back(binding.instance);
         continue;
-      if (!locals.emplace(group.name, group.direction).second || !group.clockPort) {
-        error = "missing or duplicate associated channel clock: " + group.name;
-        return std::nullopt;
-      }
-      auto source = analyzeLocalChannelClockSource(model, *group.clockPort, error);
-      if (!source) {
-        error = "channel " + group.name + ": " + error;
-        return std::nullopt;
-      }
-      if (!hubPorts.count(*source)) {
-        error = "channel clock source is outside the FAME hub: " + group.name;
-        return std::nullopt;
       }
       result.push_back({channel->name, group.name, group.direction,
-                        model.getPortName(*source).str()});
+                        std::move(clockName), bool(group.clockPort)});
     }
   }
   return result;

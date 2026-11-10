@@ -7,8 +7,8 @@
 // ports, preserves other ports and updates the circuit identity.
 // Analyses required: caller supplies the validated ordered CPU sink catalog.
 // Analyses preserved: inner module bodies and sink target module identities.
-// Output invariants: 512-bit live W data; grant-qualified nine-bit counters;
-// AW/B completion on the final beat; independent incoming address space.
+// Output invariants: 512-bit byte-assembled data; grant-qualified nine-bit counters;
+// AW/B completion on the final physical beat; independent incoming address space.
 // Queue storage, AXI buffering, controls and driver emission are separate passes.
 #include "goldengate/CPUStreamWrite.h"
 #include "llvm/ADT/StringSet.h"
@@ -107,35 +107,83 @@ LogicalResult goldengate::addCPUStreamWrite(
   // Unlike reads, only the selected sink's W.fire advances its counter.
   auto axi = [&](unsigned i) { return arg(firstHelperAXI + i); };
   Value awReady = constant(1, 0), wReady = constant(1, 0), bValid = constant(1, 0);
+  Value responseError = constant(1, 0);
+  auto bits = [&](Value v, unsigned hi, unsigned lo) -> Value {
+    return b.create<BitsPrimOp>(loc, v, hi, lo);
+  };
+  auto neg = [&](Value v) -> Value { return b.create<NotPrimOp>(loc, v); };
   for (unsigned i = 0; i < sinks.size(); ++i) {
-    Value beats = b.create<RegResetOp>(loc, uint(9), arg(0), arg(1), constant(9, 0),
-        sinks.size() == 1 ? "writeBeatCounter" : "writeBeatCounter_" + std::to_string(i)).getResult();
-    Value grant = b.create<EQPrimOp>(loc, b.create<BitsPrimOp>(loc, axi(3), 63, addressSpaceBits),
+    auto stateName = [&](StringRef name) {
+      return sinks.size() == 1 ? name.str() : name.str() + "_" + std::to_string(i);
+    };
+    auto resetReg = [&](unsigned width, StringRef name) -> Value {
+      return b.create<RegResetOp>(loc, uint(width), arg(0), arg(1),
+          constant(width, 0), stateName(name)).getResult();
+    };
+    Value beats = resetReg(9, "writeBeatCounter");
+    Value mask = resetReg(64, "partialWriteMask");
+    // Payload and its line tag are irrelevant until the reset-defined mask
+    // is nonzero. Do not initialize storage merely to define invalid bytes.
+    Value buffered = b.create<RegOp>(loc, uint(512), arg(0), stateName("partialWriteData")).getResult();
+    Value line = b.create<RegOp>(loc, uint(58), arg(0), stateName("partialWriteLine")).getResult();
+    Value burstError = resetReg(1, "writeBurstError");
+    Value grant = b.create<EQPrimOp>(loc, bits(axi(3), 63, addressSpaceBits),
         constant(64 - addressSpaceBits, i));
     Value last = b.create<EQPrimOp>(loc, beats, b.create<PadPrimOp>(loc, axi(4), 9));
+    // The shell retains byte lanes in WSTRB, including partial WC flushes.
+    // AW may span multiple physical beats; tag each by its effective line.
+    Value offset = b.create<PadPrimOp>(loc, beats, 64);
+    for (unsigned size = 1; size <= 6; ++size)
+      offset = mux(b.create<EQPrimOp>(loc, axi(5), constant(3, size)),
+          b.create<PadPrimOp>(loc, b.create<ShlPrimOp>(loc, beats, size), 64), offset);
+    Value effectiveAddress = bits(b.create<AddPrimOp>(loc, axi(3), offset), 63, 0);
+    Value currentLine = bits(effectiveAddress, 63, 6);
+    Value wrongWindow = neg(b.create<EQPrimOp>(loc, bits(effectiveAddress, 63, addressSpaceBits),
+        constant(64 - addressSpaceBits, i)));
+    Value pending = neg(b.create<EQPrimOp>(loc, mask, constant(64, 0)));
+    Value overlap = neg(b.create<EQPrimOp>(loc, both(mask, axi(9)), constant(64, 0)));
+    Value wrongLine = both(pending, neg(b.create<EQPrimOp>(loc, line, currentLine)));
+    Value badSize = b.create<EQPrimOp>(loc, axi(5), constant(3, 7));
+    Value emptyWrite = b.create<EQPrimOp>(loc, axi(9), constant(64, 0));
+    Value malformed = b.create<OrPrimOp>(loc, overlap,
+        b.create<OrPrimOp>(loc, wrongWindow, b.create<OrPrimOp>(loc, wrongLine, b.create<OrPrimOp>(loc, badSize, emptyWrite))));
+    Value errorNow = b.create<OrPrimOp>(loc, burstError, malformed);
+    Value mergedMask = b.create<OrPrimOp>(loc, mask, axi(9));
+    Value complete = b.create<EQPrimOp>(loc, mergedMask, constant(64, ~uint64_t(0)));
+    Value merged = mux(bits(axi(9), 0, 0), bits(axi(8), 7, 0), bits(buffered, 7, 0));
+    for (unsigned lane = 1; lane < 64; ++lane)
+      merged = b.create<CatPrimOp>(loc,
+          mux(bits(axi(9), lane, lane), bits(axi(8), 8 * lane + 7, 8 * lane),
+              bits(buffered, 8 * lane + 7, 8 * lane)), merged);
     Value ready = field(arg(2 + i), "ready");
-    Value selectedWReady = both(grant, both(axi(1), both(axi(10), ready)));
-    Value selectedAWReady = both(grant, both(axi(7), both(axi(10), both(ready, last))));
-    Value selectedBValid = both(grant, both(axi(1), both(axi(7), both(ready, last))));
+    // Partial physical writes must receive B even before a full stream word
+    // exists. Completed words retain the original FIFO/response backpressure.
+    Value canAccept = b.create<OrPrimOp>(loc, errorNow,
+        b.create<OrPrimOp>(loc, neg(complete), ready));
+    Value selectedWReady = both(grant, both(axi(1), both(axi(10), canAccept)));
+    Value selectedAWReady = both(grant, both(axi(7), both(axi(10), both(canAccept, last))));
+    Value selectedBValid = both(grant, both(axi(1), both(axi(7), both(canAccept, last))));
     wReady = b.create<OrPrimOp>(loc, wReady, selectedWReady);
     awReady = b.create<OrPrimOp>(loc, awReady, selectedAWReady);
     bValid = b.create<OrPrimOp>(loc, bValid, selectedBValid);
-    connect(field(arg(2 + i), "valid"), both(grant, both(axi(1), both(axi(7), axi(10)))));
-    connect(field(arg(2 + i), "bits"), axi(8));
-    Value next = mux(last, constant(9, 0), b.create<BitsPrimOp>(loc,
-        b.create<AddPrimOp>(loc, beats, constant(9, 1)), 8, 0));
-    connect(beats, mux(both(selectedWReady, axi(7)), next, beats));
+    responseError = b.create<OrPrimOp>(loc, responseError, both(grant, errorNow));
+    Value physicalFire = both(selectedWReady, axi(7));
+    Value goodFire = both(physicalFire, neg(errorNow));
+    connect(field(arg(2 + i), "valid"), both(grant,
+        both(axi(1), both(axi(7), both(axi(10), both(complete, neg(errorNow)))))));
+    connect(field(arg(2 + i), "bits"), merged);
+    Value next = mux(last, constant(9, 0), bits(b.create<AddPrimOp>(loc, beats, constant(9, 1)), 8, 0));
+    connect(beats, mux(physicalFire, next, beats));
+    connect(mask, mux(goodFire, mux(complete, constant(64, 0), mergedMask), mask));
+    connect(buffered, mux(goodFire, merged, buffered));
+    connect(line, mux(goodFire, currentLine, line));
+    connect(burstError, mux(physicalFire, mux(last, constant(1, 0), errorNow), burstError));
+    Value permitted = neg(both(grant, both(axi(1), both(axi(7), malformed))));
+    b.create<AssertOp>(loc, arg(0), permitted, neg(arg(1)),
+        "CPUManagedStreamEngine rejects overlapping, out-of-order, empty or oversized partial writes", ValueRange{}, "");
   }
   connect(axi(0), awReady); connect(axi(6), wReady); connect(axi(11), bValid);
-  connect(axi(12), axi(2)); connect(axi(13), constant(2, 0));
-  auto assertValid = [&](unsigned valid, unsigned bits, Value expected, StringRef message) {
-    Value permitted = b.create<OrPrimOp>(loc, b.create<NotPrimOp>(loc, axi(valid)),
-        b.create<EQPrimOp>(loc, axi(bits), expected));
-    b.create<AssertOp>(loc, arg(0), permitted, b.create<NotPrimOp>(loc, arg(1)),
-        message, ValueRange{}, "");
-  };
-  assertValid(1, 5, constant(3, 6), "CPUManagedStreamEngine requires 64-byte write beats");
-  assertValid(7, 9, constant(64, ~uint64_t(0)), "CPUManagedStreamEngine requires all write strobes");
+  connect(axi(12), axi(2)); connect(axi(13), mux(responseError, constant(2, 2), constant(2, 0)));
   helper->setAttr("goldengate.fromHostCPUStreamCount", b.getI32IntegerAttr(sinks.size()));
   helper->setAttr("goldengate.streamAddressSpaceBits", b.getI64IntegerAttr(addressSpaceBits));
   SmallVector<Attribute> allocations;

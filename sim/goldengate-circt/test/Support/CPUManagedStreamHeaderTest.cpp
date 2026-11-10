@@ -267,8 +267,9 @@ OwningOpRef<ModuleOp> multiFixture(MLIRContext &ctx, bool shared = false, unsign
 std::string run(CircuitOp c) {
   SmallVector<std::string> modules; for (auto m : c.getOps<FModuleLike>()) modules.push_back(dump(m.getOperation()));
   auto before = c->getAttrOfType<ArrayAttr>("rawAnnotations"); std::string error;
+  bool f2Ack = named(c,"GGCPUStreamRead")->hasAttr("goldengate.f2CPUWordReads");
   require(succeeded(goldengate::prepareCPUManagedStreamHeader(c,error)),error);
-  auto after = c->getAttrOfType<ArrayAttr>("rawAnnotations"); require(before.size() == after.size(),"changed annotation count");
+  auto after = c->getAttrOfType<ArrayAttr>("rawAnnotations"); require(before.size() + 1 + unsigned(f2Ack) == after.size(),"peer-map annotation count");
   unsigned changed = 0; std::string body;
   for (unsigned i = 0; i < before.size(); ++i) if (before[i] != after[i]) {
     ++changed; auto old = cast<DictionaryAttr>(before[i]), updated = cast<DictionaryAttr>(after[i]);
@@ -278,7 +279,29 @@ std::string run(CircuitOp c) {
   }
   require(changed == 1,"changed unrelated annotations"); unsigned i = 0;
   for (auto m : c.getOps<FModuleLike>()) require(modules[i++] == dump(m.getOperation()),"changed hardware");
+  auto peer = cast<DictionaryAttr>(after[before.size()]);
+  require(peer.getAs<StringAttr>("class") == goldengate::AnnotationClasses::OutputFile &&
+      peer.getAs<StringAttr>("fileSuffix") == ".peer2peer.const.yaml", "missing peer address map");
+  auto map = peer.getAs<StringAttr>("body").getValue();
+  require(map.contains("bufferCapacity:    6144\n") && map.contains("bufferWidthBytes:  64\n"),
+      "peer geometry differs from validated driver allocations");
+  if (f2Ack) {
+    auto protocol = cast<DictionaryAttr>(after[before.size() + 1]);
+    require(protocol.getAs<StringAttr>("class") == goldengate::AnnotationClasses::OutputFile &&
+        protocol.getAs<StringAttr>("fileSuffix") == ".f2-cpu-stream-protocol.json" &&
+        map.contains("# F2 source-count write1 ACK validated against live source-only wiring\n"),
+        "missing validated F2 source ACK protocol");
+  }
   return body;
+}
+std::string peerMap(CircuitOp c) {
+  for (auto a : c->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto d = dyn_cast<DictionaryAttr>(a);
+    auto suffix = d ? d.getAs<StringAttr>("fileSuffix") : StringAttr();
+    if (suffix && suffix.getValue() == ".peer2peer.const.yaml")
+      return d.getAs<StringAttr>("body").getValue().str();
+  }
+  throw std::runtime_error("missing peer map");
 }
 }
 int main(int argc, char **argv) {
@@ -290,6 +313,18 @@ int main(int argc, char **argv) {
     require(StringRef(body).contains("  2,\n  args,\n  std::vector<CPUManagedStreams::StreamParameters>{},"),"sink order/widget identity");
     require(StringRef(body).contains("std::string(\"trace\\\"stream\\\\domain\"), 0ULL, 2048ULL, 6144U, 64U)"),"descriptor/escaping differs");
     require(StringRef(body).contains("GET_MANAGED_STREAM_CONSTRUCTOR") && !StringRef(body).contains("_struct"),"constructor guard/substruct differs");
+    require(peerMap(c) == "\"trace\\\"stream\\\\domain\":\n  bufferBaseAddress: 0\n"
+        "  bufferCapacity:    6144\n  bufferWidthBytes:  64\n", "single peer map/escaping differs");
+    // Existing metadata must reject atomically rather than silently overwrite.
+    auto duplicate = fixture(ctx); auto dc = *duplicate->getOps<CircuitOp>().begin();
+    OpBuilder db(&ctx); auto dupRaw = dc->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> dup(dupRaw.begin(), dupRaw.end());
+    dup.push_back(db.getDictionaryAttr({db.getNamedAttr("class",db.getStringAttr(goldengate::AnnotationClasses::OutputFile)),
+      db.getNamedAttr("fileSuffix",db.getStringAttr(".peer2peer.const.yaml")),db.getNamedAttr("body",db.getStringAttr("stale"))}));
+    dc->setAttr("rawAnnotations",db.getArrayAttr(dup));
+    auto duplicateBefore = dump(*duplicate); std::string duplicateError;
+    require(failed(goldengate::prepareCPUManagedStreamHeader(dc,duplicateError)) &&
+        dump(*duplicate) == duplicateBefore, "existing peer map was overwritten");
     std::string before = dump(*root), error;
     require(failed(goldengate::prepareCPUManagedStreamHeader(c,error)) && dump(*root) == before,"duplicate constructor mutated IR");
     auto localIndex = fixture(ctx); auto lc = *localIndex->getOps<CircuitOp>().begin();
@@ -311,6 +346,11 @@ int main(int argc, char **argv) {
       std::string second = "std::string(\"trace_stream\"), 524288ULL, 2052ULL, 6144U, 64U)";
       require(StringRef(multiBody).contains(first) && StringRef(multiBody).contains(second) &&
           multiBody.find(first) < multiBody.find(second),"ordered outgoing DMA/MMIO descriptors or C++ escaping differs");
+      auto map = peerMap(mc);
+      auto firstMap = map.find("\"print\\\"stream\\\\clock\\n\\t\":\n  bufferBaseAddress: 0\n");
+      auto secondMap = map.find("\"trace_stream\":\n  bufferBaseAddress: 524288\n");
+      require(firstMap != std::string::npos && secondMap != std::string::npos && firstMap < secondMap,
+          "peer source order or independent DMA base differs");
       auto beforeMulti = dump(*multi);
       require(failed(goldengate::prepareCPUManagedStreamHeader(mc,error)) && dump(*multi) == beforeMulti,
           "multi-stream duplicate constructor mutated IR");
@@ -327,20 +367,45 @@ int main(int argc, char **argv) {
     require(failed(goldengate::prepareCPUManagedStreamHeader(sc,error)) && dump(*sharedBad) == sharedBefore,
         "extra shared queue instance escaped allocation validation");
     llvm::outs() << "CPU managed stream header: single/ordered multi-stream descriptors, distinct/shared queue definitions, escaped names; 66 atomic rejections passed\n";
-    if (argc == 3) {
+    if (argc == 3 && StringRef(argv[1]) == "--peer-map") {
+      auto selected = fixture(ctx); auto selectedCircuit = *selected->getOps<CircuitOp>().begin();
+      OpBuilder selectedBuilder(&ctx);
+      const StringRef name = "TRACERVBRIDGEMODULE_0_to_cpu_stream";
+      for (auto pair : {std::make_pair("GGTracerVStreamQueue6144", "goldengate.streamParameters"),
+                        std::make_pair("GGCPUStreamRead", "goldengate.sourceStreams"),
+                        std::make_pair("GGCPUStreamCountBank", "goldengate.mmioRegisters")}) {
+        auto module = named(selectedCircuit, pair.first); auto attr = module->getAttr(pair.second);
+        bool array = isa<ArrayAttr>(attr);
+        NamedAttrList row(array ? cast<DictionaryAttr>(cast<ArrayAttr>(attr)[0]) : cast<DictionaryAttr>(attr));
+        row.set("name", selectedBuilder.getStringAttr(name.str() + (StringRef(pair.second) == "goldengate.mmioRegisters" ? "_count" : "")));
+        auto updated = row.getDictionary(&ctx);
+        module->setAttr(pair.second, array ? Attribute(selectedBuilder.getArrayAttr({updated})) : Attribute(updated));
+      }
+      run(selectedCircuit);
+      require(succeeded(goldengate::emitOutputFiles(selectedCircuit,argv[2],"FireSim-generated",error)), error);
+    } else if (argc == 3) {
       auto boundary = parseSourceFile<ModuleOp>(argv[1],&ctx); require(bool(boundary),"boundary parse");
       require(succeeded(verify(*boundary)),"recorded input IR invalid");
       auto bc = *boundary->getOps<CircuitOp>().begin();
-      require(succeeded(goldengate::prepareMetasimInterfaceHeader(bc,"FireSim",error)),error); body = run(bc);
+      bool isF2 = false;
+      for (auto port : named(bc,"F1Shim").getPorts())
+        if (port.name.getValue() == "io_pcim") isF2 = true;
+      require(succeeded(goldengate::prepareMetasimInterfaceHeader(bc,"FireSim",error,isF2)),error); body = run(bc);
       bool nic = StringRef(body).contains("SIMPLENICBRIDGEMODULE_0_from_cpu_stream");
       require(StringRef(body).contains(nic ?
-          "std::string(\"TRACERVBRIDGEMODULE_0_to_cpu_stream\"), 524288ULL, 596ULL, 6144U, 64U)" :
+          (isF2 ? "std::string(\"TRACERVBRIDGEMODULE_0_to_cpu_stream\"), 524288ULL, 596ULL, 6144U, 64U, true)" :
+                  "std::string(\"TRACERVBRIDGEMODULE_0_to_cpu_stream\"), 524288ULL, 596ULL, 6144U, 64U)") :
           "std::string(\"TRACERVBRIDGEMODULE_0_to_cpu_stream\"), 0ULL, 568ULL, 6144U, 64U)"),"recorded U250 descriptor differs");
       if (nic) {
         require(StringRef(body).contains("std::string(\"SIMPLENICBRIDGEMODULE_0_from_cpu_stream\"), 0ULL, 600ULL, 3072U, 64U)"),
             "recorded incoming queue descriptor differs");
         auto raw = bc->getAttrOfType<ArrayAttr>("rawAnnotations");
-        SmallVector<Attribute> unprepared(raw.begin(),raw.end());
+        SmallVector<Attribute> unprepared;
+        for (auto a : raw) {
+          auto d = cast<DictionaryAttr>(a);
+          auto suffix = d.getAs<StringAttr>("fileSuffix");
+          if (!suffix || suffix.getValue() != ".peer2peer.const.yaml") unprepared.push_back(a);
+        }
         for (auto &attr : unprepared) {
           auto row = cast<DictionaryAttr>(attr);
           if (row.get("goldengate.cpuManagedStreamHeader")) {
@@ -355,6 +420,34 @@ int main(int argc, char **argv) {
               archive == bc->getAttrOfType<ArrayAttr>("rawAnnotations") && dump(mutated.getOperation()) == old,
               "invalid incoming descriptor accepted or mutated");
         };
+        if (isF2) {
+          auto reader = named(bc,"GGCPUStreamRead");
+          unsigned checked = 0;
+          for (auto eq : reader.getOps<EQPrimOp>()) {
+            auto bits = eq.getLhs().getDefiningOp<BitsPrimOp>();
+            if (!bits || bits.getInput() != reader.getArgument(7) ||
+                bits.getLo() != 0 || bits.getHi() < 1 || bits.getHi() > 4) continue;
+            auto old = eq.getRhs(); b.setInsertionPoint(eq);
+            auto wrong = b.create<ConstantOp>(eq.getLoc(),cast<UIntType>(old.getType()),
+                                            APInt(*cast<UIntType>(old.getType()).getWidth(),1));
+            eq->setOperand(1,wrong.getResult()); reject(reader);
+            eq->setOperand(1,old); wrong.erase(); ++checked;
+          }
+          require(checked == 5,"native/normalized F2 alignment branches not exercised");
+          // An otherwise well-formed extra low-address comparison is not a
+          // new authorized alignment, and a duplicate high selector cannot
+          // acquire a second allocation even when its value is canonical.
+          for (bool low : {true,false}) {
+            b.setInsertionPointToEnd(reader.getBodyBlock());
+            unsigned lo = low ? 0 : unsigned(reader->getAttrOfType<IntegerAttr>("goldengate.streamAddressSpaceBits").getInt());
+            auto bits = b.create<BitsPrimOp>(reader.getLoc(),reader.getArgument(7),low ? 5 : 63,lo);
+            auto zero = b.create<ConstantOp>(reader.getLoc(),cast<UIntType>(bits.getType()),
+                                           APInt(*cast<UIntType>(bits.getType()).getWidth(),0));
+            auto extra = b.create<EQPrimOp>(reader.getLoc(),bits,zero);
+            reject(reader); extra.erase(); zero.erase(); bits.erase();
+          }
+          llvm::outs() << "Recorded F2 outgoing allocation: five native/normalized alignments and extra low/high selector atomic rejections passed\n";
+        }
         auto rows = writer->getAttrOfType<ArrayAttr>("goldengate.sinkStreams");
         for (StringRef key : {"name", "port", "index", "depth", "widthBytes", "bufferBaseAddress"}) {
           NamedAttrList changed(cast<DictionaryAttr>(rows[0])); changed.erase(key);
@@ -372,13 +465,34 @@ int main(int argc, char **argv) {
           auto zero = b.create<ConstantOp>(conn.getLoc(),cast<UIntType>(old.getType()),APInt(field.getFieldName() == "bits" ? 512 : 1,0));
           conn->setOperand(1,zero.getResult()); reject(writer); conn->setOperand(1,old); zero.erase();
         }
+        unsigned assemblyFaults = 0;
+        // Every owned-state update and physical response must be live, not
+        // merely accompanied by an unused mask/grant comparison.
+        for (auto conn : writer.getOps<StrictConnectOp>()) {
+          bool state = bool(conn.getDest().getDefiningOp<RegResetOp>()) ||
+                       bool(conn.getDest().getDefiningOp<RegOp>());
+          auto port = dyn_cast<BlockArgument>(conn.getDest());
+          bool response = port && port.getOwner() == writer.getBodyBlock() &&
+                          writer.getPortDirection(port.getArgNumber()) == Direction::Out;
+          if (!state && !response) continue;
+          auto old = conn.getSrc(); b.setInsertionPoint(conn);
+          auto width = *cast<UIntType>(old.getType()).getWidth();
+          auto zero = b.create<ConstantOp>(conn.getLoc(),cast<UIntType>(old.getType()),APInt(width,0));
+          conn->setOperand(1,zero.getResult()); reject(writer); conn->setOperand(1,old); zero.erase(); ++assemblyFaults;
+        }
+        for (auto assertion : writer.getOps<AssertOp>()) {
+          auto old = assertion.getPredicate(); b.setInsertionPoint(assertion);
+          auto yes = b.create<ConstantOp>(assertion.getLoc(),cast<UIntType>(old.getType()),APInt(1,1));
+          assertion->setOperand(1,yes.getResult()); reject(writer); assertion->setOperand(1,old); yes.erase(); ++assemblyFaults;
+        }
+        require(assemblyFaults >= 11,"assembly state/handshake/error guards not exercised");
         auto words = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
         SmallVector<Attribute> changed(words.begin(),words.end()); NamedAttrList last(cast<DictionaryAttr>(changed.back()));
         last.set("offset",b.getI32IntegerAttr(4)); changed.back()=last.getDictionary(&ctx);
         bank->setAttr("goldengate.mmioRegisters",b.getArrayAttr(changed)); reject(bank);
         bank->setAttr("goldengate.mmioRegisters",words);
         bc->setAttr("rawAnnotations",raw);
-        llvm::outs() << "Recorded NIC incoming allocation: 10 atomic rejections passed\n";
+        llvm::outs() << "Recorded NIC incoming allocation: descriptor plus live assembly/state/response atomic rejections passed\n";
       }
       require(succeeded(verify(*boundary)),"recorded output IR invalid");
       require(succeeded(goldengate::emitOutputFiles(bc,argv[2],"FireSim-generated",error)),error);

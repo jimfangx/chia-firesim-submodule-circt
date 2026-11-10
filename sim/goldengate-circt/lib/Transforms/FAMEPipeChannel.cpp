@@ -577,17 +577,6 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
         if (!llvm::any_of(wrapper.getPorts(), [&](const PortInfo &external) {
               return external.name == port.name;
             })) innerOnlyPorts.insert(port.name.getValue().str());
-  std::set<std::string> modelSources;
-  for (Attribute attr : raw) {
-    Annotation annotation(attr);
-    auto sources = annotation.getMember<ArrayAttr>("sources");
-    auto sinks = annotation.getMember<ArrayAttr>("sinks");
-    if (annotation.isClass(AnnotationClasses::ChannelConnection) &&
-        sources && sinks && !sources.empty() && !sinks.empty())
-      for (Attribute source : sources)
-        if (auto spelling = dyn_cast<StringAttr>(source))
-          modelSources.insert(spelling.getValue().str());
-  }
   std::function<Attribute(Attribute, bool)> retarget =
       [&](Attribute attr, bool targetDomain) -> Attribute {
     if (auto string = dyn_cast<StringAttr>(attr)) {
@@ -628,22 +617,20 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
       auto sinks = annotation.getMember<ArrayAttr>("sinks");
       bool loopback = annotation.isClass(AnnotationClasses::ChannelConnection) &&
                       sources && !sources.empty() && sinks && !sinks.empty();
-      bool sharedModelSource = sources && llvm::any_of(sources, [&](Attribute source) {
-        auto spelling = dyn_cast<StringAttr>(source);
-        return spelling && modelSources.count(spelling.getValue().str());
-      });
       for (NamedAttribute value : dict)
         // A channel's associated clock names the retained target domain.
         // SimWrapper.genClockChannel changes the wrapper payload to Vec[Bool],
         // while the target still owns its scalar Clock / ClockRecord leaves.
-        // Shared model sources stay upstream of queues on the retained target;
-        // their exposed wrapper port is a queue output, a different endpoint.
+        // Model-to-model sources stay upstream of queues on the retained
+        // target. A bridge channel sharing that producer instead names its
+        // external queue output: the widget must consume queued tokens, not
+        // resolve the internal producer merely because another channel does.
         // Moving a clock leaf loses its Clock type or invalidates a record path.
         values.emplace_back(value.getName(), retarget(value.getValue(),
             targetDomain || (annotation.isClass(AnnotationClasses::ChannelConnection) &&
                 (value.getName().getValue() == "clock" ||
                  (loopback && value.getName().getValue() == "sinks") ||
-                 (sharedModelSource && value.getName().getValue() == "sources")))));
+                 (loopback && value.getName().getValue() == "sources")))));
       return DictionaryAttr::get(context, values);
     }
     return attr;

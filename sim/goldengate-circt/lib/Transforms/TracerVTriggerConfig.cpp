@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 // TracerVBridge.scala: MMIO configuration and host-cycle trigger state.
 #include "goldengate/TracerVTokenEngine.h"
+#include "goldengate/TracerVConfig.h"
 #include "goldengate/TargetUtils.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OperationSupport.h"
@@ -25,13 +26,15 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   if (!inner || !raw) return reject("TracerV trigger configuration needs the native engine and retained annotations");
   struct BridgePlan {
     DictionaryAttr key;
+    TracerVConfig config;
+    BundleType trace;
     FModuleOp engine, bank;
     FModuleLike existingBank;
     InstanceOp tracer;
     unsigned controlPort = 0, observationPort = 0;
     std::string bankName, controlName, observationName, mcrName, instanceName;
   };
-  SmallVector<BridgePlan> plans;
+  SmallVector<BridgePlan, 0> plans;
   for (auto attr : raw) {
     auto annotation = dyn_cast<DictionaryAttr>(attr);
     if (!annotation || annotation.getAs<StringAttr>("class") != "firesim.lib.bridgeutils.BridgeIOAnnotation" ||
@@ -64,32 +67,28 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   auto control = BundleType::get(ctx, {{b.getStringAttr("initDone"), true, bit},
       {b.getStringAttr("traceEnable"), true, bit}, {b.getStringAttr("trigger"), true, bit},
       {b.getStringAttr("tCycle"), false, uint(64)}});
-  auto trace = BundleType::get(ctx, {{b.getStringAttr("valid"), false, bit},
-      {b.getStringAttr("iaddr"), false, uint(40)}, {b.getStringAttr("insn"), false, uint(32)}});
   std::optional<unsigned> clock, reset;
   for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
     if (p.name == "hostClock" && p.direction == Direction::In && isa<ClockType>(p.type)) clock = i;
     if (p.name == "hostReset" && p.direction == Direction::In && p.type == bit) reset = i;
   }
   if (!clock || !reset) return reject("TracerV trigger configuration needs host clock and reset");
-  const llvm::StringRef observed[]{"tiletrace_reset", "tiletrace_trace_retiredinsns_0_valid",
-      "tiletrace_trace_retiredinsns_0_iaddr", "tiletrace_trace_retiredinsns_0_insn"};
-  const unsigned observedWidths[]{1, 1, 40, 32};
   for (auto &plan : plans) {
     auto key = plan.key;
-    auto checkWidth = [&](llvm::StringRef name, int64_t w) {
-      auto attr = key.getAs<IntegerAttr>(name); return attr && attr.getInt() == w;
-    };
+    if(!plan.config.parse(key))return reject("unsupported TracerV trigger constructor");
+    SmallVector<BundleType::BundleElement> observations;
+    for(unsigned lane=0;lane<plan.config.retireWidth;++lane)
+      for(auto f:{std::pair<StringRef,unsigned>{"valid",1},{"iaddr",40},{"insn",32}})
+        observations.push_back({b.getStringAttr(TracerVConfig::observation(lane,f.first)),false,uint(f.second)});
+    plan.trace=BundleType::get(ctx,observations);
     std::optional<unsigned> controlPort;
     for (auto [i, p] : llvm::enumerate(inner.getPorts())) {
       if (p.name == plan.mcrName || p.name == plan.observationName)
         return reject("TracerV trigger boundary already exists");
       if (p.name == plan.controlName && p.direction == Direction::Out && p.type == control) controlPort = i;
     }
-    if (!controlPort || key.getAs<StringAttr>("class") != "firechip.bridgeinterfaces.TraceBundleWidths" ||
-        !checkWidth("retireWidth", 1) || !checkWidth("iaddrWidth", 40) || !checkWidth("insnWidth", 32) ||
-        !checkWidth("causeWidth", 64) || !checkWidth("tvalWidth", 40))
-      return reject("TracerV trigger configuration requires the Rocket constructor and exact engine control boundary");
+    if (!controlPort)
+      return reject("TracerV trigger configuration requires the exact engine control boundary");
     plan.controlPort = *controlPort;
     auto engine = plan.engine;
     if (engine.getNumPorts() != 5 || engine.getPortType(3) != control || engine.getPortDirection(3) != Direction::Out)
@@ -97,10 +96,10 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
     auto hPort = engine.getNumPorts() == 5 ? dyn_cast<BundleType>(engine.getPortType(2)) : BundleType();
     auto hb = hPort && hPort.getElement("hBits") ? dyn_cast<BundleType>(hPort.getElement("hBits")->type) : BundleType();
     if (!hb) return reject("TracerV token engine has no trace payload");
-    for (unsigned i = 0; i < 4; ++i) {
-      auto f = hb.getElement(observed[i]);
-      if (!f || f->isFlip || f->type != uint(observedWidths[i]))
-        return reject("TracerV observation needs the exact Rocket trace fields");
+    for(unsigned i=0;i<plan.config.names.size();++i) {
+      auto f=hb.getElement(plan.config.names[i]);
+      if(!f || f->isFlip!=(i>=plan.config.inputs()) || f->type!=uint(plan.config.widths[i]))
+        return reject("TracerV observation needs the constructor-selected trace fields");
     }
     unsigned instances = 0;
     for (auto i : inner.getOps<InstanceOp>()) if (i.getModuleName() == engine.getName()) { plan.tracer = i; ++instances; }
@@ -131,7 +130,7 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
     // only when ports, metadata and all hardware operations match, not by name.
     b.clearInsertionPoint();
     SmallVector<PortInfo> bankPorts{{b.getStringAttr("clock"), ClockType::get(ctx), Direction::In},
-        {b.getStringAttr("reset"), bit, Direction::In}, {b.getStringAttr("trace"), trace, Direction::In},
+        {b.getStringAttr("reset"), bit, Direction::In}, {b.getStringAttr("trace"), plan.trace, Direction::In},
         {b.getStringAttr("control"), control, Direction::In}, {b.getStringAttr("mcr"), mcr, Direction::Out}};
     auto bank = b.create<FModuleOp>(loc, b.getStringAttr(plan.bankName), ConventionAttr::get(ctx, Convention::Internal), bankPorts);
     stagedBanks.emplace_back(bank);
@@ -174,17 +173,27 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
     connect(pcEnd, b.create<CatPrimOp>(loc, config[4], config[5]));
     connect(cycleStart, b.create<CatPrimOp>(loc, config[6], config[7]));
     connect(cycleEnd, b.create<CatPrimOp>(loc, config[8], config[9]));
-    Value cycleVal = reg("triggerCycleCountVal", 1), pcVal = reg("triggerPCValVec_0", 1), insnVal = reg("triggerInstValVec_0", 1);
-    connect(cycleVal, both(b.create<GEQPrimOp>(loc, field(arg(3), "tCycle"), cycleStart),
-        b.create<LEQPrimOp>(loc, field(arg(3), "tCycle"), cycleEnd)));
-    Value pc = field(arg(2), "iaddr"), valid = field(arg(2), "valid");
-    // Start takes priority if start and end coincide. No HostPort handshake gate.
-    connect(pcVal, mux(valid, mux(eq(pcStart, pc), one, mux(both(eq(pcEnd, pc), pcVal), constant(1, 0), pcVal)), pcVal));
-    auto insnMatch = [&](unsigned pattern, unsigned mask) -> Value {
-      Value diff = b.create<XorPrimOp>(loc, config[pattern], field(arg(2), "insn"));
-      return eq(both(diff, config[mask]), zeroWord);
-    };
-    connect(insnVal, mux(valid, mux(insnMatch(10, 11), one, mux(insnMatch(12, 13), constant(1, 0), insnVal)), insnVal));
+    Value cycleVal=reg("triggerCycleCountVal",1);
+    connect(cycleVal,both(b.create<GEQPrimOp>(loc,field(arg(3),"tCycle"),cycleStart),
+        b.create<LEQPrimOp>(loc,field(arg(3),"tCycle"),cycleEnd)));
+    Value pcVal=constant(1,0),insnVal=constant(1,0);
+    for(unsigned lane=0;lane<plan.config.retireWidth;++lane) {
+      auto observe=[&](StringRef n){return field(arg(2),TracerVConfig::observation(lane,n));};
+      Value lanePC=reg("triggerPCValVec_"+std::to_string(lane),1);
+      Value laneInsn=reg("triggerInstValVec_"+std::to_string(lane),1);
+      Value pc=observe("iaddr"),valid=observe("valid");
+      // Each retirement lane owns trigger history. Start has priority over end.
+      connect(lanePC,mux(valid,mux(eq(pcStart,pc),one,
+          mux(both(eq(pcEnd,pc),lanePC),constant(1,0),lanePC)),lanePC));
+      auto insnMatch=[&](unsigned pattern,unsigned mask)->Value {
+        Value diff=b.create<XorPrimOp>(loc,config[pattern],observe("insn"));
+        return eq(both(diff,config[mask]),zeroWord);
+      };
+      connect(laneInsn,mux(valid,mux(insnMatch(10,11),one,
+          mux(insnMatch(12,13),constant(1,0),laneInsn)),laneInsn));
+      pcVal=b.create<OrPrimOp>(loc,pcVal,lanePC);
+      insnVal=b.create<OrPrimOp>(loc,insnVal,laneInsn);
+    }
     Value trigger = constant(1, 0);
     Value selections[]{one, cycleVal, pcVal, insnVal};
     for (int i = 3; i >= 0; --i) trigger = mux(eq(config[14], constant(32, i)), selections[i], trigger);
@@ -217,14 +226,16 @@ LogicalResult goldengate::addTracerVTriggerConfig(CircuitOp circuit, std::string
   // independently of HostPort fire: the Scala PC/insn state runs on host clocks.
   for (auto &plan : plans) {
     plan.observationPort = inner.getNumPorts();
-    inner.insertPorts({{plan.observationPort, PortInfo(b.getStringAttr(plan.observationName), trace, Direction::Out)}});
+    inner.insertPorts({{plan.observationPort, PortInfo(b.getStringAttr(plan.observationName), plan.trace, Direction::Out)}});
     b.setInsertionPointToEnd(inner.getBodyBlock());
     Value payload = field(plan.tracer.getResult(2), "hBits");
     Value observation = inner.getBodyBlock()->getArgument(plan.observationPort);
-    connect(field(observation, "valid"), b.create<AndPrimOp>(loc, field(payload, observed[1]),
-        b.create<NotPrimOp>(loc, field(payload, observed[0]))));
-    connect(field(observation, "iaddr"), field(payload, observed[2]));
-    connect(field(observation, "insn"), field(payload, observed[3]));
+    for(unsigned lane=0;lane<plan.config.retireWidth;++lane) {
+      auto observe=[&](StringRef n){return field(observation,TracerVConfig::observation(lane,n));};
+      auto source=[&](StringRef n){return field(payload,TracerVConfig::lane(lane,n));};
+      connect(observe("valid"),b.create<AndPrimOp>(loc,source("valid"),b.create<NotPrimOp>(loc,field(payload,"tiletrace_reset"))));
+      connect(observe("iaddr"),source("iaddr"));connect(observe("insn"),source("insn"));
+    }
   }
 
   SmallVector<PortInfo> ports; SmallVector<unsigned> copied;

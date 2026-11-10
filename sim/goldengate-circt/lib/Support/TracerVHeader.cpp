@@ -10,8 +10,10 @@
 // Output invariants: one checked constructor per live engine; all rejection
 // precedes the single annotation mutation, including failures in later records.
 #include "goldengate/TracerVHeader.h"
+#include "goldengate/TracerVConfig.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/BridgeClockInfo.h"
+#include "goldengate/CPUStreamRead.h"
 #include "circt/Dialect/FIRRTL/FIRRTLInstanceGraph.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseMap.h"
@@ -189,23 +191,35 @@ LogicalResult goldengate::prepareTracerVHeader(
     };
     auto transport = liveModule("GGCPUStreamRead");
     auto key = engine ? engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") : DictionaryAttr();
-    auto width = [&](StringRef n, int64_t v) {
-      auto a = key ? key.getAs<IntegerAttr>(n) : IntegerAttr(); return a && a.getInt() == v;
-    };
+    TracerVConfig config;
     if (!engine || !queue || !transport || !key || key != bank->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor") ||
         key.getAs<StringAttr>("class") != "firechip.bridgeinterfaces.TraceBundleWidths" ||
-        !width("retireWidth",1) || !width("iaddrWidth",40) || !width("insnWidth",32) ||
-        !width("causeWidth",64) || !width("tvalWidth",40) || engine.getNumPorts() != 5 ||
+        !config.parse(key) || engine.getNumPorts() != 5 ||
         engine.getPortName(2) != "hPort" || engine.getPortName(4) != "stream" ||
         fieldType(fieldType(engine.getPortType(2),"hBits"),"tiletrace_trace_retiredinsns_0_iaddr") != uint(40) ||
         fieldType(engine.getPortType(4),"bits") != uint(512))
-      return reject("TracerV header needs the live Rocket trace constructor and 512-bit stream");
+      return reject("TracerV header needs the live trace constructor and 512-bit stream");
+    auto payload=dyn_cast_or_null<BundleType>(fieldType(engine.getPortType(2),"hBits"));
+    if(!payload || payload.getNumElements()!=config.names.size())
+      return reject("TracerV driver trace payload differs from constructor");
+    for(unsigned i=0;i<config.names.size();++i) {
+      auto f=payload.getElement(config.names[i]);
+      if(!f || f->isFlip!=(i>=config.inputs()) || f->type!=uint(config.widths[i]))
+        return reject("TracerV driver trace field differs from constructor");
+    }
     auto clock = bridge ? bridge.getAs<DictionaryAttr>("clockInfo") : DictionaryAttr();
     auto clockName = clock ? clock.getAs<StringAttr>("name") : StringAttr();
     auto multiplier = clock ? clock.getAs<IntegerAttr>("multiplier") : IntegerAttr();
     auto divisor = clock ? clock.getAs<IntegerAttr>("divisor") : IntegerAttr();
     auto mapping = bridge ? bridge.getAs<DictionaryAttr>("channelMapping") : DictionaryAttr();
-    if (!mapping || mapping.size() != 12) return reject("TracerV requires twelve analyzed channels");
+    if (!mapping || mapping.size() != config.names.size()) return reject("TracerV requires constructor-matched analyzed channels");
+    for(auto &name:config.names)if(!mapping.getAs<StringAttr>(name))
+      return reject("TracerV driver channel identities differ from constructor");
+    if(bank.getNumPorts()!=5)return reject("TracerV driver requires the trigger bank interface");
+    for(unsigned lane=0;lane<config.retireWidth;++lane)
+      for(auto f:{std::pair<StringRef,unsigned>{"valid",1},{"iaddr",40},{"insn",32}})
+        if(fieldType(bank.getPortType(2),TracerVConfig::observation(lane,f.first))!=uint(f.second))
+          return reject("TracerV driver observation lane differs from constructor");
     auto resolved = resolveBridgeClockInfo(circuit, bridge, error);
     if (!resolved) return failure();
     if (bridge.getAs<DictionaryAttr>("widgetConstructorKey") != key ||
@@ -254,7 +268,7 @@ LogicalResult goldengate::prepareTracerVHeader(
         !streamName || streamName.getValue() != "TRACERVBRIDGEMODULE_" + std::to_string(widgetIndex) + "_to_cpu_stream" ||
         !space || space.getInt() != 19 || queue.getNumPorts() != 5 ||
         fieldType(queue.getPortType(2),"bits") != uint(512) || fieldType(queue.getPortType(3),"bits") != uint(512) ||
-        transport.getNumPorts() != sourceCount + 14 ||
+        transport.getNumPorts() != sourceCount + 14 + unsigned(transport->hasAttr("goldengate.f2CPUWordReads")) ||
         transport.getPortName(streamPort) != (sourceCount == 1 ? "stream" : "stream_" + std::to_string(*driverIndex)) ||
         transport.getPortDirection(streamPort) != Direction::In ||
         fieldType(transport.getPortType(streamPort),"bits") != uint(512))
@@ -262,11 +276,16 @@ LogicalResult goldengate::prepareTracerVHeader(
     if (transport.getPortName(addressPort) != "ar_bits_addr" || transport.getPortType(addressPort) != uint(64) ||
         transport.getPortDirection(addressPort) != Direction::In || transport.getPortType(sourceCount + 11) != uint(512))
       return reject("TracerV CPU stream address/data boundary differs");
+    bool f2Words = transport->hasAttr("goldengate.f2CPUWordReads");
+    if (f2Words && failed(validateF2CPUStreamWordReads(transport, error))) return failure();
     SmallVector<unsigned> grants(sourceCount, 0);
     for (auto eq : transport.getOps<EQPrimOp>()) {
       auto bits = eq.getLhs().getDefiningOp<BitsPrimOp>();
       if (!bits || bits.getInput() != transport.getBodyBlock()->getArgument(addressPort)) continue;
       auto selector = eq.getRhs().getDefiningOp<ConstantOp>();
+      if (f2Words && selector && bits.getLo() == 0 &&
+          bits.getHi() >= 1 && bits.getHi() <= 4 && selector.getValue() == 0)
+        continue; // Exact native/normalized PCI alignment predicates were checked above.
       if (bits.getHi() != 63 || bits.getLo() != space.getInt() || !selector ||
           selector.getValue().getLimitedValue() >= sourceCount)
         return reject("TracerV CPU stream grant differs from the ordered allocation");

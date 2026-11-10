@@ -26,7 +26,19 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned latency = 1, unsigned bridges = 1) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned latency = 1, unsigned bridges = 1, unsigned wdata = 0) {
+  SmallVector<std::string> locals; SmallVector<unsigned> widths;
+  auto add=[&](std::string n,unsigned w){locals.push_back(n);widths.push_back(w);};
+  add("tiletrace_reset",1);
+  for(unsigned lane=0;lane<retire;++lane) {
+    for(auto field:{std::pair<StringRef,unsigned>{"valid",1},{"iaddr",40},{"insn",32},{"priv",3},{"exception",1},{"interrupt",1},{"cause",64},{"tval",40}})
+    {
+      add("tiletrace_trace_retiredinsns_"+std::to_string(lane)+"_"+field.first.str(),field.second);
+      if(field.first=="insn" && wdata)add("tiletrace_trace_retiredinsns_"+std::to_string(lane)+"_wdata",wdata);
+    }
+  }
+  add("tiletrace_trace_time",64);add("triggerCredit",1);add("triggerDebit",1);
+  unsigned inputs=locals.size()-2;
   auto root = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGPeekPokeBridgeControlWrapper" {
     firrtl.module @GGPeekPokeBridgeControlWrapper() {}
   } })", &ctx);
@@ -41,11 +53,11 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned la
   for (unsigned bridge = 0; bridge < bridges; ++bridge) {
     NamedAttrList mapping;
     std::string suffix = bridge ? "_" + std::to_string(bridge) : "";
-    for (unsigned j = 0; j < 12; ++j) {
+    for (unsigned j = 0; j < locals.size(); ++j) {
       auto type = BundleType::get(&ctx, {{b.getStringAttr("ready"), true, uint(1)},
           {b.getStringAttr("valid"), false, uint(1)}, {b.getStringAttr("bits"), false, uint(widths[j])}});
-      ports.push_back({b.getStringAttr("token" + suffix + "_" + std::to_string(j)), type, j < 10 ? Direction::Out : Direction::In});
-      mapping.set(locals[j], b.getStringAttr("tracerv" + suffix + "_" + locals[j].str()));
+      ports.push_back({b.getStringAttr("token" + suffix + "_" + std::to_string(j)), type, j < inputs ? Direction::Out : Direction::In});
+      mapping.set(locals[j], b.getStringAttr("tracerv" + suffix + "_" + locals[j]));
     }
     mappings.push_back(mapping.getDictionary(&ctx));
   }
@@ -57,6 +69,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned la
       b.getNamedAttr("retireWidth", b.getI64IntegerAttr(retire)), b.getNamedAttr("iaddrWidth", b.getI64IntegerAttr(40)),
       b.getNamedAttr("insnWidth", b.getI64IntegerAttr(32)), b.getNamedAttr("causeWidth", b.getI64IntegerAttr(64)),
       b.getNamedAttr("tvalWidth", b.getI64IntegerAttr(40))});
+  if(wdata){NamedAttrList fields(key);fields.set("wdataWidth",b.getI64IntegerAttr(wdata));key=fields.getDictionary(&ctx);}
   SmallVector<Attribute> all;
   for (unsigned bridge = 0; bridge < bridges; ++bridge) {
     std::string suffix = bridge ? "_" + std::to_string(bridge) : "";
@@ -64,12 +77,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned retire = 1, unsigned la
         str("widgetClass", "firechip.goldengateimplementations.TracerVBridgeModule"),
         str("target", "~FireSim|FireSim>tracerv"), b.getNamedAttr("widgetConstructorKey", key),
         b.getNamedAttr("channelMapping", mappings[bridge])}));
-    for (unsigned j = 0; j < 12; ++j)
+    for (unsigned j = 0; j < locals.size(); ++j)
       all.push_back(dict({str("class", "midas.passes.fame.FAMEChannelConnectionAnnotation"),
-          str("globalName", "tracerv" + suffix + "_" + locals[j].str()),
+          str("globalName", "tracerv" + suffix + "_" + locals[j]),
           b.getNamedAttr("channelInfo", dict({str("class", "midas.passes.fame.PipeChannel"),
               b.getNamedAttr("latency", b.getI64IntegerAttr(latency))})),
-          b.getNamedAttr(j < 10 ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(
+          b.getNamedAttr(j < inputs ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(
               "~GGPeekPokeBridgeControlWrapper|GGPeekPokeBridgeControlWrapper>token" + suffix + "_" + std::to_string(j) + ".bits")}))}));
   }
   all.push_back(dict({str("class", "test.Annotation"), str("target", "~GGPeekPokeBridgeControlWrapper|GGPeekPokeBridgeControlWrapper>other")}));
@@ -196,6 +209,91 @@ void wiring(MLIRContext &ctx) {
   for (unsigned j = 0; j < 12; ++j) require(sim.output(inner.getResult(j + 2), j < 10 ? "ready" : "valid").isZero(), "stall lost");
   llvm::outs() << "4096 all-channel helper comparisons passed\n";
 }
+void wideBehavior(MLIRContext &ctx,unsigned retire,unsigned wdata) {
+  auto root=fixture(ctx,retire,1,1,wdata);auto c=*root->getOps<CircuitOp>().begin();std::string error;
+  require(succeeded(goldengate::addTracerVTokenEngine(c,error))&&succeeded(verify(*root)),error);
+  Interpreter sim(named(c,"GGTracerVTokenEngine"));std::mt19937_64 random(931+retire);
+  std::map<std::string,Value> regs;
+  for(auto r:sim.module.getOps<RegResetOp>())regs[r.getName().str()]=r.getResult();
+  for(unsigned sample=0;sample<2048;++sample) {
+    bool targetReset=random()&1,input=random()&1,output=random()&1,ready=random()&1;
+    bool init=random()&1,enable=random()&1,trigger=random()&1;
+    uint64_t cycle=random();sim.memo.clear();
+    sim.state[regs.at("trace_cycle_counter")]=APInt(64,cycle);
+    sim.state[regs.at("counter")]=APInt(1,0);
+    sim.put(sim.arg(1),"",0);sim.put(sim.arg(2),"toHost.hValid",input);sim.put(sim.arg(2),"fromHost.hReady",output);
+    sim.put(sim.arg(2),"hBits.tiletrace_reset",targetReset);
+    sim.put(sim.arg(3),"initDone",init);sim.put(sim.arg(3),"traceEnable",enable);sim.put(sim.arg(3),"trigger",trigger);
+    sim.put(sim.arg(4),"ready",ready);
+    APInt packet(512,cycle);bool any=false;
+    for(unsigned lane=0;lane<retire;++lane) {
+      bool valid=random()&1;uint64_t pc=random()&((uint64_t(1)<<40)-1);
+      auto prefix="hBits.tiletrace_trace_retiredinsns_"+std::to_string(lane)+"_";
+      sim.put(sim.arg(2),prefix+"valid",valid);sim.put(sim.arg(2),prefix+"iaddr",pc);
+      bool masked=valid&&!targetReset;any|=masked;
+      packet|=APInt(512,pc).shl(64+64*lane);packet|=APInt(512,masked).shl(127+64*lane);
+    }
+    require(sim.output(sim.arg(4),"bits")==packet,"wide retirement order/PC/reset mask");
+    require(sim.output(sim.arg(4),"valid").getBoolValue()==(any&&enable&&input&&output&&init&&trigger),"wide stream valid");
+    require(sim.output(sim.arg(2),"toHost.hReady").getBoolValue()==(output&&ready&&init),"wide token ready");
+    sim.edge();require(sim.state[regs.at("trace_cycle_counter")].getZExtValue()==cycle+uint64_t(input&&output&&ready&&init),"wide cycle advancement");
+  }
+  {
+    Interpreter wrapper(named(c,"GGTracerVTokenWrapper"));InstanceOp inner,tracer;
+    for(auto instance:wrapper.module.getOps<InstanceOp>()) {
+      if(instance.getName()=="sim")inner=instance;else tracer=instance;
+    }
+    unsigned inputs=2+retire*(8+bool(wdata)),count=inputs+2;
+    for(unsigned sample=0;sample<256;++sample) {
+      wrapper.memo.clear();SmallVector<bool> predicates;
+      bool allValid=true,allReady=true;
+      for(unsigned j=0;j<count;++j) {
+        bool value=(random()%8)!=0;predicates.push_back(value);
+        wrapper.put(inner.getResult(2+j),j<inputs?"valid":"ready",value);
+        if(j<inputs)allValid&=value;else allReady&=value;
+      }
+      wrapper.put(tracer.getResult(2),"toHost.hReady",1);wrapper.put(tracer.getResult(2),"fromHost.hValid",1);
+      require(wrapper.output(tracer.getResult(2),"toHost.hValid").getBoolValue()==allValid,"wide all-channel valid join");
+      require(wrapper.output(tracer.getResult(2),"fromHost.hReady").getBoolValue()==allReady,"wide all-channel ready join");
+      for(unsigned j=0;j<count;++j) {
+        bool expected=true;
+        for(unsigned k=j<inputs?0:inputs;k<(j<inputs?inputs:count);++k)if(j!=k)expected&=predicates[k];
+        require(wrapper.output(inner.getResult(2+j),j<inputs?"ready":"valid").getBoolValue()==expected,"wide helper must exclude own channel predicate");
+      }
+    }
+  }
+  require(succeeded(goldengate::addTracerVTriggerConfig(c,error))&&succeeded(verify(*root)),error);
+  Interpreter bank(named(c,"GGTracerVTriggerConfig"));
+  regs.clear();for(auto r:bank.module.getOps<RegResetOp>())regs[r.getName().str()]=r.getResult();
+  for(unsigned sample=0;sample<1024;++sample) {
+    bank.memo.clear();bank.put(bank.arg(1),"",0);bank.put(bank.arg(3),"tCycle",sample);
+    unsigned selector=2+sample%2;bank.state[regs.at("triggerSelector")]=APInt(32,selector);
+    bool anyPC=false,anyInsn=false;
+    SmallVector<bool> expectedPC,expectedInsn;
+    bank.state[regs.at("triggerPCStart")]=APInt(40,17);bank.state[regs.at("triggerPCEnd")]=APInt(40,23);
+    for(auto n:{"hostTriggerStartInst","hostTriggerStartInstMask","hostTriggerEndInst","hostTriggerEndInstMask"})
+      bank.state[regs.at(n)]=APInt(32,StringRef(n).ends_with("Mask")?0xffffffffu:StringRef(n).contains("Start")?17:23);
+    for(unsigned lane=0;lane<retire;++lane) {
+      bool pc=random()&1,insn=random()&1;anyPC|=pc;anyInsn|=insn;
+      bank.state[regs.at("triggerPCValVec_"+std::to_string(lane))]=APInt(1,pc);
+      bank.state[regs.at("triggerInstValVec_"+std::to_string(lane))]=APInt(1,insn);
+      std::string suffix=lane?"_"+std::to_string(lane):"";
+      bool valid=random()&1;uint64_t address=sample%3==0?17:sample%3==1?23:39;
+      uint64_t instruction=(sample+lane)%3==0?17:(sample+lane)%3==1?23:39;
+      bank.put(bank.arg(2),"valid"+suffix,valid);bank.put(bank.arg(2),"iaddr"+suffix,address);bank.put(bank.arg(2),"insn"+suffix,instruction);
+      expectedPC.push_back(valid?(address==17?true:address==23?false:pc):pc);
+      expectedInsn.push_back(valid?(instruction==17?true:instruction==23?false:insn):insn);
+    }
+    require(bank.output(bank.arg(3),"trigger").getBoolValue()==(selector==2?anyPC:anyInsn),"per-lane trigger OR");
+    for(unsigned i=0;i<15;++i)bank.put(bank.arg(4),"write["+std::to_string(i)+"].valid",0);
+    bank.edge();
+    for(unsigned lane=0;lane<retire;++lane) {
+      require(bank.state[regs.at("triggerPCValVec_"+std::to_string(lane))].getBoolValue()==expectedPC[lane],"per-lane PC history update");
+      require(bank.state[regs.at("triggerInstValVec_"+std::to_string(lane))].getBoolValue()==expectedInsn[lane],"per-lane instruction history update");
+    }
+  }
+  llvm::outs()<<"Wide TracerV retire="<<retire<<" wdata="<<wdata<<": 2048 packet/token cycles, 1024 trigger reductions\n";
+}
 std::string print(Operation *root) { std::string s; llvm::raw_string_ostream out(s); root->print(out); return s; }
 void annotationsAndRejection(MLIRContext &ctx) {
   auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
@@ -214,16 +312,31 @@ void annotationsAndRejection(MLIRContext &ctx) {
   }
   auto copied = goldengate::resolveAnnotationTarget(c, cast<DictionaryAttr>(raw[13]).getAs<StringAttr>("target").getValue(), error);
   require(copied && copied->module.getModuleName() == "GGTracerVTokenWrapper", "copied port not transferred");
+  {
+    auto nullRoot=fixture(ctx);auto nullCircuit=*nullRoot->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
+    auto raw=nullCircuit->getAttrOfType<ArrayAttr>("rawAnnotations");SmallVector<Attribute> retained(raw.begin(),raw.end());
+    NamedAttrList bridge(cast<DictionaryAttr>(retained[0]));NamedAttrList key(cast<DictionaryAttr>(bridge.get("widgetConstructorKey")));
+    key.set("wdataWidth",b.getUnitAttr());bridge.set("widgetConstructorKey",key.getDictionary(&ctx));retained[0]=bridge.getDictionary(&ctx);
+    nullCircuit->setAttr("rawAnnotations",b.getArrayAttr(retained));
+    require(succeeded(goldengate::addTracerVTokenEngine(nullCircuit,error))&&succeeded(verify(*nullRoot)),"JSON null optional wdata must preserve Rocket constructor");
+  }
   auto snapshot = print(*root);
   require(failed(goldengate::addTracerVTokenEngine(c, error)) && print(*root) == snapshot, "repeat pass mutated IR");
-  for (unsigned mode = 0; mode < 5; ++mode) {
-    auto bad = fixture(ctx, mode == 0 ? 2 : 1, mode == 1 ? 0 : 1); auto bc = *bad->getOps<CircuitOp>().begin();
+  for (unsigned mode = 0; mode < 8; ++mode) {
+    auto bad = fixture(ctx, mode == 0 ? 8 : 1, mode == 1 ? 0 : 1); auto bc = *bad->getOps<CircuitOp>().begin();
     OpBuilder b(&ctx);
     if (mode == 2) bc->removeAttr("rawAnnotations");
     if (mode >= 3) {
       auto old = bc->getAttrOfType<ArrayAttr>("rawAnnotations"); SmallVector<Attribute> attrs(old.begin(), old.end());
       if (mode == 3) attrs.push_back(old[0]);
-      else { NamedAttrList a(cast<DictionaryAttr>(old[2])); a.set("sources", cast<DictionaryAttr>(old[1]).get("sources")); attrs[2] = a.getDictionary(&ctx); }
+      else if(mode==4) { NamedAttrList a(cast<DictionaryAttr>(old[2])); a.set("sources", cast<DictionaryAttr>(old[1]).get("sources")); attrs[2] = a.getDictionary(&ctx); }
+      else {
+        NamedAttrList bridge(cast<DictionaryAttr>(old[0]));
+        NamedAttrList key(cast<DictionaryAttr>(bridge.get("widgetConstructorKey")));
+        if(mode==5)key.set("wdataWidth",b.getStringAttr("64"));
+        else key.set(mode==6?"retireWidth":"iaddrWidth",IntegerAttr::get(IntegerType::get(&ctx,128),APInt(128,mode==6?1:40)));
+        bridge.set("widgetConstructorKey",key.getDictionary(&ctx));attrs[0]=bridge.getDictionary(&ctx);
+      }
       bc->setAttr("rawAnnotations", b.getArrayAttr(attrs));
     }
     auto saved = print(*bad);
@@ -554,6 +667,7 @@ void multipleTriggerBanks(MLIRContext &ctx) {
 int main() {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    for(unsigned retire:{2u,3u,4u,6u,7u})wideBehavior(ctx,retire,retire==3||retire==4||retire==6?64:0);
     behavior(ctx);
     for (unsigned n = 0; n < 4; ++n) behavior(ctx, n, 4);
     wiring(ctx); multipleBridges(ctx); annotationsAndRejection(ctx); triggerConfiguration(ctx);

@@ -113,14 +113,17 @@ LogicalResult goldengate::synthesizePrintStubs(
         {b.getStringAttr("enable"), false, UIntType::get(b.getContext(), 1)}};
     for (auto [index, arg] : llvm::enumerate(stub.print.getSubstitutions()))
       fields.push_back({b.getStringAttr("args_" + std::to_string(index)), false,
-                        cast<FIRRTLBaseType>(arg.getType())});
+                        cast<FIRRTLBaseType>(arg.getType()).getAllConstDroppedType()});
     auto bundle = b.create<WireOp>(loc, BundleType::get(b.getContext(), fields),
         names.newName(stub.print.getName().str() + "_wire"));
     auto enable = b.create<SubfieldOp>(loc, bundle.getResult(), 0);
-    b.create<StrictConnectOp>(loc, enable.getResult(), stub.print.getCond());
+    // Imported literals have const types. The synthesized channel is mutable,
+    // like SFC's ordinary UInt/SInt bundle; use a normal connection to drop
+    // the source's const qualifier without changing bits, width or signedness.
+    b.create<ConnectOp>(loc, enable.getResult(), stub.print.getCond());
     for (auto [index, arg] : llvm::enumerate(stub.print.getSubstitutions())) {
       auto field = b.create<SubfieldOp>(loc, bundle.getResult(), index + 1);
-      b.create<StrictConnectOp>(loc, field.getResult(), arg);
+      b.create<ConnectOp>(loc, field.getResult(), arg);
     }
     stub.bundle = bundle;
     stub.target = "~" + circuit.getName().str() + "|" + module.getName().str() + ">" + bundle.getName().str();

@@ -49,31 +49,34 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx) {
   c->setAttr("rawAnnotations", b.getArrayAttr(annos)); return root;
 }
 struct Interpreter {
-  FModuleOp module; SmallVector<RegResetOp> regs;
+  FModuleOp module; SmallVector<Value> regs;
   std::map<std::string, Value> drivers;
   std::map<std::string, APInt> memo;
-  llvm::DenseMap<Value, unsigned> state;
+  llvm::DenseMap<Value, APInt> state;
   std::string key(Value v) {
     if (auto f = v.getDefiningOp<SubfieldOp>()) return key(f.getInput()) + "." + f.getFieldName().str();
     return std::to_string(reinterpret_cast<uintptr_t>(v.getAsOpaquePointer()));
   }
   Interpreter(FModuleOp m) : module(m) {
-    for (auto r : m.getOps<RegResetOp>()) { regs.push_back(r); require(r.getResult().getType() == UIntType::get(m.getContext(), 9, false), "wrong burst counter type"); }
-    require(regs.size() == 2 && regs[0].getName() == "writeBeatCounter_0" && regs[1].getName() == "writeBeatCounter_1", "independent per-stream counters missing");
+    for (auto &op : *m.getBodyBlock())
+      if (isa<RegResetOp, RegOp>(op)) regs.push_back(op.getResult(0));
+    require(regs.size() == 10, "independent per-stream assembly/counter state missing");
     for (auto op : m.getOps<StrictConnectOp>()) require(drivers.emplace(key(op.getDest()), op.getSrc()).second, "multiple transport drivers");
   }
   Value arg(unsigned i) { return module.getArgument(i); }
-  void put(unsigned i, uint64_t n) { memo[key(arg(i))] = APInt(64, n); }
+  void put(unsigned i, uint64_t n) { memo[key(arg(i))] = APInt(*cast<UIntType>(arg(i).getType()).getWidth(), n); }
   APInt eval(Value v) {
     auto k = key(v); unsigned width = *cast<UIntType>(v.getType()).getWidth();
     if (memo.count(k)) return memo.at(k).zextOrTrunc(width);
     auto *op = v.getDefiningOp(); APInt n(width, 0);
-    if (isa_and_nonnull<RegResetOp>(op)) n = APInt(9, state.lookup(v));
+    if (isa_and_nonnull<RegResetOp, RegOp>(op)) n = state.lookup(v).zextOrTrunc(width);
     else if (drivers.count(k)) n = eval(drivers.at(k));
     else if (auto c = dyn_cast_or_null<ConstantOp>(op)) n = c.getValue();
     else if (isa_and_nonnull<PadPrimOp>(op)) n = eval(op->getOperand(0));
     else if (isa_and_nonnull<MuxPrimOp>(op)) n = eval(op->getOperand(eval(op->getOperand(0)).isZero() ? 2 : 1));
     else if (auto bits = dyn_cast_or_null<BitsPrimOp>(op)) n = eval(bits.getInput()).lshr(bits.getLo());
+    else if (auto shl = dyn_cast_or_null<ShlPrimOp>(op)) n = eval(shl.getInput()).zextOrTrunc(width).shl(shl.getAmount());
+    else if (isa_and_nonnull<CatPrimOp>(op)) n = eval(op->getOperand(0)).concat(eval(op->getOperand(1)));
     else if (isa_and_nonnull<AndPrimOp>(op)) n = eval(op->getOperand(0)) & eval(op->getOperand(1));
     else if (isa_and_nonnull<OrPrimOp>(op)) n = eval(op->getOperand(0)) | eval(op->getOperand(1));
     else if (isa_and_nonnull<NotPrimOp>(op)) n = ~eval(op->getOperand(0));
@@ -84,64 +87,93 @@ struct Interpreter {
   }
   APInt output(unsigned i) { return eval(drivers.at(key(arg(i)))); }
   void edge() {
-    llvm::DenseMap<Value, unsigned> next;
-    for (auto r : regs) next[r.getResult()] = eval(r.getResetSignal()).isZero() ? eval(drivers.at(key(r.getResult()))).getZExtValue() : eval(r.getResetValue()).getZExtValue();
+    llvm::DenseMap<Value, APInt> next;
+    for (auto r : regs) {
+      auto reset = r.getDefiningOp<RegResetOp>();
+      next[r] = reset && !eval(reset.getResetSignal()).isZero()
+          ? eval(reset.getResetValue()) : eval(drivers.at(key(r)));
+    }
     state = std::move(next);
   }
 };
 void behavior(CircuitOp c) {
   Interpreter sim(named(c, "GGCPUStreamWrite")); std::mt19937_64 rng(0x173);
-  unsigned cases = 0, fires = 0, responses = 0, misses = 0;
-  auto cycle = [&](std::array<unsigned, 2> old, unsigned len, uint64_t addr, unsigned flags, unsigned size, uint64_t strb) {
-    bool reset = flags & 1, aw = flags & 2, w = flags & 4, b = flags & 8;
-    bool ready[]{bool(flags & 16), bool(flags & 32)};
-    sim.memo.clear(); for (unsigned i = 0; i < 2; ++i) sim.state[sim.regs[i].getResult()] = old[i];
-    sim.put(1, reset); sim.put(5, aw); sim.put(6, rng() & 65535); sim.put(7, addr);
-    sim.put(8, len); sim.put(9, size); sim.put(11, w); sim.put(13, strb); sim.put(14, b);
-    APInt data(512, 0); for (unsigned word = 0; word < 8; ++word) data |= APInt(512, rng()).shl(64 * word);
-    sim.memo[sim.key(sim.arg(12))] = data;
-    for (unsigned i = 0; i < 2; ++i) sim.memo[sim.key(sim.arg(2 + i)) + ".ready"] = APInt(1, ready[i]);
-    uint64_t selector = addr >> 18; bool selected = selector < 2;
-    bool space = selected && ready[selector], last = selected && old[selector] == len;
-    bool fire = selected && aw && w && b && space;
-    require(sim.output(4).getBoolValue() == (space && w && b && last), "AW completion predicate differs");
-    require(sim.output(10).getBoolValue() == (space && aw && b), "W ready predicate differs");
-    require(sim.output(15).getBoolValue() == (space && aw && w && last), "B valid must exclude its own ready");
-    require(sim.output(16) == sim.eval(sim.arg(6)) && sim.output(17).isZero(), "live AW ID/OKAY differs");
-    for (unsigned i = 0; i < 2; ++i) {
-      require(sim.eval(sim.drivers.at(sim.key(sim.arg(2 + i)) + ".valid")).getBoolValue() == (selector == i && aw && w && b), "sink valid must exclude its own ready");
-      require(sim.eval(sim.drivers.at(sim.key(sim.arg(2 + i)) + ".bits")) == data, "all sink data must be live W data");
+  struct Model { unsigned beats = 0; uint64_t mask = 0, line = 0; APInt data{512, 0}; bool error = false; };
+  Model models[2]; unsigned cycles=0, outputs=0, partials=0, errors=0, stalls=0;
+  auto cycle = [&](bool reset, unsigned len, uint64_t addr, bool aw, bool w,
+                   bool b, bool ready0, bool ready1, unsigned size, uint64_t strb) {
+    sim.memo.clear(); sim.put(1,reset); sim.put(5,aw);sim.put(6,0x731);sim.put(7,addr);
+    sim.put(8,len);sim.put(9,size);sim.put(11,w);sim.put(13,strb);sim.put(14,b);
+    APInt data(512,0);for(unsigned word=0;word<8;++word)data|=APInt(512,rng()).shl(64*word);
+    sim.memo[sim.key(sim.arg(12))]=data;
+    bool ready[]{ready0,ready1};
+    for(unsigned i=0;i<2;++i)sim.memo[sim.key(sim.arg(2+i))+".ready"]=APInt(1,ready[i]);
+    unsigned selector=addr>>18;bool selected=selector<2;
+    bool expectedAW=false,expectedW=false,expectedB=false,errorNow=false,complete=false,fire=false,malformed=false;
+    uint64_t mergedMask=0,currentLine=0;APInt merged(512,0);
+    if(selected){auto &m=models[selector];
+      currentLine=(addr+(uint64_t(m.beats)<<size))>>6;
+      malformed=(m.mask&strb)|| (m.mask&&m.line!=currentLine)||size>6||!strb||((addr+(uint64_t(m.beats)<<size))>>18)!=selector;
+      errorNow=m.error||malformed;mergedMask=m.mask|strb;complete=mergedMask==~uint64_t(0);
+      for(unsigned lane=0;lane<64;++lane){auto value=(strb>>lane)&1?data.extractBits(8,8*lane):m.data.extractBits(8,8*lane);merged|=value.zext(512).shl(8*lane);}
+      bool accept=errorNow||!complete||ready[selector],last=m.beats==len;
+      expectedAW=w&&b&&accept&&last;expectedW=aw&&b&&accept;expectedB=aw&&w&&accept&&last;
+      fire=expectedW&&w;
     }
-    unsigned assertions = 0;
-    for (auto a : sim.module.getOps<AssertOp>()) {
-      bool permitted = assertions == 0 ? !aw || size == 6 : !w || strb == ~uint64_t(0);
-      require(sim.eval(a.getEnable()).getBoolValue() == !reset && sim.eval(a.getPredicate()).getBoolValue() == permitted, "valid-qualified assertion/reset gating differs"); ++assertions;
+    require(sim.output(4).getBoolValue()==expectedAW,"AW completion predicate differs");
+    require(sim.output(10).getBoolValue()==expectedW,"physical W readiness differs");
+    require(sim.output(15).getBoolValue()==expectedB,"physical B completion differs");
+    require(sim.output(16).getZExtValue()==0x731&&sim.output(17).getZExtValue()==(errorNow?2:0),"physical response ID/error differs");
+    for(unsigned i=0;i<2;++i){bool valid=selected&&selector==i&&aw&&w&&b&&complete&&!errorNow;
+      require(sim.eval(sim.drivers.at(sim.key(sim.arg(2+i))+".valid")).getBoolValue()==valid,"logical stream word duplicated/lost");
+      if(valid){require(sim.eval(sim.drivers.at(sim.key(sim.arg(2+i))+".bits"))==merged,"assembled live bytes differ");outputs+=ready[i]&&!reset;}
     }
-    require(assertions == 2, "write size/strobe assertions missing");
+    unsigned assertions=0;for(auto assertion:sim.module.getOps<AssertOp>()){
+      bool violation=selected&&selector==assertions&&aw&&w&&malformed;
+      require(sim.eval(assertion.getEnable()).getBoolValue()==!reset&&sim.eval(assertion.getPredicate()).getBoolValue()==!violation,"partial-write assertion differs");++assertions;}
+    require(assertions==2,"per-sink malformed guards missing");
     sim.edge();
-    for (unsigned i = 0; i < 2; ++i) {
-      unsigned expected = reset ? 0 : fire && selector == i ? (old[i] == len ? 0 : (old[i] + 1) & 511) : old[i];
-      require(sim.state.lookup(sim.regs[i].getResult()) == expected, "unselected or stalled sink counter changed");
-    }
-    ++cases; fires += fire; responses += fire && last; misses += !selected; return fire;
+    if(reset){models[0]=Model();models[1]=Model();}
+    else if(fire){auto &m=models[selector];bool last=m.beats==len;m.beats=last?0:m.beats+1;m.error=last?false:errorNow;
+      if(!errorNow){m.mask=complete?0:mergedMask;m.line=currentLine;m.data=merged;partials+=!complete;}else ++errors;}
+    stalls+=aw&&w&&!fire;++cycles;return fire;
   };
-  for (unsigned seed = 0; seed < 512; ++seed) for (unsigned len : {0U, 1U, 127U, 255U})
-    for (unsigned flags = 0; flags < 64; ++flags)
-      cycle({seed, (seed + 173) & 511}, len, (uint64_t(flags % 3) << 18) | ((1U << 18) - 1), flags, flags & 7, ~uint64_t(0));
-  for (unsigned lane = 0; lane < 64; ++lane) cycle({0,0},0,0,62,6,~(uint64_t(1)<<lane));
-  cycle({511, 256}, 255, ~uint64_t(0), 62, 6, ~uint64_t(0));
-  // Hold AW throughout each complete burst; vary FIFO and response stalls.
-  for (unsigned len = 0; len < 256; ++len) {
-    std::array<unsigned, 2> counts{0, 0}; unsigned sent = 0;
-    while (sent <= len) {
-      unsigned flags = 2 | (rng() & 1 ? 4 : 0) | (rng() & 1 ? 8 : 0) | (rng() & 1 ? 16 : 0) | (rng() & 1 ? 32 : 0);
-      bool fire = cycle(counts, len, (uint64_t(len & 1) << 18) | (rng() & ((1U << 18) - 1)), flags, 6, ~uint64_t(0));
-      sent += fire; counts = {sim.state.lookup(sim.regs[0].getResult()), sim.state.lookup(sim.regs[1].getResult())};
-      require(counts[len & 1] == (sent <= len ? sent : 0) && counts[1 - (len & 1)] == 0, "held-AW selected burst completion differs");
+  auto full=[&](unsigned len,uint64_t addr,bool aw,bool w,bool b,bool r0,bool r1){return cycle(false,len,addr,aw,w,b,r0,r1,6,~uint64_t(0));};
+  cycle(true,0,0,false,false,false,false,false,6,~uint64_t(0));
+  // Full DMA beats preserve selected burst counters through independent stalls.
+  for(unsigned sink=0;sink<2;++sink)for(unsigned len:{0u,1u,31u,127u,255u}){
+    unsigned done=0;while(done<=len){bool fire=full(len,uint64_t(sink)<<18,rng()%4,rng()%4,rng()%4,rng()%4,rng()%4);done+=fire;}
+  }
+  // Interleave every byte of two independent partial lines. Deliberately
+  // refuse FIFO readiness until the final byte; partial physical B must retire.
+  for(unsigned repetition=0;repetition<8;++repetition){
+    for(unsigned lane=0;lane<64;++lane)for(unsigned sink=0;sink<2;++sink){
+      uint64_t addr=(uint64_t(sink)<<18)+repetition*64+lane;
+      if(lane==63){require(!cycle(false,0,addr,true,true,true,false,false,6,uint64_t(1)<<lane),"complete word ignored FIFO backpressure");}
+      require(cycle(false,0,addr,true,true,true,true,true,6,uint64_t(1)<<lane),"partial physical transaction failed to retire");
     }
   }
-  require(responses && misses, "last-beat/miss coverage missing");
-  llvm::outs() << "Multi-stream write: " << cases << " SSA cases, " << fires << " W transfers, " << responses << " completions\n";
+  // A burst can start with a partial line, then finish it in a later AW;
+  // effective physical beat addresses must not merge adjacent lines.
+  for(unsigned sink=0;sink<2;++sink){uint64_t base=uint64_t(sink)<<18;
+    cycle(false,0,base,true,true,true,true,true,6,0xffffffff);
+    cycle(false,0,base+32,true,true,true,false,false,6,0xffffffff00000000ULL);
+    cycle(false,0,base+32,true,true,true,true,true,6,0xffffffff00000000ULL);
+    // Overlap and wrong-line fail without discarding pending owned bytes.
+    cycle(false,0,base,true,true,true,true,true,6,0xff);
+    cycle(false,0,base,true,true,true,true,true,6,0x0f);
+    cycle(false,0,base+64,true,true,true,true,true,6,0xff00);
+    cycle(false,0,base+8,true,true,true,true,true,6,~uint64_t(0xff));
+    cycle(false,0,base,true,true,true,true,true,6,0);
+    cycle(false,0,base,true,true,true,true,true,7,~uint64_t(0));
+  }
+  // Bad earlier physical beat propagates SLVERR to the final B response.
+  cycle(false,1,0,true,true,true,true,true,6,0xff);
+  cycle(false,1,0,true,true,true,true,true,6,0xff); // wrong effective line
+  cycle(true,0,0,false,false,false,false,false,6,~uint64_t(0));
+  full(0,0,true,true,true,true,true);
+  require(outputs>800&&partials>900&&errors>=8&&stalls>100,"insufficient full/partial/stall/error coverage");
+  llvm::outs()<<"Multi-stream write: "<<cycles<<" cycles, "<<outputs<<" logical words, "<<partials<<" partial transactions, "<<errors<<" rejected transactions\n";
 }
 void mapping(CircuitOp c) {
   auto helper = named(c, "GGCPUStreamWrite"), wrapper = named(c, "GGCPUStreamWriteWrapper"), inner = named(c, "StreamFixture");

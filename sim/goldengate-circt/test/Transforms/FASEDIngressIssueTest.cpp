@@ -22,17 +22,18 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false,uint64_t maxFlight=10) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=false,uint64_t maxFlight=10, unsigned baseCapacity=16) {
   auto root=parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDIngressOrderWrapper\" { firrtl.module @GGFASEDIngressOrderWrapper() {} } }",&ctx);require(bool(root),"fixture parse");
   auto c=*root->getOps<CircuitOp>().begin();
   if(selected)c.setName("GGSelectedPrintFASEDIngressOrderWrapper");
   (*c.getOps<FModuleOp>().begin()).erase();OpBuilder b(c.getBodyBlock(),c.getBodyBlock()->begin());
+  if (baseCapacity != 16) c->setAttr("goldengate.fasedBaseCapacity", b.getI64IntegerAttr(baseCapacity));
   auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> fields){SmallVector<BundleType::BundleElement> e;for(auto [n,w]:fields)e.push_back({b.getStringAttr(n),false,uint(w)});return BundleType::get(&ctx,e);};
   auto address=bundle({{"user",1},{"id",4},{"region",4},{"qos",4},{"prot",3},{"cache",4},{"lock",1},{"burst",2},{"size",3},{"len",8},{"addr",35}});
   auto data=bundle({{"user",1},{"strb",8},{"id",4},{"last",1},{"data",64}});
   auto token=[&](FIRRTLBaseType t){return BundleType::get(&ctx,{{b.getStringAttr("ready"),mode!=15,bit},{b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,t}});};
-  unsigned cw=llvm::Log2_64_Ceil(std::min<uint64_t>(16,maxFlight)+1);
+  unsigned cw=llvm::Log2_64_Ceil(std::min<uint64_t>(baseCapacity,maxFlight)+1);
   if(mode==30)++cw;
   auto status=bundle({{"awValue",cw},{"wValue",cw},{"awEmpty",1},{"wEmpty",1},{"writeReqDone",1}});
   auto transactions=bundle({{"arReady",1},{"arValid",1},{"rReady",1},{"rValid",1},{"rLast",1},{"awReady",1},{"awValid",1},{"bReady",1},{"bValid",1}});
@@ -157,12 +158,12 @@ void behavior(MLIRContext &ctx,bool selected) {
   }
   require(priority&&stalls,"priority/stall coverage missing");llvm::outs()<<cases<<" issue transitions/payload cases, "<<priority<<" AW/final-W collisions passed\n";
 }
-void mapping(MLIRContext &ctx,bool selected,uint64_t maxFlight){
-  auto root=fixture(ctx,0,selected,maxFlight);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDIngressIssue(c,error)),error);require(succeeded(verify(*root)),"invalid width-dependent wrapper IR");
+void mapping(MLIRContext &ctx,bool selected,uint64_t maxFlight, unsigned baseCapacity=16){
+  auto root=fixture(ctx,0,selected,maxFlight,baseCapacity);auto c=*root->getOps<CircuitOp>().begin();std::string error;require(succeeded(goldengate::addFASEDIngressIssue(c,error)),error);require(succeeded(verify(*root)),"invalid width-dependent wrapper IR");
   Interpreter wired(named(c,selected?"GGSelectedPrintFASEDIngressIssueWrapper":"GGFASEDIngressIssueWrapper"));InstanceOp inner,issue;for(auto i:wired.module.getOps<InstanceOp>())if(i.getName()=="sim")inner=i;else issue=i;
   require(wired.module.getNumPorts()==9,"wrapper port contract differs");
   require(wired.drivers.at(wired.key(issue.getResult(0)))==wired.arg(0),"host clock differs");
-  const unsigned cw=llvm::Log2_64_Ceil(std::min<uint64_t>(16,maxFlight)+1);
+  const unsigned cw=llvm::Log2_64_Ceil(std::min<uint64_t>(baseCapacity,maxFlight)+1);
   auto status=cast<BundleType>(wired.arg(5).getType());
   for(unsigned j=0;j<2;++j)require(*cast<UIntType>(status.getElements()[j].type).getWidth()==cw,"constructor-sized credit width differs");
   for(unsigned flags=0;flags<256;++flags){wired.memo.clear();
@@ -206,4 +207,24 @@ int main(int argc,char **argv){MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,cir
     std::error_code ec;llvm::raw_fd_ostream out(argv[2],ec);require(!ec,"cannot export issue helper");isolated.print(out);out<<'\n';out.close();isolated.erase();return 0;
   }
   require(argc==1,"usage: goldengate-fased-ingress-issue-test [ingress-issue.mlir helper.mlir]");
-  for(bool selected:{false,true}){behavior(ctx,selected);for(uint64_t flight:{uint64_t(1),uint64_t(2),uint64_t(3),uint64_t(8),uint64_t(10),uint64_t(16),uint64_t(20),uint64_t(INT64_MAX)})mapping(ctx,selected,flight);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}
+  for (bool selected : {false, true}) {
+      OpBuilder b(&ctx);
+      for (Attribute bad : {Attribute(b.getStringAttr("32")), Attribute(b.getF64FloatAttr(32)),
+          Attribute(b.getI64IntegerAttr(0)), Attribute(b.getI64IntegerAttr(-1)),
+          Attribute(b.getI64IntegerAttr(20)),
+          Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 32)))}) {
+        auto root = fixture(ctx, 0, selected);
+        auto c = *root->getOps<CircuitOp>().begin();
+        c->setAttr("goldengate.fasedBaseCapacity", bad);
+        std::string before, after, error;
+        { llvm::raw_string_ostream out(before); root->print(out); }
+        require(failed(goldengate::addFASEDIngressIssue(c, error)) && !error.empty(), "invalid functional capacity accepted");
+        { llvm::raw_string_ostream out(after); root->print(out); }
+        require(before == after, "invalid functional capacity mutated IR");
+      }
+    }
+    for (bool selected : {false, true}) {
+      for (uint64_t flight : {uint64_t(10), uint64_t(20), uint64_t(64)})
+        mapping(ctx, selected, flight, 32);
+    }
+    for(bool selected:{false,true}){behavior(ctx,selected);for(uint64_t flight:{uint64_t(1),uint64_t(2),uint64_t(3),uint64_t(8),uint64_t(10),uint64_t(16),uint64_t(20),uint64_t(INT64_MAX)})mapping(ctx,selected,flight);rejection(ctx,selected);}}catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}return 0;}

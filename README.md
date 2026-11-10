@@ -1,3 +1,11 @@
+# Native CIRCT Golden Gate integration
+
+This fork is pinned by [the parent Chipyard fork](https://github.com/jimfangx/chia-firesim-circt).
+For source setup, compiler/driver builds and F2 feature workloads, follow the
+parent fork's `REPRODUCING.md`; use its recorded submodule commit. Generated
+root filesystems, local manager configuration and run receipts are rebuilt
+locally and are excluded from this source snapshot.
+
 # FireSim: Fast and Effortless FPGA-accelerated Hardware Simulation with On-Prem and Cloud Flexibility
 
 ![FireSim Documentation Status](https://readthedocs.org/projects/firesim/badge/)

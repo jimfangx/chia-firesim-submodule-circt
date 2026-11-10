@@ -196,6 +196,77 @@ void run(MLIRContext &context) {
           b.getNamedAttr("opType", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(mode))}))}));
     }
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  // Exercise the production entry point from the original (ungated) handoff,
+  // including malformed late records, selection, cleanup and second invocation.
+  {
+    OwningOpRef<ModuleOp> enabled(cast<ModuleOp>(root->getOperation()->clone()));
+    auto enabledCircuit = *enabled->getOps<CircuitOp>().begin();
+    auto original = enabledCircuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    auto changed = SmallVector<Attribute>(original.begin(), original.end());
+    NamedAttrList bad(cast<DictionaryAttr>(changed.back()));
+    bad.set("opType", b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("bad.Mode"))}));
+    changed.back() = bad.getDictionary(&context);
+    enabledCircuit->setAttr("rawAnnotations", b.getArrayAttr(changed));
+    unsigned synthesized = 999;
+    std::string error;
+    auto before = dump(*enabled);
+    require(failed(goldengate::synthesizeEnabledAutoCounterPrintf(
+        enabledCircuit, {}, synthesized, error)) && synthesized == 999 &&
+        before == dump(*enabled), "production late mode failure mutated circuit/result");
+    // Generated covers are ignored unless their enclosing module was selected;
+    // an invalid operand in an unselected generated record must not be resolved.
+    NamedAttrList ignored(cast<DictionaryAttr>(original[0]));
+    ignored.set("coverGenerated", b.getBoolAttr(true));
+    ignored.set("target", b.getStringAttr("~Top|Top>missing_unselected_signal"));
+    changed.assign(original.begin(), original.end());
+    changed.push_back(ignored.getDictionary(&context));
+    enabledCircuit->setAttr("rawAnnotations", b.getArrayAttr(changed));
+    require(succeeded(goldengate::synthesizeEnabledAutoCounterPrintf(
+        enabledCircuit, {}, synthesized, error)), error);
+    require(synthesized == 10 && succeeded(verify(*enabled)),
+            "production selected event count/IR mismatch");
+    auto retained = enabledCircuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    require(retained.size() == 20, "production annotations were not consumed/preserved");
+    auto enabledModule = *enabledCircuit.getOps<FModuleOp>().begin();
+    Interpreter enabledSim(enabledModule);
+    enabledSim.inputs[enabledModule.getBodyBlock()->getArgument(2)] = llvm::APInt(1, 1);
+    for (unsigned arg = 3; arg < 8; ++arg) {
+      auto input = enabledModule.getBodyBlock()->getArgument(arg);
+      enabledSim.inputs[input] = llvm::APInt::getAllOnes(width(input));
+    }
+    unsigned printCount = 0;
+    enabledModule.walk([&](PrintFOp print) {
+      ++printCount;
+      auto condition = cast<AndPrimOp>(print.getCond().getDefiningOp());
+      auto comparison = cast<NEQPrimOp>(condition.getRhs().getDefiningOp());
+      auto gate = cast<WireOp>(comparison.getLhs().getDefiningOp());
+      auto driver = enabledSim.drivers.lookup(gate.getResult());
+      require(isa_and_nonnull<MuxPrimOp>(driver.getDefiningOp()),
+              "production counter bypassed reset gate");
+      require(!enabledSim.eval(print.getCond()).getBoolValue(),
+              "production counter emitted a sample during initial reset");
+    });
+    require(printCount == 10, "production printf count mismatch");
+    before = dump(*enabled);
+    require(succeeded(goldengate::synthesizeEnabledAutoCounterPrintf(
+        enabledCircuit, {}, synthesized, error)) && synthesized == 0 &&
+        before == dump(*enabled), "repeated production invocation duplicated counters");
+  }
+  // No selected events still consumes unused generated cover annotations, as
+  // AutoCounterTransform.execute does after its empty-selection doTransform.
+  {
+    OwningOpRef<ModuleOp> empty(cast<ModuleOp>(root->getOperation()->clone()));
+    auto emptyCircuit = *empty->getOps<CircuitOp>().begin();
+    NamedAttrList generated(cast<DictionaryAttr>(annotations.front()));
+    generated.set("coverGenerated", b.getBoolAttr(true));
+    emptyCircuit->setAttr("rawAnnotations", b.getArrayAttr({generated.getDictionary(&context)}));
+    unsigned synthesized = 999;
+    std::string error;
+    require(succeeded(goldengate::synthesizeEnabledAutoCounterPrintf(
+        emptyCircuit, {}, synthesized, error)), error);
+    require(synthesized == 0 && emptyCircuit->getAttrOfType<ArrayAttr>("rawAnnotations").empty(),
+            "empty production selection retained cover records");
+  }
   SmallVector<goldengate::AutoCounterEvent> events;
   std::string error;
   require(succeeded(goldengate::analyzeAutoCounterEvents(circuit, events, error)), error);

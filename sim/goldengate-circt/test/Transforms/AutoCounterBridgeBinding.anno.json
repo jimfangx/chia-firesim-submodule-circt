@@ -1,0 +1,184 @@
+[
+  {
+    "class": "firesim.lib.bridgeutils.BridgeIOAnnotation",
+    "target": "~Top|Top>autocounter0",
+    "channelMapping": {
+      "trigger": "g0_trigger",
+      "globalReset": "g0_globalReset",
+      "event0": "g0_event0",
+      "event1": "g0_event1"
+    },
+    "widgetClass": "midas.widgets.AutoCounterBridgeModule",
+    "widgetConstructorKey": {
+      "class": "midas.widgets.AutoCounterParameters",
+      "eventMetadata": [
+        {
+          "class": "midas.widgets.EventMetadata",
+          "portName": "event0",
+          "label": "count",
+          "description": "fixture event",
+          "width": 64,
+          "opType": {
+            "class": "midas.targetutils.PerfCounterOps$Accumulate$"
+          }
+        },
+        {
+          "class": "midas.widgets.EventMetadata",
+          "portName": "event1",
+          "label": "value",
+          "description": "fixture event",
+          "width": 64,
+          "opType": {
+            "class": "midas.targetutils.PerfCounterOps$Identity$"
+          }
+        }
+      ],
+      "triggerName": "trigger",
+      "resetPortName": "globalReset"
+    },
+    "clockInfo": {
+      "name": "domain0",
+      "multiplier": 1,
+      "divisor": 1
+    }
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g0_trigger",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain0",
+    "sources": [
+      "~Top|Top>token0_trigger.bits"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g0_globalReset",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain0",
+    "sources": [
+      "~Top|Top>token0_globalReset.bits"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g0_event0",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain0",
+    "sources": [
+      "~Top|Top>token0_event0.bits"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g0_event1",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain0",
+    "sources": [
+      "~Top|Top>token0_event1.bits"
+    ]
+  },
+  {
+    "class": "firesim.lib.bridgeutils.BridgeIOAnnotation",
+    "target": "~Top|Top>autocounter1",
+    "channelMapping": {
+      "trigger": "g1_trigger",
+      "globalReset": "g1_globalReset",
+      "event0": "g1_event0",
+      "event1": "g1_event1"
+    },
+    "widgetClass": "midas.widgets.AutoCounterBridgeModule",
+    "widgetConstructorKey": {
+      "class": "midas.widgets.AutoCounterParameters",
+      "eventMetadata": [
+        {
+          "class": "midas.widgets.EventMetadata",
+          "portName": "event0",
+          "label": "count",
+          "description": "fixture event",
+          "width": 64,
+          "opType": {
+            "class": "midas.targetutils.PerfCounterOps$Accumulate$"
+          }
+        },
+        {
+          "class": "midas.widgets.EventMetadata",
+          "portName": "event1",
+          "label": "value",
+          "description": "fixture event",
+          "width": 64,
+          "opType": {
+            "class": "midas.targetutils.PerfCounterOps$Identity$"
+          }
+        }
+      ],
+      "triggerName": "trigger",
+      "resetPortName": "globalReset"
+    },
+    "clockInfo": {
+      "name": "domain1",
+      "multiplier": 1,
+      "divisor": 3
+    }
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g1_trigger",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain1",
+    "sources": [
+      "~Top|Top>token1_trigger.bits"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g1_globalReset",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain1",
+    "sources": [
+      "~Top|Top>token1_globalReset.bits"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g1_event0",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain1",
+    "sources": [
+      "~Top|Top>token1_event0.bits"
+    ]
+  },
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "g1_event1",
+    "channelInfo": {
+      "class": "midas.passes.fame.PipeChannel",
+      "latency": 0
+    },
+    "clock": "~Top|Top>domain1",
+    "sources": [
+      "~Top|Top>token1_event1.bits"
+    ]
+  }
+]

@@ -1,5 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/CPUStreamPort.h"
+#include "goldengate/CPUStreamRead.h"
+#include "goldengate/CPUStreamWrite.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "mlir/IR/Builders.h"
@@ -51,6 +53,45 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, bool incoming = false) {
     b.create<ConnectOp>(c.getLoc(),p.direction==Direction::In?v:a,p.direction==Direction::In?a:v);
   }
   return root;
+}
+// Compose actual read/write engines, including two independent NIC sink
+// counters and mixed NIC/TracerV/Print source allocations. The final platform
+// adapter must preserve these complete engine bodies and every scalar bit.
+OwningOpRef<ModuleOp> allocatedFixture(MLIRContext &ctx, bool mixed) {
+  auto root=parseSourceString<ModuleOp>(R"(module { firrtl.circuit "Streams" {
+    firrtl.module @Streams() {}
+  } })",&ctx);require(bool(root),"allocated fixture parse");
+  auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);auto loc=c.getLoc();
+  top(c,"Streams").erase();auto bit=UIntType::get(&ctx,1);
+  auto token=BundleType::get(&ctx,{{b.getStringAttr("ready"),true,bit},
+      {b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,UIntType::get(&ctx,512)}});
+  SmallVector<PortInfo> ports{{b.getStringAttr("hostClock"),ClockType::get(&ctx),Direction::In},
+      {b.getStringAttr("hostReset"),bit,Direction::In},{b.getStringAttr("mem_0"),bit,Direction::Out}};
+  SmallVector<goldengate::CPUStreamSourcePort> sources,sinks;
+  for(unsigned i=0;i<(mixed?4u:2u);++i) {
+    std::string name=i<2?"SIMPLENICBRIDGEMODULE_"+std::to_string(i):i==2?"TRACERVBRIDGEMODULE_0":"PRINTBRIDGEMODULE_0";
+    auto port="source_"+std::to_string(i);sources.push_back({name+"_to_cpu_stream",port,i==2?6144u:3072u});
+    ports.push_back({b.getStringAttr(port),token,Direction::Out});
+  }
+  for(unsigned i=0;i<2;++i) {
+    auto port="sink_"+std::to_string(i);sinks.push_back({"SIMPLENICBRIDGEMODULE_"+std::to_string(i)+"_from_cpu_stream",port,3072});
+    ports.push_back({b.getStringAttr(port),token,Direction::In});
+  }
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  b.create<FModuleOp>(loc,b.getStringAttr("Streams"),ConventionAttr::get(&ctx,Convention::Internal),ports);
+  c->setAttr("rawAnnotations",b.getArrayAttr({}));std::string error;
+  require(succeeded(goldengate::addCPUStreamRead(c,sources,error)),error);
+  require(succeeded(goldengate::addCPUStreamWrite(c,sinks,error)),error);
+  auto child=top(c,c.getName());child.setName("GGHostMemoryReadResponseWrapper");
+  b.setInsertionPointToEnd(c.getBodyBlock());
+  auto parent=b.create<FModuleOp>(loc,b.getStringAttr("GGHostMemoryPlatformWrapper"),child.getConventionAttr(),child.getPorts());
+  auto companion=b.create<FModuleOp>(loc,b.getStringAttr("GGHostMemoryPortAdapter"),child.getConventionAttr(),ArrayRef<PortInfo>{});
+  b.setInsertionPointToStart(parent.getBodyBlock());auto sim=b.create<InstanceOp>(loc,child,"sim");
+  b.create<InstanceOp>(loc,companion,"memory_port");
+  for(auto [i,p]:llvm::enumerate(parent.getPorts()))
+    b.create<ConnectOp>(loc,p.direction==Direction::In?sim.getResult(i):parent.getArgument(i),
+        p.direction==Direction::In?parent.getArgument(i):sim.getResult(i));
+  c.setName(parent.getName());return root;
 }
 std::string path(FModuleOp m,Value v) {
   if(auto f=v.getDefiningOp<SubfieldOp>())return path(m,f.getInput())+"."+f.getFieldName().str();
@@ -177,8 +218,36 @@ int main(int argc,char **argv) {
       cb.setInsertionPoint(conn);cb.create<StrictConnectOp>(conn.getLoc(),conn.getDest(),conn.getSrc());conn.erase();
     }
     require(succeeded(goldengate::assembleCPUStreamPort(cc,error))&&succeeded(verify(*catalog)),"catalog writer/strict forwarding rejected");bindings(cc);behavior(cc);
+    for(bool mixed:{false,true}) {
+      auto allocated=allocatedFixture(ctx,mixed);auto ac=*allocated->getOps<CircuitOp>().begin();
+      std::map<std::string,std::string> saved;
+      for(auto m:ac.getOps<FModuleOp>())saved[m.getName().str()]=dump(m);
+      require(succeeded(goldengate::assembleCPUStreamPort(ac,error)),error);
+      require(succeeded(verify(*allocated)),"invalid allocated multi-NIC platform");bindings(ac);behavior(ac);
+      for(auto [name,body]:saved)require(dump(top(ac,name))==body,"allocated engine body changed");
+    }
+    for(unsigned mode=0;mode<8;++mode) {
+      auto invalid=allocatedFixture(ctx,true);auto ic=*invalid->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
+      auto read=top(ic,"GGCPUStreamRead"),write=top(ic,"GGCPUStreamWrite");
+      if(mode==0)write->removeAttr("goldengate.sinkStreams");
+      else if(mode==1)read->setAttr("goldengate.streamAddressSpaceBits",b.getI64IntegerAttr(18));
+      else if(mode==2)write->setAttr("goldengate.fromHostCPUStreamCount",b.getI32IntegerAttr(1));
+      else if(mode==3)read->removeAttr("goldengate.sourceStreams");
+      else {
+        auto rows=write->getAttrOfType<ArrayAttr>("goldengate.sinkStreams");
+        SmallVector<Attribute> changed(rows.begin(),rows.end());NamedAttrList last(cast<DictionaryAttr>(changed[1]));
+        if(mode==4)last.set("bufferBaseAddress",b.getI64IntegerAttr(0));
+        if(mode==5)last.set("name",cast<DictionaryAttr>(changed[0]).get("name"));
+        if(mode==6)last.set("widthBytes",b.getI64IntegerAttr(32));
+        if(mode==7)last.set("index",b.getI64IntegerAttr(0));
+        changed[1]=last.getDictionary(&ctx);write->setAttr("goldengate.sinkStreams",b.getArrayAttr(changed));
+      }
+      auto saved=dump(*invalid);
+      require(failed(goldengate::assembleCPUStreamPort(ic,error)),"invalid directional allocation accepted");
+      require(dump(*invalid)==saved,"directional allocation rejection mutated IR");
+    }
     auto s=dump(*root);require(failed(goldengate::assembleCPUStreamPort(c,error)),"repeat accepted");require(s==dump(*root),"repeat mutated IR");
-    llvm::outs()<<"20 atomic rejections; old bodies, aggregate bindings and copied/consumed targets preserved\n";
+    llvm::outs()<<"28 atomic rejections; two-NIC/mixed allocated engines, old bodies, aggregate bindings and copied/consumed targets preserved\n";
     if(argc>=2 && !StringRef(argv[1]).starts_with("--")){std::error_code ec;llvm::raw_fd_ostream os(argv[1],ec);require(!ec,"cannot write helper");os<<"module { firrtl.circuit \"GGCPUStreamPortAdapter\" {\n";top(c,"GGCPUStreamPortAdapter")->print(os);os<<"\n} }\n";}
     if(argc==3 && StringRef(argv[1])=="--platform-boundary") {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"platform boundary parse");

@@ -108,3 +108,25 @@ differential fixture with independent data-channel stalls, checking buffered
 enable/target state transitions as well as accepted clock tokens. Full
 multiclock simulator configuration, Rocket-specific bridge assumptions, FAME-5,
 memory threading and the SFC UART-bearing workload baseline remain pending.
+
+Iteration 15 preserves the SFC allowed initial values of ClockBridge's two
+unreset 64-bit MMIO snapshots. Scala `Widget.genWideRORegInit` creates one
+shadow register per counter; SFC initializes each with `{2{RANDOM}}`. CIRCT's
+packed register randomization previously supplied independently sampled chunks,
+which permits unequal halves before the first latch. The normal FireSim
+simulation defines `RANDOM=32'b0`, so that discrepancy is inactive there.
+
+The native producer marks only its two scalar snapshot RegOps. The backend
+captures their module/name/type identities before FIRRTL lowering, validates
+both marked identities, then validates each corresponding SV register and its
+guarded packed-array initializer. It substitutes one captured 32-bit RANDOM
+word duplicated in both halves, separately for each snapshot. Unmarked registers,
+normal updates, latch reads and reset behavior are unchanged. Unknown identities
+or initializer shapes reject without publishing RTL; arbitrary physical SV
+registers are never selected by a name heuristic.
+
+`goldengate-simulator-rtl-test` covers positive normalization, atomic rejection,
+idempotence and a small real FIRRTL backend fixture with preceding one-bit state
+and an unmarked 64-bit register. The scope is allowed snapshot initial states,
+not the exact global PRNG draw sequence or whole-design initialization
+correspondence. SFC's complete random-call sequence remains outside this check.

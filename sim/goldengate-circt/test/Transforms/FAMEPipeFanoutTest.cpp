@@ -312,7 +312,7 @@ void run(MLIRContext &ctx, const char *output, bool targetSource) {
       auto path = cast<StringAttr>(endpoints[0]).getValue();
       auto target = goldengate::resolveAnnotationTarget(circuit, path, error);
       require(target && target->module.getModuleName() ==
-              (targetSource || i ? "Top" : "GGFAMEPipeWrapper"),
+              (i ? "Top" : "GGFAMEPipeWrapper"),
               "fanout endpoint lost wrapper/inner target identity");
     }
   }

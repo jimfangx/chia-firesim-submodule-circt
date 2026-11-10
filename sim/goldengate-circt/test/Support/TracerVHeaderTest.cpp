@@ -41,7 +41,17 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> tokenFixture(MLIRContext &ctx, unsigned retire = 1, unsigned latency = 1) {
+OwningOpRef<ModuleOp> tokenFixture(MLIRContext &ctx, unsigned retire = 1, unsigned latency = 1, unsigned wdata = 0) {
+  SmallVector<std::string> locals;SmallVector<unsigned> widths;
+  auto add=[&](std::string name,unsigned width){locals.push_back(name);widths.push_back(width);};
+  add("tiletrace_reset",1);
+  for(unsigned lane=0;lane<retire;++lane)
+    for(auto f:{std::pair<StringRef,unsigned>{"valid",1},{"iaddr",40},{"insn",32},{"priv",3},{"exception",1},{"interrupt",1},{"cause",64},{"tval",40}}) {
+      add("tiletrace_trace_retiredinsns_"+std::to_string(lane)+"_"+f.first.str(),f.second);
+      if(wdata&&f.first=="insn")add("tiletrace_trace_retiredinsns_"+std::to_string(lane)+"_wdata",wdata);
+    }
+  add("tiletrace_trace_time",64);add("triggerCredit",1);add("triggerDebit",1);
+  unsigned inputs=locals.size()-2;
   auto root = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "GGPeekPokeBridgeControlWrapper" {
     firrtl.module @GGPeekPokeBridgeControlWrapper() {}
   } })", &ctx);
@@ -53,11 +63,11 @@ OwningOpRef<ModuleOp> tokenFixture(MLIRContext &ctx, unsigned retire = 1, unsign
   SmallVector<PortInfo> ports{{b.getStringAttr("hostClock"), ClockType::get(&ctx), Direction::In},
                             {b.getStringAttr("hostReset"), uint(1), Direction::In}};
   NamedAttrList mapping;
-  for (unsigned j = 0; j < 12; ++j) {
+  for (unsigned j = 0; j < locals.size(); ++j) {
     auto type = BundleType::get(&ctx, {{b.getStringAttr("ready"), true, uint(1)},
         {b.getStringAttr("valid"), false, uint(1)}, {b.getStringAttr("bits"), false, uint(widths[j])}});
-    ports.push_back({b.getStringAttr("token" + std::to_string(j)), type, j < 10 ? Direction::Out : Direction::In});
-    mapping.set(locals[j], b.getStringAttr("tracerv_" + locals[j].str()));
+    ports.push_back({b.getStringAttr("token" + std::to_string(j)), type, j < inputs ? Direction::Out : Direction::In});
+    mapping.set(locals[j], b.getStringAttr("tracerv_" + locals[j]));
   }
   ports.push_back({b.getStringAttr("other"), uint(8), Direction::Out});
   b.create<FModuleOp>(c.getLoc(), b.getStringAttr(c.getName()), ConventionAttr::get(&ctx, Convention::Internal), ports);
@@ -67,24 +77,25 @@ OwningOpRef<ModuleOp> tokenFixture(MLIRContext &ctx, unsigned retire = 1, unsign
       b.getNamedAttr("retireWidth", b.getI64IntegerAttr(retire)), b.getNamedAttr("iaddrWidth", b.getI64IntegerAttr(40)),
       b.getNamedAttr("insnWidth", b.getI64IntegerAttr(32)), b.getNamedAttr("causeWidth", b.getI64IntegerAttr(64)),
       b.getNamedAttr("tvalWidth", b.getI64IntegerAttr(40))});
+  if(wdata){NamedAttrList fields(key);fields.set("wdataWidth",b.getI64IntegerAttr(wdata));key=fields.getDictionary(&ctx);}
   SmallVector<Attribute> all{dict({str("class", "firesim.lib.bridgeutils.BridgeIOAnnotation"),
       str("widgetClass", "firechip.goldengateimplementations.TracerVBridgeModule"),
       str("target", "~FireSim|FireSim>tracerv"), b.getNamedAttr("widgetConstructorKey", key),
       b.getNamedAttr("channelMapping", mapping.getDictionary(&ctx))})};
-  for (unsigned j = 0; j < 12; ++j)
+  for (unsigned j = 0; j < locals.size(); ++j)
     all.push_back(dict({str("class", "midas.passes.fame.FAMEChannelConnectionAnnotation"),
-        str("globalName", "tracerv_" + locals[j].str()),
+        str("globalName", "tracerv_" + locals[j]),
         b.getNamedAttr("channelInfo", dict({str("class", "midas.passes.fame.PipeChannel"),
             b.getNamedAttr("latency", b.getI64IntegerAttr(latency))})),
-        b.getNamedAttr(j < 10 ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(
+        b.getNamedAttr(j < inputs ? "sources" : "sinks", b.getArrayAttr({b.getStringAttr(
             "~GGPeekPokeBridgeControlWrapper|GGPeekPokeBridgeControlWrapper>token" + std::to_string(j) + ".bits")}))}));
   all.push_back(dict({str("class", "test.Annotation"), str("target", "~GGPeekPokeBridgeControlWrapper|GGPeekPokeBridgeControlWrapper>other")}));
   c->setAttr("rawAnnotations", b.getArrayAttr(all)); return root;
 }
 // Real token, trigger, stream queue and CPU transport transforms; only the
 // allocation graph is synthetic. Optional boundary mode exercises the complete compiler IR.
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned driverIndex = 0) {
-  auto root = tokenFixture(ctx); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned driverIndex = 0, unsigned retire = 1, unsigned wdata = 0) {
+  auto root = tokenFixture(ctx,retire,1,wdata); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addTracerVTokenEngine(c,error)),error);
   require(succeeded(goldengate::addTracerVTriggerConfig(c,error)),error);
   OpBuilder b(&ctx); auto loc = c.getLoc(); auto top = named(c,c.getName());
@@ -341,6 +352,11 @@ int main(int argc, char **argv) {
         "ClockInfo{\"test\\\"clock\\\\domain\", 3U, 2U}",
         "sizeof(TRACERVBRIDGEMODULE_struct) == 15 * sizeof(uint64_t)"})
       require(StringRef(body).contains(text),"TracerV allocation/stream/clock ABI differs");
+    for(unsigned retire:{2u,3u,4u,6u,7u}) {
+      auto wider=fixture(ctx,0,1,retire,retire==3||retire==4||retire==6?64:0);
+      auto header=run(*wider->getOps<CircuitOp>().begin());
+      require(StringRef(header).contains("},\n  2,\n  args,\n  1,\n  6144,\n  "+std::to_string(retire)+",\n"),"wide constructor driver retire width");
+    }
     std::string error, before = dump(*root);
     require(failed(goldengate::prepareTracerVHeader(c,error)) && dump(*root) == before,"duplicate constructor changed IR");
     for (unsigned slot : {1U,2U}) {

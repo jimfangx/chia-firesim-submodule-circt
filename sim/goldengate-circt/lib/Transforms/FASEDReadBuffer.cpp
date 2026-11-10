@@ -132,6 +132,9 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
       MemOp::getTypeForPort(memoryDepth,uint(65),MemOp::PortKind::Write)};
   SmallVector<Attribute> memNames{b.getStringAttr("read"),b.getStringAttr("write")};
   auto ram=b.create<MemOp>(loc,memTypes,1,1,memoryDepth,RUWAttr::Undefined,memNames,"ram");
+  // Private origin mark: the RTL emitter validates the live packing and records
+  // the actual lowered storage/capture identities, then removes this on its clone.
+  ram->setAttr("goldengate.fasedReadBufferMemory", b.getUnitAttr());
   auto reader=ram.getResult(0),writer=ram.getResult(1);
   connect(field(reader,"clk"),arg(0));connect(field(reader,"en"),constant(1,1));
   connect(field(reader,"addr"),b.create<CatPrimOp>(loc,arg(5),mux(advance,nextRP,rp)));

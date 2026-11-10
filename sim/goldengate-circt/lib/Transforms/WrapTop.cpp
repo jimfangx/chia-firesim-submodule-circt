@@ -205,7 +205,9 @@ LogicalResult goldengate::wrapTop(CircuitOp circuit, std::string &error) {
     if (annotation.isClass(goldengate::AnnotationClasses::ChannelConnection))
       rewritten.push_back(retarget(attr, oldName, true, context));
     else if (annotation.isClass(goldengate::AnnotationClasses::MemModel) ||
-             annotation.isClass(goldengate::AnnotationClasses::DontTouch))
+             annotation.isClass(goldengate::AnnotationClasses::DontTouch) ||
+             annotation.isClass(goldengate::AnnotationClasses::FAMEModel) ||
+             annotation.isClass(goldengate::AnnotationClasses::EnableModelMultiThreading))
       rewritten.push_back(retarget(attr, oldName, false, context));
     else
       rewritten.push_back(attr);

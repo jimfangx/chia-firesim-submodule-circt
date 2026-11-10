@@ -5,12 +5,12 @@
 // Preserves all existing ports; adds relaxed ordering input and credit status.
 // Host issue gates and transaction-order FIFO are subsequent transforms. Their
 // accepted AW/final-W dequeue handshakes feed the relaxed retirement rules.
-// Two host-clocked counters saturate at min(16, maxFlight); strict mode consumes
+// Two host-clocked counters saturate at the platform/constructor limit; strict mode consumes
 // both credits on a completed write. Completion uses pre-edge counter values
 // and remains combinational during reset, matching the SFC ordering enqueue.
 #include "goldengate/FASEDIngressCredits.h"
+#include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
-#include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -31,15 +31,9 @@ LogicalResult goldengate::addFASEDIngressCredits(CircuitOp circuit, std::string 
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (!inner || !engine || !raw) return reject("FASED ingress credits need top, engine and annotations");
-  auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
-  auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
-  auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0)
-    return reject("FASED ingress credits need a positive 64-bit maxFlight constructor");
-  // WithDefaultMemModel supplies sixteen write slots, narrowed by the AXI
-  // edge. SatUpDownCounter includes the saturation value in its state width.
-  const uint64_t maxWrites = std::min<uint64_t>(16, flight.getInt());
-  const unsigned countWidth = llvm::Log2_64_Ceil(maxWrites + 1);
+  unsigned maxWrites, countWidth;
+  if (failed(getFASEDRequestLimitProfile(circuit, maxWrites, countWidth, error)))
+    return failure();
   auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(context, w, false); };
   auto bit = uint(1), countType = uint(countWidth);

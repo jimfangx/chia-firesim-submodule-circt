@@ -178,11 +178,15 @@ void test(MLIRContext &ctx) {
   require(bank.getNumPorts() == 3 && top.getNumPorts() == 4, "incorrect MCR boundary");
   auto catalog = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
   require(catalog.size() == 3, "wrong catalog size");
+  static constexpr llvm::StringRef expectedNames[] = {
+      "INIT_DONE", "PRESENCE_READ", "PRESENCE_WRITE"};
   unsigned idx = 0;
   for (auto a : catalog) {
     auto d = cast<DictionaryAttr>(a);
-    require(d.getAs<IntegerAttr>("offset").getInt() == 4 * idx++ &&
-        d.getAs<BoolAttr>("readable").getValue() && d.getAs<BoolAttr>("writeable").getValue(), "MCR register permissions/offsets differ");
+    require(d.getAs<StringAttr>("name").getValue() == expectedNames[idx] &&
+        d.getAs<IntegerAttr>("offset").getInt() == 4 * idx &&
+        d.getAs<BoolAttr>("readable").getValue() && d.getAs<BoolAttr>("writeable").getValue(), "MCR register names/permissions/offsets differ");
+    ++idx;
   }
   BankInterpreter sim(bank); std::mt19937_64 rng(186);
   uint32_t delay = 1, done = 1, fingerprint = 1, read = 1, write = 1;

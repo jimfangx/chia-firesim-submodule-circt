@@ -213,6 +213,172 @@ void fixture(MLIRContext &ctx) {
     llvm::outs() << '\n';
   }
 }
+void multipleModels(MLIRContext &ctx) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module { firrtl.circuit "Top" {
+    firrtl.module @Top(
+      in %h0_c0: !firrtl.clock, in %h0_c1: !firrtl.clock, in %h0_data: !firrtl.uint<8>,
+      out %h0_out: !firrtl.uint<8>, out %h0_alias0: !firrtl.clock, out %h0_alias1: !firrtl.clock,
+      in %h1_c0: !firrtl.clock, in %h1_c1: !firrtl.clock, in %h1_data: !firrtl.uint<8>,
+      out %h1_out: !firrtl.uint<8>, out %h1_alias0: !firrtl.clock, out %h1_alias1: !firrtl.clock,
+      in %w0_clock: !firrtl.clock, in %w0_data: !firrtl.uint<8>, out %w0_out: !firrtl.uint<8>, out %w0_alias: !firrtl.clock,
+      in %w1_clock: !firrtl.clock, in %w1_data: !firrtl.uint<8>, out %w1_out: !firrtl.uint<8>, out %w1_alias: !firrtl.clock) {}
+    firrtl.module private @Hub(in %c0: !firrtl.clock, in %c1: !firrtl.clock, in %data: !firrtl.uint<8>,
+      out %out: !firrtl.uint<8>, out %alias0: !firrtl.clock, out %alias1: !firrtl.clock) {
+      firrtl.strictconnect %out, %data : !firrtl.uint<8>
+      firrtl.strictconnect %alias0, %c0 : !firrtl.clock
+      firrtl.strictconnect %alias1, %c1 : !firrtl.clock
+    }
+    firrtl.module private @Worker(in %clock: !firrtl.clock, in %data: !firrtl.uint<8>,
+      out %out: !firrtl.uint<8>, out %alias: !firrtl.clock) {
+      firrtl.strictconnect %out, %data : !firrtl.uint<8>
+      firrtl.strictconnect %alias, %clock : !firrtl.clock
+    }
+  } })mlir", &ctx);
+  require(bool(root), "multi-model fixture parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto modules = circuit.getOps<FModuleOp>();
+  auto top = *modules.begin(), hub = *std::next(modules.begin()), worker = *std::next(modules.begin(), 2);
+  OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
+  auto connectInstance = [&](FModuleOp model, StringRef name, unsigned base) {
+    auto instance = b.create<InstanceOp>(top.getLoc(), model, name);
+    for (unsigned i = 0; i < model.getNumPorts(); ++i) {
+      bool input = model.getPortDirection(i) == Direction::In;
+      b.create<StrictConnectOp>(top.getLoc(), input ? instance.getResult(i) : top.getArgument(base + i),
+                               input ? top.getArgument(base + i) : instance.getResult(i));
+    }
+  };
+  connectInstance(hub, "h0", 0); connectInstance(hub, "h1", 6);
+  connectInstance(worker, "w0", 12); connectInstance(worker, "w1", 16);
+  auto target = [&](StringRef module, StringRef port) {
+    return b.getStringAttr("~Top|" + module.str() + ">" + port.str());
+  };
+  SmallVector<Attribute> annotations;
+  auto group = [&](StringRef module, StringRef name, StringRef port, StringRef clock) {
+    NamedAttrList attrs;
+    attrs.set("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelPorts));
+    attrs.set("localName", b.getStringAttr(name));
+    attrs.set("ports", b.getArrayAttr({target(module, port)}));
+    if (!clock.empty()) attrs.set("clockPort", target(module, clock));
+    annotations.push_back(attrs.getDictionary(&ctx));
+  };
+  group("Hub", "input", "data", "alias0"); group("Hub", "output", "out", "alias1");
+  group("Worker", "input", "data", ""); group("Worker", "output", "out", "");
+  auto channel = [&](StringRef name, StringRef port, StringRef clock, bool input) {
+    annotations.push_back(b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+      b.getNamedAttr("globalName", b.getStringAttr(name)),
+      b.getNamedAttr("clock", target("Top", clock)),
+      b.getNamedAttr(input ? "sinks" : "sources", b.getArrayAttr({target("Top", port)})),
+      b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::PipeChannel)),
+        b.getNamedAttr("latency", b.getI64IntegerAttr(0))}))}));
+  };
+  for (StringRef instance : {"h0", "h1"}) {
+    channel(instance.str() + "_input", instance.str() + "_data", instance.str() + "_alias0", true);
+    channel(instance.str() + "_output", instance.str() + "_out", instance.str() + "_alias1", false);
+  }
+  for (StringRef instance : {"w0", "w1"}) {
+    channel(instance.str() + "_input", instance.str() + "_data", "h0_alias0", true);
+    channel(instance.str() + "_output", instance.str() + "_out", "h1_alias1", false);
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  SmallVector<goldengate::FAMEHubClockDomain> domains{
+    {0, 0, "c0", "h0_c0", "_0", {"d0", 1, 2, 2}},
+    {1, 1, "c1", "h0_c1", "_1", {"d1", 2, 3, 3}}};
+  std::string error;
+  auto before = dump(*root);
+  auto hubAssignments = goldengate::analyzeFAMEChannelClockDomains(circuit, hub, domains, error);
+  require(hubAssignments && hubAssignments->size() == 2 && dump(*root) == before, error);
+  require((*hubAssignments)[0].modelClockName == "c0" && (*hubAssignments)[1].modelClockName == "c1",
+          "shared-definition hub assigned another instance/domain");
+  auto virtualAssignments = goldengate::analyzeFAMEChannelClockDomains(circuit, worker, {}, error);
+  require(virtualAssignments && virtualAssignments->size() == 2 && dump(*root) == before, error);
+  for (const auto &assignment : *virtualAssignments)
+    require(!assignment.hasClockDomain && assignment.modelClockName.empty(),
+            "remote hub clock was projected into a virtual-clock model");
+  auto checkVirtualFSMs = [&](ArrayRef<goldengate::FAMEChannelClockDomain> assignments,
+                              StringRef mode) {
+    auto rewritten = parseSourceString<ModuleOp>(R"mlir(module { firrtl.circuit "Worker" {
+      firrtl.module @Worker(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>,
+        in %input_sink: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<8>>,
+        out %output_source: !firrtl.bundle<ready flip: uint<1>, valid: uint<1>, bits: uint<8>>) {
+        %targetCycleFinishing = firrtl.wire : !firrtl.uint<1>
+      }
+    } })mlir", &ctx);
+    require(bool(rewritten), "virtual transformed fixture parse");
+    auto c = *rewritten->getOps<CircuitOp>().begin();
+    auto m = *c.getOps<FModuleOp>().begin();
+    OpBuilder builder(m.getBodyBlock(), m.getBodyBlock()->end());
+    Value one = builder.create<ConstantOp>(m.getLoc(), UIntType::get(&ctx, 1), APInt(1, 1));
+    SmallVector<goldengate::FAMEFiredChannel> channels;
+    for (const auto &assignment : assignments)
+      channels.push_back({assignment.localName, assignment.direction == Direction::In,
+                          one, assignment.hasClockDomain});
+    require(succeeded(goldengate::ensureFAMEFiredRegisters(m, channels, error)), error);
+    require(succeeded(goldengate::rewriteFAMEFiredStates(m, channels, error)), error);
+    goldengate::FAMEFiredRegisterIndex index;
+    require(succeeded(index.collect(m, error)), error);
+    for (const auto &assignment : assignments) {
+      auto reg = index.lookup(assignment.localName).getDefiningOp<RegResetOp>();
+      auto reset = reg.getResetValue().getDefiningOp<ConstantOp>().getValue().getZExtValue();
+      require(reset == unsigned(assignment.direction == Direction::In && assignment.hasClockDomain),
+              "virtual model reset disagrees with associated clock metadata");
+      llvm::outs() << "VIRTUAL " << mode << ' ' << assignment.localName << ' '
+                   << (assignment.hasClockDomain ? assignment.modelClockName : "none") << ' ' << reset << '\n';
+    }
+    require(succeeded(verify(*rewritten)), "virtual fired FSM IR invalid");
+  };
+  checkVirtualFSMs(*virtualAssignments, "unassociated");
+  // Different instances of the same hub definition cannot exchange local
+  // clocks. Each branch must own the clock named by its local annotation.
+  auto good = annotations;
+  for (StringRef badClock : {"h0_alias0", "h1_alias1"}) {
+    Annotation bad(annotations[6]); // h1 input
+    bad.setMember("clock", target("Top", badClock));
+    annotations[6] = bad.getAttr();
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+    before = dump(*root); error.clear();
+    require(!goldengate::analyzeFAMEChannelClockDomains(circuit, hub, domains, error) &&
+            !error.empty() && dump(*root) == before, "heterogeneous shared hub clocks accepted");
+    annotations = good;
+  }
+  // A second input channel on one instance is not a distinct per-instance
+  // binding; accepting it would schedule two producers on one local sink.
+  Annotation duplicate(good[4]);
+  duplicate.setMember("globalName", b.getStringAttr("duplicate_input"));
+  annotations.push_back(duplicate.getAttr());
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  before = dump(*root); error.clear();
+  require(!goldengate::analyzeFAMEChannelClockDomains(circuit, hub, domains, error) &&
+          !error.empty() && dump(*root) == before, "duplicate same-instance input accepted");
+  annotations = good;
+  // Explicit associated clocks on a virtual model still have a domain and
+  // therefore use the input fired reset of one, unlike its unassociated ports.
+  for (unsigned i : {2u, 3u}) {
+    Annotation associated(annotations[i]);
+    associated.setMember("clockPort", target("Worker", "alias"));
+    annotations[i] = associated.getAttr();
+  }
+  for (unsigned i = 8; i < 12; ++i) {
+    Annotation associated(annotations[i]);
+    associated.setMember("clock", target("Top", i < 10 ? "w0_alias" : "w1_alias"));
+    annotations[i] = associated.getAttr();
+  }
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+  before = dump(*root); error.clear();
+  virtualAssignments = goldengate::analyzeFAMEChannelClockDomains(circuit, worker, {}, error);
+  require(virtualAssignments && virtualAssignments->size() == 2 && dump(*root) == before, error);
+  for (const auto &assignment : *virtualAssignments)
+    require(assignment.hasClockDomain && assignment.modelClockName == "clock",
+            "virtual model lost its explicit local clock association");
+  checkVirtualFSMs(*virtualAssignments, "associated");
+  error.clear(); before = dump(*root);
+  require(!goldengate::analyzeFAMEChannelClockDomains(circuit, hub, {}, error) &&
+          !error.empty() && dump(*root) == before, "multiclock non-hub model accepted");
+  require(succeeded(verify(*root)), "multi-model fixture IR invalid");
+  llvm::outs() << "PASS two shared hub instances, two rational domains, two virtual model instances, local clock ownership\n";
+}
+
 void rocket(MLIRContext &ctx, const char *boundary, const char *golden) {
   auto root = parseSourceFile<ModuleOp>(boundary, &ctx);
   require(bool(root), "Rocket boundary parse");
@@ -278,7 +444,7 @@ int main(int argc, char **argv) {
   try {
     MLIRContext ctx;
     ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    if (argc == 3) rocket(ctx, argv[1], argv[2]); else fixture(ctx);
+    if (argc == 3) rocket(ctx, argv[1], argv[2]); else { fixture(ctx); multipleModels(ctx); }
     return 0;
   } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
 }

@@ -74,9 +74,10 @@ LogicalResult goldengate::materializeSimulationMasterBank(CircuitOp circuit,
       {b.getStringAttr("mcr"), mcr, Direction::Out}};
   auto bank = b.create<FModuleOp>(loc, b.getStringAttr(bankName),
       ConventionAttr::get(ctx, Convention::Internal), bankPorts);
+  static constexpr llvm::StringRef registerNames[] = {
+      "INIT_DONE", "PRESENCE_READ", "PRESENCE_WRITE"};
   SmallVector<Attribute> entries;
-  for (auto [i, name] : llvm::enumerate(ArrayRef<llvm::StringRef>{
-      "INIT_DONE", "PRESENCE_READ", "PRESENCE_WRITE"}))
+  for (auto [i, name] : llvm::enumerate(registerNames))
     entries.push_back(b.getDictionaryAttr({
         b.getNamedAttr("name", b.getStringAttr(name)),
         b.getNamedAttr("offset", b.getI32IntegerAttr(i * 4)),

@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/ExtractModel.h"
+#include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Support/InstanceGraph.h"
@@ -82,6 +83,17 @@ bool refersToInstance(Attribute attr, llvm::StringRef target) {
         return true;
   }
   return false;
+}
+
+// This is the one retained instance annotation whose RenameMap schema is
+// implemented here. Do not grant an exemption to nested or field-qualified
+// references, or to arbitrary annotations that happen to contain this target.
+bool isThreadingSelector(Attribute attr, llvm::StringRef target) {
+  Annotation annotation(attr);
+  auto selected = annotation.getMember<StringAttr>("target");
+  auto dict = dyn_cast<DictionaryAttr>(attr);
+  return annotation.isClass(goldengate::AnnotationClasses::EnableModelMultiThreading) &&
+         dict && dict.size() == 2 && selected && selected.getValue() == target;
 }
 
 LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
@@ -274,13 +286,27 @@ LogicalResult goldengate::extractModels(CircuitOp circuit, unsigned &promoted,
     if (!model)
       return failure();
     for (Attribute other : remaining)
-      if (refersToInstance(other, target.getValue())) {
+      if (refersToInstance(other, target.getValue()) &&
+          !isThreadingSelector(other, target.getValue())) {
         error = "another annotation references the promoted model instance";
         return failure();
       }
     SmallVector<std::string> peerTargets;
     if (failed(promoteOne(circuit, *model, peerTargets, error)))
       return failure();
+    SmallVector<Attribute> renamed;
+    for (Attribute other : remaining) {
+      if (!isThreadingSelector(other, target.getValue())) {
+        renamed.push_back(other);
+        continue;
+      }
+      for (const auto &peerTarget : peerTargets) {
+        NamedAttrList members(cast<DictionaryAttr>(other));
+        members.set("target", StringAttr::get(circuit.getContext(), peerTarget));
+        renamed.push_back(members.getDictionary(circuit.getContext()));
+      }
+    }
+    remaining = std::move(renamed);
     models.erase(models.begin() + *choice);
     // SFC's RenameMap fans the FAME annotation out to every peer instance.
     // Keep those identities until each branch reaches the circuit main.

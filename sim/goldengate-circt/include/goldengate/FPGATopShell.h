@@ -7,7 +7,7 @@ namespace goldengate {
 /// identities; does not infer or fabricate annotations from port names.
 mlir::LogicalResult attachFPGATopShell(circt::firrtl::CircuitOp circuit,
                                      llvm::StringRef inputBoundary,
-                                     std::string &error);
+                                     std::string &error, bool isF2 = false);
 mlir::LogicalResult assembleFPGATopShell(circt::firrtl::CircuitOp circuit,
-                                       std::string &error);
+                                       std::string &error, bool isF2 = false);
 }

@@ -260,7 +260,7 @@ static LogicalResult synthesizePrintChannelsImpl(
       for (auto [i, arg] : llvm::enumerate(print.getSubstitutions())) {
         auto field = type.getElements()[i + 1];
         if (field.name.getValue() != "args_" + std::to_string(i) ||
-            field.type != arg.getType()) {
+            field.type != cast<FIRRTLBaseType>(arg.getType()).getAllConstDroppedType()) {
           error = "printf bridge fields do not match native printf operands";
           return failure();
         }

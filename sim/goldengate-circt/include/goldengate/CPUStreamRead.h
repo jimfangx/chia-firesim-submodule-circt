@@ -39,5 +39,20 @@ mlir::LogicalResult deriveCPUStreamPorts(
 mlir::LogicalResult addCPUStreamRead(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<CPUStreamSourcePort> sources, std::string &error);
+// F2's BAR4 backend reads one 512-bit stream beat with non-destructive PCI
+// loads (ID0x20, LEN0; naturally aligned ARSIZE2..5 or shell-normalized6).
+// Reads retain the head regardless of PCI read speculation/coalescing. A write
+// of one to the matching source-count MMIO word consumes exactly one beat.
+// Full-width DMA bursts retain SFC behavior; speculative PCI loads also keep
+// the head. This is an F2 integration extension, not an SFC proof.
+// Apply once after stream composition, only on the F2 platform.
+mlir::LogicalResult enableF2CPUStreamWordReads(
+    circt::firrtl::CircuitOp circuit, std::string &error);
+// Read-only, strict structural validation of the complete SDK profile; header
+// generation must not trust a metadata flag without its live handshake logic.
+mlir::LogicalResult validateF2CPUStreamAckRoute(
+    circt::firrtl::CircuitOp circuit, std::string &error);
+mlir::LogicalResult validateF2CPUStreamWordReads(
+    circt::firrtl::FModuleOp engine, std::string &error);
 }
 #endif

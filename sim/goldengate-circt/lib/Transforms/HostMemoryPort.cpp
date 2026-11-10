@@ -34,10 +34,21 @@ LogicalResult goldengate::specializeHostMemoryPort(CircuitOp circuit,
   if(circuit.getName()!=oldName||!inner||!bufferModule||!engine||engines!=1||!raw)
     return reject("host memory platform adapter requires the buffered Rocket boundary and annotations");
   auto key=engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
-  auto has=[](DictionaryAttr d,StringRef n,int v){auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();return a&&a.getInt()==v;};
+  // These host stages retain the same hardware for selected idReuse 1/2.
+  // The deinterleaver uses eight beats per ID, independent of per-ID flight;
+  // buffers and source arbitration retain their fixed depths. Validate every
+  // integer before extraction so malformed/wide annotations reject atomically.
+  auto has=[](DictionaryAttr d,StringRef n,int v){
+    auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();
+    return a&&a.getValue().getBitWidth()<=64&&a.getInt()==v;
+  };
+  auto positive=[](DictionaryAttr d,StringRef n){
+    auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();
+    return a&&a.getValue().getBitWidth()<=64&&!a.getValue().isNegative()&&!a.getValue().isZero();
+  };
   auto widths=key.getAs<DictionaryAttr>("axi4Widths"),edge=key.getAs<DictionaryAttr>("axi4Edge");
   if(engine.getName()!="GGFASEDTokenEngine"||!has(widths,"addrBits",35)||!has(widths,"dataBits",64)||
-     !has(widths,"idBits",4)||!has(edge,"maxReadTransfer",8)||!has(edge,"idReuse",1)||!has(edge,"maxFlight",10))
+     !has(widths,"idBits",4)||!has(edge,"maxReadTransfer",8)||(!has(edge,"idReuse",1)&&!has(edge,"idReuse",2))||!positive(edge,"maxFlight"))
     return reject("host memory platform adapter supports the recorded Rocket profile");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};

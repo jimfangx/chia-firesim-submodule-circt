@@ -23,10 +23,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
   for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
   throw std::runtime_error("missing module");
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0, bool selected = false, int64_t maxFlight = 10) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned mode = 0, bool selected = false, int64_t maxFlight = 10, unsigned baseCapacity = 16) {
   auto root = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGFASEDTokenWrapper\" { firrtl.module @GGFASEDTokenWrapper() {} } }", &ctx);
   require(bool(root), "fixture parse failed"); auto c = *root->getOps<CircuitOp>().begin();
   (*c.getOps<FModuleOp>().begin()).erase();
+  if (baseCapacity != 16) c->setAttr("goldengate.fasedBaseCapacity", IntegerAttr::get(IntegerType::get(&ctx, 64), baseCapacity));
   if (selected) c.setName("GGSelectedPrintFASEDTokenWrapper");
   OpBuilder b(c.getBodyBlock(), c.getBodyBlock()->begin()); auto bit = UIntType::get(&ctx, 1, false);
   auto readiness = BundleType::get(&ctx, {{b.getStringAttr("readValid"), false, bit},
@@ -142,23 +143,23 @@ struct Interpreter {
     state = std::move(next);
   }
 };
-void behavior(MLIRContext &ctx, bool selected, int64_t maxFlight) {
-  const unsigned limit = std::min<int64_t>(16, maxFlight);
+void behavior(MLIRContext &ctx, bool selected, int64_t maxFlight, unsigned baseCapacity = 16) {
+  const unsigned limit = std::min<int64_t>(baseCapacity, maxFlight);
   const unsigned width = llvm::Log2_64_Ceil(limit + 1);
   const unsigned encodedStates = 1u << width;
   const std::string old = selected ? "GGSelectedPrintFASEDTokenWrapper" : "GGFASEDTokenWrapper";
   const std::string top = selected ? "GGSelectedPrintFASEDHostOutstandingWrapper" : "GGFASEDHostOutstandingWrapper";
-  auto root = fixture(ctx, 0, selected, maxFlight); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
+  auto root = fixture(ctx, 0, selected, maxFlight, baseCapacity); auto c = *root->getOps<CircuitOp>().begin(); std::string error;
   require(succeeded(goldengate::addFASEDHostOutstanding(c, error)), error);
   require(succeeded(verify(*root)), "invalid FASED host outstanding IR");
   Interpreter sim(named(c, "GGFASEDHostOutstanding")); unsigned cases = 0;
   SmallVector<Value> state; for (auto r : sim.module.getOps<RegResetOp>()) state.push_back(r.getResult());
   require(state.size() == 2, "host counter state missing");
-  for (auto value : state) require(sim.width(value) == width, "counter width differs from log2Up(min(16,maxFlight)+1)");
+  for (auto value : state) require(sim.width(value) == width, "counter width differs from log2Up(effectiveLimit+1)");
   const llvm::StringRef inputs[]{"arReady","arValid","rReady","rValid","rLast","awReady","awValid","bReady","bValid"};
   // Exhaust the recorded 10/20-flight profiles; the additional width/cap
   // probes sample handshake combinations over every encoded counter state.
-  const unsigned flagStep = maxFlight == 10 || maxFlight == 20 ? 1 : 31;
+  const unsigned flagStep = baseCapacity == 16 && (maxFlight == 10 || maxFlight == 20) ? 1 : 31;
   for (unsigned reads = 0; reads < encodedStates; ++reads) for (unsigned writes = 0; writes < encodedStates; ++writes)
     for (unsigned flags = 0; flags < 1024; flags += flagStep) {
       sim.memo.clear(); sim.state[state[0]] = APInt(width, reads); sim.state[state[1]] = APInt(width, writes);
@@ -225,6 +226,26 @@ int main(int argc, char **argv) {
   try {
     // Export the actual helper from a verified production boundary for RTL
     // differential execution against archived SFC SatUpDownCounter instances.
+    if (argc == 5 && llvm::StringRef(argv[1]) == "--fixture") {
+      const uint64_t maxFlight = std::stoull(argv[2]);
+      const unsigned baseCapacity = std::stoul(argv[3]);
+      auto root = fixture(ctx, 0, false, maxFlight, baseCapacity);
+      auto circuit = *root->getOps<CircuitOp>().begin();
+      std::string error;
+      require(succeeded(goldengate::addFASEDHostOutstanding(circuit, error)), error);
+      require(succeeded(verify(*root)), "functional fixture boundary invalid");
+      const std::string symbol = "GGFASEDHostOutstanding";
+      auto isolated = ModuleOp::create(circuit.getLoc()); OpBuilder b(&ctx);
+      b.setInsertionPointToEnd(isolated.getBody());
+      auto exported = b.create<CircuitOp>(circuit.getLoc(), b.getStringAttr(symbol));
+      b.setInsertionPointToEnd(exported.getBodyBlock());
+      auto helper = cast<FModuleOp>(b.insert(named(circuit, symbol)->clone()));
+      helper.setPublic();
+      require(succeeded(verify(isolated)), "exported functional fixture invalid");
+      std::error_code ec; llvm::raw_fd_ostream out(argv[4], ec);
+      require(!ec, "cannot export functional fixture"); isolated.print(out); out << '\n';
+      out.close(); isolated.erase(); return 0;
+    }
     if (argc == 3) {
       auto root = parseSourceFile<ModuleOp>(argv[1], &ctx);
       require(bool(root) && succeeded(verify(*root)), "production FASED boundary invalid");
@@ -241,6 +262,26 @@ int main(int argc, char **argv) {
       out.close(); isolated.erase(); return 0;
     }
     require(argc == 1, "usage: goldengate-fased-host-outstanding-test [production.mlir helper.mlir]");
+    for (bool selected : {false, true}) {
+      OpBuilder b(&ctx);
+      for (Attribute bad : {Attribute(b.getStringAttr("32")), Attribute(b.getF64FloatAttr(32)),
+          Attribute(b.getI64IntegerAttr(0)), Attribute(b.getI64IntegerAttr(-1)),
+          Attribute(b.getI64IntegerAttr(20)),
+          Attribute(b.getIntegerAttr(b.getIntegerType(128), APInt(128, 32)))}) {
+        auto root = fixture(ctx, 0, selected);
+        auto c = *root->getOps<CircuitOp>().begin();
+        c->setAttr("goldengate.fasedBaseCapacity", bad);
+        std::string before, after, error;
+        { llvm::raw_string_ostream out(before); root->print(out); }
+        require(failed(goldengate::addFASEDHostOutstanding(c, error)) && !error.empty(), "invalid functional capacity accepted");
+        { llvm::raw_string_ostream out(after); root->print(out); }
+        require(before == after, "invalid functional capacity mutated IR");
+      }
+    }
+    for (bool selected : {false, true}) {
+      for (uint64_t flight : {uint64_t(10), uint64_t(20), uint64_t(64)})
+        behavior(ctx, selected, flight, 32);
+    }
     for (bool selected : {false, true}) {
       for (int64_t flight : {int64_t(1), int64_t(8), int64_t(10), int64_t(16), int64_t(20), INT64_MAX})
         behavior(ctx, selected, flight);

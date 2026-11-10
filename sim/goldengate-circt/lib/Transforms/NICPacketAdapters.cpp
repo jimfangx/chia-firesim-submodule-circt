@@ -11,6 +11,7 @@
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
+#include <set>
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::addNICPacketAdapters(CircuitOp circuit, std::string &error) {
@@ -28,8 +29,8 @@ LogicalResult goldengate::addNICPacketAdapters(CircuitOp circuit, std::string &e
     }
   }
   if (!nics) return success();
-  if (nics != 1 || circuit.getName() != "GGNICTokenQueuesWrapper")
-    return reject("NIC packet adapters require one active NIC queue boundary");
+  if (circuit.getName() != "GGNICTokenQueuesWrapper")
+    return reject("NIC packet adapters require an active NIC queue boundary");
   constexpr llvm::StringLiteral decoderName = "GGNICBigTokenDecoder";
   constexpr llvm::StringLiteral encoderName = "GGNICBigTokenEncoder";
   constexpr llvm::StringLiteral wrapperName = "GGNICPacketAdaptersWrapper";
@@ -52,13 +53,39 @@ LogicalResult goldengate::addNICPacketAdapters(CircuitOp circuit, std::string &e
   };
   auto clock = port("hostClock", ClockType::get(ctx), Direction::In);
   auto reset = port("hostReset", bit, Direction::In);
-  auto incoming = port("nic_from_host_enq", token(66), Direction::In);
-  auto outgoing = port("nic_to_host_deq", token(66), Direction::Out);
-  if (!clock || !reset || !incoming || !outgoing)
+  if (!clock || !reset)
     return reject("NIC packet adapters need typed host clock/reset and queue ports");
-  for (auto p : inner.getPorts())
-    if (p.name == "nic_from_host_stream" || p.name == "nic_to_host_stream")
-      return reject("NIC packet stream boundary already exists");
+  auto externalName = [&](unsigned index, StringRef name) {
+    return nics == 1 ? name.str() : "nic" + std::to_string(index) + name.drop_front(3).str();
+  };
+  struct Widget { unsigned incoming, outgoing; };
+  SmallVector<Widget> widgets;
+  std::set<unsigned> consumed;
+  auto priorBindings = inner->getAttrOfType<ArrayAttr>("goldengate.nicTokenBindings");
+  if ((priorBindings && priorBindings.size() != nics) || (!priorBindings && nics > 1))
+    return reject("NIC packet adapters need matching per-widget token bindings");
+  for (unsigned index = 0; index < nics; ++index) {
+    auto fromName = externalName(index, "nic_from_host_enq");
+    auto toName = externalName(index, "nic_to_host_deq");
+    auto incoming = port(fromName, token(66), Direction::In);
+    auto outgoing = port(toName, token(66), Direction::Out);
+    if (!incoming || !outgoing || !consumed.insert(*incoming).second ||
+        !consumed.insert(*outgoing).second)
+      return reject("NIC packet adapters need distinct typed queue ports for each widget");
+    if (priorBindings) {
+      auto binding = dyn_cast<DictionaryAttr>(priorBindings[index]);
+      auto widget = binding ? binding.getAs<IntegerAttr>("widget") : IntegerAttr();
+      if (!widget || widget.getInt() != index ||
+          binding.getAs<StringAttr>("fromHost") != fromName ||
+          binding.getAs<StringAttr>("toHost") != toName)
+        return reject("NIC packet adapter token binding identity differs");
+    }
+    widgets.push_back({*incoming, *outgoing});
+    for (auto p : inner.getPorts())
+      if (p.name == externalName(index, "nic_from_host_stream") ||
+          p.name == externalName(index, "nic_to_host_stream"))
+        return reject("NIC packet stream boundary already exists");
+  }
   bool used = false; circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("NIC packet adapters require an uninstantiated top");
   // All rejection checks precede mutation.
@@ -122,22 +149,41 @@ LogicalResult goldengate::addNICPacketAdapters(CircuitOp circuit, std::string &e
   connect(field(eout, "bits"), packed);
 
   SmallVector<PortInfo> ps; SmallVector<unsigned> copied;
-  for (auto [i,p] : llvm::enumerate(inner.getPorts())) if (i != *incoming && i != *outgoing) { copied.push_back(i); ps.push_back(p); }
-  unsigned streamIn = ps.size(); ps.push_back({b.getStringAttr("nic_from_host_stream"), token(512), Direction::In});
-  unsigned streamOut = ps.size(); ps.push_back({b.getStringAttr("nic_to_host_stream"), token(512), Direction::Out});
+  for (auto [i,p] : llvm::enumerate(inner.getPorts())) if (!consumed.count(i)) { copied.push_back(i); ps.push_back(p); }
+  unsigned streamStart = ps.size();
+  for (unsigned index = 0; index < nics; ++index) {
+    ps.push_back({b.getStringAttr(externalName(index, "nic_from_host_stream")), token(512), Direction::In});
+    ps.push_back({b.getStringAttr(externalName(index, "nic_to_host_stream")), token(512), Direction::Out});
+  }
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper = b.create<FModuleOp>(loc, b.getStringAttr(wrapperName), inner.getConventionAttr(), ps);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
-  auto sim = b.create<InstanceOp>(loc, inner, "sim"), dec = b.create<InstanceOp>(loc, decoder, "from_host"), enc = b.create<InstanceOp>(loc, encoder, "to_host");
+  auto sim = b.create<InstanceOp>(loc, inner, "sim");
   auto arg = [&](unsigned i) { return wrapper.getBodyBlock()->getArgument(i); };
   for (auto [j,i] : llvm::enumerate(copied)) { auto p = inner.getPorts()[i];
     b.create<ConnectOp>(loc, p.direction == Direction::In ? sim.getResult(i) : arg(j), p.direction == Direction::In ? arg(j) : sim.getResult(i)); }
-  for (auto adapter : {dec, enc}) {
-    connect(adapter.getResult(0), arg(llvm::find(copied, *clock) - copied.begin()));
-    connect(adapter.getResult(1), arg(llvm::find(copied, *reset) - copied.begin()));
+  SmallVector<Attribute> bindings;
+  for (auto [index, widget] : llvm::enumerate(widgets)) {
+    std::string prefix = nics == 1 ? "" : "nic" + std::to_string(index) + "_";
+    auto dec = b.create<InstanceOp>(loc, decoder, prefix + "from_host");
+    auto enc = b.create<InstanceOp>(loc, encoder, prefix + "to_host");
+    for (auto adapter : {dec, enc}) {
+      connect(adapter.getResult(0), arg(llvm::find(copied, *clock) - copied.begin()));
+      connect(adapter.getResult(1), arg(llvm::find(copied, *reset) - copied.begin()));
+    }
+    b.create<ConnectOp>(loc, dec.getResult(2), arg(streamStart + 2 * index));
+    b.create<ConnectOp>(loc, sim.getResult(widget.incoming), dec.getResult(3));
+    b.create<ConnectOp>(loc, enc.getResult(2), sim.getResult(widget.outgoing));
+    b.create<ConnectOp>(loc, arg(streamStart + 2 * index + 1), enc.getResult(3));
+    NamedAttrList binding;
+    if (priorBindings) binding = NamedAttrList(cast<DictionaryAttr>(priorBindings[index]));
+    binding.set("widget", b.getI64IntegerAttr(index));
+    binding.set("fromHostStream", b.getStringAttr(externalName(index, "nic_from_host_stream")));
+    binding.set("toHostStream", b.getStringAttr(externalName(index, "nic_to_host_stream")));
+    binding.set("fromHostAdapter", b.getStringAttr(dec.getName()));
+    binding.set("toHostAdapter", b.getStringAttr(enc.getName()));
+    bindings.push_back(binding.getDictionary(ctx));
   }
-  b.create<ConnectOp>(loc, dec.getResult(2), arg(streamIn)); b.create<ConnectOp>(loc, sim.getResult(*incoming), dec.getResult(3));
-  b.create<ConnectOp>(loc, enc.getResult(2), sim.getResult(*outgoing)); b.create<ConnectOp>(loc, arg(streamOut), enc.getResult(3));
   std::string op = "~" + circuit.getName().str(), np = "~" + wrapperName.str(), mp = "|" + inner.getName().str() + ">";
   std::function<Attribute(Attribute)> retarget = [&](Attribute a) -> Attribute {
     if (auto s = dyn_cast<StringAttr>(a)) { auto v = s.getValue(); if (v == op) return b.getStringAttr(np); if (!v.consume_front(op + "|")) return a;
@@ -150,6 +196,10 @@ LogicalResult goldengate::addNICPacketAdapters(CircuitOp circuit, std::string &e
     if (auto d = dyn_cast<DictionaryAttr>(a)) { NamedAttrList out; for (auto v : d) out.set(v.getName(), retarget(v.getValue())); return out.getDictionary(ctx); }
     return a;
   };
+  wrapper->setAttr("goldengate.nicPacketBindings", retarget(b.getArrayAttr(bindings)));
+  for (auto model : circuit.getOps<FModuleOp>())
+    for (auto key : {"goldengate.nicTokenBindings", "goldengate.nicPacketBindings"})
+      if (auto metadata = model->getAttr(key)) model->setAttr(key, retarget(metadata));
   SmallVector<Attribute> annotations; for (auto a : raw) annotations.push_back(retarget(a));
   circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations)); circuit.setName(wrapperName); return success();
 }

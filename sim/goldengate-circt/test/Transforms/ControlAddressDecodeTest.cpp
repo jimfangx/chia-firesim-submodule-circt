@@ -379,6 +379,70 @@ void rejection(MLIRContext &context) {
     { llvm::raw_string_ostream out(after); root->print(out); } require(before == after, "rejection mutated IR");
   }
 }
+// Materialized register/MCR contracts for two NICs interleaved with TracerV.
+// The catalog is read-only; the full NIC AXI/queue paths are checked separately.
+void multiNICCatalog(MLIRContext &ctx) {
+  for (StringRef order : {"NNTT","NTNT","NTTN","TNNT","TNTN","TTNN"}) {
+    auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);std::string error;
+    auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};
+    auto token=BundleType::get(&ctx,{{b.getStringAttr("ready"),true,uint(1)},
+      {b.getStringAttr("valid"),false,uint(1)},{b.getStringAttr("bits"),false,uint(32)}});
+    auto add=[&](StringRef name,unsigned words,Direction direction,unsigned offset=0,bool mcr=true) {
+      b.setInsertionPointToEnd(c.getBodyBlock());auto lanes=FVectorType::get(token,words);
+      auto type=BundleType::get(&ctx,{{b.getStringAttr("read"),false,lanes},
+        {b.getStringAttr("write"),true,lanes},{b.getStringAttr("wstrb"),true,uint(4)}});
+      SmallVector<PortInfo> ports;if(mcr)ports.push_back({b.getStringAttr("mcr"),type,direction});
+      auto m=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(name),ConventionAttr::get(&ctx,Convention::Internal),ports);
+      SmallVector<Attribute> rows;
+      for(unsigned i=0;i<words;++i)rows.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("name",b.getStringAttr(name.str()+"_"+std::to_string(i))),
+        b.getNamedAttr("offset",b.getI32IntegerAttr((i+offset)*4)),
+        b.getNamedAttr("readable",b.getBoolAttr(true)),b.getNamedAttr("writeable",b.getBoolAttr(false))}));
+      m->setAttr("goldengate.mmioRegisters",b.getArrayAttr(rows));return m;
+    };
+    add("GGSimulationMasterBank",3,Direction::Out);
+    add("GGPeekPokeMMIOBank",7,Direction::Out);add("GGPeekPokeMCRFile",7,Direction::In);
+    add("GGResetPulseBridge",2,Direction::Out);add("GGResetPulseBridgeMCRFile",2,Direction::In);
+    add("GGBlockDevMMIOBank",32,Direction::Out);
+    add("GGUARTMMIOBank",6,Direction::Out);add("GGUARTMCRFile",6,Direction::In);
+    const StringRef fased[]{"GGFASEDLatencyRegisters","GGFASEDRequestLimits","GGFASEDHistograms",
+      "GGFASEDStatistics","GGFASEDFunctionalModelRegister","GGFASEDResponseErrors"};
+    for(unsigned i=0;i<6;++i)add(fased[i],1,Direction::Out,i,false);
+    add("GGNICMMIOBank",6,Direction::Out);add("GGNICMCRFile",6,Direction::In);add("GGNICMCRFile_1",6,Direction::In);
+    for(unsigned i=0;i<2;++i){auto suffix=i?"_1":"";add("GGTracerVTriggerConfig"+std::string(suffix),15,Direction::Out);add("GGTracerVMCRFile"+std::string(suffix),15,Direction::In);}
+    add("GGTSIMMIOBank",9,Direction::Out);add("GGSingleClockBridge",6,Direction::Out);add("GGClockBridgeMCRFile",6,Direction::In);
+    const StringRef load[]{"GGLoadMemWriteMMIOBank","GGLoadMemWriteDataWrapper","GGLoadMemReadRequestWrapper","GGLoadMemReadDataWrapper"};
+    for(unsigned i=0;i<4;++i)add(load[i],1,Direction::Out,i,false);
+    add("GGLoadMemMCRFile",4,Direction::In);
+    auto counts=add("GGCPUStreamCountBank",6,Direction::Out);add("GGCPUStreamMCRFile",6,Direction::In);
+    auto read=add("GGCPUStreamRead",1,Direction::In,0,false),write=add("GGCPUStreamWrite",1,Direction::In,0,false);
+    SmallVector<Attribute> raw,sources,sinks,words;unsigned ni=0,ti=0;
+    auto stream=[&](const std::string &name,unsigned index){return b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(name)),b.getNamedAttr("index",b.getI64IntegerAttr(index))});};
+    auto count=[&](const std::string &name){words.push_back(b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(name+"_count")),b.getNamedAttr("offset",b.getI32IntegerAttr(words.size()*4)),b.getNamedAttr("readable",b.getBoolAttr(true)),b.getNamedAttr("writeable",b.getBoolAttr(false))}));};
+    for(char ch:order){bool nic=ch=='N';unsigned i=nic?ni++:ti++;
+      raw.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("firesim.lib.bridgeutils.BridgeIOAnnotation")),b.getNamedAttr("widgetClass",b.getStringAttr(nic?"firechip.goldengateimplementations.SimpleNICBridgeModule":"firechip.goldengateimplementations.TracerVBridgeModule"))}));
+      auto name=std::string(nic?"SIMPLENICBRIDGEMODULE_":"TRACERVBRIDGEMODULE_")+std::to_string(i)+"_to_cpu_stream";
+      sources.push_back(stream(name,sources.size()));count(name);
+    }
+    for(unsigned i=0;i<2;++i){auto name="SIMPLENICBRIDGEMODULE_"+std::to_string(i)+"_from_cpu_stream";sinks.push_back(stream(name,i));count(name);}
+    c->setAttr("rawAnnotations",b.getArrayAttr(raw));read->setAttr("goldengate.sourceStreams",b.getArrayAttr(sources));write->setAttr("goldengate.sinkStreams",b.getArrayAttr(sinks));counts->setAttr("goldengate.mmioRegisters",b.getArrayAttr(words));
+    SmallVector<goldengate::ControlMMIOWidget> catalog;SmallVector<goldengate::ControlMMIORegion> regions;
+    auto dump=[&](){std::string text;llvm::raw_string_ostream os(text);root->print(os);return text;};auto before=dump();
+    require(succeeded(goldengate::allocateRocketControlMMIORegions(c,32,{},catalog,regions,error)),error);
+    require(catalog.size()==14&&regions.size()==14&&before==dump(),"multi NIC catalog count or mutation");
+    unsigned seen=0;for(auto &widget:catalog)if(widget.name.starts_with("SimpleNICBridgeModule_"))require(widget.name=="SimpleNICBridgeModule_"+std::to_string(seen++)&&widget.registerCount==6,"NIC constructor order");
+    for(unsigned bad=0;bad<4;++bad){auto old=read->getAttr("goldengate.sourceStreams"),oldSink=write->getAttr("goldengate.sinkStreams"),oldRaw=c->getAttr("rawAnnotations");
+      if(bad==0){auto rows=sources;NamedAttrList row(cast<DictionaryAttr>(rows.back()));row.set("name",b.getStringAttr("wrong"));rows.back()=row.getDictionary(&ctx);read->setAttr("goldengate.sourceStreams",b.getArrayAttr(rows));}
+      if(bad==1)write->setAttr("goldengate.sinkStreams",b.getArrayAttr({sinks[0]}));
+      if(bad==2){auto rows=raw;rows.pop_back();c->setAttr("rawAnnotations",b.getArrayAttr(rows));}
+      if(bad==3)named(c,"GGNICMCRFile_1").setName("GGNICMCRFile_2");
+      auto snapshot=dump();SmallVector<goldengate::ControlMMIOWidget> ws{{"sentinel",1}};SmallVector<goldengate::ControlMMIORegion> rs{{"sentinel",9,4}};
+      require(failed(goldengate::allocateRocketControlMMIORegions(c,32,{},ws,rs,error))&&dump()==snapshot&&ws.size()==1&&rs[0].start==9,"multi NIC invalid catalog accepted or mutated");
+      read->setAttr("goldengate.sourceStreams",old);write->setAttr("goldengate.sinkStreams",oldSink);c->setAttr("rawAnnotations",oldRaw);if(bad==3)named(c,"GGNICMCRFile_2").setName("GGNICMCRFile_1");
+    }
+  }
+}
+
 void productionQuad(MLIRContext &ctx, llvm::StringRef input, llvm::StringRef output) {
   auto root = parseSourceFile<ModuleOp>(input, &ctx); require(bool(root), "quad parse failed");
   auto c = *root->getOps<CircuitOp>().begin(); std::string error; OpBuilder b(&ctx);
@@ -468,6 +532,51 @@ void productionQuad(MLIRContext &ctx, llvm::StringRef input, llvm::StringRef out
   llvm::outs() << "PASS production quad allocation: 14 widgets, four TracerV regions, count base 752, " << samples
                << " address pairs and 15 atomic fourth-bank rejections\n";
 }
+void nicLoopbackMode(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"(module { firrtl.circuit "Top" {
+    firrtl.module @GGNICMMIOBank() {}
+    firrtl.module @Top() { firrtl.instance nic @GGNICMMIOBank() }
+  } })", &context);
+  require(bool(root), "loopback mode fixture parse");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto bank = named(circuit, "GGNICMMIOBank"), top = named(circuit, "Top");
+  OpBuilder builder(&context);
+  auto registers = builder.getArrayAttr({builder.getDictionaryAttr({
+      builder.getNamedAttr("name", builder.getStringAttr("done")),
+      builder.getNamedAttr("offset", builder.getI32IntegerAttr(0)),
+      builder.getNamedAttr("readable", builder.getBoolAttr(true)),
+      builder.getNamedAttr("writeable", builder.getBoolAttr(true))})});
+  auto bindings = builder.getArrayAttr({builder.getDictionaryAttr({
+      builder.getNamedAttr("mode", builder.getStringAttr("compile_time_loopback")),
+      builder.getNamedAttr("widget", builder.getI64IntegerAttr(0)),
+      builder.getNamedAttr("mcr", builder.getStringAttr("nicBridge_mcr")),
+      builder.getNamedAttr("registers", builder.getStringAttr("nic"))})});
+  bank->setAttr("goldengate.mmioRegisters", registers);
+  top->setAttr("goldengate.nicMMIOBindings", bindings);
+  std::string error;
+  require(succeeded(goldengate::validateNICControlMMIOMode(circuit, 1, 1, error)), error);
+  for (unsigned mode = 0; mode < 9; ++mode) {
+    OwningOpRef<ModuleOp> bad(cast<ModuleOp>(root->clone()));
+    auto c = *bad->getOps<CircuitOp>().begin();
+    auto b = named(c, "GGNICMMIOBank"), t = named(c, "Top");
+    NamedAttrList reg(cast<DictionaryAttr>(registers[0])), row(cast<DictionaryAttr>(bindings[0]));
+    if (mode == 0) t->removeAttr("goldengate.nicMMIOBindings");
+    if (mode == 1) row.set("mode", builder.getStringAttr("normal"));
+    if (mode == 2) row.set("widget", builder.getI64IntegerAttr(1));
+    if (mode == 3) row.set("mcr", builder.getStringAttr("wrong"));
+    if (mode == 4) row.set("registers", builder.getStringAttr("detached"));
+    if (mode == 5) reg.set("name", builder.getStringAttr("wrong"));
+    if (mode == 6) reg.set("writeable", builder.getBoolAttr(false));
+    if (mode == 7) reg.set("readable", builder.getBoolAttr(false));
+    if (mode == 8) reg.set("offset", builder.getI32IntegerAttr(4));
+    if (mode != 0) t->setAttr("goldengate.nicMMIOBindings", builder.getArrayAttr({row.getDictionary(&context)}));
+    b->setAttr("goldengate.mmioRegisters", builder.getArrayAttr({reg.getDictionary(&context)}));
+    require(failed(goldengate::validateNICControlMMIOMode(c, 1, 1, error)), "invalid loopback mode accepted");
+  }
+  require(failed(goldengate::validateNICControlMMIOMode(circuit, 2, 1, error)), "missing second binding accepted");
+  require(failed(goldengate::validateNICControlMMIOMode(circuit, 1, 6, error)), "loopback binding with normal bank accepted");
+  llvm::outs() << "PASS singleton loopback MMIO mode and eleven ABI/binding negative controls\n";
+}
 void production(MLIRContext &ctx, llvm::StringRef input, llvm::StringRef output) {
   auto root = parseSourceFile<ModuleOp>(input, &ctx); require(bool(root), "production parse failed");
   auto c = *root->getOps<CircuitOp>().begin(); std::string error;
@@ -530,7 +639,7 @@ int main(int argc, char **argv) {
   try { MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
     if (argc == 4 && StringRef(argv[3]) == "--quad") { productionQuad(context, argv[1], argv[2]); return 0; }
     if (argc == 3) { production(context, argv[1], argv[2]); return 0; }
-    allocation(context); registry(context);
+    allocation(context); registry(context); multiNICCatalog(context); nicLoopbackMode(context);
     // Nonzero base, holes, unsorted slave indices, and the full address-space
     // endpoint exercise the generic API independently of the U250 catalog.
     const goldengate::ControlMMIORegion sparse[]{{"high", 100, 10}, {"low", 4, 4}};

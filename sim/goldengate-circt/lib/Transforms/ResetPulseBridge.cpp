@@ -127,8 +127,9 @@ LogicalResult goldengate::addResetPulseBridge(CircuitOp circuit,
   auto producer = b.create<FModuleOp>(loc, b.getStringAttr(producerName),
       ConventionAttr::get(context, Convention::Internal), producerPorts);
   producer->setAttr("goldengate.bridgeConstructor", key);
+  static constexpr llvm::StringRef registerNames[] = {"pulseLength", "doneInit"};
   SmallVector<Attribute> registers;
-  for (auto [i, name] : llvm::enumerate(ArrayRef<llvm::StringRef>{"pulseLength", "doneInit"}))
+  for (auto [i, name] : llvm::enumerate(registerNames))
     registers.push_back(b.getDictionaryAttr({
         b.getNamedAttr("name", b.getStringAttr(name)),
         b.getNamedAttr("offset", b.getI32IntegerAttr(i * 4)),

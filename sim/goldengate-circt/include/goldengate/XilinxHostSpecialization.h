@@ -7,7 +7,9 @@ namespace goldengate {
 // DefineBUFGCE + ReplaceAbstractClockGates from midas.passes.xilinx.
 // Retarget existing instances in place: SSA values, connections, inner symbols,
 // annotations and generated-clock metadata retain their identities.
-// Unsupported gate schemas and symbol collisions fail before any mutation.
+// A later production stage may reuse this pass's marked, validated canonical
+// BUFGCE declaration. Other symbol collisions and unsupported gate schemas fail
+// before any mutation.
 mlir::LogicalResult specializeXilinxClockGates(
     circt::firrtl::CircuitOp circuit, std::string &error);
 } // namespace goldengate

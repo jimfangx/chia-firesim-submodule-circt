@@ -717,6 +717,46 @@ void fanoutWrapper(MLIRContext &context) {
           "secondary fanout port was not removed before ReadyValid mapping");
 }
 
+// One target-to-target ready-valid transport consumes four model ports but
+// exposes no bridge port. Invalid late arms must leave the wrapper untouched.
+void internalLink(MLIRContext &context) {
+  for (unsigned bad=0; bad<4; ++bad) {
+    auto root=fixture(context,0); auto c=*root->getOps<CircuitOp>().begin(); Builder b(&context);
+    auto rows=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+    NamedAttrList forward(cast<DictionaryAttr>(rows[0]));
+    NamedAttrList reverse(cast<DictionaryAttr>(rows[1]));
+    auto sink=cast<DictionaryAttr>(rows[2]); auto sinkReverse=cast<DictionaryAttr>(rows[3]);
+    NamedAttrList info(cast<DictionaryAttr>(forward.get("channelInfo")));
+    auto sinkInfo=sink.getAs<DictionaryAttr>("channelInfo");
+    info.set("validSink",sinkInfo.getAs<StringAttr>("validSink"));
+    info.set("readySource",sinkInfo.getAs<StringAttr>("readySource"));
+    if (bad==1) info.erase("readySource");
+    if (bad==2) info.set("validSink",b.getStringAttr("~Top|Top>a.bits.valid"));
+    forward.set("channelInfo",info.getDictionary(&context));
+    forward.set("sinks",bad==3 ? b.getArrayAttr({b.getStringAttr("~Top|Top>b.bits.valid")}) : sink.getAs<ArrayAttr>("sinks"));
+    reverse.set("sources",sinkReverse.getAs<ArrayAttr>("sources"));
+    c->setAttr("rawAnnotations",b.getArrayAttr({forward.getDictionary(&context),reverse.getDictionary(&context)}));
+    std::string error; require(succeeded(goldengate::addFAMEPipeWrapper(c,error)),error);
+    std::string before; llvm::raw_string_ostream text(before); root->print(text); text.flush();
+    auto result=goldengate::addFAMEBoundaryReadyValidChannels(c,error);
+    if (bad) {
+      std::string after; llvm::raw_string_ostream out(after); root->print(out); out.flush();
+      require(failed(result)&&!error.empty()&&before==after,"internal malformed pair mutated wrapper or passed");
+      continue;
+    }
+    require(succeeded(result),error); require(succeeded(verify(*root)),"internal link IR");
+    auto wrapper=named(c,"GGFAMEPipeWrapper"); require(wrapper.getNumPorts()==2,"internal RV leaked bridge ports");
+    unsigned channels=0; for(auto i:wrapper.getOps<InstanceOp>())channels+=i.getModuleName()=="GGFAMEReadyValid8";
+    require(channels==1,"internal RV transport multiplicity");
+    require(succeeded(goldengate::activateFAMEPipeWrapper(c,error)),error);
+    auto retained=c->getAttrOfType<ArrayAttr>("rawAnnotations");
+    for(auto row:retained) {
+      auto d=cast<DictionaryAttr>(row);
+      for(auto member:{"sources","sinks"})for(auto target:d.getAs<ArrayAttr>(member))
+        require(cast<StringAttr>(target).getValue().starts_with("~GGFAMEPipeWrapper|Top>"),"internal endpoint escaped retained target");
+    }
+  }
+}
 } // namespace
 int main(int argc, char **argv) {
   MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
@@ -729,6 +769,7 @@ int main(int argc, char **argv) {
     selectedPayload(context);
     missingSelectedValid(context);
     fanoutWrapper(context);
+    internalLink(context);
     for (unsigned width : {0, 1, 8, 32}) behavior(context, width);
     if (argc > 3) {
       // Exercise an ingested production-Scala boundary, not a rebuilt fixture.

@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Oracle: FPGATopImp clock/reset, WidgetMMIO, mem and cpu_managed_axi4 IO.
-// Requires: uninstantiated supported CPU platform wrapper, exact recorded U250
+// Requires: uninstantiated supported CPU platform wrapper, exact U250/F2
 // AXI4 port contracts, uniquely forwarded platform ports, retained annotations.
 // Annotations consumed: none. Produces HostClockSource on FPGATop.clock.
 // Transferred: the five public port targets (hostClock/hostReset renamed).
@@ -21,17 +21,29 @@ using namespace circt::firrtl;
 namespace {
 using Contract = std::map<std::string, std::pair<unsigned, bool>>;
 // bool is the leaf's input direction after resolving all bundle flips.
-bool flatten(Type t, std::string path, bool input, Contract &out) {
+bool flatten(Type t, std::string path, bool input, Contract &out,
+             bool allowVectors = false) {
   if (auto bundle = dyn_cast<BundleType>(t)) {
     for (auto f : bundle.getElements())
       if (!flatten(f.type, path + "." + f.name.getValue().str(),
-                   input != f.isFlip, out)) return false;
+                   input != f.isFlip, out, allowVectors)) return false;
+    return true;
+  }
+  // FRFCFS retains vector observations (scheduler entries, rank/bank status,
+  // LLC MSHRs and metadata). Resolve every element's leaves just as for a
+  // bundle; a vector must not conceal a flipped input or a clock/reset leaf.
+  if (auto vector = dyn_cast<FVectorType>(t)) {
+    if (!allowVectors) return false;
+    for (unsigned i = 0; i < vector.getNumElements(); ++i)
+      if (!flatten(vector.getElementType(),
+                   path + "[" + std::to_string(i) + "]", input, out, true))
+        return false;
     return true;
   }
   auto u = dyn_cast<UIntType>(t);
   return u && u.getWidth() && out.emplace(path, std::make_pair(*u.getWidth(), input)).second;
 }
-Contract expected(StringRef root) {
+Contract expected(StringRef root, bool isF2) {
   Contract out;
   using Fields = ArrayRef<std::pair<StringRef, unsigned>>;
   bool master = root == "mem_0";
@@ -44,7 +56,7 @@ Contract expected(StringRef root) {
     for (auto [f,w] : fields) out[prefix + ".bits." + f.str()] = {w,input};
   };
   if (root == "ctrl") {
-    const std::pair<StringRef,unsigned> address[]{{"addr",25},{"len",8},{"size",3},{"burst",2},{"lock",1},{"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
+    const std::pair<StringRef,unsigned> address[]{{"addr",isF2?32u:25u},{"len",8},{"size",3},{"burst",2},{"lock",1},{"cache",4},{"prot",3},{"qos",4},{"region",4},{"id",12},{"user",1}};
     channel("aw",address); channel("ar",address);
     channel("w",{{"data",32},{"last",1},{"id",12},{"strb",4},{"user",1}});
     channel("b",{{"resp",2},{"id",12},{"user",1}});
@@ -60,12 +72,12 @@ Contract expected(StringRef root) {
 }
 } // namespace
 LogicalResult goldengate::assembleFPGATopShell(CircuitOp circuit,
-                                              std::string &error) {
-  return attachFPGATopShell(circuit, "GGCPUStreamPlatformWrapper", error);
+                                              std::string &error, bool isF2) {
+  return attachFPGATopShell(circuit, "GGCPUStreamPlatformWrapper", error, isF2);
 }
 LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
                                            StringRef oldName,
-                                           std::string &error) {
+                                           std::string &error, bool isF2) {
   constexpr StringLiteral newName="FPGATop";
   auto reject=[&](StringRef s){error=s.str();return failure();};
   bool print = oldName == "GGPrintCPUStreamPlatformWrapper";
@@ -82,6 +94,46 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
   std::map<std::string,unsigned> old;
   const std::map<std::string,std::string> publicNames{{"hostClock","clock"},{"hostReset","reset"},{"ctrl","ctrl"},{"mem_0","mem_0"},{"cpu_managed_axi4","cpu_managed_axi4"}};
   const std::set<std::string> clocks{"peekPokeBridge_clock","resetBridge_clock","ep_clock","ep_1_clock","ep_2_clock","tracerv_tiletrace_clock","ep_3_clock"};
+  // PrintSynthesis exports aliases of target domain clocks after bridge
+  // extraction. They remain private observations in the complete platform.
+  // Admit an extra Clock only if its unique forwarding path reaches an exact
+  // retained channel-domain port; a spelling/prefix alone is not a contract.
+  std::set<std::pair<Operation *, unsigned>> channelClocks;
+  for (auto attr : raw) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    if (!row || row.getAs<StringAttr>("class") != AnnotationClasses::ChannelConnection) continue;
+    auto clock = row.getAs<StringAttr>("clock");
+    if (!clock) continue;
+    for (auto module : circuit.getOps<FModuleOp>())
+      for (auto [index, port] : llvm::enumerate(module.getPorts()))
+        if (isa<ClockType>(port.type) && clock.getValue() ==
+            "~" + circuit.getName().str() + "|" + module.getName().str() + ">" + port.getName().str())
+          channelClocks.emplace(module.getOperation(), index);
+  }
+  auto channelClockAlias = [&](unsigned index) {
+    std::set<std::pair<Operation *, unsigned>> visited;
+    FModuleOp module = inner;
+    while (module && visited.emplace(module.getOperation(), index).second) {
+      if (channelClocks.count({module.getOperation(), index})) return true;
+      Value source; unsigned drivers = 0;
+      for (auto &op : *module.getBodyBlock())
+        if (isa<ConnectOp, StrictConnectOp>(op) && op.getOperand(0) == module.getArgument(index)) {
+          ++drivers; source = op.getOperand(1);
+        }
+      if (drivers != 1) return false;
+      auto result = dyn_cast<OpResult>(source);
+      auto instance = result ? dyn_cast<InstanceOp>(result.getOwner()) : InstanceOp{};
+      if (!instance || instance.getPortDirection(result.getResultNumber()) != Direction::Out)
+        return false;
+      index = result.getResultNumber();
+      FModuleOp child;
+      for (auto candidate : circuit.getOps<FModuleOp>())
+        if (candidate.getName() == instance.getModuleName()) child = candidate;
+      module = child;
+    }
+    return false;
+  };
+
   for (auto [i,p]:llvm::enumerate(inner.getPorts())) {
     auto n=p.name.getValue(); if (!old.emplace(n.str(),i).second) return reject("duplicate platform port name");
     if (publicNames.count(n.str())) {
@@ -92,12 +144,12 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
         if (!u||u.getWidth()!=1||p.direction!=Direction::In) return reject("invalid host reset port");
       } else {
         Contract actual;
-        if (!isa<BundleType>(p.type)||!flatten(p.type,n.str(),p.direction==Direction::In,actual)||actual!=expected(n))
+        if (!isa<BundleType>(p.type)||!flatten(p.type,n.str(),p.direction==Direction::In,actual)||actual!=expected(n, isF2))
           return reject("platform AXI4 fields have unsupported widths, directions or field names");
       }
     } else {
       if (p.direction!=Direction::Out) return reject("FPGATop shell would hide an input port");
-      if (clocks.count(n.str())) {
+      if (clocks.count(n.str()) || (isa<ClockType>(p.type) && channelClockAlias(i))) {
         if (!isa<ClockType>(p.type)) return reject("invalid retained bridge clock");
       } else {
         Contract diagnostic;
@@ -105,8 +157,8 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
         // Only passive data outputs may be hidden, never protocol inputs or
         // additional clocks. The original boundary keeps its recorded names.
         if ((!print && !(n.starts_with("ctrl_")||n.starts_with("blockdev_")||n.starts_with("fased_")))||
-            !flatten(p.type,n.str(),false,diagnostic)) return reject("unrecognized diagnostic output");
-        for (auto [name,contract]:diagnostic) if (contract.second) return reject("diagnostic bundle contains an input leaf");
+            !flatten(p.type,n.str(),false,diagnostic,true)) return reject(("unrecognized diagnostic output: " + n).str());
+        for (auto [name,contract]:diagnostic) if (contract.second) return reject("diagnostic contains an input leaf: " + name);
       }
     }
   }

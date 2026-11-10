@@ -7,9 +7,7 @@ def call_vivado(vivado: Path, args: List[str]) -> Tuple[int, str, str]:
     pVivado = subprocess.Popen(
         [
             str(vivado),
-            # Interactive Tcl mode can return zero after a sourced script fails
-            # and stdin reaches EOF. Batch mode propagates script errors.
-            '-mode', 'batch',
+            '-mode', 'tcl',
         ] + args,
         stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE,

@@ -18,7 +18,9 @@ void require(bool v,StringRef s){if(!v)throw std::runtime_error(s.str());}
 std::string dump(Operation *m){std::string s;llvm::raw_string_ostream os(s);m->print(os,OpPrintingFlags().useLocalScope());return s;}
 FModuleOp top(CircuitOp c,StringRef n){for(auto m:c.getOps<FModuleOp>())if(m.getName()==n)return m;throw std::runtime_error("missing module");}
 void replace(std::string &s,StringRef from,StringRef to){auto i=s.find(from.str());require(i!=std::string::npos,"replacement not found");s.replace(i,from.size(),to.str());}
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,
+                            StringRef diagnosticType="", bool isF2=false,
+                            StringRef diagnosticName="ctrl_diagnostic") {
   // Exact recorded U250 ctrl/mem/CPU port contracts; representative private
   // scalar, bundle and clock diagnostics. No SFC implementation logic.
   std::string source=R"mlir(module { firrtl.circuit "GGCPUStreamPlatformWrapper" { firrtl.module @GGCPUStreamPlatformWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %ep_clock: !firrtl.clock, out %fased_pending_reads: !firrtl.bundle<value: uint<4>, full: uint<1>>, in %ctrl: !firrtl.bundle<aw: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>>, w: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<data: uint<32>, last: uint<1>, id: uint<12>, strb: uint<4>, user: uint<1>>>, b flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<resp: uint<2>, id: uint<12>, user: uint<1>>>, ar: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>>, r flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<resp: uint<2>, data: uint<32>, last: uint<1>, id: uint<12>, user: uint<1>>>>, out %mem_0: !firrtl.bundle<aw: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, qos: uint<4>, prot: uint<3>, cache: uint<4>, lock: uint<1>, burst: uint<2>, size: uint<3>, len: uint<8>, addr: uint<34>>>, w: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<strb: uint<8>, last: uint<1>, data: uint<64>>>, b flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, resp: uint<2>>>, ar: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, qos: uint<4>, prot: uint<3>, cache: uint<4>, lock: uint<1>, burst: uint<2>, size: uint<3>, len: uint<8>, addr: uint<34>>>, r flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, last: uint<1>, data: uint<64>, resp: uint<2>>>>, in %cpu_managed_axi4: !firrtl.bundle<aw: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, addr: uint<64>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>>>, w: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<data: uint<512>, strb: uint<64>, last: uint<1>>>, b flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, resp: uint<2>>>, ar: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, addr: uint<64>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>>>, r flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, data: uint<512>, resp: uint<2>, last: uint<1>>>>, out %ctrl_diagnostic: !firrtl.uint<4>) {} } })mlir";
@@ -30,6 +32,11 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
   if(mode==6)replace(source,"out %mem_0","in %mem_0");
   if(mode==7)replace(source,"data: uint<512>","data: uint<256>");
   if(mode==8)replace(source,"out %ctrl_diagnostic: !firrtl.uint<4>","out %ctrl_diagnostic: !firrtl.bundle<ready flip: uint<1>>");
+  if(mode==19)replace(source,"addr: uint<25>, len", "addr: vector<uint<25>, 1>, len");
+  if(mode==20)replace(source,"addr: uint<25>, len", "unexpected: vector<uint<1>, 0>, addr: uint<25>, len");
+  if(!diagnosticType.empty())replace(source,"out %ctrl_diagnostic: !firrtl.uint<4>","out %ctrl_diagnostic: "+diagnosticType.str());
+  if(diagnosticName!="ctrl_diagnostic")replace(source,"ctrl_diagnostic",diagnosticName);
+  if(isF2)for(unsigned i=0;i<2;++i)replace(source,"addr: uint<25>","addr: uint<32>");
   auto root=parseSourceString<ModuleOp>(source,&ctx);require(bool(root),"fixture parse");
   auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);auto m=top(c,"GGCPUStreamPlatformWrapper");
   SmallVector<Attribute> annotations;
@@ -38,7 +45,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
                    {"test.Target","ctrl.aw.bits.addr"},{"test.Target","mem_0"},
                    {"test.Target","cpu_managed_axi4.r.bits.data"},
                    {"test.Target","ctrl_diagnostic"},{"test.Target","ep_clock"}})
-    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(cls)),b.getNamedAttr("target",b.getStringAttr("~GGCPUStreamPlatformWrapper|GGCPUStreamPlatformWrapper>"+n.str()))}));
+    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(cls)),b.getNamedAttr("target",b.getStringAttr("~GGCPUStreamPlatformWrapper|GGCPUStreamPlatformWrapper>"+(n=="ctrl_diagnostic"?diagnosticName:n).str()))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(annotations));
   SmallVector<PortInfo> simPorts,cpuPorts;
   for(auto p:m.getPorts())if(p.name.getValue()=="cpu_managed_axi4")cpuPorts.push_back(p);else simPorts.push_back(p);
@@ -97,11 +104,12 @@ void check(CircuitOp c,unsigned oldCount,StringRef boundary="GGCPUStreamPlatform
   }
   require(clock==1&&reset==1&&sources==1,"unique FAME host identities and clock source");
 }
-void apply(CircuitOp c,bool print=false) {
+void apply(CircuitOp c,bool print=false,bool isF2=false) {
   auto count=c->getAttrOfType<ArrayAttr>("rawAnnotations").size();std::string error;
   std::map<std::string,std::string> bodies;for(auto m:c.getOps<FModuleOp>())bodies[m.getName().str()]=dump(m);
   auto boundary=print?"GGPrintCPUStreamPlatformWrapper":"GGCPUStreamPlatformWrapper";
-  require(succeeded(goldengate::attachFPGATopShell(c,boundary,error)),error);require(succeeded(verify(c)),"invalid shell IR");check(c,count,boundary);
+  auto applied=goldengate::attachFPGATopShell(c,boundary,error,isF2);
+  require(succeeded(applied),error);require(succeeded(verify(c)),"invalid shell IR");check(c,count,boundary);
   for(auto [n,s]:bodies)require(dump(top(c,n))==s,"old module body changed");
 }
 // Emit only the actual new wrapper and an external declaration for its child.
@@ -119,6 +127,23 @@ void writeStub(CircuitOp c,StringRef name) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    // Reuse actual post-MMIO FRFCFS diagnostic types from the component
+    // pipeline. The public shell/forwarding is still a boundary scaffold;
+    // this is not a complete target candidate or semantic comparison.
+    if(argc==3&&StringRef(argv[1])=="--frfcfs-diagnostics") {
+      auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"FRFCFS fixture parse");
+      require(succeeded(verify(*real)),"invalid FRFCFS fixture IR");
+      auto rc=*real->getOps<CircuitOp>().begin();unsigned vectors=0;
+      for(auto p:top(rc,rc.getName()).getPorts()) {
+        if(!p.name.getValue().starts_with("fased_frfcfs_")||!isa<FVectorType>(p.type))continue;
+        require(p.direction==Direction::Out,"FRFCFS vector diagnostic is an input");
+        std::string type;llvm::raw_string_ostream os(type);p.type.print(os);
+        auto test=fixture(ctx,0,type,true,p.name.getValue());auto tc=*test->getOps<CircuitOp>().begin();apply(tc,false,true);
+        llvm::outs()<<p.name.getValue()<<": "<<type<<"\n";++vectors;
+      }
+      require(vectors==4,"expected four retained FRFCFS vector diagnostics after MMIO");
+      llvm::outs()<<"PASS four production FRFCFS diagnostic types through F2 boundary scaffold\n";return 0;
+    }
     // Inspect the actual production boundary without applying the pass again
     // or synthesizing FAME identities. Exact aggregate SSA identities prove
     // all payload/handshake bits forward independently of their values.
@@ -137,7 +162,55 @@ int main(int argc,char **argv) {
     require(cast<DictionaryAttr>(ann[2]).getAs<StringAttr>("target").getValue()=="~FPGATop|FPGATop>ctrl.aw.bits.addr","aggregate reference transfer");
     require(cast<DictionaryAttr>(ann[5]).getAs<StringAttr>("target").getValue()=="~FPGATop|GGCPUStreamPlatformWrapper>ctrl_diagnostic","diagnostic identity retention");
     require(cast<DictionaryAttr>(ann[6]).getAs<StringAttr>("target").getValue()=="~FPGATop|GGCPUStreamPlatformWrapper>ep_clock","bridge clock identity retention");
-    for(unsigned mode=1;mode<=18;++mode) {
+    // Vector traversal must preserve aggregate flips at every nesting level.
+    // Exercise both exact public platform contracts and retain private targets.
+    for(bool isF2:{false,true}) {
+      for(StringRef type:{"!firrtl.vector<uint<32>, 5>",
+                          "!firrtl.vector<bundle<state: uint<1>, banks: vector<bundle<openRow: uint<26>>, 8>>, 4>"}) {
+        auto test=fixture(ctx,0,type,isF2);auto tc=*test->getOps<CircuitOp>().begin();apply(tc,false,isF2);
+        auto raw=tc->getAttrOfType<ArrayAttr>("rawAnnotations");
+        require(cast<DictionaryAttr>(raw[5]).getAs<StringAttr>("target").getValue()=="~FPGATop|GGCPUStreamPlatformWrapper>ctrl_diagnostic","vector diagnostic identity lost");
+      }
+      for(StringRef type:{"!firrtl.vector<bundle<banks: vector<bundle<ready flip: uint<1>>, 8>>, 4>",
+                          "!firrtl.bundle<lanes flip: vector<uint<1>, 4>>",
+                          "!firrtl.vector<clock, 4>",
+                          "!firrtl.vector<reset, 4>",
+                          "!firrtl.vector<uint, 4>"}) {
+        auto test=fixture(ctx,0,type,isF2);auto tc=*test->getOps<CircuitOp>().begin();auto before=dump(*test);
+        require(failed(goldengate::assembleFPGATopShell(tc,error,isF2))&&before==dump(*test),"unsafe vector diagnostic accepted or rejection mutated IR");
+        require(error.find("ctrl_diagnostic")!=std::string::npos,"diagnostic error omits failing port/leaf");
+      }
+    }
+    // Synthesized Print domain clocks are private only when their actual
+    // forwarding reaches the clock named by retained channel metadata.
+    for (unsigned mode=0; mode<5; ++mode) {
+      auto test=fixture(ctx,0,"!firrtl.clock",true,"synthesizedPrintf_domain_clock");
+      auto tc=*test->getOps<CircuitOp>().begin(); OpBuilder b(&ctx);
+      auto raw=tc->getAttrOfType<ArrayAttr>("rawAnnotations");
+      SmallVector<Attribute> annotations(raw.begin(),raw.end());
+      if (mode != 1) annotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("clock", b.getStringAttr("~GGCPUStreamPlatformWrapper|GGHostMemoryPlatformWrapper>" +
+          std::string(mode==2 ? "ep_clock" : "synthesizedPrintf_domain_clock")))}));
+      tc->setAttr("rawAnnotations",b.getArrayAttr(annotations));
+      auto inner=top(tc,"GGCPUStreamPlatformWrapper");
+      for (auto connection:llvm::make_early_inc_range(inner.getOps<ConnectOp>()))
+        if (path(inner,connection.getDest())=="synthesizedPrintf_domain_clock") {
+          if (mode==3) connection.erase();
+          else if (mode==4) {
+            b.setInsertionPoint(connection);
+            b.create<StrictConnectOp>(connection.getLoc(),connection.getDest(),connection.getSrc());
+          }
+          break;
+        }
+      if (!mode) apply(tc,false,true);
+      else {
+        auto before=dump(*test);
+        require(failed(goldengate::assembleFPGATopShell(tc,error,true))&&before==dump(*test),
+          "unproven Print clock alias accepted or rejection mutated IR");
+      }
+    }
+    for(unsigned mode=1;mode<=20;++mode) {
       auto test=fixture(ctx,mode);auto tc=*test->getOps<CircuitOp>().begin();auto t=top(tc,"GGCPUStreamPlatformWrapper");OpBuilder b(&ctx);
       auto raw=tc->getAttrOfType<ArrayAttr>("rawAnnotations");SmallVector<Attribute> as(raw.begin(),raw.end());
       if(mode==9)tc->removeAttr("rawAnnotations");
@@ -187,7 +260,7 @@ int main(int argc,char **argv) {
     auto ea=ec->getAttrOfType<ArrayAttr>("rawAnnotations");
     require(cast<DictionaryAttr>(ea[5]).getAs<StringAttr>("target").getValue()=="~FPGATop|GGPrintCPUStreamPlatformWrapper>payload_probe","Print passive diagnostic target lost");
     auto s=dump(*root);require(failed(goldengate::assembleFPGATopShell(c,error)),"repeat accepted");require(s==dump(*root),"repeat mutated IR");
-    llvm::outs()<<"Five public identity bindings, retained private scalar/bundle/clock targets; HostClockSource added; 21 atomic rejections; expanded passive diagnostic profile\n";
+    llvm::outs()<<"Five public identity bindings, retained private scalar/bundle/vector/clock targets; HostClockSource added; 33 atomic rejections; U250/F2 passive vectors and expanded diagnostic profile\n";
     if(argc>=3) {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"real parse");auto rc=*real->getOps<CircuitOp>().begin();apply(rc);
       llvm::outs()<<"Real Rocket shell: 5 ports, "<<rc->getAttrOfType<ArrayAttr>("rawAnnotations").size()<<" annotations; old module bodies unchanged\n";

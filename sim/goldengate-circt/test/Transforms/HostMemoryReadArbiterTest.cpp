@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/HostMemoryReadArbiter.h"
+#include "HostMemoryProfileChecks.h"
 #include "goldengate/HostMemoryWriteResponses.h"
 #include "goldengate/HostMemoryWriteArbiter.h"
 #include "circt/Dialect/HW/HWDialect.h"
@@ -188,6 +189,7 @@ int main(int argc,char **argv) {
       auto c=*root->getOps<CircuitOp>().begin();require(c.getName()=="GGHostMemoryReadWrapper","expanded AR top");
       compare(c);bindings(c);return 0;
     }
+    checkHostMemoryProfiles(ctx,[&](){return fixture(ctx);},goldengate::addHostMemoryReadArbiter);
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();
     std::map<std::string,std::string> before;for(auto m:c.getOps<FModuleOp>())before[m.getName().str()]=dump(m);
     std::string error;require(succeeded(goldengate::addHostMemoryReadArbiter(c,error)),error);require(succeeded(verify(*root)),"IR verifier");

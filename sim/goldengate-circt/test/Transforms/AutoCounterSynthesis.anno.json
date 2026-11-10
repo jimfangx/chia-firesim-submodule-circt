@@ -1,0 +1,90 @@
+[
+  {
+    "class": "midas.passes.fame.FAMEChannelConnectionAnnotation",
+    "globalName": "clocks",
+    "channelInfo": {
+      "class": "midas.passes.fame.TargetClockChannel",
+      "clockInfo": [
+        {
+          "name": "base",
+          "multiplier": 1,
+          "divisor": 1
+        },
+        {
+          "name": "slow",
+          "multiplier": 1,
+          "divisor": 3
+        }
+      ],
+      "perClockMFMR": [
+        1,
+        3
+      ]
+    },
+    "sinks": [
+      "~Top|Top>clock0",
+      "~Top|Top>clock1"
+    ]
+  },
+  {
+    "class": "midas.targetutils.AutoCounterCoverModuleFirrtlAnnotation",
+    "target": "~Top|Leaf"
+  },
+  {
+    "target": "~Top|Leaf>event",
+    "clock": "~Top|Leaf>localClock",
+    "reset": "~Top|Leaf>reset",
+    "label": "leafCount",
+    "description": "fixture leafCount",
+    "coverGenerated": false,
+    "class": "midas.InternalAutoCounterFirrtlAnnotation",
+    "opType": {
+      "class": "midas.targetutils.PerfCounterOps$Accumulate$"
+    }
+  },
+  {
+    "target": "~Top|Leaf>value",
+    "clock": "~Top|Leaf>localClock",
+    "reset": "~Top|Leaf>reset",
+    "label": "leafValue",
+    "description": "fixture leafValue",
+    "coverGenerated": false,
+    "class": "midas.InternalAutoCounterFirrtlAnnotation",
+    "opType": {
+      "class": "midas.targetutils.PerfCounterOps$Identity$"
+    }
+  },
+  {
+    "target": "~Top|Leaf>event",
+    "clock": "~Top|Leaf>localClock",
+    "reset": "~Top|Leaf>reset",
+    "label": "coverCount",
+    "description": "fixture coverCount",
+    "coverGenerated": true,
+    "class": "midas.InternalAutoCounterFirrtlAnnotation",
+    "opType": {
+      "class": "midas.targetutils.PerfCounterOps$Accumulate$"
+    }
+  },
+  {
+    "target": "~Top|Top>topEvent",
+    "clock": "~Top|Top>clock0",
+    "reset": "~Top|Top>reset0",
+    "label": "topCount",
+    "description": "fixture topCount",
+    "coverGenerated": false,
+    "class": "midas.InternalAutoCounterFirrtlAnnotation"
+  },
+  {
+    "target": "~Top|Ignored>missingEvent",
+    "clock": "~Top|Ignored>missingClock",
+    "reset": "~Top|Ignored>missingReset",
+    "label": "ignored",
+    "description": "fixture ignored",
+    "coverGenerated": true,
+    "class": "midas.InternalAutoCounterFirrtlAnnotation",
+    "opType": {
+      "class": "midas.targetutils.PerfCounterOps$Accumulate$"
+    }
+  }
+]

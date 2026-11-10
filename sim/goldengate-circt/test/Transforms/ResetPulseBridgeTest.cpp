@@ -210,9 +210,11 @@ void mapping(MLIRContext &context, bool first) {
   require(producer->getAttr("goldengate.bridgeConstructor") == ctor, "constructor changed");
   auto registers = producer->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
   require(registers.size() == 2, "missing register metadata");
+  static constexpr llvm::StringRef expectedNames[] = {"pulseLength", "doneInit"};
   for (auto [i, attr] : llvm::enumerate(registers)) {
     auto reg = cast<DictionaryAttr>(attr);
-    require(reg.getAs<IntegerAttr>("offset").getInt() == i * 4 &&
+    require(reg.getAs<StringAttr>("name").getValue() == expectedNames[i] &&
+            reg.getAs<IntegerAttr>("offset").getInt() == i * 4 &&
             reg.getAs<BoolAttr>("readable").getValue() && reg.getAs<BoolAttr>("writeable").getValue(),
             "genWOReg ReadWrite semantics lost");
   }

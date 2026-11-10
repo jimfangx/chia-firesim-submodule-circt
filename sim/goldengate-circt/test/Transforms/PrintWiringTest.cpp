@@ -165,7 +165,7 @@ void checkCompletedPrintMetadata(CircuitOp c, unsigned clockCount) {
       "repeated completed debug clock analysis changed operations or annotations");
   require(succeeded(verify(c)),"completed print/reset/clock boundary contains invalid FIRRTL");
 }
-void run(MLIRContext &context, bool complete = false) {
+void run(MLIRContext &context, bool complete = false, bool literalArgs = false) {
   auto root=parseSourceString<ModuleOp>(R"mlir(module {
     firrtl.circuit "Top" attributes {rawAnnotations = []} {
       firrtl.module @Top(in %clock: !firrtl.clock, in %enable: !firrtl.uint<1>,
@@ -186,8 +186,16 @@ void run(MLIRContext &context, bool complete = false) {
   OpBuilder b(&context); SmallVector<Attribute> annos;
   auto print=[&](FModuleOp m,StringRef name,bool args) {
     b.setInsertionPointToEnd(m.getBodyBlock()); auto arg=[&](unsigned i){return m.getBodyBlock()->getArgument(i);};
+    SmallVector<Value> operands;
+    if (args) {
+      if (literalArgs) {
+        operands.push_back(b.create<ConstantOp>(m.getLoc(), UIntType::get(&context,8,true), APInt(8,173)));
+        operands.push_back(b.create<ConstantOp>(m.getLoc(), SIntType::get(&context,9,true), APInt(9,-7,true)));
+        operands.push_back(b.create<ConstantOp>(m.getLoc(), UIntType::get(&context,129,true), APInt(129,123)));
+      } else operands = {arg(2),arg(3),arg(4)};
+    }
     b.create<PrintFOp>(m.getLoc(),arg(0),arg(1),"%d %d %x\n\t\r\b\f\"\\ café 😀\x01\x7f",
-        args?ValueRange{arg(2),arg(3),arg(4)}:ValueRange{},name);
+        operands,name);
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::SynthPrintf)),
       b.getNamedAttr("target",b.getStringAttr("~Top|"+m.getName().str()+">"+name.str()))}));
   };
@@ -570,6 +578,6 @@ void runGolden(MLIRContext &context,StringRef path) {
 }
 int main(int argc,char **argv) {
   MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {run(context);run(context,true);runClocks(context);runTwoClockWiring(context);runTwoClockWiring(context,true);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
+  try {run(context);run(context,true);run(context,true,true);runClocks(context);runTwoClockWiring(context);runTwoClockWiring(context,true);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
   catch(const std::exception &e){llvm::errs()<<"Print wiring FAIL: "<<e.what()<<'\n';return 1;}
 }

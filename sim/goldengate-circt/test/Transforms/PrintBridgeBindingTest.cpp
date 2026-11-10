@@ -4,6 +4,7 @@
 #include "goldengate/ControlCatalog.h"
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/PrintControlWidth.h"
 #include "goldengate/RocketDriverHeader.h"
 #include "goldengate/LoadMemHeader.h"
 #include "goldengate/TracerVHeader.h"
@@ -207,7 +208,7 @@ struct Fixture {
   OwningOpRef<ModuleOp> root;
   CircuitOp circuit;
   SmallVector<FModuleOp> hosts;
-  Fixture(MLIRContext &ctx, bool multipleRecords = false, bool reverseRecords = false) {
+  Fixture(MLIRContext &ctx, bool multipleRecords = false, bool reverseRecords = false, unsigned addressBits = 25) {
     unsigned fields = multipleRecords ? 5 : 3;
     std::string text = "module { firrtl.circuit \"Top\" { firrtl.module @Top(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>";
     for (unsigned d = 0; d < 2; ++d) for (unsigned f = 0; f < fields; ++f)
@@ -266,7 +267,7 @@ struct Fixture {
     require(succeeded(goldengate::materializePrintBridgePayloads(circuit, payloads, error)), error);
     require(succeeded(goldengate::materializePrintBridgeTokenStages(circuit, payloads, stages, error)), error);
     require(succeeded(goldengate::materializePrintBridgeControls(circuit, payloads, stages, controls, error)), error);
-    require(succeeded(goldengate::materializePrintBridgeHosts(circuit, controls, 25, 12, hosts, error)), error);
+    require(succeeded(goldengate::materializePrintBridgeHosts(circuit, controls, addressBits, 12, hosts, error)), error);
   }
 };
 
@@ -288,6 +289,13 @@ struct Interpreter {
     if (drivers.count(k)) return eval(drivers.at(k));
     auto *op = v.getDefiningOp();
     if (auto c = dyn_cast_or_null<ConstantOp>(op)) return c.getValue().getZExtValue();
+    if (isa_and_nonnull<NotPrimOp>(op)) return (~eval(op->getOperand(0))) &
+        llvm::APInt::getLowBitsSet(64, *cast<UIntType>(v.getType()).getWidth()).getZExtValue();
+    if (isa_and_nonnull<LTPrimOp>(op)) return eval(op->getOperand(0)) < eval(op->getOperand(1));
+    if (isa_and_nonnull<EQPrimOp>(op)) return eval(op->getOperand(0)) == eval(op->getOperand(1));
+    if (isa_and_nonnull<MuxPrimOp>(op)) return eval(op->getOperand(0)) ? eval(op->getOperand(1)) : eval(op->getOperand(2));
+    if (isa_and_nonnull<CatPrimOp>(op)) return (eval(op->getOperand(0)) <<
+        *cast<UIntType>(op->getOperand(1).getType()).getWidth()) | eval(op->getOperand(1));
     if (isa_and_nonnull<AndPrimOp>(op)) return eval(op->getOperand(0)) & eval(op->getOperand(1));
     if (isa_and_nonnull<OrPrimOp>(op)) return eval(op->getOperand(0)) | eval(op->getOperand(1));
     if (isa_and_nonnull<AsSIntPrimOp, AsUIntPrimOp, PadPrimOp>(op)) return eval(op->getOperand(0));
@@ -299,8 +307,8 @@ struct Interpreter {
   }
 };
 
-void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
-  Fixture f(ctx); if (reverse) std::reverse(f.hosts.begin(), f.hosts.end());
+void checkBinding(MLIRContext &ctx, bool reverse, StringRef output, unsigned addressBits = 25) {
+  Fixture f(ctx, false, false, addressBits); if (reverse) std::reverse(f.hosts.begin(), f.hosts.end());
   auto old = named(f.circuit, "Top"); std::string oldText = dump(old), error;
   require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
   auto wrapper = named(f.circuit, "GGPrintBridgeHostWrapper");
@@ -419,12 +427,41 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
     widgets.push_back(widget);
   }
   SmallVector<goldengate::ControlMMIORegion> regions;
-  require(succeeded(goldengate::allocateControlMMIORegions(25, widgets, regions, error)) &&
+  require(succeeded(goldengate::allocateControlMMIORegions(addressBits, widgets, regions, error)) &&
       regions.size() == 2 && regions[0].start == 0 && regions[1].start == 32 &&
       regions[0].size == 32 && regions[1].size == 32, "Print six-word banks must allocate 32-byte regions");
   require(succeeded(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)) && succeeded(verify(*f.root)), error);
   require(f.circuit.getName() == "GGControlReadDispatchWrapper", "Print MMIO composition stopped before AR binding");
   auto decoder = named(f.circuit, "GGControlAddressDecode");
+  require(goldengate::controlPortWidth(decoder, "aw_addr") == addressBits &&
+          goldengate::controlPortWidth(decoder, "ar_addr") == addressBits,
+          "Print decoder truncated the platform address boundary");
+  Interpreter decodeSim(decoder);
+  for (uint64_t low : {0ULL, 4ULL, 31ULL, 32ULL, 63ULL, 64ULL, 79ULL, 80ULL}) {
+    for (uint64_t address : SmallVector<uint64_t>{low, low | (1ULL << (addressBits - 1)), low | (1ULL << 25)}) {
+      if (address >= (1ULL << addressBits)) continue;
+      for (unsigned channel = 0; channel < 2; ++channel) {
+        decodeSim.inputs[decodeSim.key(decoder.getArgument(channel))] = address;
+        auto route = decodeSim.eval(decoder.getArgument(2 + channel));
+        auto target = decodeSim.eval(decoder.getArgument(4 + channel));
+        auto error = decodeSim.eval(decoder.getArgument(6 + channel));
+        unsigned expected = address < 32 ? 0 : address < 64 ? 1 : address < 80 ? 2 : 3;
+        require(route == (expected == 3 ? 0u : (1u << expected)) &&
+                target == expected && error == (expected == 3),
+                "Print high address aliased a low MMIO widget instead of the error endpoint");
+      }
+    }
+  }
+  if (!output.empty() && !reverse) {
+    auto isolated = parseSourceString<ModuleOp>("module { firrtl.circuit \"GGControlAddressDecode\" { firrtl.module @GGControlAddressDecode() {} } }", &ctx);
+    require(bool(isolated), "cannot construct isolated Print decoder");
+    auto c = *isolated->getOps<CircuitOp>().begin();
+    (*c.getOps<FModuleOp>().begin()).erase();
+    c.getBodyBlock()->push_back(decoder->clone());
+    require(succeeded(verify(*isolated)), "invalid isolated Print decoder");
+    std::error_code ec; llvm::raw_fd_ostream out((output + ".decode.mlir").str(), ec);
+    require(!ec, "cannot write isolated Print decoder"); isolated->print(out);
+  }
   auto allocated = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
   auto writeBindings = named(f.circuit, "GGControlWidgetWriteWrapper")->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings");
   auto readBindings = named(f.circuit, "GGControlReadDispatchWrapper")->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings");
@@ -558,6 +595,9 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
         !name.starts_with("ctrl_read_arb_out_") && !name.starts_with("ctrl_write_arb_out_"),
         "master request/response scalar remains exposed");
   }
+  require(goldengate::controlPortWidth(master, "ctrl.aw.bits.addr") == addressBits &&
+          goldengate::controlPortWidth(master, "ctrl.ar.bits.addr") == addressBits,
+          "Print control master lost the platform AW/AR width");
   auto ctrl = cast<BundleType>(master.getPorts()[port(master, "ctrl")].type);
   require(ctrl.getElements().size() == 5 && master.getPorts()[port(master, "ctrl")].direction == Direction::In,
       "master is not one complete flipped Nasti interface");
@@ -584,6 +624,27 @@ void checkBinding(MLIRContext &ctx, bool reverse, StringRef output) {
   require(failed(goldengate::bindControlMaster(f.circuit, "GGControlWriteTrackerWrapper", error)) &&
       dump(*f.root) == mastered, "repeat selected master assembly must be atomic");
   llvm::outs() << "PASS binding " << (reverse ? "reversed" : "ordered") << " " << evaluations << " handshake/data cases and three-stream CPU composition\n";
+}
+
+// Platform width comes from typed host ports, with metadata as a checked
+// correspondence contract. Invalid mixed/missing widths must fail read-only.
+void printControlWidthRejections(MLIRContext &ctx) {
+  for (unsigned bad = 0; bad < 4; ++bad) {
+    Fixture f(ctx, false, false, 32); OpBuilder b(&ctx); std::string error;
+    require(goldengate::printControlAddressBits(f.circuit, error) == 32,
+            "valid F2 Print host widths were not recognized");
+    auto host = f.hosts.back();
+    NamedAttrList info(host->getAttrOfType<DictionaryAttr>("goldengate.printHost"));
+    if (bad == 0) info.set("addressBits", b.getI64IntegerAttr(25));
+    if (bad == 1) info.erase("addressBits");
+    if (bad == 2) info.set("addressBits", b.getStringAttr("32"));
+    if (bad == 3) info.set("addressBits", b.getIntegerAttr(b.getIntegerType(129), 32));
+    host->setAttr("goldengate.printHost", info.getDictionary(&ctx));
+    auto before = dump(*f.root);
+    require(!goldengate::printControlAddressBits(f.circuit, error) && !error.empty() &&
+            dump(*f.root) == before, "invalid Print width mutated IR or was accepted");
+  }
+  llvm::outs() << "PASS four atomic Print host width correspondence rejections\n";
 }
 
 // Exercise the production catalog against actual materialized Rocket banks.
@@ -2596,7 +2657,8 @@ void rocketNativeDriverHeaders(CircuitOp c, ModuleOp root, StringRef directory) 
   for (auto row : c->getAttrOfType<ArrayAttr>("rawAnnotations")) {
     auto d = cast<DictionaryAttr>(row); auto suffix = d.getAs<StringAttr>("fileSuffix");
     if (d.getAs<StringAttr>("class") == goldengate::AnnotationClasses::OutputFile &&
-        suffix && (suffix == ".const.h" || suffix == ".const.vh")) continue;
+        suffix && (suffix == ".const.h" || suffix == ".const.vh" ||
+                   suffix == ".partition.const.h" || suffix == ".peer2peer.const.yaml")) continue;
     retained.push_back(row);
   }
   c->setAttr("rawAnnotations", b.getArrayAttr(retained));
@@ -2637,7 +2699,12 @@ void rocketNativeDriverHeaders(CircuitOp c, ModuleOp root, StringRef directory) 
   auto original = c->getAttrOfType<ArrayAttr>("rawAnnotations"); auto hardware = dump(root);
   require(succeeded(goldengate::prepareRocketDriverHeaders(c, error)), error);
   auto updated = c->getAttrOfType<ArrayAttr>("rawAnnotations");
-  require(original.size() == updated.size(), "composition changed archive count");
+  require(original.size() + 1 == updated.size(), "composition peer map count");
+  auto peer = cast<DictionaryAttr>(updated[updated.size()-1]);
+  require(peer.getAs<StringAttr>("class") == goldengate::AnnotationClasses::OutputFile &&
+      peer.getAs<StringAttr>("fileSuffix") == ".peer2peer.const.yaml" &&
+      peer.getAs<StringAttr>("body").getValue().contains("bufferWidthBytes:  64\n"),
+      "composition omitted validated CPU stream map");
   unsigned changed = 0;
   for (auto [before, after] : llvm::zip(original, updated)) {
     if (before == after) continue;
@@ -5642,9 +5709,9 @@ void rocketStreams(MLIRContext &ctx, StringRef baseline, StringRef controlBaseli
                << rejected << " atomic rejections\n";
 }
 
-void allocatedHeaders(MLIRContext &ctx, StringRef output) {
+void allocatedHeaders(MLIRContext &ctx, StringRef output, unsigned addressBits = 25) {
   for (bool reverse : {false, true}) {
-    Fixture f(ctx); OpBuilder b(&ctx); std::string error, header;
+    Fixture f(ctx, false, false, addressBits); OpBuilder b(&ctx); std::string error, header;
     // The reversed case has a real preceding stream queue. This makes widget
     // numbers and CPU allocation indices differ, as on a TracerV platform.
     if (reverse) {
@@ -5673,13 +5740,19 @@ void allocatedHeaders(MLIRContext &ctx, StringRef output) {
     require(succeeded(goldengate::mapPrintBridgeCPUStreams(f.circuit, earlier, earlierCounts, error)), error);
     require(succeeded(goldengate::mapPrintBridgeControlDispatch(f.circuit, error)), error);
     require(succeeded(goldengate::mapPrintBridgeControlResponses(f.circuit, error)), error);
-    auto before = dump(*f.root); header = "preserve";
-    require(failed(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, header, error)) &&
-        header == "preserve" && dump(*f.root) == before, "header accepted incomplete master assembly");
+    auto before = dump(*f.root); header = "preserve"; std::string peerMap = "preserve-map";
+    require(failed(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, header, error, &peerMap)) &&
+        header == "preserve" && peerMap == "preserve-map" && dump(*f.root) == before,
+        "header/map accepted incomplete master assembly");
     require(succeeded(goldengate::bindControlMaster(f.circuit, "GGControlWriteTrackerWrapper", error)), error);
     before = dump(*f.root);
-    require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, header, error)) &&
+    require(succeeded(goldengate::preparePrintBridgeAllocatedHeader(f.circuit, f.hosts, header, error, &peerMap)) &&
         dump(*f.root) == before, error);
+    for (unsigned i = 0; i < 2 + unsigned(reverse); ++i)
+      require(peerMap.find("  bufferBaseAddress: " + std::to_string(i * 524288) + "\n") != std::string::npos,
+          "Print CPU peer map lost ordered allocation");
+    require(peerMap.find("  bufferCapacity:    6144\n  bufferWidthBytes:  64\n") != std::string::npos,
+        "Print CPU peer geometry differs");
     // The default full-platform API must still reject this outgoing-only IR.
     OwningOpRef<CircuitOp> complete(cast<CircuitOp>(f.circuit->clone()));
     auto raw = complete->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations");
@@ -5780,6 +5853,34 @@ void allocatedHeaders(MLIRContext &ctx, StringRef output) {
     unexpected.erase();
   }
   llvm::outs() << "PASS allocated Print/count headers in both host orders, preceding live queue, register permutation and 44 atomic rejections\n";
+}
+
+void duplexPrintCatalog(MLIRContext &ctx) {
+  Fixture f(ctx); std::string error;
+  require(succeeded(goldengate::bindPrintBridgeHosts(f.circuit, f.hosts, error)), error);
+  SmallVector<goldengate::CPUStreamSourcePort> sources{
+      {"SIMPLENICBRIDGEMODULE_0_to_cpu_stream", "nic_to_cpu", 6144}};
+  SmallVector<goldengate::CPUStreamCountPort> counts{
+      {"SIMPLENICBRIDGEMODULE_0_to_cpu_stream", "nic_to_cpu_count", 13},
+      {"SIMPLENICBRIDGEMODULE_0_from_cpu_stream", "nic_from_cpu_count", 13},
+      {"SIMPLENICBRIDGEMODULE_1_from_cpu_stream", "nic1_from_cpu_count", 13}};
+  auto before = dump(*f.root);
+  require(succeeded(goldengate::appendPrintBridgeCPUStreamPorts(f.circuit, sources, counts, error)) &&
+      dump(*f.root) == before, "Print production catalog changed the simulator IR: " + error);
+  require(sources.size() == 3 && counts.size() == 5 &&
+      sources[0].streamName == "SIMPLENICBRIDGEMODULE_0_to_cpu_stream" &&
+      counts[1].streamName == "PRINTBRIDGEMODULE_0_to_cpu_stream" &&
+      counts[2].streamName == "PRINTBRIDGEMODULE_1_to_cpu_stream" &&
+      counts[3].streamName == "SIMPLENICBRIDGEMODULE_0_from_cpu_stream" &&
+      counts[4].streamName == "SIMPLENICBRIDGEMODULE_1_from_cpu_stream",
+      "Print production catalog reordered incoming DMA counts or outgoing widget indices");
+  auto originalSources = sources; auto originalCounts = counts;
+  counts[0].streamName = "wrong_preceding_count";
+  require(failed(goldengate::appendPrintBridgeCPUStreamPorts(f.circuit, sources, counts, error)) &&
+      sources.size() == originalSources.size() && counts.size() == originalCounts.size() &&
+      counts[0].streamName == "wrong_preceding_count" && dump(*f.root) == before,
+      "Print production catalog accepted an unmatched source/count or partially published results");
+  llvm::outs() << "PASS production Print catalog inserts outgoing counts before independent NIC sink counts without constructing transport\n";
 }
 
 void nestedCPUAllocation(MLIRContext &ctx) {
@@ -6031,8 +6132,16 @@ void rejections(MLIRContext &ctx) {
 int main(int argc, char **argv) {
   try {
     MLIRContext ctx; ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    if (argc == 3 && StringRef(argv[1]) == "--f2-control") {
+      printControlWidthRejections(ctx);
+      checkBinding(ctx, false, argv[2], 32);
+      checkBinding(ctx, true, {}, 32);
+      allocatedHeaders(ctx, argv[2], 32);
+      llvm::outs() << "PASS F2 Print AXI32 dispatch, response/master ABI and high-address error routing\n";
+      return 0;
+    }
     if (argc == 2 && StringRef(argv[1]) == "--nested-cpu-allocation-test") {
-      nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
+      duplexPrintCatalog(ctx); nestedCPUAllocation(ctx); allocationRejections(ctx); return 0;
     }
     if (argc == 3 && StringRef(argv[1]) == "--selected-print-fased-ingress-credits") {
       auto source = parseSourceFile<ModuleOp>(argv[2], &ctx);
@@ -9221,7 +9330,7 @@ int main(int argc, char **argv) {
       llvm::outs() << "PASS expanded FASED issue boundary and " << rejected << " atomic rejections\n";
       return 0;
     }
-    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); nestedCPUAllocation(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
+    checkBinding(ctx, false, argc > 1 ? argv[1] : ""); checkBinding(ctx, true, ""); rejections(ctx); duplexPrintCatalog(ctx); nestedCPUAllocation(ctx); allocationRejections(ctx); controlRejections(ctx); responseRejections(ctx);
     allocatedHeaders(ctx, argc > 1 ? argv[1] : "");
     platformCatalog(ctx, argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");
     rocketStreams(ctx, argc > 3 ? argv[3] : "", argc > 2 ? argv[2] : "", argc > 1 ? argv[1] : "");

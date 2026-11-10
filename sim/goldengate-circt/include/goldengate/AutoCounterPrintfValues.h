@@ -29,4 +29,16 @@ struct AutoCounterPrintf {
 mlir::LogicalResult synthesizeAutoCounterPrintf(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<AutoCounterEvent> selected,
     llvm::SmallVectorImpl<AutoCounterPrintf> &prints, std::string &error);
+// Production AutoCounterTransform's enabled AutoCounterUsePrintfImpl path.
+// Operands must already be LowerTypes/ExpandWhens-normalized with synchronous
+// UInt<1> resets. Select events, suppress reset samples, synthesize counter/
+// identity state and trigger-controlled printf operations, then consume all
+// AutoCounter selections. Retain the new PrintSynthesis and TriggerWiring
+// annotations. Unsupported modes/widths fail before mutation; synthesized is
+// updated only on success. This implements the SFC printf strategy, not its
+// separate AutoCounterBridge (CSV/MMIO) strategy.
+mlir::LogicalResult synthesizeEnabledAutoCounterPrintf(
+    circt::firrtl::CircuitOp circuit,
+    llvm::ArrayRef<llvm::StringRef> coverModuleNames,
+    unsigned &synthesized, std::string &error);
 } // namespace goldengate

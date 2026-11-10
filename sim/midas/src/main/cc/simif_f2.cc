@@ -4,10 +4,12 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <unistd.h>
+#include <unordered_map>
 
 #include "bridges/cpu_managed_stream.h"
 #include "bridges/fpga_managed_stream.h"
 #include "core/simif.h"
+#include "core/f2_stream_io.h"
 
 #include <fpga_mgmt.h>
 #include <fpga_pci.h>
@@ -30,12 +32,14 @@ public:
 
 private:
   uint32_t mmio_read(size_t addr) override { return read(addr); }
+  bool supports_explicit_ack() const override { return true; }
   void mmio_write(size_t addr, uint32_t value) override {
     return write(addr, value);
   }
   size_t
   cpu_managed_axi4_write(size_t addr, const char *data, size_t size) override;
   size_t cpu_managed_axi4_read(size_t addr, char *data, size_t size) override;
+  size_t cpu_managed_axi4_read_acked(size_t addr, char *data, size_t size) override;
   uint64_t get_beat_bytes() const override {
     return config.cpu_managed->beat_bytes();
   }
@@ -45,6 +49,9 @@ private:
   // int edma_read_fd;
   pci_bar_handle_t pci_bar_handle;
   pci_bar_handle_t pci_bar4_handle;
+  // SDK mappings remain valid for this backend's attached BAR4 lifetime.
+  std::unordered_map<size_t, const char *> stable_head_addresses;
+  bool stable_read_mode_reported = false;
 };
 
 simif_f2_t::simif_f2_t(const TargetConfig &config,
@@ -245,13 +252,47 @@ size_t simif_f2_t::cpu_managed_axi4_read(size_t addr, char *data, size_t size) {
   return bytes_read;
 }
 
+size_t simif_f2_t::cpu_managed_axi4_read_acked(size_t addr, char *data, size_t size) {
+  if (addr % 64 || size != 64)
+    throw std::invalid_argument("F2 explicit-ACK reads require one aligned 64-byte head");
+  static const bool streaming = f2_stream_io::streaming_load_supported();
+  if (!stable_read_mode_reported) {
+    fprintf(stderr, "F2_SOURCE_READ explicit_ack=1 mode=%s payload_load_bytes=%u\n",
+            streaming ? "wc-sse4.1" : "sdk64", streaming ? 16u : 8u);
+    stable_read_mode_reported = true;
+  }
+  const char *mapped = nullptr;
+  if (streaming) {
+    auto found = stable_head_addresses.find(addr);
+    if (found == stable_head_addresses.end()) {
+      void *head;
+      const int rc = fpga_pci_get_address(pci_bar4_handle, addr, 64, &head);
+      check_rc(rc, "PCIS stable-head mapping FAILED");
+      if (!head || reinterpret_cast<uintptr_t>(head) % 64)
+        throw std::runtime_error("PCIS stable-head mapping is not cache-line aligned");
+      found = stable_head_addresses.emplace(addr, static_cast<const char *>(head)).first;
+    }
+    mapped = found->second;
+  }
+  return f2_stream_io::read_stable_line(mapped, data, streaming,
+      [&](size_t offset, uint64_t *word) {
+        const int rc = fpga_pci_peek64(pci_bar4_handle, addr + offset, word);
+        check_rc(rc, "PCIS stable-head read FAILED");
+        return sizeof(*word);
+      });
+}
+
 // rh: replace XDMA with burst
 size_t simif_f2_t::cpu_managed_axi4_write(size_t addr, const char *data, size_t size) {
   // fprintf(stderr, "PCIS write: addr=0x%lx size=%zu\n", addr, size); //rh: log PCIS writes
-  int rc = fpga_pci_write_burst(pci_bar4_handle, addr, (uint32_t *) data, size / 4);
-  check_rc(rc, "PCIS write FAILED");
+  return f2_stream_io::write_lines(addr, data, size,
+      [&](size_t line_addr, const char *line, size_t line_size) {
+        int rc = fpga_pci_write_burst(pci_bar4_handle, line_addr,
+                                    (uint32_t *)line, line_size / 4);
+        check_rc(rc, "PCIS write FAILED");
+        return line_size;
+      });
   // fprintf(stderr, "PCIS write: addr=0x%lx size=%zu SUCCESS\n", addr, size);
-  return size;
 }
 
 uint32_t simif_f2_t::is_write_ready() {

@@ -6,6 +6,7 @@
 // Analyses preserved: all. Output invariant: decoder offsets/widths match the
 // host payload; allocation remains explicit; failure preserves caller text.
 #include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/PrintControlWidth.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "goldengate/ControlAddressDecode.h"
@@ -167,7 +168,10 @@ LogicalResult goldengate::preparePrintBridgeDecoderHeader(CircuitOp circuit,
 // only after the complete batch succeeds. Rocket bridge constructors remain
 // separate because RocketDriverHeader already emits them.
 LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
-    ArrayRef<FModuleOp> hosts, std::string &header, std::string &error) {
+    ArrayRef<FModuleOp> hosts, std::string &header, std::string &error, std::string *peerMap, DictionaryAttr *f2StreamProtocol) {
+  auto addressWidth = printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   bool rocket = circuit.getName() == "F1Shim";
   // CPU buffering changes the top path, while the live register/stream
@@ -240,7 +244,7 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
   auto actual = decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions");
   auto sources = transport->getAttrOfType<ArrayAttr>("goldengate.sourceStreams");
   if (!catalog || catalog.size() != hosts.size() || !readBindings || readBindings != writeBindings ||
-      !actual || !sources || (rocket ? actual.size() != hosts.size() + 11 :
+      !actual || actual.empty() || !sources || (!rocket &&
           (readBindings.size() != hosts.size() + 1 + tracerV || actual.size() != readBindings.size())))
     return reject("allocated Print header requires a complete matching Print/count catalog");
   SmallVector<ControlMMIOWidget> widgets;
@@ -298,8 +302,10 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
     // FPGATop registers Print after the original bridges and before LoadMem
     // and CPU streams. Their banks participate in the same stable size sort;
     // deriving a Print-only map would silently emit wrong driver addresses.
+    // Its complete live catalog also determines the region count: multiple
+    // TracerV/NIC widgets make the historical fixed eleven-bank tail invalid.
     SmallVector<ControlMMIOWidget> complete;
-    if (failed(allocateRocketControlMMIORegions(circuit, 25, hosts, complete, regions, error))) return failure();
+    if (failed(allocateRocketControlMMIORegions(circuit, addressBits, hosts, complete, regions, error))) return failure();
   } else {
     SmallVector<ControlMMIOWidget> complete;
     if (tracerV) {
@@ -325,7 +331,7 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
       widgets.push_back(trace);
       controlPorts.push_back(StringAttr::get(circuit.getContext(), "tracerv_ctrl"));
     } else complete = widgets;
-    if (failed(allocateControlMMIORegions(25, complete, regions, error))) return failure();
+    if (failed(allocateControlMMIORegions(addressBits, complete, regions, error))) return failure();
   }
   if (regions.size() != actual.size())
     return reject("allocated Print header region count differs from materialized allocation");
@@ -371,7 +377,31 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
   // emitter to validate the actual trigger-register SSA, constructor payload,
   // analyzed clock and live queue before publishing any caller collateral.
   if (tracerV && failed(prepareTracerVHeader(*staged, error))) return failure();
-  auto transportHeader = cast<DictionaryAttr>(staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations").getValue().back()).getAs<StringAttr>("body");
+  StringAttr transportHeader, transportPeerMap;
+  DictionaryAttr transportProtocol;
+  bool requiresF2Protocol = false;
+  for (auto module : staged->getOps<FModuleOp>())
+    requiresF2Protocol |= module->hasAttr("goldengate.f2CPUWordReads");
+  for (auto attr : staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+    auto d = dyn_cast<DictionaryAttr>(attr);
+    auto cls = d ? d.getAs<StringAttr>("class") : StringAttr();
+    auto suffix = d ? d.getAs<StringAttr>("fileSuffix") : StringAttr();
+    if (!cls || !suffix || cls.getValue() != AnnotationClasses::OutputFile) continue;
+    if (suffix.getValue() == ".const.h")
+      transportHeader = d.getAs<StringAttr>("body");
+    if (suffix.getValue() == ".peer2peer.const.yaml")
+      transportPeerMap = d.getAs<StringAttr>("body");
+    if (suffix.getValue() == ".f2-cpu-stream-protocol.json") {
+      if (transportProtocol) return reject("allocated Print CPU transport has duplicate F2 ACK protocol");
+      transportProtocol = d;
+    }
+  }
+  if (bool(transportProtocol) != requiresF2Protocol ||
+      (transportProtocol && (!transportProtocol.getAs<StringAttr>("body") ||
+          transportProtocol.getAs<StringAttr>("body").getValue().empty())))
+    return reject("allocated Print CPU transport F2 ACK protocol is missing or unexpected");
+  if (!transportHeader || !transportPeerMap)
+    return reject("allocated Print CPU transport header/address map is missing");
   std::string result; llvm::raw_string_ostream out(result);
   out << (rocket ? "// Rocket Print/count allocation" : "// Selected Print/count allocation")
       << "; include under the standard Golden Gate GET_* guards.\n"
@@ -390,5 +420,7 @@ LogicalResult goldengate::preparePrintBridgeAllocatedHeader(CircuitOp circuit,
     out << "}, " << slot << "U, args, " << streamIndices[slot] << "U).release());\n";
   }
   out << "#endif // GET_BRIDGE_CONSTRUCTOR\n" << transportHeader.getValue(); out.flush();
+  if (peerMap) *peerMap = transportPeerMap.getValue().str();
+  if (f2StreamProtocol) *f2StreamProtocol = transportProtocol;
   header = std::move(result); return success();
 }

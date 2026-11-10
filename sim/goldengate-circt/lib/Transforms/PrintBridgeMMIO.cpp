@@ -3,6 +3,7 @@
 // for the implemented Print hosts and their live CPU stream count bank.
 #include "goldengate/PrintBridgePayload.h"
 #include "goldengate/PrintBridgeHeader.h"
+#include "goldengate/PrintControlWidth.h"
 #include "goldengate/HostMemoryWriteArbiter.h"
 #include "goldengate/HostMemoryWriteResponses.h"
 #include "goldengate/HostMemoryReadArbiter.h"
@@ -81,6 +82,9 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::mapPrintBridgeTracerVControl(CircuitOp circuit,
                                                       std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   FModuleOp adapter;
   for (auto m : circuit.getOps<FModuleOp>())
@@ -92,7 +96,7 @@ LogicalResult goldengate::mapPrintBridgeTracerVControl(CircuitOp circuit,
   if (adapter)
     for (auto m : staged->getOps<FModuleOp>())
       if (m.getName() == adapter.getName()) { m.erase(); break; }
-  if (failed(mapTracerVBridgeControl(*staged, 25, 12, error))) return failure();
+  if (failed(mapTracerVBridgeControl(*staged, addressBits, 12, error))) return failure();
   FModuleOp native;
   for (auto m : staged->getOps<FModuleOp>())
     if (m.getName() == "GGTracerVMCRFile") native = m;
@@ -118,6 +122,9 @@ LogicalResult goldengate::mapPrintBridgeTracerVControl(CircuitOp circuit,
 
 LogicalResult goldengate::mapPrintBridgeControlDispatch(CircuitOp circuit,
                                                        std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGCPUStreamCountWrapper")
     return reject("Print control dispatch requires the allocated CPU count wrapper");
@@ -255,16 +262,16 @@ LogicalResult goldengate::mapPrintBridgeControlDispatch(CircuitOp circuit,
   // A later bank/dispatcher can fail after earlier wrappers have been created.
   // Stage the whole operation so even such failures preserve existing IR IDs.
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
-  if (failed(mapCPUStreamControl(*staged, 25, 12, error))) return failure();
+  if (failed(mapCPUStreamControl(*staged, addressBits, 12, error))) return failure();
   ControlMMIOWidget counts;
   if (failed(deriveControlMMIOWidget(*staged, "CPUManagedStreamEngine_0", "GGCPUStreamMCRFile",
         {"GGCPUStreamCountBank"}, counts, error))) return failure();
   widgets.push_back(counts);
   controls.push_back({"CPUManagedStreamEngine_0", "cpuStream_ctrl"});
   SmallVector<ControlMMIORegion> regions;
-  if (failed(allocateControlMMIORegions(25, widgets, regions, error)) ||
-      failed(addControlErrorSlave(*staged, 25, 12, "GGCPUStreamControlWrapper", error)) ||
-      failed(addControlAddressDecode(*staged, 25, regions, error)) ||
+  if (failed(allocateControlMMIORegions(addressBits, widgets, regions, error)) ||
+      failed(addControlErrorSlave(*staged, addressBits, 12, "GGCPUStreamControlWrapper", error)) ||
+      failed(addControlAddressDecode(*staged, addressBits, regions, error)) ||
       failed(addControlWriteRoute(*staged, error)) ||
       failed(addControlWriteDispatch(*staged, error)) ||
       failed(bindControlWidgetWrites(*staged, controls, error)) ||
@@ -284,6 +291,9 @@ namespace {
 using namespace goldengate;
 LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
                                   std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGControlReadDispatchWrapper")
     return reject("Print control responses require the selected AR dispatch wrapper");
@@ -365,14 +375,14 @@ LogicalResult mapControlResponses(CircuitOp circuit, bool rocket,
   }
   SmallVector<ControlMMIORegion> allocated;
   if (rocket) {
-    if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts,
+    if (failed(allocateRocketControlMMIORegions(circuit, addressBits, printHosts,
             widgets, allocated, error))) return failure();
   } else {
     ControlMMIOWidget counts;
     if (failed(deriveControlMMIOWidget(circuit, "CPUManagedStreamEngine_0", "GGCPUStreamMCRFile",
             {"GGCPUStreamCountBank"}, counts, error))) return failure();
     widgets.push_back(counts);
-    if (failed(allocateControlMMIORegions(25, widgets, allocated, error))) return failure();
+    if (failed(allocateControlMMIORegions(addressBits, widgets, allocated, error))) return failure();
   }
   if (allocated.size() != regions.size()) return reject("Print response allocation count differs");
   for (auto [i, region] : llvm::enumerate(allocated)) {
@@ -458,6 +468,9 @@ LogicalResult goldengate::mapPrintBridgeRocketControlResponses(CircuitOp circuit
 
 LogicalResult goldengate::mapPrintBridgeRocketSimulationMaster(CircuitOp circuit,
                                                               std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGControlWriteTrackerWrapper")
     return reject("Rocket Print master requires the completed response tracker boundary");
@@ -505,7 +518,7 @@ LogicalResult goldengate::mapPrintBridgeRocketSimulationMaster(CircuitOp circuit
   }
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<ControlMMIORegion> allocated;
-  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+  if (failed(allocateRocketControlMMIORegions(circuit, addressBits, printHosts, widgets, allocated, error)))
     return failure();
   if (allocated.size() != regions.size()) return reject("Rocket Print master allocation count differs");
   // The old eleven-bank address is no longer correct once Print is present.
@@ -534,7 +547,7 @@ LogicalResult goldengate::mapPrintBridgeRocketSimulationMaster(CircuitOp circuit
   }
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(attachSimulationMasterBank(*staged, find(*staged, "GGSimulationMasterBank"), error)) ||
-      failed(mapSimulationMasterControl(*staged, 25, 12, error)) ||
+      failed(mapSimulationMasterControl(*staged, addressBits, 12, error)) ||
       failed(bindSimulationMasterControl(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print master produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
@@ -553,6 +566,9 @@ LogicalResult goldengate::mapPrintBridgeRocketSimulationMaster(CircuitOp circuit
 // a missing channel, malformed bank or late wrapper collision leaves IR intact.
 LogicalResult goldengate::mapPrintBridgeRocketTSI(CircuitOp circuit,
                                                 std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGSimulationMasterBoundWrapper")
     return reject("Rocket Print TSI requires the completed SimulationMaster boundary");
@@ -596,7 +612,7 @@ LogicalResult goldengate::mapPrintBridgeRocketTSI(CircuitOp circuit,
   }
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<ControlMMIORegion> allocated;
-  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+  if (failed(allocateRocketControlMMIORegions(circuit, addressBits, printHosts, widgets, allocated, error)))
     return failure();
   if (allocated.size() != regions.size()) return reject("Rocket Print TSI allocation count differs");
   for (auto [i, region] : llvm::enumerate(allocated)) {
@@ -614,7 +630,7 @@ LogicalResult goldengate::mapPrintBridgeRocketTSI(CircuitOp circuit,
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   if (failed(addTSITokenEngine(*staged, error)) || failed(addTSIWordQueues(*staged, error)) ||
       failed(attachTSIMMIOBank(*staged, find(*staged, "GGTSIMMIOBank"), error)) ||
-      failed(mapTSIBridgeControl(*staged, 25, 12, error)) ||
+      failed(mapTSIBridgeControl(*staged, addressBits, 12, error)) ||
       failed(bindTSIBridgeControl(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print TSI produced invalid FIRRTL IR");
   llvm::StringSet<> originalNames;
@@ -634,6 +650,9 @@ LogicalResult goldengate::mapPrintBridgeRocketTSI(CircuitOp circuit,
 // a missing channel, malformed bank or late wrapper collision leaves IR intact.
 LogicalResult goldengate::mapPrintBridgeRocketBlockDev(CircuitOp circuit,
                                                 std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGTSIBridgeBoundWrapper")
     return reject("Rocket Print BlockDev requires the completed TSI boundary");
@@ -680,7 +699,7 @@ LogicalResult goldengate::mapPrintBridgeRocketBlockDev(CircuitOp circuit,
   }
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<ControlMMIORegion> allocated;
-  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+  if (failed(allocateRocketControlMMIORegions(circuit, addressBits, printHosts, widgets, allocated, error)))
     return failure();
   if (allocated.size() != regions.size()) return reject("Rocket Print BlockDev allocation count differs");
   for (auto [i, region] : llvm::enumerate(allocated)) {
@@ -700,7 +719,7 @@ LogicalResult goldengate::mapPrintBridgeRocketBlockDev(CircuitOp circuit,
       failed(addBlockDevRequestQueue(*staged, error)) || failed(addBlockDevDataQueue(*staged, error)) ||
       failed(addBlockDevReadResponseQueue(*staged, error)) || failed(addBlockDevWriteAckQueue(*staged, error)) ||
       failed(attachBlockDevMMIOBank(*staged, find(*staged, "GGBlockDevMMIOBank"), error)) ||
-      failed(mapBlockDevBridgeControl(*staged, 25, 12, error)) || failed(bindBlockDevBridgeControl(*staged, error)) ||
+      failed(mapBlockDevBridgeControl(*staged, addressBits, 12, error)) || failed(bindBlockDevBridgeControl(*staged, error)) ||
       failed(addBlockDevWriteLatency(*staged, error)) || failed(addBlockDevReadLatency(*staged, error)) ||
       failed(addBlockDevResponseScheduler(*staged, error))) return failure();
   if (failed(verify(*staged))) return reject("Rocket Print BlockDev produced invalid FIRRTL IR");
@@ -722,6 +741,9 @@ LogicalResult goldengate::mapPrintBridgeRocketBlockDev(CircuitOp circuit,
 // No cached analysis is preserved. Timing, host-memory and MMIO binding follow.
 LogicalResult goldengate::mapPrintBridgeRocketFASEDIngress(CircuitOp circuit,
                                                         std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != "GGBlockDevResponseSchedulerWrapper")
     return reject("Rocket Print FASED ingress requires the completed BlockDev boundary");
@@ -749,7 +771,7 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDIngress(CircuitOp circuit,
   }
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<ControlMMIORegion> allocated;
-  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+  if (failed(allocateRocketControlMMIORegions(circuit, addressBits, printHosts, widgets, allocated, error)))
     return failure();
   if (allocated.size() != regions.size()) return reject("Rocket Print FASED ingress allocation count differs");
   for (auto [i, region] : llvm::enumerate(allocated)) {
@@ -786,6 +808,9 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDIngress(CircuitOp circuit,
 // and live Rocket allocator. Reject stale region metadata before staging IR.
 static LogicalResult validateRocketPrintFASEDAllocation(CircuitOp circuit,
                                                        std::string &error) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   auto find = [](CircuitOp c, StringRef name) -> FModuleOp {
     for (auto m : c.getOps<FModuleOp>()) if (m.getName() == name) return m;
@@ -811,7 +836,7 @@ static LogicalResult validateRocketPrintFASEDAllocation(CircuitOp circuit,
   }
   SmallVector<ControlMMIOWidget> widgets;
   SmallVector<ControlMMIORegion> allocated;
-  if (failed(allocateRocketControlMMIORegions(circuit, 25, printHosts, widgets, allocated, error)))
+  if (failed(allocateRocketControlMMIORegions(circuit, addressBits, printHosts, widgets, allocated, error)))
     return failure();
   if (allocated.size() != regions.size()) return reject("Rocket Print FASED allocation count differs");
   for (auto [i, region] : llvm::enumerate(allocated)) {
@@ -1405,11 +1430,14 @@ LogicalResult goldengate::mapPrintBridgeRocketFASEDMMIOBank(CircuitOp circuit,
 // live read data, zero legacy strobe and retirement through arbiter readiness.
 static LogicalResult attachPrintFASEDControl(CircuitOp circuit, StringRef inputName,
                                              std::string &error, bool bindSlave = true) {
+  auto addressWidth = goldengate::printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const unsigned addressBits = *addressWidth;
   auto reject = [&](StringRef why) { error = why.str(); return failure(); };
   if (circuit.getName() != inputName)
     return reject("Print FASED control requires the completed MMIO bank");
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
-  if (failed(mapFASEDBridgeControl(*staged, 25, 12, error))) return failure();
+  if (failed(mapFASEDBridgeControl(*staged, addressBits, 12, error))) return failure();
   const StringRef fragments[]{"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
       "GGFASEDHistograms", "GGFASEDStatistics", "GGFASEDFunctionalModelRegister",
       "GGFASEDResponseErrors"};
@@ -3174,13 +3202,16 @@ LogicalResult goldengate::mapPrintBridgeRocketCPUStreamPort(
 // explicit FAME host clock/reset identities. Consume no annotations; transfer
 // public targets and produce HostClockSource. Preserve private targets and all
 // existing IR identities. Rebuild hierarchy analyses after publishing the shell.
-// Output: five unchanged U250 interface types, one retained child, no new state.
+// Output: five selected-platform interface types, one retained child, no new state.
 // Clone staging makes every unsupported boundary rejection atomic.
 LogicalResult goldengate::mapPrintBridgeRocketFPGATopShell(
     CircuitOp circuit, std::string &error) {
+  auto addressWidth = printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const bool isF2 = *addressWidth == 32;
   if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
-  if (failed(attachFPGATopShell(*staged, "GGPrintCPUStreamPlatformWrapper", error)))
+  if (failed(attachFPGATopShell(*staged, "GGPrintCPUStreamPlatformWrapper", error, isF2)))
     return failure();
   if (failed(verify(*staged))) {
     error = "Print FPGATop shell produced invalid FIRRTL IR"; return failure();
@@ -3197,16 +3228,19 @@ LogicalResult goldengate::mapPrintBridgeRocketFPGATopShell(
 // Required input invariants: validated live Rocket Print allocation; the
 // expanded five-port FPGATop shell forwards each public interface once to its
 // unique Print CPU platform child; retained HostClockSource and raw archive.
-// Annotations consumed: none. Produced: DDR OutputFile and U250 XDCPaths.
+// Annotations consumed: none. Produced: DDR OutputFile and platform XDCPaths.
 // Transfer circuit identity recursively; keep local targets on retained modules.
 // IR mutations: publish only the verified shared F1Shim, circuit/archive rename.
 // Analyses required: Print allocation. Preserved: existing modules, ports, SSA
 // values and operations. Rebuild hierarchy analyses after adding the platform.
-// Output invariants: exact U250 interfaces, two host-reset modulo-4096 control
+// Output invariants: selected platform interfaces, two host-reset modulo-4096 control
 // request ID counters, inactive QSFP lanes, one memory channel. Clone staging
 // makes all unsupported boundary and verification failures atomic.
 LogicalResult goldengate::mapPrintBridgeRocketF1Shim(
     CircuitOp circuit, std::string &error) {
+  auto addressWidth = printControlAddressBits(circuit, error);
+  if (!addressWidth) return failure();
+  const bool isF2 = *addressWidth == 32;
   if (failed(validateRocketPrintFASEDAllocation(circuit, error))) return failure();
   FModuleOp shell, platform;
   for (auto m : circuit.getOps<FModuleOp>()) {
@@ -3245,7 +3279,7 @@ LogicalResult goldengate::mapPrintBridgeRocketF1Shim(
   }
   if (!expected.empty()) return reject();
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
-  if (failed(assembleF1Shim(*staged, error))) return failure();
+  if (failed(assembleF1Shim(*staged, error, isF2))) return failure();
   if (failed(verify(*staged))) {
     error = "Print F1Shim produced invalid FIRRTL IR"; return failure();
   }
