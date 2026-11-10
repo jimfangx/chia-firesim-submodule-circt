@@ -74,6 +74,7 @@ $(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(partition_he
 	cmake -S $(firesim_base_dir)/goldengate-circt -B $(goldengate_circt_build) -G Ninja \
 		-DCIRCT_DIR=$(GOLDENGATE_CIRCT_PREFIX)/lib/cmake/circt \
 		-DCMAKE_BUILD_TYPE=$(GOLDENGATE_CIRCT_BUILD_TYPE) \
+		-DBUILD_TESTING=OFF \
 		-DZLIB_ROOT=$(abspath $(GOLDENGATE_CIRCT_PREFIX)/..)
 	# Build the compiler here; CTest executables are built by focused validation.
 	cmake --build $(goldengate_circt_build) --target goldengate-circt
