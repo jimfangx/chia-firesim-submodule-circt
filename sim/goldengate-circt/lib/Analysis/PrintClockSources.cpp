@@ -12,6 +12,13 @@ using namespace circt::firrtl;
 LogicalResult goldengate::analyzePrintClockSources(
     CircuitOp circuit, ArrayRef<PrintStub> stubs, ArrayRef<WiredPrint> routes,
     SmallVectorImpl<PrintClockSource> &sources, std::string &error) {
+  return analyzePrintClockSources(circuit, stubs, routes, sources, error, false);
+}
+
+LogicalResult goldengate::analyzePrintClockSources(
+    CircuitOp circuit, ArrayRef<PrintStub> stubs, ArrayRef<WiredPrint> routes,
+    SmallVectorImpl<PrintClockSource> &sources, std::string &error,
+    bool skipUndriven) {
   std::map<StringRef, FModuleOp> modules;
   llvm::DenseMap<Value, SmallVector<Value>> drivers;
   for (auto module : circuit.getOps<FModuleOp>()) {
@@ -116,6 +123,10 @@ LogicalResult goldengate::analyzePrintClockSources(
     while (true) {
       Inputs inputs;
       if (failed(cone(clock, inputs))) return failure();
+      // AssertionSynthesis's FindClockSources drops assertions with no root
+      // clock (e.g. an undriven clock in AssertTorture). Other consumers keep
+      // their strict contract; ambiguous multi-root clocks always fail.
+      if (skipUndriven && inputs.empty()) break;
       if (inputs.size() != 1) {
         error = "printf clock has " + std::to_string(inputs.size()) +
             " input Clock drivers in " + module.getName().str() +

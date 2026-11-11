@@ -6,6 +6,7 @@
 #include "goldengate/ControlPortWidth.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/AutoCounterBridge.h"
+#include "goldengate/AssertionBridge.h"
 #include "mlir/IR/Builders.h"
 #include <functional>
 #include <map>
@@ -318,6 +319,57 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
       owner = found->second; value = owner.getArgument(result.getResultNumber());
     }
     if (!reachesHost) return reject("Rocket request port does not reach its instantiated CSV bank");
+    widgets.push_back({widget, port});
+  }
+  SmallVector<FModuleOp> assertionHosts;
+  if (failed(discoverBoundAssertionBridgeHosts(circuit, assertionHosts, error))) return failure();
+  std::set<std::string> allocatedAssertion;
+  for (auto attr : regions) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    auto name = row ? row.getAs<StringAttr>("name") : StringAttr();
+    if (name && name.getValue().starts_with("AssertBridgeModule_") &&
+        !allocatedAssertion.insert(name.getValue().str()).second)
+      return reject("Rocket request allocation duplicates a Assertion bank");
+  }
+  if (allocatedAssertion.size() != assertionHosts.size())
+    return reject("Rocket request allocation must identify every instantiated Assertion bank");
+  for (auto [index, host] : llvm::enumerate(assertionHosts)) {
+    auto widget = "AssertBridgeModule_" + std::to_string(index);
+    auto port = "assertion_" + std::to_string(index) + "_ctrl";
+    if (!allocatedAssertion.erase(widget)) return reject("Rocket request allocation omits a Assertion bank");
+    Value value;
+    for (unsigned p = 0; p < top.getNumPorts(); ++p)
+      if (top.getPortName(p) == port && top.getPortDirection(p) == Direction::In &&
+          top.getPortType(p) == host.getPortType(7)) value = top.getArgument(p);
+    // A matching AXI type is insufficient: prove the port reaches this exact
+    // logical widget through unique, whole-bundle forwarding at every wrapper.
+    FModuleOp owner = top;
+    bool reachesHost = false;
+    std::set<std::pair<Operation *, unsigned>> visited;
+    for (unsigned depth = 0; value && depth < 4096; ++depth) {
+      auto argument = dyn_cast<BlockArgument>(value);
+      if (!argument || !visited.emplace(owner.getOperation(), argument.getArgNumber()).second) break;
+      Value dest; unsigned drivers = 0;
+      for (auto &op : *owner.getBodyBlock()) {
+        if (auto connect = dyn_cast<ConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+        if (auto connect = dyn_cast<StrictConnectOp>(op))
+          if (connect.getSrc() == value) { dest = connect.getDest(); ++drivers; }
+      }
+      auto result = dyn_cast_or_null<OpResult>(dest);
+      auto instance = result ? dyn_cast<InstanceOp>(result.getOwner()) : InstanceOp();
+      if (drivers != 1 || !instance) break;
+      auto found = modules.find(instance.getModuleName().str());
+      if (found == modules.end() || result.getResultNumber() >= found->second.getNumPorts() ||
+          found->second.getPortDirection(result.getResultNumber()) != Direction::In) break;
+      if (found->second == host) {
+        reachesHost = owner->hasAttr("goldengate.assertionHostBindings") &&
+            instance.getName() == widget && result.getResultNumber() == 7;
+        break;
+      }
+      owner = found->second; value = owner.getArgument(result.getResultNumber());
+    }
+    if (!reachesHost) return reject("Rocket request port does not reach its instantiated Assertion bank");
     widgets.push_back({widget, port});
   }
   return bindControlWidgetWrites(circuit, widgets, error);

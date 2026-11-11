@@ -84,6 +84,7 @@ class FireSimCompilerSelectionTest(unittest.TestCase):
         self.assertEqual(rtl.read_text(), "CIRCT.sv\nBLACKBOX\n\n")
         args = json.loads(self.calls.read_text())
         self.assertIn("--compile-baseline", args)
+        self.assertNotIn("--enable-synth-asserts", args)
         self.assertEqual(args[args.index('--platform-config') + 1], "BaseF2Config")
         for suffix in (".const.h", ".const.vh", ".partition.const.h",
                        ".peer2peer.const.yaml", ".memory-origins.json",
@@ -111,6 +112,22 @@ class FireSimCompilerSelectionTest(unittest.TestCase):
         self.assertIn("native compiler failed", result.stderr)
         self.assertEqual(len(self.calls.read_text().splitlines()), 1)
         self.assertFalse((self.generated / "FireSim-generated.sv").exists())
+
+    def test_synthesized_assertions_configuration_reaches_native_compiler(self):
+        result = self.make("compile", "PLATFORM_CONFIG=WithSynthAsserts_BaseF2Config")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--enable-synth-asserts", json.loads(self.calls.read_text()))
+
+    def test_synthesized_assertions_explicit_option_reaches_native_compiler(self):
+        result = self.make("compile", "GOLDENGATE_CIRCT_SYNTH_ASSERTS=enabled")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("--enable-synth-asserts", json.loads(self.calls.read_text()))
+
+    def test_invalid_synthesized_assertions_option_stops_build(self):
+        result = self.make("compile", "GOLDENGATE_CIRCT_SYNTH_ASSERTS=yes")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("GOLDENGATE_CIRCT_SYNTH_ASSERTS must be enabled or disabled", result.stderr)
+        self.assertFalse(self.calls.exists())
 
     def test_standard_platform_fragments_reach_native_compiler(self):
         result = self.make("compile", "PLATFORM_CONFIG=WithAutoCounter_WithAutoILA_ILADepth2048_BaseF2Config")

@@ -21,6 +21,7 @@
 #include "goldengate/FASEDHeader.h"
 #include "goldengate/PrintBridgeHeader.h"
 #include "goldengate/AutoCounterBridge.h"
+#include "goldengate/AssertionBridge.h"
 #include "goldengate/AnnotationClasses.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
@@ -177,6 +178,61 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
       attr = next.getDictionary(circuit.getContext());
     }
     if (!found) return reject("Rocket CSV driver interface header is missing");
+    staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(updated));
+  }
+  SmallVector<FModuleOp> assertionHosts;
+  if (failed(discoverBoundAssertionBridgeHosts(*staged, assertionHosts, error))) return failure();
+  if (!assertionHosts.empty()) {
+    SmallVector<FModuleOp> printHosts;
+    if (printWrapper) {
+      auto rows = printWrapper->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
+      for (auto attr : rows) {
+        auto row = cast<DictionaryAttr>(attr);
+        auto name = row.getAs<StringAttr>("hostModule");
+        for (auto module : staged->getOps<FModuleOp>())
+          if (module.getName() == name) printHosts.push_back(module);
+      }
+    }
+    auto info = assertionHosts.front()->getAttrOfType<DictionaryAttr>("goldengate.assertionHost");
+    unsigned addressBits = info.getAs<IntegerAttr>("addressBits").getInt();
+    SmallVector<ControlMMIOWidget> widgets;
+    SmallVector<ControlMMIORegion> regions;
+    if (failed(allocateRocketControlMMIORegions(*staged, addressBits, printHosts, widgets, regions, error)))
+      return failure();
+    FModuleOp decoder;
+    for (auto module : staged->getOps<FModuleOp>())
+      if (module.getName() == "GGControlAddressDecode") decoder = module;
+    auto actual = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
+    if (!actual || actual.size() != regions.size())
+      return reject("Rocket Assertion driver requires the complete shared MMIO allocation");
+    for (auto [i, region] : llvm::enumerate(regions)) {
+      auto row = dyn_cast<DictionaryAttr>(actual[i]);
+      if (!row || row.getAs<StringAttr>("name") != region.name ||
+          !row.getAs<IntegerAttr>("start") || row.getAs<IntegerAttr>("start").getInt() != int64_t(region.start) ||
+          !row.getAs<IntegerAttr>("size") || row.getAs<IntegerAttr>("size").getInt() != int64_t(region.size) ||
+          !row.getAs<IntegerAttr>("slave") || row.getAs<IntegerAttr>("slave").getInt() != int64_t(i))
+        return reject("Rocket Assertion driver allocation differs from the live platform");
+    }
+    std::string fragment;
+    if (failed(prepareAssertionBridgeHeader(*staged, assertionHosts, regions, fragment, error))) return failure();
+    OpBuilder b(circuit.getContext());
+    auto annotations = staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> updated(annotations.begin(), annotations.end());
+    bool found = false;
+    for (auto &attr : updated) {
+      auto row = dyn_cast<DictionaryAttr>(attr);
+      if (!row || row.getAs<StringAttr>("class") != AnnotationClasses::OutputFile ||
+          row.getAs<StringAttr>("fileSuffix") != ".const.h") continue;
+      auto body = row.getAs<StringAttr>("body");
+      if (found || !body || row.get("goldengate.assertionBridgeHeader"))
+        return reject("Rocket Assertion driver requires one unextended Assertion header");
+      found = true;
+      NamedAttrList next(row);
+      next.set("body", b.getStringAttr(body.getValue().str() + fragment));
+      next.set("goldengate.assertionBridgeHeader", b.getBoolAttr(true));
+      attr = next.getDictionary(circuit.getContext());
+    }
+    if (!found) return reject("Rocket Assertion driver interface header is missing");
     staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(updated));
   }
   // SimpleNIC constructor stream indices belong to the shared CPU catalog.

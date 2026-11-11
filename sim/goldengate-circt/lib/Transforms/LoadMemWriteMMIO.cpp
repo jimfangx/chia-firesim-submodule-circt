@@ -38,13 +38,25 @@ LogicalResult goldengate::addLoadMemWriteMMIO(CircuitOp circuit, std::string &er
   const llvm::StringRef names[]{"hostClock", "hostReset", "loadmem_write_ready", "loadmem_write_valid",
       "loadmem_write_bits_addr", "loadmem_write_bits_len", "loadmem_zero_ready", "loadmem_zero_valid", "loadmem_zero_finished"};
   const unsigned widths[]{0,1,1,1,34,34,1,1,1};
+  const auto innerPorts = inner.getPorts();
   unsigned indices[9];
   for (unsigned j = 0; j < 9; ++j) {
+    Type expectedType = ClockType::get(context);
+    if (j != 0) expectedType = uint(widths[j]);
     std::optional<unsigned> found;
-    for (auto [i, p] : llvm::enumerate(inner.getPorts()))
+    for (auto [i, p] : llvm::enumerate(innerPorts))
       if (p.name == names[j] && p.direction == (j == 2 || j == 6 || j == 8 ? Direction::Out : Direction::In) &&
-          p.type == (j == 0 ? Type(ClockType::get(context)) : Type(uint(widths[j])))) found = i;
-    if (!found) return reject("LoadMem write MMIO needs exact U250 clock/reset and request geometry");
+          p.type == expectedType) found = i;
+    if (!found) {
+      error = "LoadMem write MMIO needs exact U250 clock/reset and request geometry: " + names[j].str();
+      for (auto p : innerPorts) if (p.name == names[j]) {
+        llvm::raw_string_ostream stream(error); stream << " has type " << p.type
+          << " direction " << unsigned(p.direction) << "; expected "
+          << expectedType
+          << " direction " << unsigned(j == 2 || j == 6 || j == 8 ? Direction::Out : Direction::In);
+      }
+      return failure();
+    }
     indices[j] = *found;
   }
   for (auto p : inner.getPorts()) {

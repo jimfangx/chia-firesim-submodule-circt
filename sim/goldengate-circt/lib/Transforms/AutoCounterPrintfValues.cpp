@@ -162,9 +162,12 @@ LogicalResult goldengate::synthesizeAutoCounterPrintf(
     b.setInsertionPointToEnd(module.getBodyBlock());
     auto loc = module.getLoc();
     auto bit = UIntType::get(b.getContext(), 1);
-    auto trigger = b.create<WireOp>(loc, bit, names.newName("trigger"));
     auto one = b.create<ConstantOp>(loc, bit, llvm::APInt(1, 1));
-    b.create<StrictConnectOp>(loc, trigger.getResult(), one.getResult());
+    // SFC's wire driven by one becomes a node at its normalized handoff.
+    // Emit that representation directly: TriggerWiring replaces its input
+    // with the per-clock synchronized trigger enable.
+    auto trigger = b.create<NodeOp>(loc, one.getResult(),
+                                    b.getStringAttr(names.newName("trigger")));
     auto enable = b.create<AndPrimOp>(loc, trigger.getResult(), value.printEnable);
     auto ref = StringRef(value.source.target).split('>').second;
     auto print = b.create<PrintFOp>(loc, value.source.clock, enable.getResult(),

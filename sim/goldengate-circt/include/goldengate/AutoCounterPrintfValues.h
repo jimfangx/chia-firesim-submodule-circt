@@ -20,7 +20,7 @@ mlir::LogicalResult synthesizeAutoCounterPrintfValues(
     llvm::SmallVectorImpl<AutoCounterPrintfValue> &values, std::string &error);
 struct AutoCounterPrintf {
   AutoCounterPrintfValue value;
-  circt::firrtl::WireOp trigger;
+  circt::firrtl::NodeOp trigger;
   circt::firrtl::PrintFOp print;
 };
 // Complete onModulePrintfImpl's printf generation. Preserve the input records

@@ -35,6 +35,7 @@ GOLDENGATE_CIRCT_NIC_MODE ?= normal
 # Translate the standard AutoILA compiler fragments; explicit variables also
 # support native invocations without a Scala compiler configuration instance.
 goldengate_circt_config_fragments := $(subst _, ,$(PLATFORM_CONFIG))
+GOLDENGATE_CIRCT_SYNTH_ASSERTS ?= $(if $(filter WithSynthAsserts,$(goldengate_circt_config_fragments)),enabled,disabled)
 GOLDENGATE_CIRCT_AUTOILA ?= $(if $(filter WithAutoILA,$(goldengate_circt_config_fragments)),enabled,disabled)
 GOLDENGATE_CIRCT_ILA_DEPTH ?= $(or $(patsubst ILADepth%,%,$(firstword $(filter ILADepth%,$(goldengate_circt_config_fragments)))),1024)
 GOLDENGATE_CIRCT_ILA_PROBE_TRIGGERS ?= 2
@@ -47,6 +48,11 @@ ifeq ($(GOLDENGATE_CIRCT_AUTOILA),enabled)
 goldengate_circt_ila_flags := --enable-autoila --ila-depth $(GOLDENGATE_CIRCT_ILA_DEPTH) --ila-probe-triggers $(GOLDENGATE_CIRCT_ILA_PROBE_TRIGGERS)
 else ifneq ($(GOLDENGATE_CIRCT_AUTOILA),disabled)
 $(error GOLDENGATE_CIRCT_AUTOILA must be enabled or disabled)
+endif
+ifeq ($(GOLDENGATE_CIRCT_SYNTH_ASSERTS),enabled)
+goldengate_circt_feature_flags += --enable-synth-asserts
+else ifneq ($(GOLDENGATE_CIRCT_SYNTH_ASSERTS),disabled)
+$(error GOLDENGATE_CIRCT_SYNTH_ASSERTS must be enabled or disabled)
 endif
 ifeq ($(GOLDENGATE_CIRCT_AUTOCOUNTER),printf)
 goldengate_circt_feature_flags += --enable-autocounter-printf

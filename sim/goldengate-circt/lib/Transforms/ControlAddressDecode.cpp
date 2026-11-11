@@ -5,6 +5,7 @@
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/AutoCounterBridge.h"
+#include "goldengate/AssertionBridge.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/ADT/StringSet.h"
@@ -317,6 +318,12 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
   }
   if (failed(bank("TSIBridgeModule_0", "GGTSIMMIOBank", {"GGTSIMMIOBank"}, Direction::Out)) ||
       failed(bank("ClockBridgeModule_0", "GGClockBridgeMCRFile", {"GGSingleClockBridge"}))) return failure();
+  SmallVector<FModuleOp> assertionHosts;
+  SmallVector<ControlMMIOWidget> assertionCatalog;
+  if (failed(discoverBoundAssertionBridgeHosts(circuit, assertionHosts, error)) ||
+      failed(deriveAssertionControlMMIOCatalog(circuit, assertionHosts, assertionCatalog, error)))
+    return failure();
+  catalog.append(assertionCatalog.begin(), assertionCatalog.end());
   // AutoCounterTransform runs before PrintSynthesis and appends the CSV
   // constructors first. Both participate in HasWidgets' stable size sort.
   SmallVector<FModuleOp> csvHosts;

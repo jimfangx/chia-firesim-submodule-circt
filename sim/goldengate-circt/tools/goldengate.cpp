@@ -46,6 +46,8 @@
 #include "goldengate/AutoCounterResetGate.h"
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/AutoCounterSynthesis.h"
+#include "goldengate/AssertionSynthesis.h"
+#include "goldengate/AssertionBridge.h"
 #include "goldengate/AutoCounterPipeline.h"
 #include "goldengate/AutoCounterControl.h"
 #include "goldengate/InstrumentationControl.h"
@@ -416,6 +418,7 @@ int main(int argc, char **argv) {
   bool disableAutoCounter =
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
   bool enableSynthPrints = false;
+  bool enableSynthAsserts = false;
   bool enableMultiThreading = false;
   bool compileBaseline =
       argc >= 7 &&
@@ -470,7 +473,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--platform-config config] [--output-filename-base name] [--enable-autoila] "
-                    "[--enable-synth-prints] [--enable-autocounter-printf | --enable-autocounter-csv] [--enable-multithreading] [--nic-mode=normal|loopback] [--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser [--map-print-host-fased-timing-cycle]]]]]]]]]]]]]]]]]]]]]] "
+                    "[--enable-synth-prints] [--enable-synth-asserts] [--enable-autocounter-printf | --enable-autocounter-csv] [--enable-multithreading] [--nic-mode=normal|loopback] [--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser [--map-print-host-fased-timing-cycle]]]]]]]]]]]]]]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -536,6 +539,11 @@ int main(int argc, char **argv) {
       if (option == "--enable-autoila") {
         if (enableAutoILA) return fail("duplicate --enable-autoila");
         enableAutoILA = true;
+        continue;
+      }
+      if (option == "--enable-synth-asserts") {
+        if (enableSynthAsserts) return fail("duplicate --enable-synth-asserts");
+        enableSynthAsserts = true;
         continue;
       }
       if (option == "--enable-synth-prints") {
@@ -817,6 +825,8 @@ int main(int argc, char **argv) {
         if (fasedFRFCFS)
           return fail("duplicate FRFCFS16GBQuadRankLLC4MB compiler configuration");
         fasedFRFCFS = true;
+      } else if (fragment == "WithSynthAsserts") {
+        enableSynthAsserts = true;
       } else if (fragment == "WithPrintfSynthesis") {
         enableSynthPrints = true;
       } else if (fragment == "WithAutoCounter") {
@@ -1954,6 +1964,17 @@ int main(int argc, char **argv) {
       goldengate::coerceAsyncToSyncReset(circuit);
       llvm::outs() << "Coerced CIRCT target resets to synchronous Bool resets\n";
     }
+    if (compileBaseline && enableSynthAsserts) {
+      mlir::PassManager lowForm(module->getContext());
+      lowForm.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+      if (failed(lowForm.run(*module)))
+        return fail("enabled AssertionSynthesis ExpandWhens failed");
+      unsigned assertions = 0;
+      if (failed(goldengate::synthesizeAssertions(circuit, assertions, error)))
+        return fail("enabled AssertionSynthesis: " + error);
+      llvm::outs() << "Synthesized " << assertions
+                   << " target assertion instances for CIRCT host binding\n";
+    }
     unsigned removed = 0;
     if (enableAutoCounterPrintf || enableAutoCounterCSV) {
       mlir::PassManager lowForm(module->getContext());
@@ -2071,11 +2092,11 @@ int main(int argc, char **argv) {
                      << resetIRPath << '\n';
       }
 
-      // New Print bridges were absent from the initial aggregate clock map.
+      // Synthesized instrumentation bridges were absent from the initial clock map.
       // Refresh their metadata after reset wiring, as in MidasTransforms.
-      if ((enableSynthPrints || enableAutoCounterCSV) &&
+      if ((enableSynthPrints || enableAutoCounterCSV || enableSynthAsserts) &&
           failed(goldengate::analyzeChannelClocksAndUpdateBridges(circuit, error)))
-        return fail("enabled Print bridge clock analysis: " + error);
+        return fail("enabled instrumentation bridge clock analysis: " + error);
       if (mlir::failed(goldengate::wrapTop(circuit, error)))
         return fail("WrapTop: " + error);
       if (enableAutoILA && failed(goldengate::prepareAutoILAAnnotations(
@@ -3118,6 +3139,17 @@ int main(int argc, char **argv) {
       llvm::outs() << "Activated CIRCT FAME PipeChannel wrapper in "
                    << activeIRPath << '\n';
       } // Selected SRAM and baseline FAME paths share all host/platform stages.
+      if (enableSynthAsserts) {
+        llvm::SmallVector<FModuleOp> assertionHosts;
+        if (failed(goldengate::materializeAssertionBridgeHosts(
+                circuit, ctrlAddressBits, 12, assertionHosts, error)) ||
+            failed(goldengate::bindAssertionBridgeHosts(circuit, assertionHosts, error)))
+          return fail("production assertion host construction: " + error);
+        if (failed(mlir::verify(*module)))
+          return fail("production assertion hosts produced invalid FIRRTL IR");
+        llvm::outs() << "Bound " << assertionHosts.size()
+                     << " assertion hosts to the complete simulator transport\n";
+      }
       llvm::SmallVector<FModuleOp> productionCSVHosts;
       if (enableAutoCounterCSV) {
         if (failed(goldengate::materializeAutoCounterBridgeHosts(

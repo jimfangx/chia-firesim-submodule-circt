@@ -1,6 +1,7 @@
 // See LICENSE for license details.
 #include "goldengate/AutoCounterPrintfValues.h"
 #include "goldengate/AutoCounterResetGate.h"
+#include "goldengate/TriggerWiring.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/HW/HWDialect.h"
@@ -114,6 +115,7 @@ void checkPrints(CircuitOp circuit, ArrayRef<goldengate::AutoCounterPrintf> prin
   for (auto [i, record] : llvm::enumerate(prints)) {
     auto print = record.print;
     auto trigger = record.trigger;
+    require(isa<NodeOp>(trigger.getOperation()), "trigger sink is not a node");
     auto value = record.value;
     auto condition = dyn_cast<AndPrimOp>(print.getCond().getDefiningOp());
     require(condition && condition.getLhs() == trigger.getResult() &&
@@ -251,6 +253,40 @@ void run(MLIRContext &context) {
     require(succeeded(goldengate::synthesizeEnabledAutoCounterPrintf(
         enabledCircuit, {}, synthesized, error)) && synthesized == 0 &&
         before == dump(*enabled), "repeated production invocation duplicated counters");
+    // Exercise the actual producer/consumer boundary with live trigger sources.
+    // With no sources TriggerWiring only consumes annotations, hiding a bad sink
+    // representation. Both printf modes and both sink clocks must be rewired.
+    SmallVector<Attribute> triggerAnnotations(retained.begin(), retained.end());
+    for (bool credit : {true, false})
+      triggerAnnotations.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::InternalTriggerSource)),
+          b.getNamedAttr("target", b.getStringAttr("~Top|Top>e1")),
+          b.getNamedAttr("clock", b.getStringAttr("~Top|Top>clock")),
+          b.getNamedAttr("sourceType", b.getBoolAttr(credit))}));
+    triggerAnnotations.push_back(b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("channelInfo", b.getDictionaryAttr({b.getNamedAttr("class",
+            b.getStringAttr(goldengate::AnnotationClasses::TargetClockChannel))})),
+        b.getNamedAttr("sinks", b.getArrayAttr({b.getStringAttr("~Top|Top>clock")}))}));
+    enabledCircuit->setAttr("rawAnnotations", b.getArrayAttr(triggerAnnotations));
+    unsigned consumed = 0;
+    require(succeeded(goldengate::wireTriggers(enabledCircuit, consumed, error)), error);
+    require(consumed == 2 && succeeded(verify(*enabled)), "printf/trigger integration failed");
+    unsigned synchronized = 0;
+    enabledModule.walk([&](PrintFOp print) {
+      auto condition = cast<AndPrimOp>(print.getCond().getDefiningOp());
+      auto node = dyn_cast<NodeOp>(condition.getLhs().getDefiningOp());
+      auto sync = node ? node.getInput().getDefiningOp<RegOp>() : RegOp();
+      require(sync && sync.getClockVal() == print.getClock(),
+              "printf sink did not receive its local-clock trigger synchronizer");
+      ++synchronized;
+    });
+    require(synchronized == 10, "not all generated printf sinks were synchronized");
+    for (auto attr : enabledCircuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      auto anno = cast<DictionaryAttr>(attr);
+      require(anno.getAs<StringAttr>("class") != goldengate::AnnotationClasses::InternalTriggerSink,
+              "generated trigger sink annotation was not consumed");
+    }
   }
   // No selected events still consumes unused generated cover annotations, as
   // AutoCounterTransform.execute does after its empty-selection doTransform.

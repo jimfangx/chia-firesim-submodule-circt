@@ -51,6 +51,7 @@ add_executable(goldengate-circt
   lib/Transforms/AutoCounterResetGate.cpp
   lib/Transforms/AutoCounterPrintfValues.cpp
   lib/Transforms/AutoCounterSynthesis.cpp
+  lib/Transforms/AssertionSynthesis.cpp
   lib/Transforms/AutoCounterPipeline.cpp
   lib/Transforms/AutoCounterControl.cpp
   lib/Transforms/InstrumentationControl.cpp
@@ -77,6 +78,8 @@ add_executable(goldengate-circt
   lib/Transforms/FAMEModelGraph.cpp
   lib/Transforms/AutoCounterBridgeBinding.cpp
   lib/Transforms/AutoCounterBridge.cpp
+  lib/Transforms/AssertionBridge.cpp
+  lib/Transforms/AssertionBridgeBinding.cpp
   lib/Transforms/TriggerWiring.cpp
   lib/Transforms/ChannelExcision.cpp
   lib/Transforms/InferModelPorts.cpp
@@ -576,6 +579,8 @@ if(BUILD_TESTING)
   add_executable(goldengate-instrumentation-control-test
     test/Transforms/InstrumentationControlTest.cpp ${instrumentationSources}
     lib/Transforms/AutoCounterBridge.cpp
+  lib/Transforms/AssertionBridge.cpp
+  lib/Transforms/AssertionBridgeBinding.cpp
     lib/Transforms/AutoCounterBridgeBinding.cpp
     lib/Transforms/AutoCounterControl.cpp
     lib/Transforms/InstrumentationControl.cpp)
@@ -651,6 +656,7 @@ if(BUILD_TESTING)
   add_executable(goldengate-autocounter-printf-values-test
     test/Transforms/AutoCounterPrintfValuesTest.cpp
     lib/Transforms/AutoCounterPrintfValues.cpp
+    lib/Transforms/TriggerWiring.cpp
     lib/Transforms/AutoCounterResetGate.cpp lib/Analysis/AutoCounterAnalysis.cpp
     lib/Support/TargetUtils.cpp)
   target_compile_features(goldengate-autocounter-printf-values-test PRIVATE cxx_std_17)
@@ -2834,6 +2840,7 @@ if(BUILD_TESTING)
           lib/Transforms/ControlAddressDecode.cpp
           lib/Transforms/CPUStreamRead.cpp
           lib/Transforms/AutoCounterBridgeBinding.cpp
+          lib/Transforms/AssertionBridgeBinding.cpp
           lib/Support/TargetUtils.cpp)
         if(NOT goldengate_control_dependency IN_LIST goldengate_control_sources)
           target_sources(${goldengate_control_target} PRIVATE ${goldengate_control_dependency})
@@ -2842,4 +2849,50 @@ if(BUILD_TESTING)
       endforeach()
     endif()
   endforeach()
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-assertion-synthesis-test
+    test/Transforms/AssertionSynthesisTest.cpp
+    lib/Transforms/AssertionSynthesis.cpp lib/Analysis/PrintClockSources.cpp)
+  target_compile_features(goldengate-assertion-synthesis-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-assertion-synthesis-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-assertion-synthesis-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-assertion-synthesis-test PRIVATE
+    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-assertion-synthesis COMMAND goldengate-assertion-synthesis-test
+    ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AssertionSynthesis)
+endif()
+
+if(BUILD_TESTING)
+  add_executable(goldengate-assertion-bridge-test
+    test/Transforms/AssertionBridgeTest.cpp lib/Transforms/AssertionBridge.cpp
+    lib/Transforms/ClockBridgeControl.cpp lib/Transforms/ControlAddressDecode.cpp
+    lib/Transforms/AutoCounterBridgeBinding.cpp lib/Transforms/AssertionBridgeBinding.cpp
+    lib/Transforms/CPUStreamRead.cpp lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-assertion-bridge-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-assertion-bridge-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-assertion-bridge-test PRIVATE
+    include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+  target_link_libraries(goldengate-assertion-bridge-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-assertion-bridge COMMAND goldengate-assertion-bridge-test)
+endif()
+if(BUILD_TESTING AND Python3_Interpreter_FOUND)
+  find_program(GOLDENGATE_ASSERT_FIRTOOL NAMES firtool
+    HINTS "${CIRCT_DIR}/../../../bin")
+  find_program(GOLDENGATE_ASSERT_VERILATOR NAMES verilator
+    HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.conda-env/bin")
+  if(GOLDENGATE_ASSERT_FIRTOOL AND GOLDENGATE_ASSERT_VERILATOR)
+    add_test(NAME goldengate-assertion-bridge-rtl
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AssertionBridgeRTLTest.py
+        $<TARGET_FILE:goldengate-assertion-bridge-test>
+        ${CMAKE_CURRENT_BINARY_DIR}/assertion-bridge-rtl
+        --firtool ${GOLDENGATE_ASSERT_FIRTOOL}
+        --verilator ${GOLDENGATE_ASSERT_VERILATOR}
+        --cxx ${CMAKE_CXX_COMPILER}
+        --runtime-include ${CMAKE_CURRENT_SOURCE_DIR}/../midas/src/main/cc)
+  endif()
 endif()

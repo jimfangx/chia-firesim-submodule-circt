@@ -28,6 +28,14 @@ mlir::LogicalResult analyzePrintClockSources(
     circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
     llvm::ArrayRef<WiredPrint> routes,
     llvm::SmallVectorImpl<PrintClockSource> &sources, std::string &error);
+// AssertionSynthesis may omit routes with no clock driver, matching SFC.
+// Ambiguous or cyclic clock cones still fail. routeIndex identifies the input
+// route even when earlier undriven routes were omitted.
+mlir::LogicalResult analyzePrintClockSources(
+    circt::firrtl::CircuitOp circuit, llvm::ArrayRef<PrintStub> stubs,
+    llvm::ArrayRef<WiredPrint> routes,
+    llvm::SmallVectorImpl<PrintClockSource> &sources, std::string &error,
+    bool skipUndriven);
 // Finish BridgeTopWiring: resolve clocks, append one output Clock per native
 // top input, and replace pending input annotations with five-field outputs.
 // Group outputs by local source in module/statement order, retaining absolute

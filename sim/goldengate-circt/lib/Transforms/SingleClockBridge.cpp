@@ -33,8 +33,9 @@ LogicalResult goldengate::addClockBridge(CircuitOp circuit,
   constexpr llvm::StringLiteral controlName = "clockBridge_mcr";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
   bool printBoundary = circuit.getName() == "GGPrintBridgeHostWrapper";
+  bool assertionBoundary = circuit.getName() == "GGAssertionBridgeHostWrapper";
   bool csvBoundary = circuit.getName() == "GGAutoCounterBridgeHostWrapper";
-  if (circuit.getName() != "GGFAMEPipeWrapper" && !printBoundary && !csvBoundary)
+  if (circuit.getName() != "GGFAMEPipeWrapper" && !printBoundary && !csvBoundary && !assertionBoundary)
     return reject("clock bridge requires the active FAME PipeChannel wrapper");
   FModuleOp inner;
   for (auto &op : circuit.getBodyBlock()->getOperations()) {
@@ -60,6 +61,8 @@ LogicalResult goldengate::addClockBridge(CircuitOp circuit,
       registry = "goldengate.printHostBindings";
     else if (boundary.getName() == "GGAutoCounterBridgeHostWrapper")
       registry = "goldengate.autocounterHostBindings";
+    else if (boundary.getName() == "GGAssertionBridgeHostWrapper")
+      registry = "goldengate.assertionHostBindings";
     else return reject("clock bridge instrumentation child is not the active simulator transport");
     auto bindings = boundary->getAttrOfType<ArrayAttr>(registry);
     InstanceOp sim;
