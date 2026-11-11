@@ -4,6 +4,7 @@
 // normal/error dequeue count. Validate all bindings before mutating the IR.
 // Retain annotation classes/payloads; copied targets move to the wrapper and
 // consumed dispatch targets remain on the inner module.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlReadTracker.h"
 #include "goldengate/ControlTransactionTracker.h"
 #include "mlir/IR/Builders.h"
@@ -31,10 +32,10 @@ LogicalResult goldengate::addControlReadTracker(CircuitOp circuit,
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto bindings = inner ? inner->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings") : ArrayAttr();
   auto catalog = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
-  if (!inner || !raw || !bindings || !catalog || catalog.empty() || catalog.size() > 63)
-    return reject("control read tracker requires retained annotations, read bindings and one to 63 decoded regions");
+  if (!inner || !raw || !bindings || !catalog || !goldengate::validControlRegionCount(catalog.size()))
+    return reject("control read tracker requires retained annotations, read bindings and a representable nonempty decoded region catalog");
   const unsigned slaveCount = catalog.size();
-  const unsigned routeWidth = llvm::Log2_64_Ceil(slaveCount + 1);
+  const unsigned routeWidth = goldengate::controlRouteWidth(slaveCount);
   SmallVector<StringAttr> regionNames;
   std::set<std::string> uniqueNames;
   for (auto [i, a] : llvm::enumerate(catalog)) {

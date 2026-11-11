@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 // Port NastiRouter's AW/W dispatch as FIRRTL mux, bit-select and connect ops.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlWriteDispatch.h"
 #include "goldengate/ControlPortWidth.h"
 #include "mlir/IR/Builders.h"
@@ -20,8 +21,8 @@ LogicalResult goldengate::addControlWriteDispatch(CircuitOp circuit, std::string
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto catalog=decoder?decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions"):ArrayAttr();
-  if(!inner||!raw||!catalog||catalog.empty()||catalog.size()>63)
-    return reject("control write dispatch needs retained annotations and one to 63 decoded regions");
+  if(!inner||!raw||!catalog||!goldengate::validControlRegionCount(catalog.size()))
+    return reject("control write dispatch needs retained annotations and a representable nonempty decoded region catalog");
   const unsigned slaveCount=catalog.size();
   auto addressWidth = controlPortWidth(inner, "ctrl_decode_aw_addr");
   if (!addressWidth) return reject("control write dispatch requires a typed AW address boundary");

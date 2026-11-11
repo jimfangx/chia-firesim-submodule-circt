@@ -5,7 +5,7 @@
 #include <string>
 namespace goldengate {
 // NastiRouter RRArbiter and accepted B response signals. The decoder catalog
-// supplies 1..63 normal sources; the error source occupies its final index.
+// supplies one source per normal region; the error source occupies its final index.
 // Read bindings identify consumed widget bundles by region name and index.
 mlir::LogicalResult addControlWriteArbiter(circt::firrtl::CircuitOp circuit,
                                          std::string &error);

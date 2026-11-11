@@ -272,7 +272,7 @@ void test(MLIRContext &ctx) {
     auto r = fixture(ctx, bad); auto ci = *r->getOps<CircuitOp>().begin(); auto s = dump(*r);
     require(failed(goldengate::addControlWriteArbiter(ci, error)), "malformed boundary accepted"); require(dump(*r) == s, "rejection mutated IR"); ++rejected;
   }
-  for (unsigned count : {0u, 64u}) {
+  for (unsigned count : {0u}) {
     auto r = fixture(ctx, 0, count); auto ci = *r->getOps<CircuitOp>().begin(); auto before = dump(*r);
     require(failed(goldengate::addControlWriteArbiter(ci, error)), "invalid catalog count accepted");
     require(dump(*r) == before, "invalid catalog count mutated IR"); ++rejected;

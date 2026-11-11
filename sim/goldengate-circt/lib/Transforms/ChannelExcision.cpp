@@ -179,6 +179,7 @@ LogicalResult goldengate::exciseChannels(CircuitOp circuit,
           !isa<ClockType>(dest.getType()))
         continue;
       unsigned sourceIndex;
+      bool newSource = false;
       if (auto found = modelSourcePorts.find(source);
           found != modelSourcePorts.end()) {
         sourceIndex = found->second;
@@ -193,6 +194,7 @@ LogicalResult goldengate::exciseChannels(CircuitOp circuit,
         sourceIndex = top.getNumPorts();
         newPort(sourceName, dest.getType(), Direction::Out);
         modelSourcePorts.insert({source, sourceIndex});
+        newSource = true;
         renames.emplace(rhsTarget, topPrefix + sourceName);
       }
       std::string sinkName = uniqueName(lhs->first.getName().str() + "_" +
@@ -201,11 +203,16 @@ LogicalResult goldengate::exciseChannels(CircuitOp circuit,
       Value sink = newPort(sinkName, source.getType(), Direction::In);
       renames.emplace(lhsTarget, topPrefix + sinkName);
       op->setOperand(1, sink);
-      OpBuilder builder(op);
-      builder.setInsertionPointAfter(op);
-      builder.create<ConnectOp>(op->getLoc(),
-                                top.getBodyBlock()->getArgument(sourceIndex),
-                                source);
+      // A fanout shares one source boundary. Re-emitting its identical
+      // connection per sink makes the otherwise unique hierarchy binding
+      // appear multiply driven to InferModelPorts.
+      if (newSource) {
+        OpBuilder builder(op);
+        builder.setInsertionPointAfter(op);
+        builder.create<ConnectOp>(op->getLoc(),
+                                  top.getBodyBlock()->getArgument(sourceIndex),
+                                  source);
+      }
       continue;
     }
 

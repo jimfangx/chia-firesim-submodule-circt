@@ -1,12 +1,13 @@
 // See LICENSE for license details.
 // CIRCT implementation of junctions/ReorderQueue.scala's small-tag storage.
-// Required input invariants: one to 63 decoded slaves, twelve-bit tags; dequeue
+// Required input invariants: a nonempty decoded slave catalog, twelve-bit tags; dequeue
 // valid means accepted B or accepted final R, as wired by the owning wrapper.
 // Annotations consumed/produced: none. Analyses required: none.
 // IR mutations: create a tracker module with storage and NastiRouter retirement
 // assertions. Existing modules, ports and annotations are preserved.
 // Output invariants: assertions sample pre-edge matches on the tracker clock,
 // disabled during reset; assertions do not change storage or handshake behavior.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlTransactionTracker.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
@@ -14,8 +15,8 @@
 using namespace mlir;
 using namespace circt::firrtl;
 llvm::SmallVector<PortInfo> goldengate::controlTransactionTrackerPorts(MLIRContext *ctx, unsigned slaveCount) {
-  if (!slaveCount || slaveCount > 63) return {};
-  const unsigned routeWidth = llvm::Log2_64_Ceil(slaveCount + 1);
+  if (!goldengate::validControlRegionCount(slaveCount)) return {};
+  const unsigned routeWidth = goldengate::controlRouteWidth(slaveCount);
   OpBuilder b(ctx); std::map<std::string, unsigned> hpIndex;
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   SmallVector<PortInfo> hp;
@@ -34,8 +35,8 @@ llvm::SmallVector<PortInfo> goldengate::controlTransactionTrackerPorts(MLIRConte
 }
 FModuleOp goldengate::createControlTransactionTracker(CircuitOp circuit, llvm::StringRef name,
                                                      llvm::StringRef queueName, unsigned slaveCount) {
-  if (!slaveCount || slaveCount > 63) return {};
-  const unsigned routeWidth = llvm::Log2_64_Ceil(slaveCount + 1);
+  if (!goldengate::validControlRegionCount(slaveCount)) return {};
+  const unsigned routeWidth = goldengate::controlRouteWidth(slaveCount);
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); };
   auto hp = controlTransactionTrackerPorts(ctx, slaveCount); std::map<std::string, unsigned> hpIndex;

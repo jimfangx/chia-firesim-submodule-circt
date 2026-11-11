@@ -1,10 +1,12 @@
 // See LICENSE for license details.
 #include "goldengate/FindDefaultClocks.h"
+#include "goldengate/PassthroughSourceAnalysis.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/STLExtras.h"
 #include <deque>
 
 using namespace circt::firrtl;
@@ -26,6 +28,7 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
   std::string topPrefix = "~" + circuit.getName().str() + "|" +
                           top.getName().str() + ">";
   StringAttr referenceClockPort;
+  SmallVector<StringAttr> referenceClockPorts;
   for (Attribute attr : raw) {
     Annotation annotation(attr);
     if (!annotation.isClass(goldengate::AnnotationClasses::ChannelConnection))
@@ -40,6 +43,11 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
       if (target && target.getValue().starts_with(topPrefix)) {
         referenceClockPort = StringAttr::get(
             circuit.getContext(), target.getValue().drop_front(topPrefix.size()));
+        for (Attribute attr : sinks)
+          if (auto sink = dyn_cast<StringAttr>(attr);
+              sink && sink.getValue().starts_with(topPrefix))
+            referenceClockPorts.push_back(StringAttr::get(
+                circuit.getContext(), sink.getValue().drop_front(topPrefix.size())));
         break;
       }
     }
@@ -98,6 +106,24 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
     error = "target-clock channel sink is not connected to a hub model";
     return failure();
   }
+  FModuleOp hubModule;
+  for (auto model : circuit.getOps<FModuleOp>())
+    if (model.getName() == hub.getModuleName())
+      hubModule = model;
+  llvm::DenseSet<Value> hubDomainInputs;
+  top.walk([&](Operation *op) {
+    if (!isa<ConnectOp, StrictConnectOp>(op)) return;
+    auto input = instancePort(op->getOperand(0));
+    auto source = op->getOperand(1);
+    if (hubModule && input && input->first == hub &&
+        isa<ClockType>(source.getType()) &&
+        llvm::is_contained(referenceClockPorts, topPortNames.lookup(source)))
+      hubDomainInputs.insert(hubModule.getArgument(input->second));
+  });
+  DenseMap<Value, StringAttr> preferredClocks;
+  llvm::DenseSet<StringAttr> localDomainClocks;
+  PassthroughSourceAnalysis aliases(circuit, /*preserveModelOutputs=*/false);
+  DenseMap<StringAttr, Value> clockRoots, topClockRoots;
   // A hub port is a separate clock graph node. This preserves distinct hub
   // clocks even when one hub instance drives several satellite domains.
   top.walk([&](Operation *op) {
@@ -112,8 +138,22 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
           return;
         std::string target = topPrefix + candidate.getName().str() + "." +
                              candidate.getPortNameStr(port).str();
-        directClocks[other.getOperation()].push_back(
-            StringAttr::get(circuit.getContext(), target));
+        auto name = StringAttr::get(circuit.getContext(), target);
+        directClocks[other.getOperation()].push_back(name);
+        if (hubModule && !clockRoots.count(name)) {
+          auto root = aliases.trace(hubModule, hubModule.getArgument(port));
+          clockRoots[name] = root.value_or(Value());
+          auto topRoot = aliases.trace(top, candidate.getResult(port));
+          topClockRoots[name] = topRoot.value_or(Value());
+          // A feedback alias may be a separate hub input locally. Prefer an
+          // exported clock rooted in the actual target-clock channel input,
+          // so later FAME metadata resolves it to that declared hub domain.
+          if (root && topRoot && hubDomainInputs.contains(*root) &&
+              candidate.getPortDirection(port) == Direction::Out) {
+            preferredClocks.try_emplace(*topRoot, name);
+            localDomainClocks.insert(name);
+          }
+        }
       };
       add(lhs->first, lhs->second, rhs->first);
       add(rhs->first, rhs->second, lhs->first);
@@ -127,19 +167,36 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
   auto defaultClock = [&](InstanceOp satellite) -> StringAttr {
     std::deque<Operation *> queue{satellite.getOperation()};
     llvm::DenseSet<Operation *> visited;
-    StringAttr found;
+    StringAttr found, componentClock;
+    bool aliasesFound = false;
     while (!queue.empty()) {
       Operation *node = queue.front();
       queue.pop_front();
       if (!visited.insert(node).second)
         continue;
       for (StringAttr clock : directClocks[node]) {
+        if (!componentClock && localDomainClocks.contains(clock))
+          componentClock = clock;
         if (found && found != clock) {
+          // Distinct hub port names may export the same physical clock. Only
+          // accept aliases proven by unconditional identity wiring, including
+          // through hierarchy and parent connections. In particular, a hub
+          // clock input can be fed back from a satellite's clock output alias.
+          // Equal frequencies alone do not establish identity.
+          auto root = clockRoots.lookup(found);
+          auto topRoot = topClockRoots.lookup(found);
+          if ((root && root == clockRoots.lookup(clock)) ||
+              (topRoot && topRoot == topClockRoots.lookup(clock))) {
+            aliasesFound = true;
+            continue;
+          }
           error = "satellite model has ambiguous default clocks: " +
-                  satellite.getName().str();
+                  satellite.getName().str() + " (" + found.getValue().str() +
+                  " versus " + clock.getValue().str() + ")";
           return {};
         }
-        found = clock;
+        if (!found)
+          found = clock;
       }
       for (Operation *neighbor : adjacency[node])
         if (neighbor != hub.getOperation())
@@ -148,6 +205,15 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
     if (!found)
       error = "satellite model has no connected hub clock: " +
               satellite.getName().str();
+    // Preserve established clock names for already unambiguous components.
+    // Canonicalize only proven aliases or feedback inputs outside the local
+    // hub domain, preferring a clock reachable in this same component.
+    if (found && (aliasesFound ||
+                  !hubDomainInputs.contains(clockRoots.lookup(found)))) {
+      if (componentClock) return componentClock;
+      if (auto preferred = preferredClocks.lookup(topClockRoots.lookup(found)))
+        return preferred;
+    }
     return found;
   };
   auto modelFor = [&](ArrayAttr endpoints) -> InstanceOp {

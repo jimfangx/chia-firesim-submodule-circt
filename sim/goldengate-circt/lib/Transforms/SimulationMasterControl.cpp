@@ -1,6 +1,6 @@
 // See LICENSE for license details.
 // Requires: uninstantiated widget MCRFile wrapper, matching platform Nasti ports,
-// retained annotations and an ordered, unique 1..63-region decoder catalog.
+// retained annotations and an ordered, unique nonempty decoder catalog.
 // Widget.scala zips sortedWidgets with the interconnect slaves. Resolve the
 // widget by catalog name: adding a larger bank can move its slot and address.
 // Consume AW/W/AR dispatch and B/R arbiter boundaries using FIRRTL operations.
@@ -12,6 +12,7 @@
 // required: none. Produces: resolved slave attribute; no annotation classes
 // are consumed or produced. Retained targets follow wrapper identity.
 // These bindings add no state and preserve host clock/reset and tracker wiring.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/SimulationMasterControl.h"
 #include "goldengate/ControlPortWidth.h"
 #include "mlir/IR/Builders.h"
@@ -39,8 +40,8 @@ LogicalResult bindWidgetControl(CircuitOp circuit, const WidgetBinding &spec,
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto regions = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
-  if (!inner || !raw || !regions || regions.empty() || regions.size() > 63)
-    return reject("widget binding needs retained annotations and one to 63 regions");
+  if (!inner || !raw || !regions || !goldengate::validControlRegionCount(regions.size()))
+    return reject("widget binding needs retained annotations and a representable nonempty region catalog");
   auto addressWidth = goldengate::controlPortWidth(inner, spec.controlPort.str()+".aw.bits.addr");
   if (!addressWidth) return reject("widget control address width is missing or unsupported");
   const unsigned addressBits = *addressWidth;

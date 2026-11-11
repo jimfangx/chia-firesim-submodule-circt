@@ -15,7 +15,7 @@ namespace goldengate {
 // and wire accepted final beats to each unbound slave's tracker retirement.
 // Output invariants: one selected R source, burst lock held across stalls/gaps,
 // host reset clears cursor/lock, mapped/error R ports are consumed internally.
-// NastiRouter's HellaPeekingArbiter with one source per decoded region (1..63)
+// NastiRouter's HellaPeekingArbiter with one source per decoded region (nonempty, representable)
 // plus the error responder. Accepted last beats release the burst lock and
 // retire the existing AR tracker slots.
 mlir::LogicalResult addControlReadArbiter(circt::firrtl::CircuitOp circuit,

@@ -2,6 +2,7 @@
 // Golden Gate widget regions are half-open byte ranges. Construct address
 // comparisons and one-hot/encoded selections directly as CIRCT FIRRTL ops.
 // The encoder's no-match value selects NastiRouter's stateful error endpoint.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlAddressDecode.h"
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/AutoCounterBridge.h"
@@ -37,7 +38,7 @@ LogicalResult tracerVBanks(CircuitOp circuit, SmallVectorImpl<FModuleOp> &banks,
           !index || suffix != std::to_string(index))) return reject();
       auto native = dyn_cast<FModuleOp>(module.getOperation());
       auto &entries = prefix == "GGTracerVTriggerConfig" ? configs : adapters;
-      if (!native || index >= 63 || !entries.emplace(index, native).second) return reject();
+      if (!native || !entries.emplace(index, native).second) return reject();
     }
   }
   if (configs.empty() || configs.size() != adapters.size()) return reject();
@@ -60,7 +61,7 @@ LogicalResult nicAdapters(CircuitOp circuit, SmallVectorImpl<FModuleOp> &ordered
     auto suffix = name.drop_front(StringRef("GGNICMCRFile").size()); unsigned i = 0;
     auto native = dyn_cast<FModuleOp>(m.getOperation());
     if ((!suffix.empty() && (!suffix.consume_front("_") || suffix.getAsInteger(10, i) ||
-         !i || suffix != std::to_string(i))) || !native || i >= 63 ||
+         !i || suffix != std::to_string(i))) || !native ||
          !adapters.emplace(i, native).second) {
       error = "NIC catalog needs canonical independent MCR adapter indices"; return failure();
     }
@@ -509,8 +510,8 @@ LogicalResult goldengate::allocateControlMMIORegions(unsigned addressBits,
     ArrayRef<ControlMMIOWidget> widgets,
     SmallVectorImpl<ControlMMIORegion> &regions, std::string &error) {
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (!addressBits || addressBits > 63 || widgets.empty() || widgets.size() > 63)
-    return reject("control allocation needs 1..63 address bits and 1..63 widgets");
+  if (!addressBits || addressBits > 63 || !goldengate::validControlRegionCount(widgets.size()))
+    return reject("control allocation needs 1..63 address bits and a representable nonempty widget catalog");
   uint64_t limit = uint64_t(1) << addressBits;
   SmallVector<ControlMMIORegion> allocated;
   for (auto [i, widget] : llvm::enumerate(widgets)) {
@@ -552,8 +553,8 @@ LogicalResult goldengate::addControlAddressDecode(CircuitOp circuit,
   constexpr llvm::StringLiteral wrapperName = "GGControlDecodeWrapper";
   constexpr llvm::StringLiteral helperName = "GGControlAddressDecode";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
-  if (!addressBits || addressBits > 63 || regions.empty() || regions.size() > 63)
-    return reject("control decoder needs 1..63 address bits and 1..63 regions");
+  if (!addressBits || addressBits > 63 || !goldengate::validControlRegionCount(regions.size()))
+    return reject("control decoder needs 1..63 address bits and a representable nonempty region catalog");
   uint64_t limit = uint64_t(1) << addressBits;
   for (auto [i, region] : llvm::enumerate(regions)) {
     if (region.name.empty() || !region.size || region.start >= limit || region.size > limit - region.start)
@@ -582,7 +583,7 @@ LogicalResult goldengate::addControlAddressDecode(CircuitOp circuit,
 
   auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();
   auto uint = [&](unsigned width) { return UIntType::get(context, width, false); };
-  unsigned count = regions.size(), indexBits = std::max(1u, llvm::Log2_64_Ceil(count + 1));
+  unsigned count = regions.size(), indexBits = goldengate::controlRouteWidth(count);
   SmallVector<PortInfo> helperPorts;
   for (auto name : {"aw_addr", "ar_addr"})
     helperPorts.push_back({b.getStringAttr(name), uint(addressBits), Direction::In});

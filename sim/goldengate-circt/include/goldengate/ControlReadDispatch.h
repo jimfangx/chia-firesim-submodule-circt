@@ -6,7 +6,7 @@
 namespace goldengate {
 // NastiRouter AR DecoupledHelper gates, readiness priority and payload broadcast.
 // Requires: uninstantiated widget write wrapper, retained rawAnnotations,
-// ordered unique controlRegions (1..63), matching decoder route/target widths,
+// ordered unique controlRegions (nonempty, representable), matching decoder route/target widths,
 // and a controlWriteBindings subset with exact U250 b/ar/r bundles.
 // Consumes: decoder address and error request boundaries; mapped widget AR IO.
 // Produces: controlReadBindings and helper controlRegions; tracker enqueue IO.

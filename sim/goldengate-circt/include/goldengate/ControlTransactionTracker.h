@@ -5,7 +5,7 @@
 namespace goldengate {
 // NastiRouter ReorderQueue with twelve-bit transaction tags: 64 low-tag slots,
 // six upper tag bits, ceil(log2(slaveCount + 1)) route bits and slaveCount + 1
-// retirement ports (including the error slave). slaveCount must be 1..63.
+// retirement ports (including the error slave). slaveCount must pass validControlRegionCount.
 // Tag and route state have no reset; only free bits reset. Invalid counts return
 // an empty port list/null module without mutating the circuit.
 llvm::SmallVector<circt::firrtl::PortInfo> controlTransactionTrackerPorts(mlir::MLIRContext *context,

@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 // Port NastiRouter's HellaPeekingArbiter response selection and burst locking.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlReadArbiter.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
@@ -26,10 +27,10 @@ LogicalResult goldengate::addControlReadArbiter(CircuitOp circuit,
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto bindings = inner ? inner->getAttrOfType<ArrayAttr>("goldengate.controlReadBindings") : ArrayAttr();
   auto catalog = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
-  if (!inner || !raw || !bindings || !catalog || catalog.empty() || catalog.size() > 63)
-    return reject("control read arbiter requires retained annotations, read bindings and one to 63 decoded regions");
+  if (!inner || !raw || !bindings || !catalog || !goldengate::validControlRegionCount(catalog.size()))
+    return reject("control read arbiter requires retained annotations, read bindings and a representable nonempty decoded region catalog");
   const unsigned slaveCount = catalog.size(), sourceCount = slaveCount + 1;
-  const unsigned indexWidth = llvm::Log2_64_Ceil(sourceCount);
+  const unsigned indexWidth = goldengate::controlRouteWidth(slaveCount);
   SmallVector<StringAttr> regionNames;
   std::set<std::string> uniqueNames;
   for (auto [i, a] : llvm::enumerate(catalog)) {

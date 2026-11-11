@@ -16,6 +16,7 @@
 #include "goldengate/RetainedAnnotationTargets.h"
 #include "FAMEPortAnnotations.h"
 #include "llvm/ADT/BitVector.h"
+#include "llvm/ADT/DenseMap.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
 #include <functional>
@@ -293,6 +294,16 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
   std::map<std::string, std::string> renames;
   SmallVector<DataEndpoint, 0> endpoints;
   std::set<unsigned> claimedTop;
+  // This phase does not mutate signatures or connectivity. Index the stable
+  // hierarchy once instead of scanning every connection for each data leaf.
+  // Keep each matching connection in its original order.
+  llvm::DenseMap<std::pair<Operation *, unsigned>,
+                 SmallVector<const TopPortConnection *>> connectionsByPort;
+  for (const auto &connection : hierarchy->connections) {
+    auto instance = connection.instance;
+    connectionsByPort[{instance.getOperation(), connection.instancePort}]
+        .push_back(&connection);
+  }
   for (const auto &list : {plan->sinks, plan->sources}) for (const auto &endpoint : list) {
     auto binding = *endpoint.binding; auto group = *binding.portGroup;
     auto model = cast<FModuleOp>(group.module.getOperation());
@@ -307,7 +318,8 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
           ".bits" + suffix(oldModel, group.name, group.ports.size());
       auto [r, fresh] = renames.emplace(target(model, oldModel), newModel);
       if (!fresh && r->second != newModel) return reject("incompatible shared model payload identity");
-      for (const auto &connection : hierarchy->connections) if (connection.instance == binding.instance && connection.instancePort == i) {
+      for (const auto *matched : connectionsByPort[{binding.instance.getOperation(), i}]) {
+        const auto &connection = *matched;
         claimedTop.insert(connection.topPort);
         auto oldTop = top.getPortName(connection.topPort);
         auto field = group.direction == Direction::Out && group.ports.size() > 1
@@ -481,8 +493,14 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
         }));
   }
   circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), annotations));
-  for (const auto &[oldTarget, payload] : renames)
-    if (failed(transferFAMEPortDebugTargets(circuit, oldTarget, payload, error))) return failure();
+  // Debug transfers validate and scan retained annotations for each renamed
+  // port. With no debug annotations there is no transfer to perform.
+  bool hasDebugTargets = llvm::any_of(annotations, [](Attribute attr) {
+    return Annotation(attr).isClass(AnnotationClasses::InternalFpgaDebug);
+  });
+  if (hasDebugTargets)
+    for (const auto &[oldTarget, payload] : renames)
+      if (failed(transferFAMEPortDebugTargets(circuit, oldTarget, payload, error))) return failure();
   if (failed(rewriteFAMEModelControls(circuit, controls, error))) return failure();
   for (auto &model : models) {
     // SFC keeps unused clock outputs as local wires in every transformed

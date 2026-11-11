@@ -2,6 +2,7 @@
 // Port junctions.nasti.scala's AR DecoupledHelper and Widget.scala's slave
 // binding with CIRCT FIRRTL operations. Requests and tracker enqueues fire
 // together, even under independent slave and response-tracker backpressure.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlReadDispatch.h"
 #include "goldengate/ControlPortWidth.h"
 #include "mlir/IR/Builders.h"
@@ -25,8 +26,8 @@ LogicalResult goldengate::addControlReadDispatch(CircuitOp circuit,
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto regions=decoder?decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions"):ArrayAttr();
   auto bindings=inner?inner->getAttrOfType<ArrayAttr>("goldengate.controlWriteBindings"):ArrayAttr();
-  if(!inner||!raw||!regions||regions.empty()||regions.size()>63||!bindings)
-    return reject("control read dispatch needs retained annotations, write bindings and one to 63 decoded regions");
+  if(!inner||!raw||!regions||!goldengate::validControlRegionCount(regions.size())||!bindings)
+    return reject("control read dispatch needs retained annotations, write bindings and a representable nonempty decoded region catalog");
   const unsigned slaveCount=regions.size();
   auto addressWidth = controlPortWidth(inner, "ctrl_decode_ar_addr");
   if (!addressWidth) return reject("control read dispatch requires a typed AR address boundary");

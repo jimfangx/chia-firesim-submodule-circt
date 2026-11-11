@@ -163,6 +163,7 @@ void rejection(MLIRContext &ctx) {
     if(bad==7)named(c,"GGControlAddressDecode")->removeAttr("goldengate.controlRegions");
     if(bad==8)named(c,"GGControlAddressDecode")->setAttr("goldengate.controlRegions",b.getArrayAttr({}));
     if(bad==9){SmallVector<Attribute> names(top.getPortNames().begin(),top.getPortNames().end());names[2]=b.getStringAttr("wrongRoute");top.setPortNames(names);}
+    if(bad==10)named(c,"GGControlAddressDecode")->setAttr("goldengate.controlRegions",b.getArrayAttr(SmallVector<Attribute>(65,b.getDictionaryAttr({}))));
     if(bad==11)named(c,"GGControlAddressDecode")->setAttr("goldengate.controlRegions",b.getArrayAttr(SmallVector<Attribute>(13,b.getDictionaryAttr({}))));
     std::string before,after,error;{llvm::raw_string_ostream o(before);root->print(o);}require(failed(goldengate::addControlWriteRoute(c,error)),"invalid boundary accepted");{llvm::raw_string_ostream o(after);root->print(o);}require(before==after,"rejection mutated IR");
   }

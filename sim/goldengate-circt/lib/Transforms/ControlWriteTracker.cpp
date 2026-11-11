@@ -1,10 +1,11 @@
 // See LICENSE for license details.
 // Bind the AW outstanding ReorderQueue to write-route acceptance and B fire.
 // Required input: uninstantiated B-arbiter wrapper, retained annotations and
-// the decoder's one-to-63-region catalog. Region count determines route width
+// the decoder's nonempty region catalog. Region count determines route width
 // and normal/error retirement count; all boundaries validate before mutation.
 // Copied targets transfer to the new top; consumed handshake/retirement targets
 // stay on the inner module. Every annotation class and payload is retained.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlWriteTracker.h"
 #include "goldengate/ControlTransactionTracker.h"
 #include "mlir/IR/Builders.h"
@@ -29,10 +30,10 @@ LogicalResult goldengate::addControlWriteTracker(CircuitOp circuit, std::string 
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto catalog = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
-  if (!inner || !raw || !catalog || catalog.empty() || catalog.size() > 63)
-    return reject("control write tracker requires a top, retained annotations and one to 63 decoded regions");
+  if (!inner || !raw || !catalog || !goldengate::validControlRegionCount(catalog.size()))
+    return reject("control write tracker requires a top, retained annotations and a representable nonempty decoded region catalog");
   const unsigned slaveCount = catalog.size();
-  const unsigned routeWidth = llvm::Log2_64_Ceil(slaveCount + 1);
+  const unsigned routeWidth = goldengate::controlRouteWidth(slaveCount);
   bool used = false;
   circuit.walk([&](InstanceOp i) { used |= i.getModuleName() == inner.getName(); });
   if (used) return reject("control write tracker requires an uninstantiated top");

@@ -57,7 +57,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned bad = 0, unsigned slave
     auto decoder = b.create<FModuleOp>(c.getLoc(), b.getStringAttr("GGControlAddressDecode"),
         ConventionAttr::get(&ctx, Convention::Internal), ArrayRef<PortInfo>{});
     SmallVector<Attribute> regions;
-    for (unsigned i = 0; i < (bad == 11 ? 0 : bad == 12 ? 64 : slaveCount); ++i)
+    for (unsigned i = 0; i < (bad == 11 ? 0 : bad == 12 ? slaveCount + 1 : slaveCount); ++i)
       regions.push_back(b.getDictionaryAttr({b.getNamedAttr("name", b.getStringAttr("slave" + std::to_string(i)))}));
     decoder->setAttr("goldengate.controlRegions", b.getArrayAttr(regions));
   }
@@ -261,10 +261,10 @@ int main(int argc, char **argv) {
     return 1;
   }
   try {
-    for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 14u, 31u, 63u}) test(ctx, count);
+    for (unsigned count : {1u, 2u, 3u, 11u, 12u, 13u, 14u, 31u, 63u, 64u, 65u, 128u}) test(ctx, count);
     auto root = fixture(ctx); auto c = *root->getOps<CircuitOp>().begin();
     auto before = dump(*root);
-    for (unsigned count : {0u, 64u, ~0u}) {
+    for (unsigned count : {0u, ~0u}) {
       require(goldengate::controlTransactionTrackerPorts(&ctx, count).empty(), "invalid helper ports accepted");
       require(!goldengate::createControlTransactionTracker(c, "InvalidTracker", "aw_queue", count), "invalid helper count accepted");
       require(dump(*root) == before, "invalid helper count mutated circuit");

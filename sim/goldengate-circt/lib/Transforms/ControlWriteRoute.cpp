@@ -3,6 +3,7 @@
 // memory, registers and ready/valid expressions. The decoded AW route is copied
 // into a circular queue with one entry per decoded slave. Accepted W.last
 // advances the route. Tracker and selected-slave readiness remain boundaries.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlWriteRoute.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
@@ -25,8 +26,8 @@ LogicalResult goldengate::addControlWriteRoute(CircuitOp circuit, std::string &e
   }
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto catalog = decoder ? decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions") : ArrayAttr();
-  if (!inner || !raw || !catalog || catalog.empty() || catalog.size() > 63)
-    return reject("control write route needs a top, retained annotations and one to 63 decoded regions");
+  if (!inner || !raw || !catalog || !goldengate::validControlRegionCount(catalog.size()))
+    return reject("control write route needs a top, retained annotations and a representable nonempty decoded region catalog");
   const unsigned slaveCount = catalog.size();
   const unsigned pointerWidth = std::max(1u, llvm::Log2_64_Ceil(slaveCount));
   auto *context = circuit.getContext(); OpBuilder b(context); auto loc = circuit.getLoc();

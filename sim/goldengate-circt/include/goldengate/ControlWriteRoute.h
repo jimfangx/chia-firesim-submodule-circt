@@ -6,10 +6,10 @@
 namespace goldengate {
 // NastiRouter's AW route queue and AW/W DecoupledHelper gates. One route
 // per accepted AW, popped only on accepted W.last. One entry per decoded slave
-// (1..63), no flow/pipe; reset flushes occupancy while accepted writes still
+// (nonempty, representable), no flow/pipe; reset flushes occupancy while accepted writes still
 // update unreset RAM.
 // Requires: uninstantiated GGControlDecodeWrapper, host clock/reset, retained
-// rawAnnotations and GGControlAddressDecode's 1..63-entry controlRegions.
+// rawAnnotations and GGControlAddressDecode's nonempty controlRegions.
 // Decoded AW route width must equal the region count.
 // Consumes: no annotations. Produces: queue depth/flow/pipe attributes.
 // Mutates: adds helper and wrapper modules; transfers copied top-port targets

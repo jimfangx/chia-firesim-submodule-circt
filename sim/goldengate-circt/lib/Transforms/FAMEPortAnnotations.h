@@ -34,12 +34,12 @@ inline mlir::FailureOr<unsigned> collectFAMEPayloadSymbols(
     fieldID += bundle.getFieldID(*index);
     type = bundle.getElements()[*index].type;
   }
-  if (type != module.getPorts()[port].type ||
+  if (type != module.getPortType(port) ||
       mlir::isa<BundleType, FVectorType>(type)) {
     error = "FAME data identity requires a matching ground payload";
     return mlir::failure();
   }
-  auto sym = module.getPorts()[port].sym;
+  auto sym = module.getPortSymbolAttr(port);
   if (sym)
     for (auto property : sym) {
       if (property.getFieldID() != 0) {

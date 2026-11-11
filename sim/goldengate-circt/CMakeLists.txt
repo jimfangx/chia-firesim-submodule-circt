@@ -315,6 +315,30 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-promote-passthrough-test PRIVATE
     CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-promote-passthrough COMMAND goldengate-promote-passthrough-test)
+  add_executable(goldengate-find-default-clocks-test
+    test/Transforms/FindDefaultClocksTest.cpp
+    lib/Transforms/FindDefaultClocks.cpp)
+  target_compile_features(goldengate-find-default-clocks-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-find-default-clocks-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-find-default-clocks-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-find-default-clocks-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-find-default-clocks COMMAND goldengate-find-default-clocks-test)
+  add_executable(goldengate-channel-excision-fanout-test
+    test/Transforms/ChannelExcisionFanoutTest.cpp
+    lib/Transforms/ChannelExcision.cpp lib/Transforms/InferModelPorts.cpp
+    lib/Analysis/HierarchyAnalysis.cpp lib/Analysis/ChannelAnalysis.cpp
+    lib/Support/TargetUtils.cpp)
+  target_compile_features(goldengate-channel-excision-fanout-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-channel-excision-fanout-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-channel-excision-fanout-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-channel-excision-fanout-test PRIVATE
+    CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+  add_test(NAME goldengate-channel-excision-fanout COMMAND goldengate-channel-excision-fanout-test)
+
+
   add_test(NAME goldengate-sram-model-channels COMMAND ${CMAKE_COMMAND}
     -DCOMPILER=$<TARGET_FILE:goldengate-circt>
     -DFIXTURES=${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms
@@ -2174,6 +2198,25 @@ if(BUILD_TESTING)
   target_link_libraries(goldengate-control-error-slave-test PRIVATE
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-control-error-slave COMMAND goldengate-control-error-slave-test)
+  add_executable(goldengate-control-region-geometry-test
+    test/Transforms/ControlRegionGeometryTest.cpp
+    lib/Transforms/ControlAddressDecode.cpp
+    lib/Transforms/ControlErrorSlave.cpp
+    lib/Transforms/ControlWriteRoute.cpp
+    lib/Transforms/ControlWriteDispatch.cpp
+    lib/Transforms/ControlReadDispatch.cpp
+    lib/Transforms/ControlReadTracker.cpp
+    lib/Transforms/ControlReadArbiter.cpp
+    lib/Transforms/ControlWriteArbiter.cpp
+    lib/Transforms/ControlWriteTracker.cpp
+    lib/Transforms/ControlTransactionTracker.cpp)
+  target_compile_features(goldengate-control-region-geometry-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-control-region-geometry-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-control-region-geometry-test PRIVATE
+    ${CIRCT_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS} ${CMAKE_CURRENT_SOURCE_DIR}/include)
+  target_link_libraries(goldengate-control-region-geometry-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport)
+  add_test(NAME goldengate-control-region-geometry COMMAND goldengate-control-region-geometry-test)
   add_executable(goldengate-control-address-decode-test
     test/Transforms/ControlAddressDecodeTest.cpp
     lib/Transforms/ControlAddressDecode.cpp)

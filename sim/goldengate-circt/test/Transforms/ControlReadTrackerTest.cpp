@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/ControlReadTracker.h"
+#include "goldengate/ControlRegionGeometry.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/AsmParser/AsmParser.h"
 #include "mlir/IR/Builders.h"
@@ -358,7 +359,7 @@ void test(MLIRContext &ctx, ArrayRef<unsigned> counts) {
     require(dump(*r) == before, "rejection mutated IR"); ++rejected;
   };
   for (unsigned bad = 1; bad <= 26; ++bad) reject(fixture(ctx, bad));
-  reject(fixture(ctx, 0, 0)); reject(fixture(ctx, 0, 64));
+  reject(fixture(ctx, 0, 0));
   for (auto key : {"name", "slave"}) {
     auto r = fixture(ctx); auto c = *r->getOps<CircuitOp>().begin(); auto d = named(c, "GGControlAddressDecode");
     auto rows = d->getAttrOfType<ArrayAttr>("goldengate.controlRegions"); SmallVector<Attribute> out(rows.begin(), rows.end());
@@ -399,12 +400,12 @@ int main(int argc, char **argv) {
       llvm::outs() << "Production NIC AR tracker and cloned helpers verified\n"; return 0;
     } catch (const std::exception &e) { llvm::errs() << e.what() << '\n'; return 1; }
   }
-  SmallVector<unsigned> counts{1U, 2U, 3U, 11U, 12U, 13U, 14U, 31U, 63U};
+  SmallVector<unsigned> counts{1U, 2U, 3U, 11U, 12U, 13U, 14U, 31U, 63U, 64U, 65U, 128U};
   if (argc != 1) {
     unsigned count = 0;
     if (argc != 3 || StringRef(argv[1]) != "--regions" ||
-        StringRef(argv[2]).getAsInteger(10, count) || !count || count > 63) {
-      llvm::errs() << "usage: goldengate-control-read-tracker-test [--regions 1..63] or input.mlir output.mlir [dispatch.mlir tracker.mlir]\n";
+        StringRef(argv[2]).getAsInteger(10, count) || !goldengate::validControlRegionCount(count)) {
+      llvm::errs() << "usage: goldengate-control-read-tracker-test [--regions N] or input.mlir output.mlir [dispatch.mlir tracker.mlir]\n";
       return 1;
     }
     counts.assign(1, count);

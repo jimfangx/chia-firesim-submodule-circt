@@ -382,7 +382,12 @@ void rejection(MLIRContext &context) {
 // Materialized register/MCR contracts for two NICs interleaved with TracerV.
 // The catalog is read-only; the full NIC AXI/queue paths are checked separately.
 void multiNICCatalog(MLIRContext &ctx) {
-  for (StringRef order : {"NNTT","NTNT","NTTN","TNNT","TNTN","TTNN"}) {
+  std::vector<std::string> orders{"NNTT","NTNT","NTTN","TNNT","TNTN","TTNN"};
+  orders.push_back(std::string(64, 'N') + std::string(64, 'T'));
+  orders.push_back(std::string(65, 'T') + std::string(65, 'N'));
+  for (const auto &order : orders) {
+    unsigned nicCount=std::count(order.begin(),order.end(),'N');
+    unsigned tracerCount=std::count(order.begin(),order.end(),'T');
     auto root=fixture(ctx);auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);std::string error;
     auto uint=[&](unsigned w){return UIntType::get(&ctx,w,false);};
     auto token=BundleType::get(&ctx,{{b.getStringAttr("ready"),true,uint(1)},
@@ -408,13 +413,14 @@ void multiNICCatalog(MLIRContext &ctx) {
     const StringRef fased[]{"GGFASEDLatencyRegisters","GGFASEDRequestLimits","GGFASEDHistograms",
       "GGFASEDStatistics","GGFASEDFunctionalModelRegister","GGFASEDResponseErrors"};
     for(unsigned i=0;i<6;++i)add(fased[i],1,Direction::Out,i,false);
-    add("GGNICMMIOBank",6,Direction::Out);add("GGNICMCRFile",6,Direction::In);add("GGNICMCRFile_1",6,Direction::In);
-    for(unsigned i=0;i<2;++i){auto suffix=i?"_1":"";add("GGTracerVTriggerConfig"+std::string(suffix),15,Direction::Out);add("GGTracerVMCRFile"+std::string(suffix),15,Direction::In);}
+    add("GGNICMMIOBank",6,Direction::Out);
+    for(unsigned i=0;i<nicCount;++i)add("GGNICMCRFile"+(i?"_"+std::to_string(i):""),6,Direction::In);
+    for(unsigned i=0;i<tracerCount;++i){auto suffix=i?"_"+std::to_string(i):"";add("GGTracerVTriggerConfig"+std::string(suffix),15,Direction::Out);add("GGTracerVMCRFile"+std::string(suffix),15,Direction::In);}
     add("GGTSIMMIOBank",9,Direction::Out);add("GGSingleClockBridge",6,Direction::Out);add("GGClockBridgeMCRFile",6,Direction::In);
     const StringRef load[]{"GGLoadMemWriteMMIOBank","GGLoadMemWriteDataWrapper","GGLoadMemReadRequestWrapper","GGLoadMemReadDataWrapper"};
     for(unsigned i=0;i<4;++i)add(load[i],1,Direction::Out,i,false);
     add("GGLoadMemMCRFile",4,Direction::In);
-    auto counts=add("GGCPUStreamCountBank",6,Direction::Out);add("GGCPUStreamMCRFile",6,Direction::In);
+    auto counts=add("GGCPUStreamCountBank",2*nicCount+tracerCount,Direction::Out);add("GGCPUStreamMCRFile",2*nicCount+tracerCount,Direction::In);
     auto read=add("GGCPUStreamRead",1,Direction::In,0,false),write=add("GGCPUStreamWrite",1,Direction::In,0,false);
     SmallVector<Attribute> raw,sources,sinks,words;unsigned ni=0,ti=0;
     auto stream=[&](const std::string &name,unsigned index){return b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(name)),b.getNamedAttr("index",b.getI64IntegerAttr(index))});};
@@ -424,21 +430,21 @@ void multiNICCatalog(MLIRContext &ctx) {
       auto name=std::string(nic?"SIMPLENICBRIDGEMODULE_":"TRACERVBRIDGEMODULE_")+std::to_string(i)+"_to_cpu_stream";
       sources.push_back(stream(name,sources.size()));count(name);
     }
-    for(unsigned i=0;i<2;++i){auto name="SIMPLENICBRIDGEMODULE_"+std::to_string(i)+"_from_cpu_stream";sinks.push_back(stream(name,i));count(name);}
+    for(unsigned i=0;i<nicCount;++i){auto name="SIMPLENICBRIDGEMODULE_"+std::to_string(i)+"_from_cpu_stream";sinks.push_back(stream(name,i));count(name);}
     c->setAttr("rawAnnotations",b.getArrayAttr(raw));read->setAttr("goldengate.sourceStreams",b.getArrayAttr(sources));write->setAttr("goldengate.sinkStreams",b.getArrayAttr(sinks));counts->setAttr("goldengate.mmioRegisters",b.getArrayAttr(words));
     SmallVector<goldengate::ControlMMIOWidget> catalog;SmallVector<goldengate::ControlMMIORegion> regions;
     auto dump=[&](){std::string text;llvm::raw_string_ostream os(text);root->print(os);return text;};auto before=dump();
     require(succeeded(goldengate::allocateRocketControlMMIORegions(c,32,{},catalog,regions,error)),error);
-    require(catalog.size()==14&&regions.size()==14&&before==dump(),"multi NIC catalog count or mutation");
+    require(catalog.size()==10+nicCount+tracerCount&&regions.size()==catalog.size()&&before==dump(),"multi NIC catalog count or mutation");
     unsigned seen=0;for(auto &widget:catalog)if(widget.name.starts_with("SimpleNICBridgeModule_"))require(widget.name=="SimpleNICBridgeModule_"+std::to_string(seen++)&&widget.registerCount==6,"NIC constructor order");
     for(unsigned bad=0;bad<4;++bad){auto old=read->getAttr("goldengate.sourceStreams"),oldSink=write->getAttr("goldengate.sinkStreams"),oldRaw=c->getAttr("rawAnnotations");
       if(bad==0){auto rows=sources;NamedAttrList row(cast<DictionaryAttr>(rows.back()));row.set("name",b.getStringAttr("wrong"));rows.back()=row.getDictionary(&ctx);read->setAttr("goldengate.sourceStreams",b.getArrayAttr(rows));}
       if(bad==1)write->setAttr("goldengate.sinkStreams",b.getArrayAttr({sinks[0]}));
       if(bad==2){auto rows=raw;rows.pop_back();c->setAttr("rawAnnotations",b.getArrayAttr(rows));}
-      if(bad==3)named(c,"GGNICMCRFile_1").setName("GGNICMCRFile_2");
+      if(bad==3)named(c,"GGNICMCRFile_1").setName("GGNICMCRFile_"+std::to_string(nicCount));
       auto snapshot=dump();SmallVector<goldengate::ControlMMIOWidget> ws{{"sentinel",1}};SmallVector<goldengate::ControlMMIORegion> rs{{"sentinel",9,4}};
       require(failed(goldengate::allocateRocketControlMMIORegions(c,32,{},ws,rs,error))&&dump()==snapshot&&ws.size()==1&&rs[0].start==9,"multi NIC invalid catalog accepted or mutated");
-      read->setAttr("goldengate.sourceStreams",old);write->setAttr("goldengate.sinkStreams",oldSink);c->setAttr("rawAnnotations",oldRaw);if(bad==3)named(c,"GGNICMCRFile_2").setName("GGNICMCRFile_1");
+      read->setAttr("goldengate.sourceStreams",old);write->setAttr("goldengate.sinkStreams",oldSink);c->setAttr("rawAnnotations",oldRaw);if(bad==3)named(c,"GGNICMCRFile_"+std::to_string(nicCount)).setName("GGNICMCRFile_1");
     }
   }
 }

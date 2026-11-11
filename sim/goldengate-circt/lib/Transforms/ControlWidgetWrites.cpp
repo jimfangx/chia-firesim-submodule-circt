@@ -2,6 +2,7 @@
 // Widget.scala binds each widget's io.ctrl to its allocated Nasti slave.
 // Connect requests and readiness through FIRRTL operations; preserve the
 // independent AW/W routes and the MCRFile's independent request capture.
+#include "goldengate/ControlRegionGeometry.h"
 #include "goldengate/ControlWidgetWrites.h"
 #include "goldengate/ControlPortWidth.h"
 #include "goldengate/ControlAddressDecode.h"
@@ -83,7 +84,7 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
         !index || suffix != std::to_string(index)))
       return reject("Rocket request binding requires canonical TracerV adapter indices");
     auto native = dyn_cast<FModuleOp>(module.getOperation());
-    if (!native || index >= 63 || !tracers.emplace(index, native).second)
+    if (!native || !tracers.emplace(index, native).second)
       return reject("Rocket request binding requires unique native TracerV adapters");
   }
   if (tracers.empty() || tracers.size() != allocatedTracers.size())
@@ -208,7 +209,7 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
     auto suffix = name.drop_front(StringRef("GGNICMCRFile").size()); unsigned i = 0;
     auto native = dyn_cast<FModuleOp>(module.getOperation());
     if ((!suffix.empty() && (!suffix.consume_front("_") || suffix.getAsInteger(10, i) ||
-         !i || suffix != std::to_string(i))) || !native || i >= 63 ||
+         !i || suffix != std::to_string(i))) || !native ||
         !nics.emplace(i, native).second)
       return reject("Rocket NIC request binding needs canonical independent adapter indices");
   }
@@ -389,8 +390,8 @@ LogicalResult goldengate::bindControlWidgetWrites(CircuitOp circuit,
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   auto regions=decoder?decoder->getAttrOfType<ArrayAttr>("goldengate.controlRegions"):ArrayAttr();
-  if(!inner||!raw||!regions||regions.empty()||regions.size()>63)
-    return reject("widget writes require retained annotations and 1..63 decoded regions");
+  if(!inner||!raw||!regions||!goldengate::validControlRegionCount(regions.size()))
+    return reject("widget writes require retained annotations and a representable nonempty decoded region catalog");
   // Widget.scala zips sortedWidgets with the interconnect slaves. Resolve
   // identity through the decoder's allocation rather than assuming the
   // baseline ordering: adding a register bank can shift existing slaves.
