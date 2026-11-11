@@ -10,13 +10,17 @@
 #include "goldengate/AsyncRAMModel.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
+#include "goldengate/RetainedAnnotationTargets.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/StringMap.h"
 #include "llvm/ADT/StringSet.h"
-#include <functional>
+#include "circt/Support/Namespace.h"
+#include <map>
+#include <set>
 
 using namespace mlir;
 using namespace circt::firrtl;
@@ -43,6 +47,10 @@ struct RAMModelPlan {
   SmallVector<MemoryPort, 2> memoryPorts;
   unsigned clock, reset;
   BundleType channels;
+  // One physical input token may carry fields for multiple serialized memory
+  // commands. Each consumer must see it exactly once before the source advances.
+  std::map<unsigned, SmallVector<unsigned>> inputConsumers;
+  std::map<unsigned, SmallVector<unsigned>> responseProducers;
 };
 LogicalResult analyzeRAMModel(CircuitOp circuit, FModuleOp wrapper,
                               RAMModelPlan &plan, std::string &error) {
@@ -169,18 +177,21 @@ LogicalResult analyzeRAMModel(CircuitOp circuit, FModuleOp wrapper,
   }
   RAMModelParameters planned{memoryPorts.front().addr.width, memoryPorts.front().data.width, 0, 0};
   for (const auto &port : memoryPorts) port.read ? ++planned.reads : ++planned.writes;
-  // Multiple fields of one command can share a channel. A channel shared by
-  // different commands would make SFC's annotation-set iteration decide which
-  // ready/valid connect wins; require a defined arbitration policy first.
-  llvm::DenseSet<unsigned> ownedChannels;
-  for (const auto &port : memoryPorts) {
-    llvm::DenseSet<unsigned> local{port.addr.port, port.en.port, port.data.port};
-    if (!port.read) local.insert(port.mask.port);
-    for (unsigned channel : local)
-      if (!ownedChannels.insert(channel).second) {
-        error = "RAM channel shared by different commands requires arbitration";
+  std::map<unsigned, SmallVector<unsigned>> inputConsumers;
+  std::map<unsigned, SmallVector<unsigned>> responseProducers;
+  std::set<std::pair<unsigned, std::string>> responseFields;
+  for (auto [consumer, port] : llvm::enumerate(memoryPorts)) {
+    llvm::DenseSet<unsigned> inputs{port.addr.port, port.en.port};
+    if (!port.read) { inputs.insert(port.data.port); inputs.insert(port.mask.port); }
+    for (unsigned channel : inputs)
+      inputConsumers[channel].push_back(consumer);
+    if (port.read) {
+      if (!responseFields.insert({port.data.port, port.data.field}).second) {
+        error = "RAM response payload field shared by different producers requires arbitration";
         return failure();
       }
+      responseProducers[port.data.port].push_back(consumer);
+    }
   }
   // The current AsyncMemChiselModel indexes both command vectors at zero.
   if (!planned.reads || !planned.writes) {
@@ -216,35 +227,36 @@ LogicalResult analyzeRAMModel(CircuitOp circuit, FModuleOp wrapper,
     return failure();
   }
   std::string prefix = "~" + circuit.getName().str() + "|";
-  std::function<bool(Attribute)> referencesBody = [&](Attribute attr) {
-    if (auto text = dyn_cast<StringAttr>(attr)) {
-      auto ref = text.getValue();
-      if (!ref.consume_front(prefix)) return false;
-      auto [scope, reference] = ref.split('>');
-      SmallVector<StringRef> path;
-      scope.split(path, '/');
-      for (auto [i, step] : llvm::enumerate(path)) {
-        auto name = i ? step.split(':').second : step;
-        if (name != wrapper.getName()) continue;
-        if (i + 1 != path.size()) return true; // Erased instance in this body.
-        if (reference.empty()) continue; // Module/instance identity survives.
-        std::string ignored;
-        auto target = resolveAnnotationTarget(circuit,
-            prefix + wrapper.getName().str() + ">" + reference.str(), ignored);
-        if (!target || !target->port) return true;
-      }
-      return false;
+  auto referencesBody = [&](StringAttr text) {
+    auto ref = text.getValue();
+    if (!ref.consume_front(prefix)) return false;
+    auto [scope, reference] = ref.split('>');
+    SmallVector<StringRef> path;
+    scope.split(path, '/');
+    for (auto [i, step] : llvm::enumerate(path)) {
+      auto name = i ? step.split(':').second : step;
+      if (name != wrapper.getName()) continue;
+      if (i + 1 != path.size()) return true; // Erased instance in this body.
+      if (reference.empty()) continue; // Module/instance identity survives.
+      std::string ignored;
+      auto target = resolveAnnotationTarget(circuit,
+          prefix + wrapper.getName().str() + ">" + reference.str(), ignored);
+      if (!target || !target->port) return true;
     }
-    if (auto array = dyn_cast<ArrayAttr>(attr)) return llvm::any_of(array, referencesBody);
-    if (auto dictionary = dyn_cast<DictionaryAttr>(attr))
-      return llvm::any_of(dictionary, [&](NamedAttribute member) { return referencesBody(member.getValue()); });
     return false;
   };
-  if (referencesBody(raw)) {
+  bool retainedBodyTarget = false;
+  for (auto annotation : raw)
+    goldengate::mapRetainedAnnotationTargets(annotation, [&](StringAttr target) {
+      retainedBodyTarget |= referencesBody(target);
+      return target;
+    });
+  if (retainedBodyTarget) {
     error = "RAM wrapper body has retained targets requiring a rename policy";
     return failure();
   }
-  plan = {planned, std::move(memoryPorts), *clock, *reset, channels};
+  plan = {planned, std::move(memoryPorts), *clock, *reset, channels,
+          std::move(inputConsumers), std::move(responseProducers)};
   return success();
 }
 } // namespace
@@ -300,16 +312,31 @@ LogicalResult goldengate::wrapRAMModel(
   auto constant = [&](bool value) -> Value {
     return b.create<ConstantOp>(loc, bit, APInt(1, value));
   };
+  auto both = [&](Value left, Value right) -> Value {
+    return b.create<AndPrimOp>(loc, left, right);
+  };
+  auto either = [&](Value left, Value right) -> Value {
+    return b.create<OrPrimOp>(loc, left, right);
+  };
+  auto neg = [&](Value value) -> Value { return b.create<NotPrimOp>(loc, value); };
+  using Delivery = std::pair<unsigned, unsigned>; // Physical channel, command.
+  std::map<Delivery, Value> delivered, consumerReady;
+  std::map<unsigned, Value> responses;
   auto bits = [&](const Signal &s) {
     Value result = sub(block->getArgument(s.port), "bits");
     return s.field.empty() ? result : sub(result, s.field);
   };
-  auto valid = [&](const Signal &s) { return sub(block->getArgument(s.port), "valid"); };
+  auto valid = [&](const Signal &s, unsigned consumer) {
+    Value result = sub(block->getArgument(s.port), "valid");
+    auto seen = delivered.find({s.port, consumer});
+    return seen == delivered.end() ? result : both(result, neg(seen->second));
+  };
   auto ready = [&](const Signal &s) { return sub(block->getArgument(s.port), "ready"); };
-  auto andAll = [&](Value first, ArrayRef<Signal> signals, const Signal *excluded) {
+  auto andAll = [&](Value first, ArrayRef<Signal> signals, const Signal *excluded,
+                    unsigned consumer) {
     for (const auto &s : signals)
       if (!excluded || s.target != excluded->target)
-        first = b.create<AndPrimOp>(loc, first, valid(s));
+        first = b.create<AndPrimOp>(loc, first, valid(s, consumer));
     return first;
   };
   connect(model.getResult(*implClock), block->getArgument(plan.clock));
@@ -317,29 +344,90 @@ LogicalResult goldengate::wrapRAMModel(
   Value channel = model.getResult(*implChannels), resetChannel = sub(channel, "reset");
   connect(sub(resetChannel, "valid"), constant(true));
   connect(sub(resetChannel, "bits"), constant(false));
+  circt::Namespace stateNames;
+  for (auto port : wrapper.getPorts()) stateNames.newName(port.getName());
+  stateNames.newName(model.getName());
+  for (const auto &[port, consumers] : plan.inputConsumers) {
+    if (consumers.size() < 2) continue;
+    for (unsigned consumer : consumers) {
+      auto name = stateNames.newName("ram_shared_" + std::to_string(port) + "_" +
+                                     std::to_string(consumer) + "_delivered");
+      delivered[{port, consumer}] = b.create<RegOp>(
+          loc, bit, block->getArgument(plan.clock), name).getResult();
+    }
+  }
   unsigned readIndex = 0, writeIndex = 0;
-  for (const auto &port : plan.memoryPorts) {
+  for (auto [consumer, port] : llvm::enumerate(plan.memoryPorts)) {
     auto index = port.read ? readIndex++ : writeIndex++;
     Value cmd = b.create<SubindexOp>(loc,
         sub(channel, port.read ? "read_cmds" : "write_cmds"), index);
     SmallVector<Signal> inputs;
     if (!port.read) { inputs.push_back(port.data); inputs.push_back(port.mask); }
     inputs.push_back(port.addr); inputs.push_back(port.en);
-    for (const auto &s : inputs)
-      connect(ready(s), andAll(sub(cmd, "ready"), inputs, &s));
-    connect(sub(cmd, "valid"), andAll(constant(true), inputs, nullptr));
+    for (const auto &s : inputs) {
+      auto commandReady = andAll(sub(cmd, "ready"), inputs, &s, consumer);
+      if (delivered.count({s.port, consumer}))
+        consumerReady[{s.port, consumer}] = commandReady;
+      else connect(ready(s), commandReady);
+    }
+    connect(sub(cmd, "valid"), andAll(constant(true), inputs, nullptr, consumer));
     Value payload = sub(cmd, "bits");
     connect(sub(payload, "addr"), bits(port.addr));
     connect(sub(payload, "en"), bits(port.en));
     if (port.read) {
       Value resp = b.create<SubindexOp>(loc, sub(channel, "read_resps"), index);
       connect(bits(port.data), sub(resp, "bits"));
-      connect(valid(port.data), sub(resp, "valid"));
-      connect(sub(resp, "ready"), ready(port.data));
+      responses[consumer] = resp;
+      if (plan.responseProducers.at(port.data.port).size() == 1) {
+        connect(valid(port.data, consumer), sub(resp, "valid"));
+        connect(sub(resp, "ready"), ready(port.data));
+      }
     } else {
       connect(sub(payload, "data"), bits(port.data));
       connect(sub(payload, "mask"), bits(port.mask));
     }
+  }
+  // Distinct response payload fields may share one physical channel. Join
+  // their tokens: none of the independently buffered model responses may be
+  // released until the complete output packet can transfer. SFC's last-connect
+  // valid happens to work for ordered arrivals, but can expose stale fields
+  // when a later-priority read command arrives before an earlier one.
+  for (const auto &[port, producers] : plan.responseProducers) {
+    if (producers.size() < 2) continue;
+    Value output = block->getArgument(port), allValid = constant(true);
+    for (unsigned producer : producers)
+      allValid = both(allValid, sub(responses.at(producer), "valid"));
+    connect(sub(output, "valid"), allValid);
+    for (unsigned producer : producers) {
+      Value responseReady = sub(output, "ready");
+      for (unsigned other : producers)
+        if (producer != other)
+          responseReady = both(responseReady, sub(responses.at(other), "valid"));
+      connect(sub(responses.at(producer), "ready"), responseReady);
+    }
+  }
+  // A shared source must hold its token/payload until every consumer has
+  // accepted it. Remember early deliveries instead of AND-ing ready signals:
+  // host RAM commands are serialized, so their ready pulses need not overlap.
+  // Suppress repeats for already-served commands and clear only on the source
+  // handshake (or host reset). Storage is never initialized by this protocol.
+  for (const auto &[port, consumers] : plan.inputConsumers) {
+    if (consumers.size() < 2) continue;
+    Value source = block->getArgument(port);
+    Value sourceValid = sub(source, "valid"), allDone = constant(true);
+    SmallVector<Value> done;
+    for (unsigned consumer : consumers) {
+      Value seen = delivered.at({port, consumer});
+      Value fire = both(both(sourceValid, neg(seen)),
+                        consumerReady.at({port, consumer}));
+      done.push_back(either(seen, fire));
+      allDone = both(allDone, done.back());
+    }
+    connect(sub(source, "ready"), allDone);
+    Value flush = either(block->getArgument(plan.reset), both(sourceValid, allDone));
+    for (auto [index, consumer] : llvm::enumerate(consumers))
+      connect(delivered.at({port, consumer}), b.create<MuxPrimOp>(
+          loc, flush, constant(false), done[index]));
   }
   if (failed(verify(*candidate))) {
     error = "RAM adapter produced invalid CIRCT FIRRTL";
@@ -382,5 +470,72 @@ LogicalResult goldengate::materializeRAMModel(
       failed(wrapRAMModel(circuit, wrapper, *host, parameters, error)))
     return failure();
   implementation = host.release();
+  return success();
+}
+
+LogicalResult goldengate::materializeSelectedRAMModels(
+    CircuitOp circuit, unsigned &materialized, std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "Selected RAM materialization needs retained memory port annotations";
+    return failure();
+  }
+  SmallVector<std::string> selected;
+  llvm::DenseSet<Operation *> seen;
+  for (auto attr : raw) {
+    Annotation annotation(attr);
+    if (!annotation.isClass(AnnotationClasses::ModelReadPort) &&
+        !annotation.isClass(AnnotationClasses::ModelWritePort) &&
+        !annotation.isClass(AnnotationClasses::ModelReadWritePort))
+      continue;
+    auto address = annotation.getMember<StringAttr>("addr");
+    auto target = address ? resolveAnnotationTarget(circuit, address.getValue(), error)
+                          : std::nullopt;
+    if (!target || !target->port ||
+        !isa<FModuleOp>(target->module.getOperation())) {
+      if (error.empty())
+        error = "Selected RAM addr annotation must target an internal wrapper port";
+      return failure();
+    }
+    if (seen.insert(target->module.getOperation()).second)
+      selected.push_back(target->module.getName().str());
+  }
+  if (selected.empty()) {
+    materialized = 0;
+    return success();
+  }
+
+  OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
+  llvm::StringMap<FModuleOp> originalWrappers, stagedWrappers;
+  llvm::StringSet<> originalModules;
+  for (auto module : circuit.getOps<FModuleLike>()) {
+    originalModules.insert(module.getModuleName());
+    if (auto internal = dyn_cast<FModuleOp>(module.getOperation()))
+      originalWrappers[internal.getName()] = internal;
+  }
+  for (auto wrapper : staged->getOps<FModuleOp>())
+    stagedWrappers[wrapper.getName()] = wrapper;
+  for (const auto &name : selected) {
+    FModuleOp implementation;
+    RAMModelParameters parameters;
+    if (failed(materializeRAMModel(*staged, stagedWrappers.lookup(name),
+                                   implementation, parameters, error)))
+      return failure();
+  }
+  if (failed(verify(*staged))) {
+    error = "Selected RAM materialization produced invalid FIRRTL";
+    return failure();
+  }
+  // Each replacement changes only a selected body and adds a fresh module.
+  // Preserve untouched simulator operations and selected module identities;
+  // callers may retain their FAME selection sets across this boundary.
+  for (const auto &name : selected)
+    originalWrappers.lookup(name).getBody().takeBody(
+        stagedWrappers.lookup(name).getBody());
+  for (auto &op : llvm::make_early_inc_range(staged->getBodyBlock()->getOperations()))
+    if (auto module = dyn_cast<FModuleLike>(&op))
+      if (!originalModules.count(module.getModuleName()))
+        op.moveBefore(circuit.getBodyBlock(), circuit.getBodyBlock()->end());
+  materialized = selected.size();
   return success();
 }

@@ -2,6 +2,7 @@
 #include "goldengate/LowerTypes.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
+#include "goldengate/HierarchicalTargets.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/Passes.h"
 #include "circt/Dialect/HW/HWTypeInterfaces.h"
@@ -10,11 +11,233 @@
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/DenseSet.h"
 #include <array>
+#include <map>
+#include <set>
 
 using namespace circt::firrtl;
 using namespace mlir;
 
 namespace {
+// SFC DestructTypes.uniquify reserves intermediate bundle/vector prefixes as
+// well as ground leaves. CIRCT need not reserve these names: instance results
+// are SSA values rather than a flattened instance bundle. Preserve SFC's
+// instance namespace nevertheless, so channel names and hierarchical targets
+// agree when an extracted peer occupies one of those intermediate prefixes.
+struct SFCNames {
+  std::string root;
+  SmallVector<std::string> all, leaves;
+};
+bool sfcZeroWidthType(FIRRTLBaseType type) {
+  if (auto bundle = dyn_cast<BundleType>(type))
+    return llvm::all_of(bundle.getElements(), [](auto element) {
+      return sfcZeroWidthType(element.type);
+    });
+  if (auto vector = dyn_cast<FVectorType>(type))
+    return vector.getNumElements() == 0 || sfcZeroWidthType(vector.getElementType());
+  return type.getBitWidthOrSentinel() == 0;
+}
+SFCNames sfcNames(StringRef name, FIRRTLBaseType type,
+                  std::set<std::string> &names,
+                  const std::set<std::string> &reserved = {},
+                  bool protectInstanceRoot = false) {
+  // SFC ZeroWidth precedes LowerTypes. Deleted fields reserve neither ground
+  // names nor intermediate prefixes, even when their widths were inferred.
+  if (sfcZeroWidthType(type)) return {name.str(), {}, {}};
+  std::string prefix = name.str();
+  while (reserved.count(prefix)) prefix += '_';
+  SmallVector<std::pair<std::string, FIRRTLBaseType>> children;
+  if (auto bundle = dyn_cast<BundleType>(type)) {
+    for (auto element : bundle.getElements())
+      if (!sfcZeroWidthType(element.type))
+        children.emplace_back(element.name.getValue().str(), element.type);
+  } else if (auto vector = dyn_cast<FVectorType>(type)) {
+    for (unsigned i = 0; i < vector.getNumElements(); ++i)
+      children.emplace_back(std::to_string(i), vector.getElementType());
+  } else return {prefix, {prefix}, {prefix}};
+  std::set<std::string> local;
+  for (auto &child : children) local.insert(child.first);
+  SmallVector<std::string> suffixes, leaves;
+  for (auto &child : children) {
+    auto lowered = sfcNames(child.first, child.second, local);
+    for (auto &suffix : lowered.all) suffixes.push_back("_" + suffix);
+    for (auto &leaf : lowered.leaves) leaves.push_back("_" + leaf);
+  }
+  // SFC only checks suffixes here. A renamed instance root may nevertheless
+  // collide with an existing declaration; keep the native IR valid in that
+  // corner instead of reproducing SFC's duplicate-instance-name bug.
+  while ((protectInstanceRoot && prefix != name && names.count(prefix)) ||
+         llvm::any_of(suffixes, [&](const std::string &suffix) {
+    return names.count(prefix + suffix);
+  })) prefix += '_';
+  if (prefix != name) {
+    if (!reserved.count(name.str())) names.erase(name.str());
+    names.insert(prefix);
+  }
+  SFCNames result{prefix, {}, {}};
+  for (auto &suffix : suffixes) result.all.push_back(prefix + suffix);
+  result.all.push_back(prefix);
+  for (auto &leaf : leaves) result.leaves.push_back(prefix + leaf);
+  return result;
+}
+struct InstanceRename {
+  std::string name, child;
+};
+using InstanceRenames =
+    std::map<std::pair<std::string, std::string>, InstanceRename>;
+struct InstancePrefixPlan {
+  FModuleLike owner;
+  StringAttr symbol;
+  std::string original, desired;
+  bool temporary;
+};
+
+SmallVector<InstancePrefixPlan> uniquifySFCInstancePrefixes(CircuitOp circuit) {
+  SmallVector<InstancePrefixPlan> plans;
+  circt::hw::InnerSymbolNamespaceCollection namespaces;
+  for (auto owner : circuit.getOps<FModuleLike>()) {
+    // SFC lowers ports independently before constructing the body namespace.
+    std::set<std::string> portNamespace, ports;
+    for (unsigned i = 0; i < owner.getNumPorts(); ++i)
+      if (auto type = dyn_cast<FIRRTLBaseType>(owner.getPortType(i)))
+        if (!sfcZeroWidthType(type))
+          portNamespace.insert(owner.getPortName(i).str());
+    for (unsigned i = 0; i < owner.getNumPorts(); ++i) {
+      auto type = dyn_cast<FIRRTLBaseType>(owner.getPortType(i));
+      if (!type) continue;
+      auto lowered = sfcNames(owner.getPortName(i), type, portNamespace);
+      ports.insert(lowered.leaves.begin(), lowered.leaves.end());
+    }
+    auto names = ports;
+    owner->walk([&](Operation *op) {
+      if (isa<NodeOp, WireOp, RegOp, RegResetOp, MemOp, InstanceOp,
+              InstanceChoiceOp>(op)) {
+        if (isa<NodeOp, WireOp, RegOp, RegResetOp>(op) &&
+            sfcZeroWidthType(cast<FIRRTLBaseType>(op->getResult(0).getType())))
+          return;
+        names.insert(op->getAttrOfType<StringAttr>("name").getValue().str());
+      }
+    });
+    owner->walk([&](InstanceOp instance) {
+      SmallVector<BundleType::BundleElement> fields;
+      for (unsigned i = 0; i < instance.getNumResults(); ++i) {
+        auto type = dyn_cast<FIRRTLBaseType>(instance.getResult(i).getType());
+        if (!type) return;
+        fields.push_back({cast<StringAttr>(instance.getPortNamesAttr()[i]),
+                          false, type});
+      }
+      auto original = instance.getName().str();
+      auto lowered = sfcNames(original,
+          BundleType::get(circuit.getContext(), fields), names, ports, true);
+      // CIRCT retains zero-width ports at this boundary and can independently
+      // rename an instance for a prefix SFC's ZeroWidth has already deleted.
+      // Carry the planned name through its supported native inner identity;
+      // CIRCT's lowering does not retain arbitrary operation attributes.
+      auto symbols = instance.getInnerSymAttr();
+      auto symbol = symbols ? symbols.getSymIfExists(0) : StringAttr();
+      bool temporary = !symbol;
+      if (temporary) {
+        symbol = StringAttr::get(circuit.getContext(),
+                                  namespaces[owner].newName("gg_lower_instance"));
+        SmallVector<circt::hw::InnerSymPropertiesAttr> properties;
+        if (symbols) llvm::append_range(properties, symbols.getProps());
+        properties.push_back(circt::hw::InnerSymPropertiesAttr::get(
+            circuit.getContext(), symbol, 0,
+            StringAttr::get(circuit.getContext(), "private")));
+        instance.setInnerSymAttr(circt::hw::InnerSymAttr::get(circuit.getContext(), properties));
+      }
+      plans.push_back({owner, symbol, original, lowered.root, temporary});
+      if (lowered.root == original) return;
+      instance.setNameAttr(StringAttr::get(circuit.getContext(), lowered.root));
+    });
+  }
+  return plans;
+}
+
+// Rewrite complete target tokens, following the parent module at every
+// hierarchical edge. Never replace substrings in printf text, constructor
+// payloads, global channel names, or another module's identically named pin.
+StringAttr renameInstanceTarget(StringAttr attr, StringRef circuit,
+                                const InstanceRenames &renames) {
+  auto text = attr.getValue();
+  if (!text.consume_front("~")) return attr;
+  auto [targetCircuit, local] = text.split('|');
+  if (targetCircuit != circuit || local.empty()) return attr;
+  auto [hierarchy, reference] = local.split('>');
+  SmallVector<StringRef> path;
+  hierarchy.split(path, '/');
+  if (path.empty() || path.front().empty()) return attr;
+  std::string parent = path.front().str();
+  std::string result = "~" + circuit.str() + "|" + parent;
+  bool changed = false;
+  for (auto edge : llvm::drop_begin(path)) {
+    auto [instance, child] = edge.split(':');
+    if (instance.empty() || child.empty() || child.contains(':')) return attr;
+    auto found = renames.find({parent, instance.str()});
+    if (found != renames.end() && found->second.child == child) {
+      result += "/" + found->second.name + ":" + child.str();
+      changed = true;
+    } else result += "/" + edge.str();
+    parent = child.str();
+  }
+  if (local.contains('>')) {
+    if (reference.empty() || reference.contains('>')) return attr;
+    auto end = reference.find_first_of(".[");
+    auto root = reference.take_front(end);
+    auto found = renames.find({parent, root.str()});
+    result += ">";
+    if (found != renames.end()) {
+      result += found->second.name + reference.drop_front(root.size()).str();
+      changed = true;
+    } else result += reference.str();
+  }
+  return changed ? StringAttr::get(attr.getContext(), result) : attr;
+}
+
+Attribute renameInstanceSelectors(Attribute attr, StringRef circuit,
+                                  const InstanceRenames &renames) {
+  if (renames.empty()) return attr;
+  Annotation annotation(attr);
+  auto rewrite = [&](StringRef member) {
+    if (auto target = annotation.getMember<StringAttr>(member))
+      annotation.setMember(member, renameInstanceTarget(target, circuit, renames));
+    else if (auto targets = annotation.getMember<ArrayAttr>(member)) {
+      SmallVector<Attribute> updated;
+      for (auto element : targets)
+        updated.push_back(isa<StringAttr>(element) ?
+            renameInstanceTarget(cast<StringAttr>(element), circuit, renames) : element);
+      annotation.setMember(member, ArrayAttr::get(attr.getContext(), updated));
+    }
+  };
+  // SingleTarget/Targets annotations have these standard schema members,
+  // including user-defined classes. Other selectors are class-specific.
+  rewrite("target");
+  rewrite("targets");
+  using A = goldengate::AnnotationClasses;
+  if (annotation.isClass(A::ChannelConnection)) {
+    for (StringRef member : {"clock", "sources", "sinks"}) rewrite(member);
+    if (auto info = annotation.getMember<DictionaryAttr>("channelInfo")) {
+      Annotation channel(info);
+      if (channel.isClass(A::DecoupledForwardChannel)) {
+        for (StringRef member : {"readySink", "validSource", "readySource", "validSink"})
+          if (auto target = channel.getMember<StringAttr>(member))
+            channel.setMember(member, renameInstanceTarget(target, circuit, renames));
+        annotation.setMember("channelInfo", channel.getAttr());
+      }
+    }
+  } else if (annotation.isClass(A::ChannelPorts)) {
+    rewrite("clockPort"); rewrite("ports");
+  } else if (annotation.isClass(A::ModelReadPort, A::ModelWritePort,
+                                A::ModelReadWritePort)) {
+    for (StringRef member : {"data", "mask", "addr", "en", "wmode", "rdata", "wdata", "wmask"})
+      rewrite(member);
+  } else if (annotation.isClass(A::AutoCounter, A::InternalAutoCounter,
+                               A::TriggerSource, A::InternalTriggerSource,
+                               A::TriggerSink, A::InternalTriggerSink)) {
+    rewrite("clock"); rewrite("reset");
+  }
+  return annotation.getAttr();
+}
+
 // SFC DestructTypes records each aggregate reference as referring to all of
 // its ground children. Walk the selected CIRCT subtype in declaration order,
 // including vector indices, to apply that one-to-many rename to raw metadata.
@@ -122,6 +345,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
     bool channelInfo;
     bool legacyComponent = false;
     bool exact = false;
+    std::string hierarchy;
   };
   SmallVector<SmallVector<TargetPlan>> replacements(raw.size());
   auto isHostSignal = [](Annotation annotation) {
@@ -203,9 +427,19 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         spelling = StringAttr::get(module.getContext(), "~" + circuitName +
             "|" + moduleAndRef.first.str() + ">" + moduleAndRef.second.str());
       }
-      auto local = spelling.getValue().split('>').second;
       std::string resolutionError;
-      auto target = resolveAnnotationTarget(circuit, spelling.getValue(), resolutionError);
+      auto resolutionSpelling = spelling;
+      if (spelling.getValue().split('>').first.contains('/')) {
+        auto resolved = resolveHierarchicalReference(circuit, spelling.getValue(), resolutionError);
+        if (!resolved) {
+          error = "unresolved retained annotation hierarchy " + spelling.getValue().str() + ": " + resolutionError;
+          return failure();
+        }
+        plan.hierarchy = resolved->hierarchy;
+        resolutionSpelling = StringAttr::get(module.getContext(), resolved->localTarget);
+      }
+      auto local = resolutionSpelling.getValue().split('>').second;
+      auto target = resolveAnnotationTarget(circuit, resolutionSpelling.getValue(), resolutionError);
       if (target && target->port) {
         auto type = cast<FIRRTLBaseType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
             target->module.getPortType(*target->port), *target->fieldID));
@@ -216,7 +450,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         }
         collectGroundTargets(type, target->module, *target->port, nullptr,
                              *target->fieldID, plan.targets);
-      } else if (auto internal = resolveInternalFieldTarget(circuit, spelling.getValue(),
+      } else if (auto internal = resolveInternalFieldTarget(circuit, resolutionSpelling.getValue(),
                                                             resolutionError)) {
         if (exact && !memoryPort && !internal->type.isGround()) {
           error = kind.str() + " " + member.str() +
@@ -233,7 +467,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
              globalReset) &&
             !local.contains('.') && !local.contains('['))
           return success();
-        if (exact || !resolveInternalAnnotationTarget(circuit, spelling.getValue(),
+        if (exact || !resolveInternalAnnotationTarget(circuit, resolutionSpelling.getValue(),
                                                      resolutionError)) {
           error = "unresolved retained annotation " + member.str() + " " +
                   spelling.getValue().str() + ": " + resolutionError;
@@ -432,13 +666,60 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
   passes.nest<CircuitOp>().addNestedPass<FModuleOp>(createLowerCHIRRTLPass());
   passes.addNestedPass<CircuitOp>(createInferWidthsPass());
   passes.addNestedPass<CircuitOp>(createInferResetsPass());
-  passes.addNestedPass<CircuitOp>(createLowerFIRRTLTypesPass());
   if (failed(passes.run(module))) {
+    error = "CIRCT LowerTypes input inference failed";
+    return failure();
+  }
+  // Namespace planning needs final widths but the original aggregate shape.
+  // In particular, an unknown-width port inferred as zero must not trigger an
+  // instance rename based on a field that SFC deletes before flattening.
+  auto instancePlans = uniquifySFCInstancePrefixes(circuit);
+  auto cleanupPrefixes = llvm::make_scope_exit([&] {
+    circt::hw::InnerSymbolTableCollection identities;
+    for (auto &plan : instancePlans) {
+      if (!plan.temporary) continue;
+      auto target = identities.getInnerSymbolTable(plan.owner).lookup(plan.symbol);
+      if (!target || target.isPort()) continue;
+      auto declaration = dyn_cast<circt::hw::InnerSymbolOpInterface>(target.getOp());
+      if (!declaration) continue;
+      SmallVector<circt::hw::InnerSymPropertiesAttr> properties;
+      for (auto property : declaration.getInnerSymAttr())
+        if (property.getName() != plan.symbol) properties.push_back(property);
+      if (properties.empty())
+        declaration->removeAttr(circt::hw::InnerSymbolTable::getInnerSymbolAttrName());
+      else declaration.setInnerSymbolAttr(circt::hw::InnerSymAttr::get(module.getContext(), properties));
+    }
+  });
+  PassManager lowering(module.getContext());
+  lowering.addNestedPass<CircuitOp>(createLowerFIRRTLTypesPass());
+  if (failed(lowering.run(module))) {
     error = "CIRCT LowerTypes failed";
     return failure();
   }
 
+  circt::hw::InnerSymbolTableCollection instanceIdentities;
+  for (auto &plan : instancePlans) {
+    auto target = instanceIdentities.getInnerSymbolTable(plan.owner).lookup(plan.symbol);
+    auto instance = target && !target.isPort() ? dyn_cast<InstanceOp>(target.getOp()) : InstanceOp();
+    if (!instance || target.getField() != 0) {
+      error = "LowerTypes did not preserve instance namespace identity " + plan.symbol.getValue().str();
+      return failure();
+    }
+    instance.setNameAttr(StringAttr::get(module.getContext(), plan.desired));
+  }
+
   uniquifyLoweredNames(circuit);
+  // A flattened non-instance declaration can still occupy a planned root.
+  // Bind raw hierarchy selectors to the final unique declaration identity,
+  // never to a provisional prefix. Native InnerRefs do not depend on names.
+  InstanceRenames instanceRenames;
+  for (auto &plan : instancePlans) {
+    auto target = instanceIdentities.getInnerSymbolTable(plan.owner).lookup(plan.symbol);
+    auto instance = cast<InstanceOp>(target.getOp());
+    if (plan.original != instance.getName())
+      instanceRenames[{plan.owner.getModuleName().str(), plan.original}] =
+          {instance.getName().str(), instance.getModuleName().str()};
+  }
   circt::hw::InnerSymbolTableCollection tables;
   // Width inference can also discover a zero-width leaf. Resolve its final
   // CIRCT type through the same identity used for renaming, so it obeys the
@@ -476,7 +757,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
         singleTargets.insert(attr).second)
       rewritten.push_back(attr);
   };
-  auto loweredSpelling = [&](GroundTarget replacement) -> StringAttr {
+  auto loweredSpelling = [&](GroundTarget replacement, StringRef hierarchy) -> StringAttr {
     auto lowered = tables.getInnerSymbolTable(replacement.module)
                        .lookup(replacement.symbol);
     if (!lowered || lowered.getField() != 0) {
@@ -499,19 +780,25 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
       error = "LowerTypes annotated identity is not a named ground value";
       return {};
     }
-    auto spelling = "~" + circuitName + "|" +
-        replacement.module.getModuleName().str() + ">" + name.getValue().str();
+    std::string prefix = "~" + circuitName + "|" + replacement.module.getModuleName().str();
+    if (!hierarchy.empty())
+      prefix = renameInstanceTarget(StringAttr::get(module.getContext(), hierarchy),
+                                    circuitName, instanceRenames).getValue().str();
+    auto spelling = prefix + ">" + name.getValue().str();
     return StringAttr::get(module.getContext(), spelling);
   };
   for (auto [index, attr] : llvm::enumerate(raw)) {
-    Annotation annotation(attr);
+    // Rename original hierarchy selectors once. Ground selectors produced
+    // below already carry final native identities and must not be interpreted
+    // again as an old instance root of the same spelling.
+    Annotation annotation(renameInstanceSelectors(attr, circuitName, instanceRenames));
     const TargetPlan *events = nullptr;
     for (auto &plan : replacements[index]) {
       if (plan.member == "target" && !plan.element && !plan.channelInfo) {
         events = &plan;
         continue;
       }
-      auto spelling = loweredSpelling(plan.targets.front());
+      auto spelling = loweredSpelling(plan.targets.front(), plan.hierarchy);
       if (!spelling) return failure();
       if (plan.channelInfo) {
         Annotation info(annotation.getMember<DictionaryAttr>("channelInfo"));
@@ -529,7 +816,7 @@ LogicalResult goldengate::lowerTypesWithRetainedTargets(
       continue;
     }
     for (auto &replacement : events->targets) {
-      auto spelling = loweredSpelling(replacement);
+      auto spelling = loweredSpelling(replacement, events->hierarchy);
       if (!spelling) return failure();
       if (events->legacyComponent) {
         auto moduleAndRef =

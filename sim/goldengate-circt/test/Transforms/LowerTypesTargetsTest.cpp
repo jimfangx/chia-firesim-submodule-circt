@@ -1176,12 +1176,293 @@ void zeroWidthTargets(MLIRContext &context) {
   noTemporarySymbols(circuit); noTemporarySymbols(owner);
   llvm::outs() << "Zero-width fanout leaves deleted for five annotation classes; inferred zeros deleted; 68 exact endpoint cases reject atomically; inferred exact endpoint rejects without publishing annotations or leaking symbols\n";
 }
+void instanceNamespaceTargets(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Harness" attributes {rawAnnotations = []} {
+      firrtl.module @Harness() {
+        %core_state_word, %core_clk = firrtl.instance core @Logic(in state: !firrtl.bundle<word: uint<8>>, in clk: !firrtl.clock)
+        firrtl.instance core_state @Peer()
+        %leaf_data = firrtl.instance leaf @Scalar(in data: !firrtl.uint<8>)
+        %leaf_data_reserved = firrtl.wire {name = "leaf_data"} : !firrtl.uint<1>
+        %root_data = firrtl.instance root @Scalar(in data: !firrtl.uint<8>)
+        %root_data_reserved = firrtl.wire {name = "root_data"} : !firrtl.uint<1>
+        firrtl.instance root_ @Peer()
+        %repeat_data = firrtl.instance repeat @Scalar(in data: !firrtl.uint<8>)
+        %repeat_data_reserved = firrtl.wire {name = "repeat_data"} : !firrtl.uint<1>
+        %repeat__data_reserved = firrtl.wire {name = "repeat__data"} : !firrtl.uint<1>
+        %stable_state_word, %stable_clk = firrtl.instance stable @Logic(in state: !firrtl.bundle<word: uint<8>>, in clk: !firrtl.clock)
+        firrtl.instance outer @Parent()
+      }
+      firrtl.module @Logic(in %state: !firrtl.bundle<word: uint<8>>, in %clk: !firrtl.clock) {}
+      firrtl.module @Scalar(in %data: !firrtl.uint<8>) {}
+      firrtl.module @Peer() {}
+      firrtl.module @Parent() {
+        %inner_data = firrtl.instance inner @Scalar(in data: !firrtl.uint<8>)
+        %inner_data_reserved = firrtl.wire {name = "inner_data"} : !firrtl.uint<1>
+      }
+    }
+  })mlir", &context);
+  require(bool(root), "instance namespace fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context);
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  auto leaf = *std::next(top.getOps<InstanceOp>().begin(), 2);
+  leaf.setInnerSymAttr(circt::hw::InnerSymAttr::get(b.getStringAttr("leaf_identity")));
+  auto nativeRef = circt::hw::InnerRefAttr::get(b.getStringAttr("Harness"),
+                                             b.getStringAttr("leaf_identity"));
+  circuit->setAttr("test.native_ref", nativeRef);
+  const auto threading = goldengate::AnnotationClasses::EnableModelMultiThreading;
+  auto annotation = [&](StringRef target, StringRef klass = "test.Selector") {
+    return b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr(klass)),
+        b.getNamedAttr("target", b.getStringAttr(target)),
+        b.getNamedAttr("test.text", b.getStringAttr("~Harness|Harness/core:Logic")),
+        b.getNamedAttr("test.payload", b.getDictionaryAttr({
+          b.getNamedAttr("target", b.getStringAttr("~Harness|Harness/core:Logic"))}))});
+  };
+  SmallVector<Attribute> original{
+      annotation("~Harness|Harness/core:Logic", threading),
+      annotation("~Harness|Harness/core:Logic", threading),
+      annotation("~Harness|Harness/outer:Parent/inner:Scalar>data"),
+      annotation("~Harness|Parent/inner:Scalar"),
+      annotation("~Harness|Harness>leaf.data"),
+      annotation("~Harness|Harness/root:Scalar"),
+      annotation("~Harness|Harness/stable:Logic"),
+      annotation("~Another|Harness/core:Logic"),
+      annotation("~Harness|Harness/core:Another"),
+      annotation("~Harness|Harness>core_state"),
+      annotation("~Harness|Harness>core_state_word"),
+      annotation("~Harness|Logic>data")};
+  circuit->setAttr("rawAnnotations", b.getArrayAttr(original));
+  require(succeeded(verify(*root)), "initial instance namespace fixture invalid");
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "instance namespace fixture invalid after lowering");
+  SmallVector<StringRef> expectedNames{"core_", "core_state", "leaf_", "root__", "root_", "repeat__", "stable", "outer"};
+  unsigned i = 0;
+  for (auto instance : top.getOps<InstanceOp>()) {
+    require(instance.getName() == expectedNames[i++],
+            "SFC instance aggregate namespace differs: " + instance.getName().str());
+  }
+  require(i == expectedNames.size(), "instance count changed during namespace lowering");
+  SmallVector<StringRef> expectedTargets{
+      "~Harness|Harness/core_:Logic", "~Harness|Harness/core_:Logic",
+      "~Harness|Harness/outer:Parent/inner_:Scalar>data",
+      "~Harness|Parent/inner_:Scalar", "~Harness|Harness>leaf_.data",
+      "~Harness|Harness/root__:Scalar",
+      "~Harness|Harness/stable:Logic", "~Another|Harness/core:Logic",
+      "~Harness|Harness/core:Another", "~Harness|Harness>core_state",
+      "~Harness|Harness>core_state_word", "~Harness|Logic>data"};
+  auto updated = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(updated.size() == original.size(), "instance target records reordered/coalesced");
+  for (auto [index, attr] : llvm::enumerate(updated)) {
+    Annotation actual(attr), before(original[index]);
+    require(actual.getMember<StringAttr>("target").getValue() == expectedTargets[index],
+            "instance/hierarchical annotation target did not follow its structural edge");
+    require(actual.getMember<StringAttr>("test.text") == before.getMember<StringAttr>("test.text") &&
+                actual.getMember<DictionaryAttr>("test.payload") == before.getMember<DictionaryAttr>("test.payload"),
+            "instance namespace rename modified unrelated annotation payloads");
+  }
+  auto identity = circt::hw::InnerSymbolTable(top).lookup("leaf_identity");
+  require(identity && identity.getOp()->getAttrOfType<StringAttr>("name").getValue() == "leaf_" &&
+              circuit->getAttr("test.native_ref") == nativeRef,
+          "instance rename damaged native inner-symbol hierarchy identity");
+  auto before = dump(*root);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)) &&
+              dump(*root) == before,
+          "SFC instance namespace compatibility is not idempotent");
+  llvm::outs() << "SFC instance namespace: aggregate prefix, unrelated leaf declaration, repeated suffix collisions, noncollision, duplicate selectors and nested paths preserved\n";
+}
+void zeroWidthInstanceNamespaceTargets(MLIRContext &context) {
+  const char *fixture = R"mlir(module {
+    firrtl.circuit "Harness" attributes {rawAnnotations = []} {
+      firrtl.module @Harness(in %zero: !firrtl.uint<0>) {
+        %known_removed, %known_live = firrtl.instance known @Known(in removed: !firrtl.bundle<pad: uint<0>>, in live: !firrtl.uint<8>)
+        firrtl.instance known_removed @Peer()
+        %inferred_dropped, %inferred_live = firrtl.instance inferred @Inferred(in dropped: !firrtl.uint, in live: !firrtl.uint<8>)
+        firrtl.connect %inferred_dropped, %zero : !firrtl.uint, !firrtl.uint<0>
+        firrtl.instance inferred_dropped @Peer()
+        %named_data = firrtl.instance named @Scalar(in data: !firrtl.uint<8>)
+        %named_data_zero = firrtl.wire {name = "named_data"} : !firrtl.uint
+        firrtl.connect %named_data_zero, %zero : !firrtl.uint, !firrtl.uint<0>
+        %real_io = firrtl.instance real @Mixed(in io: !firrtl.bundle<pad: uint<0>, live: uint<8>>)
+        %real_io_live = firrtl.wire : !firrtl.uint<1>
+      }
+      firrtl.module @Known(in %removed: !firrtl.bundle<pad: uint<0>>, in %live: !firrtl.uint<8>) {}
+      firrtl.module @Inferred(in %dropped: !firrtl.uint, in %live: !firrtl.uint<8>) {}
+      firrtl.module @Scalar(in %data: !firrtl.uint<8>) {}
+      firrtl.module @Mixed(in %io: !firrtl.bundle<pad: uint<0>, live: uint<8>>) {}
+      firrtl.module @Peer() {}
+    }
+  })mlir";
+  auto root = parseSourceString<ModuleOp>(fixture, &context);
+  require(bool(root), "zero-width instance namespace fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  OpBuilder b(&context);
+  auto selector = [&](StringRef target) {
+    return b.getDictionaryAttr({b.getNamedAttr("class", b.getStringAttr("test.Selector")),
+        b.getNamedAttr("target", b.getStringAttr(target)),
+        b.getNamedAttr("payload", b.getStringAttr("inferred_dropped"))});
+  };
+  auto raw = b.getArrayAttr({selector("~Harness|Harness/known:Known"),
+      selector("~Harness|Harness/inferred:Inferred"),
+      selector("~Harness|Harness/inferred:Inferred"),
+      selector("~Harness|Harness/named:Scalar"),
+      selector("~Harness|Harness/real:Mixed")});
+  circuit->setAttr("rawAnnotations", raw);
+  require(succeeded(verify(*root)), "zero-width instance namespace input invalid");
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "zero-width namespace output invalid");
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  SmallVector<StringRef> names{"known", "known_removed", "inferred", "inferred_dropped", "named", "real_"};
+  unsigned index = 0;
+  for (auto instance : top.getOps<InstanceOp>()) {
+    auto expected = names[index++];
+    require(instance.getName() == expected,
+            "zero-only deleted prefix caused an instance rename: expected " +
+                expected.str() + ", actual " + instance.getName().str());
+  }
+  require(index == names.size(), "zero-width namespace changed instance count");
+  circt::hw::InnerSymbolTable::walkSymbols(top, [&](StringAttr, circt::hw::InnerSymTarget) {
+    require(false, "zero-width instance namespace leaked temporary native symbols");
+  });
+  auto updated = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(updated.size() == raw.size(), "zero-width namespace coalesced selector records");
+  for (unsigned i = 0; i + 1 < raw.size(); ++i)
+    require(updated[i] == raw[i], "deleted/inferred-zero prefix changed raw selector payload");
+  Annotation real(updated[updated.size() - 1]);
+  require(real.getMember<StringAttr>("target").getValue() == "~Harness|Harness/real_:Mixed" &&
+          real.getMember<StringAttr>("payload").getValue() == "inferred_dropped",
+          "surviving leaf collision or unrelated payload lost while deleting zero prefixes");
+  auto before = dump(*root);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)) && dump(*root) == before,
+          "zero-width namespace handling is not idempotent");
+  llvm::outs() << "SFC instance namespace ignores declared/inferred-zero ports, fields and declarations; surviving collisions and duplicate selectors preserved\n";
+}
+void finalInstanceNamespaceTargets(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Harness" attributes {rawAnnotations = []} {
+      firrtl.module @Harness() {
+        %foo = firrtl.wire : !firrtl.bundle<x: uint<8>>
+        %foo_x_data = firrtl.instance foo_x @Scalar(in data: !firrtl.uint<8>)
+      }
+      firrtl.module @Scalar(in %data: !firrtl.uint<8>) {}
+    }
+  })mlir", &context);
+  require(bool(root), "final instance namespace fixture parse failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  OpBuilder b(&context);
+  auto instance = *top.getOps<InstanceOp>().begin();
+  instance.setInnerSymAttr(circt::hw::InnerSymAttr::get(b.getStringAttr("instance_identity")));
+  auto wire = *top.getOps<WireOp>().begin();
+  wire.setInnerSymAttr(circt::hw::InnerSymAttr::get(&context, {
+      circt::hw::InnerSymPropertiesAttr::get(&context, b.getStringAttr("wire_identity"),
+                                            1, b.getStringAttr("private"))}));
+  auto raw = b.getArrayAttr({b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("test.Selector")),
+      b.getNamedAttr("target", b.getStringAttr("~Harness|Harness/foo_x:Scalar"))}),
+      b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::DontTouch)),
+        b.getNamedAttr("target", b.getStringAttr("~Harness|Harness>foo.x"))})});
+  circuit->setAttr("rawAnnotations", raw);
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root, circuit, error)), error);
+  require(succeeded(verify(*root)), "flattened wire/instance root collision produced invalid IR");
+  auto identity = circt::hw::InnerSymbolTable(top).lookup("instance_identity");
+  require(bool(identity), "flattened collision lost original instance identity");
+  auto name = identity.getOp()->getAttrOfType<StringAttr>("name").getValue();
+  Annotation selector(circuit->getAttrOfType<ArrayAttr>("rawAnnotations")[0]);
+  require(selector.getMember<StringAttr>("target").getValue() ==
+              "~Harness|Harness/" + name.str() + ":Scalar",
+          "hierarchical selector retained a provisional instance name");
+  auto wireIdentity = circt::hw::InnerSymbolTable(top).lookup("wire_identity");
+  require(wireIdentity && wireIdentity.getField() == 0 && isa<WireOp>(wireIdentity.getOp()),
+          "flattened wire collision lost native leaf identity");
+  Annotation wireSelector(circuit->getAttrOfType<ArrayAttr>("rawAnnotations")[1]);
+  auto selectedWire = goldengate::resolveInternalAnnotationTarget(circuit,
+      wireSelector.getMember<StringAttr>("target").getValue(), error);
+  require(selectedWire == wireIdentity.getOp(),
+          "computed ground wire target was renamed again as an old instance root");
+  llvm::DenseSet<Attribute> names;
+  top.walk([&](Operation *op) {
+    if (isa<WireOp, InstanceOp>(op)) {
+      require(names.insert(op->getAttr("name")).second,
+              "flattened wire and instance have duplicate final roots");
+      require(!op->hasAttr("gg.sfc_instance_prefix") &&
+                  !op->hasAttr("gg.sfc_instance_original"),
+              "temporary instance prefix identity leaked");
+    }
+  });
+  llvm::outs() << "Flattened wire/instance root collision keeps valid names, native symbols and final hierarchical selectors\n";
+}
+void hierarchicalTargets(MLIRContext &context) {
+  const char *fixture=R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Top() {
+        %p0_io = firrtl.wire : !firrtl.uint<1>
+        %p0_data = firrtl.instance p0 @Parent(in io: !firrtl.bundle<a: uint<8>, b: uint<4>>)
+        %p1_data = firrtl.instance p1 @Parent(in io: !firrtl.bundle<a: uint<8>, b: uint<4>>)
+      }
+      firrtl.module @Parent(in %io: !firrtl.bundle<a: uint<8>, b: uint<4>>) {
+        %state = firrtl.wire : !firrtl.bundle<x: uint<3>>
+        %sub_q = firrtl.wire : !firrtl.uint<1>
+        %child_q = firrtl.instance sub @Child(in q: !firrtl.vector<uint<2>, 2>)
+      }
+      firrtl.module @Child(in %q: !firrtl.vector<uint<2>, 2>) {}
+    }
+  })mlir";
+  auto root=parseSourceString<ModuleOp>(fixture,&context);
+  require(bool(root),"hierarchical target fixture parse failed");
+  auto circuit=*root->getOps<CircuitOp>().begin();OpBuilder b(&context);
+  auto annotation=[&](StringRef target) {
+    return b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(goldengate::AnnotationClasses::DontTouch)),
+        b.getNamedAttr("target",b.getStringAttr(target)),
+        b.getNamedAttr("description",b.getStringAttr("~Top|Top/p0:Parent>io"))});
+  };
+  SmallVector<Attribute> raw{annotation("~Top|Top/p0:Parent>io"),
+      annotation("~Top|Top/p0:Parent>io.a"),annotation("~Top|Top/p0:Parent>io.a"),
+      annotation("~Top|Top/p1:Parent>state.x"),
+      annotation("~Top|Top/p1:Parent/sub:Child>q")};
+  circuit->setAttr("rawAnnotations",b.getArrayAttr(raw));
+  std::string error;
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root,circuit,error))&&succeeded(verify(*root)),error);
+  SmallVector<StringRef> expected{"~Top|Top/p0_:Parent>io_a","~Top|Top/p0_:Parent>io_b",
+      "~Top|Top/p0_:Parent>io_a","~Top|Top/p0_:Parent>io_a",
+      "~Top|Top/p1:Parent>state_x","~Top|Top/p1:Parent/sub_:Child>q_0",
+      "~Top|Top/p1:Parent/sub_:Child>q_1"};
+  auto updated=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(updated.size()==expected.size(),"hierarchical aggregate fanout count differs");
+  for(auto [index,attr]:llvm::enumerate(updated)) {
+    Annotation actual(attr);
+    require(actual.getMember<StringAttr>("target").getValue()==expected[index],
+            "hierarchical leaf lost its exact instance context or native field identity");
+    require(actual.getMember<StringAttr>("description")==Annotation(raw[0]).getMember<StringAttr>("description"),
+            "hierarchical lowering modified opaque payload text");
+  }
+  auto before=dump(*root);
+  require(succeeded(goldengate::lowerTypesWithRetainedTargets(*root,circuit,error))&&dump(*root)==before,
+          "hierarchical ground targets are not idempotent");
+  for(StringRef bad:{"~Top|Top/missing:Parent>io.a","~Top|Top/p0:Child>q[0]"}) {
+    auto invalid=parseSourceString<ModuleOp>(fixture,&context);
+    auto owner=*invalid->getOps<CircuitOp>().begin();
+    owner->setAttr("rawAnnotations",b.getArrayAttr({raw.front(),annotation(bad)}));
+    auto original=dump(*invalid);error.clear();
+    require(failed(goldengate::lowerTypesWithRetainedTargets(*invalid,owner,error))&&dump(*invalid)==original,
+            "unresolved hierarchy edge was stripped or mutated before rejection");
+  }
+  llvm::outs()<<"Hierarchical ground target transfer preserves complete renamed context, native fields, duplicates and payloads; invalid edges reject before mutation\n";
+}
 } // namespace
 int main(int argc, char **argv) {
   MLIRContext context;
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
     run(context);
+    instanceNamespaceTargets(context);
+    zeroWidthInstanceNamespaceTargets(context);
+    finalInstanceNamespaceTargets(context);
+    hierarchicalTargets(context);
     memoryPortTargets(context);
     zeroWidthTargets(context);
     for (bool internal : {false, true})

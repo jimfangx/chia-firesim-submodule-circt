@@ -9,6 +9,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include <stdexcept>
 #include <set>
+#include <map>
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
@@ -156,14 +157,109 @@ void run(MLIRContext &context) {
 
   auto referenced = parseSourceString<ModuleOp>(fixture, &context);
   auto referencedCircuit = *referenced->getOps<CircuitOp>().begin();
-  auto external = b.getDictionaryAttr({
-      b.getNamedAttr("class", b.getStringAttr("test.InstanceReference")),
-      b.getNamedAttr("target", b.getStringAttr("~Top|Parent/ram:Ram>r.data"))});
-  referencedCircuit->setAttr("rawAnnotations", b.getArrayAttr({model, external}));
-  before = dump(*referenced);
-  require(failed(goldengate::extractModels(referencedCircuit, promoted, error)) &&
-          promoted == 0 && before == dump(*referenced),
-          "unported external instance annotation rename rejected before mutation");
+  auto reference = [&](StringRef target, StringRef klass = goldengate::AnnotationClasses::DontTouch) {
+    return b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(klass)),
+        b.getNamedAttr("target", b.getStringAttr(target)),
+        b.getNamedAttr("description", b.getStringAttr("~Top|Parent/ram:Ram>r.data")),
+        b.getNamedAttr("constructor", b.getDictionaryAttr({
+          b.getNamedAttr("target", b.getStringAttr("~Top|Parent/ram:Ram>r.data"))}))});
+  };
+  auto external = reference("~Top|Parent/ram:Ram>r.data", "test.InstanceReference");
+  auto nested = reference("~Top|Top/m0:Middle/p0:Parent/ram:Ram>r.addr");
+  auto localPort = reference("~Top|Parent>ram.r.addr");
+  auto otherCircuit = reference("~Other|Parent/ram:Ram>r.data");
+  auto literal = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr("test.Note")),
+      b.getNamedAttr("description", b.getStringAttr("~Top|Parent/ram:Ram>r.data"))});
+  referencedCircuit->setAttr("rawAnnotations", b.getArrayAttr({model, port,
+      external, external, nested, localPort, otherCircuit, literal}));
+  error.clear();
+  require(succeeded(goldengate::extractModels(referencedCircuit, promoted, error)) &&
+          promoted == 3 && succeeded(verify(*referenced)),
+          "retained hierarchical target promotion failed: " + error);
+  auto targets = referencedCircuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  require(targets.size() == 13 && targets[0] == port &&
+          targets[10] == localPort && targets[11] == otherCircuit && targets[12] == literal,
+          "promotion lost duplicate annotation records, order or unrelated targets/payloads");
+  std::map<std::string, unsigned> counts;
+  for (unsigned i = 1; i <= 8; ++i) {
+    Annotation actual(targets[i]);
+    require(actual.isClass("test.InstanceReference") &&
+            actual.getMember<StringAttr>("description") == Annotation(external).getMember<StringAttr>("description") &&
+            actual.getMember<DictionaryAttr>("constructor") == Annotation(external).getMember<DictionaryAttr>("constructor"),
+            "promotion changed opaque payloads while moving real target fields");
+    ++counts[actual.getMember<StringAttr>("target").getValue().str()];
+  }
+  for (const auto &peer : peerTargets)
+    require(counts[peer + ">r.data"] == 2, "duplicate SingleTarget records did not follow every peer");
+  require(Annotation(targets[9]).getMember<StringAttr>("target").getValue() ==
+              "~Top|Top/m0_p0_ram:Ram>r.addr",
+          "explicit outer instance context was incorrectly fanned out or retained");
+
+  // Native inner references and attached native annotations require their own
+  // relocation policy. Reject before erasing the selected instance identity.
+  for (unsigned kind = 0; kind < 3; ++kind) {
+    auto native = parseSourceString<ModuleOp>(fixture, &context);
+    auto owner = *native->getOps<CircuitOp>().begin();
+    owner->setAttr("rawAnnotations", b.getArrayAttr({model}));
+    native->walk([&](InstanceOp instance) {
+      if (instance.getModuleName() != "Ram") return;
+      if (kind == 1)
+        instance.setInnerSymAttr(circt::hw::InnerSymAttr::get(b.getStringAttr("native_identity")));
+      else {
+        auto annotations = b.getArrayAttr({b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr("test.NativeIdentity"))})});
+        if (kind == 0) instance->setAttr("annotations", annotations);
+        else {
+          SmallVector<Attribute> ports(instance.getNumResults(), b.getArrayAttr({}));
+          ports[0] = annotations;
+          instance.setPortAnnotationsAttr(b.getArrayAttr(ports));
+        }
+      }
+    });
+    before = dump(*native);
+    require(failed(goldengate::extractModels(owner, promoted, error)) &&
+            promoted == 0 && before == dump(*native),
+            "native instance identity was erased or mutated without a relocation policy");
+  }
+
+  // SFC reserves grandparent module ports as well as body declarations. The
+  // first peer must avoid leaf_ram, so transitive promotion can add its bundle.
+  auto collision = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" attributes {rawAnnotations = []} {
+      firrtl.module @Ram(in %data: !firrtl.uint<8>) {}
+      firrtl.module @Leaf() {
+        %data = firrtl.instance ram @Ram(in data: !firrtl.uint<8>)
+      }
+      firrtl.module @Parent(in %leaf_ram: !firrtl.uint<1>) {
+        firrtl.instance leaf @Leaf()
+      }
+      firrtl.module @Top() {
+        %leaf_ram = firrtl.instance p @Parent(in leaf_ram: !firrtl.uint<1>)
+      }
+    }
+  })mlir", &context);
+  require(bool(collision), "port collision fixture parse failed");
+  auto collisionCircuit = *collision->getOps<CircuitOp>().begin();
+  auto collisionModel = b.getDictionaryAttr({
+      b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::FAMEModel)),
+      b.getNamedAttr("target", b.getStringAttr("~Top|Leaf/ram:Ram"))});
+  collisionCircuit->setAttr("rawAnnotations", b.getArrayAttr({collisionModel,
+      reference("~Top|Leaf/ram:Ram>data")}));
+  error.clear();
+  require(succeeded(goldengate::extractModels(collisionCircuit, promoted, error)) &&
+          promoted == 2 && succeeded(verify(*collision)),
+          "grandparent port namespace collision rejected: " + error);
+  unsigned finalPeers = 0;
+  collision->walk([&](InstanceOp instance) {
+    if (instance.getModuleName() != "Ram") return;
+    ++finalPeers;
+    require(instance.getName() == "p_leaf_ram_0", "peer name did not reserve grandparent ports like SFC");
+  });
+  require(finalPeers == 1 && Annotation(collisionCircuit->getAttrOfType<ArrayAttr>("rawAnnotations")[0])
+              .getMember<StringAttr>("target").getValue() == "~Top|Top/p_leaf_ram_0:Ram>data",
+          "collision-aware peer and annotation target identities differ");
 }
 } // namespace
 int main() {

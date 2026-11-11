@@ -1,6 +1,6 @@
 // See LICENSE for license details.
-// The first Golden Gate CIRCT boundary: import SFC's pre-FAME FIRRTL without
-// lowering away FireSim annotations, and inventory the CIRCT operations.
+// Import native Chisel CHIRRTL or legacy reference FIRRTL while retaining
+// FireSim annotations, then compile or inventory the CIRCT operations.
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
 #include "circt/Dialect/FIRRTL/FIRParser.h"
 #include "circt/Dialect/FIRRTL/FIREmitter.h"
@@ -419,6 +419,7 @@ int main(int argc, char **argv) {
       argc == 7 && llvm::StringRef(argv[6]) == "--disable-autocounter";
   bool enableSynthPrints = false;
   bool enableSynthAsserts = false;
+  bool enableMultiCycleRamModels = false;
   bool enableMultiThreading = false;
   bool compileBaseline =
       argc >= 7 &&
@@ -473,7 +474,7 @@ int main(int argc, char **argv) {
                     "--wire-autocounter-print-reset | "
                     "--disable-autocounter | --compile-baseline "
                     "[--platform-config config] [--output-filename-base name] [--enable-autoila] "
-                    "[--enable-synth-prints] [--enable-synth-asserts] [--enable-autocounter-printf | --enable-autocounter-csv] [--enable-multithreading] [--nic-mode=normal|loopback] [--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser [--map-print-host-fased-timing-cycle]]]]]]]]]]]]]]]]]]]]]] "
+                    "[--enable-synth-prints] [--enable-synth-asserts] [--enable-multicycle-ram-models] [--enable-autocounter-printf | --enable-autocounter-csv] [--enable-multithreading] [--nic-mode=normal|loopback] [--stop-after-print-host-binding [--print-rocket-control-catalog native.mlir] [--map-print-host-tracerv [--map-print-host-tracerv-trigger [--map-print-host-tracerv-queue]]] [--map-print-host-cpu-streams [--map-print-host-control [--map-print-host-responses [--map-print-host-master [--map-print-host-cpu-write-buffer [--map-print-host-cpu-read-buffer [--map-print-host-cpu-response-buffer [--map-print-host-cpu-write-response-buffer [--map-print-host-cpu-port [--map-print-host-fased-tokens [--map-print-host-fased-outstanding [--map-print-host-fased-ingress [--map-print-host-fased-ingress-credits [--map-print-host-fased-ingress-order [--map-print-host-fased-ingress-issue [--map-print-host-fased-ingress-deadlock [--map-print-host-fased-read-buffer [--map-print-host-fased-read-scheduler [--map-print-host-fased-write-egress [--map-print-host-fased-response-releaser [--map-print-host-fased-timing-cycle]]]]]]]]]]]]]]]]]]]]]] "
                     "[--ila-depth count] [--ila-probe-triggers count]]\n";
     return 2;
   }
@@ -544,6 +545,11 @@ int main(int argc, char **argv) {
       if (option == "--enable-synth-asserts") {
         if (enableSynthAsserts) return fail("duplicate --enable-synth-asserts");
         enableSynthAsserts = true;
+        continue;
+      }
+      if (option == "--enable-multicycle-ram-models") {
+        if (enableMultiCycleRamModels) return fail("duplicate --enable-multicycle-ram-models");
+        enableMultiCycleRamModels = true;
         continue;
       }
       if (option == "--enable-synth-prints") {
@@ -827,6 +833,8 @@ int main(int argc, char **argv) {
         fasedFRFCFS = true;
       } else if (fragment == "WithSynthAsserts") {
         enableSynthAsserts = true;
+      } else if (fragment == "WithMultiCycleRamModels" || fragment == "MCRams") {
+        enableMultiCycleRamModels = true;
       } else if (fragment == "WithPrintfSynthesis") {
         enableSynthPrints = true;
       } else if (fragment == "WithAutoCounter") {
@@ -975,6 +983,29 @@ int main(int argc, char **argv) {
   module->walk([&](CircuitOp op) { circuit = op; });
   if (!circuit)
     return fail("input did not produce a firrtl.circuit");
+  // Native Chipyard CHIRRTL embeds the same annotation array that it writes
+  // to the sidecar. Normalize that mirrored handoff before any GG transform.
+  // Remove only a complete matching second copy; intentional duplicates within
+  // either array, or distinct embedded/sidecar payloads, remain untouched.
+  auto deduplicateMirroredAnnotations = [&](size_t externalCount) {
+    auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+    if (!raw || !externalCount || raw.size() != 2 * externalCount ||
+        !llvm::equal(raw.getValue().take_front(externalCount),
+                     raw.getValue().drop_front(externalCount)))
+      return false;
+    circuit->setAttr("rawAnnotations", ArrayAttr::get(
+        &context, raw.getValue().take_front(externalCount)));
+    return true;
+  };
+  bool deduplicatedEmbeddedAnnotations = false;
+  if (sourceMgr.getMemoryBuffer(1)->getBuffer().contains("%[")) {
+    auto sidecar = llvm::json::parse(
+        sourceMgr.getMemoryBuffer(annotationBufferID)->getBuffer());
+    if (!sidecar || !sidecar->getAsArray())
+      return fail("annotation file must contain a JSON array");
+    deduplicatedEmbeddedAnnotations =
+        deduplicateMirroredAnnotations(sidecar->getAsArray()->size());
+  }
   const std::string originalTargetName = circuit.getName().str();
   // Platform capacity must precede early allocation and all functional queues.
   // maxFlight caps this capacity; it does not identify the platform model.
@@ -2125,13 +2156,11 @@ int main(int argc, char **argv) {
       llvm::outs() << "Wrapped CIRCT top in " << wrapIRPath << '\n';
 
       // MidasTransforms gates LabelSRAMModels on GenerateMultiCycleRamModels,
-      // whose default is false. None of the supported platform fragments sets
-      // it: FirrtlMemModel annotations only select memories if that optional
-      // transform is enabled. Keep the selections and inline memory behavior
-      // in baseline builds. Explicit SRAM diagnostic modes remain available.
-      constexpr bool generateMultiCycleRamModels = false;
+      // whose default is false. Memory annotations select the memories, while
+      // WithMultiCycleRamModels/MCRams or the explicit native flag enable the
+      // transform. Disabled builds retain selections and inline memory behavior.
       unsigned selectedSRAMs = 0;
-      if (generateMultiCycleRamModels &&
+      if (enableMultiCycleRamModels &&
           failed(goldengate::labelSRAMModels(circuit, selectedSRAMs, error)))
         return fail("LabelSRAMModels: " + error);
       unsigned promotedModels = 0;
@@ -2286,34 +2315,31 @@ int main(int argc, char **argv) {
         if (!resolved || resolved->port) return fail("invalid FAME graph selection: " + error);
         selectedGraphDefinitions.insert(resolved->module.getOperation());
       }
-      if (selectedSRAMs) {
-        unsigned materialized = 0;
-        if (failed(goldengate::rewriteSRAMTimingHardware(circuit, materialized, error)))
-          return fail("selected SRAM simulator hardware: " + error);
-        if (materialized != selectedSRAMs)
-          return fail("selected SRAM definitions were not all materialized");
-        llvm::SmallString<256> memoryIR(outputDir), memoryAnnos(outputDir);
-        llvm::sys::path::append(memoryIR, "post-sram-simulator-hardware.mlir");
-        llvm::sys::path::append(memoryAnnos, "post-sram-simulator-hardware-all.json");
-        std::error_code memoryEC = emitDebugSnapshot(
-            module->getOperation(), memoryIR, emitDebugSnapshots);
-        if (memoryEC) return fail("cannot write selected SRAM simulator hardware: " + memoryEC.message());
-        if (failed(goldengate::emitAllAnnotations(circuit, memoryAnnos, error)))
-          return fail("cannot write selected SRAM simulator annotations: " + error);
-        llvm::outs() << "Materialized " << materialized
-                     << " selected native SRAM definitions for FireSim host assembly\n";
-        // SRAM command/response queues are already internal to the active
-        // transport wrapper. External Print channels retain latency-zero
-        // Decoupled endpoints on that wrapper, which the constructor binder
-        // joins exactly as it joins the single-hub target's output tokens.
-        if (stopAfterPrintHostBinding) return emitPrintPayloadBoundary();
-      } else if (selectedGraphDefinitions.size() > 1 || enableMultiThreading) {
+      if (selectedSRAMs || selectedGraphDefinitions.size() > 1 || enableMultiThreading) {
+        if (selectedSRAMs) {
+          mlir::PassManager normalized(module->getContext());
+          normalized.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+          if (failed(normalized.run(*module)))
+            return fail("selected SRAM last-connect normalization failed");
+        }
         goldengate::FAMEModelGraphResult graph;
         if (failed(goldengate::rewriteFAMEModelGraph(circuit, graph, error,
                                                      !stopAfterPrintHostBinding,
                                                      enableMultiThreading,
                                                      goldengate::FAME5ClockSemantics::XilinxBUFGCE)))
           return fail("generalized FAME model graph: " + error);
+        // Selected memories participate in the same topology-driven FAME graph
+        // as all other models. Replace only their typed, channelized wrappers
+        // after the shared clock and transport construction has completed.
+        if (selectedSRAMs) {
+          unsigned materialized = 0;
+          if (failed(goldengate::materializeSelectedRAMModels(circuit, materialized, error)))
+            return fail("selected SRAM simulator hardware: " + error);
+          if (materialized != selectedSRAMs)
+            return fail("selected SRAM definitions were not all materialized");
+          llvm::outs() << "Materialized " << materialized
+                       << " selected native SRAM definitions for FireSim host assembly\n";
+        }
         if (failed(verify(*module))) return fail("FAME model graph produced invalid IR");
         llvm::SmallString<256> graphIR(outputDir), graphAnnotations(outputDir);
         llvm::sys::path::append(graphIR, "post-fame-model-graph.mlir");
@@ -6041,9 +6067,9 @@ int main(int argc, char **argv) {
     return 0;
   }
 
-  // The importer already parses and validates the annotation JSON. Only this
-  // diagnostic path needs a separate JSON tree to check retained annotations;
-  // production compilation returns above without constructing it again.
+  // The importer already validates the annotation JSON. Reparse it here for
+  // diagnostic inventory reporting. Legacy production needs no separate tree;
+  // native production uses one only for the mirrored handoff check above.
   auto parsedAnnotations = llvm::json::parse(
       sourceMgr.getMemoryBuffer(annotationBufferID)->getBuffer());
   if (!parsedAnnotations || !parsedAnnotations->getAsArray())
@@ -6060,16 +6086,11 @@ int main(int argc, char **argv) {
   if (!rawAnnotations)
     return fail("CIRCT did not retain the input annotations");
   // The current FireSim generator writes the same annotations into the FIRRTL
-  // 3.3 header and the separate .anno.json. SFC's handoff provides both. Only
+  // 3.3 header and the separate .anno.json. The native handoff provides both. Only
   // remove the second copy when every imported attribute matches in order.
-  bool deduplicatedEmbeddedAnnotations = false;
   auto externalCount = parsedAnnotations->getAsArray()->size();
-  if (externalCount && rawAnnotations.size() == 2 * externalCount &&
-      llvm::equal(rawAnnotations.getValue().take_front(externalCount),
-                  rawAnnotations.getValue().drop_front(externalCount))) {
-    rawAnnotations = mlir::ArrayAttr::get(
-        &context, rawAnnotations.getValue().take_front(externalCount));
-    circuit->setAttr("rawAnnotations", rawAnnotations);
+  if (deduplicateMirroredAnnotations(externalCount)) {
+    rawAnnotations = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
     deduplicatedEmbeddedAnnotations = true;
   }
   std::map<std::string, unsigned> classes;

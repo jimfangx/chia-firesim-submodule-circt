@@ -503,9 +503,12 @@ file(READ "${OUTPUT}/timing-models/post-sram-models.implementation.xdc" implemen
 file(READ "${OUTPUT}/timing-models/post-sram-models.synthesis.xdc" synthesis_xdc)
 string(REGEX MATCHALL "inst [^\n]*_buffer of AbstractClockGate" surviving_gates "${timing_fir}")
 list(LENGTH surviving_gates gate_count)
+# ExtractModel introduces the sibling Top_ram. SFC LowerTypes reserves that
+# intermediate aggregate prefix and consequently renames the original Top
+# instance to Top_; generated timing constraints must follow the actual pin.
 if(NOT gate_count EQUAL 1 OR NOT timing_fir MATCHES "module RamModel" OR
    NOT timing_fir MATCHES "inst model of RamModel" OR
-   NOT implementation_xdc MATCHES "post/link/target_FAMETop/Top/clock_buffer/O" OR
+   NOT implementation_xdc MATCHES "post/link/target_FAMETop/Top_/clock_buffer/O" OR
    NOT implementation_xdc MATCHES "set_multicycle_path 3 -setup" OR
    NOT implementation_xdc MATCHES "set_multicycle_path 2 -hold" OR
    synthesis_xdc MATCHES "create_generated_clock")
@@ -583,8 +586,8 @@ if(NOT print_ram_count EQUAL 4 OR
    NOT print_bound MATCHES "inst sim of GGFAMEPipeWrapper" OR
    NOT print_bound MATCHES "connect PrintBridgeModule_0.hostClock, hostClock" OR
    NOT print_bound MATCHES "connect PrintBridgeModule_0.hostReset, hostReset" OR
-   NOT print_bound MATCHES "connect PrintBridgeModule_0.hBits.record.data,[ \n]+sim.Top_print_data_source.bits" OR
-   NOT print_bound_annos MATCHES "~GGPrintBridgeHostWrapper\\|GGFAMEPipeWrapper>Top_print_data_source.bits" OR
+   NOT print_bound MATCHES "connect PrintBridgeModule_0.hBits.record.data,[ \n]+sim.Top__print_data_source.bits" OR
+   NOT print_bound_annos MATCHES "~GGPrintBridgeHostWrapper\\|GGFAMEPipeWrapper>Top__print_data_source.bits" OR
    NOT print_bound_annos MATCHES "~GGPrintBridgeHostWrapper\\|GGPrintBridgeHostQueued>hBits.record.data" OR
    NOT print_header MATCHES "value=%x")
   message(FATAL_ERROR "Selected SRAM Print host lost RAM, queued endpoint or decoder identity")

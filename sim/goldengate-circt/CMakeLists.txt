@@ -238,6 +238,16 @@ endif()
 if(BUILD_TESTING)
   find_package(Python3 QUIET COMPONENTS Interpreter)
   if(Python3_Interpreter_FOUND)
+    add_test(NAME goldengate-fame-boundary-routes
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/CompareFAMEBoundaryRoutesTest.py)
+    add_test(NAME goldengate-compile-contract-provenance
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/CompileContractProvenanceTest.py)
+    add_test(NAME goldengate-native-chirrtl-annotations
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/NativeCHIRRTLAnnotationsTest.py
+        $<TARGET_FILE:goldengate-circt>)
     add_test(NAME goldengate-firesim-compiler-selection
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/FireSimCompilerSelectionTest.py)
@@ -2614,6 +2624,8 @@ endif()
 if(BUILD_TESTING)
   add_executable(goldengate-fame-model-graph-test
     test/Transforms/FAMEModelGraphTest.cpp
+    lib/Transforms/RAMModelAdapter.cpp
+    lib/Transforms/AsyncRAMModel.cpp
     lib/Transforms/FAMEModelGraph.cpp
     lib/Transforms/FAMEModelControls.cpp
     lib/Transforms/FAMEInputChannel.cpp
@@ -2647,7 +2659,14 @@ if(BUILD_TESTING)
   target_include_directories(goldengate-fame-model-graph-test PRIVATE
     include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
   target_link_libraries(goldengate-fame-model-graph-test PRIVATE
-    CIRCTImportFIRFile CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRIR MLIRSupport LLVMSupport)
+    CIRCTImportFIRFile CIRCTFIRRTLTransforms CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
+  if(Python3_Interpreter_FOUND)
+    add_test(NAME goldengate-multicycle-ram-model-graph
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/MultiCycleRAMGraphTest.py
+        $<TARGET_FILE:goldengate-circt> $<TARGET_FILE:goldengate-fame-model-graph-test>
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms)
+  endif()
   add_test(NAME goldengate-fame-model-graph COMMAND goldengate-fame-model-graph-test
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.fir
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.anno.json)
@@ -2885,6 +2904,20 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
   find_program(GOLDENGATE_ASSERT_VERILATOR NAMES verilator
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.conda-env/bin")
   if(GOLDENGATE_ASSERT_FIRTOOL AND GOLDENGATE_ASSERT_VERILATOR)
+    add_test(NAME goldengate-multicycle-ram-sharing
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/MultiCycleRAMSharingTest.py
+        --compiler $<TARGET_FILE:goldengate-circt>
+        --firtool ${GOLDENGATE_ASSERT_FIRTOOL}
+        --verilator ${GOLDENGATE_ASSERT_VERILATOR}
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/multicycle-ram-sharing)
+    add_test(NAME goldengate-multicycle-ram-response-join
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/MultiCycleRAMResponseJoinTest.py
+        --compiler $<TARGET_FILE:goldengate-circt>
+        --firtool ${GOLDENGATE_ASSERT_FIRTOOL}
+        --verilator ${GOLDENGATE_ASSERT_VERILATOR}
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/multicycle-ram-response-join)
     add_test(NAME goldengate-assertion-bridge-rtl
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/AssertionBridgeRTLTest.py

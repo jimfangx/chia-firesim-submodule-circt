@@ -85,6 +85,7 @@ class FireSimCompilerSelectionTest(unittest.TestCase):
         args = json.loads(self.calls.read_text())
         self.assertIn("--compile-baseline", args)
         self.assertNotIn("--enable-synth-asserts", args)
+        self.assertNotIn("--enable-multicycle-ram-models", args)
         self.assertEqual(args[args.index('--platform-config') + 1], "BaseF2Config")
         for suffix in (".const.h", ".const.vh", ".partition.const.h",
                        ".peer2peer.const.yaml", ".memory-origins.json",
@@ -136,6 +137,31 @@ class FireSimCompilerSelectionTest(unittest.TestCase):
         self.assertIn("--enable-autocounter-csv", args)
         self.assertIn("--enable-autoila", args)
         self.assertEqual(args[args.index('--ila-depth') + 1], "2048")
+
+
+    def test_multicycle_ram_configuration_aliases_reach_native_compiler(self):
+        for fragment in ('WithMultiCycleRamModels', 'MCRams'):
+            with self.subTest(fragment=fragment):
+                self.calls.unlink(missing_ok=True)
+                result = self.make('compile', 'PLATFORM_CONFIG=' + fragment + '_BaseF2Config')
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(json.loads(self.calls.read_text()).count('--enable-multicycle-ram-models'), 1)
+
+    def test_multicycle_ram_explicit_option_reaches_native_compiler(self):
+        result = self.make('compile', 'GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS=enabled')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('--enable-multicycle-ram-models', json.loads(self.calls.read_text()))
+
+    def test_multicycle_ram_explicit_disabled_remains_disabled(self):
+        result = self.make('compile', 'GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS=disabled')
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertNotIn('--enable-multicycle-ram-models', json.loads(self.calls.read_text()))
+
+    def test_invalid_multicycle_ram_option_stops_build(self):
+        result = self.make('compile', 'GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS=yes')
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS must be enabled or disabled', result.stderr)
+        self.assertFalse(self.calls.exists())
 
 
 if __name__ == "__main__":

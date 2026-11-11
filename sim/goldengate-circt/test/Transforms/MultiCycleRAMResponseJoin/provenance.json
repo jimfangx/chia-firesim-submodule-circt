@@ -1,0 +1,12 @@
+{
+  "oracle": "Actual EmitAndWrapRAMModels followed by FIRRTL VerilogCompiler; Scala2.13.10, generated2026-11-11.",
+  "source_generator": "../MultiCycleRAMResponseJoinOracle.scala",
+  "source_memory": "UInt<8>,4 addresses,2readcommands,1writecommand; distinct read payload fields in one physical response channel.",
+  "scope": "Finite model-level protocol/data regression; not full-design equivalence or target DRAM initialization.",
+  "sfc_jar_sha256": "16ae60498397d40c57008cf86d3d6ec4e5b2a0c097783b52380e3ecd02357057",
+  "sha256": {
+    "input.fir": "fc946f9536bb83f79474773a6a14b35a30949843882b21b58dae7167c2e3982b",
+    "annotations.json": "d13d03db4c307cd37b978710d7e787c14a2aa214e93b871c1372ec061a87571e",
+    "sfc.sv": "6ad9c6e0b3e86dafe458d3d93ae98e369dbbc2097273955eef99f53b0af8c06d"
+  }
+}

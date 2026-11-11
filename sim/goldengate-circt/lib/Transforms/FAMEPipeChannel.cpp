@@ -2,6 +2,7 @@
 #include "goldengate/FAMEPipeChannel.h"
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/TargetUtils.h"
+#include "goldengate/RetainedAnnotationTargets.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/ADT/APSInt.h"
@@ -577,9 +578,7 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
         if (!llvm::any_of(wrapper.getPorts(), [&](const PortInfo &external) {
               return external.name == port.name;
             })) innerOnlyPorts.insert(port.name.getValue().str());
-  std::function<Attribute(Attribute, bool)> retarget =
-      [&](Attribute attr, bool targetDomain) -> Attribute {
-    if (auto string = dyn_cast<StringAttr>(attr)) {
+  auto retarget = [&](StringAttr string, bool targetDomain) -> StringAttr {
       // Filtered payload leaves remain on the retained target, even when their
       // spelling coincides with a normalized external leaf.
       targetDomain |= internalTargets.count(string.getValue().str()) != 0;
@@ -590,7 +589,7 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
       if (value == oldCircuit)
         return StringAttr::get(context, newCircuit);
       if (!value.starts_with(oldCircuit + "|"))
-        return attr;
+        return string;
       std::string suffix = value.drop_front(oldName.size() + 1).str();
       if (suffix == oldModule)
         return StringAttr::get(context, newCircuit + newModule);
@@ -603,41 +602,31 @@ LogicalResult goldengate::activateFAMEPipeWrapper(CircuitOp circuit,
         if (exposed) suffix.replace(0, oldModule.size() + 1, newModule + ">");
       }
       return StringAttr::get(context, newCircuit + suffix);
-    }
-    if (auto array = dyn_cast<ArrayAttr>(attr)) {
-      SmallVector<Attribute> values;
-      for (Attribute value : array)
-        values.push_back(retarget(value, targetDomain));
-      return ArrayAttr::get(context, values);
-    }
-    if (auto dict = dyn_cast<DictionaryAttr>(attr)) {
-      SmallVector<NamedAttribute> values;
-      Annotation annotation(dict);
-      auto sources = annotation.getMember<ArrayAttr>("sources");
-      auto sinks = annotation.getMember<ArrayAttr>("sinks");
-      bool loopback = annotation.isClass(AnnotationClasses::ChannelConnection) &&
-                      sources && !sources.empty() && sinks && !sinks.empty();
-      for (NamedAttribute value : dict)
-        // A channel's associated clock names the retained target domain.
-        // SimWrapper.genClockChannel changes the wrapper payload to Vec[Bool],
-        // while the target still owns its scalar Clock / ClockRecord leaves.
-        // Model-to-model sources stay upstream of queues on the retained
-        // target. A bridge channel sharing that producer instead names its
-        // external queue output: the widget must consume queued tokens, not
-        // resolve the internal producer merely because another channel does.
-        // Moving a clock leaf loses its Clock type or invalidates a record path.
-        values.emplace_back(value.getName(), retarget(value.getValue(),
-            targetDomain || (annotation.isClass(AnnotationClasses::ChannelConnection) &&
-                (value.getName().getValue() == "clock" ||
-                 (loopback && value.getName().getValue() == "sinks") ||
-                 (loopback && value.getName().getValue() == "sources")))));
-      return DictionaryAttr::get(context, values);
-    }
-    return attr;
   };
   SmallVector<Attribute> annotations;
-  for (Attribute annotation : raw)
-    annotations.push_back(retarget(annotation, false));
+  for (Attribute attr : raw) {
+    Annotation original(attr);
+    Annotation updated(goldengate::mapRetainedAnnotationTargets(attr,
+        [&](StringAttr value) { return retarget(value, false); }));
+    // Preserve the existing member-specific target-domain policy. Applying
+    // it to values globally would misclassify the same spelling appearing in
+    // both a bridge endpoint and an associated target clock.
+    if (original.isClass(AnnotationClasses::ChannelConnection)) {
+      if (auto clock = original.getMember<StringAttr>("clock"))
+        updated.setMember("clock", retarget(clock, true));
+      auto sources = original.getMember<ArrayAttr>("sources");
+      auto sinks = original.getMember<ArrayAttr>("sinks");
+      if (sources && !sources.empty() && sinks && !sinks.empty())
+        for (StringRef member : {"sources", "sinks"}) {
+          SmallVector<Attribute> targets;
+          for (auto value : original.getMember<ArrayAttr>(member))
+            targets.push_back(isa<StringAttr>(value) ?
+                retarget(cast<StringAttr>(value), true) : value);
+          updated.setMember(member, ArrayAttr::get(context, targets));
+        }
+    }
+    annotations.push_back(updated.getAttr());
+  }
   circuit->setAttr("rawAnnotations", ArrayAttr::get(context, annotations));
   circuit.setName(wrapperName);
   return success();

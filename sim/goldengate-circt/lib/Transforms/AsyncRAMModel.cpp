@@ -10,10 +10,10 @@
 // suppresses writes but does not clear data. Writes wait for all reads and a
 // reset token; advance waits for every response and write command.
 #include "goldengate/AsyncRAMModel.h"
+#include "goldengate/RetainedAnnotationTargets.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
-#include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
@@ -81,26 +81,23 @@ LogicalResult goldengate::emitAsyncRAMModel(FModuleOp module,
   // Retained body targets need a separate rename policy. Port targets remain.
   if (auto raw = circuit ? circuit->getAttrOfType<ArrayAttr>("rawAnnotations") : ArrayAttr{}) {
     std::string prefix = "~" + circuit.getName().str() + "|";
-    std::function<void(Attribute)> check = [&](Attribute a) {
-      if (auto s = dyn_cast<StringAttr>(a)) {
-        auto ref = s.getValue();
-        if (!ref.consume_front(prefix)) return;
+    for (auto annotation : raw)
+      goldengate::mapRetainedAnnotationTargets(annotation, [&](StringAttr target) {
+        auto ref = target.getValue();
+        if (!ref.consume_front(prefix)) return target;
         auto [scope, reference] = ref.split('>');
         SmallVector<StringRef> path;
         scope.split(path, '/');
         for (auto [i, step] : llvm::enumerate(path)) {
           auto name = i ? step.split(':').second : step;
           if (name != module.getName()) continue;
-          // A path through a soon-to-be-erased instance is also a body identity.
           if (i + 1 != path.size()) { identities = true; continue; }
-          if (reference.empty()) continue; // The module identity survives.
+          if (reference.empty()) continue;
           auto root = reference.take_front(reference.find_first_of(".["));
           identities |= llvm::none_of(ports, [&](PortInfo p) { return p.name.getValue() == root; });
         }
-      } else if (auto array = dyn_cast<ArrayAttr>(a)) { for (auto v : array) check(v); }
-      else if (auto d = dyn_cast<DictionaryAttr>(a)) { for (auto v : d) check(v.getValue()); }
-    };
-    check(raw);
+        return target;
+      });
   }
   if (identities) return reject("Async RAM body identities require a rename policy");
   OwningOpRef<FModuleOp> candidate(cast<FModuleOp>(module->clone()));

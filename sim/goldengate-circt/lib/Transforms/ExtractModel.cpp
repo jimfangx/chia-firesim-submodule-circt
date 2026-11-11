@@ -1,16 +1,19 @@
 // See LICENSE for license details.
 #include "goldengate/ExtractModel.h"
 #include "goldengate/AnnotationClasses.h"
+#include "goldengate/RetainedAnnotationTargets.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "circt/Dialect/FIRRTL/FIRRTLUtils.h"
 #include "circt/Support/InstanceGraph.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/OwningOpRef.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/DenseSet.h"
 #include <limits>
 #include <map>
 #include <set>
 #include <vector>
+#include <tuple>
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -69,35 +72,140 @@ std::optional<ModelInstance> resolveModel(CircuitOp circuit,
   return ModelInstance{parent, child, instance};
 }
 
-bool refersToInstance(Attribute attr, llvm::StringRef target) {
-  if (auto text = dyn_cast<StringAttr>(attr))
-    return text.getValue().starts_with(target);
-  if (auto array = dyn_cast<ArrayAttr>(attr)) {
-    for (Attribute member : array)
-      if (refersToInstance(member, target))
-        return true;
+struct PromotionPeer {
+  InstanceOp parentUse;
+  FModuleOp grandparent;
+  std::string parentName, name;
+};
+
+struct RetainedPath {
+  StringRef circuit, root, reference;
+  SmallVector<std::pair<StringRef, StringRef>> edges;
+  bool hasReference = false;
+};
+
+std::optional<RetainedPath> parseRetainedPath(StringRef text) {
+  if (!text.consume_front("~")) return std::nullopt;
+  RetainedPath result;
+  std::tie(result.circuit, text) = text.split('|');
+  if (result.circuit.empty() || text.empty() || text.contains('|')) return std::nullopt;
+  result.hasReference = text.contains('>');
+  StringRef hierarchy;
+  std::tie(hierarchy, result.reference) = text.split('>');
+  if ((result.hasReference && result.reference.empty()) || result.reference.contains('>'))
+    return std::nullopt;
+  SmallVector<StringRef> path;
+  hierarchy.split(path, '/');
+  result.root = path.front();
+  if (result.root.empty()) return std::nullopt;
+  for (auto token : llvm::drop_begin(path)) {
+    auto [instance, child] = token.split(':');
+    if (instance.empty() || child.empty() || child.contains(':')) return std::nullopt;
+    result.edges.emplace_back(instance, child);
   }
-  if (auto dict = dyn_cast<DictionaryAttr>(attr)) {
-    for (NamedAttribute member : dict)
-      if (refersToInstance(member.getValue(), target))
-        return true;
-  }
-  return false;
+  return result;
 }
 
-// This is the one retained instance annotation whose RenameMap schema is
-// implemented here. Do not grant an exemption to nested or field-qualified
-// references, or to arbitrary annotations that happen to contain this target.
-bool isThreadingSelector(Attribute attr, llvm::StringRef target) {
-  Annotation annotation(attr);
-  auto selected = annotation.getMember<StringAttr>("target");
-  auto dict = dyn_cast<DictionaryAttr>(attr);
-  return annotation.isClass(goldengate::AnnotationClasses::EnableModelMultiThreading) &&
-         dict && dict.size() == 2 && selected && selected.getValue() == target;
+// A local target applies to every use of the parent definition. A target with
+// an explicit parent-instance context selects only that context's new peer.
+// Match complete hierarchy tokens, never a substring in an arbitrary payload.
+std::optional<unsigned> selectedEdge(const RetainedPath &path,
+                                    const ModelInstance &model,
+                                    StringRef circuit) {
+  if (path.circuit != circuit) return std::nullopt;
+  auto selectedParent = model.parent;
+  auto selectedInstance = model.instance;
+  auto selectedChild = model.child;
+  StringRef parent = path.root;
+  for (auto [index, edge] : llvm::enumerate(path.edges)) {
+    if (parent == selectedParent.getName() && edge.first == selectedInstance.getName() &&
+        edge.second == selectedChild.getName()) return index;
+    parent = edge.second;
+  }
+  return std::nullopt;
+}
+
+StringAttr rewritePromotedTarget(StringAttr attr, const ModelInstance &model,
+                                ArrayRef<PromotionPeer> peers,
+                                const PromotionPeer *localPeer,
+                                StringRef circuit, std::string &error) {
+  auto path = parseRetainedPath(attr.getValue());
+  auto edge = path ? selectedEdge(*path, model, circuit) : std::nullopt;
+  if (!edge) return attr;
+  const PromotionPeer *peer = localPeer;
+  if (*edge) {
+    StringRef grandparent = *edge == 1 ? path->root : path->edges[*edge - 2].second;
+    auto oldParent = path->edges[*edge - 1].first;
+    peer = nullptr;
+    for (const auto &candidate : peers) {
+      auto owner = candidate.grandparent;
+      if (owner.getName() == grandparent && candidate.parentName == oldParent) {
+        peer = &candidate;
+        break;
+      }
+    }
+  }
+  if (!peer) {
+    error = "promoted annotation has an unresolved parent-instance context: " + attr.getValue().str();
+    return attr;
+  }
+  auto owner = peer->grandparent;
+  auto child = model.child;
+  std::string result = "~" + circuit.str() + "|" +
+      (*edge ? path->root.str() : owner.getName().str());
+  for (unsigned i = 0; i + 1 < *edge; ++i)
+    result += "/" + path->edges[i].first.str() + ":" + path->edges[i].second.str();
+  result += "/" + peer->name + ":" + child.getName().str();
+  for (unsigned i = *edge + 1; i < path->edges.size(); ++i)
+    result += "/" + path->edges[i].first.str() + ":" + path->edges[i].second.str();
+  if (path->hasReference) result += ">" + path->reference.str();
+  return StringAttr::get(attr.getContext(), result);
+}
+
+LogicalResult rewritePromotedAnnotations(ArrayRef<Attribute> annotations,
+                                        const ModelInstance &model,
+                                        ArrayRef<PromotionPeer> peers,
+                                        StringRef circuit,
+                                        SmallVectorImpl<Attribute> &rewritten,
+                                        std::string &error) {
+  for (auto attr : annotations) {
+    bool local = false, affected = false, invalidThreading = false;
+    Annotation annotation(attr);
+    goldengate::mapRetainedAnnotationTargets(attr, [&](StringAttr target) {
+      auto path = parseRetainedPath(target.getValue());
+      auto edge = path ? selectedEdge(*path, model, circuit) : std::nullopt;
+      if (edge) {
+        affected = true;
+        local |= *edge == 0;
+        invalidThreading |= annotation.isClass(goldengate::AnnotationClasses::EnableModelMultiThreading) && path->hasReference;
+      }
+      return target;
+    });
+    if (invalidThreading) {
+      error = "threading selector must name an instance, not a reference";
+      return failure();
+    }
+    if (!affected) {
+      rewritten.push_back(attr);
+      continue;
+    }
+    std::string mappingError;
+    auto append = [&](const PromotionPeer *peer) {
+      rewritten.push_back(goldengate::mapRetainedAnnotationTargets(attr, [&](StringAttr target) {
+        return rewritePromotedTarget(target, model, peers, peer, circuit, mappingError);
+      }));
+    };
+    if (local) for (const auto &peer : peers) append(&peer);
+    else append(nullptr);
+    if (!mappingError.empty()) { error = mappingError; return failure(); }
+  }
+  return success();
 }
 
 LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
                          SmallVectorImpl<std::string> &peerTargets,
+                         ArrayRef<Attribute> annotations,
+                         SmallVectorImpl<Attribute> &rewrittenAnnotations,
                          std::string &error) {
   auto parent = model.parent;
   auto child = model.child;
@@ -105,6 +213,12 @@ LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
   std::string promotedName = instance.getName().str();
   if (parent.getName() == circuit.getName()) {
     error = "cannot promote a model instance from the wrapper top";
+    return failure();
+  }
+  bool nativePortAnnotations = llvm::any_of(instance.getPortAnnotationsAttr(),
+      [](Attribute attr) { return !cast<ArrayAttr>(attr).empty(); });
+  if (instance.getInnerSymAttr() || !AnnotationSet(instance).empty() || nativePortAnnotations) {
+    error = "promoted model instance has native annotation/symbol identities requiring a relocation policy";
     return failure();
   }
 
@@ -157,36 +271,49 @@ LogicalResult promoteOne(CircuitOp circuit, const ModelInstance &model,
                             BundleType::get(circuit.getContext(), fields),
                             Direction::In)});
 
+  SmallVector<PromotionPeer> peers;
+  std::map<Operation *, std::set<std::string>> namespaces;
+  for (auto use : parentUses) {
+    auto grandparent = use->getParentOfType<FModuleOp>();
+    auto [entry, fresh] = namespaces.try_emplace(grandparent.getOperation());
+    auto &used = entry->second;
+    if (fresh) {
+      for (const auto &port : grandparent.getPorts()) used.insert(port.getName().str());
+      grandparent.walk([&](Operation *op) {
+        if (auto name = op->getAttrOfType<StringAttr>("name")) used.insert(name.getValue().str());
+      });
+    }
+    std::string base = use.getName().str() + "_" + promotedName;
+    std::string peerName = base;
+    for (unsigned suffix = 0; !used.insert(peerName).second; ++suffix)
+      peerName = base + "_" + std::to_string(suffix);
+    peers.push_back({use, grandparent, use.getName().str(), std::move(peerName)});
+  }
+  if (failed(rewritePromotedAnnotations(annotations, model, peers, circuit.getName(),
+                                        rewrittenAnnotations, error))) return failure();
+
   parent.insertPorts(added);
   OpBuilder parentBuilder(&parent.getBodyBlock()->front());
   for (unsigned i = 0; i < child.getNumPorts(); ++i)
     instance.getResult(i).replaceAllUsesWith(parentBuilder.create<SubfieldOp>(
         instance.getLoc(), parent.getBodyBlock()->getArgument(oldPortCount),
         child.getPortName(i)));
+  OwningOpRef<InstanceOp> childTemplate(cast<InstanceOp>(instance->clone()));
   instance.erase();
 
-  for (InstanceOp use : parentUses) {
-    auto grandparent = use->getParentOfType<FModuleOp>();
-    std::set<std::string> used;
-    grandparent.walk([&](Operation *op) {
-      if (auto name = op->getAttrOfType<StringAttr>("name"))
-        used.insert(name.getValue().str());
-    });
-    std::string base = use.getName().str() + "_" + promotedName;
-    std::string peerName = base;
-    for (unsigned suffix = 0; used.count(peerName); ++suffix)
-      peerName = base + "_" + std::to_string(suffix);
-
+  for (const auto &plannedPeer : peers) {
+    InstanceOp use = plannedPeer.parentUse;
+    auto grandparent = plannedPeer.grandparent;
     InstanceOp expanded = use.cloneAndInsertPorts(added);
     for (unsigned i = 0; i < oldPortCount; ++i)
       use.getResult(i).replaceAllUsesWith(expanded.getResult(i));
     use.erase();
     OpBuilder builder(expanded);
     builder.setInsertionPointAfter(expanded);
-    InstanceOp peer = builder.create<InstanceOp>(expanded.getLoc(), child,
-                                                 peerName);
+    InstanceOp peer = cast<InstanceOp>(builder.insert(childTemplate.get().getOperation()->clone()));
+    peer.setNameAttr(StringAttr::get(circuit.getContext(), plannedPeer.name));
     peerTargets.push_back("~" + circuit.getName().str() + "|" +
-                          grandparent.getName().str() + "/" + peerName +
+                          grandparent.getName().str() + "/" + plannedPeer.name +
                           ":" + child.getName().str());
     builder.setInsertionPointAfter(peer);
     for (unsigned i = 0; i < child.getNumPorts(); ++i) {
@@ -286,27 +413,10 @@ LogicalResult goldengate::extractModels(CircuitOp circuit, unsigned &promoted,
     auto model = resolveModel(circuit, target.getValue(), error);
     if (!model)
       return failure();
-    for (Attribute other : remaining)
-      if (refersToInstance(other, target.getValue()) &&
-          !isThreadingSelector(other, target.getValue())) {
-        error = "another annotation references the promoted model instance";
-        return failure();
-      }
     SmallVector<std::string> peerTargets;
-    if (failed(promoteOne(circuit, *model, peerTargets, error)))
-      return failure();
     SmallVector<Attribute> renamed;
-    for (Attribute other : remaining) {
-      if (!isThreadingSelector(other, target.getValue())) {
-        renamed.push_back(other);
-        continue;
-      }
-      for (const auto &peerTarget : peerTargets) {
-        NamedAttrList members(cast<DictionaryAttr>(other));
-        members.set("target", StringAttr::get(circuit.getContext(), peerTarget));
-        renamed.push_back(members.getDictionary(circuit.getContext()));
-      }
-    }
+    if (failed(promoteOne(circuit, *model, peerTargets, remaining, renamed, error)))
+      return failure();
     remaining = std::move(renamed);
     models.erase(models.begin() + *choice);
     // SFC's RenameMap fans the FAME annotation out to every peer instance.

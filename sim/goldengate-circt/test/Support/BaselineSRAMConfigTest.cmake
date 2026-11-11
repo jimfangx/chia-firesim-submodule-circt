@@ -87,4 +87,36 @@ foreach(mode IN ITEMS label-sram-models extract-sram-models)
     message(FATAL_ERROR "${mode}: explicit SRAM wrapper/annotation contract changed")
   endif()
 endforeach()
-message(STATUS "Selected F2/U250 base profiles retain inline SRAMs; explicit optional extraction still works")
+# Exercise the production configuration gate as well as the standalone passes.
+# This probe intentionally lacks a complete bridge/platform graph, so inspect
+# its extraction handoff and allow the later assembly boundary to reject it.
+foreach(config IN ITEMS WithMultiCycleRamModels_BaseF2Config MCRams_BaseF2Config
+    WithMultiCycleRamModels_BaseXilinxAlveoU250Config explicit-native-enable)
+  set(extra)
+  set(profile "${config}")
+  if(config STREQUAL "explicit-native-enable")
+    set(profile BaseF2Config)
+    set(extra --enable-multicycle-ram-models)
+  endif()
+  set(out "${work}/enabled-${config}")
+  execute_process(COMMAND "${COMPILER}" "${work}/input.fir"
+    --annotation-file "${work}/input.json" --output-dir "${out}"
+    --compile-baseline --emit-debug-snapshots --platform-config "${profile}" ${extra}
+    RESULT_VARIABLE result ERROR_VARIABLE error OUTPUT_VARIABLE output TIMEOUT 15)
+  file(WRITE "${out}.log" "${output}\n${error}")
+  if(NOT EXISTS "${out}/post-extract-model-all.json")
+    message(FATAL_ERROR "${config}: did not reach enabled SRAM extraction ${result}\n${output}\n${error}")
+  endif()
+  file(READ "${out}/post-extract-model.mlir" ir)
+  file(READ "${out}/post-extract-model-all.json" annotations)
+  string(REGEX MATCHALL "midas.passes.fame.ModelReadPort" reads "${annotations}")
+  string(REGEX MATCHALL "midas.passes.fame.ModelWritePort" writes "${annotations}")
+  list(LENGTH reads read_count)
+  list(LENGTH writes write_count)
+  if(NOT ir MATCHES "firrtl.module @rf\\(" OR NOT read_count EQUAL 1
+      OR NOT write_count EQUAL 1 OR annotations MATCHES "FirrtlMemModelAnnotation"
+      OR NOT ir MATCHES "depth = 31 : i64" OR NOT ir MATCHES "data: uint<64>")
+    message(FATAL_ERROR "${config}: enabled extraction lost source geometry or typed memory-port selections")
+  endif()
+endforeach()
+message(STATUS "Base profiles retain inline SRAMs; configured F2/U250 and explicit native enables extract selected SRAMs")

@@ -8,6 +8,14 @@ default before `ExtractModel`. Unsupported platform fragments still reject.
 The explicit `--label-sram-models` and `--extract-sram-models` boundaries retain
 their existing behavior.
 
+The optional production path is now enabled by `WithMultiCycleRamModels`,
+`MCRams`, or `--enable-multicycle-ram-models`. It uses the generalized FAME graph
+for selected SRAMs alongside other models, then derives native host models
+from typed memory-port annotations. The disabled profiles below remain
+unchanged. The configuration test also checks enabled F2/U250 aliases and the
+direct flag at the extraction handoff; its clock-only fixture intentionally
+cannot complete full platform assembly.
+
 The unchanged Scala contract is in `midas/Config.scala:67` and
 `midas/passes/MidasTransforms.scala:20–26`. `BaseF2Config`, the selected
 `FRFCFS16GBQuadRankLLC4MB` fragment and `WithAutoILA` never enable the parameter.

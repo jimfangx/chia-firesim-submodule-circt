@@ -1,0 +1,21 @@
+[
+  {
+    "class":"midas.passes.fame.ModelReadPort",
+    "data":"~Grouped|Grouped>responses.bits.d0",
+    "addr":"~Grouped|Grouped>rq0.bits.addr",
+    "en":"~Grouped|Grouped>rq0.bits.en"
+  },
+  {
+    "class":"midas.passes.fame.ModelReadPort",
+    "data":"~Grouped|Grouped>responses.bits.d1",
+    "addr":"~Grouped|Grouped>rq1.bits.addr",
+    "en":"~Grouped|Grouped>rq1.bits.en"
+  },
+  {
+    "class":"midas.passes.fame.ModelWritePort",
+    "data":"~Grouped|Grouped>write.bits.data",
+    "mask":"~Grouped|Grouped>write.bits.mask",
+    "addr":"~Grouped|Grouped>write.bits.addr",
+    "en":"~Grouped|Grouped>write.bits.en"
+  }
+]

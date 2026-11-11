@@ -12,6 +12,8 @@
 #include "goldengate/FAMEReadyValidChannel.h"
 #include "goldengate/RemainingFanout.h"
 #include "goldengate/TargetUtils.h"
+#include "goldengate/HierarchicalTargets.h"
+#include "goldengate/RetainedAnnotationTargets.h"
 #include "FAMEPortAnnotations.h"
 #include "llvm/ADT/BitVector.h"
 #include "mlir/IR/BuiltinOps.h"
@@ -354,37 +356,48 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
   for (auto [i, p] : llvm::enumerate(top.getPorts()))
     if (p.getName() != "hostClock" && p.getName() != "hostReset" && !isa<ClockType>(p.type) && !claimedTop.count(i))
       return reject("non-model scalar top data passthrough is unsupported: " + p.getName().str());
-  std::function<bool(Attribute)> referencesData = [&](Attribute attr) {
-    if (auto s = dyn_cast<StringAttr>(attr)) return renames.count(s.getValue().str()) != 0;
-    if (auto a = dyn_cast<ArrayAttr>(attr)) return llvm::any_of(a, referencesData);
-    if (auto d = dyn_cast<DictionaryAttr>(attr)) return llvm::any_of(d, [&](NamedAttribute m) { return referencesData(m.getValue()); });
-    return false;
-  };
-  // Local port transfer policies do not interpret instance-qualified targets.
-  // Reject selected data references through such paths before a recognized or
-  // unknown annotation can retain a stale pre-channelization port spelling.
-  std::function<bool(Attribute)> unsupportedInstanceData = [&](Attribute attr) {
-    if (auto value = dyn_cast<StringAttr>(attr)) {
-      auto spelling = value.getValue();
-      auto prefix = "~" + circuit.getName().str() + "|";
-      if (!spelling.consume_front(prefix)) return false;
-      auto [path, reference] = spelling.split('>');
-      if (!path.contains('/') || reference.empty()) return false;
-      auto module = path.rsplit(':').second;
-      auto root = reference.take_front(reference.find_first_of(".["));
-      return renames.count("~" + circuit.getName().str() + "|" + module.str() + ">" + root.str()) != 0;
-    }
-    if (auto a = dyn_cast<ArrayAttr>(attr)) return llvm::any_of(a, unsupportedInstanceData);
-    if (auto d = dyn_cast<DictionaryAttr>(attr)) return llvm::any_of(d, [&](NamedAttribute m) { return unsupportedInstanceData(m.getValue()); });
-    return false;
-  };
+  std::map<std::string, std::string> hierarchicalRenames;
   for (auto attr : raw) {
-    if (unsupportedInstanceData(attr))
-      return reject("instance-qualified selected data target has no supported channel transfer policy");
     Annotation anno(attr);
-    if (referencesData(attr) && !anno.isClass(AnnotationClasses::ChannelPorts) &&
+    bool referencesData = false;
+    std::string targetError;
+    mapRetainedAnnotationTargets(attr, [&](StringAttr target) {
+      auto spelling = target.getValue();
+      referencesData |= renames.count(spelling.str()) != 0;
+      auto prefix = "~" + circuit.getName().str() + "|";
+      if (!spelling.starts_with(prefix) || !spelling.split('>').first.contains('/') ||
+          spelling.split('>').second.empty()) return target;
+      auto root = spelling.drop_front(prefix.size()).split('/').first;
+      // SFC drops model-rooted DontTouches regardless of the selected leaf.
+      if (anno.isClass(AnnotationClasses::DontTouch) &&
+          llvm::any_of(models, [&](auto &model) { return model.op.getName() == root; }))
+        return target;
+      auto resolved = resolveHierarchicalReference(circuit, spelling, targetError);
+      if (!resolved) return target;
+      auto rename = renames.find(resolved->localTarget);
+      if (rename == renames.end()) return target;
+      referencesData = true;
+      if (!anno.isClass(AnnotationClasses::DontTouch)) {
+        targetError = "instance-qualified selected data target has no supported annotation transfer policy";
+        return target;
+      }
+      std::string resolutionError;
+      auto port = resolveAnnotationTarget(circuit, resolved->localTarget, resolutionError);
+      if (!port || !port->port || *port->fieldID != 0) {
+        targetError = "instance-qualified selected target does not resolve to the original ground port";
+        return target;
+      }
+      auto payload = StringRef(rename->second).split('>').second;
+      hierarchicalRenames.emplace(spelling.str(), resolved->hierarchy + ">" + payload.str());
+      return target;
+    });
+    if (!targetError.empty()) return reject(targetError);
+    if (referencesData && !anno.isClass(AnnotationClasses::ChannelPorts) &&
         !anno.isClass(AnnotationClasses::ChannelConnection) && !anno.isClass(AnnotationClasses::DontTouch) &&
-        !anno.isClass(AnnotationClasses::CombinationalPath) && !anno.isClass(AnnotationClasses::InternalFpgaDebug))
+        !anno.isClass(AnnotationClasses::CombinationalPath) && !anno.isClass(AnnotationClasses::InternalFpgaDebug) &&
+        !anno.isClass(AnnotationClasses::ModelReadPort) &&
+        !anno.isClass(AnnotationClasses::ModelWritePort) &&
+        !anno.isClass(AnnotationClasses::ModelReadWritePort))
       return reject("data target has unsupported retained annotation metadata");
   }
   SmallVector<FModuleOp> selectedModels; for (auto &m : models) selectedModels.push_back(m.op);
@@ -455,15 +468,17 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
                                                    : rewriteFAMEOutputChannel(current, channel, error, definition))) return failure();
   }
   rewriteTopPassthroughs(top, *passthroughs);
-  std::function<Attribute(Attribute)> rename = [&](Attribute attr) -> Attribute {
-    if (auto s = dyn_cast<StringAttr>(attr)) { auto i = renames.find(s.getValue().str()); return i == renames.end() ? attr : StringAttr::get(circuit.getContext(), i->second); }
-    if (auto a = dyn_cast<ArrayAttr>(attr)) { SmallVector<Attribute> values; for (auto v : a) values.push_back(rename(v)); return ArrayAttr::get(circuit.getContext(), values); }
-    if (auto d = dyn_cast<DictionaryAttr>(attr)) { NamedAttrList values; for (auto v : d) values.set(v.getName(), rename(v.getValue())); return values.getDictionary(circuit.getContext()); }
-    return attr;
-  };
   SmallVector<Attribute> annotations;
   for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
-    Annotation anno(attr); annotations.push_back(anno.isClass(AnnotationClasses::InternalFpgaDebug) ? attr : rename(attr));
+    Annotation anno(attr);
+    annotations.push_back(anno.isClass(AnnotationClasses::InternalFpgaDebug) ? attr :
+        mapRetainedAnnotationTargets(attr, [&](StringAttr value) {
+          auto local = renames.find(value.getValue().str());
+          if (local != renames.end()) return StringAttr::get(circuit.getContext(), local->second);
+          auto hierarchical = hierarchicalRenames.find(value.getValue().str());
+          return hierarchical == hierarchicalRenames.end() ? value :
+              StringAttr::get(circuit.getContext(), hierarchical->second);
+        }));
   }
   circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), annotations));
   for (const auto &[oldTarget, payload] : renames)

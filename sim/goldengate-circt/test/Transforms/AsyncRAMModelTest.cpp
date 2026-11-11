@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/AsyncRAMModel.h"
+#include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/FIRRTL/FIRParser.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "mlir/IR/Builders.h"
@@ -32,7 +33,7 @@ const char *fixture = R"fir(circuit HostRAM :
     oldState <= UInt<1>(0)
 )fir";
 void run(MLIRContext &context) {
-  for (unsigned probe = 0; probe != 13; ++probe) {
+  for (unsigned probe = 0; probe != 15; ++probe) {
     std::string input(fixture);
     auto replace = [&](StringRef from, StringRef to) {
       auto pos = input.find(from.str());
@@ -63,6 +64,18 @@ void run(MLIRContext &context) {
         probe == 11 ? "~HostRAM|Parent/ram:HostRAM>channels.read_resps[0].bits" :
         probe == 12 ? "~HostRAM|HostRAM/oldInstance:Child>data" :
                       "~HostRAM|HostRAM>channels.read_resps[0].bits"))})});
+    if (probe == 13 || probe == 14) {
+      SmallVector<Attribute> extra(raw.begin(), raw.end());
+      extra.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(probe == 13
+              ? "test.Payload" : goldengate::AnnotationClasses::InternalXDC)),
+          b.getNamedAttr(probe == 13 ? "constructor" : "argumentList",
+              probe == 13 ? Attribute(b.getDictionaryAttr({
+                  b.getNamedAttr("target", b.getStringAttr("~HostRAM|HostRAM>oldState")),
+                  b.getNamedAttr("format", b.getStringAttr("~HostRAM|HostRAM/old:Child>data"))}))
+                  : Attribute(b.getArrayAttr({b.getStringAttr("~HostRAM|HostRAM>oldState")})))}));
+      raw = b.getArrayAttr(extra);
+    }
     circuit->setAttr("rawAnnotations", raw);
     if (probe == 5) module.getBodyBlock()->front().setAttr("annotations", raw);
     auto before = dump(*root);
@@ -72,7 +85,7 @@ void run(MLIRContext &context) {
     goldengate::RAMModelParameters parameters;
     std::string error;
     auto result = goldengate::emitAsyncRAMModel(module, parameters, error);
-    if (probe != 0 && probe != 7 && probe != 11) {
+    if (probe != 0 && probe != 7 && probe != 11 && probe != 13) {
       require(failed(result) && !error.empty(), "unsupported Async RAM boundary accepted");
       require(dump(*root) == before && parameters.reads == 0, "Async RAM rejection mutated circuit");
     } else {
@@ -96,5 +109,5 @@ int main() {
   try { run(context); } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n'; return 1;
   }
-  llvm::outs() << "PASS native Async RAM, retained port identities and ten atomic rejection boundaries\n";
+  llvm::outs() << "PASS native Async RAM, retained port identities, opaque payloads and atomic rejection boundaries\n";
 }

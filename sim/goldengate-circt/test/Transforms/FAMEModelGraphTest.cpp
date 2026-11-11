@@ -1,9 +1,17 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEModelGraph.h"
+#include "goldengate/RAMModelAdapter.h"
+#include "goldengate/TargetUtils.h"
+#include "goldengate/HierarchicalTargets.h"
+#include "circt/Dialect/FIRRTL/Passes.h"
+#include "mlir/Pass/PassManager.h"
+#include <set>
+#include <map>
 #include "goldengate/FAMEInputChannel.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/FIRRTL/FIRParser.h"
 #include "circt/Dialect/HW/HWDialect.h"
+#include "circt/Dialect/HW/HWTypeInterfaces.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Verifier.h"
@@ -42,7 +50,7 @@ void run(MLIRContext &ctx, StringRef fir, StringRef anno) {
       rows.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.UnsupportedDataOwner")),b.getNamedAttr("target",b.getStringAttr("~Top|Worker>data"))}));
     }
     if(bad==9) {
-      rows.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.UnsupportedInstanceDataOwner")),b.getNamedAttr("nested",b.getArrayAttr({b.getStringAttr("~Top|Top/w0_:Worker>data")}))}));
+      rows.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.UnsupportedInstanceDataOwner")),b.getNamedAttr("target",b.getStringAttr("~Top|Top/w0_:Worker>data"))}));
     }
     if(bad==2) {
       top.insertPorts({{top.getNumPorts(),PortInfo(b.getStringAttr("unboundData"),UIntType::get(&ctx,1),Direction::In)}});
@@ -82,10 +90,40 @@ void run(MLIRContext &ctx, StringRef fir, StringRef anno) {
   }
   for(bool transport:{false,true}) {
     auto root=fixture(ctx,fir,anno);auto c=*root->getOps<CircuitOp>().begin();std::string error;FAMEModelGraphResult result;
+    Builder b(&ctx);
+    auto literal = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.NoTargetPayload")),
+        b.getNamedAttr("constructor", b.getDictionaryAttr({
+          b.getNamedAttr("target",b.getStringAttr("~Top|Top/w0_:Worker>data"))})),
+        b.getNamedAttr("format",b.getStringAttr("~Top|Worker>data"))});
+    auto protection = b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(AnnotationClasses::DontTouch)),
+        b.getNamedAttr("target",b.getStringAttr("~Top|Top/w0_:Worker>data")),
+        b.getNamedAttr("test.context",b.getStringAttr("selected")),
+        b.getNamedAttr("description",b.getStringAttr("~Top|Worker>data"))});
+    auto raw=c->getAttrOfType<ArrayAttr>("rawAnnotations");SmallVector<Attribute> rows(raw.begin(),raw.end());
+    rows.push_back(protection);rows.push_back(protection);rows.push_back(literal);
+    c->setAttr("rawAnnotations",b.getArrayAttr(rows));
     require(succeeded(rewriteFAMEModelGraph(c,result,error,transport)),error);
     require(succeeded(verify(*root)),"graph output is invalid");
     require(result.definitions==2&&result.instances==3&&result.clockDomains==2&&result.dataEndpoints==8,"model graph inventory differs");
     require(c->hasAttr("test.metadata"),"graph metadata lost");
+    unsigned protectedContexts=0;bool literalPreserved=false;
+    for(auto attr:c->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      literalPreserved|=attr==literal;
+      Annotation annotation(attr);
+      if(!annotation.getMember("test.context"))continue;
+      ++protectedContexts;
+      auto target=annotation.getMember<StringAttr>("target");
+      require(target.getValue()=="~"+c.getName().str()+"|Top/w0_:Worker>input_sink.bits" &&
+              annotation.getMember<StringAttr>("description")==Annotation(protection).getMember<StringAttr>("description"),
+              "wrapper-rooted protection lost its instance context or changed opaque payload text");
+      auto context=resolveHierarchicalReference(c,target.getValue(),error);
+      require(bool(context),"retargeted protection has an invalid physical hierarchy: "+error);
+      auto leaf=resolveAnnotationTarget(c,context->localTarget,error);
+      require(leaf&&leaf->port&&cast<UIntType>(circt::hw::FieldIdImpl::getFinalTypeByFieldID(
+                  named(c,"Worker").getPortType(*leaf->port),*leaf->fieldID)).getWidth()==8,
+              "retargeted instance protection no longer selects its channel payload");
+    }
+    require(protectedContexts==2&&literalPreserved,"duplicate protections or NoTarget payload were lost");
     auto top=named(c,"Top");unsigned hub=0,workers=0;
     for(auto i:top.getOps<InstanceOp>()) {
       if(i.getModuleName()=="Hub")++hub;if(i.getModuleName()=="Worker")++workers;
@@ -412,6 +450,63 @@ void runVirtual(MLIRContext &ctx, StringRef fir, StringRef anno, StringRef outpu
 }
 } // namespace
 int main(int argc,char **argv){try{
+ if(argc==3 && StringRef(argv[1])=="--ram-model-input") {
+  MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(root),"prepared RAM graph parse failed");
+  auto circuit=*root->getOps<CircuitOp>().begin();std::string error;
+  std::set<std::string> wrappers;
+  std::map<std::string,Type> contextTypes;
+  SmallVector<Attribute> opaquePayloads;
+  for(auto attr:circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+   auto d=dyn_cast<DictionaryAttr>(attr);auto cls=d?d.getAs<StringAttr>("class"):StringAttr();
+   if(cls=="test.NoTargetPayload")opaquePayloads.push_back(attr);
+   if(d&&d.getAs<StringAttr>("test.context")) {
+    auto context=resolveHierarchicalReference(circuit,d.getAs<StringAttr>("target").getValue(),error);
+    require(bool(context),"prepared RAM context does not resolve: "+error);
+    auto leaf=resolveAnnotationTarget(circuit,context->localTarget,error);
+    require(leaf&&leaf->port&&*leaf->fieldID==0,"prepared RAM context is not an original ground port");
+    auto module=leaf->module;
+    contextTypes[context->hierarchy.substr(context->hierarchy.find('|')+1)]=module.getPortType(*leaf->port);
+   }
+   if(cls!=AnnotationClasses::ModelReadPort&&cls!=AnnotationClasses::ModelWritePort)continue;
+   auto address=d.getAs<StringAttr>("addr");auto target=resolveAnnotationTarget(circuit,address.getValue(),error);
+   require(bool(target),error);wrappers.insert(target->module.getName().str());
+  }
+  require(!wrappers.empty(),"prepared graph has no selected RAMs");
+  PassManager normalized(&ctx);normalized.nest<CircuitOp>().addNestedPass<FModuleOp>(createExpandWhensPass());
+  require(succeeded(normalized.run(*root)),"RAM graph last-connect normalization failed");
+  FAMEModelGraphResult graph;
+  require(succeeded(rewriteFAMEModelGraph(circuit,graph,error,true)),error);
+  unsigned materialized=0;
+  require(succeeded(materializeSelectedRAMModels(circuit,materialized,error)),error);
+  require(materialized==wrappers.size()&&succeeded(verify(*root)),"RAM graph lost selected wrappers or produced invalid IR");
+  unsigned retainedContexts=0;
+  auto finalAnnotations=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  for(auto attr:finalAnnotations) {
+   Annotation annotation(attr);
+   if(!annotation.getMember("test.context"))continue;
+   ++retainedContexts;
+   auto context=resolveHierarchicalReference(circuit,annotation.getMember<StringAttr>("target").getValue(),error);
+   require(bool(context),"materialized RAM context does not resolve: "+error);
+   auto key=context->hierarchy.substr(context->hierarchy.find('|')+1);
+   auto leaf=resolveAnnotationTarget(circuit,context->localTarget,error);
+   auto module=leaf?leaf->module:FModuleLike();
+   require(contextTypes.count(key)&&leaf&&leaf->port&&
+           context->reference=="r_addr_sink.bits"&&
+           circt::hw::FieldIdImpl::getFinalTypeByFieldID(module.getPortType(*leaf->port),*leaf->fieldID)==contextTypes[key],
+           "materialized RAM protection changed its original instance/port/type identity");
+  }
+  require(retainedContexts==contextTypes.size(),"RAM graph lost retained instance-specific protections");
+  for(auto payload:opaquePayloads)
+   require(llvm::is_contained(finalAnnotations,payload),"RAM graph/materialization changed opaque NoTarget payload text");
+  for(auto &name:wrappers) {
+   auto wrapper=named(circuit,name);unsigned memories=0,instances=0;
+   wrapper.walk([&](MemOp){++memories;});wrapper.walk([&](InstanceOp){++instances;});
+   require(memories==0&&instances==1,"selected wrapper was not replaced with independent host RAM storage");
+  }
+  llvm::outs()<<"PASS parameterized selected RAMs through generalized FAME graph and native materialization\n";return 0;
+ }
+
  if(argc==3 && StringRef(argv[1])=="--threaded-input") {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
   auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(root),"threaded graph snapshot parse failed");

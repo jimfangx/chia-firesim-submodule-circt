@@ -20,8 +20,6 @@ import signal
 import subprocess
 import time
 
-import yaml
-
 BASE = "FireSim-generated"
 BRIDGES = ("firesim.lib.bridgeutils.BridgeIOAnnotation",
            "midas.passes.fame.FAMEChannelConnectionAnnotation")
@@ -236,6 +234,8 @@ def compare_implementation_clocks(golden, candidate):
 
 def stream_metadata(text):
     """Compare manager-visible stream allocations, rejecting duplicate YAML keys."""
+    import yaml
+
     class UniqueLoader(yaml.SafeLoader):
         pass
 
@@ -533,6 +533,8 @@ def paired_syntax(repo, golden, candidate, gm, cm, evidence):
 
 
 def compare(repo, target, golden_root, candidate_root, syntax_evidence=None):
+    import yaml
+
     sfc = load_module("f2_semantic_recipes", Path(__file__).with_name("GenerateF2SFCGoldens.py"))
     recipes = sfc.validate_recipes(yaml.safe_load((repo / "automation/chia_firesim_circt/selected_config_build_recipes.yaml").read_text()),
                                   yaml.safe_load((repo / "sims/firesim-staging/sample_config_build_recipes.yaml").read_text()))

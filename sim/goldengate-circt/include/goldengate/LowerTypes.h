@@ -27,6 +27,10 @@ enum class RetainedTargetScope { All, FpgaDebugOnly };
 // Fanout annotations omit zero-width leaves, including widths inferred as zero.
 // Mutates: resolves CHIRRTL, infers widths/resets, lowers aggregates, uniquifies
 // declaration names, synchronizes instance ports, and transfers retained targets.
+// Instance prefixes follow SFC DestructTypes namespace rules, including
+// intermediate aggregate-name collisions. Schema target members follow exact
+// local/hierarchical instance tokens; unrelated payload text and native inner
+// symbols remain unchanged.
 // Requires analyses: FIRRTL subtype/field IDs and CIRCT inner symbol namespaces.
 // Preserves: annotation payload/order, unrelated annotations, native leaf symbols
 // and InnerRefs. Structural analyses must be rebuilt after lowering.

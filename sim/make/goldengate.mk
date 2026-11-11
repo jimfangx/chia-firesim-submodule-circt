@@ -36,6 +36,7 @@ GOLDENGATE_CIRCT_NIC_MODE ?= normal
 # support native invocations without a Scala compiler configuration instance.
 goldengate_circt_config_fragments := $(subst _, ,$(PLATFORM_CONFIG))
 GOLDENGATE_CIRCT_SYNTH_ASSERTS ?= $(if $(filter WithSynthAsserts,$(goldengate_circt_config_fragments)),enabled,disabled)
+GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS ?= $(if $(filter WithMultiCycleRamModels MCRams,$(goldengate_circt_config_fragments)),enabled,disabled)
 GOLDENGATE_CIRCT_AUTOILA ?= $(if $(filter WithAutoILA,$(goldengate_circt_config_fragments)),enabled,disabled)
 GOLDENGATE_CIRCT_ILA_DEPTH ?= $(or $(patsubst ILADepth%,%,$(firstword $(filter ILADepth%,$(goldengate_circt_config_fragments)))),1024)
 GOLDENGATE_CIRCT_ILA_PROBE_TRIGGERS ?= 2
@@ -53,6 +54,11 @@ ifeq ($(GOLDENGATE_CIRCT_SYNTH_ASSERTS),enabled)
 goldengate_circt_feature_flags += --enable-synth-asserts
 else ifneq ($(GOLDENGATE_CIRCT_SYNTH_ASSERTS),disabled)
 $(error GOLDENGATE_CIRCT_SYNTH_ASSERTS must be enabled or disabled)
+endif
+ifeq ($(GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS),enabled)
+goldengate_circt_feature_flags += --enable-multicycle-ram-models
+else ifneq ($(GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS),disabled)
+$(error GOLDENGATE_CIRCT_MULTICYCLE_RAM_MODELS must be enabled or disabled)
 endif
 ifeq ($(GOLDENGATE_CIRCT_AUTOCOUNTER),printf)
 goldengate_circt_feature_flags += --enable-autocounter-printf

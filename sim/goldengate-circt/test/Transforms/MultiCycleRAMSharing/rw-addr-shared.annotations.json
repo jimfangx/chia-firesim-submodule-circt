@@ -1,0 +1,15 @@
+[
+  {
+    "class":"midas.passes.fame.ModelReadPort",
+    "data":"~Probe|Probe>response0.bits",
+    "addr":"~Probe|Probe>shared.bits",
+    "en":"~Probe|Probe>en0.bits"
+  },
+  {
+    "class":"midas.passes.fame.ModelWritePort",
+    "data":"~Probe|Probe>write.bits.data",
+    "mask":"~Probe|Probe>write.bits.mask",
+    "addr":"~Probe|Probe>shared.bits",
+    "en":"~Probe|Probe>write.bits.en"
+  }
+]

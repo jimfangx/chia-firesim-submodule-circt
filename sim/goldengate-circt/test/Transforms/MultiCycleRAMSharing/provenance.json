@@ -1,0 +1,21 @@
+{
+  "oracle": "Actual midas.passes.fame.EmitAndWrapRAMModels followed by FIRRTL VerilogCompiler; Scala 2.13.10, generated 2026-11-11.",
+  "source_generator": "../MultiCycleRAMSharingOracle.scala",
+  "source_memory": "8 addresses, UInt<17>, asynchronous reads, synchronous writes",
+  "scope": "Finite protocol/data regression fixtures; neither full-design equivalence nor DRAM initialization.",
+  "sfc_jar_sha256": "16ae60498397d40c57008cf86d3d6ec4e5b2a0c097783b52380e3ecd02357057",
+  "sha256": {
+    "read-full-shared.input.fir": "03ba66375f45bac44866ec7ba41d23ab478fb9d73088c885c2306f4e7f8fa3f0",
+    "read-full-shared.annotations.json": "dda1e520d6b3544049d2f7d36f65499f47b004bd406da35c7ef6576493816f3d",
+    "read-full-shared.sfc.sv": "caf42015a1508294e928c0de421b4a52ba3993c0bd3a9c76d07f68dfb34937b2",
+    "read-addr-shared.input.fir": "fc46f20700359dd537722be5417d5fdeaa9df2893c05996fcc8d640eed083e65",
+    "read-addr-shared.annotations.json": "7aa2d65113559c9e4d4e203b50dc6d20e1e860d3a7e1e08c0d5e4bcd5f6412d3",
+    "read-addr-shared.sfc.sv": "1391f465fcbe5ca40a64b713c4b76a7c718ab2e215c3cf465d3f6a2c13173a9d",
+    "rw-addr-shared.input.fir": "e1b48e67e40f6d8dd1635c98f62fca5c1a5e3df1cc1181849b3f6cd94c18f67c",
+    "rw-addr-shared.annotations.json": "4a7f1e6f6e0a91917bb91d4abfbbdb5f015c4d50869d34dbfde5046e27aa6b4d",
+    "rw-addr-shared.sfc.sv": "41c1cc884e1d16a042a66cf88847266ead06993c36e55417bb87b437fa4ddfbd",
+    "rw-full-shared.input.fir": "820ac383694243b29cd8cd03da58351ade526074356e4263b931611698e305b5",
+    "rw-full-shared.annotations.json": "0b55faa506f1a114d87cf28553bfb6da614e08c494aa5b4d6ce2620c6df894d9",
+    "rw-full-shared.sfc.sv": "de41726bef38028e5dfebb5f0544f321768197f1e0ba9ae36b154a8dd0582b80"
+  }
+}
