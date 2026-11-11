@@ -99,12 +99,63 @@ void run(MLIRContext &context) {
   require(dump(model) == before, "promotion changed model hardware");
   require(succeeded(verify(*root)), "promoted IR verification failed");
 }
+void runLateInstance(MLIRContext &context) {
+  auto root = parseSourceString<ModuleOp>(R"mlir(module {
+    firrtl.circuit "Top" {
+      firrtl.module @Top(out %out: !firrtl.uint<8>) {
+        %a = firrtl.wire : !firrtl.uint<8>
+        %b = firrtl.wire : !firrtl.uint<8>
+        %sinkIn = firrtl.instance sink @Sink(in in: !firrtl.uint<8>)
+        firrtl.strictconnect %sinkIn, %a : !firrtl.uint<8>
+        firrtl.connect %out, %b : !firrtl.uint<8>, !firrtl.uint<8>
+        %sourceOut = firrtl.instance source @Source(out out: !firrtl.uint<8>)
+        firrtl.strictconnect %a, %sourceOut : !firrtl.uint<8>
+        firrtl.strictconnect %b, %sourceOut : !firrtl.uint<8>
+        %zero = firrtl.constant 0 : !firrtl.uint<8>
+        firrtl.strictconnect %out, %zero : !firrtl.uint<8>
+      }
+      firrtl.module @Source(out %out: !firrtl.uint<8>) {
+        %one = firrtl.constant 1 : !firrtl.uint<8>
+        firrtl.strictconnect %out, %one : !firrtl.uint<8>
+      }
+      firrtl.module @Sink(in %in: !firrtl.uint<8>) {}
+    }
+  })mlir", &context);
+  require(bool(root), "late-instance fixture parse failed");
+  require(succeeded(verify(*root)), "late-instance fixture verification failed");
+  auto circuit = *root->getOps<CircuitOp>().begin();
+  auto top = *circuit.getOps<FModuleOp>().begin();
+  SmallVector<Operation *> connections;
+  top.walk([&](Operation *op) {
+    if (isa<ConnectOp, StrictConnectOp>(op)) connections.push_back(op);
+  });
+  unsigned promoted = 0;
+  std::string error;
+  require(succeeded(goldengate::promotePassthroughConnections(circuit, promoted, error)),
+          "late-instance promotion failed");
+  require(promoted == 2, "late instance aliases were not promoted");
+  require(succeeded(verify(*root)), "late instance source does not dominate promoted use");
+  SmallVector<Operation *> after;
+  top.walk([&](Operation *op) {
+    if (isa<ConnectOp, StrictConnectOp>(op)) after.push_back(op);
+  });
+  require(after == connections, "promotion changed connection priority/order");
+  for (unsigned i : {0u, 1u}) {
+    auto source = connections[i]->getOperand(1).getDefiningOp<InstanceOp>();
+    require(bool(source) && source.getName() == "source",
+            "late instance source was not used directly");
+    require(source->isBeforeInBlock(connections[i]),
+            "late source declaration was not hoisted before its use");
+  }
+}
+
 } // namespace
 int main() {
   MLIRContext context;
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
     run(context);
+    runLateInstance(context);
     llvm::outs() << "PASS typed output aliases, opaque hierarchy, passthrough and unsafe-path boundaries\n";
   } catch (const std::exception &e) {
     llvm::errs() << e.what() << '\n';

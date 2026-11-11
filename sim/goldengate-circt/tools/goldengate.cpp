@@ -2208,6 +2208,8 @@ int main(int argc, char **argv) {
         llvm::outs() << "Deduplicated " << removed << " native target definitions\n";
       }
 
+      if (mlir::failed(mlir::verify(*module)))
+        return fail("invalid FIRRTL IR before PromotePassthroughConnections");
       unsigned promotedConnections = 0;
       if (mlir::failed(goldengate::promotePassthroughConnections(
               circuit, promotedConnections, error)))
@@ -6577,6 +6579,8 @@ int main(int argc, char **argv) {
     return extractModelBoundary();
 
   if (promotePassthrough) {
+    if (mlir::failed(mlir::verify(*module)))
+      return fail("invalid FIRRTL IR before PromotePassthroughConnections");
     std::string error;
     unsigned promoted = 0;
     if (mlir::failed(goldengate::promotePassthroughConnections(
