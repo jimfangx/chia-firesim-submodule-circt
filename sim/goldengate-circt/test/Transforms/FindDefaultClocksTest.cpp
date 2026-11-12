@@ -99,6 +99,16 @@ void run(MLIRContext &context, unsigned scenario) {
     auto updated = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
     auto clock = Annotation(updated[1]).getMember<StringAttr>("clock");
     require(clock && clock.getValue() == "~Top|Top>hub.a", "wrong canonical hub clock");
+    FModuleOp hub;
+    for (auto model : circuit.getOps<FModuleOp>()) if (model.getName() == "Hub") hub = model;
+    auto proofs = hub->getAttrOfType<ArrayAttr>("goldengate.fameClockAliases");
+    if (scenario == 6) {
+      require(proofs && proofs.size() == 1, "feedback input lost its pre-excision alias proof");
+      auto proof = cast<DictionaryAttr>(proofs[0]);
+      require(proof.getAs<StringAttr>("port").getValue() == "c1" &&
+              proof.getAs<StringAttr>("clock").getValue() == "c0" &&
+              proof.getAs<StringAttr>("instance").getValue() == "hub", "incorrect physical alias proof");
+    } else require(!proofs, "independent input clock acquired an alias proof");
   } else {
     require(failed(result), "distinct, multiply driven or inverted clocks accepted");
     require(error.find("hub.a") != std::string::npos && error.find("hub.b") != std::string::npos,

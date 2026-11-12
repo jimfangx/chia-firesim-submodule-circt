@@ -8,6 +8,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
 #include <stdexcept>
 
 using namespace mlir;
@@ -36,7 +37,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned count) {
     }
   } })mlir";
   auto pos = ir.find("INDEX");
-  ir.replace(pos, 5, count == 2 ? "1" : "2");
+  ir.replace(pos, 5, std::to_string(llvm::Log2_64_Ceil(count)));
   return parseSourceString<ModuleOp>(ir, &ctx);
 }
 FModuleOp model(ModuleOp root) {
@@ -159,7 +160,7 @@ int main() {
   try {
     MLIRContext context;
     context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    for (unsigned count : {2u, 3u, 4u})
+    for (unsigned count : {2u, 3u, 4u, 64u})
       behavior(context, count);
     rejections(context);
     return 0;

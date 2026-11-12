@@ -560,6 +560,110 @@ void runClocks(MLIRContext &context) {
   require(succeeded(goldengate::analyzePrintClockSources(c,stubs,empty,sources,error)) &&
       sources.empty() && dump(*root)==before,"empty clock query mutated circuit");
 }
+// ChannelClockInfo traces each query separately and materializes source field
+// projections. Preserve both last-connect precedence and the exact query-order
+// IR, including nested aggregate ancestors and child-module clock forwarding.
+void runClockDriverQueries(MLIRContext &context, bool snapshot) {
+  for (unsigned mode = 0; mode < 5; ++mode) for (bool reverse : {false, true}) {
+    auto root = parseSourceString<ModuleOp>(R"mlir(module {
+      firrtl.circuit "Top" {
+        firrtl.module @Top(in %clock0: !firrtl.clock, in %clock1: !firrtl.clock,
+          out %alias: !firrtl.bundle<c: clock, n: clock>) {}
+        firrtl.module private @Forward(
+          in %clock0: !firrtl.clock, in %clock1: !firrtl.clock,
+          out %output: !firrtl.bundle<c: clock, n: clock>) {
+          %outC = firrtl.subfield %output[c] : !firrtl.bundle<c: clock, n: clock>
+          %outN = firrtl.subfield %output[n] : !firrtl.bundle<c: clock, n: clock>
+          firrtl.strictconnect %outC, %clock0 : !firrtl.clock
+          firrtl.strictconnect %outN, %clock1 : !firrtl.clock
+        }
+      }
+    })mlir", &context);
+    require(bool(root), "clock-driver fixture parse");
+    auto circuit = *root->getOps<CircuitOp>().begin();
+    auto top = named(circuit, "Top"), forward = named(circuit, "Forward");
+    auto loc = top.getLoc();
+    OpBuilder b(top.getBodyBlock(), top.getBodyBlock()->end());
+    auto clockType = ClockType::get(&context);
+    auto nestedType = BundleType::get(&context, {{b.getStringAttr("c"), false, clockType}});
+    auto type = BundleType::get(&context, {{b.getStringAttr("c"), false, clockType},
+                                         {b.getStringAttr("nested"), false, nestedType}});
+    auto first = b.create<WireOp>(loc, type, "first");
+    auto second = b.create<WireOp>(loc, type, "second");
+    auto bus = b.create<WireOp>(loc, type, "bus");
+    auto field = [&](Value value, StringRef name) -> Value {
+      return b.create<SubfieldOp>(loc, value, name).getResult();
+    };
+    for (auto [value, clock] : {std::make_pair(first.getResult(), top.getArgument(0)),
+                              std::make_pair(second.getResult(), top.getArgument(1))}) {
+      b.create<StrictConnectOp>(loc, field(value, "c"), clock);
+      b.create<StrictConnectOp>(loc, field(field(value, "nested"), "c"), clock);
+    }
+    b.create<ConnectOp>(loc, bus.getResult(), first.getResult());
+    auto busC = field(bus.getResult(), "c");
+    if (mode == 0) b.create<StrictConnectOp>(loc, busC, top.getArgument(0));
+    b.create<StrictConnectOp>(loc, bus.getResult(), second.getResult());
+    if (mode == 1) b.create<StrictConnectOp>(loc, busC, top.getArgument(0));
+    auto instance = b.create<InstanceOp>(loc, forward, "forward");
+    b.create<StrictConnectOp>(loc, instance.getResult(0), busC);
+    b.create<StrictConnectOp>(loc, instance.getResult(1), field(field(bus.getResult(), "nested"), "c"));
+    b.create<StrictConnectOp>(loc, top.getArgument(2), instance.getResult(2));
+    // Materialize the annotated port projections before tracing, as bridge
+    // promotion does; the analyzer must follow their actual incoming connects.
+    auto aliasC = field(top.getArgument(2), "c");
+    field(top.getArgument(2), "n");
+    if (mode == 3) b.create<StrictConnectOp>(loc, aliasC, aliasC);
+    if (mode == 4) {
+      auto undriven = b.create<WireOp>(loc, ClockType::get(&context), "undriven");
+      b.create<StrictConnectOp>(loc, aliasC, undriven.getResult());
+    }
+    SmallVector<Attribute> ratios, roots;
+    for (unsigned i = 0; i < 2; ++i) {
+      ratios.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("name", b.getStringAttr(i ? "slow" : "base")),
+          b.getNamedAttr("multiplier", b.getI64IntegerAttr(1)),
+          b.getNamedAttr("divisor", b.getI64IntegerAttr(i ? 2 : 1))}));
+      roots.push_back(b.getStringAttr("~Top|Top>clock" + std::to_string(i)));
+    }
+    SmallVector<Attribute> annotations{b.getDictionaryAttr({
+        b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+        b.getNamedAttr("globalName", b.getStringAttr("clocks")),
+        b.getNamedAttr("channelInfo", b.getDictionaryAttr({
+            b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::TargetClockChannel)),
+            b.getNamedAttr("clockInfo", b.getArrayAttr(ratios))})),
+        b.getNamedAttr("sinks", b.getArrayAttr(roots))})};
+    SmallVector<Attribute> queries;
+    for (unsigned i = 0; i < 3; ++i)
+      queries.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(goldengate::AnnotationClasses::ChannelConnection)),
+          b.getNamedAttr("globalName", b.getStringAttr(mode == 2 ? "duplicate" : "query" + std::to_string(i))),
+          b.getNamedAttr("clock", b.getStringAttr(i == 1 ? "~Top|Top>alias.n" : "~Top|Top>alias.c"))}));
+    if (reverse) std::reverse(queries.begin(), queries.end());
+    annotations.append(queries.begin(), queries.end());
+    circuit->setAttr("rawAnnotations", b.getArrayAttr(annotations));
+    require(succeeded(verify(*root)), "clock-driver fixture invalid before analysis");
+    std::string error;
+    auto status = goldengate::analyzeChannelClocksAndUpdateBridges(circuit, error);
+    if (mode >= 2) {
+      StringRef expected = mode == 2 ? "duplicate channel clock name" :
+                           mode == 3 ? "cycle in clock connections" : "missing clock driver";
+      require(failed(status) && StringRef(error).contains(expected),
+              "clock-driver rejection changed: " + error);
+    } else {
+      require(succeeded(status), error);
+      auto info = Annotation(circuit->getAttrOfType<ArrayAttr>("rawAnnotations")[0])
+                      .getMember<DictionaryAttr>("infoMap");
+      for (unsigned i = 0; i < 3; ++i)
+        require(info.get("query" + std::to_string(i)) == ratios[mode == 1 && i != 1 ? 0 : 1],
+                "clock-driver last-connect/ancestor precedence changed");
+      require(succeeded(verify(*root)), "clock projections violate SSA dominance");
+    }
+    if (snapshot) {
+      llvm::outs() << "CLOCK-DRIVER " << mode << " " << reverse << " " << error << '\n';
+      root->print(llvm::outs()); llvm::outs() << '\n';
+    }
+  }
+}
 void runGolden(MLIRContext &context,StringRef path) {
   auto root=parseSourceFile<ModuleOp>(path,&context);require(bool(root),"golden candidate parse failed");
   auto c=*root->getOps<CircuitOp>().begin();std::string error;SmallVector<goldengate::PrintStub> stubs;
@@ -578,6 +682,6 @@ void runGolden(MLIRContext &context,StringRef path) {
 }
 int main(int argc,char **argv) {
   MLIRContext context;context.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  try {run(context);run(context,true);run(context,true,true);runClocks(context);runTwoClockWiring(context);runTwoClockWiring(context,true);if(argc==2)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
+  try {run(context);run(context,true);run(context,true,true);runClocks(context);runTwoClockWiring(context);runTwoClockWiring(context,true);bool snapshot=argc==2 && StringRef(argv[1])=="--clock-driver-snapshot";runClockDriverQueries(context,snapshot);if(argc==2 && !snapshot)runGolden(context,argv[1]);llvm::outs()<<"Print wiring PASS\n";return 0;}
   catch(const std::exception &e){llvm::errs()<<"Print wiring FAIL: "<<e.what()<<'\n';return 1;}
 }

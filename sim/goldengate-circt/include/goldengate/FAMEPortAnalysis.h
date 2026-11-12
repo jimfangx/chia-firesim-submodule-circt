@@ -63,6 +63,13 @@ analyzeFAMEChannelClockDomains(circt::firrtl::CircuitOp circuit,
                               llvm::ArrayRef<FAMEHubClockDomain> domains,
                               std::string &error);
 
+// Reuse only while the circuit and its annotations/connectivity stay unchanged.
+std::optional<llvm::SmallVector<FAMEChannelClockDomain>>
+analyzeFAMEChannelClockDomains(PreparedFAMEAnalysis &prepared,
+                              circt::firrtl::FModuleOp model,
+                              llvm::ArrayRef<FAMEHubClockDomain> domains,
+                              std::string &error);
+
 // Capture names and dependencies before any port rewrite invalidates indices.
 // Selection follows connection annotation order; payload order stays in the
 // connection's source list, independently of the model's physical port order.
@@ -109,6 +116,10 @@ struct FAMEDataSelection {
 
 std::optional<FAMEDataSelection>
 analyzeFAMEDataSelection(circt::firrtl::CircuitOp circuit,
+                        circt::firrtl::FModuleOp model, std::string &error);
+
+std::optional<FAMEDataSelection>
+analyzeFAMEDataSelection(PreparedFAMEAnalysis &prepared,
                         circt::firrtl::FModuleOp model, std::string &error);
 
 std::optional<llvm::SmallVector<FAMEOutputSelection>>

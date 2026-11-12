@@ -190,12 +190,137 @@ std::string suffix(StringRef name, StringRef channel, unsigned size) {
   }
   return "." + name.str();
 }
+// Clock aliases promoted out of cloned models can feed back into the hub.
+// SFC's transformed model ABI retains only the clock channel, not these
+// ancillary scalar inputs. Fold physical identities before taking any port
+// indices: subsequent channelization and clock gating then cover every live
+// consumer, including consumers below the hub's hierarchy.
+LogicalResult foldHubClockAliases(CircuitOp circuit, std::string &error) {
+  auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
+  if (!raw) return success(); // The ordinary graph validator reports this.
+  bool hasProofs = false;
+  for (auto model : circuit.getOps<FModuleOp>()) hasProofs |= model->hasAttr("goldengate.fameClockAliases");
+  if (!hasProofs) return success();
+  auto hierarchy = analyzeTopHierarchy(circuit, error);
+  if (!hierarchy) return failure();
+  SmallVector<ModelPortGroup> groups;
+  for (auto attr : raw) {
+    Annotation a(attr);
+    // Data groups with an associated clock cannot be the clock-input group.
+    // Avoid resolving their many payload targets just to find the hub clock.
+    if (!a.isClass(AnnotationClasses::ChannelPorts) || a.getMember("clockPort")) continue;
+    auto group = analyzeModelPortGroup(circuit, a, error);
+    if (!group) return failure();
+    groups.push_back(std::move(*group));
+  }
+  for (auto attr : raw) {
+    Annotation a(attr);
+    if (!a.isClass(AnnotationClasses::ChannelConnection)) continue;
+    auto info = a.getMember<DictionaryAttr>("channelInfo");
+    if (!info || info.getAs<StringAttr>("class") != AnnotationClasses::TargetClockChannel) continue;
+    auto channel = analyzeChannelConnection(circuit, a, error);
+    if (!channel) return failure();
+    if (channel->kind != ChannelKind::TargetClock) continue;
+    auto bindings = bindChannelToModels(*channel, *hierarchy, groups, error);
+    if (!bindings) return failure();
+    if (bindings->size() != 1) continue; // Ordinary validator diagnoses arity.
+    auto &binding = bindings->front();
+    auto module = binding.portGroup->module;
+    auto model = dyn_cast<FModuleOp>(module.getOperation());
+    if (!model) continue;
+    auto domains = analyzeFAMEHubClockDomains(*channel, *hierarchy, binding, error);
+    if (!domains) return failure();
+    auto hub = binding.instance;
+    struct Alias { std::string name, domain; };
+    SmallVector<Alias> aliases;
+    auto proofs = model->getAttrOfType<ArrayAttr>("goldengate.fameClockAliases");
+    if (!proofs) continue;
+    std::set<std::string> declared;
+    for (const auto &domain : *domains) declared.insert(domain.modelClockName);
+    std::set<std::string> seen;
+    for (auto attr : proofs) {
+      auto record = dyn_cast<DictionaryAttr>(attr);
+      auto alias = record ? record.getAs<StringAttr>("port") : StringAttr();
+      auto domain = record ? record.getAs<StringAttr>("clock") : StringAttr();
+      auto owner = record ? record.getAs<StringAttr>("instance") : StringAttr();
+      auto index = alias ? port(model, alias.getValue()) : std::nullopt;
+      auto canonicalPort = domain ? port(model, domain.getValue()) : std::nullopt;
+      if (!index || !canonicalPort || !owner || owner != hub.getNameAttr() ||
+          !declared.count(domain.getValue().str()) || declared.count(alias.getValue().str()) ||
+          !seen.insert(alias.getValue().str()).second ||
+          model.getPortDirection(*index) != Direction::In ||
+          !isa<ClockType>(model.getPortType(*index))) {
+        error = "FAME hub clock alias proof no longer matches its input/domain identity";
+        return failure();
+      }
+      unsigned i = *index;
+      auto name = alias.getValue().str(), canonical = domain.getValue().str();
+      auto annotated = [&](ArrayAttr annotations) {
+        return annotations && i < annotations.size() &&
+               !cast<ArrayAttr>(annotations[i]).empty();
+      };
+      if (annotated(model.getPortAnnotationsAttr()) || model.getPortSymbolAttr(i) ||
+          annotated(hub.getPortAnnotationsAttr())) {
+        error = "FAME hub clock alias has attached identity without a transfer policy: " + name;
+        return failure();
+      }
+      for (auto &op : *model.getBodyBlock())
+        if (auto existing = op.getAttrOfType<StringAttr>("name"))
+          if (existing.getValue() == name) {
+            error = "FAME hub clock alias wire name collides with a declaration: " + name;
+            return failure();
+          }
+      aliases.push_back({name, canonical});
+    }
+    if (aliases.empty()) continue;
+    std::map<std::string, std::string> clockRenames;
+    auto prefix = "~" + circuit.getName().str() + "|";
+    for (const auto &alias : aliases) {
+      clockRenames[prefix + model.getName().str() + ">" + alias.name] =
+          prefix + model.getName().str() + ">" + alias.domain;
+      clockRenames[prefix + hierarchy->top.getName().str() + ">" +
+                   hub.getName().str() + "." + alias.name] =
+          prefix + hierarchy->top.getName().str() + ">" + hub.getName().str() + "." + alias.domain;
+    }
+    for (const auto &alias : aliases) {
+      auto old = port(model, alias.name), canonical = port(model, alias.domain);
+      if (!old || !canonical) { error = "lost FAME hub clock alias"; return failure(); }
+      OpBuilder b(model.getBodyBlock(), model.getBodyBlock()->begin());
+      auto wire = b.create<WireOp>(model.getLoc(), model.getPortType(*old), alias.name);
+      model.getArgument(*old).replaceAllUsesWith(wire.getResult());
+      b.create<StrictConnectOp>(model.getLoc(), wire.getResult(), model.getArgument(*canonical));
+      if (failed(removeFAMEVirtualClockPort(circuit, model, alias.name, error))) return failure();
+    }
+    // Associated clock metadata follows the canonical domain. Other targets
+    // retain the same local name, now a driven wire rather than an input port;
+    // opaque constructor/format strings are never rewritten.
+    SmallVector<Attribute> updated;
+    for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+      Annotation annotation(attr);
+      StringRef member = annotation.isClass(AnnotationClasses::ChannelConnection) ? "clock" :
+                         annotation.isClass(AnnotationClasses::ChannelPorts) ? "clockPort" : "";
+      if (!member.empty()) if (auto target = annotation.getMember<StringAttr>(member)) {
+        auto found = clockRenames.find(target.getValue().str());
+        if (found != clockRenames.end())
+          annotation.setMember(member, StringAttr::get(circuit.getContext(), found->second));
+      }
+      updated.push_back(annotation.getAttr());
+    }
+    circuit->setAttr("rawAnnotations", ArrayAttr::get(circuit.getContext(), updated));
+    model->removeAttr("goldengate.fameClockAliases");
+    // One target-clock hub is the supported FAME model-graph contract. Its
+    // removal changed instance handles/port indices; the graph starts fresh.
+    return success();
+  }
+  return success();
+}
 LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
                       std::string &error, bool withTransport, bool enableMultiThreading,
                       FAME5ClockSemantics threadingClocks) {
   auto reject = [&](const std::string &why) { error = "FAME model graph: " + why; return failure(); };
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  auto hierarchy = analyzeTopHierarchy(circuit, error);
+  auto prepared = PreparedFAMEAnalysis::create(circuit, error);
+  const auto *hierarchy = prepared ? &prepared->hierarchy() : nullptr;
   if (!raw || !hierarchy) return reject("requires prepared hierarchy and retained annotations: " + error);
   auto top = hierarchy->top;
   bool usedTop = false;
@@ -214,7 +339,7 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
     auto op = resolved && !resolved->port ? dyn_cast<FModuleOp>(resolved->module.getOperation()) : FModuleOp{};
     if (!op || op == top) return reject("invalid transformed model target");
     if (llvm::any_of(models, [&](const auto &m) { return m.op == op; })) continue;
-    auto data = analyzeFAMEDataSelection(circuit, op, error);
+    auto data = analyzeFAMEDataSelection(*prepared, op, error);
     if (!data) return failure();
     Model model; model.op = op; model.selection = std::move(*data);
     bool promoted = true;
@@ -238,28 +363,18 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
     models.push_back(std::move(model));
   }
   if (models.empty()) return reject("no transformed definitions");
-  SmallVector<ModelPortGroup> groups;
-  SmallVector<GGChannelConnection, 0> channels;
-  for (auto attr : raw) {
-    Annotation anno(attr);
-    if (anno.isClass(AnnotationClasses::ChannelPorts)) {
-      auto group = analyzeModelPortGroup(circuit, anno, error); if (!group) return failure();
-      groups.push_back(std::move(*group));
-    } else if (anno.isClass(AnnotationClasses::ChannelConnection)) {
-      auto channel = analyzeChannelConnection(circuit, anno, error); if (!channel) return failure();
-      if (withTransport && channel->kind == ChannelKind::Pipe &&
-          (channel->sources.size() > 1 || channel->sinks.size() > 1))
-        return reject("aggregated PipeChannel transport is unsupported by SFC SimWrapper");
-      channels.push_back(std::move(*channel));
-    }
-  }
+  auto channels = prepared->channels();
+  for (const auto &channel : channels)
+    if (withTransport && channel.kind == ChannelKind::Pipe &&
+        (channel.sources.size() > 1 || channel.sinks.size() > 1))
+      return reject("aggregated PipeChannel transport is unsupported by SFC SimWrapper");
   if (!validateDecoupledChannelPairs(channels, error)) return failure();
   SmallVector<ModelChannelBinding> bindings;
   Model *hub = nullptr;
   std::string clockLocal, clockGlobal, clockTopPort, hubInstance;
   SmallVector<FAMEHubClockDomain> domains;
-  for (const auto &channel : channels) {
-    auto bound = bindChannelToModels(channel, *hierarchy, groups, error); if (!bound) return failure();
+  for (auto [index, channel] : llvm::enumerate(channels)) {
+    auto bound = prepared->bindingsFor(index, error); if (!bound) return failure();
     bindings.append(bound->begin(), bound->end());
     if (channel.kind != ChannelKind::TargetClock) continue;
     if (hub || bound->size() != 1) return reject("requires one clock channel bound to one hub instance");
@@ -268,14 +383,16 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
     auto captured = analyzeFAMEHubClockDomains(channel, *hierarchy, bound->front(), error);
     if (!captured) return failure();
     domains = *captured; clockLocal = bound->front().portGroup->name;
-    clockGlobal = channel.name; hubInstance = bound->front().instance.getName().str();
+    clockGlobal = channel.name;
+    auto boundInstance = bound->front().instance;
+    hubInstance = boundInstance.getName().str();
   }
   // FAMETransform permits independently scheduled scalar virtual-clock models
   // without a clock-token hub. SimWrapper requires exactly one clock channel,
   // so retain that requirement only when constructing simulator transport.
   if (!hub && withTransport) return reject("simulator transport requires an explicit target clock hub");
   for (auto &model : models) {
-    auto assignment = analyzeFAMEChannelClockDomains(circuit, model.op,
+    auto assignment = analyzeFAMEChannelClockDomains(*prepared, model.op,
         hub && model.op == hub->op ? ArrayRef<FAMEHubClockDomain>(domains) : ArrayRef<FAMEHubClockDomain>{}, error);
     if (!assignment) return failure(); model.assignments = *assignment;
     if (!hub || model.op != hub->op) {
@@ -412,6 +529,17 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
         !anno.isClass(AnnotationClasses::ModelReadWritePort))
       return reject("data target has unsupported retained annotation metadata");
   }
+  // Everything retained below is an owned name/type/selection snapshot. Drop
+  // binding pointers and immutable lookup indices before the first mutation.
+  BundleType clockType;
+  for (const auto &p : plan->sinks)
+    if (p.binding->globalName == clockGlobal) clockType = p.type;
+  plan.reset();
+  bindings.clear();
+  connectionsByPort.clear();
+  channels = {};
+  hierarchy = nullptr;
+  prepared.reset();
   SmallVector<FModuleOp> selectedModels; for (auto &m : models) selectedModels.push_back(m.op);
   if (failed(consumeFAMEModelDontTouches(circuit, selectedModels, error))) return failure();
   for (auto &m : models) if (failed(addFAMEHostControl(circuit, m.op, error))) return failure();
@@ -435,8 +563,6 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
     auto liveHub = instance(top, hubInstance);
     ModelChannelBinding clockBinding{clockGlobal, &clockGroup, liveHub, clockIndices};
     // The prepared clock port type is captured before rewriting host ports.
-    BundleType clockType;
-    for (const auto &p : plan->sinks) if (p.binding->globalName == clockGlobal) clockType = p.type;
     if (!liveHub || !clockType) return reject("lost live hub clock instance/type");
     FAMETopChannelPort clockEndpoint{&clockBinding, clockTopPort, clockType};
     if (failed(rewriteFAMEHubClockChannel(*current, clockEndpoint, domains, true, error))) return failure();
@@ -515,6 +641,11 @@ LogicalResult rewrite(CircuitOp circuit, FAMEModelGraphResult &result,
         failed(groupFAMEChannelPorts(top, model.op, model.instances.front(),
              hub && model.op == hub->op ? clockLocal + "_sink" : "", error))) return failure();
   }
+  for (auto &model : models)
+    for (auto p : model.op.getPorts())
+      if (p.direction == Direction::In && isa<ClockType>(p.type) && p.getName() != "hostClock")
+        return reject("unconsumed scalar model clock input: " + model.op.getName().str() + "." +
+                      p.getName().str() + "; prove hub aliases before ChannelExcision");
   if (failed(removeFAMEStaleTopClocks(top, error))) return failure();
   for (const auto &model : models)
     for (const auto &[name, metadata] : model.instanceMetadata) {
@@ -552,7 +683,8 @@ LogicalResult goldengate::rewriteFAMEModelGraph(CircuitOp circuit,
     bool enableMultiThreading, FAME5ClockSemantics threadingClocks) {
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   FAMEModelGraphResult count;
-  if (failed(rewrite(*staged, count, error, withTransport, enableMultiThreading, threadingClocks))) return failure();
+  if (failed(foldHubClockAliases(*staged, error)) ||
+      failed(rewrite(*staged, count, error, withTransport, enableMultiThreading, threadingClocks))) return failure();
   if (failed(verify(*staged))) { error = "FAME model graph produced invalid FIRRTL IR"; return failure(); }
   circuit->setAttrs((*staged)->getAttrs()); circuit.getBody().takeBody(staged->getBody()); result = count;
   return success();

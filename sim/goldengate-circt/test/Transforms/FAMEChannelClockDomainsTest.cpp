@@ -102,6 +102,22 @@ void fixture(MLIRContext &ctx) {
   for (const auto &a : *assignments)
     require(a.modelClockName == (StringRef(a.localName).ends_with("0") ? "clock0" : "clock1"),
             "clock identity followed port or annotation order");
+  auto prepared = goldengate::PreparedFAMEAnalysis::create(circuit, error);
+  require(bool(prepared), error);
+  for (unsigned repeat = 0; repeat < 2; ++repeat) {
+    auto reused = goldengate::analyzeFAMEChannelClockDomains(*prepared, model, domains, error);
+    require(reused && reused->size() == assignments->size() && dump(*root) == before,
+            "prepared clock query mutated IR or changed assignment count: " + error);
+    for (unsigned i = 0; i < reused->size(); ++i) {
+      const auto &a = (*reused)[i];
+      const auto &b = (*assignments)[i];
+      require(a.globalName == b.globalName && a.localName == b.localName &&
+                  a.direction == b.direction && a.modelClockName == b.modelClockName &&
+                  a.hasClockDomain == b.hasClockDomain,
+              "prepared clock query changed annotation/domain order");
+    }
+  }
+  prepared.reset(); // The following cases deliberately mutate annotations/IR.
   // A second global output on this same clock must reuse the producer's
   // assignment. Every branch still has to agree with its local clock.
   Annotation alias(annos[1]);

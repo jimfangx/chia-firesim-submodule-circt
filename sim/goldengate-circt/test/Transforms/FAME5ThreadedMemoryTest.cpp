@@ -12,6 +12,7 @@
 #include "llvm/Support/Path.h"
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
 #include <stdexcept>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -30,10 +31,8 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, StringRef path, unsigned thr
   if (signedData)
     for (size_t pos = 0; (pos = input.find("UInt<8>", pos)) != std::string::npos; pos += 7)
       input.replace(pos, 7, "SInt<8>");
-  if (threads == 2) {
-    auto pos = input.find("threadIdx : UInt<2>");
-    input.replace(pos, 19, "threadIdx : UInt<1>");
-  }
+  auto pos = input.find("threadIdx : UInt<2>");
+  input.replace(pos, 19, "threadIdx : UInt<" + std::to_string(llvm::Log2_64_Ceil(threads)) + ">");
   llvm::SourceMgr source;
   source.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBufferCopy(input), llvm::SMLoc());
   DefaultTimingManager timer; auto scope = timer.getRootScope();
@@ -215,12 +214,12 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: FAME5ThreadedMemoryTest fixture.fir");
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(context, argv[1], 2); behavior(context, argv[1], 3); behavior(context, argv[1], 4); rejections(context, argv[1]);
+    behavior(context, argv[1], 2); behavior(context, argv[1], 3); behavior(context, argv[1], 4); behavior(context, argv[1], 64); rejections(context, argv[1]);
     llvm::SmallString<256> syncPath(argv[1]);
     llvm::sys::path::remove_filename(syncPath);
     llvm::sys::path::append(syncPath, "FAME5SynchronousMemory.fir");
-    synchronous(context, syncPath, 2); synchronous(context, syncPath, 3); synchronous(context, syncPath, 4);
-    synchronous(context, syncPath, 2, true); synchronous(context, syncPath, 3, true); synchronous(context, syncPath, 4, true);
+    synchronous(context, syncPath, 2); synchronous(context, syncPath, 3); synchronous(context, syncPath, 4); synchronous(context, syncPath, 64);
+    synchronous(context, syncPath, 2, true); synchronous(context, syncPath, 3, true); synchronous(context, syncPath, 4, true); synchronous(context, syncPath, 64, true);
     synchronousRejections(context, syncPath); return 0;
   } catch (const std::exception &error) { llvm::errs() << error.what() << '\n'; return 1; }
 }

@@ -8,11 +8,11 @@ import firrtl.ir._
 import scala.collection.mutable
 
 object FAME5ThreadedStateOracle extends App {
-  for (count <- Seq(2, 3, 4)) {
+  for (count <- Seq(2, 3, 4, 64)) {
     val input = s"""circuit Model :
       |  module Model :
       |    input clock : Clock
-      |    input thread : UInt<${if (count == 2) 1 else 2}>
+      |    input thread : UInt<${BigInt(count - 1).bitLength}>
       |    input reset : UInt<1>
       |    input enable : UInt<1>
       |    input data : UInt<8>
@@ -25,7 +25,7 @@ object FAME5ThreadedStateOracle extends App {
     val circuit = new LowFirrtlCompiler().compile(CircuitState(Parser.parse(input), ChirrtlForm), Nil).circuit
     val original = circuit.modules.head.asInstanceOf[Module]
     val resets = mutable.ArrayBuffer[Statement]()
-    val index = WRef("thread", UIntType(IntWidth(if (count == 2) 1 else 2)), PortKind, SourceFlow)
+    val index = WRef("thread", UIntType(IntWidth(BigInt(count - 1).bitLength)), PortKind, SourceFlow)
     val transformed = MuxingMultiThreader.onStmt(resets, BigInt(count), index)(original.body)
     val body = Block(Seq(transformed) ++ resets)
     val nodes = mutable.Map[String, Expression]()

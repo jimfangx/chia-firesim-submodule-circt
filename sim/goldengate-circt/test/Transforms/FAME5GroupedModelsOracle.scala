@@ -37,7 +37,7 @@ object FAME5GroupedModelsOracle extends App {
     require(allMemories.exists(m => m.depth == 3 * n && m.readLatency == 1 && m.readUnderWrite == ReadUnderWrite.Old))
     require(allMemories.exists(m => m.depth == n && m.readLatency == (if (n < 4) 0 else 1) && m.name != state.name))
   } else require(registers.size == 1 && memories.size == 1 && memories.head.readLatency == 0 && memories.head.writeLatency == 1)
-  require(Seq(2,3,4).contains(n))
+  require(n >= 2)
   write("threaded.sfc.fir", result.circuit.serialize)
   write("threaded.sfc.json", JsonProtocol.serialize(result.annotations.filterNot(_.isInstanceOf[ConfigParametersAnnotation])))
   val emitted = new VerilogCompiler().compileAndEmit(result.copy(form = HighForm), Nil)

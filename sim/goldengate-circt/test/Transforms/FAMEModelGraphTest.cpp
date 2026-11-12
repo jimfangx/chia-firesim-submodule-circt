@@ -1,5 +1,8 @@
 // See LICENSE for license details.
 #include "goldengate/FAMEModelGraph.h"
+#include "goldengate/FindDefaultClocks.h"
+#include "goldengate/FAMEClockGate.h"
+#include "circt/Dialect/FIRRTL/FIREmitter.h"
 #include "goldengate/RAMModelAdapter.h"
 #include "goldengate/TargetUtils.h"
 #include "goldengate/HierarchicalTargets.h"
@@ -448,8 +451,81 @@ void runVirtual(MLIRContext &ctx, StringRef fir, StringRef anno, StringRef outpu
   require(gates==1,"shared virtual definition lost its own gate");
   if(!output.empty()){std::error_code ec;llvm::raw_fd_ostream out(output,ec);require(!ec,"cannot write hubless graph");root->print(out);}
 }
+void runClockAliases(MLIRContext &ctx, StringRef fir, StringRef anno, StringRef output) {
+  for (unsigned count : {1u, 3u, 63u}) for (bool transport : {false, true}) {
+    auto root = fixture(ctx, fir, anno); auto circuit = *root->getOps<CircuitOp>().begin();
+    auto top = named(circuit, "Top"), hub = named(circuit, "Hub"); OpBuilder b(&ctx);
+    unsigned first = hub.getNumPorts(); SmallVector<std::pair<unsigned, PortInfo>> extra;
+    for (unsigned i = 0; i < count; ++i)
+      extra.push_back({first, PortInfo(b.getStringAttr("feedback_" + std::to_string(i)),
+                                    ClockType::get(&ctx), Direction::In)});
+    hub.insertPorts(extra);
+    InstanceOp old;
+    for (auto instance : top.getOps<InstanceOp>()) if (instance.getModuleName() == "Hub") old = instance;
+    b.setInsertionPoint(old); auto replacement = b.create<InstanceOp>(old.getLoc(), hub, old.getName());
+    replacement->setAttr("test.preserved", old->getAttr("test.preserved"));
+    for (unsigned i = 0; i < old.getNumResults(); ++i) old.getResult(i).replaceAllUsesWith(replacement.getResult(i));
+    old.erase();
+    auto input = [&](StringRef name) { for(unsigned i=0;i<hub.getNumPorts();++i)if(hub.getPortName(i)==name)return i;throw std::runtime_error("missing port"); };
+    // Live state in both domains reads an alias, not the canonical argument.
+    hub.walk([&](Operation *op) {
+      if (!isa<RegOp,RegResetOp>(op)) return;
+      Value clock = op->getOperand(0);
+      if (clock == hub.getArgument(input("c0"))) op->setOperand(0,hub.getArgument(input("feedback_0")));
+      if (count > 1 && clock == hub.getArgument(input("c1"))) op->setOperand(0,hub.getArgument(input("feedback_1")));
+    });
+    b.setInsertionPointToEnd(top.getBodyBlock());
+    SmallVector<Operation *> feedback;
+    for (unsigned i=0;i<count;++i)
+      feedback.push_back(b.create<StrictConnectOp>(top.getLoc(), replacement.getResult(input("feedback_"+std::to_string(i))),
+                       replacement.getResult(input(i%2 ? "alias1" : "alias0"))).getOperation());
+    require(succeeded(verify(*root)),"alias input fixture invalid");
+    std::string error;
+    require(succeeded(findDefaultClocks(circuit,error)),error);
+    auto proofs=hub->getAttrOfType<ArrayAttr>("goldengate.fameClockAliases");
+    require(proofs && proofs.size()==count,"physical feedback aliases were not all proven");
+    // Model the clock-input side of ChannelExcision. The physical connection
+    // is now cut; only the compiler's pre-excision proof can justify folding.
+    SmallVector<std::pair<unsigned, PortInfo>> wrapper;
+    for(unsigned i=0;i<count;++i)wrapper.push_back({top.getNumPorts(),PortInfo(b.getStringAttr("feedback_in_"+std::to_string(i)),ClockType::get(&ctx),Direction::In)});
+    unsigned firstTop=top.getNumPorts();top.insertPorts(wrapper);
+    for(unsigned i=0;i<count;++i)feedback[i]->setOperand(1,top.getArgument(firstTop+i));
+    if(count==3 && !transport)for(unsigned bad=0;bad<5;++bad) {
+      OwningOpRef<ModuleOp> broken(cast<ModuleOp>(root->clone()));auto c=*broken->getOps<CircuitOp>().begin();auto h=named(c,"Hub");
+      auto rows=h->getAttrOfType<ArrayAttr>("goldengate.fameClockAliases");SmallVector<Attribute> changed(rows.begin(),rows.end());
+      if(bad==0)h->removeAttr("goldengate.fameClockAliases");
+      else if(bad==4){SmallVector<Attribute> annos(h.getPortAnnotationsAttr().begin(),h.getPortAnnotationsAttr().end());if(annos.empty())annos.assign(h.getNumPorts(),b.getArrayAttr({}));annos[first]=b.getArrayAttr({b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.ClockIdentity"))})});h.setPortAnnotationsAttr(b.getArrayAttr(annos));}
+      else {NamedAttrList row(cast<DictionaryAttr>(changed[0]));row.set(bad==1?"port":bad==2?"clock":"instance",b.getStringAttr("missing"));changed[0]=row.getDictionary(&ctx);h->setAttr("goldengate.fameClockAliases",b.getArrayAttr(changed));}
+      auto before=dump(*broken);FAMEModelGraphResult result;std::string why;
+      auto rejected=rewriteFAMEModelGraph(c,result,why,transport);require(failed(rejected) && !why.empty() && dump(*broken)==before,"unsafe alias cleanup case "+std::to_string(bad)+" accepted or changed rejected graph: "+why);
+    }
+    FAMEModelGraphResult result;require(succeeded(rewriteFAMEModelGraph(circuit,result,error,transport)),error);
+    require(succeeded(verify(*root)),"folded clock graph invalid");
+    hub=named(circuit,"Hub");FAMEClockGateIndex gates;require(succeeded(gates.collect(hub,error)),error);
+    for(auto p:hub.getPorts())require(p.getName()=="hostClock" || !isa<ClockType>(p.type),"ancillary scalar clock survived the model ABI");
+    unsigned wires=0;
+    for(auto wire:hub.getOps<WireOp>())if(wire.getName().starts_with("feedback_")) {
+      unsigned i=0;require(!wire.getName().drop_front(9).getAsInteger(10,i),"alias name changed");
+      auto gate=gates.lookup(i%2 ? "c1":"c0");require(bool(gate),"missing independent domain gate");
+      unsigned drivers=0;
+      for(auto &use:wire.getResult().getUses())if(auto con=dyn_cast<StrictConnectOp>(use.getOwner());con&&con.getDest()==wire.getResult()) {++drivers;require(con.getSrc()==gate.getResult(2),"alias consumer bypasses its token-controlled domain gate");}
+      require(drivers==1,"alias wire is uninitialized or multiply driven");++wires;
+    }
+    require(wires==count,"alias identity lost");
+    if(count==63&&!output.empty()) {
+      std::string path=output.str()+(transport?"-transport.mlir":".mlir");std::error_code ec;llvm::raw_fd_ostream out(path,ec);require(!ec,"cannot export alias graph");root->print(out);out<<'\n';out.close();
+      if(!transport){llvm::raw_fd_ostream firOut(output.str()+".fir",ec);require(!ec&&succeeded(exportFIRFile(*root,firOut,16384,FIRVersion(1,2,0))),"cannot export alias FIRRTL");}
+    }
+  }
+  llvm::outs()<<"PASS 1/3/63 pre-excision clock aliases: two live gated domains, transport and five atomic rejections\n";
+}
 } // namespace
 int main(int argc,char **argv){try{
+ if(argc==4 && StringRef(argv[1])=="--clock-aliases") {
+  MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
+  auto fixtureDir=StringRef(argv[2]);runClockAliases(ctx,(fixtureDir+"/FAMEModelGraph.fir").str(),(fixtureDir+"/FAMEModelGraph.anno.json").str(),argv[3]);return 0;
+ }
+
  if(argc==3 && StringRef(argv[1])=="--ram-model-input") {
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
   auto root=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(root),"prepared RAM graph parse failed");

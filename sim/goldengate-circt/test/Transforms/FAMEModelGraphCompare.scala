@@ -15,8 +15,17 @@ object FAMEModelGraphCompare extends App {
   // host schedule supplies rational clock tokens and independent peer stalls.
   class Interpreter(module: Module) {
     val body = flatten(module.body)
-    val nodes = body.collect { case n: DefNode => n.name -> n.value }.toMap
+    val clockWires = body.collect { case w: DefWire if w.tpe == ClockType => w.name }.toSet
+    val clockAssignments = body.collect { case Connect(_, WRef(name, _, _, _), rhs) if clockWires(name) => name -> rhs }.groupBy(_._1)
+    require(clockAssignments.values.forall(_.size == 1), "clock alias has multiple drivers")
+    val nodes = body.collect { case n: DefNode => n.name -> n.value }.toMap ++ clockAssignments.map { case (name, rows) => name -> rows.head._2 }
     val drivers = body.collect { case c: Connect => c.loc.serialize -> c.expr }.toMap
+    def clockSource(e: Expression, seen: Set[String] = Set.empty): String = e match {
+      case r: WRef if nodes.contains(r.name) =>
+        require(!seen(r.name), "cyclic clock alias")
+        clockSource(nodes(r.name), seen + r.name)
+      case other => other.serialize
+    }
     val registers = body.collect { case r: DefRegister => r }
     val gates = body.collect { case i: WDefInstance if i.module == "AbstractClockGate" => i.name }
     var inputs = Map.empty[String, BigInt]
@@ -49,10 +58,11 @@ object FAMEModelGraphCompare extends App {
     def fired(channel: String): BigInt = ref(registers.find(_.name.startsWith(channel + "_fired")).get.name)
     def enabled(clock: String): BigInt = ref(registers.find(_.name.startsWith(clock + "_enabled")).get.name)
     def gate(clock: String): BigInt = ref(gates.find(_.startsWith(clock + "_buffer")).get + ".CE")
-    def resetHost(): Unit = { state = state ++ registers.filter(_.clock.serialize == "hostClock").map(r => r.name -> eval(r.init)) }
+    def resetHost(): Unit = { state = state ++ registers.filter(r => clockSource(r.clock) == "hostClock").map(r => r.name -> eval(r.init)) }
     def step(): Unit = {
       state = registers.map { r =>
-        val advance = r.clock.serialize == "hostClock" || gates.find(g => r.clock.serialize == g + ".O").exists(g => ref(g + ".CE") != 0)
+        val source = clockSource(r.clock)
+        val advance = source == "hostClock" || gates.find(g => source == g + ".O").exists(g => ref(g + ".CE") != 0)
         val value = if (!advance) state(r.name) else if (eval(r.reset) != 0) eval(r.init) else eval(drivers(r.name))
         r.name -> value
       }.toMap
@@ -64,15 +74,19 @@ object FAMEModelGraphCompare extends App {
   def interface(m:Module)=m.ports.map(p=>(p.name,p.direction.serialize,p.tpe.serialize)).sortBy(_._1)
   def signature(m:Module):Map[String,String]={
     val body=flatten(m.body)
-    val nodes=body.collect{case n:DefNode=>n.name->n.value}.toMap
-    def canonical(e:Expression):String=e match {
-      case r:WRef if nodes.contains(r.name)=>canonical(nodes(r.name))
+    val clockWires=body.collect{case w:DefWire if w.tpe==ClockType=>w.name}.toSet
+    val clockAssignments=body.collect{case Connect(_,WRef(name,_,_,_),rhs) if clockWires(name)=>name->rhs}.groupBy(_._1)
+    require(clockAssignments.values.forall(_.size==1),"clock alias has multiple drivers")
+    val nodes=body.collect{case n:DefNode=>n.name->n.value}.toMap ++ clockAssignments.map{case(name,rows)=>name->rows.head._2}
+    def canonical(e:Expression,seen:Set[String]=Set.empty):String=e match {
+      case r:WRef if nodes.contains(r.name)=>
+        require(!seen(r.name),"cyclic clock alias"); canonical(nodes(r.name),seen+r.name)
       case r:WRef=>norm(r.name)
       case f:WSubField=>norm(f.serialize)
       case UIntLiteral(v,_)=>v.toString
-      case DoPrim(PrimOps.AsUInt,args,_,_)=>canonical(args.head)
-      case DoPrim(op,args,cs,_)=>s"$op(${args.map(canonical).mkString(",")};${cs.mkString(",")})"
-      case Mux(s,h,l,_)=>s"mux(${canonical(s)},${canonical(h)},${canonical(l)})"
+      case DoPrim(PrimOps.AsUInt,args,_,_)=>canonical(args.head,seen)
+      case DoPrim(op,args,cs,_)=>s"$op(${args.map(a=>canonical(a,seen)).mkString(",")};${cs.mkString(",")})"
+      case Mux(s,h,l,_)=>s"mux(${canonical(s,seen)},${canonical(h,seen)},${canonical(l,seen)})"
       case _=>norm(e.serialize)
     }
     body.collect{case r:DefRegister if r.name.startsWith("state")=>

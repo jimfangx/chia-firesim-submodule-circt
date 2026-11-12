@@ -216,6 +216,13 @@ target_compile_features(goldengate-circt PRIVATE cxx_std_17)
 target_compile_options(goldengate-circt PRIVATE -fno-rtti)
 target_include_directories(goldengate-circt PRIVATE
   ${CMAKE_CURRENT_SOURCE_DIR}/include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
+# Share common CIRCT/MLIR header parsing within the compiler build. CMake's
+# standard CMAKE_DISABLE_PRECOMPILE_HEADERS option remains available.
+target_precompile_headers(goldengate-circt PRIVATE
+  <circt/Dialect/FIRRTL/FIRRTLOps.h>
+  <mlir/IR/Builders.h>
+  <mlir/IR/BuiltinOps.h>
+  <llvm/Support/raw_ostream.h>)
 target_link_libraries(goldengate-circt PRIVATE
   CIRCTImportFIRFile CIRCTExportFIRRTL CIRCTFirtool CIRCTFIRRTL CIRCTFIRRTLTransforms CIRCTHW CIRCTOM CIRCTSupport
   MLIRIR MLIRSupport LLVMSupport)
@@ -251,6 +258,12 @@ if(BUILD_TESTING)
     add_test(NAME goldengate-firesim-compiler-selection
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/FireSimCompilerSelectionTest.py)
+    add_test(NAME goldengate-firesim-bootstrap-overlap
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/FireSimBootstrapOverlapTest.py)
+    add_test(NAME goldengate-driver-parallelism
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Support/DriverParallelismTest.py)
     add_test(NAME goldengate-enabled-autocounter-printf-cli
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/EnabledAutoCounterPrintfCLI.py
@@ -1705,7 +1718,8 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-cpu-stream-port COMMAND goldengate-cpu-stream-port-test)
   add_executable(goldengate-fpga-top-shell-test
-    test/Transforms/FPGATopShellTest.cpp lib/Transforms/FPGATopShell.cpp)
+    test/Transforms/FPGATopShellTest.cpp lib/Transforms/FPGATopShell.cpp
+    lib/Transforms/CPUStreamRead.cpp)
   target_compile_features(goldengate-fpga-top-shell-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fpga-top-shell-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fpga-top-shell-test PRIVATE
@@ -2667,6 +2681,7 @@ endif()
 if(BUILD_TESTING)
   add_executable(goldengate-fame-model-graph-test
     test/Transforms/FAMEModelGraphTest.cpp
+    lib/Transforms/FindDefaultClocks.cpp
     lib/Transforms/RAMModelAdapter.cpp
     lib/Transforms/AsyncRAMModel.cpp
     lib/Transforms/FAMEModelGraph.cpp
@@ -2702,7 +2717,7 @@ if(BUILD_TESTING)
   target_include_directories(goldengate-fame-model-graph-test PRIVATE
     include ${MLIR_INCLUDE_DIRS} ${CIRCT_INCLUDE_DIRS})
   target_link_libraries(goldengate-fame-model-graph-test PRIVATE
-    CIRCTImportFIRFile CIRCTFIRRTLTransforms CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
+    CIRCTExportFIRRTL CIRCTImportFIRFile CIRCTFIRRTLTransforms CIRCTFIRRTL CIRCTHW CIRCTSupport MLIRParser MLIRPass MLIRIR MLIRSupport LLVMSupport)
   if(Python3_Interpreter_FOUND)
     add_test(NAME goldengate-multicycle-ram-model-graph
       COMMAND ${Python3_EXECUTABLE}
@@ -2710,6 +2725,10 @@ if(BUILD_TESTING)
         $<TARGET_FILE:goldengate-circt> $<TARGET_FILE:goldengate-fame-model-graph-test>
         ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms)
   endif()
+  add_test(NAME goldengate-fame-model-graph-clock-aliases
+    COMMAND goldengate-fame-model-graph-test --clock-aliases
+      ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms
+      ${CMAKE_CURRENT_BINARY_DIR}/fame-model-graph-clock-aliases)
   add_test(NAME goldengate-fame-model-graph COMMAND goldengate-fame-model-graph-test
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.fir
     ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEModelGraph.anno.json)
@@ -2944,9 +2963,32 @@ endif()
 if(BUILD_TESTING AND Python3_Interpreter_FOUND)
   find_program(GOLDENGATE_ASSERT_FIRTOOL NAMES firtool
     HINTS "${CIRCT_DIR}/../../../bin")
+  if(GOLDENGATE_ASSERT_FIRTOOL)
+    add_test(NAME goldengate-fame-clock-aliases-rtl
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAMEClockAliasesRTLTest.py
+        --graph-test $<TARGET_FILE:goldengate-fame-model-graph-test>
+        --firtool ${GOLDENGATE_ASSERT_FIRTOOL}
+        --fixtures ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/fame-clock-aliases-rtl)
+  endif()
   find_program(GOLDENGATE_ASSERT_VERILATOR NAMES verilator
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.conda-env/bin")
   if(GOLDENGATE_ASSERT_FIRTOOL AND GOLDENGATE_ASSERT_VERILATOR)
+    add_test(NAME goldengate-fame5-memory-64-rtl
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAME5Memory64RTLTest.py
+        --compiler $<TARGET_FILE:goldengate-circt>
+        --verilator ${GOLDENGATE_ASSERT_VERILATOR}
+        --fixtures ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/fame5-memory-64-rtl)
+    add_test(NAME goldengate-fame5-grouped-64-rtl
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAME5Grouped64RTLTest.py
+        --compiler $<TARGET_FILE:goldengate-circt>
+        --verilator ${GOLDENGATE_ASSERT_VERILATOR}
+        --fixtures ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/fame5-grouped-64-rtl)
     add_test(NAME goldengate-multicycle-ram-sharing
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/MultiCycleRAMSharingTest.py

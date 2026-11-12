@@ -4,6 +4,10 @@
 # Master Simulation Driver #
 ############################
 DRIVER_CXXOPTS ?= -O2
+# Keep the outer elaboration/build graph serial, while compiling independent
+# driver translation units on the available CPUs. Override with e.g.
+# DRIVER_BUILD_JOBS=1 when a serial driver build is desired.
+DRIVER_BUILD_JOBS ?= $(or $(shell nproc 2>/dev/null),1)
 
 platforms_dir := $(abspath $(firesim_base_dir)/../platforms)
 
@@ -23,7 +27,7 @@ $(f2): export LDFLAGS := $(LDFLAGS) $(common_ld_flags) -Wl,-rpath='$$$$ORIGIN' -
 $(f2): $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h)
 	mkdir -p $(OUTPUT_DIR)/build
 	cp $(header) $(OUTPUT_DIR)/build/
-	$(MAKE) -C $(simif_dir) driver MAIN=$(PLATFORM) PLATFORM=$(PLATFORM) \
+	$(MAKE) --jobs=$(DRIVER_BUILD_JOBS) -C $(simif_dir) driver MAIN=$(PLATFORM) PLATFORM=$(PLATFORM) \
 		DRIVER_NAME=$(DESIGN) \
 		GEN_FILE_BASENAME=$(BASE_FILE_NAME) \
 		GEN_DIR=$(OUTPUT_DIR)/build \
@@ -40,7 +44,7 @@ $$($1): export LDFLAGS := $$(LDFLAGS) $$(common_ld_flags) -Wl,-rpath='$$$$$$$$OR
 $$($1): $$(header) $$(DRIVER_CC) $$(DRIVER_H) $$(midas_cc) $$(midas_h)
 	mkdir -p $$(OUTPUT_DIR)/build
 	cp $$(header) $$(OUTPUT_DIR)/build/
-	$$(MAKE) -C $$(simif_dir) driver MAIN=$$(PLATFORM) PLATFORM=$$(PLATFORM) \
+	$$(MAKE) --jobs=$$(DRIVER_BUILD_JOBS) -C $$(simif_dir) driver MAIN=$$(PLATFORM) PLATFORM=$$(PLATFORM) \
 		DRIVER_NAME=$$(DESIGN) \
 		GEN_FILE_BASENAME=$$(BASE_FILE_NAME) \
 		GEN_DIR=$$(OUTPUT_DIR)/build \
@@ -65,7 +69,7 @@ $(vitis): export LDFLAGS := $(LDFLAGS) $(common_ld_flags) -Wl,-rpath='$$$$ORIGIN
 $(vitis): $(header) $(DRIVER_CC) $(DRIVER_H) $(midas_cc) $(midas_h)
 	mkdir -p $(OUTPUT_DIR)/build
 	cp $(header) $(OUTPUT_DIR)/build/
-	$(MAKE) -C $(simif_dir) driver MAIN=$(PLATFORM) PLATFORM=$(PLATFORM) \
+	$(MAKE) --jobs=$(DRIVER_BUILD_JOBS) -C $(simif_dir) driver MAIN=$(PLATFORM) PLATFORM=$(PLATFORM) \
 		DRIVER_NAME=$(DESIGN) \
 		GEN_FILE_BASENAME=$(BASE_FILE_NAME) \
 		GEN_DIR=$(OUTPUT_DIR)/build \

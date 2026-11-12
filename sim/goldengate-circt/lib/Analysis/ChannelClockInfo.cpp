@@ -204,32 +204,52 @@ LogicalResult goldengate::analyzeChannelClocksAndUpdateBridges(
   for (Operation &op : circuit.getBodyBlock()->getOperations())
     if (auto module = dyn_cast<FModuleOp>(&op))
       modules.emplace(module.getName().str(), module);
+  struct Driver {
+    Operation *connect;
+    Value source;
+    SmallVector<StringAttr> fields;
+  };
+  using ModuleDrivers = DenseMap<Value, SmallVector<Driver>>;
+  DenseMap<Operation *, ModuleDrivers> driverIndices;
   auto getDriver = [&](FModuleOp module, Value value) -> std::optional<Value> {
     auto wanted = describeField(value);
-    for (Operation &op : llvm::reverse(module.getBodyBlock()->getOperations())) {
-      Value dest, source;
-      if (auto connect = dyn_cast<ConnectOp>(&op)) {
-        dest = connect.getDest();
-        source = connect.getSrc();
-      } else if (auto connect = dyn_cast<StrictConnectOp>(&op)) {
-        dest = connect.getDest();
-        source = connect.getSrc();
-      } else {
-        continue;
+    auto [indexed, inserted] = driverIndices.try_emplace(module.getOperation());
+    if (inserted) {
+      // Tracing only inserts SubfieldOps: connections, their operands and their
+      // relative order stay fixed for this call. Index each destination base
+      // once, retaining reverse program order for FIRRTL last-connect priority.
+      for (Operation &op : llvm::reverse(module.getBodyBlock()->getOperations())) {
+        Value dest, source;
+        if (auto connect = dyn_cast<ConnectOp>(&op)) {
+          dest = connect.getDest();
+          source = connect.getSrc();
+        } else if (auto connect = dyn_cast<StrictConnectOp>(&op)) {
+          dest = connect.getDest();
+          source = connect.getSrc();
+        } else {
+          continue;
+        }
+        auto assigned = describeField(dest);
+        indexed->second[assigned.base].push_back(
+            {&op, source, std::move(assigned.fields)});
       }
-      auto assigned = describeField(dest);
-      if (assigned.base != wanted.base ||
-          assigned.fields.size() > wanted.fields.size() ||
-          !std::equal(assigned.fields.begin(), assigned.fields.end(),
+    }
+    auto candidates = indexed->second.find(wanted.base);
+    if (candidates == indexed->second.end()) return std::nullopt;
+    for (const auto &driver : candidates->second) {
+      if (driver.fields.size() > wanted.fields.size() ||
+          !std::equal(driver.fields.begin(), driver.fields.end(),
                       wanted.fields.begin()))
         continue;
+      Value source = driver.source;
+      Operation &op = *driver.connect;
       // The suffix identifies the same leaf in the aggregate source. Create
       // projections only after finding the winning connect so that repeated
       // aggregate assignments do not manufacture unused FIRRTL operations.
       OpBuilder builder(&op);
       builder.setInsertionPointAfter(&op);
       for (StringAttr field :
-           ArrayRef<StringAttr>(wanted.fields).drop_front(assigned.fields.size())) {
+           ArrayRef<StringAttr>(wanted.fields).drop_front(driver.fields.size())) {
         source = builder.create<SubfieldOp>(op.getLoc(), source,
                                             field.getValue());
       }

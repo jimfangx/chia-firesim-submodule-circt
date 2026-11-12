@@ -3,6 +3,7 @@
 
 #include "goldengate/ChannelAnalysis.h"
 #include "goldengate/HierarchyAnalysis.h"
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -21,6 +22,34 @@ struct ModelChannelBinding {
   const ModelPortGroup *portGroup;
   circt::firrtl::InstanceOp instance;
   llvm::SmallVector<unsigned> instancePorts;
+};
+
+// A caller-owned snapshot for the immutable FAME planning phase. Bindings retain
+// pointers into this object; destroy all plans and this snapshot before changing
+// annotations, module signatures or connectivity. It is intentionally immovable.
+class PreparedFAMEAnalysis {
+public:
+  static std::unique_ptr<PreparedFAMEAnalysis>
+  create(circt::firrtl::CircuitOp circuit, std::string &error);
+  ~PreparedFAMEAnalysis();
+  PreparedFAMEAnalysis(const PreparedFAMEAnalysis &) = delete;
+  PreparedFAMEAnalysis &operator=(const PreparedFAMEAnalysis &) = delete;
+
+  circt::firrtl::CircuitOp circuit() const;
+  const TopHierarchy &hierarchy() const;
+  llvm::ArrayRef<ModelPortGroup> groups() const;
+  llvm::ArrayRef<GGChannelConnection> channels() const;
+  llvm::ArrayRef<const TopPortConnection *>
+  connectionsForTopPort(unsigned port) const;
+  // Lazy to preserve data/clock queries' intentional exclusion of TargetClock
+  // bindings. A successful query is shared across all model selections.
+  const llvm::SmallVector<ModelChannelBinding> *
+  bindingsFor(unsigned channel, std::string &error);
+
+private:
+  struct Impl;
+  explicit PreparedFAMEAnalysis(std::unique_ptr<Impl> impl);
+  std::unique_ptr<Impl> impl;
 };
 
 std::optional<ModelPortGroup>

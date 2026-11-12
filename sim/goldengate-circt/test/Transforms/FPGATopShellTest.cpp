@@ -1,5 +1,6 @@
 // See LICENSE for license details.
 #include "goldengate/FPGATopShell.h"
+#include "goldengate/CPUStreamRead.h"
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/HW/HWDialect.h"
 #include "circt/Dialect/FIRRTL/CHIRRTLDialect.h"
@@ -127,6 +128,17 @@ void writeStub(CircuitOp c,StringRef name) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    if(argc==4&&StringRef(argv[1])=="--apply-f2-input") {
+      auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"F2 platform input parse");
+      require(succeeded(verify(*real)),"invalid F2 platform input IR");
+      auto circuit=*real->getOps<CircuitOp>().begin();
+      require(succeeded(goldengate::enableF2CPUStreamWordReads(circuit,error)),error);
+      require(succeeded(goldengate::assembleFPGATopShell(circuit,error,true)),error);
+      require(succeeded(verify(*real)),"invalid F2 platform shell IR");
+      std::error_code ec;llvm::raw_fd_ostream out(argv[3],ec);require(!ec,"cannot write F2 shell output");
+      real->print(out);out<<'\n';
+      llvm::outs()<<"PASS exact production F2 platform input through wrapper assembly\n";return 0;
+    }
     // Reuse actual post-MMIO FRFCFS diagnostic types from the component
     // pipeline. The public shell/forwarding is still a boundary scaffold;
     // this is not a complete target candidate or semantic comparison.

@@ -99,16 +99,23 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
   // Admit an extra Clock only if its unique forwarding path reaches an exact
   // retained channel-domain port; a spelling/prefix alone is not a contract.
   std::set<std::pair<Operation *, unsigned>> channelClocks;
+  std::set<std::string> channelClockTargets;
   for (auto attr : raw) {
     auto row = dyn_cast<DictionaryAttr>(attr);
     if (!row || row.getAs<StringAttr>("class") != AnnotationClasses::ChannelConnection) continue;
     auto clock = row.getAs<StringAttr>("clock");
     if (!clock) continue;
-    for (auto module : circuit.getOps<FModuleOp>())
-      for (auto [index, port] : llvm::enumerate(module.getPorts()))
-        if (isa<ClockType>(port.type) && clock.getValue() ==
-            "~" + circuit.getName().str() + "|" + module.getName().str() + ">" + port.getName().str())
-          channelClocks.emplace(module.getOperation(), index);
+    channelClockTargets.insert(clock.getValue().str());
+  }
+  // Match the same exact identities without rebuilding every module's full
+  // PortInfo list for every channel. Repeated clock annotations have no effect
+  // on the set of matched ports.
+  for (auto module : circuit.getOps<FModuleOp>()) {
+    auto prefix = "~" + circuit.getName().str() + "|" + module.getName().str() + ">";
+    for (unsigned index = 0; index < module.getNumPorts(); ++index)
+      if (isa<ClockType>(module.getPortType(index)) &&
+          channelClockTargets.count(prefix + module.getPortName(index).str()))
+        channelClocks.emplace(module.getOperation(), index);
   }
   auto channelClockAlias = [&](unsigned index) {
     std::set<std::pair<Operation *, unsigned>> visited;

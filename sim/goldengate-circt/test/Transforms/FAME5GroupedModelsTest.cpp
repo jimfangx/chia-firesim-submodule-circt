@@ -15,6 +15,7 @@
 #include "llvm/Support/SourceMgr.h"
 #include "llvm/Support/raw_ostream.h"
 #include <sstream>
+#include <regex>
 #include <map>
 #include <stdexcept>
 using namespace mlir;
@@ -34,6 +35,13 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, StringRef path, unsigned thr
     for (unsigned i = threads; i < 4; ++i)
       remove |= line.find("in" + std::to_string(i)) != std::string::npos || line.find("out" + std::to_string(i)) != std::string::npos || line.find("worker" + std::to_string(i)) != std::string::npos;
     if (!remove) source += line + "\n";
+    if (threads > 4 && std::regex_search(line, std::regex("\\b(in|out|worker)3\\b")))
+      for (unsigned i = 4; i < threads; ++i) {
+        auto clone = line;
+        for (auto prefix : {"in", "out", "worker"})
+          clone = std::regex_replace(clone, std::regex("\\b" + std::string(prefix) + "3\\b"), std::string(prefix) + std::to_string(i));
+        source += clone + "\n";
+      }
   }
   llvm::SourceMgr manager; manager.AddNewSourceBuffer(llvm::MemoryBuffer::getMemBufferCopy(source), llvm::SMLoc());
   DefaultTimingManager timer; auto scope = timer.getRootScope();
@@ -80,6 +88,13 @@ Value drive(FModuleOp top, Value root, StringRef field) {
 void behavior(MLIRContext &context, StringRef path, unsigned threads) {
   auto root = fixture(context, path, threads); auto circuit = *root->getOps<CircuitOp>().begin();
   std::string original = text(named(circuit, "Worker")); auto raw = circuit->getAttr("rawAnnotations");
+  std::vector<unsigned> declarationOrder;
+  for (auto instance : named(circuit, "Top").getOps<InstanceOp>()) if (instance.getModuleName() == "Worker") {
+    unsigned member = 0;
+    require(!instance.getName().drop_front(6).getAsInteger(10, member), "bad fixture member name");
+    declarationOrder.push_back(member);
+  }
+  require(declarationOrder.size() == threads, "fixture thread count differs");
   unsigned groups = 999; std::string error;
   auto result = goldengate::multiThreadFAME5Models(circuit, groups, error);
   if (failed(result)) llvm::errs() << "FAME5 rejection: " << error << '\n' << text(circuit) << '\n';
@@ -120,19 +135,22 @@ void behavior(MLIRContext &context, StringRef path, unsigned threads) {
   Value in = shared.getResult(inPort), out = shared.getResult(outPort);
   unsigned observations = 0;
   for (unsigned slot = 0; slot < threads; ++slot)
-    for (unsigned pattern = 0; pattern < (1u << (threads * 2)); ++pattern) {
+    for (unsigned pattern = 0; pattern < (threads <= 4 ? (1u << (threads * 2)) : 16u); ++pattern) {
       llvm::DenseMap<Value, uint64_t> inputs{{count.getResult(), slot}, {in, pattern & 1}, {out, ((pattern & 2) ? 2 : 0) | (uint64_t(0x12345) << 2)}};
       for (unsigned i = 0; i < threads; ++i) {
-        unsigned member = i == 0 ? 1 : i == 1 ? 0 : threads == 4 ? 5-i : i;
-        inputs[argument(top, "in" + std::to_string(member))] = (((pattern >> i) & 1) << 1) | (uint64_t(17 + member * 19) << 2);
-        inputs[argument(top, "out" + std::to_string(member))] = (pattern >> (i + threads)) & 1;
+        unsigned member = declarationOrder[i];
+        inputs[argument(top, "in" + std::to_string(member))] = ((threads <= 4 ? ((pattern >> i) & 1) : unsigned((pattern * 17 + i * 7 + i / 5) % 11 < 6)) << 1) | ((uint64_t(17 + member * 19) & mask(*getBitWidth(cast<BundleType>(in.getType()).getElement("bits")->type))) << 2);
+        inputs[argument(top, "out" + std::to_string(member))] = threads <= 4 ? (pattern >> (i + threads)) & 1 : unsigned((pattern * 31 + i * 13 + i / 3) % 7 < 4);
       }
-      unsigned member = slot == 0 ? 1 : slot == 1 ? 0 : threads == 4 ? 5-slot : slot;
+      unsigned member = declarationOrder[slot];
       auto selectedIn = inputs[argument(top, "in" + std::to_string(member))];
-      require(evaluate(drive(top, in, "valid"), inputs) == ((selectedIn >> 1) & 1) && evaluate(drive(top, in, "bits"), inputs) == (selectedIn >> 2), "input channel did not select scheduled thread");
+      auto gotValid = evaluate(drive(top, in, "valid"), inputs), gotBits = evaluate(drive(top, in, "bits"), inputs);
+      if (gotValid != ((selectedIn >> 1) & 1) || gotBits != (selectedIn >> 2))
+        llvm::errs() << "threads=" << threads << " slot=" << slot << " member=" << member << " pattern=" << pattern << " got=" << gotValid << "/" << gotBits << " expected=" << ((selectedIn >> 1) & 1) << "/" << (selectedIn >> 2) << "\n";
+      require(gotValid == ((selectedIn >> 1) & 1) && gotBits == (selectedIn >> 2), "input channel did not select scheduled thread");
       require(evaluate(drive(top, out, "ready"), inputs) == inputs[argument(top, "out" + std::to_string(member))], "output ready did not select scheduled thread");
       for (unsigned i = 0; i < threads; ++i) {
-        unsigned m = i == 0 ? 1 : i == 1 ? 0 : threads == 4 ? 5-i : i;
+        unsigned m = declarationOrder[i];
         require(evaluate(drive(top, argument(top, "in" + std::to_string(m)), "ready"), inputs) == ((i == slot) && (pattern & 1)), "ready leaked to another thread");
         require(evaluate(drive(top, argument(top, "out" + std::to_string(m)), "valid"), inputs) == ((i == slot) && (pattern & 2)), "valid leaked to another thread");
         require(evaluate(drive(top, argument(top, "out" + std::to_string(m)), "bits"), inputs) == 0x12345, "demux payload broadcast changed");
@@ -149,7 +167,7 @@ void behavior(MLIRContext &context, StringRef path, unsigned threads) {
   }
   std::string before = text(circuit); groups = 777;
   require(failed(goldengate::multiThreadFAME5Models(circuit, groups, error)) && text(circuit) == before && groups == 777, "repeated grouping was not atomic");
-  llvm::outs() << "Passed " << threads << "-thread grouped state, canonical order, free-running counters and " << observations << " exhaustive channel observations\n";
+  llvm::outs() << "Passed " << threads << "-thread grouped state, canonical order, free-running counters and " << observations << (threads <= 4 ? " exhaustive channel observations" : " directed channel observations") << "\n";
 }
 void synchronousMemories(MLIRContext &context, StringRef path) {
   for (unsigned threads : {2u, 4u}) {
@@ -674,7 +692,7 @@ int main(int argc, char **argv) {
   try {
     require(argc == 2, "usage: FAME5GroupedModelsTest fixture.fir");
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    behavior(context, argv[1], 2); behavior(context, argv[1], 3); behavior(context, argv[1], 4); rejections(context, argv[1]); productionGroupsAndSources(context, argv[1]); consumedProvenance(context, argv[1]);
+    behavior(context, argv[1], 2); behavior(context, argv[1], 3); behavior(context, argv[1], 4); behavior(context, argv[1], 64); rejections(context, argv[1]); productionGroupsAndSources(context, argv[1]); consumedProvenance(context, argv[1]);
     auto synchronous = std::string(argv[1]);
     synchronous.replace(synchronous.rfind("FAME5GroupedModels.fir"), std::string("FAME5GroupedModels.fir").size(), "FAME5GroupedSynchronousMemory.fir");
     synchronousMemories(context, synchronous);

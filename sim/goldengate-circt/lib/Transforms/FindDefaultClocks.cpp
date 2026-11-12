@@ -4,6 +4,7 @@
 #include "goldengate/AnnotationClasses.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "llvm/ADT/DenseMap.h"
+#include "mlir/IR/Builders.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLExtras.h"
@@ -164,6 +165,34 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
       inspectClock(connect.getDest(), connect.getSrc());
   });
 
+  // ChannelExcision later splits these physical connections into independent
+  // wrapper ports. Preserve unique physical clock identities now so the FAME
+  // graph can fold ancillary hub inputs into their token-gated domains.
+  Builder clockBuilder(circuit.getContext());
+  SmallVector<Attribute> clockAliasProofs;
+  if (hubModule) {
+    SmallVector<std::pair<unsigned, Value>> roots;
+    for (unsigned i = 0; i < hubModule.getNumPorts(); ++i)
+      if (hubDomainInputs.contains(hubModule.getArgument(i)))
+        if (auto root = aliases.trace(top, hub.getResult(i))) roots.push_back({i, *root});
+    for (unsigned i = 0; i < hubModule.getNumPorts(); ++i) {
+      if (hubModule.getPortDirection(i) != Direction::In ||
+          !isa<ClockType>(hubModule.getPortType(i)) ||
+          hubDomainInputs.contains(hubModule.getArgument(i))) continue;
+      auto root = aliases.trace(top, hub.getResult(i));
+      std::optional<unsigned> canonical;
+      unsigned matches = 0;
+      for (const auto &[port, source] : roots) if (root && source == *root) {
+        canonical = port; ++matches;
+      }
+      if (matches != 1) continue;
+      clockAliasProofs.push_back(clockBuilder.getDictionaryAttr({
+          clockBuilder.getNamedAttr("port", hubModule.getPortNameAttr(i)),
+          clockBuilder.getNamedAttr("clock", hubModule.getPortNameAttr(*canonical)),
+          clockBuilder.getNamedAttr("instance", hub.getNameAttr())}));
+    }
+  }
+
   auto defaultClock = [&](InstanceOp satellite) -> StringAttr {
     std::deque<Operation *> queue{satellite.getOperation()};
     llvm::DenseSet<Operation *> visited;
@@ -286,5 +315,9 @@ LogicalResult goldengate::findDefaultClocks(CircuitOp circuit,
   }
   circuit->setAttr("rawAnnotations",
                    ArrayAttr::get(circuit.getContext(), updated));
+  if (hubModule) {
+    if (clockAliasProofs.empty()) hubModule->removeAttr("goldengate.fameClockAliases");
+    else hubModule->setAttr("goldengate.fameClockAliases", clockBuilder.getArrayAttr(clockAliasProofs));
+  }
   return success();
 }

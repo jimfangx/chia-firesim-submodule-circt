@@ -26,7 +26,24 @@ $(error FireSim builds require GOLDENGATE_COMPILER=circt; SFC is disabled in the
 endif
 GOLDENGATE_CIRCT_BUILD_TYPE ?= Release
 GOLDENGATE_CIRCT_PREFIX ?= $(abspath $(dir $(shell which firtool))/..)
-goldengate_circt_build := $(GENERATED_DIR)/goldengate-circt-build
+# Shared across production recipes in this checkout. Override the root for an
+# isolated build; no generated RTL is shared between recipes.
+GOLDENGATE_CIRCT_BUILD_ROOT ?= $(firesim_base_dir)/generated-src/goldengate-circt-build
+GOLDENGATE_CIRCT_BUILD_JOBS ?= $(shell getconf _NPROCESSORS_ONLN)
+GOLDENGATE_CIRCT_PYTHON ?= python3
+GOLDENGATE_CIRCT_CXXFLAGS ?=
+GOLDENGATE_CIRCT_LDFLAGS ?=
+# Firechip can prepare the independent compiler while its frontend runs. Both
+# modes use exactly the same native build configuration as design compilation.
+goldengate_circt_build_args = \
+	--source-dir "$(firesim_base_dir)/goldengate-circt" \
+	--build-root "$(GOLDENGATE_CIRCT_BUILD_ROOT)" \
+	--circt-prefix "$(GOLDENGATE_CIRCT_PREFIX)" \
+	--build-type "$(GOLDENGATE_CIRCT_BUILD_TYPE)" --jobs "$(GOLDENGATE_CIRCT_BUILD_JOBS)" \
+	--cxx-flags="$(GOLDENGATE_CIRCT_CXXFLAGS)" --linker-flags="$(GOLDENGATE_CIRCT_LDFLAGS)"
+goldengate_circt_frontend_prefix = \
+	$(GOLDENGATE_CIRCT_PYTHON) $(firesim_base_dir)/goldengate-circt/tools/firesim_compile.py \
+	$(goldengate_circt_build_args) --with-frontend --
 # Enabled CSV and printf counters use the ordinary full-platform MMIO/driver path.
 GOLDENGATE_CIRCT_AUTOCOUNTER ?= $(if $(filter WithAutoCounter,$(subst _, ,$(PLATFORM_CONFIG))),csv,disabled)
 GOLDENGATE_CIRCT_MULTITHREADING ?= disabled
@@ -77,46 +94,28 @@ goldengate_circt_feature_flags += --nic-mode=loopback
 else ifneq ($(GOLDENGATE_CIRCT_NIC_MODE),normal)
 $(error GOLDENGATE_CIRCT_NIC_MODE must be normal or loopback)
 endif
-.PHONY: goldengate-circt-force
-goldengate-circt-force:
+# Always validate content identities, but compile only when those identities or
+# required outputs change. This also rejects unreceipted SFC artifacts. Grouped
+# outputs let replace-rtl and driver share one invocation without rewriting a
+# cached header and needlessly rebuilding the driver.
+goldengate_circt_outputs := $(simulator_verilog) $(simulator_xdc) $(header) \
+	$(verilog_header) $(partition_header) $(peer2peer_map) $(fame_annos) \
+	$(GENERATED_DIR)/$(BASE_FILE_NAME).implementation.xdc \
+	$(GENERATED_DIR)/$(BASE_FILE_NAME).defines.vh \
+	$(GENERATED_DIR)/$(BASE_FILE_NAME).memory-origins.json
+ifeq ($(PLATFORM),f2)
+goldengate_circt_outputs += $(GENERATED_DIR)/$(BASE_FILE_NAME).f2-cpu-stream-protocol.json
+endif
+.PHONY: goldengate-circt-check
+goldengate-circt-check:
 
-# An existing SFC .sv must never make the CIRCT selection appear successful.
-$(simulator_verilog) $(simulator_xdc) $(header) $(verilog_header) $(partition_header) $(peer2peer_map) $(fame_annos) &: $(FIRRTL_FILE) $(ANNO_FILE) goldengate-circt-force
-	cmake -S $(firesim_base_dir)/goldengate-circt -B $(goldengate_circt_build) -G Ninja \
-		-DCIRCT_DIR=$(GOLDENGATE_CIRCT_PREFIX)/lib/cmake/circt \
-		-DCMAKE_BUILD_TYPE=$(GOLDENGATE_CIRCT_BUILD_TYPE) \
-		-DBUILD_TESTING=OFF \
-		-DZLIB_ROOT=$(abspath $(GOLDENGATE_CIRCT_PREFIX)/..)
-	# Build the compiler here; CTest executables are built by focused validation.
-	cmake --build $(goldengate_circt_build) --target goldengate-circt
-	rm -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f
-	# A disabled rebuild must not retain a previous enabled build's ILA IP.
-	rm -f $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl $(GENERATED_DIR)/$(BASE_FILE_NAME).*.ipgen.tcl
-	$(goldengate_circt_build)/goldengate-circt $(FIRRTL_FILE) \
-		--annotation-file $(ANNO_FILE) --output-dir $(GENERATED_DIR)/circt-ingestion \
-		--compile-baseline --platform-config $(PLATFORM_CONFIG) \
-		--output-filename-base $(BASE_FILE_NAME) $(goldengate_circt_ila_flags) $(goldengate_circt_feature_flags)
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).sv $(simulator_verilog)
-	@if test -f $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; then \
-		while IFS= read -r blackbox || test -n "$$blackbox"; do \
-			if test -n "$$blackbox"; then \
-				cat "$$blackbox" >> $(simulator_verilog) || exit 1; \
-				printf '\n' >> $(simulator_verilog) || exit 1; \
-			fi; \
-		done < $(GENERATED_DIR)/circt-ingestion/firrtl_black_box_resource_files.f; \
-	fi
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).memory-origins.json $(GENERATED_DIR)/$(BASE_FILE_NAME).memory-origins.json
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).synthesis.xdc $(simulator_xdc)
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).implementation.xdc $(GENERATED_DIR)/$(BASE_FILE_NAME).implementation.xdc
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).defines.vh $(GENERATED_DIR)/$(BASE_FILE_NAME).defines.vh
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).const.h $(header)
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).const.vh $(verilog_header)
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).partition.const.h $(partition_header)
-	cp $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).peer2peer.const.yaml $(peer2peer_map)
-	@for collateral in $(GENERATED_DIR)/circt-ingestion/$(BASE_FILE_NAME).*.ipgen.tcl; do \
-		if test -f "$$collateral"; then cp "$$collateral" $(GENERATED_DIR)/; fi; \
-	done
-	cp $(GENERATED_DIR)/circt-ingestion/post-bridge-extraction-all.json $(fame_annos)
+$(goldengate_circt_outputs) &: $(FIRRTL_FILE) $(ANNO_FILE) goldengate-circt-check
+	$(GOLDENGATE_CIRCT_PYTHON) $(firesim_base_dir)/goldengate-circt/tools/firesim_compile.py \
+		$(goldengate_circt_build_args) \
+		--input "$(FIRRTL_FILE)" --annotations "$(ANNO_FILE)" \
+		--output-dir "$(GENERATED_DIR)" --base "$(BASE_FILE_NAME)" \
+		--platform "$(PLATFORM)" --platform-config "$(PLATFORM_CONFIG)" \
+		-- $(goldengate_circt_ila_flags) $(goldengate_circt_feature_flags)
 
 ####################################
 # Runtime-Configuration Generation #

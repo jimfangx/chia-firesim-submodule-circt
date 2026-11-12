@@ -10,7 +10,7 @@
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv);
   unsigned threads = argc == 2 ? std::atoi(argv[1]) : 4;
-  if (threads != 2 && threads != 4) return 2;
+  if (threads != 2 && threads != 4 && threads != 64) return 2;
   VModel top;
   using Word = std::array<unsigned, 2>;
   std::vector<std::array<Word, 3>> expected(threads);

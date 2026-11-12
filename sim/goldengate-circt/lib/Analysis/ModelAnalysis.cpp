@@ -1,6 +1,10 @@
 // See LICENSE for license details.
 #include "goldengate/ModelAnalysis.h"
+#include "goldengate/AnnotationClasses.h"
+#include "llvm/ADT/DenseMap.h"
 #include <algorithm>
+#include <map>
+#include <vector>
 
 using namespace circt::firrtl;
 
@@ -53,11 +57,38 @@ goldengate::analyzeModelPortGroup(CircuitOp circuit, Annotation annotation,
   return group;
 }
 
+namespace {
+// Matching uses unordered port sets, but keeps every candidate so duplicate
+// groups still reject as ambiguous. Connection order is retained separately:
+// binding historically selects the first edge, payload validation uses all.
+struct BindingIndex {
+  using Key = std::pair<std::string, std::vector<unsigned>>;
+  llvm::DenseMap<unsigned, llvm::SmallVector<const goldengate::TopPortConnection *>> connections;
+  std::map<Key, llvm::SmallVector<const goldengate::ModelPortGroup *>> groups;
+  BindingIndex(const goldengate::TopHierarchy &hierarchy,
+               llvm::ArrayRef<goldengate::ModelPortGroup> portGroups) {
+    for (const auto &connection : hierarchy.connections)
+      connections[connection.topPort].push_back(&connection);
+    for (const auto &group : portGroups) {
+      std::vector<unsigned> ports(group.ports.begin(), group.ports.end());
+      llvm::sort(ports);
+      auto module = group.module;
+      groups[{module.getModuleName().str(), std::move(ports)}].push_back(&group);
+    }
+  }
+  const goldengate::TopPortConnection *first(unsigned port) const {
+    auto found = connections.find(port);
+    return found == connections.end() ? nullptr : found->second.front();
+  }
+};
+
 std::optional<llvm::SmallVector<goldengate::ModelChannelBinding>>
-goldengate::bindChannelToModels(const GGChannelConnection &channel,
-                                const TopHierarchy &hierarchy,
-                                llvm::ArrayRef<ModelPortGroup> portGroups,
-                                std::string &error) {
+bindIndexed(const goldengate::GGChannelConnection &channel,
+            const goldengate::TopHierarchy &hierarchy,
+            const BindingIndex *index,
+            llvm::ArrayRef<goldengate::ModelPortGroup> portGroups,
+            std::string &error) {
+  using namespace goldengate;
   struct InstancePorts {
     InstanceOp instance;
     llvm::SmallVector<unsigned> ports;
@@ -65,11 +96,11 @@ goldengate::bindChannelToModels(const GGChannelConnection &channel,
     bool hasSink = false;
   };
   llvm::SmallVector<InstancePorts> instances;
-  auto lookupConnection = [&](unsigned topPort)
-      -> const TopPortConnection * {
+  auto lookupConnection = [&](unsigned topPort) {
+    if (index) return index->first(topPort);
     auto found = llvm::find_if(hierarchy.connections,
-                              [&](const TopPortConnection &c) {
-                                return c.topPort == topPort;
+                              [&](const TopPortConnection &connection) {
+                                return connection.topPort == topPort;
                               });
     return found == hierarchy.connections.end() ? nullptr : &*found;
   };
@@ -106,20 +137,32 @@ goldengate::bindChannelToModels(const GGChannelConnection &channel,
       return std::nullopt;
     }
     const ModelPortGroup *match = nullptr;
-    for (const auto &group : portGroups) {
-      auto modelModule = group.module;
-      if (modelModule.getModuleName() != entry.instance.getModuleName() ||
-          group.ports.size() != entry.ports.size())
-        continue;
-      llvm::SmallVector<unsigned> sorted(group.ports);
-      llvm::sort(sorted);
-      if (sorted != entry.ports)
-        continue;
-      if (match) {
-        error = "ambiguous local model port group for " + channel.name;
-        return std::nullopt;
+    if (index) {
+      std::vector<unsigned> ports(entry.ports.begin(), entry.ports.end());
+      auto found = index->groups.find({entry.instance.getModuleName().str(), std::move(ports)});
+      if (found != index->groups.end()) {
+        if (found->second.size() > 1) {
+          error = "ambiguous local model port group for " + channel.name;
+          return std::nullopt;
+        }
+        match = found->second.front();
       }
-      match = &group;
+    } else {
+      // Single standalone queries retain their original lazy scan; building a
+      // full index for one channel would add work to unrelated callers.
+      for (const auto &group : portGroups) {
+        auto module = group.module;
+        if (module.getModuleName() != entry.instance.getModuleName() ||
+            group.ports.size() != entry.ports.size()) continue;
+        llvm::SmallVector<unsigned> sorted(group.ports);
+        llvm::sort(sorted);
+        if (sorted != entry.ports) continue;
+        if (match) {
+          error = "ambiguous local model port group for " + channel.name;
+          return std::nullopt;
+        }
+        match = &group;
+      }
     }
     if (!match) {
       error = "no local model port group for " + channel.name;
@@ -158,4 +201,75 @@ goldengate::bindChannelToModels(const GGChannelConnection &channel,
                         std::move(entry.ports)});
   }
   return bindings;
+}
+
+} // namespace
+
+std::optional<llvm::SmallVector<goldengate::ModelChannelBinding>>
+goldengate::bindChannelToModels(const GGChannelConnection &channel,
+                                const TopHierarchy &hierarchy,
+                                llvm::ArrayRef<ModelPortGroup> portGroups,
+                                std::string &error) {
+  return bindIndexed(channel, hierarchy, nullptr, portGroups, error);
+}
+
+struct goldengate::PreparedFAMEAnalysis::Impl {
+  CircuitOp circuit;
+  TopHierarchy hierarchy;
+  llvm::SmallVector<ModelPortGroup> groups;
+  llvm::SmallVector<GGChannelConnection, 0> channels;
+  std::unique_ptr<BindingIndex> index;
+  std::vector<std::optional<llvm::SmallVector<ModelChannelBinding>>> bindings;
+};
+
+goldengate::PreparedFAMEAnalysis::PreparedFAMEAnalysis(std::unique_ptr<Impl> value)
+    : impl(std::move(value)) {}
+goldengate::PreparedFAMEAnalysis::~PreparedFAMEAnalysis() = default;
+
+std::unique_ptr<goldengate::PreparedFAMEAnalysis>
+goldengate::PreparedFAMEAnalysis::create(CircuitOp circuit, std::string &error) {
+  auto hierarchy = analyzeTopHierarchy(circuit, error);
+  if (!hierarchy) return nullptr;
+  auto raw = circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
+  if (!raw) {
+    error = "FAME analysis needs retained channel annotations";
+    return nullptr;
+  }
+  auto impl = std::make_unique<Impl>();
+  impl->circuit = circuit;
+  impl->hierarchy = std::move(*hierarchy);
+  for (auto attr : raw) {
+    Annotation annotation(attr);
+    if (!annotation.isClass(AnnotationClasses::ChannelPorts)) continue;
+    auto group = analyzeModelPortGroup(circuit, annotation, error);
+    if (!group) return nullptr;
+    impl->groups.push_back(std::move(*group));
+  }
+  for (auto attr : raw) {
+    Annotation annotation(attr);
+    if (!annotation.isClass(AnnotationClasses::ChannelConnection)) continue;
+    auto channel = analyzeChannelConnection(circuit, annotation, error);
+    if (!channel) return nullptr;
+    impl->channels.push_back(std::move(*channel));
+  }
+  impl->index = std::make_unique<BindingIndex>(impl->hierarchy, impl->groups);
+  impl->bindings.resize(impl->channels.size());
+  return std::unique_ptr<PreparedFAMEAnalysis>(new PreparedFAMEAnalysis(std::move(impl)));
+}
+
+CircuitOp goldengate::PreparedFAMEAnalysis::circuit() const { return impl->circuit; }
+const goldengate::TopHierarchy &goldengate::PreparedFAMEAnalysis::hierarchy() const { return impl->hierarchy; }
+llvm::ArrayRef<goldengate::ModelPortGroup> goldengate::PreparedFAMEAnalysis::groups() const { return impl->groups; }
+llvm::ArrayRef<goldengate::GGChannelConnection> goldengate::PreparedFAMEAnalysis::channels() const { return impl->channels; }
+llvm::ArrayRef<const goldengate::TopPortConnection *>
+goldengate::PreparedFAMEAnalysis::connectionsForTopPort(unsigned port) const {
+  auto found = impl->index->connections.find(port);
+  if (found == impl->index->connections.end()) return {};
+  return found->second;
+}
+const llvm::SmallVector<goldengate::ModelChannelBinding> *
+goldengate::PreparedFAMEAnalysis::bindingsFor(unsigned channel, std::string &error) {
+  auto &cached = impl->bindings.at(channel);
+  if (!cached) cached = bindIndexed(impl->channels[channel], impl->hierarchy, impl->index.get(), {}, error);
+  return cached ? &*cached : nullptr;
 }

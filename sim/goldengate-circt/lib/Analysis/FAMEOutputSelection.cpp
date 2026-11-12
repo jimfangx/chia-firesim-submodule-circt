@@ -8,24 +8,15 @@ using namespace circt::firrtl;
 std::optional<goldengate::FAMEDataSelection>
 goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
                                     std::string &error) {
-  auto hierarchy = analyzeTopHierarchy(circuit, error);
-  if (!hierarchy)
-    return std::nullopt;
-  auto annotations = circuit->getAttrOfType<mlir::ArrayAttr>("rawAnnotations");
-  if (!annotations) {
-    error = "FAME data selection needs retained channel annotations";
-    return std::nullopt;
-  }
-  llvm::SmallVector<ModelPortGroup> groups;
-  for (auto attr : annotations) {
-    Annotation annotation(attr);
-    if (!annotation.isClass(AnnotationClasses::ChannelPorts))
-      continue;
-    auto group = analyzeModelPortGroup(circuit, annotation, error);
-    if (!group)
-      return std::nullopt;
-    groups.push_back(std::move(*group));
-  }
+  auto prepared = PreparedFAMEAnalysis::create(circuit, error);
+  if (!prepared) return std::nullopt;
+  return analyzeFAMEDataSelection(*prepared, model, error);
+}
+
+std::optional<goldengate::FAMEDataSelection>
+goldengate::analyzeFAMEDataSelection(PreparedFAMEAnalysis &prepared,
+                                    FModuleOp model, std::string &error) {
+  const auto *hierarchy = &prepared.hierarchy();
   llvm::SmallVector<ModelChannelBinding> modelBindings;
   FAMEDataSelection selection;
   auto &outputs = selection.outputs;
@@ -36,20 +27,15 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
   llvm::SmallVector<const ModelPortGroup *> inputGroups;
   llvm::SmallVector<llvm::SmallVector<unsigned>> inputOrders;
   llvm::SmallVector<llvm::SmallVector<InstanceOp>> inputInstances;
-  for (auto attr : annotations) {
-    Annotation annotation(attr);
-    if (!annotation.isClass(AnnotationClasses::ChannelConnection))
-      continue;
-    auto channel = analyzeChannelConnection(circuit, annotation, error);
-    if (!channel)
-      return std::nullopt;
+  for (auto [index, value] : llvm::enumerate(prepared.channels())) {
+    const auto *channel = &value;
     if (!globalNames.insert(channel->name).second) {
       error = "duplicate global FAME channel: " + channel->name;
       return std::nullopt;
     }
     if (channel->kind == ChannelKind::TargetClock)
       continue;
-    auto bindings = bindChannelToModels(*channel, *hierarchy, groups, error);
+    auto bindings = prepared.bindingsFor(index, error);
     if (!bindings)
       return std::nullopt;
     for (const auto &binding : *bindings) {
@@ -59,11 +45,10 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
       if (binding.portGroup->direction == Direction::In) {
         llvm::SmallVector<unsigned> orderedPorts;
         for (const auto &sink : channel->sinks)
-          for (const auto &connection : hierarchy->connections)
-            if (sink.port && sink.module == hierarchy->top &&
-                connection.topPort == *sink.port &&
-                connection.instance == binding.instance)
-              orderedPorts.push_back(connection.instancePort);
+          if (sink.port && sink.module == hierarchy->top)
+            for (const auto *connection : prepared.connectionsForTopPort(*sink.port))
+              if (connection->instance == binding.instance)
+                orderedPorts.push_back(connection->instancePort);
         auto previous = llvm::find(inputGroups, binding.portGroup);
         if (previous != inputGroups.end()) {
           unsigned index = previous - inputGroups.begin();
@@ -89,11 +74,10 @@ goldengate::analyzeFAMEDataSelection(CircuitOp circuit, FModuleOp model,
         // producer. Sorting here would silently accept reversed payloads.
         llvm::SmallVector<unsigned> orderedPorts;
         for (const auto &source : channel->sources)
-          for (const auto &connection : hierarchy->connections)
-            if (source.port && source.module == hierarchy->top &&
-                connection.topPort == *source.port &&
-                connection.instance == binding.instance)
-              orderedPorts.push_back(connection.instancePort);
+          if (source.port && source.module == hierarchy->top)
+            for (const auto *connection : prepared.connectionsForTopPort(*source.port))
+              if (connection->instance == binding.instance)
+                orderedPorts.push_back(connection->instancePort);
         auto previous = llvm::find(outputGroups, binding.portGroup);
         if (previous != outputGroups.end()) {
           unsigned index = previous - outputGroups.begin();

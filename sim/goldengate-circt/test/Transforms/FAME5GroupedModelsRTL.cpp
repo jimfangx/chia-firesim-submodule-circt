@@ -11,6 +11,7 @@
 #define PORTS(field) &top.field##0, &top.field##1
 int main(int argc, char **argv) {
   Verilated::commandArgs(argc, argv); VTop top;
+#ifndef INPUTS
 #if THREADS == 2
 #define INPUTS(suffix) &top.in0_##suffix, &top.in1_##suffix
 #define OUTPUTS(suffix) &top.out0_##suffix, &top.out1_##suffix
@@ -18,8 +19,19 @@ int main(int argc, char **argv) {
 #define INPUTS(suffix) &top.in0_##suffix, &top.in1_##suffix, &top.in2_##suffix, &top.in3_##suffix
 #define OUTPUTS(suffix) &top.out0_##suffix, &top.out1_##suffix, &top.out2_##suffix, &top.out3_##suffix
 #else
-#error only two/four-thread RTL supporting cases
+#error supply INPUTS and OUTPUTS macros for another thread count
 #endif
+#endif
+#ifndef FAME5_MEMBER_ORDER
+#if THREADS == 2
+#define FAME5_MEMBER_ORDER 1, 0
+#elif THREADS == 4
+#define FAME5_MEMBER_ORDER 1, 0, 3, 2
+#else
+#error supply FAME5_MEMBER_ORDER from the input declaration order
+#endif
+#endif
+  constexpr std::array<unsigned, THREADS> order{FAME5_MEMBER_ORDER};
   std::array<CData*, THREADS> valid{INPUTS(valid)}, ready{INPUTS(ready)}, clear{INPUTS(bits_clear)}, add{INPUTS(bits_add)}, enable{INPUTS(bits_enable)};
   std::array<CData*, THREADS> outReady{OUTPUTS(ready)}, outValid{OUTPUTS(valid)}, sum{OUTPUTS(bits_sum)}, echo{OUTPUTS(bits_echo)}, flag{OUTPUTS(bits_flag)};
   std::array<unsigned, THREADS> expected{};
@@ -38,7 +50,7 @@ int main(int argc, char **argv) {
   for (unsigned cycle = 0; cycle < 8192; ++cycle) {
     if (cycle == 2048 || cycle == 4096) resetAll();
     unsigned slot = cycle % THREADS;
-    unsigned selected = slot == 0 ? 1 : slot == 1 ? 0 : 5-slot;
+    unsigned selected = order[slot];
     for (unsigned i = 0; i < THREADS; ++i) {
       *valid[i] = (cycle * 3 + i * 7) % 11 != 0;
       *outReady[i] = (cycle / (i + 1) + i) % 7 != 0;

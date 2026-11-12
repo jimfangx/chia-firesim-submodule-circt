@@ -158,9 +158,10 @@ LogicalResult rewriteMultiportInputChannel(
 
   std::string modelName = binding.portGroup->name + "_sink";
   bool matchedDefinition = false;
-  for (const auto &port : model.getPorts())
-    if (port.getName() == modelName) {
-      matchedDefinition = port.type == channel.type && port.direction == binding.portGroup->direction;
+  for (unsigned i = 0; i < model.getNumPorts(); ++i)
+    if (model.getPortName(i) == modelName) {
+      matchedDefinition = model.getPortType(i) == channel.type &&
+                          model.getPortDirection(i) == binding.portGroup->direction;
       if (!rewriteModel) continue;
       error = "FAME model channel port already exists: " + modelName;
       return failure();
@@ -169,8 +170,8 @@ LogicalResult rewriteMultiportInputChannel(
     error = "shared FAME bundle definition does not match the instance channel ABI";
     return failure();
   }
-  for (const auto &port : top.getPorts())
-    if (port.getName() == channel.portName) {
+  for (unsigned i = 0; i < top.getNumPorts(); ++i)
+    if (top.getPortName(i) == channel.portName) {
       error = "FAME top channel port already exists: " + channel.portName;
       return failure();
     }
@@ -278,18 +279,23 @@ LogicalResult goldengate::rewriteFAMEInputChannel(
     return failure();
   }
   std::string modelName = binding.portGroup->name + "_sink";
-  bool sharedDefinitionMatches = llvm::any_of(model.getPorts(), [&](const PortInfo &p) {
-    return p.getName() == modelName && p.type == channel.type &&
-           p.direction == binding.portGroup->direction;
-  });
+  bool sharedDefinitionMatches = false;
+  if (!rewriteModel)
+    for (unsigned i = 0; i < model.getNumPorts(); ++i)
+      if (model.getPortName(i) == modelName &&
+          model.getPortType(i) == channel.type &&
+          model.getPortDirection(i) == binding.portGroup->direction) {
+        sharedDefinitionMatches = true;
+        break;
+      }
   if ((!rewriteModel && !sharedDefinitionMatches) ||
       (rewriteModel && model.getPortType(modelPort) != payloadType)) {
     error = "FAME scalar definition does not match the instance rewrite stage";
     return failure();
   }
   if (rewriteModel)
-    for (const auto &port : model.getPorts())
-      if (port.getName() == modelName) {
+    for (unsigned i = 0; i < model.getNumPorts(); ++i)
+      if (model.getPortName(i) == modelName) {
         error = "FAME model channel port already exists: " + modelName;
         return failure();
       }

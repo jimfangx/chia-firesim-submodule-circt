@@ -212,6 +212,53 @@ void run(MLIRContext &context, unsigned rejection) {
   auto before = dump(*root);
   std::string error;
   auto dataSelection = goldengate::analyzeFAMEDataSelection(circuit, model, error);
+  // Exercise one immutable snapshot across repeated queries and distinct model
+  // definitions. Cached bindings must retain identity and rejection behavior.
+  std::string preparedError;
+  auto prepared = goldengate::PreparedFAMEAnalysis::create(circuit, preparedError);
+  auto reused = prepared
+      ? goldengate::analyzeFAMEDataSelection(*prepared, model, preparedError)
+      : std::nullopt;
+  require(bool(reused) == bool(dataSelection) && preparedError == error,
+          "prepared data selection changed acceptance/diagnostic");
+  if (reused) {
+    require(reused->inputs.size() == dataSelection->inputs.size() &&
+                reused->outputs.size() == dataSelection->outputs.size(),
+            "prepared selection changed channel counts");
+    for (unsigned i = 0; i < reused->outputs.size(); ++i) {
+      const auto &a = reused->outputs[i];
+      const auto &b = dataSelection->outputs[i];
+      require(a.globalName == b.globalName && a.localName == b.localName &&
+                  a.fieldCount == b.fieldCount && a.kind == b.kind &&
+                  a.dependency.inputChannels == b.dependency.inputChannels &&
+                  a.globalAliases.size() == b.globalAliases.size(),
+              "prepared selection changed ordered payload/dependencies");
+    }
+    auto otherPrepared = goldengate::analyzeFAMEDataSelection(*prepared, other, preparedError);
+    require(otherPrepared && otherPrepared->outputs.size() == 1 &&
+                otherPrepared->outputs.front().globalName == "other_print_global",
+            "shared analysis leaked model-local selections");
+  }
+  if (prepared) for (auto [index, channel] : llvm::enumerate(prepared->channels())) {
+    if (channel.kind == goldengate::ChannelKind::TargetClock) continue;
+    std::string indexedError, standaloneError;
+    auto *indexed = prepared->bindingsFor(index, indexedError);
+    auto standalone = goldengate::bindChannelToModels(
+        channel, prepared->hierarchy(), prepared->groups(), standaloneError);
+    require(bool(indexed) == bool(standalone) && indexedError == standaloneError,
+            "indexed binding changed duplicate/ambiguity/clock rejection");
+    if (!indexed) continue;
+    require(indexed == prepared->bindingsFor(index, indexedError) &&
+                indexed->size() == standalone->size(),
+            "successful binding was not reused or changed instance count");
+    for (unsigned i = 0; i < indexed->size(); ++i)
+      require((*indexed)[i].globalName == (*standalone)[i].globalName &&
+                  (*indexed)[i].portGroup == (*standalone)[i].portGroup &&
+                  (*indexed)[i].instance == (*standalone)[i].instance &&
+                  (*indexed)[i].instancePorts == (*standalone)[i].instancePorts,
+              "indexed binding changed ordered instance/port identities");
+  }
+  prepared.reset(); // Never carry this snapshot into the mutations below.
   auto selected = dataSelection
       ? std::optional<SmallVector<goldengate::FAMEOutputSelection>>(dataSelection->outputs)
       : std::nullopt;
