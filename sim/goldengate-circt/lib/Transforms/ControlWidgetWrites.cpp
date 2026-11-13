@@ -87,7 +87,7 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
     if (!native || !tracers.emplace(index, native).second)
       return reject("Rocket request binding requires unique native TracerV adapters");
   }
-  if (tracers.empty() || tracers.size() != allocatedTracers.size())
+  if (tracers.size() != allocatedTracers.size())
     return reject("Rocket request allocation must identify every instantiated TracerV bank");
   SmallVector<ControlWidgetPort> widgets;
   for (unsigned i = 0; i < tracers.size(); ++i) {
@@ -139,7 +139,15 @@ LogicalResult goldengate::bindRocketControlWidgetWrites(CircuitOp circuit,
       return reject("Rocket TracerV request port does not reach its instantiated bank");
     widgets.push_back({widget, port});
   }
-  for (auto w : ArrayRef(widgetPorts).drop_front()) widgets.push_back({w.widget, w.port});
+  for (auto w : ArrayRef(widgetPorts).drop_front()) {
+    bool allocated = llvm::any_of(regions, [&](Attribute attr) {
+      auto row = dyn_cast<DictionaryAttr>(attr);
+      return row && row.getAs<StringAttr>("name") == w.widget;
+    });
+    if (w.widget == "CPUManagedStreamEngine_0" && !allocated &&
+        !modules.count("GGCPUStreamMCRFile")) continue;
+    widgets.push_back({w.widget, w.port});
+  }
   if (bound) {
     auto registry = bound->getAttrOfType<ArrayAttr>("goldengate.printHostBindings");
     if (!registry || registry.empty() || registry.size() != allocatedPrints.size())

@@ -34,6 +34,17 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
   auto raw = circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
   if (circuit.getName() != "F1Shim" || !raw)
     return reject("Rocket driver headers require the assembled F1Shim and retained annotations");
+  bool hasTracerV = false, hasCPU = false, isF2 = false;
+  for (auto attr : raw) {
+    auto row = dyn_cast<DictionaryAttr>(attr);
+    hasTracerV |= row && row.getAs<StringAttr>("class") == AnnotationClasses::BridgeIO &&
+        row.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.TracerVBridgeModule";
+  }
+  for (auto m : circuit.getOps<FModuleOp>()) {
+    hasCPU |= m.getName() == "GGCPUStreamRead";
+    if (m.getName() == "F1Shim")
+      for (auto port : m.getPorts()) isF2 |= port.name == "io_pcim";
+  }
   OwningOpRef<CircuitOp> staged(cast<CircuitOp>(circuit->clone()));
   // Retain the established production constructor order. Each emitter checks
   // the live allocated registry, rather than assuming an SFC absolute address.
@@ -44,6 +55,7 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
       {"LoadMem", prepareLoadMemHeader}, {"PeekPoke", preparePeekPokeHeader},
       {"UART", prepareUARTHeader}, {"TSI", prepareTSIHeader},
       {"BlockDev", prepareBlockDevHeader}, {"TracerV", prepareTracerVHeader}}) {
+    if (name == "TracerV" && !hasTracerV) continue;
     if (failed(emit(*staged, error))) {
       error = name.str() + " driver header: " + error; return failure();
     }
@@ -62,7 +74,22 @@ LogicalResult goldengate::prepareRocketDriverHeaders(CircuitOp circuit,
   }
   if (hasNIC != hasNICBank)
     return reject("SimpleNIC driver header needs matching native hardware and retained bridge identity");
-  if (!hasPrint) {
+  if (!hasCPU && !hasPrint) {
+    // SFC instantiates no CPUManagedStreamWidget without any streams.
+    OpBuilder b(circuit.getContext());
+    auto annotations = staged->getOperation()->getAttrOfType<ArrayAttr>("rawAnnotations");
+    SmallVector<Attribute> updated(annotations.begin(), annotations.end());
+    auto output = [&](StringRef suffix, StringRef body) {
+      updated.push_back(b.getDictionaryAttr({
+          b.getNamedAttr("class", b.getStringAttr(AnnotationClasses::OutputFile)),
+          b.getNamedAttr("fileSuffix", b.getStringAttr(suffix)),
+          b.getNamedAttr("body", b.getStringAttr(body))}));
+    };
+    output(".peer2peer.const.yaml", "");
+    if (isF2) output(".f2-cpu-stream-protocol.json",
+        R"({"version":2,"platform":"f2","protocol":"disabled-no-streams","sources":[]})");
+    staged->getOperation()->setAttr("rawAnnotations", b.getArrayAttr(updated));
+  } else if (!hasPrint) {
     if (failed(prepareCPUManagedStreamHeader(*staged, error))) return failure();
   } else {
     auto bindings = printWrapper ? printWrapper->getAttrOfType<ArrayAttr>("goldengate.printHostBindings") : ArrayAttr();

@@ -73,7 +73,7 @@ Contract expected(StringRef root, bool isF2) {
 } // namespace
 LogicalResult goldengate::assembleFPGATopShell(CircuitOp circuit,
                                               std::string &error, bool isF2) {
-  return attachFPGATopShell(circuit, "GGCPUStreamPlatformWrapper", error, isF2);
+  return attachFPGATopShell(circuit, circuit.getName(), error, isF2);
 }
 LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
                                            StringRef oldName,
@@ -81,7 +81,8 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
   constexpr StringLiteral newName="FPGATop";
   auto reject=[&](StringRef s){error=s.str();return failure();};
   bool print = oldName == "GGPrintCPUStreamPlatformWrapper";
-  if (!print && oldName != "GGCPUStreamPlatformWrapper")
+  bool noCPU = oldName == "GGHostMemoryPlatformWrapper";
+  if (!print && !noCPU && oldName != "GGCPUStreamPlatformWrapper")
     return reject("unsupported FPGATop CPU platform boundary");
   FModuleOp inner;
   for (auto m:circuit.getOps<FModuleLike>()) {
@@ -92,7 +93,8 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
   if (circuit.getName()!=oldName||!inner||!raw)
     return reject("FPGATop shell requires the assembled CPU/memory/control boundary and annotations");
   std::map<std::string,unsigned> old;
-  const std::map<std::string,std::string> publicNames{{"hostClock","clock"},{"hostReset","reset"},{"ctrl","ctrl"},{"mem_0","mem_0"},{"cpu_managed_axi4","cpu_managed_axi4"}};
+  std::map<std::string,std::string> publicNames{{"hostClock","clock"},{"hostReset","reset"},{"ctrl","ctrl"},{"mem_0","mem_0"},{"cpu_managed_axi4","cpu_managed_axi4"}};
+  if (noCPU) publicNames.erase("cpu_managed_axi4");
   const std::set<std::string> clocks{"peekPokeBridge_clock","resetBridge_clock","ep_clock","ep_1_clock","ep_2_clock","tracerv_tiletrace_clock","ep_3_clock"};
   // PrintSynthesis exports aliases of target domain clocks after bridge
   // extraction. They remain private observations in the complete platform.
@@ -175,14 +177,16 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
   for (auto i:inner.getOps<InstanceOp>()) {
     ++instances;
     if (i.getName()=="sim"&&i.getModuleName()==
-        (print ? "GGPrintCPUStreamWriteResponseBufferWrapper" : "GGHostMemoryPlatformWrapper")) sim=i;
-    if (i.getName()=="cpu_port"&&i.getModuleName()=="GGCPUStreamPortAdapter") cpu=i;
+        (noCPU ? "GGHostMemoryReadResponseWrapper" :
+         print ? "GGPrintCPUStreamWriteResponseBufferWrapper" : "GGHostMemoryPlatformWrapper")) sim=i;
+    if ((!noCPU && i.getName()=="cpu_port"&&i.getModuleName()=="GGCPUStreamPortAdapter") ||
+        (noCPU && i.getName()=="memory_port"&&i.getModuleName()=="GGHostMemoryPortAdapter")) cpu=i;
   }
   if (used||instances!=2||!sim||!cpu) return reject("FPGATop shell requires the unique CPU platform wrapper");
   for (auto [n,name]:publicNames) {
-    auto instance=n=="cpu_managed_axi4"?cpu:sim; Value v;
+    auto instance=(n=="cpu_managed_axi4" || (noCPU && n=="mem_0"))?cpu:sim; Value v;
     for (auto [i,p]:llvm::enumerate(instance.getPortNames()))
-      if (cast<StringAttr>(p).getValue()==n) v=instance.getResult(i);
+      if (cast<StringAttr>(p).getValue()==(noCPU && n=="mem_0" ? "out" : n)) v=instance.getResult(i);
     auto p = inner.getPortDirection(old.at(n)); Value a=inner.getBodyBlock()->getArgument(old.at(n));
     if (!v||v.getType()!=a.getType()||!a.hasOneUse()||!v.hasOneUse())
       return reject("platform port requires one exact child forwarding use");
@@ -217,13 +221,14 @@ LogicalResult goldengate::attachFPGATopShell(CircuitOp circuit,
   auto *ctx=circuit.getContext(); OpBuilder b(ctx); auto loc=circuit.getLoc();
   SmallVector<PortInfo> ports;
   const auto innerPorts = inner.getPorts();
-  for (auto n:{"hostClock","hostReset","ctrl","mem_0","cpu_managed_axi4"}) {
-    auto p=innerPorts[old.at(n)]; p.name=b.getStringAttr(publicNames.at(n)); ports.push_back(p);
+  SmallVector<StringRef> inputNames{"hostClock","hostReset","ctrl","mem_0"};
+  if (!noCPU) inputNames.push_back("cpu_managed_axi4");
+  for (auto n:inputNames) {
+    auto p=innerPorts[old.at(n.str())]; p.name=b.getStringAttr(publicNames.at(n.str())); ports.push_back(p);
   }
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper=b.create<FModuleOp>(loc,b.getStringAttr(newName),inner.getConventionAttr(),ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock()); auto instance=b.create<InstanceOp>(loc,inner,"sim");
-  const StringRef inputNames[]{"hostClock","hostReset","ctrl","mem_0","cpu_managed_axi4"};
   for (auto [i,n]:llvm::enumerate(inputNames)) {
     auto p=ports[i]; Value a=wrapper.getBodyBlock()->getArgument(i),v=instance.getResult(old.at(n.str()));
     b.create<ConnectOp>(loc,p.direction==Direction::In?v:a,p.direction==Direction::In?a:v);

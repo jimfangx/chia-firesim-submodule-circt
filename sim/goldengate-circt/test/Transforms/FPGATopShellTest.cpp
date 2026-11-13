@@ -21,7 +21,7 @@ FModuleOp top(CircuitOp c,StringRef n){for(auto m:c.getOps<FModuleOp>())if(m.get
 void replace(std::string &s,StringRef from,StringRef to){auto i=s.find(from.str());require(i!=std::string::npos,"replacement not found");s.replace(i,from.size(),to.str());}
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,
                             StringRef diagnosticType="", bool isF2=false,
-                            StringRef diagnosticName="ctrl_diagnostic") {
+                            StringRef diagnosticName="ctrl_diagnostic", bool noCPU=false) {
   // Exact recorded U250 ctrl/mem/CPU port contracts; representative private
   // scalar, bundle and clock diagnostics. No SFC implementation logic.
   std::string source=R"mlir(module { firrtl.circuit "GGCPUStreamPlatformWrapper" { firrtl.module @GGCPUStreamPlatformWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %ep_clock: !firrtl.clock, out %fased_pending_reads: !firrtl.bundle<value: uint<4>, full: uint<1>>, in %ctrl: !firrtl.bundle<aw: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>>, w: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<data: uint<32>, last: uint<1>, id: uint<12>, strb: uint<4>, user: uint<1>>>, b flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<resp: uint<2>, id: uint<12>, user: uint<1>>>, ar: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<addr: uint<25>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>, region: uint<4>, id: uint<12>, user: uint<1>>>, r flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<resp: uint<2>, data: uint<32>, last: uint<1>, id: uint<12>, user: uint<1>>>>, out %mem_0: !firrtl.bundle<aw: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, qos: uint<4>, prot: uint<3>, cache: uint<4>, lock: uint<1>, burst: uint<2>, size: uint<3>, len: uint<8>, addr: uint<34>>>, w: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<strb: uint<8>, last: uint<1>, data: uint<64>>>, b flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, resp: uint<2>>>, ar: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, qos: uint<4>, prot: uint<3>, cache: uint<4>, lock: uint<1>, burst: uint<2>, size: uint<3>, len: uint<8>, addr: uint<34>>>, r flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, last: uint<1>, data: uint<64>, resp: uint<2>>>>, in %cpu_managed_axi4: !firrtl.bundle<aw: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, addr: uint<64>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>>>, w: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<data: uint<512>, strb: uint<64>, last: uint<1>>>, b flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, resp: uint<2>>>, ar: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, addr: uint<64>, len: uint<8>, size: uint<3>, burst: uint<2>, lock: uint<1>, cache: uint<4>, prot: uint<3>, qos: uint<4>>>, r flip: bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<id: uint<16>, data: uint<512>, resp: uint<2>, last: uint<1>>>>, out %ctrl_diagnostic: !firrtl.uint<4>) {} } })mlir";
@@ -40,23 +40,32 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,
   if(isF2)for(unsigned i=0;i<2;++i)replace(source,"addr: uint<25>","addr: uint<32>");
   auto root=parseSourceString<ModuleOp>(source,&ctx);require(bool(root),"fixture parse");
   auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);auto m=top(c,"GGCPUStreamPlatformWrapper");
+  if (noCPU) {
+    llvm::BitVector removed(m.getNumPorts());
+    for (unsigned i=0;i<m.getNumPorts();++i) if(m.getPortName(i)=="cpu_managed_axi4") removed.set(i);
+    m.erasePorts(removed); m.setName("GGHostMemoryPlatformWrapper"); c.setName("GGHostMemoryPlatformWrapper");
+  }
+  const std::string boundary = c.getName().str();
   SmallVector<Attribute> annotations;
   for(auto [cls,n]:{std::pair<StringRef,StringRef>{goldengate::AnnotationClasses::HostClock,"hostClock"},
                    {goldengate::AnnotationClasses::HostReset,"hostReset"},
                    {"test.Target","ctrl.aw.bits.addr"},{"test.Target","mem_0"},
                    {"test.Target","cpu_managed_axi4.r.bits.data"},
-                   {"test.Target","ctrl_diagnostic"},{"test.Target","ep_clock"}})
-    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(cls)),b.getNamedAttr("target",b.getStringAttr("~GGCPUStreamPlatformWrapper|GGCPUStreamPlatformWrapper>"+(n=="ctrl_diagnostic"?diagnosticName:n).str()))}));
+                   {"test.Target","ctrl_diagnostic"},{"test.Target","ep_clock"}}) {
+    if (noCPU && n.starts_with("cpu_managed_axi4")) continue;
+    annotations.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr(cls)),b.getNamedAttr("target",b.getStringAttr("~"+boundary+"|"+boundary+">"+(n=="ctrl_diagnostic"?diagnosticName:n).str()))}));
+  }
   c->setAttr("rawAnnotations",b.getArrayAttr(annotations));
   SmallVector<PortInfo> simPorts,cpuPorts;
-  for(auto p:m.getPorts())if(p.name.getValue()=="cpu_managed_axi4")cpuPorts.push_back(p);else simPorts.push_back(p);
+  for(auto p:m.getPorts())if(p.name.getValue()==(noCPU ? "mem_0" : "cpu_managed_axi4"))cpuPorts.push_back(p);else simPorts.push_back(p);
+  if (noCPU) cpuPorts[0].name=b.getStringAttr("out");
   b.setInsertionPointToEnd(c.getBodyBlock());
-  auto child=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGHostMemoryPlatformWrapper"),ConventionAttr::get(&ctx,Convention::Internal),simPorts);
-  auto helper=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGCPUStreamPortAdapter"),ConventionAttr::get(&ctx,Convention::Internal),cpuPorts);
-  b.setInsertionPointToStart(m.getBodyBlock());auto sim=b.create<InstanceOp>(c.getLoc(),child,"sim"),cpu=b.create<InstanceOp>(c.getLoc(),helper,"cpu_port");
+  auto child=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(noCPU ? "GGHostMemoryReadResponseWrapper" : "GGHostMemoryPlatformWrapper"),ConventionAttr::get(&ctx,Convention::Internal),simPorts);
+  auto helper=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(noCPU ? "GGHostMemoryPortAdapter" : "GGCPUStreamPortAdapter"),ConventionAttr::get(&ctx,Convention::Internal),cpuPorts);
+  b.setInsertionPointToStart(m.getBodyBlock());auto sim=b.create<InstanceOp>(c.getLoc(),child,"sim"),cpu=b.create<InstanceOp>(c.getLoc(),helper,noCPU ? "memory_port" : "cpu_port");
   unsigned k=0;
   for(auto [i,p]:llvm::enumerate(m.getPorts())) {
-    Value a=m.getBodyBlock()->getArgument(i),v=p.name.getValue()=="cpu_managed_axi4"?cpu.getResult(0):sim.getResult(k++);
+    Value a=m.getBodyBlock()->getArgument(i),v=p.name.getValue()==(noCPU ? "mem_0" : "cpu_managed_axi4")?cpu.getResult(0):sim.getResult(k++);
     b.create<ConnectOp>(c.getLoc(),p.direction==Direction::In?v:a,p.direction==Direction::In?a:v);
   }
   return root;
@@ -128,6 +137,13 @@ void writeStub(CircuitOp c,StringRef name) {
 int main(int argc,char **argv) {
   try {
     MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::chirrtl::CHIRRTLDialect,circt::hw::HWDialect>();std::string error;
+    for (bool isF2 : {false,true}) {
+      auto test=fixture(ctx,0,"",isF2,"ctrl_diagnostic",true);
+      auto nc=*test->getOps<CircuitOp>().begin();
+      require(succeeded(goldengate::assembleFPGATopShell(nc,error,isF2)),error);
+      require(succeeded(verify(*test)),"invalid no-stream FPGATop");
+      require(top(nc,"FPGATop").getNumPorts()==4,"no-stream shell must omit CPU port");
+    }
     if(argc==4&&StringRef(argv[1])=="--apply-f2-input") {
       auto real=parseSourceFile<ModuleOp>(argv[2],&ctx);require(bool(real),"F2 platform input parse");
       require(succeeded(verify(*real)),"invalid F2 platform input IR");

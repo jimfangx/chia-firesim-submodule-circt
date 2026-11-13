@@ -1,7 +1,7 @@
 // See LICENSE for license details.
 // Oracle: F1Shim.scala and AXI4NastiAssigner.toAXI4Slave.
-// Invariant: exact U250/F2 FPGATop five-port boundary, one memory channel,
-// CPU-managed AXI4 enabled, no QSFP target endpoints. Unsupported schemas
+// Invariant: exact U250/F2 FPGATop four- or five-port boundary, one memory channel,
+// optional CPU-managed AXI4, no QSFP target endpoints. Unsupported schemas
 // fail before mutation. All existing module bodies and local targets remain.
 // Produces one F1Shim and FPGATop instance, leaf PCIS/control bindings,
 // two host-clock synchronous-reset modulo-4096 request ID counters, and
@@ -64,8 +64,8 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error, 
     if(m.getModuleName()=="FPGATop") inner=dyn_cast<FModuleOp>(m.getOperation());
   }
   auto raw=circuit->getAttrOfType<ArrayAttr>("rawAnnotations");
-  if(circuit.getName()!="FPGATop"||!inner||!raw||inner.getNumPorts()!=5)
-    return reject("F1Shim requires the five-port FPGATop and annotations");
+  if(circuit.getName()!="FPGATop"||!inner||!raw||(inner.getNumPorts()!=5 && inner.getNumPorts()!=4))
+    return reject("F1Shim requires the four- or five-port FPGATop and annotations");
   std::map<std::string,unsigned> indices;
   for(auto [i,p]:llvm::enumerate(inner.getPorts())) {
     auto n=p.name.getValue();
@@ -81,7 +81,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error, 
         return reject("unsupported platform FPGATop AXI4 contract");
     } else return reject("unsupported FPGATop port (QSFP/PCIM/additional memory)");
   }
-  for(auto n:{"clock","reset","ctrl","mem_0","cpu_managed_axi4"})
+  for(auto n:{"clock","reset","ctrl","mem_0"})
     if(!indices.count(n)) return reject("missing FPGATop port");
   bool used=false; circuit.walk([&](InstanceOp i){used|=i.getModuleName()=="FPGATop";});
   if(used) return reject("FPGATop must be the unique uninstantiated circuit top");
@@ -175,9 +175,21 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error, 
       else connect(input?dst:src,input?src:dst);
     };
   bind(child("ctrl"),arg(masterIndex),true,"",true);
-  bind(child("cpu_managed_axi4"),arg(pcisIndex),true,"",false);
+  if (indices.count("cpu_managed_axi4"))
+    bind(child("cpu_managed_axi4"),arg(pcisIndex),true,"",false);
+  else {
+    // F1Shim.scala: no CPU stream engine means no PCIS handshakes.
+    // DontCare response payloads lower to zero; do not create a stream engine.
+    std::function<void(Value,bool)> tieOff = [&](Value value, bool input) {
+      if (auto bundle = dyn_cast<BundleType>(value.getType())) {
+        for (auto field : bundle.getElements())
+          tieOff(f(value, field.name.getValue()), input != field.isFlip);
+      } else if (!input) connect(value, k(*cast<UIntType>(value.getType()).getWidth(), 0));
+    };
+    tieOff(arg(pcisIndex), true);
+  }
   // SFC DontCare response user bits lower to zero in the recorded RTL.
-  for(auto ch:{"b","r"}) connect(f(f(f(arg(pcisIndex),ch),"bits"),"user"),k(1,0));
+  if (indices.count("cpu_managed_axi4")) for(auto ch:{"b","r"}) connect(f(f(f(arg(pcisIndex),ch),"bits"),"user"),k(1,0));
   Value memory=b.create<SubindexOp>(loc,arg(slaveIndex),0);
   b.create<ConnectOp>(loc,memory,child("mem_0"));
   if (!isF2) for(unsigned i=0;i<2;++i) {

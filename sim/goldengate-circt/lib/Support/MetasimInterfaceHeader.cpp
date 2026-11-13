@@ -79,7 +79,7 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
     if (module.getName() == "FPGATop") top = module;
     if (module.getName() == "F1Shim") shim = module;
   }
-  if (circuit.getName() != "F1Shim" || !top || !shim || top.getNumPorts() != 5)
+  if (circuit.getName() != "F1Shim" || !top || !shim || (top.getNumPorts() != 5 && top.getNumPorts() != 4))
     return reject("metasim header requires the F1Shim/FPGATop boundary");
   AXIConfig ctrl{}, memory{}, cpu{};
   unsigned clocks = 0, resets = 0, controls = 0, memories = 0, cpus = 0;
@@ -102,7 +102,7 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
       if (master) ++memories; else if (name == "ctrl") ++controls; else ++cpus;
     } else return reject("metasim header has not ported additional memory, FPGA-managed or QSFP endpoints");
   }
-  if (clocks != 1 || resets != 1 || controls != 1 || memories != 1 || cpus != 1)
+  if (clocks != 1 || resets != 1 || controls != 1 || memories != 1 || cpus > 1)
     return reject("metasim header requires unique clock/reset/control/memory/CPU ports");
   // F1Shim exposes two physical QSFP lanes even when FPGATop has zero target
   // endpoints. Their payload width supplies FPGATopQSFPBitWidth, not the count.
@@ -164,7 +164,8 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
     out << "AXI4Config{" << config.id << ", " << config.addr << ", " << config.data << "}";
   };
   printAXI(ctrl); out << ",\n.mem = "; printAXI(memory);
-  out << ",\n.mem_num_channels = " << memories << ",\n.cpu_managed = "; printAXI(cpu);
+  out << ",\n.mem_num_channels = " << memories << ",\n.cpu_managed = ";
+  if (cpus) printAXI(cpu); else out << "std::nullopt";
   out << ",\n.fpga_managed = std::nullopt,\n.qsfp = FPGATopQSFPConfig{"
       << qsfpWidth << ", 0},\n.target_name = " << cString(targetName)
       << "\n};\n#undef GET_METASIM_INTERFACE_CONFIG\n"
@@ -191,9 +192,11 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
             << "`define " << prefix << "_DATA_BITS " << config.data << '\n';
   };
   printVerilogAXI("CTRL", ctrl);
-  printVerilogAXI("CPU_MANAGED_AXI4", cpu);
-  verilog << "`define CPU_MANAGED_AXI4_PRESENT 1\n"
-          << "`define QSFP_DATA_BITS " << qsfpWidth << '\n';
+  if (cpus) {
+    printVerilogAXI("CPU_MANAGED_AXI4", cpu);
+    verilog << "`define CPU_MANAGED_AXI4_PRESENT 1\n";
+  }
+  verilog << "`define QSFP_DATA_BITS " << qsfpWidth << '\n';
   for (unsigned channel = 0; channel < memories; ++channel)
     verilog << "`define MEM_HAS_CHANNEL" << channel << " 1\n";
   printVerilogAXI("MEM", memory);

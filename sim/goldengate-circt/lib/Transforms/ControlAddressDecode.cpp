@@ -41,7 +41,7 @@ LogicalResult tracerVBanks(CircuitOp circuit, SmallVectorImpl<FModuleOp> &banks,
       if (!native || !entries.emplace(index, native).second) return reject();
     }
   }
-  if (configs.empty() || configs.size() != adapters.size()) return reject();
+  if (configs.size() != adapters.size()) return reject();
   SmallVector<FModuleOp> ordered;
   for (unsigned i = 0; i < configs.size(); ++i) {
     if (!configs.count(i) || !adapters.count(i)) return reject();
@@ -370,8 +370,12 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
       importedLoadMem ? "CatalogRocket_GGLoadMemWriteDataFIFO" : "GGLoadMemWriteDataWrapper",
       importedLoadMem ? "CatalogRocket_GGLoadMemReadRequests" : "GGLoadMemReadRequestWrapper",
       importedLoadMem ? "CatalogRocket_GGLoadMemReadDataFIFO" : "GGLoadMemReadDataWrapper"};
-  if (failed(bank("LoadMemWidget_0", "GGLoadMemMCRFile", loadmemRegisters)) ||
-      failed(bank("CPUManagedStreamEngine_0", "GGCPUStreamMCRFile", {"GGCPUStreamCountBank"}))) return failure();
+  if (failed(bank("LoadMemWidget_0", "GGLoadMemMCRFile", loadmemRegisters))) return failure();
+  bool hasCPU = llvm::any_of(circuit.getOps<FModuleOp>(), [](FModuleOp m) {
+    return m.getName() == "GGCPUStreamCountBank" || m.getName() == "GGCPUStreamMCRFile";
+  });
+  if (hasCPU && failed(bank("CPUManagedStreamEngine_0", "GGCPUStreamMCRFile",
+                            {"GGCPUStreamCountBank"}))) return failure();
   widgets.assign(catalog.begin(), catalog.end()); return success();
 }
 
@@ -402,6 +406,13 @@ LogicalResult goldengate::allocateRocketControlMMIORegions(CircuitOp circuit,
   if (nic != bool(writer) || nic != bool(nicCount) || (nic && (!sinks || sinks.size() != nicCount)))
     return reject("Rocket MMIO allocation requires the complete duplex NIC catalog");
   auto words = counts ? counts->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters") : ArrayAttr{};
+  if (!reader && !counts && printHosts.empty() && !tracerCount && !nicCount) {
+    SmallVector<ControlMMIORegion> allocated;
+    if (failed(allocateControlMMIORegions(addressBits, catalog, allocated, error))) return failure();
+    widgets.assign(catalog.begin(), catalog.end());
+    regions.assign(allocated.begin(), allocated.end());
+    return success();
+  }
   if (!sources || !words || sources.size() != printHosts.size() + tracerCount + nicCount ||
       words.size() != sources.size() + (nic ? sinks.size() : 0))
     return reject("Rocket MMIO allocation requires one count word per registered DMA source and sink");

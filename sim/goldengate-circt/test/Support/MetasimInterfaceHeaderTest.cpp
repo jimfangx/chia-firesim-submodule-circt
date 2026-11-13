@@ -73,6 +73,19 @@ int main(int argc, char **argv) {
   try {
     require(argc == 1 || argc == 3, "usage: MetasimInterfaceHeaderTest [boundary.mlir output-directory]");
     MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
+    // SFC has no CPU-managed interface when no bridge registers a stream.
+    auto noStreams = fixture(context);
+    auto nc = *noStreams->getOps<CircuitOp>().begin();
+    FModuleOp nt;
+    for (auto m : nc.getOps<FModuleOp>()) if (m.getName() == "FPGATop") nt = m;
+    llvm::BitVector removed(nt.getNumPorts()); removed.set(4); nt.erasePorts(removed);
+    auto emptyBody = run(nc, "NoStreams");
+    require(emptyBody.find(".cpu_managed = std::nullopt") != std::string::npos,
+            "no-stream target must omit the CPU-managed interface");
+    auto emptyAnnotations = nc->getAttrOfType<ArrayAttr>("rawAnnotations");
+    auto emptyVH = cast<DictionaryAttr>(emptyAnnotations[emptyAnnotations.size()-2])
+                       .getAs<StringAttr>("body").getValue();
+    require(!emptyVH.contains("CPU_MANAGED_AXI4_PRESENT"), "no-stream Verilog interface still enabled");
     auto positive = fixture(context);
     auto circuit = *positive->getOps<CircuitOp>().begin();
     auto body = run(circuit, "Quoted\"\\\nTarget");

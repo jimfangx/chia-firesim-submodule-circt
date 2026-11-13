@@ -228,6 +228,28 @@ int main(int argc,char **argv) {
       if(mode==7||mode==8){auto text=dump(*test);std::string from=mode==7?"uint<25>":"!firrtl.clock",to=mode==7?"uint<26>":"!firrtl.uint<1>";while(text.find(from)!=std::string::npos)replace(text,from,to);test=parseSourceString<ModuleOp>(text,&ctx);require(bool(test),"bad schema fixture parse");tc=*test->getOps<CircuitOp>().begin();}
       auto before=dump(*test);require(failed(goldengate::assembleF1Shim(tc,error))&&!error.empty(),"invalid shim accepted");require(before==dump(*test),"rejection changed IR");
     }
+    for (bool isF2 : {false, true}) {
+      auto noCPU = fixture(ctx);
+      if (isF2) {
+        auto text=dump(*noCPU);
+        while(text.find("uint<25>")!=std::string::npos) replace(text,"uint<25>","uint<32>");
+        noCPU=parseSourceString<ModuleOp>(text,&ctx);
+      }
+      auto nc = *noCPU->getOps<CircuitOp>().begin();
+      require(succeeded(goldengate::assembleFPGATopShell(nc,error,isF2)),error);
+      auto nt=top(nc,"FPGATop"); unsigned port=0;
+      for (unsigned i=0;i<nt.getNumPorts();++i) if(nt.getPortName(i)=="cpu_managed_axi4") port=i;
+      for (auto use:llvm::make_early_inc_range(nt.getArgument(port).getUsers())) use->erase();
+      llvm::BitVector removed(nt.getNumPorts()); removed.set(port); nt.erasePorts(removed);
+      require(succeeded(goldengate::assembleF1Shim(nc,error,isF2)),error);
+      require(succeeded(verify(*noCPU)),"invalid no-stream shim");
+      auto shim=top(nc,"F1Shim"); unsigned zeros=0;
+      for(auto conn:shim.getOps<StrictConnectOp>()) {
+        auto value=conn.getSrc().getDefiningOp<ConstantOp>();
+        if(value && value.getValue().isZero()) ++zeros;
+      }
+      require(zeros>=14,"no-stream PCIS response and ready outputs are not tied off");
+    }
     auto before=dump(*root);require(failed(goldengate::assembleF1Shim(c,error)),"repeat accepted");require(before==dump(*root),"repeat changed IR");
     llvm::outs()<<"U250 F1Shim, two 12-bit host counters, retained bodies/clock identity; 12 atomic rejections\n";
     if(argc==3&&StringRef(argv[1])=="--f2"){writeStub(f2c,argv[2],true);emitCollateral(f2c,argv[2]);return 0;}

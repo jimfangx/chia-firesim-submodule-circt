@@ -3363,6 +3363,13 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, peekPokeControlAnnotations, error)))
         return fail("PeekPoke MCRFile transactions annotations: " + error);
       llvm::outs() << "Mapped CIRCT PeekPoke MCRFile transactions in " << peekPokeControlPath << '\n';
+      bool hasTracerV = false;
+      for (auto attr : circuit->getAttrOfType<ArrayAttr>("rawAnnotations")) {
+        auto row = dyn_cast<DictionaryAttr>(attr);
+        hasTracerV |= row && row.getAs<StringAttr>("class") == goldengate::AnnotationClasses::BridgeIO &&
+            row.getAs<StringAttr>("widgetClass") == "firechip.goldengateimplementations.TracerVBridgeModule";
+      }
+      if (hasTracerV) {
       if (failed(goldengate::addTracerVTokenEngine(circuit, error)))
         return fail("TracerV token engine: " + error);
       if (failed(mlir::verify(*module)))
@@ -3419,6 +3426,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, tracerQueueAnnotations, error)))
         return fail("TracerV stream queue annotations: " + error);
       llvm::outs() << "Buffered CIRCT TracerV CPU stream in " << tracerQueuePath << '\n';
+      }
       if (failed(compileTimeNICLoopback
                      ? goldengate::addNICLoopbackPlatformQueues(circuit, error)
                      : goldengate::addNICTokenQueues(circuit, error)))
@@ -3463,6 +3471,9 @@ int main(int argc, char **argv) {
       if (!productionPrintHosts.empty() &&
           failed(goldengate::appendPrintBridgeCPUStreamPorts(circuit, rocketStreams, rocketCounts, error)))
         return fail("shared Print CPU stream catalog: " + error);
+      const bool hasCPUStreams = !rocketStreams.empty() || !cpuSinks.empty();
+      // SFC omits the CPUManagedStreamEngine entirely when both lists are empty.
+      if (hasCPUStreams) {
       if (failed(goldengate::addCPUStreamRead(circuit, rocketStreams, error)))
         return fail("CPU stream read transport: " + error);
       if (failed(mlir::verify(*module)))
@@ -3686,8 +3697,12 @@ int main(int argc, char **argv) {
           return fail("CPU stream B response buffer annotations: " + error);
         llvm::outs() << "Buffered CIRCT CPU stream B responses in " << cpuWriteResponseBufferPath << '\n';
       }
+      }
+      // With no streams, retain the PeekPoke control boundary for LoadMem.
+      // No dummy stream, occupancy register or CPU driver is materialized.
       // Both CPU transport profiles now enter the same native LoadMem path.
-      if (failed(goldengate::attachLoadMemWriter(circuit, cpuSinks.empty()
+      if (failed(goldengate::attachLoadMemWriter(circuit, !hasCPUStreams
+              ? "GGPeekPokeBridgeControlWrapper" : cpuSinks.empty()
               ? "GGCPUStreamWriteResponseBufferWrapper" : "GGNICCPUStreamControlWrapper", error)))
         return fail("LoadMem writer: " + error);
       if (failed(mlir::verify(*module)))
@@ -4909,7 +4924,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, hostPlatformAnnotations, error)))
         return fail("host memory platform annotations: " + error);
       llvm::outs() << "Adapted CIRCT host memory to the sixteen-bit mem_0 ID interface in " << hostPlatformPath << '\n';
-      if (failed(goldengate::assembleCPUStreamPort(circuit, error)))
+      if (hasCPUStreams && failed(goldengate::assembleCPUStreamPort(circuit, error)))
         return fail("CPU stream platform port: " + error);
       if (failed(mlir::verify(*module))) return fail("CPU stream platform port produced invalid FIRRTL IR");
       llvm::SmallString<256> cpuPlatformPath(outputDir), cpuPlatformAnnotations(outputDir);
@@ -4920,8 +4935,10 @@ int main(int argc, char **argv) {
       if (cpuPlatformError) return fail("cannot write CPU stream platform port: " + cpuPlatformError.message());
       if (failed(goldengate::emitAllAnnotations(circuit, cpuPlatformAnnotations, error)))
         return fail("CPU stream platform annotations: " + error);
-      llvm::outs() << "Assembled CIRCT CPU-managed AXI4 slave in " << cpuPlatformPath << '\n';
-      if (isF2 && failed(goldengate::enableF2CPUStreamWordReads(circuit, error)))
+      llvm::outs() << (hasCPUStreams ? "Assembled CIRCT CPU-managed AXI4 slave in "
+                                     : "Omitted unused CIRCT CPU-managed AXI4 slave in ")
+                   << cpuPlatformPath << '\n';
+      if (isF2 && hasCPUStreams && failed(goldengate::enableF2CPUStreamWordReads(circuit, error)))
         return fail("F2 CPU-managed DWORD reads: " + error);
       if (failed(goldengate::assembleFPGATopShell(circuit, error, isF2)))
         return fail("FPGA top shell: " + error);
@@ -4934,7 +4951,9 @@ int main(int argc, char **argv) {
       if (fpgaTopError) return fail("cannot write FPGA top shell: " + fpgaTopError.message());
       if (failed(goldengate::emitAllAnnotations(circuit, fpgaTopAnnotations, error)))
         return fail("FPGA top shell annotations: " + error);
-      llvm::outs() << "Assembled CIRCT FPGATop clock/reset and three AXI4 interfaces in " << fpgaTopPath << '\n';
+      llvm::outs() << "Assembled CIRCT FPGATop clock/reset and "
+                   << (hasCPUStreams ? "three" : "two") << " AXI4 interfaces in "
+                   << fpgaTopPath << '\n';
       if (failed(goldengate::assembleF1Shim(circuit, error, isF2)))
         return fail("platform F1 shim: " + error);
       if (failed(mlir::verify(*module))) return fail("platform F1 shim produced invalid FIRRTL IR");
@@ -5066,7 +5085,7 @@ int main(int argc, char **argv) {
             ilaF2StreamProtocol = dict;
           }
         }
-        if (isF2 && !ilaF2StreamProtocol)
+        if (isF2 && hasCPUStreams && !ilaF2StreamProtocol)
           return fail("F2 source-count ACK protocol capture failed");
         if (!ilaDriverHeader || !ilaPeerMap)
           return fail("AutoILA driver header/peer map capture failed");
@@ -5148,7 +5167,7 @@ int main(int argc, char **argv) {
         // CPU stream geometry was validated before payload lowering. Publish
         // its map with the captured header after restoring the same archive.
         updated.push_back(ilaPeerMap);
-        if (isF2) updated.push_back(ilaF2StreamProtocol);
+        if (ilaF2StreamProtocol) updated.push_back(ilaF2StreamProtocol);
         circuit->setAttr("rawAnnotations", mlir::ArrayAttr::get(&context, updated));
       }
       if (isF2) {

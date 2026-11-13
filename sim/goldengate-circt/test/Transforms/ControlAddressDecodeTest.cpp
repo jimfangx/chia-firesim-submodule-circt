@@ -383,6 +383,7 @@ void rejection(MLIRContext &context) {
 // The catalog is read-only; the full NIC AXI/queue paths are checked separately.
 void multiNICCatalog(MLIRContext &ctx) {
   std::vector<std::string> orders{"NNTT","NTNT","NTTN","TNNT","TNTN","TTNN"};
+  orders.push_back(""); // No TracerV/NIC means no CPU stream engine or MMIO region.
   orders.push_back(std::string(64, 'N') + std::string(64, 'T'));
   orders.push_back(std::string(65, 'T') + std::string(65, 'N'));
   for (const auto &order : orders) {
@@ -422,6 +423,22 @@ void multiNICCatalog(MLIRContext &ctx) {
     add("GGLoadMemMCRFile",4,Direction::In);
     auto counts=add("GGCPUStreamCountBank",2*nicCount+tracerCount,Direction::Out);add("GGCPUStreamMCRFile",2*nicCount+tracerCount,Direction::In);
     auto read=add("GGCPUStreamRead",1,Direction::In,0,false),write=add("GGCPUStreamWrite",1,Direction::In,0,false);
+    if (order.empty()) {
+      for (StringRef name : {"GGNICMMIOBank", "GGCPUStreamCountBank", "GGCPUStreamMCRFile",
+                             "GGCPUStreamRead", "GGCPUStreamWrite"}) named(c,name).erase();
+      c->setAttr("rawAnnotations",b.getArrayAttr({}));
+      SmallVector<goldengate::ControlMMIOWidget> catalog;
+      SmallVector<goldengate::ControlMMIORegion> regions;
+      require(succeeded(goldengate::allocateRocketControlMMIORegions(c,32,{},catalog,regions,error)),error);
+      require(catalog.size()==9 && regions.size()==9,"no-stream catalog contains a dummy CPU widget");
+      for (const auto &widget : catalog)
+        require(!widget.name.starts_with("TracerV") && widget.name!="CPUManagedStreamEngine_0",
+                "no-stream catalog allocated disabled widgets");
+      add("GGTracerVMCRFile",15,Direction::In);
+      require(failed(goldengate::allocateRocketControlMMIORegions(c,32,{},catalog,regions,error)),
+              "orphan TracerV adapter accepted as a tracing-disabled target");
+      continue;
+    }
     SmallVector<Attribute> raw,sources,sinks,words;unsigned ni=0,ti=0;
     auto stream=[&](const std::string &name,unsigned index){return b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(name)),b.getNamedAttr("index",b.getI64IntegerAttr(index))});};
     auto count=[&](const std::string &name){words.push_back(b.getDictionaryAttr({b.getNamedAttr("name",b.getStringAttr(name+"_count")),b.getNamedAttr("offset",b.getI32IntegerAttr(words.size()*4)),b.getNamedAttr("readable",b.getBoolAttr(true)),b.getNamedAttr("writeable",b.getBoolAttr(false))}));};
