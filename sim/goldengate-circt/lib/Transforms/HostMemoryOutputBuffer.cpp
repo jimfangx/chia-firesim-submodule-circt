@@ -7,6 +7,7 @@
 // Reset clears occupancy; RAM writes remain enabled on an accepted reset edge.
 #include "goldengate/HostMemoryOutputBuffer.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <array>
 #include <optional>
 using namespace mlir;
@@ -44,8 +45,10 @@ LogicalResult goldengate::addHostMemoryOutputBuffer(CircuitOp circuit,
     auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();
     return a&&a.getValue().getBitWidth()<=64&&!a.getValue().isNegative()&&!a.getValue().isZero();
   };
-  if(!has(widths,"addrBits",35)||!has(widths,"dataBits",64)||!has(widths,"idBits",4)||
-     !has(edge,"maxReadTransfer",8)||(!has(edge,"idReuse",1)&&!has(edge,"idReuse",2))||!positive(edge,"maxFlight"))
+  if (!has(widths, "addrBits", 35) ||
+      !validFASEDGeometry(getFASEDGeometry(circuit)) ||
+      !has(widths, "idBits", 4) || !positive(edge, "maxReadTransfer") ||
+      !positive(edge, "idReuse") || !positive(edge, "maxFlight"))
     return reject("host memory output buffer supports the recorded Rocket profile");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};

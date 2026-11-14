@@ -133,7 +133,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error, 
   ports.push_back({b.getStringAttr("io_slave"),FVectorType::get(cast<FIRRTLBaseType>(type("mem_0")),1),Direction::Out});
   // EC2F2Config includes WithPCIMPorts even when there are no peer streams.
   // CreateNastiParameters uses the 64/512/6 physical FPGA-managed geometry.
-  if (isF2) {
+  if (isF2 && hasF2PCIM(circuit)) {
     std::function<Type(Type,StringRef)> pcimType=[&](Type t,StringRef n)->Type {
       if(auto xs=dyn_cast<BundleType>(t)) {
         SmallVector<BundleType::BundleElement> es;
@@ -196,7 +196,7 @@ LogicalResult goldengate::assembleF1Shim(CircuitOp circuit, std::string &error, 
     Value tx=b.create<SubindexOp>(loc,arg(3),i),rx=b.create<SubindexOp>(loc,arg(4),i);
     connect(f(tx,"valid"),k(1,0)); connect(f(tx,"bits"),k(256,0)); connect(f(rx,"ready"),k(1,0));
   }
-  if (isF2) {
+  if (isF2 && hasF2PCIM(circuit)) {
     Value pcim=arg(slaveIndex+1);
     for (auto ch : {"aw", "ar", "w"}) {
       auto request=f(pcim,ch);

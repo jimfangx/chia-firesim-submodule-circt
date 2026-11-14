@@ -11,10 +11,12 @@
 #include "goldengate/FASEDIngressCredits.h"
 #include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDIngressCredits(CircuitOp circuit, std::string &error) {
+  auto geometry = getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral helperName = "GGFASEDIngressCredits";
   const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressARQueueWrapper";
   const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressCreditsWrapper"
@@ -44,7 +46,11 @@ LogicalResult goldengate::addFASEDIngressCredits(CircuitOp circuit, std::string 
   };
   auto address = bundle({{"user",1},{"id",4},{"region",4},{"qos",4},{"prot",3},
       {"cache",4},{"lock",1},{"burst",2},{"size",3},{"len",8},{"addr",35}});
-  auto data = bundle({{"user",1},{"strb",8},{"id",4},{"last",1},{"data",64}});
+  auto data = bundle({{"user", 1},
+                      {"strb", geometry.dataBits / 8},
+                      {"id", 4},
+                      {"last", 1},
+                      {"data", geometry.dataBits}});
   auto token = [&](BundleType payload) { return BundleType::get(context,
       {{b.getStringAttr("ready"),true,bit},{b.getStringAttr("valid"),false,bit},
        {b.getStringAttr("bits"),false,payload}}); };

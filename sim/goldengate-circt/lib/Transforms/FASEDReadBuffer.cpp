@@ -10,12 +10,14 @@
 // All supported-profile, hierarchy and port checks precede mutation.
 #include "goldengate/FASEDReadBuffer.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressIssueWrapper";
   llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDReadBufferWrapper" : "GGFASEDReadBufferWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
@@ -38,16 +40,21 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
   };
   auto reuse = edge ? edge.getAs<IntegerAttr>("idReuse") : IntegerAttr();
   auto flight = edge ? edge.getAs<IntegerAttr>("maxFlight") : IntegerAttr();
-  if (!has(edge,"maxReadTransfer",8) || !reuse ||
-      reuse.getValue().getBitWidth() > 64 || (reuse.getInt() != 1 && reuse.getInt() != 2) ||
-      !flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0 ||
-      !has(widths,"dataBits",64) || !has(widths,"idBits",4) || !has(widths,"addrBits",35))
-    return reject("FASED read buffer supports 35/64/4-bit, 8-beat, one or two requests per ID with positive maxFlight");
+  if (!reuse || !flight || !edge.getAs<IntegerAttr>("maxReadTransfer") ||
+      !validFASEDGeometry(geometry) || !has(widths, "addrBits", 35) ||
+      !has(widths, "idBits", 4))
+    return reject("FASED requires a valid byte-addressable AXI data width, "
+                  "transfer lengths, ID reuse and maxFlight");
+
+  if (needsFASEDReadTranslation(geometry, getFASEDEffectiveCapacity(circuit)))
+    return reject(
+        "FASED read ID translation is required for this constructor geometry");
   // BaseConfig.maxReadsPerID uses edge.idReuse directly. ReadEgress's virtual
   // state is at most 16 * 16 * 64 bits here, below the translation threshold;
   // maxFlight therefore does not reduce this per-ID storage allocation.
-  unsigned entries = 8 * reuse.getInt();
-  unsigned pointerWidth = llvm::Log2_64(entries), memoryDepth = 16 * entries;
+  unsigned entries = geometry.readDepth();
+  unsigned pointerWidth = std::max(1u, llvm::Log2_64(entries)),
+           memoryDepth = 16 * entries;
   std::string queueName = "GGFASEDReadBuffer16x" + std::to_string(entries);
   for (auto m : circuit.getOps<FModuleLike>())
     if (m.getModuleName() == queueName)
@@ -63,8 +70,12 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
       {b.getStringAttr("ready"),true,bit},{b.getStringAttr("valid"),false,bit},
       {b.getStringAttr("bits"),false,t}}); };
   auto responses = bundle({{"rReady",1},{"rValid",1},{"rLast",1},{"bReady",1},{"bValid",1}});
-  auto stored = bundle({{"data",64},{"last",1}});
-  auto read = bundle({{"user",1},{"id",4},{"last",1},{"data",64},{"resp",2}});
+  auto stored = bundle({{"data", geometry.dataBits}, {"last", 1}});
+  auto read = bundle({{"user", 1},
+                      {"id", 4},
+                      {"last", 1},
+                      {"data", geometry.dataBits},
+                      {"resp", 2}});
   auto port = [&](llvm::StringRef n, Type t, Direction d) -> std::optional<unsigned> {
     for (auto [i,p] : llvm::enumerate(inner.getPorts()))
       if (p.name == n && p.type == t && p.direction == d) return i;
@@ -101,7 +112,15 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
   auto neg = [&](Value a)->Value { return b.create<NotPrimOp>(loc,a); };
   auto eq = [&](Value a,Value z)->Value { return b.create<EQPrimOp>(loc,a,z); };
   auto mux = [&](Value c,Value a,Value z)->Value { return b.create<MuxPrimOp>(loc,c,a,z); };
-  auto inc = [&](Value v)->Value { return b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,v,constant(pointerWidth,1)),pointerWidth-1,0); };
+  auto inc = [&](Value v) -> Value {
+    return entries == 1
+               ? constant(pointerWidth, 0)
+               : Value(b.create<BitsPrimOp>(
+                     loc,
+                     b.create<AddPrimOp>(loc, v, constant(pointerWidth, 1)),
+                     pointerWidth - 1,
+                     0));
+  };
   SmallVector<Value> enqPtrs,deqPtrs,fullFlags;
   for (unsigned i=0;i<16;++i) {
     enqPtrs.push_back(reg(pointerWidth,"enqPtrs_"+std::to_string(i)));
@@ -128,8 +147,11 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
     Value different=mux(both(pop,deqId),constant(1,0),mux(both(push,enqId),constant(1,1),fullFlags[i]));
     connect(fullFlags[i],mux(sameId,mux(both(enqId,b.create<XorPrimOp>(loc,push,pop)),push,fullFlags[i]),different));
   }
-  SmallVector<Type> memTypes{MemOp::getTypeForPort(memoryDepth,uint(65),MemOp::PortKind::Read),
-      MemOp::getTypeForPort(memoryDepth,uint(65),MemOp::PortKind::Write)};
+  SmallVector<Type> memTypes{
+      MemOp::getTypeForPort(
+          memoryDepth, uint(geometry.dataBits + 1), MemOp::PortKind::Read),
+      MemOp::getTypeForPort(
+          memoryDepth, uint(geometry.dataBits + 1), MemOp::PortKind::Write)};
   SmallVector<Attribute> memNames{b.getStringAttr("read"),b.getStringAttr("write")};
   auto ram=b.create<MemOp>(loc,memTypes,1,1,memoryDepth,RUWAttr::Undefined,memNames,"ram");
   // Private origin mark: the RTL emitter validates the live packing and records
@@ -137,12 +159,18 @@ LogicalResult goldengate::addFASEDReadBuffer(CircuitOp circuit, std::string &err
   ram->setAttr("goldengate.fasedReadBufferMemory", b.getUnitAttr());
   auto reader=ram.getResult(0),writer=ram.getResult(1);
   connect(field(reader,"clk"),arg(0));connect(field(reader,"en"),constant(1,1));
-  connect(field(reader,"addr"),b.create<CatPrimOp>(loc,arg(5),mux(advance,nextRP,rp)));
+  connect(field(reader, "addr"),
+          entries == 1 ? arg(5)
+                       : Value(b.create<CatPrimOp>(
+                             loc, arg(5), mux(advance, nextRP, rp))));
   Value readData=field(reader,"data"),out=field(arg(3),"bits"),in=field(arg(2),"bits");
-  connect(field(out,"data"),b.create<BitsPrimOp>(loc,readData,64,1));
+  connect(field(out, "data"),
+          b.create<BitsPrimOp>(loc, readData, geometry.dataBits, 1));
   connect(field(out,"last"),b.create<BitsPrimOp>(loc,readData,0,0));
   connect(field(writer,"clk"),arg(0));connect(field(writer,"en"),push);
-  connect(field(writer,"mask"),constant(1,1));connect(field(writer,"addr"),b.create<CatPrimOp>(loc,arg(4),wp));
+  connect(field(writer, "mask"), constant(1, 1));
+  connect(field(writer, "addr"),
+          entries == 1 ? arg(4) : Value(b.create<CatPrimOp>(loc, arg(4), wp)));
   connect(field(writer,"data"),b.create<CatPrimOp>(loc,field(in,"data"),field(in,"last")));
 
   SmallVector<PortInfo> ports;SmallVector<unsigned> copied;

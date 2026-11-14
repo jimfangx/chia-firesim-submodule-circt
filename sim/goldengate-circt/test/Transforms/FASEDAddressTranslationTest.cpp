@@ -37,10 +37,19 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0){
   for(unsigned j=0;j<4;++j)sets.push_back(b.getDictionaryAttr({
     b.getNamedAttr("base",b.getI64IntegerAttr(base[j])),
     b.getNamedAttr("mask",b.getI64IntegerAttr(mask[j]+(bad==5&&j==3)))}));
-  auto k=b.getDictionaryAttr({b.getNamedAttr("memoryRegionName",b.getStringAttr(bad==6?"Other":"MainMemory_0")),
-    b.getNamedAttr("axi4Widths",b.getDictionaryAttr({b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),
-      b.getNamedAttr("dataBits",b.getI64IntegerAttr(bad==7?128:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))})),
-    b.getNamedAttr("axi4Edge",b.getDictionaryAttr({b.getNamedAttr("address",b.getArrayAttr(sets))}))});
+  auto k = b.getDictionaryAttr(
+      {b.getNamedAttr("memoryRegionName",
+                      b.getStringAttr(bad == 6 ? "Other" : "MainMemory_0")),
+       b.getNamedAttr(
+           "axi4Widths",
+           b.getDictionaryAttr(
+               {b.getNamedAttr("addrBits", b.getI64IntegerAttr(35)),
+                b.getNamedAttr("dataBits",
+                               b.getI64IntegerAttr(bad == 7 ? 96 : 64)),
+                b.getNamedAttr("idBits", b.getI64IntegerAttr(4))})),
+       b.getNamedAttr("axi4Edge",
+                      b.getDictionaryAttr(
+                          {b.getNamedAttr("address", b.getArrayAttr(sets))}))});
   top(c,"GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor",k);
   if(bad==8)c->removeAttr("rawAnnotations");
   if(bad==9){auto m=top(c,"GGFASEDHostMemoryWrapper");b.setInsertionPointToStart(m.getBodyBlock());b.create<InstanceOp>(c.getLoc(),m,"used");}

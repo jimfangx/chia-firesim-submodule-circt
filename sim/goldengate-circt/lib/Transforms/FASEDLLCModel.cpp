@@ -4,6 +4,7 @@
 #include "goldengate/FASEDLLCMetadata.h"
 #include "goldengate/FASEDLLCMSHRTable.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <array>
 #include <tuple>
 using namespace mlir;
@@ -13,6 +14,7 @@ LogicalResult goldengate::materializeFASEDLLCModel(
   for(auto module:circuit.getOps<FModuleLike>())
     for(auto name:{"GGFASEDLLCModel","GGFASEDLLCMetadata","GGFASEDLLCMSHRTable"})
       if(module.getModuleName()==name) {error="LLC model requires free model, metadata and MSHR symbols";return failure();}
+  auto geometry = getFASEDGeometry(circuit);
   FModuleOp metadata,table;
   if(failed(materializeFASEDLLCMetadata(circuit,metadata,error)) ||
      failed(materializeFASEDLLCMSHRTable(circuit,table,error)))return failure();
@@ -122,7 +124,8 @@ LogicalResult goldengate::materializeFASEDLLCModel(
   Value tag=b.create<DShrPrimOp>(loc,mux(writeStart,writes.addr,reads.addr),tagShift);
   con(mp("lookupStart"),start);con(mp("lookupSet"),mux(writeStart,writeSet,readSet));con(mp("lookupTag"),tag);
   con(tp("readSet"),readSet);con(tp("writeSet"),writeSet);
-  Value shift=trim(b.create<SubPrimOp>(loc,arg("blockBits"),c(3,3)),3);
+  Value shift = trim(
+      b.create<SubPrimOp>(loc, arg("blockBits"), c(3, geometry.byteBits())), 3);
   con(blockLen,trim(b.create<SubPrimOp>(loc,b.create<DShlPrimOp>(loc,c(1,1),shift),c(8,1)),8));
   auto physical=[&](Value set,Value tag)->Value {
     Value setPart=resized(b.create<DShlPrimOp>(loc,set,arg("blockBits")),35);

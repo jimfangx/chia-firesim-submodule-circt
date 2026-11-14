@@ -4,6 +4,8 @@
 // Exact selected .const.h register order; no LBP programmable request limits.
 #include "goldengate/FASEDFRFCFSMMIO.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDDRAMProfile.h"
+#include <vector>
 using namespace mlir;
 using namespace circt::firrtl;
 
@@ -166,6 +168,28 @@ goldengate::getFASEDFRFCFSMMIORegisters() {
   return rows;
 }
 
+llvm::ArrayRef<goldengate::FASEDFRFCFSMMIORegister>
+goldengate::getFASEDFRFCFSMMIORegisters(CircuitOp circuit) {
+  static const auto noLLC = [] {
+    std::vector<FASEDFRFCFSMMIORegister> result;
+    for (const auto &r : getFASEDFRFCFSMMIORegisters())
+      if (!StringRef(r.name).starts_with("llc_"))
+        result.push_back(r);
+    return result;
+  }();
+  static const auto fcfs = [] {
+    std::vector<FASEDFRFCFSMMIORegister> result;
+    for (const auto &r : noLLC)
+      if (r.name != "schedulerWindowSize" && r.name != "transactionQueueDepth")
+        result.push_back(r);
+    return result;
+  }();
+  if (isFASEDFCFS(circuit))
+    return fcfs;
+  return hasFASEDLLC(circuit) ? getFASEDFRFCFSMMIORegisters()
+                              : llvm::ArrayRef<FASEDFRFCFSMMIORegister>(noLLC);
+}
+
 LogicalResult goldengate::materializeFASEDFRFCFSMMIO(CircuitOp circuit,
                                                      FModuleOp &result,
                                                      std::string &error) {
@@ -209,7 +233,8 @@ LogicalResult goldengate::materializeFASEDFRFCFSMMIO(CircuitOp circuit,
                                {{b.getStringAttr("ready"), true, bit},
                                 {b.getStringAttr("valid"), false, bit},
                                 {b.getStringAttr("bits"), false, u(32)}});
-  auto words = FVectorType::get(token, 68);
+  auto words =
+      FVectorType::get(token, getFASEDFRFCFSMMIORegisters(circuit).size());
   auto mcr = BundleType::get(ctx,
                              {{b.getStringAttr("read"), false, words},
                               {b.getStringAttr("write"), true, words},
@@ -224,7 +249,7 @@ LogicalResult goldengate::materializeFASEDFRFCFSMMIO(CircuitOp circuit,
     add(n, bit, Direction::In);
   for (auto n : {"rResp", "bResp"})
     add(n, u(2), Direction::In);
-  for (auto &r : getFASEDFRFCFSMMIORegisters()) {
+  for (auto &r : getFASEDFRFCFSMMIORegisters(circuit)) {
     if (r.port == "rrespError" || r.port == "brespError" ||
         llvm::any_of(ports, [&](auto p) { return p.getName() == r.port; }))
       continue;
@@ -243,7 +268,7 @@ LogicalResult goldengate::materializeFASEDFRFCFSMMIO(CircuitOp circuit,
                           ConventionAttr::get(ctx, Convention::Internal),
                           ports);
   SmallVector<Attribute> registry;
-  for (auto [i, r] : llvm::enumerate(getFASEDFRFCFSMMIORegisters()))
+  for (auto [i, r] : llvm::enumerate(getFASEDFRFCFSMMIORegisters(circuit)))
     registry.push_back(b.getDictionaryAttr(
         {b.getNamedAttr("name", b.getStringAttr(r.name)),
          b.getNamedAttr("offset", b.getI32IntegerAttr(4 * i)),
@@ -271,13 +296,13 @@ LogicalResult goldengate::materializeFASEDFRFCFSMMIO(CircuitOp circuit,
   };
   Value one = c(1, 1), zero = c(2, 0),
         enabled = b.create<NotPrimOp>(loc, arg("reset"));
-  for (auto [i, r] : llvm::enumerate(getFASEDFRFCFSMMIORegisters())) {
+  for (auto [i, r] : llvm::enumerate(getFASEDFRFCFSMMIORegisters(circuit))) {
     Value read = index(field(arg("mcr"), "read"), i);
     Value write = index(field(arg("mcr"), "write"), i);
     con(field(read, "valid"), one);
     con(field(write, "ready"), one);
     Value value;
-    bool responseError = i >= 66;
+    bool responseError = r.name == "rrespError" || r.name == "brespError";
     if (r.writeable || responseError) {
       unsigned width = responseError ? 2 : 32;
       value = b.create<RegResetOp>(loc,
@@ -292,7 +317,7 @@ LogicalResult goldengate::materializeFASEDFRFCFSMMIO(CircuitOp circuit,
         next = b.create<MuxPrimOp>(
             loc, field(write, "valid"), field(write, "bits"), value);
       else {
-        StringRef prefix = i == 66 ? "r" : "b";
+        StringRef prefix = r.name == "rrespError" ? "r" : "b";
         Value fire = b.create<AndPrimOp>(
             loc, arg((prefix + "Valid").str()), arg((prefix + "Ready").str()));
         Value bad =

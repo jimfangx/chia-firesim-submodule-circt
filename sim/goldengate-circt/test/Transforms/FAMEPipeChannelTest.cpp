@@ -458,6 +458,34 @@ int main(int argc, char **argv) {
   MLIRContext context;
   context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
+    for (auto spelling :
+         {"uint<0>", "sint<13>", "bundle<a: uint<5>, b: vector<uint<3>, 2>>"}) {
+      auto root = parseSourceString<ModuleOp>(
+          "module { firrtl.circuit \"Top\" { firrtl.module @Top() {} } }",
+          &context);
+      auto c = *root->getOps<CircuitOp>().begin();
+      OpBuilder builder(&context);
+      c->setAttr("goldengate.tokenIrrevocabilityAssertions",
+                 builder.getBoolAttr(true));
+      // Parse payload types through a tiny module to cover signed and
+      // aggregates.
+      auto typed = parseSourceString<ModuleOp>(
+          std::string("module { firrtl.circuit \"Type\" { firrtl.module "
+                      "@Type(in %x: !firrtl.") +
+              spelling + ") {} } }",
+          &context);
+      auto type =
+          (*(*typed->getOps<CircuitOp>().begin()).getOps<FModuleOp>().begin())
+              .getPortType(0);
+      std::string error;
+      require(succeeded(goldengate::addFAMEPipeChannel(
+                  c, cast<FIRRTLBaseType>(type), 1, error)),
+              error);
+      unsigned checks = 0;
+      c.walk([&](AssertOp) { ++checks; });
+      require(checks == 2 && succeeded(verify(*root)),
+              "DefaultF2 token assertions lost typed payloads");
+    }
     checkWrapper(context);
     checkRejectedQueueInterfaces(context);
     checkRejectedAnnotations(context);

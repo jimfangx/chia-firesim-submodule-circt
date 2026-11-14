@@ -8,6 +8,7 @@
 // separate transforms. Reject unsupported allocation profiles before mutation.
 #include "goldengate/FASEDAddressTranslation.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 #include <map>
 using namespace mlir;
@@ -39,8 +40,9 @@ LogicalResult goldengate::addFASEDAddressTranslation(CircuitOp circuit,
   auto edge=key.getAs<DictionaryAttr>("axi4Edge");
   auto addresses=edge.getAs<ArrayAttr>("address");
   auto has=[&](StringRef n,int v){auto a=widths?widths.getAs<IntegerAttr>(n):IntegerAttr();return a&&a.getInt()==v;};
-  if(!region || region.getValue()!="MainMemory_0" || !has("addrBits",35) ||
-      !has("dataBits",64) || !has("idBits",4) || !addresses || addresses.size()!=4)
+  if (!region || region.getValue() != "MainMemory_0" || !has("addrBits", 35) ||
+      !validFASEDGeometry(getFASEDGeometry(circuit)) || !has("idBits", 4) ||
+      !addresses || addresses.size() != 4)
     return reject("FASED translation supports the recorded MainMemory_0 profile");
   const uint64_t bases[]{0x80000000ULL,0x100000000ULL,0x200000000ULL,0x400000000ULL};
   const uint64_t masks[]{0x7fffffffULL,0xffffffffULL,0x1ffffffffULL,0x7fffffffULL};

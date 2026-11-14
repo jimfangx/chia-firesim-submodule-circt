@@ -7,14 +7,17 @@
 #include "goldengate/FASEDFRFCFSBridge.h"
 #include "goldengate/FASEDFRFCFSTimingModel.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include "mlir/IR/OwningOpRef.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/StringSet.h"
 #include <functional>
+#include "goldengate/FASEDDRAMProfile.h"
 using namespace mlir;
 using namespace circt::firrtl;
 namespace {
 LogicalResult attach(CircuitOp circuit, std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   auto reject = [&](StringRef text) {
     error = text.str();
     return failure();
@@ -39,9 +42,10 @@ LogicalResult attach(CircuitOp circuit, std::string &error) {
   auto base =
       circuit->getAttrOfType<IntegerAttr>("goldengate.fasedBaseCapacity");
   if (!inner || !engine || !raw || !base ||
-      base.getValue().getBitWidth() > 64 || base.getInt() != 32)
+      base.getValue().getBitWidth() > 64 ||
+      base.getInt() != goldengate::getFASEDDRAMBaseCapacity(circuit))
     return reject("FRFCFS bridge requires top, mapped constructor, annotations "
-                  "and explicit base32");
+                  "and the selected explicit base capacity");
   auto key =
       engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
@@ -52,13 +56,10 @@ LogicalResult attach(CircuitOp circuit, std::string &error) {
     return a && a.getValue().getBitWidth() <= 64 ? a.getInt() : -1;
   };
   int64_t flight = integer(edge, "maxFlight"), reuse = integer(edge, "idReuse");
-  if (!((flight == 10 && reuse == 1) || (flight == 20 && reuse == 2)) ||
-      integer(edge, "maxReadTransfer") != 8 ||
-      integer(edge, "maxWriteTransfer") != 8 ||
-      integer(widths, "addrBits") != 35 || integer(widths, "dataBits") != 64 ||
-      integer(widths, "idBits") != 4)
-    return reject("FRFCFS bridge requires selected 35/64/4, transfer8 and 10/1 "
-                  "or20/2 constructor");
+  if (!goldengate::validFASEDGeometry(geometry) || flight <= 0 || reuse <= 0 ||
+      integer(widths, "addrBits") != 35 || integer(widths, "idBits") != 4)
+    return reject("DDR3 bridge requires valid target AXI geometry and 35-bit "
+                  "addresses/four-bit IDs");
   auto *ctx = circuit.getContext();
   OpBuilder b(ctx);
   auto loc = circuit.getLoc();
@@ -89,11 +90,17 @@ LogicalResult attach(CircuitOp circuit, std::string &error) {
                           {"size", 3},
                           {"len", 8},
                           {"addr", 35}});
-  auto data =
-      payload({{"user", 1}, {"strb", 8}, {"id", 4}, {"last", 1}, {"data", 64}});
+  auto data = payload({{"user", 1},
+                       {"strb", geometry.dataBits / 8},
+                       {"id", 4},
+                       {"last", 1},
+                       {"data", geometry.dataBits}});
   auto write = payload({{"user", 1}, {"id", 4}, {"resp", 2}});
-  auto read =
-      payload({{"user", 1}, {"id", 4}, {"last", 1}, {"data", 64}, {"resp", 2}});
+  auto read = payload({{"user", 1},
+                       {"id", 4},
+                       {"last", 1},
+                       {"data", geometry.dataBits},
+                       {"resp", 2}});
   auto response = [&](BundleType bits) {
     return bundle({{b.getStringAttr("tReady"), true, bit},
                    {b.getStringAttr("hValid"), false, bit},
@@ -155,7 +162,7 @@ LogicalResult attach(CircuitOp circuit, std::string &error) {
     return reject("FRFCFS bridge requires an uninstantiated top");
   FModuleOp model;
   if (failed(goldengate::materializeFASEDFRFCFSTimingModel(
-          circuit, flight, model, error)))
+          circuit, std::min<int64_t>(flight, base.getInt()), model, error)))
     return failure();
   llvm::StringSet<> closed;
   for (auto n : {"clock",

@@ -60,8 +60,7 @@ void checkHostMemoryProfiles(mlir::MLIRContext &ctx, Factory fixture,
       b.getIntegerAttr(b.getIntegerType(128),APInt(128,10)),
       b.getIntegerAttr(b.getIntegerType(128),APInt(128,1).shl(80))};
     if (field == "idReuse") {
-      bad.push_back(b.getI64IntegerAttr(3));
-      bad.push_back(b.getI64IntegerAttr(99));
+      bad.push_back(b.getI64IntegerAttr(65537));
       bad.push_back(b.getI64IntegerAttr(std::numeric_limits<int64_t>::max()));
     }
     for (auto value : bad) {

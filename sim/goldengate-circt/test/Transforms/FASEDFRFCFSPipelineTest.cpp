@@ -46,7 +46,11 @@ FModuleOp named(CircuitOp c, StringRef name) {
       return m;
   throw std::runtime_error("missing module " + name.str());
 }
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned flight) {
+OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,
+                              unsigned flight,
+                              unsigned dataBits = 64,
+                              unsigned beats = 8,
+                              unsigned reuse = 0) {
   const bool normalized = true, selected = false;
   auto root = parseSourceString<ModuleOp>(
       "module { firrtl.circuit \"GGBlockDevResponseSchedulerWrapper\" { "
@@ -115,9 +119,10 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned flight) {
     if (j == 0 || j == 1 || j == 3 || j == 8 || j == 10) {
       SmallVector<BundleType::BundleElement> elements;
       for (auto &name : fields[j]) {
-        unsigned w = name == "bits_data"                         ? 64
-                     : name == "bits_addr"                       ? 35
-                     : name == "bits_len" || name == "bits_strb" ? 8
+        unsigned w = name == "bits_data"   ? dataBits
+                     : name == "bits_addr" ? 35
+                     : name == "bits_strb" ? dataBits / 8
+                     : name == "bits_len"  ? 8
                      : name == "bits_id" || name == "bits_region" ||
                              name == "bits_qos" || name == "bits_cache"
                          ? 4
@@ -174,17 +179,20 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx, unsigned flight) {
                      "axi4Edge",
                      dict({b.getNamedAttr("maxFlight",
                                           b.getI64IntegerAttr(flight)),
-                           b.getNamedAttr(
-                               "idReuse",
-                               b.getI64IntegerAttr(flight == 10 ? 1 : 2)),
+                           b.getNamedAttr("idReuse",
+                                          b.getI64IntegerAttr(reuse ? reuse
+                                                              : flight == 10
+                                                                  ? 1
+                                                                  : 2)),
                            b.getNamedAttr("maxReadTransfer",
-                                          b.getI64IntegerAttr(8)),
+                                          b.getI64IntegerAttr(beats)),
                            b.getNamedAttr("maxWriteTransfer",
-                                          b.getI64IntegerAttr(8))})),
+                                          b.getI64IntegerAttr(beats))})),
                  b.getNamedAttr(
                      "axi4Widths",
                      dict({b.getNamedAttr("addrBits", b.getI64IntegerAttr(35)),
-                           b.getNamedAttr("dataBits", b.getI64IntegerAttr(64)),
+                           b.getNamedAttr("dataBits",
+                                          b.getI64IntegerAttr(dataBits)),
                            b.getNamedAttr("idBits",
                                           b.getI64IntegerAttr(4))}))})),
        b.getNamedAttr("channelMapping", mapping.getDictionary(&ctx))})};
@@ -243,9 +251,27 @@ void initialize(FModuleOp top) {
     if (!isa<ClockType>(p.type))
       drive(top.getBodyBlock()->getArgument(i), p.direction == Direction::Out);
 }
-void composition(MLIRContext &ctx, unsigned flight, StringRef output = {}) {
-  auto root = fixture(ctx, flight);
+void composition(MLIRContext &ctx,
+                 unsigned flight,
+                 StringRef output = {},
+                 StringRef profile = {},
+                 unsigned dataBits = 64,
+                 unsigned beats = 8,
+                 unsigned reuse = 0) {
+  auto root = fixture(ctx, flight, dataBits, beats, reuse);
   auto c = *root->getOps<CircuitOp>().begin();
+  bool fcfs = profile == "fcfs",
+       llc = profile.empty() || profile == "frfcfs-llc";
+  if (!reuse)
+    reuse = flight == 10 ? 1 : 2;
+  unsigned capacity = fcfs ? 16 : 32,
+           limitExpected = std::min(flight, capacity);
+  unsigned words = llc ? 68 : fcfs ? 58 : 60;
+  OpBuilder builder(&ctx);
+  c->setAttr("goldengate.fasedBaseCapacity",
+             builder.getI64IntegerAttr(capacity));
+  if (!profile.empty())
+    c->setAttr("goldengate.fasedDRAMProfile", builder.getStringAttr(profile));
   initialize(named(c, c.getName()));
   std::string error;
   FModuleOp bank;
@@ -272,25 +298,37 @@ void composition(MLIRContext &ctx, unsigned flight, StringRef output = {}) {
   unsigned limit = 0, countWidth = 0;
   require(succeeded(goldengate::getFASEDRequestLimitProfile(
               c, limit, countWidth, error)) &&
-              limit == flight && countWidth == llvm::Log2_64_Ceil(flight + 1),
+              limit == limitExpected &&
+              countWidth == llvm::Log2_64_Ceil(limitExpected + 1),
           "functional platform capacity was lost in the real pass chain");
-  auto aw = named(c, "GGFASEDIngressAWQueue" + std::to_string(flight));
+  auto aw = named(c, "GGFASEDIngressAWQueue" + std::to_string(limitExpected));
   unsigned awMemories = 0;
   for (auto mem : aw.getOps<MemOp>()) {
     ++awMemories;
-    require(mem.getDepth() == flight,
+    require(mem.getDepth() == limitExpected,
             "AW queue still has a ten/sixteen-entry limit");
   }
   require(awMemories == 1, "AW ingress storage missing");
   auto buffer =
-      named(c, "GGFASEDReadBuffer16x" + std::to_string(flight == 10 ? 8 : 16));
+      named(c,
+            "GGFASEDReadBuffer16x" +
+                std::to_string(llvm::PowerOf2Ceil(uint64_t(beats) * reuse)));
   unsigned readMemories = 0;
   for (auto mem : buffer.getOps<MemOp>()) {
     ++readMemories;
-    require(mem.getDepth() == (flight == 10 ? 128u : 256u),
+    require(mem.getDepth() == 16 * llvm::PowerOf2Ceil(uint64_t(beats) * reuse),
             "read buffer ignored constructor ID reuse");
   }
   require(readMemories == 1, "read egress storage missing");
+  for (auto memory : buffer.getOps<MemOp>())
+    require(cast<UIntType>(memory.getDataType()).getWidth() == dataBits + 1,
+            "read data packing ignored target width");
+  auto wQueue = named(c, "GGFASEDIngressWQueue" + std::to_string(2 * beats));
+  for (auto memory : wQueue.getOps<MemOp>())
+    require(memory.getDepth() == 2 * beats &&
+                cast<UIntType>(memory.getDataType()).getWidth() ==
+                    dataBits + dataBits / 8 + 6,
+            "write queue ignored target beat geometry");
   require(succeeded(goldengate::attachFASEDFRFCFSMMIO(c, bank, error)), error);
   require(succeeded(verify(*root)), "MMIO attachment produced invalid IR");
   auto top = named(c, c.getName());
@@ -314,13 +352,30 @@ void composition(MLIRContext &ctx, unsigned flight, StringRef output = {}) {
                                                     {bank.getName()},
                                                     widget,
                                                     error)) &&
-          widget.registerCount == 68,
+          widget.registerCount == words,
       "real functional chain lost FRFCFS register ABI");
   SmallVector<goldengate::ControlMMIORegion> regions;
   require(succeeded(goldengate::allocateControlMMIORegions(
               32, {widget}, regions, error)) &&
-              regions.size() == 1 && regions[0].size == 512,
+              regions.size() == 1 && regions[0].size == (llc ? 512 : 256),
           "FRFCFS control allocation differs");
+  bool foundLLC = false, foundFIFO = false, foundFirstReady = false;
+  for (auto module : c.getOps<FModuleOp>()) {
+    foundLLC |= module.getName() == "GGFASEDLLCModel";
+    foundFIFO |= module.getName() == "GGFASEDFCFSCommandScheduler";
+    foundFirstReady |= module.getName() == "GGFASEDFRFCFSCommandScheduler";
+  }
+  require(foundLLC == llc && foundFIFO == fcfs && foundFirstReady == !fcfs,
+          "wrong LLC or command scheduler selected");
+  auto registry = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
+  for (auto row : registry) {
+    auto name = cast<DictionaryAttr>(row).getAs<StringAttr>("name").getValue();
+    require(llc || !name.starts_with("llc_"),
+            "LLC programming leaked into no-LLC profile");
+    require(!fcfs || (name != "schedulerWindowSize" &&
+                      name != "transactionQueueDepth"),
+            "FIFO model advertises first-ready window");
+  }
   if (!output.empty()) {
     std::error_code ec;
     llvm::raw_fd_ostream os(output, ec);
@@ -343,16 +398,35 @@ int main(int argc, char **argv) {
   try {
     MLIRContext ctx;
     ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    if (argc == 4 && StringRef(argv[1]) == "--fixture") {
+    if ((argc == 4 || argc == 5 || argc == 8) &&
+        StringRef(argv[1]) == "--fixture") {
       unsigned flight = 0;
-      require(!StringRef(argv[2]).getAsInteger(10, flight) &&
-                  (flight == 10 || flight == 20),
-              "fixture requires selected maxFlight 10 or 20");
-      composition(ctx, flight, argv[3]);
+      require(!StringRef(argv[2]).getAsInteger(10, flight) && flight > 0,
+              "fixture requires positive maxFlight");
+      unsigned dataBits = 64, beats = 8, reuse = 0;
+      if (argc == 8) {
+        require(!StringRef(argv[5]).getAsInteger(10, dataBits) &&
+                    !StringRef(argv[6]).getAsInteger(10, beats) &&
+                    !StringRef(argv[7]).getAsInteger(10, reuse),
+                "invalid AXI fixture geometry");
+      }
+      composition(ctx,
+                  flight,
+                  argv[3],
+                  argc >= 5 ? StringRef(argv[4]) : StringRef(),
+                  dataBits,
+                  beats,
+                  reuse);
     } else {
-      require(argc == 1, "usage: test [--fixture 10|20 output.mlir]");
+      require(argc == 1,
+              "usage: test [--fixture maxFlight output.mlir [profile [dataBits "
+              "beats idReuse]]]");
       for (unsigned flight : {10u, 20u})
-        composition(ctx, flight);
+        for (StringRef profile : {"", "fcfs", "frfcfs"})
+          composition(ctx, flight, {}, profile);
+      composition(ctx, 232, {}, "frfcfs-llc", 256, 2, 15);
+      composition(ctx, 232, {}, "fcfs", 256, 2, 15);
+      composition(ctx, 232, {}, "frfcfs", 256, 2, 15);
       llvm::outs() << "PASS real FRFCFS no-Print functional pipeline: token "
                       "engine through "
                       "functional queues/egress, native model, 68-word "

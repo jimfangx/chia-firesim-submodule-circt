@@ -9,6 +9,7 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
 #include <map>
 #include <functional>
 #include <random>
@@ -38,7 +39,23 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=fal
   auto top=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ports);
   if(mode!=9){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     auto attrs=[&](std::initializer_list<std::pair<llvm::StringRef,int>> es){NamedAttrList list;for(auto [n,v]:es)list.set(n,b.getI64IntegerAttr(v));return list.getDictionary(&ctx);};
-    if(mode!=20)engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxWriteTransfer",mode==19?4:8},{"idReuse",mode==10?3:static_cast<int>(reuse)},{"maxFlight",mode==21?0:mode==22?-1:static_cast<int>(flight)}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
+    if (mode != 20)
+      engine->setAttr(
+          "goldengate.bridgeConstructor",
+          b.getDictionaryAttr(
+              {b.getNamedAttr(
+                   "axi4Edge",
+                   attrs({{"maxWriteTransfer", mode == 19 ? 0 : 8},
+                          {"idReuse", mode == 10 ? 0 : static_cast<int>(reuse)},
+                          {"maxFlight",
+                           mode == 21   ? 0
+                           : mode == 22 ? -1
+                                        : static_cast<int>(flight)}})),
+               b.getNamedAttr(
+                   "axi4Widths",
+                   attrs(
+                       {{"addrBits", 35}, {"dataBits", 64}, {"idBits", 4}}))}));
+  }
   if(mode>=23&&mode<=26) {
     auto engine=named(c,"GGFASEDTokenEngine");
     NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));
@@ -137,7 +154,8 @@ void behavior(MLIRContext &ctx,bool selected,unsigned reuse,unsigned flight) {
   Interpreter sim(named(c,"GGFASEDWriteEgress"));std::map<std::string,Value> regs;
   for(auto r:sim.module.getOps<RegResetOp>())regs[r.getName().str()]=r.getResult();for(auto r:sim.module.getOps<RegOp>())regs[r.getName().str()]=r.getResult();
   require(regs.size()==19,"write egress state differs");
-  const unsigned counterWidth=reuse==1?1:2,limit=(1<<counterWidth)-1;
+  const unsigned counterWidth = llvm::Log2_64_Ceil(reuse + 1),
+                 limit = (1 << counterWidth) - 1;
   for(unsigned j=0;j<16;++j)require(sim.width(regs.at("ackCounters_"+std::to_string(j)))==counterWidth,"constructor counter width differs");
   std::mt19937_64 random(218);unsigned cases=0,cancelled=0,hostRetries=0,priority=0,wraps=0,oldSample=0,evenNonzero=0,underflows=0;
   auto sample=[&](unsigned active,unsigned ack,unsigned id,unsigned enqId,unsigned newId,unsigned flags,uint64_t mask){
@@ -224,6 +242,7 @@ int main(int argc, char **argv) {
     require(argc == 1, "usage: goldengate-fased-write-egress-test [boundary.mlir helper.mlir]");
     for(bool selected:{false,true}) {
       for(unsigned reuse:{1u,2u})for(unsigned flight:{1u,10u,20u})behavior(ctx,selected,reuse,flight);
+      behavior(ctx, selected, 15, 232);
       mapping(ctx,selected);rejection(ctx,selected);
     }
   } catch(const std::exception &e) {llvm::errs()<<e.what()<<"\n";return 1;}

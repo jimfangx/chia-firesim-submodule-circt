@@ -6,19 +6,23 @@
 #include "goldengate/FASEDRefreshUnit.h"
 #include "mlir/IR/Builders.h"
 #include <array>
+#include "goldengate/FASEDDRAMProfile.h"
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
     CircuitOp circuit, FModuleOp &result, std::string &error) {
-  constexpr llvm::StringLiteral name = "GGFASEDFRFCFSCommandScheduler";
+  bool fcfs = isFASEDFCFS(circuit);
+  llvm::StringRef name =
+      fcfs ? "GGFASEDFCFSCommandScheduler" : "GGFASEDFRFCFSCommandScheduler";
   // The rank materializer also creates the bank helper. Check every dependency
   // before invoking any materializer, including helpers created later below.
   for (auto module : circuit.getOps<FModuleLike>())
-    for (auto symbol : {name, llvm::StringLiteral("GGFASEDRankStateTracker"),
-                        llvm::StringLiteral("GGFASEDBankStateTracker"),
-                        llvm::StringLiteral("GGFASEDRefreshUnit"),
-                        llvm::StringLiteral("GGFASEDCollapsingBuffer")})
+    for (StringRef symbol : {name,
+                             StringRef("GGFASEDRankStateTracker"),
+                             StringRef("GGFASEDBankStateTracker"),
+                             StringRef("GGFASEDRefreshUnit"),
+                             StringRef("GGFASEDCollapsingBuffer")})
       if (module.getModuleName() == symbol) {
         error = "FASED FRFCFS scheduler requires free core, rank, bank, refresh and buffer symbols";
         return failure();
@@ -26,7 +30,8 @@ LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
   FModuleOp rank, refresh, buffer;
   if (failed(materializeFASEDRankStateTracker(circuit, rank, error)) ||
       failed(materializeFASEDRefreshUnit(circuit, refresh, error)) ||
-      failed(materializeFASEDCollapsingBuffer(circuit, buffer, error)))
+      (!fcfs &&
+       failed(materializeFASEDCollapsingBuffer(circuit, buffer, error))))
     return failure();
 
   auto *ctx = circuit.getContext();
@@ -73,7 +78,14 @@ LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
   port("cmdBank", u(3), Direction::Out);                                  // 23
   port("cmdRow", u(26), Direction::Out);                                  // 24
   port("autoPRE", bitType, Direction::Out);                               // 25
-  port("entries", buffer.getPortType(6), Direction::Out);             // 26
+  auto entryFields = metadataFields;
+  for (auto n : {"isReady", "mayPRE"})
+    entryFields.push_back({b.getStringAttr(n), false, bitType});
+  auto entry = BundleType::get(
+      ctx,
+      {{b.getStringAttr("valid"), false, bitType},
+       {b.getStringAttr("bits"), false, BundleType::get(ctx, entryFields)}});
+  port("entries", FVectorType::get(entry, fcfs ? 1 : 8), Direction::Out);  // 26
   port("rankStati", FVectorType::get(statusType, 4), Direction::Out);      // 27
   port("bankHasReadyEntries", u(32), Direction::Out);                      // 28
   b.setInsertionPointToEnd(circuit.getBodyBlock());
@@ -106,7 +118,9 @@ LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
   for (unsigned i = 0; i < 4; ++i)
     states.push_back(b.create<InstanceOp>(loc, rank, "rank" + std::to_string(i)));
   auto refreshInstance = b.create<InstanceOp>(loc, refresh, "refresh");
-  auto bufferInstance = b.create<InstanceOp>(loc, buffer, "referenceBuffer");
+  InstanceOp bufferInstance;
+  if (!fcfs)
+    bufferInstance = b.create<InstanceOp>(loc, buffer, "referenceBuffer");
   auto status = [&](unsigned r, StringRef n) -> Value {
     for (unsigned p = 10; p < rank.getNumPorts(); ++p)
       if (rank.getPortName(p) == n) return states[r].getResult(p);
@@ -131,6 +145,135 @@ LogicalResult goldengate::materializeFASEDFRFCFSCommandScheduler(
   connect(refreshInstance.getResult(1), pack(refreshable));
   connect(refreshInstance.getResult(2), pack(prechargeable));
   connect(refreshInstance.getResult(7), arg(11));
+  if (fcfs) {
+    // FIFOMASModel.currentReference is Queue(1, pipe=true, flow=false).
+    // Only this reference can issue commands; a younger row hit cannot pass it.
+    Value valid =
+        b.create<RegResetOp>(
+             loc, bitType, arg(0), enabledReset, zero, "currentReferenceValid")
+            .getResult();
+    Value current =
+        b.create<WireOp>(loc, metadataType, "currentReference").getResult();
+    Value reference = index(arg(26), 0);
+    connect(field(reference, "valid"), valid);
+    auto selectRank = [&](StringRef n) -> Value {
+      Value value = status(3, n);
+      for (int r = 2; r >= 0; --r)
+        value = mux(eq(field(current, "rankAddr"), constant(2, r)),
+                    status(r, n),
+                    value);
+      return value;
+    };
+    auto selectBank = [&](StringRef n) -> Value {
+      Value value;
+      for (int r = 3; r >= 0; --r) {
+        Value bank = bankStatus(r, 7, n);
+        for (int k = 6; k >= 0; --k)
+          bank = mux(eq(field(current, "bankAddr"), constant(3, k)),
+                     bankStatus(r, k, n),
+                     bank);
+        value = value ? mux(eq(field(current, "rankAddr"), constant(2, r)),
+                            bank,
+                            value)
+                      : bank;
+      }
+      return value;
+    };
+    Value rowHit = and_(selectBank("state"),
+                        eq(field(current, "rowAddr"), selectBank("openRow")));
+    Value notRefreshing = not_(selectRank("wantREF"));
+    auto legal = [&](StringRef n) {
+      return and_(selectBank(n), selectRank(n));
+    };
+    Value canRead =
+        and_(valid,
+             and_(rowHit,
+                  and_(not_(field(current, "isWrite")),
+                       and_(notRefreshing, and_(legal("canCASR"), arg(6))))));
+    Value canWrite =
+        and_(valid,
+             and_(rowHit,
+                  and_(field(current, "isWrite"),
+                       and_(notRefreshing, and_(legal("canCASW"), arg(7))))));
+    Value canAct = and_(valid, and_(legal("canACT"), notRefreshing));
+    Value canPre =
+        and_(arg(10), and_(valid, and_(not_(rowHit), legal("canPRE"))));
+    Value refreshREF = refreshInstance.getResult(8),
+          refreshPRE = refreshInstance.getResult(10);
+    Value cmd =
+        mux(refreshREF,
+            constant(3, 5),
+            mux(refreshPRE,
+                constant(3, 2),
+                mux(canRead,
+                    constant(3, 4),
+                    mux(canWrite,
+                        constant(3, 3),
+                        mux(canAct,
+                            constant(3, 1),
+                            mux(canPre, constant(3, 2), constant(3, 0)))))));
+    Value cmdRank = mux(refreshREF,
+                        refreshInstance.getResult(9),
+                        mux(refreshPRE,
+                            refreshInstance.getResult(11),
+                            field(current, "rankAddr")));
+    Value cmdBank = mux(and_(not_(refreshREF), refreshPRE),
+                        refreshInstance.getResult(12),
+                        field(current, "bankAddr"));
+    Value done = or_(eq(cmd, constant(3, 3)), eq(cmd, constant(3, 4)));
+    Value ready = or_(not_(valid), done), enq = and_(arg(4), ready);
+    connect(arg(13), ready);
+    connect(valid, mux(arg(2), mux(ready, arg(4), valid), valid));
+    for (auto [n, w] : llvm::zip(metadataNames, metadataWidths)) {
+      Value reg =
+          b.create<RegOp>(loc, u(w), arg(0), std::string("current_") + n)
+              .getResult();
+      connect(reg, mux(and_(arg(2), enq), field(arg(5), n), reg));
+      connect(field(current, n), reg);
+      connect(field(field(reference, "bits"), n), reg);
+    }
+    connect(field(field(reference, "bits"), "isReady"), rowHit);
+    connect(field(field(reference, "bits"), "mayPRE"), arg(10));
+    connect(arg(28), constant(32, 0));
+    Value autoPRE = and_(not_(arg(10)), done);
+    Value bankOH = constant(8, 0);
+    for (unsigned k = 0; k < 8; ++k)
+      bankOH = or_(bankOH,
+                   mux(eq(cmdBank, constant(3, k)),
+                       constant(8, 1u << k),
+                       constant(8, 0)));
+    for (unsigned r = 0; r < 4; ++r) {
+      for (unsigned i = 0; i < 3; ++i)
+        connect(states[r].getResult(i), arg(i));
+      connect(states[r].getResult(3), cmd);
+      connect(states[r].getResult(4), eq(cmdRank, constant(2, r)));
+      connect(states[r].getResult(5), bankOH);
+      connect(states[r].getResult(6), autoPRE);
+      connect(states[r].getResult(7), field(current, "rowAddr"));
+      connect(states[r].getResult(8), arg(8));
+      connect(states[r].getResult(9), arg(3));
+    }
+    connect(arg(14), and_(done, not_(field(current, "isWrite"))));
+    connect(arg(15), field(current, "id"));
+    connect(arg(16), field(current, "len"));
+    connect(arg(17), and_(done, field(current, "isWrite")));
+    connect(arg(18), field(current, "id"));
+    Value cas = trim(
+        b.create<AddPrimOp>(loc, field(arg(8), "tCAS"), field(arg(8), "tAL")),
+        7);
+    connect(arg(19),
+            trim(b.create<AddPrimOp>(
+                     loc, b.create<PadPrimOp>(loc, cas, 12), arg(12)),
+                 12));
+    connect(arg(20), constant(12, 1));
+    connect(arg(21), cmd);
+    connect(arg(22), cmdRank);
+    connect(arg(23), cmdBank);
+    connect(arg(24), field(current, "rowAddr"));
+    connect(arg(25), autoPRE);
+    result = module;
+    return success();
+  }
   connect(bufferInstance.getResult(0), arg(0));
   connect(bufferInstance.getResult(1), arg(1));
   connect(bufferInstance.getResult(2), arg(2));

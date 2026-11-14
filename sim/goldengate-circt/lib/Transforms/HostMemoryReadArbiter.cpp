@@ -15,6 +15,7 @@
 //   Reset is synchronous on the host clock; R responses retain their boundary.
 #include "goldengate/HostMemoryReadArbiter.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 #include <map>
 #include <optional>
@@ -54,8 +55,11 @@ LogicalResult goldengate::addHostMemoryReadArbiter(CircuitOp circuit,
     return a&&a.getValue().getBitWidth()<=64&&!a.getValue().isNegative()&&!a.getValue().isZero();
   };
   auto widths=key.getAs<DictionaryAttr>("axi4Widths"),edge=key.getAs<DictionaryAttr>("axi4Edge");
-  if(engine.getName()!="GGFASEDTokenEngine"||!has(widths,"addrBits",35)||!has(widths,"dataBits",64)||
-     !has(widths,"idBits",4)||!has(edge,"maxReadTransfer",8)||(!has(edge,"idReuse",1)&&!has(edge,"idReuse",2))||!positive(edge,"maxFlight"))
+  if (engine.getName() != "GGFASEDTokenEngine" ||
+      !has(widths, "addrBits", 35) ||
+      !validFASEDGeometry(getFASEDGeometry(circuit)) ||
+      !has(widths, "idBits", 4) || !positive(edge, "maxReadTransfer") ||
+      !positive(edge, "idReuse") || !positive(edge, "maxFlight"))
     return reject("host memory read arbiter supports the recorded LoadMem ID 16 and FASED IDs 0..15");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};

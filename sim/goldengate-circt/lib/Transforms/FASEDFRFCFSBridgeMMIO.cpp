@@ -7,16 +7,19 @@
 #include "goldengate/FASEDFRFCFSMMIO.h"
 #include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include "mlir/IR/Verifier.h"
 #include "llvm/ADT/StringSet.h"
 #include <functional>
 #include <map>
+#include "goldengate/FASEDDRAMProfile.h"
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::attachFASEDFRFCFSMMIO(CircuitOp circuit,
                                                 FModuleOp bank,
                                                 std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   auto reject = [&](StringRef why) {
     error = why.str();
     return failure();
@@ -31,13 +34,14 @@ LogicalResult goldengate::attachFASEDFRFCFSMMIO(CircuitOp circuit,
   auto base =
       circuit->getAttrOfType<IntegerAttr>("goldengate.fasedBaseCapacity");
   unsigned capacity, width;
-  if (!base || base.getValue().getBitWidth() > 64 || base.getInt() != 32 ||
+  if (!base || base.getValue().getBitWidth() > 64 ||
+      base.getInt() != getFASEDDRAMBaseCapacity(circuit) ||
       failed(getFASEDRequestLimitProfile(circuit, capacity, width, error)))
     return reject(
-        "FRFCFS MMIO requires the explicit base-32 functional profile");
-  if (capacity != 10 && capacity != 20)
-    return reject(
-        "FRFCFS MMIO requires selected effective capacity ten or twenty");
+        "FRFCFS MMIO requires the selected explicit DDR3 functional profile");
+  if (capacity == 0 || capacity > 32)
+    return reject("FRFCFS MMIO requires selected effective capacity ten, "
+                  "sixteen or twenty");
   FModuleOp inner;
   for (auto m : circuit.getOps<FModuleLike>()) {
     if (m.getModuleName() == output)
@@ -71,11 +75,11 @@ LogicalResult goldengate::attachFASEDFRFCFSMMIO(CircuitOp circuit,
                                      error,
                                      Direction::Out)))
     return failure();
-  if (descriptor.registerCount != 68)
-    return reject("FRFCFS MMIO requires all 68 selected register words");
+  if (descriptor.registerCount != getFASEDFRFCFSMMIORegisters(circuit).size())
+    return reject("FRFCFS MMIO requires all selected DDR3 register words");
 
   auto rows = bank->getAttrOfType<ArrayAttr>("goldengate.mmioRegisters");
-  auto expected = getFASEDFRFCFSMMIORegisters();
+  auto expected = getFASEDFRFCFSMMIORegisters(circuit);
   for (auto [i, row] : llvm::enumerate(rows)) {
     auto entry = cast<DictionaryAttr>(row);
     auto &reg = expected[entry.getAs<IntegerAttr>("offset").getInt() / 4];
@@ -102,8 +106,11 @@ LogicalResult goldengate::attachFASEDFRFCFSMMIO(CircuitOp circuit,
                             {b.getStringAttr("valid"), false, u(1)},
                             {b.getStringAttr("bits"), false, bits}});
   };
-  auto rType = token(payload(
-      {{"user", 1}, {"id", 4}, {"last", 1}, {"data", 64}, {"resp", 2}}));
+  auto rType = token(payload({{"user", 1},
+                              {"id", 4},
+                              {"last", 1},
+                              {"data", geometry.dataBits},
+                              {"resp", 2}}));
   auto bType = token(payload({{"user", 1}, {"id", 4}, {"resp", 2}}));
   auto find = [&](StringRef name,
                   Type type,

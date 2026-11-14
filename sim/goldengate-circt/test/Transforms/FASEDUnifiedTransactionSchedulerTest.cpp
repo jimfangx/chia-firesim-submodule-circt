@@ -87,8 +87,18 @@ void behavior(MLIRContext &ctx,unsigned capacity,llvm::StringRef output) {
   sim.state[sim.registers.at("lastGrant")]=1;
   std::mt19937_64 rng(0xa11b17+capacity);
   unsigned cycles=0,acceptedR=0,acceptedW=0,released=0,fullReject=0,blocked=0,stalledReset=0,simultaneous=0,saturated=0,resetGrant=0;
-  auto sample=[&](bool reset,bool fire,bool ar,bool aw,bool w,bool last,bool ready,unsigned pendingW,unsigned pendingAW){
-    sim.memo.clear();Request read{rng()%16,rng()%256,0,rng()&((1ULL<<35)-1)},write{rng()%16,rng()%256,1,rng()&((1ULL<<35)-1)};
+  auto sample = [&](bool reset,
+                    bool fire,
+                    bool ar,
+                    bool aw,
+                    bool w,
+                    bool last,
+                    bool ready,
+                    uint64_t pendingW,
+                    uint64_t pendingAW) {
+    sim.memo.clear();
+    Request read{rng() % 16, rng() % 256, 0, rng() & ((1ULL << 35) - 1)},
+        write{rng() % 16, rng() % 256, 1, rng() & ((1ULL << 35) - 1)};
     sim.inputs={{"reset",reset},{"targetFire",fire},{"arValid",ar},{"arId",read.id},{"arLen",read.len},{"arAddr",read.addr},
       {"awValid",aw},{"awId",write.id},{"awLen",write.len},{"awAddr",write.addr},{"wValid",w},{"wLast",last},{"pendingWReq",pendingW},{"pendingAWReq",pendingAW},{"nextReady",ready}};
     // Independent two-way round-robin reference: after a successful grant,
@@ -101,22 +111,50 @@ void behavior(MLIRContext &ctx,unsigned capacity,llvm::StringRef output) {
     require(sim.get("arReady")==expectAR&&sim.get("awReady")==expectAW,"RR ready differs");
     require(sim.get("wReady")==wready,"write data ready differs");
     require(sim.get("nextValid")==valid,"head gating differs");
-    if(valid){auto r=queue.front();require(sim.get("nextId")==r.id&&sim.get("nextLen")==r.len&&sim.get("nextIsWrite")==r.isWrite&&sim.get("nextAddr")==r.addr,"queue metadata differs");}
+    if(valid){
+      auto r = queue.front();
+      require(sim.get("nextId") == r.id && sim.get("nextLen") == r.len &&
+                  sim.get("nextIsWrite") == r.isWrite &&
+                  sim.get("nextAddr") == r.addr,
+              "queue metadata differs");
+    }
     bool enq=space&&(ar||aw),deq=valid&&ready;
     bool add=w&&last&&wready,sub=deq&&queue.front().isWrite;
     if(fire){
-      if(enq)lastGrant=selectAW;
-      if(reset){queue.clear();completed=0;}else{
-        if(deq){queue.pop_front();++released;}
-        if(enq){queue.push_back(selectAW?write:read);if(selectAW)++acceptedW;else ++acceptedR;}
-        if(add&&!sub&&completed<capacity)++completed;
-        else if(!add&&sub&&completed>0)--completed;
+      if(enq)
+        lastGrant = selectAW;
+      if(reset){
+        queue.clear();
+        completed = 0;
+      } else {
+        if(deq){
+          queue.pop_front();
+          ++released;
+        }
+        if(enq){
+          queue.push_back(selectAW ? write : read);
+          if (selectAW)
+            ++acceptedW;
+          else
+            ++acceptedR;
+        }
+        if(add&&!sub&&completed<capacity)
+          ++completed;
+        else if(!add&&sub&&completed>0)
+          --completed;
       }
     }
-    fullReject+=!space&&(ar||aw);blocked+=!queue.empty()&&queue.front().isWrite&&!completed;
-    stalledReset+=reset&&!fire;simultaneous+=fire&&add&&sub;saturated+=completed==capacity;resetGrant+=fire&&reset&&enq;
-    sim.edge();require(sim.state[sim.registers.at("completedWrites")]==completed,"completed write counter differs");
-    require(sim.state[sim.registers.at("lastGrant")]==lastGrant,"RR reset incorrectly changed winner");++cycles;
+    fullReject+=!space&&(ar||aw);
+    blocked += !queue.empty() && queue.front().isWrite && !completed;
+    stalledReset+=reset&&!fire;
+    simultaneous += fire && add && sub;
+    saturated += completed == capacity;
+    resetGrant += fire && reset && enq;
+    sim.edge();
+    require(sim.state[sim.registers.at("completedWrites")] == completed,
+            "completed write counter differs");
+    require(sim.state[sim.registers.at("lastGrant")]==lastGrant,"RR reset incorrectly changed winner");
+    ++cycles;
   };
   sample(true,true,false,false,false,false,false,0,0);
   // Fill from AR/AW while preventing release and exercise full rejection.
@@ -126,13 +164,23 @@ void behavior(MLIRContext &ctx,unsigned capacity,llvm::StringRef output) {
   for(unsigned i=0;i<32;++i)sample(false,true,false,false,true,true,true,0,0);
   sample(true,true,true,true,true,true,true,0,0);
   sample(true,false,true,true,true,true,true,0,0);
-  for(unsigned i=0;i<40000;++i)sample(rng()%97==0,rng()%5!=0,rng()%3!=0,rng()%3!=0,rng()%2,rng()%4!=0,rng()%3!=0,
-    rng()&((1u<<(capacity+1))-1),rng()&((1u<<(capacity+1))-1));
+  for(unsigned i=0;i<40000;++i)
+    sample(rng() % 97 == 0,
+           rng() % 5 != 0,
+           rng() % 3 != 0,
+           rng() % 3 != 0,
+           rng() % 2,
+           rng() % 4 != 0,
+           rng() % 3 != 0,
+           rng() & ((1ULL << (capacity + 1)) - 1),
+           rng() & ((1ULL << (capacity + 1)) - 1));
   require(acceptedR&&acceptedW&&released&&fullReject&&blocked&&stalledReset&&simultaneous&&saturated&&resetGrant,"missing boundary coverage");
   auto unchanged=print(root->getOperation());FModuleOp sentinel=top;
   require(failed(goldengate::materializeFASEDUnifiedTransactionScheduler(circuit,capacity,sentinel,error)),"duplicate accepted");
   require(sentinel==top&&print(root->getOperation())==unchanged,"duplicate failure changed circuit/result");
-  require(failed(goldengate::materializeFASEDUnifiedTransactionScheduler(circuit,32,sentinel,error)),"unsupported capacity accepted");
+  require(failed(goldengate::materializeFASEDUnifiedTransactionScheduler(
+              circuit, 33, sentinel, error)),
+          "unsupported capacity accepted");
   require(sentinel==top&&print(root->getOperation())==unchanged,"unsupported failure changed circuit/result");
   auto external=parseSourceString<ModuleOp>("module { firrtl.circuit \"Top\" { firrtl.module @Top() {} firrtl.extmodule @GGFASEDUnifiedTransactionScheduler"+std::to_string(capacity)+"() } }",&ctx);
   auto other=*external->getOps<CircuitOp>().begin();unchanged=print(external->getOperation());
@@ -145,6 +193,10 @@ void behavior(MLIRContext &ctx,unsigned capacity,llvm::StringRef output) {
 int main(int argc,char **argv){try{
   require(argc==1||argc==3,"usage: goldengate-fased-unified-transaction-scheduler-test [10|20 helper.mlir]");
   MLIRContext ctx;ctx.loadDialect<FIRRTLDialect,circt::hw::HWDialect>();
-  if(argc==3)behavior(ctx,std::stoul(argv[1]),argv[2]);else for(unsigned capacity:{10u,20u})behavior(ctx,capacity,"");
+  if (argc == 3)
+    behavior(ctx, std::stoul(argv[1]), argv[2]);
+  else
+    for (unsigned capacity : {10u, 16u, 20u, 32u})
+      behavior(ctx, capacity, "");
   return 0;
 }catch(const std::exception &e){llvm::errs()<<e.what()<<"\n";return 1;}}

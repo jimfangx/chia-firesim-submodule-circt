@@ -4,6 +4,7 @@
 // uses the old pending count; simultaneous increment/decrement holds occupancy.
 #include "goldengate/FASEDTimingMonitor.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <array>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -12,8 +13,9 @@ LogicalResult goldengate::materializeFASEDTimingMonitor(CircuitOp circuit,
                                                         unsigned maxFlight,
                                                         FModuleOp &result,
                                                         std::string &error) {
-  if (maxFlight != 10 && maxFlight != 20) {
-    error = "FASED timing monitor requires selected maxFlight 10 or 20";
+  if (maxFlight == 0 || maxFlight > 32) {
+    error = "FASED timing monitor requires selected maxFlight one through "
+            "thirty-two";
     return failure();
   }
   std::string name = "GGFASEDTimingMonitor" + std::to_string(maxFlight);
@@ -26,7 +28,7 @@ LogicalResult goldengate::materializeFASEDTimingMonitor(CircuitOp circuit,
   OpBuilder b(ctx);
   auto loc = circuit.getLoc();
   auto u = [&](unsigned w) { return UIntType::get(ctx, w, false); };
-  const unsigned pendingWidth = maxFlight == 10 ? 4 : 5;
+  const unsigned pendingWidth = llvm::Log2_64_Ceil(maxFlight + 1);
   SmallVector<BundleType::BundleElement> powerFields;
   for (auto n : {"allPreCycles", "numCASR", "numCASW", "numACT"})
     powerFields.push_back({b.getStringAttr(n), false, u(32)});
@@ -132,7 +134,9 @@ LogicalResult goldengate::materializeFASEDTimingMonitor(CircuitOp circuit,
       Value next = r;
       if (i < maximums.size()) {
         Value matches = b.create<LEQPrimOp>(
-            loc, count, constant(pendingWidth, maximums[i]));
+            loc,
+            b.create<PadPrimOp>(loc, count, std::max(4u, pendingWidth)),
+            constant(std::max(4u, pendingWidth), maximums[i]));
         next = mux(and_(not_(incremented), matches), incr(r, 32), r);
         incremented = or_(incremented, matches);
       }

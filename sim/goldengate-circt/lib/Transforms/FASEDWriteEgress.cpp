@@ -17,11 +17,13 @@
 // sampling and qualified reset/fire match SFC; request ID remains unreset.
 #include "goldengate/FASEDWriteEgress.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDWriteEgress(CircuitOp circuit, std::string &error) {
+  auto geometry = getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral helperName = "GGFASEDWriteEgress";
   bool isSelectedPrint = circuit.getName() == "GGSelectedPrintFASEDReadSchedulerWrapper";
   llvm::StringRef wrapperName = isSelectedPrint ? "GGSelectedPrintFASEDWriteEgressWrapper"
@@ -49,12 +51,13 @@ LogicalResult goldengate::addFASEDWriteEgress(CircuitOp circuit, std::string &er
   // maxRequests/maxReqLength do not enter the SFC WriteEgress logic.
   // Its acknowledgment width uses maxReqsPerId directly, without clamping
   // to maxFlight; maxFlight=1 still needs two bits when idReuse=2.
-  if (!has(edge,"maxWriteTransfer",8)||!reuse||reuse.getValue().getBitWidth()>64||
-      (reuse.getInt()!=1&&reuse.getInt()!=2)||!flight||
-      flight.getValue().getBitWidth()>64||flight.getInt()<=0||
-      !has(widths,"addrBits",35)||!has(widths,"dataBits",64)||!has(widths,"idBits",4))
-    return reject("FASED write egress supports 35/64/4-bit, 8-beat, one or two requests per ID with positive maxFlight");
-  unsigned counterWidth=reuse.getInt()==1?1:2;
+  if (!reuse || !flight || !edge.getAs<IntegerAttr>("maxWriteTransfer") ||
+      !validFASEDGeometry(geometry) || !has(widths, "addrBits", 35) ||
+      !has(widths, "idBits", 4))
+    return reject("FASED requires a valid byte-addressable AXI data width, "
+                  "transfer lengths, ID reuse and maxFlight");
+
+  unsigned counterWidth = llvm::Log2_64_Ceil(geometry.idReuse + 1);
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w) {return UIntType::get(ctx,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> es) {

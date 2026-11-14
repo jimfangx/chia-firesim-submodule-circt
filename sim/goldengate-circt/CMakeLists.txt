@@ -114,7 +114,7 @@ add_executable(goldengate-circt
   lib/Transforms/FASEDTokenEngine.cpp
   lib/Transforms/FASEDHostOutstanding.cpp
   lib/Transforms/FASEDIngressIssue.cpp
-  lib/Transforms/FASEDHostMemory.cpp
+  lib/Transforms/FASEDHostMemory.cpp lib/Transforms/FASEDHostWidthAdapter.cpp
   lib/Transforms/FASEDAddressTranslation.cpp
   lib/Transforms/FASEDReadDeinterleaver.cpp
   lib/Transforms/FASEDHostMemoryBuffer.cpp
@@ -605,7 +605,7 @@ if(BUILD_TESTING)
     lib/Transforms/TSIMMIOBank.cpp
     lib/Transforms/SimulationMaster.cpp
     lib/Transforms/SimulationMasterControl.cpp
-    lib/Transforms/FASEDHostMemory.cpp
+    lib/Transforms/FASEDHostMemory.cpp lib/Transforms/FASEDHostWidthAdapter.cpp
     lib/Transforms/FASEDReadDeinterleaver.cpp
     lib/Transforms/FASEDHostMemoryBuffer.cpp
     lib/Transforms/FASEDAddressTranslation.cpp
@@ -1659,7 +1659,7 @@ if(BUILD_TESTING)
     CIRCTFIRRTL CIRCTHW MLIRParser MLIRIR MLIRSupport LLVMSupport)
   add_test(NAME goldengate-control-master COMMAND goldengate-control-master-test)
   add_executable(goldengate-fased-host-memory-test
-    test/Transforms/FASEDHostMemoryTest.cpp lib/Transforms/FASEDHostMemory.cpp)
+    test/Transforms/FASEDHostMemoryTest.cpp lib/Transforms/FASEDHostMemory.cpp lib/Transforms/FASEDHostWidthAdapter.cpp)
   target_compile_features(goldengate-fased-host-memory-test PRIVATE cxx_std_17)
   target_compile_options(goldengate-fased-host-memory-test PRIVATE -fno-rtti)
   target_include_directories(goldengate-fased-host-memory-test PRIVATE
@@ -2534,6 +2534,17 @@ if(BUILD_TESTING)
 endif()
 
 if(BUILD_TESTING)
+  add_executable(goldengate-fased-host-width-adapter-test
+    test/Transforms/FASEDHostWidthAdapterTest.cpp lib/Transforms/FASEDHostWidthAdapter.cpp)
+  target_compile_features(goldengate-fased-host-width-adapter-test PRIVATE cxx_std_17)
+  target_compile_options(goldengate-fased-host-width-adapter-test PRIVATE -fno-rtti)
+  target_include_directories(goldengate-fased-host-width-adapter-test PRIVATE
+    include ${CIRCT_INCLUDE_DIRS} ${LLVM_INCLUDE_DIRS} ${MLIR_INCLUDE_DIRS})
+  target_link_libraries(goldengate-fased-host-width-adapter-test PRIVATE
+    CIRCTFIRRTL CIRCTHW MLIRIR MLIRParser MLIRSupport LLVMSupport)
+endif()
+
+if(BUILD_TESTING)
   set(frfcfs_bridge_dependencies
     lib/Transforms/FASEDFRFCFSBridge.cpp lib/Transforms/FASEDFRFCFSTimingModel.cpp
     lib/Transforms/FASEDAXI4Releaser.cpp lib/Transforms/FASEDTimingMonitor.cpp
@@ -2975,6 +2986,20 @@ if(BUILD_TESTING AND Python3_Interpreter_FOUND)
   find_program(GOLDENGATE_ASSERT_VERILATOR NAMES verilator
     HINTS "${CMAKE_CURRENT_SOURCE_DIR}/../../../../.conda-env/bin")
   if(GOLDENGATE_ASSERT_FIRTOOL AND GOLDENGATE_ASSERT_VERILATOR)
+    add_test(NAME goldengate-fased-host-width-adapter-rtl
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FASEDHostWidthAdapterRTLTest.py
+        --fixture $<TARGET_FILE:goldengate-fased-host-width-adapter-test>
+        --firtool ${GOLDENGATE_ASSERT_FIRTOOL}
+        --verilator ${GOLDENGATE_ASSERT_VERILATOR}
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/host-width-adapter-rtl)
+    add_test(NAME goldengate-fased-dram-profiles-rtl
+      COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FASEDDRAMProfilesRTLTest.py
+        --fixture $<TARGET_FILE:goldengate-fased-frfcfs-pipeline-test>
+        --firtool ${GOLDENGATE_ASSERT_FIRTOOL}
+        --verilator ${GOLDENGATE_ASSERT_VERILATOR}
+        --output-dir ${CMAKE_CURRENT_BINARY_DIR}/dram-profiles-rtl)
     add_test(NAME goldengate-fame5-memory-64-rtl
       COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/test/Transforms/FAME5Memory64RTLTest.py

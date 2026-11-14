@@ -188,6 +188,7 @@
 #include <set>
 #include <string>
 #include <tuple>
+#include "goldengate/FASEDDRAMProfile.h"
 
 using namespace circt;
 using namespace circt::firrtl;
@@ -483,7 +484,10 @@ int main(int argc, char **argv) {
   llvm::StringRef outputBase = "FireSim-generated";
   llvm::StringRef platformConfig = "BaseXilinxAlveoU250Config";
   bool isF2 = false;
-  bool fasedFRFCFS = false;
+  bool defaultF2 = false;
+  bool tokenIrrevocabilityAssertions = false;
+  bool fasedDRAM = false;
+  llvm::StringRef fasedDRAMProfile, memoryFragment;
   unsigned ctrlAddressBits = 25;
   bool enableAutoILA = false;
   bool enableAutoCounterPrintf = false;
@@ -819,21 +823,41 @@ int main(int argc, char **argv) {
     platformConfig.split(fragments, '_', -1, false);
     bool hasPlatformBase = false;
     for (auto fragment : fragments) {
-      if (fragment == "BaseXilinxAlveoU250Config" || fragment == "BaseF2Config") {
+      if (fragment == "BaseXilinxAlveoU250Config" ||
+          fragment == "BaseF2Config" || fragment == "DefaultF2Config") {
         if (hasPlatformBase) return fail("duplicate or conflicting base compiler configuration");
         hasPlatformBase = true;
-        isF2 = fragment == "BaseF2Config";
+        isF2 = fragment != "BaseXilinxAlveoU250Config";
+        if (fragment == "DefaultF2Config") {
+          defaultF2 = true;
+          // midasexamples.BaseMidasExamplesConfig enables the simulator debug
+          // features in addition to the F2 interface and default memory model.
+          enableSynthAsserts = enableMultiCycleRamModels = true;
+          enableMultiThreading = enableAutoILA = true;
+          enableSynthPrints = enableAutoCounterCSV = true;
+          tokenIrrevocabilityAssertions = true;
+        }
         // midas.F2Config uses CtrlNastiKey(32,32,12); U250 inherits
         // F1Config's (32,25,12). Propagate the actual address width through
         // every widget, decoder and platform boundary.
         ctrlAddressBits = isF2 ? 32 : 25;
-      } else if (fragment == "FRFCFS16GBQuadRankLLC4MB") {
-        if (fasedFRFCFS)
-          return fail("duplicate FRFCFS16GBQuadRankLLC4MB compiler configuration");
-        fasedFRFCFS = true;
+      } else if (fragment == "FRFCFS16GBQuadRankLLC4MB" ||
+                 fragment == "FRFCFS16GBQuadRank" ||
+                 fragment == "FCFS16GBQuadRank") {
+        if (fasedDRAM)
+          return fail(memoryFragment == fragment
+                          ? "duplicate " + fragment.str() +
+                                " compiler configuration"
+                          : "conflicting memory compiler configurations");
+        memoryFragment = fragment;
+        fasedDRAM = true;
+        fasedDRAMProfile = fragment == "FCFS16GBQuadRank"     ? "fcfs"
+                           : fragment == "FRFCFS16GBQuadRank" ? "frfcfs"
+                                                              : "frfcfs-llc";
       } else if (fragment == "WithSynthAsserts") {
         enableSynthAsserts = true;
-      } else if (fragment == "WithMultiCycleRamModels" || fragment == "MCRams") {
+      } else if (fragment == "WithMultiCycleRamModels" ||
+                 fragment == "MCRams") {
         enableMultiCycleRamModels = true;
       } else if (fragment == "WithPrintfSynthesis") {
         enableSynthPrints = true;
@@ -842,7 +866,8 @@ int main(int argc, char **argv) {
       } else if (fragment == "WithAutoCounterPrintf") {
         enableAutoCounterPrintf = true;
         enableSynthPrints = true;
-      } else if (fragment == "MTModels" || fragment == "WithModelMultiThreading") {
+      } else if (fragment == "MTModels" ||
+                 fragment == "WithModelMultiThreading") {
         enableMultiThreading = true;
       } else if (fragment == "WithAutoILA") {
         enableAutoILA = true;
@@ -860,8 +885,10 @@ int main(int argc, char **argv) {
       return fail("Golden Gate platform configuration requires BaseXilinxAlveoU250Config or BaseF2Config");
   }
   // The selected DDR3/LLC implementation uses F2 platform geometry.
-  if (fasedFRFCFS && !isF2)
-    return fail("FRFCFS16GBQuadRankLLC4MB requires BaseF2Config in the native compiler");
+  if (fasedDRAM && !isF2)
+    return fail(
+        memoryFragment.str() +
+        " requires BaseF2Config or DefaultF2Config in the native compiler");
   if (enableAutoCounterCSV && enableAutoCounterPrintf)
     return fail("AutoCounter CSV and printf implementations are mutually exclusive");
   // WithAutoCounterPrintf also enables SynthPrints in the Scala configuration.
@@ -1007,12 +1034,21 @@ int main(int argc, char **argv) {
         deduplicateMirroredAnnotations(sidecar->getAsArray()->size());
   }
   const std::string originalTargetName = circuit.getName().str();
+  if (compileBaseline && defaultF2)
+    circuit->setAttr("goldengate.f2PCIM", BoolAttr::get(&context, false));
+  if (compileBaseline && tokenIrrevocabilityAssertions)
+    circuit->setAttr("goldengate.tokenIrrevocabilityAssertions",
+                     BoolAttr::get(&context, true));
   // Platform capacity must precede early allocation and all functional queues.
   // maxFlight caps this capacity; it does not identify the platform model.
   if (compileBaseline)
-    circuit->setAttr("goldengate.fasedBaseCapacity",
-        IntegerAttr::get(IntegerType::get(&context, 32), fasedFRFCFS ? 32 : 16));
-
+    circuit->setAttr(
+        "goldengate.fasedBaseCapacity",
+        IntegerAttr::get(IntegerType::get(&context, 32),
+                         fasedDRAM && fasedDRAMProfile != "fcfs" ? 32 : 16));
+  if (compileBaseline && fasedDRAM)
+    circuit->setAttr("goldengate.fasedDRAMProfile",
+                     StringAttr::get(&context, fasedDRAMProfile));
 
   auto emitPrintPayloadBoundary = [&]() -> int {
     std::string error;
@@ -3870,7 +3906,7 @@ int main(int argc, char **argv) {
       FModuleOp fasedFRFCFSBank, fasedLatencyBank, fasedRequestLimitsBank,
           fasedFunctionalModelBank, fasedResponseErrorsBank, fasedStatisticsBank,
           fasedHistogramsBank;
-      if (fasedFRFCFS) {
+      if (fasedDRAM) {
         if (failed(goldengate::materializeFASEDFRFCFSMMIO(circuit, fasedFRFCFSBank, error)))
           return fail("FASED FRFCFS MMIO materialization: " + error);
         if (failed(mlir::verify(*module)))
@@ -3882,7 +3918,8 @@ int main(int argc, char **argv) {
           return fail("cannot write FASED FRFCFS MMIO bank: " + ec.message());
         if (failed(goldengate::emitAllAnnotations(circuit, bankAnnotations, error)))
           return fail("FASED FRFCFS MMIO bank annotations: " + error);
-        llvm::outs() << "Materialized CIRCT FASED FRFCFS 68-word bank before control allocation\n";
+        llvm::outs()
+            << "Materialized CIRCT FASED DDR3 bank before control allocation\n";
       } else {
         // FASED host register fragments: allocate their state independently
         // of the later timing-model wrappers. Remaining fragments still attach late.
@@ -3987,7 +4024,7 @@ int main(int argc, char **argv) {
       // FASED fragments now exist, so derive its size from their complete
       // registry. Validate the assembled typed MCR port again before binding.
       SmallVector<llvm::StringRef> fasedRegisterModules;
-      if (fasedFRFCFS)
+      if (fasedDRAM)
         fasedRegisterModules = {"GGFASEDFRFCFSMMIO"};
       else
         fasedRegisterModules = {"GGFASEDLatencyRegisters", "GGFASEDRequestLimits",
@@ -4536,7 +4573,7 @@ int main(int argc, char **argv) {
       if (failed(goldengate::emitAllAnnotations(circuit, fasedWriteEgressAnnotations, error)))
         return fail("FASED write egress annotations: " + error);
       llvm::outs() << "Mapped CIRCT FASED per-ID write acknowledgements and token readiness in " << fasedWriteEgressPath << '\n';
-      if (fasedFRFCFS) {
+      if (fasedDRAM) {
         if (failed(goldengate::addFASEDFRFCFSBridge(circuit, error)))
           return fail("FASED FRFCFS timing/functional attachment: " + error);
         if (failed(mlir::verify(*module)))
@@ -4552,7 +4589,8 @@ int main(int argc, char **argv) {
           return fail("cannot write FASED FRFCFS attachment: " + ec.message());
         if (failed(goldengate::emitAllAnnotations(circuit, modelAnnotations, error)))
           return fail("FASED FRFCFS attachment annotations: " + error);
-        llvm::outs() << "Attached CIRCT FASED FRFCFS DDR3/LLC model and 68-word MMIO bank\n";
+        llvm::outs() << "Attached CIRCT FASED DDR3 model and profile-specific "
+                        "MMIO bank\n";
       } else {
         // NIC and no-NIC models share AXI4Releaser's pipe occupancy queues.
         // Advance their native state and model reset only on a target token.

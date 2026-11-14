@@ -9,6 +9,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include "goldengate/TokenIrrevocability.h"
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -416,6 +417,10 @@ LogicalResult goldengate::addFAMEReadyValidChannel(CircuitOp circuit,
   Value fwdReady = wire(bit, "enqFwdQ_deq_ready"), revReady = wire(bit, "deqRevQ_deq_ready");
   Value packed = arg(3);
   if (width) packed = b.create<CatPrimOp>(loc, arg(3), arg(4));
+  assertTokenIrrevocable(
+      circuit, b, loc, arg(0), arg(1), arg(6), packed, arg(5), "enqFwd");
+  assertTokenIrrevocable(
+      circuit, b, loc, arg(0), arg(1), arg(15), arg(9), arg(14), "deqRev");
   Queue fwd = queue(b, loc, arg(0), arg(1), arg(6), packed, fwdReady, true, "enqFwdQ");
   Queue rev = queue(b, loc, arg(0), arg(1), arg(15), arg(9), revReady, true, "deqRevQ");
   Value deqFired = b.create<RegResetOp>(loc, bit, arg(0), arg(1), zero, "deqFwdFired").getResult();

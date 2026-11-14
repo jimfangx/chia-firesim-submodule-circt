@@ -137,6 +137,10 @@ int main(int argc, char **argv) {
     auto missingBefore=dump(missingPcim);
     require(failed(goldengate::prepareMetasimInterfaceHeader(missingCircuit,"F2Target",f2error,true)) &&
             missingBefore==dump(missingPcim),"missing F2 PCIM accepted or mutated on failure");
+    missingCircuit->setAttr("goldengate.f2PCIM", builder.getBoolAttr(false));
+    require(StringRef(run(missingCircuit, "DefaultF2Target", true))
+                .contains(".fpga_managed = std::nullopt"),
+            "DefaultF2 header requires absent physical PCIM");
     missingPcim.erase();
     auto f2body=run(f2c,"F2Target",true);
     require(StringRef(f2body).contains(".qsfp = FPGATopQSFPConfig{256, 0}") &&

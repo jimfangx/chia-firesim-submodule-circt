@@ -41,7 +41,21 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0,bool selected=fal
   auto top=b.create<FModuleOp>(c.getLoc(),b.getStringAttr(c.getName()),ConventionAttr::get(&ctx,Convention::Internal),ports);
   if(mode!=10){auto engine=b.create<FModuleOp>(c.getLoc(),b.getStringAttr("GGFASEDTokenEngine"),top.getConventionAttr(),ArrayRef<PortInfo>{});
     auto attrs=[&](std::initializer_list<std::pair<llvm::StringRef,int>> es){NamedAttrList list;for(auto [n,v]:es)list.set(n,b.getI64IntegerAttr(v));return list.getDictionary(&ctx);};
-    engine->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Edge",attrs({{"maxReadTransfer",8},{"idReuse",mode==11?3:static_cast<int>(reuse)},{"maxFlight",mode==20?0:mode==21?-1:static_cast<int>(flight)}})),b.getNamedAttr("axi4Widths",attrs({{"addrBits",35},{"dataBits",64},{"idBits",4}}))}));}
+    engine->setAttr(
+        "goldengate.bridgeConstructor",
+        b.getDictionaryAttr(
+            {b.getNamedAttr(
+                 "axi4Edge",
+                 attrs({{"maxReadTransfer", 8},
+                        {"idReuse", mode == 11 ? 0 : static_cast<int>(reuse)},
+                        {"maxFlight",
+                         mode == 20   ? 0
+                         : mode == 21 ? -1
+                                      : static_cast<int>(flight)}})),
+             b.getNamedAttr(
+                 "axi4Widths",
+                 attrs({{"addrBits", 35}, {"dataBits", 64}, {"idBits", 4}}))}));
+  }
   if(mode>=22&&mode<=25) {
     auto engine=named(c,"GGFASEDTokenEngine");
     NamedAttrList key(engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor"));

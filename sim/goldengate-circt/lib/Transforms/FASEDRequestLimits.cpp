@@ -40,9 +40,10 @@ LogicalResult requireLatencyPipeBank(CircuitOp circuit, std::string &error) {
   unsigned capacity;
   if (failed(baseCapacity(circuit, capacity, error)))
     return failure();
-  if (capacity != 16) {
-    error = "FASED request-limit MMIO bank requires the base-16 LatencyPipe "
-            "profile; FRFCFS has no programmable read/write maximum words";
+  if (capacity != 16 || circuit->hasAttr("goldengate.fasedDRAMProfile")) {
+    error =
+        "FASED request-limit MMIO bank requires the base-16 LatencyPipe "
+        "profile; DDR3 models have no programmable read/write maximum words";
     return failure();
   }
   return success();

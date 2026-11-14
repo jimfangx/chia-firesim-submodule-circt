@@ -16,7 +16,8 @@ namespace {
 void require(bool v,StringRef s){if(!v)throw std::runtime_error(s.str());}
 std::string dump(Operation *m){std::string s;llvm::raw_string_ostream os(s);m->print(os);return s;}
 FModuleOp top(CircuitOp c,StringRef n){for(auto m:c.getOps<FModuleOp>())if(m.getName()==n)return m;throw std::runtime_error("missing module");}
-OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0){
+OwningOpRef<ModuleOp>
+fixture(MLIRContext &ctx, unsigned bad = 0, unsigned width = 64) {
   std::string address="user: uint<1>, id: uint<4>, region: uint<4>, qos: uint<4>, prot: uint<3>, cache: uint<4>, lock: uint<1>, burst: uint<2>, size: uint<3>, len: uint<8>, addr: uint<35>";
   auto token=[](std::string fs){return "bundle<ready flip: uint<1>, valid: uint<1>, bits: bundle<"+fs+">>";};
   std::string s="module { firrtl.circuit \"GGControlMasterWrapper\" { firrtl.module @GGControlMasterWrapper(in %hostClock: !firrtl.clock, in %hostReset: !firrtl.uint<1>, out %diagnostic: !firrtl.uint<4>, out %fased_host_requests: !firrtl.bundle<aw: "+token(address)+", w: "+token("user: uint<1>, strb: uint<8>, id: uint<4>, last: uint<1>, data: uint<64>")+", ar: "+token(address)+">, in %fased_host_read_response: !firrtl."+token("user: uint<1>, id: uint<4>, last: uint<1>, data: uint<64>, resp: uint<2>")+", in %fased_host_write_response: !firrtl."+token("user: uint<1>, id: uint<4>, resp: uint<2>");
@@ -26,13 +27,34 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned bad=0){
   if(bad==2)s.replace(s.find("in %fased_host_read_response"),2,"out");
   if(bad==9)s.replace(s.find("strb: uint<8>"),std::string("strb: uint<8>").size(),"strb: uint<7>");
   if(bad==10)s.replace(s.find("ready flip: uint<1>"),std::string("ready flip: uint<1>").size(),"ready: uint<1>");
+  if (width != 64) {
+    auto replaceAll = [&](std::string old, std::string value) {
+      size_t i = 0;
+      while ((i = s.find(old, i)) != std::string::npos) {
+        s.replace(i, old.size(), value);
+        i += value.size();
+      }
+    };
+    replaceAll("data: uint<64>", "data: uint<" + std::to_string(width) + ">");
+    replaceAll("strb: uint<8>",
+               "strb: uint<" + std::to_string(width / 8) + ">");
+  }
   auto root=parseSourceString<ModuleOp>(s,&ctx);require(bool(root),"fixture parse failed");
   auto c=*root->getOps<CircuitOp>().begin();OpBuilder b(&ctx);
   SmallVector<Attribute> annos;
   for(auto n:{"diagnostic","fased_host_requests.aw.bits.addr","fased_host_read_response.bits.resp","fased_host_write_response.ready","fased_host_requests.w.bits.id","fased_host_requests","fased_host_read_response.bits.user"})
     annos.push_back(b.getDictionaryAttr({b.getNamedAttr("class",b.getStringAttr("test.Target")),b.getNamedAttr("targets",b.getArrayAttr({b.getStringAttr("~GGControlMasterWrapper|GGControlMasterWrapper>"+std::string(n))}))}));
   c->setAttr("rawAnnotations",b.getArrayAttr(annos));
-  top(c,"GGFASEDTokenEngine")->setAttr("goldengate.bridgeConstructor",b.getDictionaryAttr({b.getNamedAttr("axi4Widths",b.getDictionaryAttr({b.getNamedAttr("addrBits",b.getI64IntegerAttr(35)),b.getNamedAttr("dataBits",b.getI64IntegerAttr(bad==4?128:64)),b.getNamedAttr("idBits",b.getI64IntegerAttr(4))}))}));
+  top(c, "GGFASEDTokenEngine")
+      ->setAttr(
+          "goldengate.bridgeConstructor",
+          b.getDictionaryAttr({b.getNamedAttr(
+              "axi4Widths",
+              b.getDictionaryAttr(
+                  {b.getNamedAttr("addrBits", b.getI64IntegerAttr(35)),
+                   b.getNamedAttr("dataBits",
+                                  b.getI64IntegerAttr(bad == 4 ? 128 : width)),
+                   b.getNamedAttr("idBits", b.getI64IntegerAttr(4))}))}));
   if(bad==5)c->removeAttr("rawAnnotations");
   if(bad==6){auto m=top(c,"GGControlMasterWrapper");b.setInsertionPointToStart(m.getBodyBlock());b.create<InstanceOp>(c.getLoc(),m,"used");}
   if(bad==7)c.setName("Wrong");
@@ -74,6 +96,26 @@ int main(){
     auto as=c->getAttrOfType<ArrayAttr>("rawAnnotations");require(as.size()==7,"annotations lost");
     const char *targets[]{"GGFASEDHostMemoryWrapper>diagnostic","GGFASEDHostMemoryWrapper>fased_host_mem.aw.bits.addr","GGFASEDHostMemoryWrapper>fased_host_mem.r.bits.resp","GGFASEDHostMemoryWrapper>fased_host_mem.b.ready","GGControlMasterWrapper>fased_host_requests.w.bits.id","GGControlMasterWrapper>fased_host_requests","GGControlMasterWrapper>fased_host_read_response.bits.user"};
     for(auto [i,a]:llvm::enumerate(as))require(cast<StringAttr>(cast<DictionaryAttr>(a).getAs<ArrayAttr>("targets")[0]).getValue()=="~GGFASEDHostMemoryWrapper|"+std::string(targets[i]),"target transfer differs");
+    for (unsigned width : {128u, 256u, 512u}) {
+      auto wide = fixture(ctx, 0, width);
+      auto wc = *wide->getOps<CircuitOp>().begin();
+      require(succeeded(goldengate::bindFASEDHostMemory(wc, error)) &&
+                  succeeded(verify(*wide)),
+              "wide host binding failed");
+      auto adapter = top(wc, "GGFASEDHostWidthAdapter");
+      auto in = cast<BundleType>(adapter.getPortType(2)),
+           out = cast<BundleType>(adapter.getPortType(3));
+      auto dataType = [](BundleType bus) {
+        return cast<BundleType>(cast<BundleType>(bus.getElement("r")->type)
+                                    .getElement("bits")
+                                    ->type)
+            .getElement("data")
+            ->type;
+      };
+      require(cast<UIntType>(dataType(in)).getWidth() == width &&
+                  cast<UIntType>(dataType(out)).getWidth() == 64,
+              "host data width adapter missing");
+    }
     auto good=dump(*root);require(failed(goldengate::bindFASEDHostMemory(c,error))&&dump(*root)==good,"repeat mutated IR");
     for(unsigned bad=1;bad<=11;++bad){auto r=fixture(ctx,bad);auto c=*r->getOps<CircuitOp>().begin();auto original=dump(*r);require(failed(goldengate::bindFASEDHostMemory(c,error)),"invalid boundary accepted");require(original==dump(*r),"rejection mutated IR");}
     llvm::outs()<<"FASED host memory: 37 AXI leaves, two invalid users, target transfer and 12 atomic rejections passed\n";return 0;

@@ -6,7 +6,10 @@
 #include "goldengate/FASEDLLCModel.h"
 #include "goldengate/FASEDTimingMonitor.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
+#include "llvm/Support/MathExtras.h"
 #include <tuple>
+#include "goldengate/FASEDDRAMProfile.h"
 using namespace mlir;
 using namespace circt::firrtl;
 
@@ -15,13 +18,19 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
                                               unsigned maxFlight,
                                               FModuleOp &result,
                                               std::string &error) {
-  if (maxFlight != 10 && maxFlight != 20) {
-    error = "FRFCFS timing model requires selected maxFlight 10 or 20";
+  if (maxFlight == 0 || maxFlight > 32) {
+    error = "FRFCFS timing model requires selected maxFlight one through "
+            "thirty-two";
     return failure();
   }
+  auto geometry = getFASEDGeometry(circuit);
+  bool useLLC = hasFASEDLLC(circuit);
   std::string suffix = std::to_string(maxFlight);
   std::string name = "GGFASEDFRFCFSTimingModel" + suffix;
-  std::string controllerName = "GGFASEDFRFCFSController" + suffix;
+  std::string controllerName =
+      (isFASEDFCFS(circuit) ? "GGFASEDFCFSController"
+                            : "GGFASEDFRFCFSController") +
+      suffix;
   std::string frontendName = "GGFASEDUnifiedTransactionScheduler" + suffix;
   std::string monitorName = "GGFASEDTimingMonitor" + suffix;
   SmallVector<StringRef> symbols{name,
@@ -33,7 +42,9 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
                                  "GGFASEDLLCMSHRTable",
                                  "GGFASEDAXI4Releaser",
                                  "GGFASEDDRAMBackend",
-                                 "GGFASEDFRFCFSCommandScheduler",
+                                 isFASEDFCFS(circuit)
+                                     ? "GGFASEDFCFSCommandScheduler"
+                                     : "GGFASEDFRFCFSCommandScheduler",
                                  "GGFASEDRankStateTracker",
                                  "GGFASEDBankStateTracker",
                                  "GGFASEDRefreshUnit",
@@ -44,7 +55,7 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
       return failure();
     }
   FModuleOp llc, controller, releaser, monitor;
-  if (failed(materializeFASEDLLCModel(circuit, llc, error)) ||
+  if ((useLLC && failed(materializeFASEDLLCModel(circuit, llc, error))) ||
       failed(materializeFASEDFRFCFSController(
           circuit, maxFlight, controller, error)) ||
       failed(materializeFASEDAXI4Releaser(circuit, releaser, error)) ||
@@ -64,11 +75,26 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
       }
     llvm_unreachable("unknown copied timing model port");
   };
-  for (auto n : {"clock", "reset",   "targetFire", "arValid",   "arReady",
-                 "arId",  "arLen",   "arAddr",     "awValid",   "awReady",
-                 "awId",  "awLen",   "awAddr",     "wValid",    "wReady",
-                 "wLast", "wayBits", "setBits",    "blockBits", "activeMSHRs"})
-    copy(llc, n);
+  for (auto n : {"clock",
+                 "reset",
+                 "targetFire",
+                 "arValid",
+                 "arReady",
+                 "arId",
+                 "arLen",
+                 "arAddr",
+                 "awValid",
+                 "awReady",
+                 "awId",
+                 "awLen",
+                 "awAddr",
+                 "wValid",
+                 "wReady",
+                 "wLast"})
+    copy(useLLC ? llc : controller, n);
+  if (useLLC)
+    for (auto n : {"wayBits", "setBits", "blockBits", "activeMSHRs"})
+      copy(llc, n);
   for (auto n : {"arBurst", "awBurst"})
     ports.push_back({b.getStringAttr(n), u(2), Direction::In});
   for (auto p : releaser.getPorts())
@@ -86,18 +112,20 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
                  "rowAddrOffset",
                  "rowAddrMask",
                  "targetCycle"})
-    copy(controller, n);
+    if (StringRef(n) != "schedulerWindowSize" || !isFASEDFCFS(circuit))
+      copy(controller, n);
   for (auto p : monitor.getPorts())
     if (p.direction == Direction::Out)
       ports.push_back(p);
   // Expose observations without importing oracle state into any native stage.
   for (auto pair :
        {std::pair<FModuleOp, StringRef>{controller, "dram_"}, {llc, "llc_"}})
-    for (auto p : pair.first.getPorts())
-      if (p.direction == Direction::Out)
-        ports.push_back({b.getStringAttr((pair.second + p.getName()).str()),
-                         p.type,
-                         p.direction});
+    if (pair.first)
+      for (auto p : pair.first.getPorts())
+        if (p.direction == Direction::Out)
+          ports.push_back({b.getStringAttr((pair.second + p.getName()).str()),
+                           p.type,
+                           p.direction});
 
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto module =
@@ -112,7 +140,9 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
         return module.getBodyBlock()->getArgument(i);
     llvm_unreachable("unknown timing model port");
   };
-  auto l = b.create<InstanceOp>(loc, llc, "llc");
+  InstanceOp l;
+  if (useLLC)
+    l = b.create<InstanceOp>(loc, llc, "llc");
   auto d = b.create<InstanceOp>(loc, controller, "dram");
   auto r = b.create<InstanceOp>(loc, releaser, "release");
   auto m = b.create<InstanceOp>(loc, monitor, "monitor");
@@ -149,28 +179,45 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
     return b.create<SubindexOp>(loc, v, i);
   };
   for (auto n : {"clock", "reset", "targetFire"}) {
-    con(lp(n), arg(n));
+    if (useLLC)
+      con(lp(n), arg(n));
     con(dp(n), arg(n));
     con(rp(n), arg(n));
     con(mp(n), arg(n));
   }
-  for (auto n : {"arValid",
-                 "arId",
-                 "arLen",
-                 "arAddr",
-                 "awValid",
-                 "awId",
-                 "awLen",
-                 "awAddr",
-                 "wValid",
-                 "wLast",
-                 "wayBits",
-                 "setBits",
-                 "blockBits",
-                 "activeMSHRs"})
-    con(lp(n), arg(n));
-  for (auto n : {"arReady", "awReady", "wReady"})
-    con(arg(n), lp(n));
+  if (useLLC) {
+    for (auto n : {"arValid",
+                   "arId",
+                   "arLen",
+                   "arAddr",
+                   "awValid",
+                   "awId",
+                   "awLen",
+                   "awAddr",
+                   "wValid",
+                   "wLast",
+                   "wayBits",
+                   "setBits",
+                   "blockBits",
+                   "activeMSHRs"})
+      con(lp(n), arg(n));
+    for (auto n : {"arReady", "awReady", "wReady"})
+      con(arg(n), lp(n));
+  } else {
+    for (auto n : {"arValid",
+                   "arId",
+                   "arLen",
+                   "arAddr",
+                   "awValid",
+                   "awId",
+                   "awLen",
+                   "awAddr",
+                   "wValid",
+                   "wLast"})
+      con(dp(n), arg(n));
+    for (auto n : {"arReady", "awReady", "wReady"})
+      con(arg(n), dp(n));
+  }
   for (auto p : releaser.getPorts())
     if (p.getName() != "clock" && p.getName() != "reset" &&
         p.getName() != "targetFire" && !p.getName().starts_with("next")) {
@@ -189,32 +236,44 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
                  "rankAddrMask",
                  "rowAddrOffset",
                  "rowAddrMask"})
-    con(dp(n), arg(n));
+    if (StringRef(n) != "schedulerWindowSize" || !isFASEDFCFS(circuit))
+      con(dp(n), arg(n));
   con(arg("targetCycle"), dp("targetCycle"));
-  for (auto ch : {"Ar", "Aw"}) {
-    std::string native = StringRef(ch) == "Ar" ? "ar" : "aw";
-    std::string mem = std::string("mem") + ch;
-    for (auto suffix : {"Valid", "Id", "Len", "Addr"})
-      con(dp(native + suffix), lp(mem + suffix));
-    con(lp(mem + "Ready"), dp(native + "Ready"));
+  if (useLLC) {
+    for (auto ch : {"Ar", "Aw"}) {
+      std::string native = StringRef(ch) == "Ar" ? "ar" : "aw";
+      std::string mem = std::string("mem") + ch;
+      for (auto suffix : {"Valid", "Id", "Len", "Addr"})
+        con(dp(native + suffix), lp(mem + suffix));
+      con(lp(mem + "Ready"), dp(native + "Ready"));
+    }
+    con(dp("wValid"), lp("memWValid"));
+    con(dp("wLast"), lp("memWLast"));
+    con(lp("memWReady"), dp("wReady"));
+    con(lp("memRValid"), dp("completedReadValid"));
+    con(lp("memRId"), dp("completedReadID"));
+    con(dp("completedReadReady"), lp("memRReady"));
+    con(lp("memBValid"), dp("completedWriteValid"));
+    con(lp("memBId"), dp("completedWriteID"));
+    con(dp("completedWriteReady"), lp("memBReady"));
+    for (auto ch : {"Read", "Write"}) {
+      std::string response = StringRef(ch) == "Read" ? "rResp" : "wResp";
+      std::string next = std::string("next") + ch;
+      con(rp(next + "Valid"), lp(response + "Valid"));
+      con(rp(next + "Id"), lp(response + "Id"));
+      con(lp(response + "Ready"), rp(next + "Ready"));
+    }
+    con(rp("nextReadLen"), lp("rRespLen"));
+  } else {
+    for (auto ch : {"Read", "Write"}) {
+      std::string next = std::string("next") + ch;
+      std::string completed = std::string("completed") + ch;
+      con(rp(next + "Valid"), dp(completed + "Valid"));
+      con(rp(next + "Id"), dp(completed + "ID"));
+      con(dp(completed + "Ready"), rp(next + "Ready"));
+    }
+    con(rp("nextReadLen"), dp("completedReadLen"));
   }
-  con(dp("wValid"), lp("memWValid"));
-  con(dp("wLast"), lp("memWLast"));
-  con(lp("memWReady"), dp("wReady"));
-  con(lp("memRValid"), dp("completedReadValid"));
-  con(lp("memRId"), dp("completedReadID"));
-  con(dp("completedReadReady"), lp("memRReady"));
-  con(lp("memBValid"), dp("completedWriteValid"));
-  con(lp("memBId"), dp("completedWriteID"));
-  con(dp("completedWriteReady"), lp("memBReady"));
-  for (auto ch : {"Read", "Write"}) {
-    std::string response = StringRef(ch) == "Read" ? "rResp" : "wResp";
-    std::string next = std::string("next") + ch;
-    con(rp(next + "Valid"), lp(response + "Valid"));
-    con(rp(next + "Id"), lp(response + "Id"));
-    con(lp(response + "Ready"), rp(next + "Ready"));
-  }
-  con(rp("nextReadLen"), lp("rRespLen"));
   for (auto ch : {"ar", "aw", "w", "r", "b"})
     con(mp(std::string(ch) + "Fire"),
         and_(arg(std::string(ch) + "Valid"), arg(std::string(ch) + "Ready")));
@@ -246,10 +305,11 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
   for (auto pair :
        {std::tuple<FModuleOp, InstanceOp, StringRef>{controller, d, "dram_"},
         {llc, l, "llc_"}})
-    for (auto p : std::get<0>(pair).getPorts())
-      if (p.direction == Direction::Out)
-        con(arg((std::get<2>(pair) + p.getName()).str()),
-            pin(std::get<1>(pair), std::get<0>(pair), p.getName()));
+    if (std::get<0>(pair))
+      for (auto p : std::get<0>(pair).getPorts())
+        if (p.direction == Direction::Out)
+          con(arg((std::get<2>(pair) + p.getName()).str()),
+              pin(std::get<1>(pair), std::get<0>(pair), p.getName()));
 
   Value assertionEnable = and_(arg("targetFire"), not_(arg("reset")));
   for (auto ch : {"ar", "aw"}) {
@@ -268,7 +328,12 @@ goldengate::materializeFASEDFRFCFSTimingModel(CircuitOp circuit,
         ValueRange{},
         stem + "BurstProtocol");
     Value accepted = and_(valid, arg(stem + "Ready"));
-    Value shortEnough = b.create<LTPrimOp>(loc, len, constant(8, 8));
+    Value shortEnough =
+        b.create<LEQPrimOp>(loc,
+                            len,
+                            constant(8,
+                                     stem == "ar" ? geometry.readBeats - 1
+                                                  : geometry.writeBeats - 1));
     b.create<AssertOp>(
         loc,
         arg("clock"),

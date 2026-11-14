@@ -987,6 +987,7 @@ namespace {
 struct NativeMemoryOrigin {
   std::string module, memory, reader, writer, capture;
   uint64_t depth;
+  unsigned width;
 };
 constexpr StringLiteral memoryOriginMark = "goldengate.fasedReadBufferMemory";
 
@@ -1002,14 +1003,17 @@ static LogicalResult collectNativeMemoryOrigins(
     auto parent = op->getParentOfType<firrtl::FModuleOp>();
     auto type = memory ? dyn_cast<firrtl::UIntType>(memory.getDataType())
                        : firrtl::UIntType();
-    bool valid = isa<UnitAttr>(mark) && memory && parent && type &&
-                 type.getWidth() == 65 && memory.getNumResults() == 2 &&
-                 memory.getReadLatency() == 1 && memory.getWriteLatency() == 1 &&
-                 memory.getRuw() == firrtl::RUWAttr::Undefined &&
-                 (memory.getDepth() == 128 || memory.getDepth() == 256) &&
-                 memory.getPortKind(0) == firrtl::MemOp::PortKind::Read &&
-                 memory.getPortKind(1) == firrtl::MemOp::PortKind::Write &&
-                 !memory.getInnerSymAttr() && memory.getAnnotations().empty();
+    bool valid =
+        isa<UnitAttr>(mark) && memory && parent && type && type.getWidth() &&
+        *type.getWidth() >= 9 && *type.getWidth() <= 1025 &&
+        llvm::isPowerOf2_64(*type.getWidth() - 1) &&
+        memory.getNumResults() == 2 && memory.getReadLatency() == 1 &&
+        memory.getWriteLatency() == 1 &&
+        memory.getRuw() == firrtl::RUWAttr::Undefined &&
+        memory.getDepth() >= 16 && llvm::isPowerOf2_64(memory.getDepth()) &&
+        memory.getPortKind(0) == firrtl::MemOp::PortKind::Read &&
+        memory.getPortKind(1) == firrtl::MemOp::PortKind::Write &&
+        !memory.getInnerSymAttr() && memory.getAnnotations().empty();
     if (!valid) { invalid = true; return; }
     auto subfield = [&](unsigned port, StringRef name) -> firrtl::SubfieldOp {
       firrtl::SubfieldOp found;
@@ -1056,15 +1060,18 @@ static LogicalResult collectNativeMemoryOrigins(
     else {
       auto data = packed.getLhs().getDefiningOp<firrtl::SubfieldOp>();
       auto last = packed.getRhs().getDefiningOp<firrtl::SubfieldOp>();
-      bool aggregate = data && last && data.getFieldName() == "data" &&
-               last.getFieldName() == "last" &&
-               data.getInput() == last.getInput() &&
-               data.getType() == firrtl::UIntType::get(circuit.getContext(), 64) &&
-               last.getType() == firrtl::UIntType::get(circuit.getContext(), 1);
-      bool flattened = flatPort(packed.getLhs(), "enq_bits_data", 64,
-                                firrtl::Direction::In) &&
-                       flatPort(packed.getRhs(), "enq_bits_last", 1,
-                                firrtl::Direction::In);
+      bool aggregate =
+          data && last && data.getFieldName() == "data" &&
+          last.getFieldName() == "last" && data.getInput() == last.getInput() &&
+          data.getType() == firrtl::UIntType::get(circuit.getContext(),
+                                                  *type.getWidth() - 1) &&
+          last.getType() == firrtl::UIntType::get(circuit.getContext(), 1);
+      bool flattened =
+          flatPort(packed.getLhs(),
+                   "enq_bits_data",
+                   *type.getWidth() - 1,
+                   firrtl::Direction::In) &&
+          flatPort(packed.getRhs(), "enq_bits_last", 1, firrtl::Direction::In);
       valid &= aggregate || flattened;
     }
     auto readData = subfield(0, "data");
@@ -1073,32 +1080,40 @@ static LogicalResult collectNativeMemoryOrigins(
       auto bits = dyn_cast<firrtl::BitsPrimOp>(user);
       if (!bits) { valid = false; continue; }
       StringRef name;
-      if (bits.getHi() == 64 && bits.getLo() == 1) {
+      if (bits.getHi() == *type.getWidth() - 1 && bits.getLo() == 1) {
         name = "data"; ++dataSlices;
       } else if (bits.getHi() == 0 && bits.getLo() == 0) {
         name = "last"; ++lastSlices;
-      } else valid = false;
+      } else
+        valid = false;
       if (!bits.getResult().hasOneUse()) { valid = false; continue; }
       auto connect = dyn_cast<firrtl::StrictConnectOp>(*bits.getResult().getUsers().begin());
       auto dest = connect ? connect.getDest().getDefiningOp<firrtl::SubfieldOp>()
                           : firrtl::SubfieldOp();
       bool destination = dest && dest.getFieldName() == name;
       if (connect)
-        destination |= flatPort(connect.getDest(),
-            name == "data" ? "deq_bits_data" : "deq_bits_last",
-            name == "data" ? 64 : 1, firrtl::Direction::Out);
+        destination |=
+            flatPort(connect.getDest(),
+                     name == "data" ? "deq_bits_data" : "deq_bits_last",
+                     name == "data" ? *type.getWidth() - 1 : 1,
+                     firrtl::Direction::Out);
       valid &= connect && connect.getSrc() == bits.getResult() && destination;
     }
     valid &= dataSlices == 1 && lastSlices == 1 &&
              identities.insert((parent.getName() + "/" + memory.getName()).str()).second;
     if (!valid) { invalid = true; return; }
-    origins.push_back({parent.getName().str(), memory.getName().str(),
-                       memory.getPortNameStr(0).str(), memory.getPortNameStr(1).str(),
-                       "", memory.getDepth()});
+    origins.push_back({parent.getName().str(),
+                       memory.getName().str(),
+                       memory.getPortNameStr(0).str(),
+                       memory.getPortNameStr(1).str(),
+                       "",
+                       memory.getDepth(),
+                       unsigned(*type.getWidth())});
     op->removeAttr(memoryOriginMark);
   });
   if (invalid) {
-    error = "native read-buffer origin mark requires checked 65-bit data/last packing, constant-enabled synchronous reader and common clock";
+    error = "native read-buffer origin mark requires checked data/last "
+            "packing, constant-enabled synchronous reader and common clock";
     return failure();
   }
   return success();
@@ -1148,10 +1163,14 @@ static LogicalResult describeNativeMemoryOrigins(
       if (reg.getName() == "Memory") array = reg;
     auto arrayType = array ? dyn_cast<hw::UnpackedArrayType>(array.getElementType())
                            : hw::UnpackedArrayType();
-    if (!storage || !capture || !arrayType || arrayType.getNumElements() != origin.depth ||
-        arrayType.getElementType() != IntegerType::get(lowered.getContext(), 65) ||
-        capture.getElementType() != IntegerType::get(lowered.getContext(), 65))
-      return reject("native memory origin does not resolve to 65-bit storage and capture");
+    if (!storage || !capture || !arrayType ||
+        arrayType.getNumElements() != origin.depth ||
+        arrayType.getElementType() !=
+            IntegerType::get(lowered.getContext(), origin.width) ||
+        capture.getElementType() !=
+            IntegerType::get(lowered.getContext(), origin.width))
+      return reject("native memory origin does not resolve to the declared "
+                    "storage and capture width");
     auto parentName = hw::getVerilogModuleName(parent);
     auto storageName = hw::getVerilogModuleName(storageModule);
     if (!plainVerilogIdentifier(parentName) || !plainVerilogIdentifier(storageName) ||
@@ -1179,21 +1198,33 @@ static LogicalResult describeNativeMemoryOrigins(
     if (invalidHierarchy || paths.empty())
       return reject("native memory origin hierarchy is cyclic, unsupported or unreachable");
     llvm::json::Array fields;
-    fields.push_back(llvm::json::Object{{"name", "data"}, {"hi", 64}, {"lo", 1}});
+    fields.push_back(llvm::json::Object{
+        {"name", "data"}, {"hi", origin.width - 1}, {"lo", 1}});
     fields.push_back(llvm::json::Object{{"name", "last"}, {"hi", 0}, {"lo", 0}});
     memories.push_back(llvm::json::Object{
         {"origin", "FASEDReadBuffer"},
-        {"source", llvm::json::Object{{"module", origin.module}, {"memory", origin.memory},
-            {"read_port", origin.reader}, {"write_port", origin.writer},
-            {"width", 65}, {"depth", origin.depth}}},
+        {"source",
+         llvm::json::Object{{"module", origin.module},
+                            {"memory", origin.memory},
+                            {"read_port", origin.reader},
+                            {"write_port", origin.writer},
+                            {"width", origin.width},
+                            {"depth", origin.depth}}},
         {"fields", std::move(fields)},
-        {"lowered", llvm::json::Object{{"module", parentName},
-            {"memory_instance", storage.getInstanceName()}, {"memory_module", storageName},
-            {"storage", array.getName()}, {"read_capture", capture.getName()}}},
+        {"lowered",
+         llvm::json::Object{{"module", parentName},
+                            {"memory_instance", storage.getInstanceName()},
+                            {"memory_module", storageName},
+                            {"storage", array.getName()},
+                            {"read_capture", capture.getName()}}},
         {"instance_paths", std::move(paths)},
-        {"read_capture", llvm::json::Object{{"latency", 1}, {"enable", "constant_one"},
-            {"clock", "clock"}, {"reset", "none"}, {"disabled", "hold"},
-            {"collision", "pre_edge_data"}}}});
+        {"read_capture",
+         llvm::json::Object{{"latency", 1},
+                            {"enable", "constant_one"},
+                            {"clock", "clock"},
+                            {"reset", "none"},
+                            {"disabled", "hold"},
+                            {"collision", "pre_edge_data"}}}});
   }
   auto hash = llvm::SHA256::hash(llvm::arrayRefFromStringRef(rtl));
   description = llvm::json::Object{

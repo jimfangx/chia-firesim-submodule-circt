@@ -73,7 +73,11 @@ FModuleOp named(CircuitOp c, llvm::StringRef name) {
 OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,
                               unsigned bad = 0,
                               unsigned targetBits = 36,
-                              unsigned frfcfsFlight = 0) {
+                              unsigned frfcfsFlight = 0,
+                              StringRef profile = {},
+                              unsigned dataBits = 64,
+                              unsigned beats = 8,
+                              unsigned reuse = 0) {
   auto root = parseSourceString<ModuleOp>(
       R"(module { firrtl.circuit "GGFASEDHistogramsWrapper" {
     firrtl.module @GGFASEDTokenEngine() {} firrtl.module @GGFASEDHistogramsWrapper() {} } })",
@@ -140,8 +144,8 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,
       &ctx,
       {{b.getStringAttr("aw"), false, channel(address)},
        {b.getStringAttr("ar"), false, channel(address)},
-       {b.getStringAttr("w"), false, channel(payload("data", 64))},
-       {b.getStringAttr("r"), true, channel(payload("data", 64))}});
+       {b.getStringAttr("w"), false, channel(payload("data", dataBits))},
+       {b.getStringAttr("r"), true, channel(payload("data", dataBits))}});
   auto hPort = BundleType::get(
       &ctx,
       {{b.getStringAttr("hBits"),
@@ -155,7 +159,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,
                          {b.getStringAttr("timing"), axi, Direction::Out}});
   auto widths = b.getDictionaryAttr(
       {b.getNamedAttr("addrBits", b.getI32IntegerAttr(targetBits)),
-       b.getNamedAttr("dataBits", b.getI32IntegerAttr(64)),
+       b.getNamedAttr("dataBits", b.getI32IntegerAttr(dataBits)),
        b.getNamedAttr("idBits", b.getI32IntegerAttr(4))});
   auto key = b.getDictionaryAttr(
       {b.getNamedAttr("class",
@@ -174,16 +178,21 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,
   }
   FModuleOp frfcfsBank;
   if (frfcfsFlight) {
-    c->setAttr("goldengate.fasedBaseCapacity", b.getI64IntegerAttr(32));
+    c->setAttr("goldengate.fasedBaseCapacity",
+               b.getI64IntegerAttr(profile == "fcfs" ? 16 : 32));
+    if (!profile.empty())
+      c->setAttr("goldengate.fasedDRAMProfile", b.getStringAttr(profile));
     NamedAttrList constructor(key);
     constructor.set(
         "axi4Edge",
         b.getDictionaryAttr(
             {b.getNamedAttr("maxFlight", b.getI64IntegerAttr(frfcfsFlight)),
              b.getNamedAttr("idReuse",
-                            b.getI64IntegerAttr(frfcfsFlight == 10 ? 1 : 2)),
-             b.getNamedAttr("maxReadTransfer", b.getI64IntegerAttr(8)),
-             b.getNamedAttr("maxWriteTransfer", b.getI64IntegerAttr(8))}));
+                            b.getI64IntegerAttr(reuse                ? reuse
+                                                : frfcfsFlight == 10 ? 1
+                                                                     : 2)),
+             b.getNamedAttr("maxReadTransfer", b.getI64IntegerAttr(beats)),
+             b.getNamedAttr("maxWriteTransfer", b.getI64IntegerAttr(beats))}));
     engine->setAttr("goldengate.bridgeConstructor",
                     constructor.getDictionary(&ctx));
     std::string error;
@@ -220,7 +229,7 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,
           {b.getStringAttr("id"), false, u(4)}};
       if (read) {
         fields.push_back({b.getStringAttr("last"), false, u(1)});
-        fields.push_back({b.getStringAttr("data"), false, u(64)});
+        fields.push_back({b.getStringAttr("data"), false, u(dataBits)});
       }
       fields.push_back({b.getStringAttr("resp"), false, u(2)});
       return BundleType::get(
@@ -275,7 +284,12 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,
       {b.getNamedAttr("name", b.getStringAttr("FASEDMemoryTimingModel_2")),
        b.getNamedAttr("slave", b.getI32IntegerAttr(0)),
        b.getNamedAttr("start", b.getI64IntegerAttr(2048)),
-       b.getNamedAttr("size", b.getI64IntegerAttr(frfcfsFlight ? 512 : 128))});
+       b.getNamedAttr(
+           "size",
+           b.getI64IntegerAttr(
+               frfcfsFlight
+                   ? ((profile.empty() || profile == "frfcfs-llc") ? 512 : 256)
+                   : 128))});
   decoder->setAttr("goldengate.controlRegions", b.getArrayAttr({row}));
   auto bound = b.create<FModuleOp>(loc,
                                    b.getStringAttr("GGFASEDBridgeBoundWrapper"),
@@ -690,6 +704,35 @@ int main(int argc, char **argv) {
                     StringRef(generated).contains("\"brespError\"), 2316U"),
                 "FRFCFS 68-read/32-write ABI differs");
       }
+    for (StringRef profile : {"fcfs", "frfcfs"})
+      for (unsigned flight : {10U, 20U})
+        for (bool selected : {false, true}) {
+          auto ddr = fixture(ctx, 0, 35, flight, profile);
+          auto dc = *ddr->getOps<CircuitOp>().begin();
+          if (selected)
+            selectPrintNames(dc);
+          require(succeeded(verify(*ddr)), "no-LLC header fixture verifier");
+          auto generated = run(dc);
+          require(!StringRef(generated).contains("llc_") &&
+                      (StringRef(generated).contains("schedulerWindowSize") ==
+                       (profile == "frfcfs")),
+                  "no-LLC header advertises wrong programming model");
+          unsigned count = 0;
+          StringRef remaining(generated);
+          while (remaining.contains("{ std::string(")) {
+            remaining =
+                remaining.drop_front(remaining.find("{ std::string(") + 1);
+            ++count;
+          }
+          require(count == (profile == "fcfs" ? 84 : 88),
+                  "no-LLC read/write register ABI differs");
+        }
+    for (StringRef profile : {"fcfs", "frfcfs", "frfcfs-llc"}) {
+      auto wide = fixture(ctx, 0, 35, 232, profile, 256, 2, 15);
+      auto c = *wide->getOps<CircuitOp>().begin();
+      require(succeeded(verify(*wide)), "wide DDR3 header fixture is invalid");
+      require(!run(c).empty(), "wide DDR3 header generation failed");
+    }
     // Every failure must leave both annotations and hardware unchanged.
     for (unsigned bad = 1; bad <= 13; ++bad) {
       auto ddr = fixture(ctx, 0, 35, 20);
@@ -740,7 +783,7 @@ int main(int argc, char **argv) {
         edge.set(bad == 9    ? "idReuse"
                  : bad == 10 ? "maxFlight"
                              : "maxReadTransfer",
-                 b.getI64IntegerAttr(3));
+                 b.getI64IntegerAttr(0));
         key.set("axi4Edge", edge.getDictionary(&ctx));
         engine->setAttr("goldengate.bridgeConstructor",
                         key.getDictionary(&ctx));

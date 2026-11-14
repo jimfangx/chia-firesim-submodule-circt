@@ -12,6 +12,7 @@
 #include "goldengate/TargetUtils.h"
 #include "circt/Dialect/FIRRTL/FIRRTLAnnotations.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 #include <algorithm>
 #include <vector>
@@ -19,6 +20,7 @@ using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDTokenEngine(CircuitOp circuit, std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral engineName = "GGFASEDTokenEngine";
   bool selected = circuit.getName() == "GGSelectedPrintCPUStreamPlatformWrapper";
   const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDTokenWrapper" : "GGFASEDTokenWrapper";
@@ -47,8 +49,10 @@ LogicalResult goldengate::addFASEDTokenEngine(CircuitOp circuit, std::string &er
   auto keyClass = key ? key.getAs<StringAttr>("class") : StringAttr();
   auto widths = key ? key.getAs<DictionaryAttr>("axi4Widths") : DictionaryAttr();
   auto hasWidth = [&](llvm::StringRef n, int w) { auto a = widths ? widths.getAs<IntegerAttr>(n) : IntegerAttr(); return a && a.getInt() == w; };
-  if (!keyClass || keyClass.getValue() != "firesim.lib.bridges.CompleteConfig" ||
-      !hasWidth("addrBits", 35) || !hasWidth("dataBits", 64) || !hasWidth("idBits", 4) || !mapping || mapping.size() != 11)
+  if (!keyClass ||
+      keyClass.getValue() != "firesim.lib.bridges.CompleteConfig" ||
+      !hasWidth("addrBits", 35) || !validFASEDGeometry(geometry) ||
+      !hasWidth("idBits", 4) || !mapping || mapping.size() != 11)
     return reject("FASED requires the Rocket 35/64/4-bit constructor and eleven channels");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx);
   auto uint = [&](unsigned w) { return UIntType::get(ctx, w, false); }; auto bit = uint(1);
@@ -60,9 +64,17 @@ LogicalResult goldengate::addFASEDTokenEngine(CircuitOp circuit, std::string &er
   };
   auto address = payload({{"user",1}, {"id",4}, {"region",4}, {"qos",4}, {"prot",3}, {"cache",4},
       {"lock",1}, {"burst",2}, {"size",3}, {"len",8}, {"addr",35}});
-  auto data = payload({{"user",1}, {"strb",8}, {"id",4}, {"last",1}, {"data",64}});
+  auto data = payload({{"user", 1},
+                       {"strb", geometry.dataBits / 8},
+                       {"id", 4},
+                       {"last", 1},
+                       {"data", geometry.dataBits}});
   auto response = payload({{"user",1}, {"id",4}, {"resp",2}});
-  auto read = payload({{"user",1}, {"id",4}, {"last",1}, {"data",64}, {"resp",2}});
+  auto read = payload({{"user", 1},
+                       {"id", 4},
+                       {"last", 1},
+                       {"data", geometry.dataBits},
+                       {"resp", 2}});
   const llvm::StringRef locals[]{"axi4_aw_fwd", "axi4_w_fwd", "axi4_b_rev", "axi4_ar_fwd", "axi4_r_rev", "reset",
       "axi4_aw_rev", "axi4_w_rev", "axi4_b_fwd", "axi4_ar_rev", "axi4_r_fwd"};
   const bool forwards[]{true,true,false,true,false,false,false,false,true,false,true};

@@ -5,19 +5,31 @@
 #include "goldengate/FASEDUnifiedTransactionScheduler.h"
 #include "goldengate/FASEDDRAMBackend.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
+#include "goldengate/FASEDDRAMProfile.h"
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::materializeFASEDFRFCFSController(
     CircuitOp circuit, unsigned maxWrites, FModuleOp &result, std::string &error) {
-  if (maxWrites != 10 && maxWrites != 20) {
-    error = "FRFCFS controller requires selected maxWrites 10 or 20";
+  if (maxWrites == 0 || maxWrites > 32) {
+    error =
+        "FRFCFS controller requires selected maxWrites one through thirty-two";
     return failure();
   }
-  std::string name = "GGFASEDFRFCFSController" + std::to_string(maxWrites);
+  std::string name = (isFASEDFCFS(circuit) ? "GGFASEDFCFSController"
+                                           : "GGFASEDFRFCFSController") +
+                     std::to_string(maxWrites);
   std::string frontendName = "GGFASEDUnifiedTransactionScheduler" + std::to_string(maxWrites);
-  SmallVector<StringRef> symbols{name, frontendName, "GGFASEDDRAMBackend",
-      "GGFASEDFRFCFSCommandScheduler", "GGFASEDRankStateTracker",
-      "GGFASEDBankStateTracker", "GGFASEDRefreshUnit", "GGFASEDCollapsingBuffer"};
+  SmallVector<StringRef> symbols{name,
+                                 frontendName,
+                                 "GGFASEDDRAMBackend",
+                                 isFASEDFCFS(circuit)
+                                     ? "GGFASEDFCFSCommandScheduler"
+                                     : "GGFASEDFRFCFSCommandScheduler",
+                                 "GGFASEDRankStateTracker",
+                                 "GGFASEDBankStateTracker",
+                                 "GGFASEDRefreshUnit",
+                                 "GGFASEDCollapsingBuffer"};
   for (auto module : circuit.getOps<FModuleLike>())
     if (llvm::is_contained(symbols, module.getModuleName())) {
       error = "FRFCFS controller requires free controller and dependency symbols";
@@ -38,10 +50,14 @@ LogicalResult goldengate::materializeFASEDFRFCFSController(
     llvm_unreachable("unknown copied port");
   };
   for (unsigned i = 0; i < 16; ++i) ports.push_back(frontendPorts[i]);
-  for (auto n : {"pendingWReq", "pendingAWReq"}) port(n, u(maxWrites == 10 ? 4 : 5), Direction::In);
+  for (auto n : {"pendingWReq", "pendingAWReq"})
+    port(n, u(llvm::Log2_64_Ceil(maxWrites + 1)), Direction::In);
   for (auto n : {"completedReadValid", "completedReadReady", "completedReadID", "completedReadLen",
                  "completedWriteValid", "completedWriteReady", "completedWriteID"}) copy(backend, n);
-  for (auto n : {"timings", "schedulerWindowSize", "openPagePolicy", "backendLatency"}) copy(scheduler, n);
+  for (auto n :
+       {"timings", "schedulerWindowSize", "openPagePolicy", "backendLatency"})
+    if (StringRef(n) != "schedulerWindowSize" || !isFASEDFCFS(circuit))
+      copy(scheduler, n);
   for (auto stem : {"bank", "rank", "row"}) {
     port(std::string(stem)+"AddrOffset", u(32), Direction::In);
     port(std::string(stem)+"AddrMask", u(StringRef(stem)=="bank" ? 3 : StringRef(stem)=="rank" ? 2 : 26), Direction::In);
@@ -110,7 +126,10 @@ LogicalResult goldengate::materializeFASEDFRFCFSController(
   Value rankMask=arg("rankAddrMask");
   Value ranks=mux(bits(rankMask,1,1),c(4,15),mux(bits(rankMask,0,0),c(4,3),c(4,1)));
   con(arg("ranksInUse"),ranks); con(sp("ranksInUse"),ranks);
-  for (auto n : {"timings","schedulerWindowSize","openPagePolicy","backendLatency"}) con(sp(n),arg(n));
+  for (auto n : {"timings", "openPagePolicy", "backendLatency"})
+    con(sp(n), arg(n));
+  con(sp("schedulerWindowSize"),
+      isFASEDFCFS(circuit) ? c(3, 0) : arg("schedulerWindowSize"));
   con(sp("backendReadReady"),dp("newReadReady")); con(sp("backendWriteReady"),dp("newWriteReady"));
   con(arg("backendReadReady"),dp("newReadReady")); con(arg("backendWriteReady"),dp("newWriteReady"));
   for (auto pair : {std::pair<StringRef,StringRef>{"newReadValid","newReadValid"},{"newReadID","newReadId"},

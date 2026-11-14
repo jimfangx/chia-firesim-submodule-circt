@@ -11,6 +11,8 @@
 // width adaptation and LoadMem arbitration are separate subsequent transforms.
 #include "goldengate/FASEDHostMemory.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
+#include "goldengate/FASEDHostWidthAdapter.h"
 #include <functional>
 #include <map>
 #include <set>
@@ -19,6 +21,7 @@ using namespace circt::firrtl;
 
 LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
                                              std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral inputName = "GGControlMasterWrapper";
   constexpr llvm::StringLiteral wrapperName = "GGFASEDHostMemoryWrapper";
   auto reject = [&](llvm::StringRef s) { error = s.str(); return failure(); };
@@ -40,15 +43,24 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
     auto a = widths ? widths.getAs<IntegerAttr>(n) : IntegerAttr();
     return a && a.getInt() == v;
   };
-  if (!has("addrBits",35) || !has("dataBits",64) || !has("idBits",4))
+  if (!has("addrBits", 35) || !validFASEDGeometry(geometry) ||
+      !has("idBits", 4))
     return reject("FASED host memory supports the recorded 35/64/4-bit profile");
   auto *ctx = circuit.getContext(); OpBuilder b(ctx); auto loc = circuit.getLoc();
   auto uint = [&](unsigned w) { return UIntType::get(ctx,w,false); };
   struct Field { const char *name; unsigned width; };
   const Field address[]{{"user",1},{"id",4},{"region",4},{"qos",4},{"prot",3},
     {"cache",4},{"lock",1},{"burst",2},{"size",3},{"len",8},{"addr",35}};
-  const Field data[]{{"user",1},{"strb",8},{"id",4},{"last",1},{"data",64}};
-  const Field read[]{{"user",1},{"id",4},{"last",1},{"data",64},{"resp",2}};
+  const Field data[]{{"user", 1},
+                     {"strb", geometry.dataBits / 8},
+                     {"id", 4},
+                     {"last", 1},
+                     {"data", geometry.dataBits}};
+  const Field read[]{{"user", 1},
+                     {"id", 4},
+                     {"last", 1},
+                     {"data", geometry.dataBits},
+                     {"resp", 2}};
   const Field write[]{{"user",1},{"id",4},{"resp",2}};
   auto payload = [&](ArrayRef<Field> fs, bool axi) {
     SmallVector<BundleType::BundleElement> fields;
@@ -72,6 +84,19 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
     {b.getStringAttr("b"),true,token(write,true)},
     {b.getStringAttr("ar"),false,token(address,true)},
     {b.getStringAttr("r"),true,token(read,true)}});
+  std::function<FIRRTLBaseType(FIRRTLBaseType, StringRef)> narrow =
+      [&](FIRRTLBaseType type, StringRef name) -> FIRRTLBaseType {
+    if (auto bundle = dyn_cast<BundleType>(type)) {
+      SmallVector<BundleType::BundleElement> fields;
+      for (auto field : bundle.getElements())
+        fields.push_back({field.name,
+                          field.isFlip,
+                          narrow(field.type, field.name.getValue())});
+      return BundleType::get(ctx, fields);
+    }
+    return name == "data" ? uint(64) : name == "strb" ? uint(8) : type;
+  };
+  auto hostMaster = cast<BundleType>(narrow(master, {}));
   const StringRef names[]{"fased_host_requests","fased_host_read_response","fased_host_write_response"};
   const Type types[]{requests,token(read,false),token(write,false)};
   std::map<std::string,unsigned> old, copied; std::set<std::string> consumed;
@@ -84,6 +109,11 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
       return reject("FASED host memory needs exact split request/response bundles");
     consumed.insert(names[j].str());
   }
+  if (geometry.dataBits != 64 &&
+      (!old.count("hostClock") || !old.count("hostReset") ||
+       inner.getPortType(old.at("hostClock")) != ClockType::get(ctx) ||
+       inner.getPortType(old.at("hostReset")) != uint(1)))
+    return reject("FASED width adaptation requires host clock and reset");
   bool used=false; circuit.walk([&](InstanceOp i){used |= i.getModuleName()==inputName;});
   if (used) return reject("FASED host memory requires an uninstantiated top");
   // Every failure above leaves the circuit untouched.
@@ -92,7 +122,13 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
     copied[p.name.getValue().str()] = ports.size(); ports.push_back(p);
   }
   unsigned memoryIndex=ports.size();
-  ports.push_back({b.getStringAttr("fased_host_mem"),master,Direction::Out});
+  FModuleOp widthAdapter;
+  if (geometry.dataBits != 64 &&
+      failed(materializeFASEDHostWidthAdapter(
+          circuit, master, hostMaster, widthAdapter, error)))
+    return failure();
+  ports.push_back(
+      {b.getStringAttr("fased_host_mem"), hostMaster, Direction::Out});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   auto wrapper=b.create<FModuleOp>(loc,b.getStringAttr(wrapperName),inner.getConventionAttr(),ports);
   b.setInsertionPointToStart(wrapper.getBodyBlock());
@@ -104,6 +140,18 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
   }
   auto field=[&](Value v,StringRef n)->Value{return b.create<SubfieldOp>(loc,v,n);};
   Value mem=wrapper.getBodyBlock()->getArgument(memoryIndex);
+  if (widthAdapter) {
+    auto adapter = b.create<InstanceOp>(loc, widthAdapter, "width_adapter");
+    auto clock = copied.find("hostClock"), reset = copied.find("hostReset");
+    if (clock == copied.end() || reset == copied.end())
+      llvm_unreachable("validated host memory controls");
+    b.create<StrictConnectOp>(
+        loc, adapter.getResult(0), wrapper.getArgument(clock->second));
+    b.create<StrictConnectOp>(
+        loc, adapter.getResult(1), wrapper.getArgument(reset->second));
+    b.create<ConnectOp>(loc, mem, adapter.getResult(3));
+    mem = adapter.getResult(2);
+  }
   std::map<std::string,std::string> mapped;
   for (auto ch : {"aw","w","ar","r","b"}) {
     bool request=StringRef(ch)=="aw" || StringRef(ch)=="w" || StringRef(ch)=="ar";
@@ -135,7 +183,8 @@ LogicalResult goldengate::bindFASEDHostMemory(CircuitOp circuit,
       if(!v.consume_front(op+"|"))return a;
       std::string suffix="|"+v.str(); StringRef ref(suffix);
       if(ref.consume_front(mp)) {
-        auto mapping=mapped.find(ref.str());
+        auto mapping =
+            geometry.dataBits == 64 ? mapped.find(ref.str()) : mapped.end();
         if(mapping!=mapped.end()) suffix="|"+wrapperName.str()+">"+mapping->second;
         else if(copied.count(ref.take_front(ref.find_first_of(".[")).str()))
           suffix.replace(0,mp.size(),"|"+wrapperName.str()+">");

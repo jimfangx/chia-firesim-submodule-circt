@@ -7,6 +7,7 @@
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/Support/raw_ostream.h"
+#include "llvm/Support/MathExtras.h"
 #include <array>
 #include <map>
 #include <random>
@@ -44,6 +45,8 @@ struct Interpreter {
       value = eval(bits.getInput()) >> bits.getLo();
     else if (isa_and_nonnull<MuxPrimOp>(op))
       value = eval(op->getOperand(eval(op->getOperand(0)) ? 1 : 2));
+    else if (isa_and_nonnull<PadPrimOp>(op))
+      value = eval(op->getOperand(0));
     else if (isa_and_nonnull<NotPrimOp>(op))
       value = ~eval(op->getOperand(0));
     else if (isa_and_nonnull<AndPrimOp>(op))
@@ -87,7 +90,7 @@ void behavior(MLIRContext &ctx, unsigned capacity, llvm::StringRef output) {
   require(ports.size() == 24, "unexpected monitor interface");
   for (unsigned i = 14; i < 17; ++i)
     require(*cast<UIntType>(ports[i].type).getWidth() ==
-                (capacity == 10 ? 4 : 5),
+                llvm::Log2_64_Ceil(capacity + 1),
             "pending width does not match constructor");
   require(cast<FVectorType>(ports[21].type).getNumElements() == 5 &&
               cast<FVectorType>(ports[22].type).getNumElements() == 5,
@@ -254,7 +257,7 @@ void behavior(MLIRContext &ctx, unsigned capacity, llvm::StringRef output) {
           "duplicate accepted");
   require(sentinel == top && unchanged == print(root->getOperation()),
           "symbol collision changed circuit/result");
-  for (unsigned invalid : {0u, 1u, 8u, 16u, 32u}) {
+  for (unsigned invalid : {0u, 33u, 64u}) {
     require(failed(goldengate::materializeFASEDTimingMonitor(
                 circuit, invalid, sentinel, error)),
             "unsupported capacity accepted");
@@ -298,7 +301,7 @@ int main(int argc, char **argv) {
             "output capacity must be 10 or 20");
     MLIRContext ctx;
     ctx.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
-    for (unsigned capacity : {10u, 20u})
+    for (unsigned capacity : {10u, 16u, 20u, 32u})
       behavior(
           ctx, capacity, argc >= 2 && capacity == emitCapacity ? argv[1] : "");
     return 0;

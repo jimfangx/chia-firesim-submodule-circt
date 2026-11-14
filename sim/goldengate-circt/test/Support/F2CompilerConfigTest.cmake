@@ -16,6 +16,17 @@ function(check_config config expected)
   endif()
 endfunction()
 check_config(BaseF2Config "cannot read FIRRTL")
+check_config(DefaultF2Config "cannot read FIRRTL")
+check_config(FCFS16GBQuadRank_DefaultF2Config "cannot read FIRRTL")
+check_config(FCFS16GBQuadRank_BaseF2Config "cannot read FIRRTL")
+check_config(FRFCFS16GBQuadRank_BaseF2Config "cannot read FIRRTL")
+check_config(FRFCFS16GBQuadRank_DefaultF2Config "cannot read FIRRTL")
+check_config(FCFS16GBQuadRank_FCFS16GBQuadRank_BaseF2Config "duplicate FCFS16GBQuadRank")
+check_config(FRFCFS16GBQuadRank_FCFS16GBQuadRank_BaseF2Config "conflicting memory")
+check_config(FRFCFS16GBQuadRankLLC4MB_FRFCFS16GBQuadRank_BaseF2Config "conflicting memory")
+check_config(FCFS16GBQuadRank_BaseXilinxAlveoU250Config "requires BaseF2Config")
+check_config(FRFCFS16GBQuadRank_BaseXilinxAlveoU250Config "requires BaseF2Config")
+check_config(DefaultF2Config_BaseF2Config "duplicate or conflicting base")
 check_config(BaseF2Config "cannot read FIRRTL" --emit-debug-snapshots)
 check_config(BaseF2Config "duplicate --emit-debug-snapshots"
   --emit-debug-snapshots --emit-debug-snapshots)
@@ -70,18 +81,20 @@ file(WRITE "${WORK}/profile.json" [=[
     "clockInfo":[{"name":"base","multiplier":1,"divisor":1}],
     "perClockMFMR":[1]}}]
 ]=])
-foreach(capacity IN ITEMS 16 32)
-  if(capacity EQUAL 32)
-    set(config WithAutoILA_FRFCFS16GBQuadRankLLC4MB_BaseF2Config)
+foreach(config IN ITEMS BaseF2Config DefaultF2Config
+    FCFS16GBQuadRank_DefaultF2Config FCFS16GBQuadRank_BaseF2Config
+    FRFCFS16GBQuadRank_BaseF2Config WithAutoILA_FRFCFS16GBQuadRankLLC4MB_BaseF2Config)
+  if(config MATCHES "FRFCFS")
+    set(capacity 32)
   else()
-    set(config BaseF2Config)
+    set(capacity 16)
   endif()
-  set(profile_dir "${WORK}/profile-${capacity}")
+  set(profile_dir "${WORK}/profile-${config}")
   execute_process(COMMAND "${COMPILER}" "${WORK}/profile.fir"
     --annotation-file "${WORK}/profile.json" --output-dir "${profile_dir}"
     --compile-baseline --emit-debug-snapshots --platform-config "${config}"
     RESULT_VARIABLE result ERROR_VARIABLE error OUTPUT_VARIABLE output TIMEOUT 15)
-  if(NOT result EQUAL 1 OR NOT error MATCHES "FAME model has no data channels")
+  if(NOT result EQUAL 1 OR NOT error MATCHES "(FAME model has no data channels|model has no data channels)")
     message(FATAL_ERROR "${config} did not reach expected FAME boundary: ${result}\n${output}\n${error}")
   endif()
   file(GLOB snapshots "${profile_dir}/*.mlir")
@@ -90,6 +103,11 @@ foreach(capacity IN ITEMS 16 32)
   endif()
   foreach(snapshot IN LISTS snapshots)
     file(READ "${snapshot}" ir)
+    if(config MATCHES "DefaultF2Config" AND
+        (NOT ir MATCHES "goldengate.f2PCIM = false" OR
+         NOT ir MATCHES "goldengate.tokenIrrevocabilityAssertions = true"))
+      message(FATAL_ERROR "${snapshot}: missing DefaultF2 debug/platform selection")
+    endif()
     if(NOT ir MATCHES "goldengate.fasedBaseCapacity = ${capacity} : i32")
       message(FATAL_ERROR "${snapshot}: missing explicit platform capacity ${capacity}")
     endif()

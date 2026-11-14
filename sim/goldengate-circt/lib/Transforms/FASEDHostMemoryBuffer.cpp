@@ -3,6 +3,7 @@
 // Default BufferParams: depth two, no flow and no pipe on all five channels.
 #include "goldengate/FASEDHostMemoryBuffer.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 using namespace mlir;
 using namespace circt::firrtl;
 
@@ -43,8 +44,10 @@ LogicalResult goldengate::addFASEDHostMemoryBuffer(CircuitOp circuit,
     auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();
     return a&&a.getValue().getBitWidth()<=64&&!a.getValue().isNegative()&&!a.getValue().isZero();
   };
-  if(!has(widths,"addrBits",35)||!has(widths,"dataBits",64)||!has(widths,"idBits",4)||
-     !has(edge,"maxReadTransfer",8)||(!has(edge,"idReuse",1)&&!has(edge,"idReuse",2))||!positive(edge,"maxFlight"))
+  if (!has(widths, "addrBits", 35) ||
+      !validFASEDGeometry(getFASEDGeometry(circuit)) ||
+      !has(widths, "idBits", 4) || !positive(edge, "maxReadTransfer") ||
+      !positive(edge, "idReuse") || !positive(edge, "maxFlight"))
     return reject("FASED host memory buffer supports the recorded sixteen-ID eight-beat profile");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};

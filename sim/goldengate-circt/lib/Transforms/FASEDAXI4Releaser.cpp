@@ -2,6 +2,7 @@
 // Oracle: midas/models/dram/Util.scala AXI4Releaser.
 #include "goldengate/FASEDAXI4Releaser.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 
 using namespace mlir;
 using namespace circt::firrtl;
@@ -9,6 +10,7 @@ using namespace circt::firrtl;
 LogicalResult goldengate::materializeFASEDAXI4Releaser(CircuitOp circuit,
                                                        FModuleOp &result,
                                                        std::string &error) {
+  auto geometry = getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral name = "GGFASEDAXI4Releaser";
   for (auto module : circuit.getOps<FModuleLike>()) {
     if (module.getModuleName() == name) {
@@ -38,7 +40,7 @@ LogicalResult goldengate::materializeFASEDAXI4Releaser(CircuitOp circuit,
   port("rValid", 1, Direction::Out);
   port("rId", 4, Direction::Out);
   port("rLast", 1, Direction::Out);
-  port("rData", 64, Direction::Out);
+  port("rData", geometry.dataBits, Direction::Out);
   port("rResp", 2, Direction::Out);
   port("rUser", 1, Direction::Out);
   port("bReady", 1, Direction::In);
@@ -52,7 +54,7 @@ LogicalResult goldengate::materializeFASEDAXI4Releaser(CircuitOp circuit,
   port("egressWriteId", 4, Direction::Out);
   port("egressRId", 4, Direction::In);
   port("egressRLast", 1, Direction::In);
-  port("egressRData", 64, Direction::In);
+  port("egressRData", geometry.dataBits, Direction::In);
   port("egressRResp", 2, Direction::In);
   port("egressRUser", 1, Direction::In);
   port("egressBId", 4, Direction::In);

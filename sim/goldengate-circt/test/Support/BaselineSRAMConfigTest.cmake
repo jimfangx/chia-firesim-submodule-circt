@@ -90,7 +90,8 @@ endforeach()
 # Exercise the production configuration gate as well as the standalone passes.
 # This probe intentionally lacks a complete bridge/platform graph, so inspect
 # its extraction handoff and allow the later assembly boundary to reject it.
-foreach(config IN ITEMS WithMultiCycleRamModels_BaseF2Config MCRams_BaseF2Config
+foreach(config IN ITEMS DefaultF2Config FCFS16GBQuadRank_DefaultF2Config
+    WithMultiCycleRamModels_BaseF2Config MCRams_BaseF2Config
     WithMultiCycleRamModels_BaseXilinxAlveoU250Config explicit-native-enable)
   set(extra)
   set(profile "${config}")

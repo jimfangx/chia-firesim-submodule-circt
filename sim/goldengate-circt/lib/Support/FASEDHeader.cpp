@@ -12,12 +12,14 @@
 #include "goldengate/AnnotationClasses.h"
 #include "goldengate/FASEDFRFCFSMMIO.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include "llvm/ADT/APSInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/Support/raw_ostream.h"
 #include <cstdint>
 #include <functional>
+#include "goldengate/FASEDDRAMProfile.h"
 
 using namespace mlir;
 using namespace circt::firrtl;
@@ -92,9 +94,14 @@ LogicalResult goldengate::prepareFASEDHeader(CircuitOp circuit,
                    (base.getInt() != 16 && base.getInt() != 32)))
     return reject(
         "FASED header needs an integer base capacity of sixteen or thirty-two");
-  bool frfcfs = base && base.getInt() == 32;
-  unsigned registerCount = frfcfs ? 68 : 21;
-  unsigned regionBytes = frfcfs ? 512 : 128;
+  bool frfcfs = circuit->hasAttr("goldengate.fasedDRAMProfile") ||
+                (base && base.getInt() == 32);
+  if (frfcfs && (!base || base.getInt() != getFASEDDRAMBaseCapacity(circuit)))
+    return reject(
+        "FASED DDR3 header base capacity differs from its memory profile");
+  auto dramRegisters = getFASEDFRFCFSMMIORegisters(circuit);
+  unsigned registerCount = frfcfs ? dramRegisters.size() : 21;
+  unsigned regionBytes = frfcfs ? (registerCount > 64 ? 512 : 256) : 128;
   auto bank = liveModule("GGFASEDMMIOWrapper");
   auto selectedBank = liveModule("GGSelectedPrintFASEDMMIOWrapper");
   if (bank && selectedBank)
@@ -189,26 +196,16 @@ LogicalResult goldengate::prepareFASEDHeader(CircuitOp circuit,
   if (!key ||
       key.getAs<StringAttr>("class") != "firesim.lib.bridges.CompleteConfig" ||
       !addrBits || addrBits.getInt() < 1 || addrBits.getInt() > 62 ||
-      !dataBits || dataBits.getInt() != 64 || !idBits || idBits.getInt() != 4 ||
-      !flight || flight.getValue().getBitWidth() > 64 || flight.getInt() <= 0 ||
-      !timing || !hPort || engine.getPortDirection(*timing) != Direction::Out ||
+      !dataBits || !validFASEDGeometry(getFASEDGeometry(circuit)) || !idBits ||
+      idBits.getInt() != 4 || !flight || flight.getValue().getBitWidth() > 64 ||
+      flight.getInt() <= 0 || !timing || !hPort ||
+      engine.getPortDirection(*timing) != Direction::Out ||
       engine.getPortDirection(*hPort) != Direction::In)
     return reject("FASED header requires a retained positive maxFlight "
                   "constructor and target AXI types");
-  if (frfcfs) {
-    auto reuse = edge.getAs<IntegerAttr>("idReuse");
-    auto reads = edge.getAs<IntegerAttr>("maxReadTransfer");
-    auto writes = edge.getAs<IntegerAttr>("maxWriteTransfer");
-    auto exact = [](IntegerAttr v, int64_t n) {
-      return v && v.getValue().getBitWidth() <= 64 && v.getInt() == n;
-    };
-    if (addrBits.getInt() != 35 ||
-        !((exact(flight, 10) && exact(reuse, 1)) ||
-          (exact(flight, 20) && exact(reuse, 2))) ||
-        !exact(reads, 8) || !exact(writes, 8))
-      return reject("FASED FRFCFS header needs the exact selected target "
-                    "AXI/edge profile");
-  }
+  if (frfcfs && (addrBits.getInt() != 35 || idBits.getInt() != 4 ||
+                 !validFASEDGeometry(getFASEDGeometry(circuit))))
+    return reject("FASED DDR3 header needs valid target AXI geometry");
   // genHeader uses the target Nasti address space, before host translation.
   Type target =
       fieldType(fieldType(engine.getPortType(*hPort), "hBits"), "axi4");
@@ -276,9 +273,9 @@ LogicalResult goldengate::prepareFASEDHeader(CircuitOp circuit,
     auto read = word ? word.getAs<BoolAttr>("readable") : BoolAttr();
     auto write = word ? word.getAs<BoolAttr>("writeable") : BoolAttr();
     StringRef expectedName =
-        frfcfs ? StringRef(getFASEDFRFCFSMMIORegisters()[i].name) : names[i];
-    bool expectedWrite = frfcfs ? getFASEDFRFCFSMMIORegisters()[i].writeable
-                                : (i < 4 || i == 18);
+        frfcfs ? StringRef(dramRegisters[i].name) : names[i];
+    bool expectedWrite =
+        frfcfs ? dramRegisters[i].writeable : (i < 4 || i == 18);
     if (!word || word.getAs<StringAttr>("name") != expectedName || !offset ||
         offset.getInt() != 4 * i || !read || !read.getValue() || !write ||
         write.getValue() != expectedWrite ||
@@ -533,7 +530,8 @@ LogicalResult goldengate::prepareFASEDHeader(CircuitOp circuit,
         request.getInput() != arg(adapter, 2))
       continue;
     if ((request.getFieldName() != "aw" && request.getFieldName() != "ar") ||
-        slice.getHi() != (frfcfs ? 8 : 6) || slice.getLo() != 2)
+        slice.getHi() != (frfcfs ? (registerCount > 64 ? 8 : 7) : 6) ||
+        slice.getLo() != 2)
       return reject("FASED MCRFile local word selection differs from the "
                     "profile allocation");
     if (request.getFieldName() == "aw")

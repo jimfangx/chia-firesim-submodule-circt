@@ -11,12 +11,21 @@
 // RAM writes accepted before a reset edge still occur. No flow/pipe bypass.
 #include "goldengate/FASEDIngressWQueue.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDIngressWQueue(CircuitOp circuit, std::string &error) {
-  constexpr llvm::StringLiteral queueName = "GGFASEDIngressWQueue16";
+  auto geometry = getFASEDGeometry(circuit);
+  if (!validFASEDGeometry(geometry)) {
+    error = "invalid FASED W geometry";
+    return failure();
+  }
+  unsigned depth = 2 * geometry.writeBeats;
+  unsigned pointerBits = llvm::Log2_64_Ceil(depth);
+  unsigned packedBits = geometry.dataBits + geometry.dataBits / 8 + 6;
+  std::string queueName = "GGFASEDIngressWQueue" + std::to_string(depth);
   const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressAWWrapper";
   const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressWQueueWrapper" : "GGFASEDIngressWQueueWrapper";
   auto reject = [&](llvm::StringRef reason) { error = reason.str(); return failure(); };
@@ -36,15 +45,21 @@ LogicalResult goldengate::addFASEDIngressWQueue(CircuitOp circuit, std::string &
   auto key = engine->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
   auto edge = key ? key.getAs<DictionaryAttr>("axi4Edge") : DictionaryAttr();
   auto maxWrite = edge ? edge.getAs<IntegerAttr>("maxWriteTransfer") : IntegerAttr();
-  if (!maxWrite || maxWrite.getInt() != 8)
+  if (!maxWrite || maxWrite.getInt() <= 0 || maxWrite.getInt() > 256)
     return reject("FASED W ingress currently supports the recorded maxWriteTransfer=8 profile");
   auto *context = circuit.getContext();
   OpBuilder b(context);
-  auto bit = UIntType::get(context, 1, false), word = UIntType::get(context, 64, false);
-  auto payload = BundleType::get(context, {{b.getStringAttr("user"), false, bit},
-      {b.getStringAttr("strb"), false, UIntType::get(context, 8, false)},
-      {b.getStringAttr("id"), false, UIntType::get(context, 4, false)},
-      {b.getStringAttr("last"), false, bit}, {b.getStringAttr("data"), false, word}});
+  auto bit = UIntType::get(context, 1, false),
+       word = UIntType::get(context, geometry.dataBits, false);
+  auto payload = BundleType::get(
+      context,
+      {{b.getStringAttr("user"), false, bit},
+       {b.getStringAttr("strb"),
+        false,
+        UIntType::get(context, geometry.dataBits / 8, false)},
+       {b.getStringAttr("id"), false, UIntType::get(context, 4, false)},
+       {b.getStringAttr("last"), false, bit},
+       {b.getStringAttr("data"), false, word}});
   auto token = BundleType::get(context, {{b.getStringAttr("ready"), true, bit},
       {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, payload}});
   auto port = [&](llvm::StringRef name, Type type, Direction direction) -> std::optional<unsigned> {
@@ -84,7 +99,8 @@ LogicalResult goldengate::addFASEDIngressWQueue(CircuitOp circuit, std::string &
   };
   auto mux = [&](Value c, Value yes, Value no) -> Value { return b.create<MuxPrimOp>(loc, c, yes, no); };
   auto both = [&](Value a, Value c) -> Value { return b.create<AndPrimOp>(loc, a, c); };
-  Value enqPtr = reg(4, "enq_ptr_value"), deqPtr = reg(4, "deq_ptr_value");
+  Value enqPtr = reg(pointerBits, "enq_ptr_value"),
+        deqPtr = reg(pointerBits, "deq_ptr_value");
   Value maybeFull = reg(1, "maybe_full");
   Value equal = b.create<EQPrimOp>(loc, enqPtr, deqPtr);
   Value full = both(equal, maybeFull), empty = both(equal, b.create<NotPrimOp>(loc, maybeFull));
@@ -92,17 +108,31 @@ LogicalResult goldengate::addFASEDIngressWQueue(CircuitOp circuit, std::string &
   Value push = both(ready, field(arg(2), "valid")), pop = both(valid, field(arg(3), "ready"));
   connect(field(arg(2), "ready"), ready); connect(field(arg(3), "valid"), valid);
   auto increment = [&](Value pointer) -> Value {
-    return b.create<BitsPrimOp>(loc, b.create<AddPrimOp>(loc, pointer, constant(4, 1)), 3, 0);
+    Value incremented = b.create<BitsPrimOp>(
+        loc,
+        b.create<AddPrimOp>(loc, pointer, constant(pointerBits, 1)),
+        pointerBits - 1,
+        0);
+    return b.create<MuxPrimOp>(
+        loc,
+        b.create<EQPrimOp>(loc, pointer, constant(pointerBits, depth - 1)),
+        constant(pointerBits, 0),
+        incremented);
   };
   connect(enqPtr, mux(push, increment(enqPtr), enqPtr));
   connect(deqPtr, mux(pop, increment(deqPtr), deqPtr));
   connect(maybeFull, mux(b.create<XorPrimOp>(loc, push, pop), push, maybeFull));
 
-  SmallVector<Type> memoryTypes{MemOp::getTypeForPort(16, UIntType::get(context, 78, false), MemOp::PortKind::Read),
-      MemOp::getTypeForPort(16, UIntType::get(context, 78, false), MemOp::PortKind::Write)};
+  SmallVector<Type> memoryTypes{
+      MemOp::getTypeForPort(depth,
+                            UIntType::get(context, packedBits, false),
+                            MemOp::PortKind::Read),
+      MemOp::getTypeForPort(depth,
+                            UIntType::get(context, packedBits, false),
+                            MemOp::PortKind::Write)};
   SmallVector<Attribute> memoryNames{b.getStringAttr("read"), b.getStringAttr("write")};
-  auto ram = b.create<MemOp>(loc, memoryTypes, 0, 1, 16,
-      RUWAttr::Undefined, memoryNames, "ram");
+  auto ram = b.create<MemOp>(
+      loc, memoryTypes, 0, 1, depth, RUWAttr::Undefined, memoryNames, "ram");
   Value reader = ram.getResult(0), writer = ram.getResult(1);
   connect(field(reader, "clk"), arg(0)); connect(field(reader, "en"), constant(1, 1));
   connect(field(reader, "addr"), deqPtr);

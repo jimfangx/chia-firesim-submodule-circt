@@ -237,9 +237,15 @@ void rejection(MLIRContext &context) {
     auto engine = named(c, "GGFASEDTokenEngine");
     if (bad == 17) engine.erase();
     if (bad == 18) engine->removeAttr("goldengate.bridgeConstructor");
-    if (bad == 19 || bad == 20) engine->setAttr("goldengate.bridgeConstructor", b.getDictionaryAttr({
-        b.getNamedAttr("axi4Edge", b.getDictionaryAttr({
-            b.getNamedAttr("maxWriteTransfer", bad == 19 ? Attribute(b.getI64IntegerAttr(4)) : Attribute(b.getStringAttr("8")))}))}));
+    if (bad == 19 || bad == 20)
+      engine->setAttr(
+          "goldengate.bridgeConstructor",
+          b.getDictionaryAttr({b.getNamedAttr(
+              "axi4Edge",
+              b.getDictionaryAttr({b.getNamedAttr(
+                  "maxWriteTransfer",
+                  bad == 19 ? Attribute(b.getI64IntegerAttr(0))
+                            : Attribute(b.getStringAttr("8")))}))}));
     if (bad == 21) { SmallVector<Attribute> names(top.getPortNames().begin(), top.getPortNames().end()); names[4] = b.getStringAttr("fased_ingress_w_last_fire"); top.setPortNames(names); }
     std::string before, after, error;
     { llvm::raw_string_ostream out(before); root->print(out); }

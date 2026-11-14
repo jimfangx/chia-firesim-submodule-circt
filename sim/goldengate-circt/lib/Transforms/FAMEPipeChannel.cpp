@@ -12,6 +12,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include "goldengate/TokenIrrevocability.h"
 
 using namespace circt::firrtl;
 using namespace mlir;
@@ -287,6 +288,8 @@ LogicalResult goldengate::addFAMEPipeChannel(CircuitOp circuit,
   auto arg = [&](unsigned index) { return pipe.getBodyBlock()->getArgument(index); };
   Location loc = pipe.getLoc();
   Value zero = builder.create<ConstantOp>(loc, bit, APInt(1, 0));
+  assertTokenIrrevocable(
+      circuit, builder, loc, arg(0), arg(1), arg(3), arg(4), arg(2), "input");
   Value initializing, zeroData;
   if (latency == 1) {
     // Match 0.U.asTypeOf(gen), including signed and aggregate payloads.

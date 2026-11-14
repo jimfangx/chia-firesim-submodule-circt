@@ -6,11 +6,12 @@
 #include <string>
 
 namespace goldengate {
-// Selected 35/64/4-bit AXI4 response release semantics from Util.scala.
-// Two one-entry pipe queues retain occupancy only; metadata and egress payloads
-// are not stored. State/reset advance only on targetFire. Egress requests and
-// payload/ready forwarding remain combinational, including invalid cycles.
-// A symbol collision leaves both the circuit and result unchanged.
+// AXI4 response release semantics with constructor-derived data width from
+// Util.scala. Two one-entry pipe queues retain occupancy only; metadata and
+// egress payloads are not stored. State/reset advance only on targetFire.
+// Egress requests and payload/ready forwarding remain combinational, including
+// invalid cycles. A symbol collision leaves both the circuit and result
+// unchanged.
 mlir::LogicalResult
 materializeFASEDAXI4Releaser(circt::firrtl::CircuitOp circuit,
                              circt::firrtl::FModuleOp &result,

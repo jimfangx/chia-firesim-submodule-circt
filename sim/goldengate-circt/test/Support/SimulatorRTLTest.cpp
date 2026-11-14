@@ -978,7 +978,8 @@ int main(int argc, char **argv) {
     require(succeeded(goldengate::emitSimulatorRTL(*vector, argv[1], unitPath + ".vector.sv", error)), error);
     llvm::outs() << "Unknown vector widths inferred before LowerTypes; 39-bit dynamic mux emitted through backend\n";
     // The mark belongs to native-generated packing, not to a text-name guess.
-    for (unsigned depth : {128u, 256u}) {
+    for (unsigned depth : {128u, 256u, 512u}) {
+      unsigned dataBits = depth == 512 ? 256 : 64;
       auto originFixture = parseSourceString<ModuleOp>(R"mlir(module {
         firrtl.circuit "OriginTest" {
           firrtl.module @OriginTest(in %clock: !firrtl.clock, in %wen: !firrtl.uint<1>, in %waddr: !firrtl.uint<8>, in %raddr: !firrtl.uint<8>, in %enq_bits: !firrtl.bundle<data: uint<64>, last: uint<1>>, out %deq_bits: !firrtl.bundle<data: uint<64>, last: uint<1>>) {}
@@ -996,9 +997,26 @@ int main(int argc, char **argv) {
       auto connect = [&](Value dest, Value src) {
         b.create<StrictConnectOp>(loc, dest, src);
       };
+      if (dataBits != 64) {
+        auto payload =
+            BundleType::get(&context,
+                            {{b.getStringAttr("data"), false, uint(dataBits)},
+                             {b.getStringAttr("last"), false, uint(1)}});
+        SmallVector<Attribute> portTypes(
+            originModule.getPortTypesAttr().begin(),
+            originModule.getPortTypesAttr().end());
+        for (unsigned i : {2u, 3u, 4u, 5u}) {
+          Type type = i < 4 ? Type(uint(9)) : Type(payload);
+          portTypes[i] = TypeAttr::get(type);
+          originModule.getArgument(i).setType(type);
+        }
+        originModule->setAttr("portTypes", b.getArrayAttr(portTypes));
+      }
       SmallVector<Type> types{
-          MemOp::getTypeForPort(depth, uint(65), MemOp::PortKind::Read),
-          MemOp::getTypeForPort(depth, uint(65), MemOp::PortKind::Write)};
+          MemOp::getTypeForPort(
+              depth, uint(dataBits + 1), MemOp::PortKind::Read),
+          MemOp::getTypeForPort(
+              depth, uint(dataBits + 1), MemOp::PortKind::Write)};
       SmallVector<Attribute> names{b.getStringAttr("read"), b.getStringAttr("write")};
       auto memory = b.create<MemOp>(loc, types, 1, 1, depth, RUWAttr::Undefined,
                                     names, "ram");
@@ -1022,7 +1040,7 @@ int main(int argc, char **argv) {
       connect(sf(writer, "data"), packed);
       auto output = sf(reader, "data");
       connect(sf(originModule.getArgument(5), "data"),
-              b.create<BitsPrimOp>(loc, output, 64, 1));
+              b.create<BitsPrimOp>(loc, output, dataBits, 1));
       connect(sf(originModule.getArgument(5), "last"),
               b.create<BitsPrimOp>(loc, output, 0, 0));
       auto beforeOrigin = dump(*originFixture);
@@ -1044,10 +1062,12 @@ int main(int argc, char **argv) {
       auto *lowered = record->getObject("lowered");
       auto *source = record->getObject("source");
       require(source && source->getInteger("depth") == depth &&
-                  lowered && lowered->getString("module") == "OriginTest" &&
+                  source->getInteger("width") == dataBits + 1 && lowered &&
+                  lowered->getString("module") == "OriginTest" &&
                   lowered->getString("memory_instance") == "ram_ext" &&
                   lowered->getString("read_capture") == "ram_read_rdata" &&
-                  (*record->getArray("instance_paths"))[0].getAsString() == "OriginTest" &&
+                  (*record->getArray("instance_paths"))[0].getAsString() ==
+                      "OriginTest" &&
                   read(originJSON).find("assum") == std::string::npos &&
                   beforeOrigin == dump(*originFixture),
               "native origin lost actual identity or changed public source IR");
@@ -1111,10 +1131,10 @@ int main(int argc, char **argv) {
           // represent the declared data64/last1 origin.
           SmallVector<Attribute> portTypes(badModule.getPortTypesAttr().begin(),
                                            badModule.getPortTypesAttr().end());
-          portTypes[dataIndex] = TypeAttr::get(uint(63));
+          portTypes[dataIndex] = TypeAttr::get(uint(dataBits - 1));
           portTypes[lastIndex] = TypeAttr::get(uint(2));
           badModule->setAttr("portTypes", b.getArrayAttr(portTypes));
-          badModule.getArgument(dataIndex).setType(uint(63));
+          badModule.getArgument(dataIndex).setType(uint(dataBits - 1));
           badModule.getArgument(lastIndex).setType(uint(2));
         } else {
           badModule.walk([&](MemOp mem) {

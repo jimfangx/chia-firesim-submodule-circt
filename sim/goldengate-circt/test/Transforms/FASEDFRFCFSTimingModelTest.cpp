@@ -93,6 +93,8 @@ static void checkWiringAndAssertions(FModuleOp model) {
       return !eval(op->getOperand(0));
     if (isa_and_nonnull<EQPrimOp>(op))
       return eval(op->getOperand(0)) == eval(op->getOperand(1));
+    if (isa_and_nonnull<LEQPrimOp>(op))
+      return eval(op->getOperand(0)) <= eval(op->getOperand(1));
     if (isa_and_nonnull<LTPrimOp>(op))
       return eval(op->getOperand(0)) < eval(op->getOperand(1));
     throw std::runtime_error("unsupported protocol predicate operation");
@@ -166,7 +168,7 @@ int main(int argc, char **argv) {
       require(saved == print(root->getOperation()) && sentinel == helper,
               "duplicate changed circuit/result");
       require(failed(goldengate::materializeFASEDFRFCFSTimingModel(
-                  circuit, 11, sentinel, error)),
+                  circuit, 33, sentinel, error)),
               "unsupported capacity accepted");
       require(saved == print(root->getOperation()),
               "invalid capacity changed circuit");

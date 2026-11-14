@@ -7,6 +7,7 @@
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
+#include "goldengate/F1Shim.h"
 
 using namespace mlir;
 using namespace circt::firrtl;
@@ -137,7 +138,9 @@ LogicalResult goldengate::prepareMetasimInterfaceHeader(
         return reject("invalid F2 physical PCIM geometry");
       ++pcimPorts;
     }
-    if (pcimPorts != 1) return reject("F2 requires one physical PCIM port");
+    if (pcimPorts != unsigned(hasF2PCIM(circuit)))
+      return reject(
+          "F2 physical PCIM presence differs from platform configuration");
     // FPGATopQSFPBitWidth retains its default even with no physical ports.
     qsfpWidth = 256;
   } else if (qsfpPorts != 2)

@@ -61,7 +61,10 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &ctx,unsigned mode=0) {
 }
 void checkShim(CircuitOp c,unsigned oldAnnotations, bool isF2=false) {
   auto shim=top(c,"F1Shim");
-  require(c.getName()=="F1Shim"&&shim.getNumPorts()==(isF2?6u:8u),"shim schema");
+  require(c.getName() == "F1Shim" &&
+              shim.getNumPorts() ==
+                  (isF2 ? (goldengate::hasF2PCIM(c) ? 6u : 5u) : 8u),
+          "shim schema");
   if (isF2) {
     unsigned pcim=0;
     for (auto p:shim.getPorts()) {
@@ -79,7 +82,8 @@ void checkShim(CircuitOp c,unsigned oldAnnotations, bool isF2=false) {
           require(cast<UIntType>(bits.getElement("data")->type).getWidth()==512,"F2 physical PCIM data width");
       }
     }
-    require(pcim==1,"F2 physical PCIM count");
+    require(pcim == unsigned(goldengate::hasF2PCIM(c)),
+            "F2 physical PCIM count");
     unsigned invalids=0, inactive=0;
     shim.walk([&](InvalidValueOp){++invalids;});
     shim.walk([&](StrictConnectOp c){
@@ -88,7 +92,9 @@ void checkShim(CircuitOp c,unsigned oldAnnotations, bool isF2=false) {
       auto zero=c.getSrc().getDefiningOp<ConstantOp>();
       if(zero && zero.getValue().isZero())++inactive;
     });
-    require(invalids==3 && inactive==5,"inactive F2 PCIM requests and responses");
+    require(invalids == (goldengate::hasF2PCIM(c) ? 3u : 0u) &&
+                inactive == (goldengate::hasF2PCIM(c) ? 5u : 0u),
+            "inactive F2 PCIM requests and responses");
   }
   unsigned regs=0;
   for(auto r:shim.getOps<RegResetOp>()) {
@@ -212,6 +218,13 @@ int main(int argc,char **argv) {
     require(succeeded(goldengate::assembleFPGATopShell(f2c,error,true)),error);
     f2before=dump(*f2);
     require(failed(goldengate::assembleF1Shim(f2c,error))&&f2before==dump(*f2),"F2 shim accepted as U250");
+    OwningOpRef<ModuleOp> defaultF2 = cast<ModuleOp>(f2->clone());
+    auto defaultCircuit = *defaultF2->getOps<CircuitOp>().begin();
+    OpBuilder defaultBuilder(&ctx);
+    defaultCircuit->setAttr("goldengate.f2PCIM",
+                            defaultBuilder.getBoolAttr(false));
+    applyShim(defaultCircuit, true);
+    require(succeeded(verify(*defaultF2)), "DefaultF2 shell is invalid");
     applyShim(f2c,true);
     llvm::outs()<<"F2 F1Shim: 32-bit control addresses, no physical QSFP, inactive 64/512/6 PCIM, AWS post-link hierarchy\n";
     for(unsigned mode=0;mode<11;++mode) {

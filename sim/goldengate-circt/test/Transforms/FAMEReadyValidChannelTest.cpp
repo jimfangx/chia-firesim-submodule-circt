@@ -761,6 +761,22 @@ void internalLink(MLIRContext &context) {
 int main(int argc, char **argv) {
   MLIRContext context; context.loadDialect<FIRRTLDialect, circt::hw::HWDialect>();
   try {
+    for (unsigned width : {0u, 8u}) {
+      auto root = parseSourceString<ModuleOp>(
+          "module { firrtl.circuit \"Top\" { firrtl.module @Top() {} } }",
+          &context);
+      auto c = *root->getOps<CircuitOp>().begin();
+      OpBuilder builder(&context);
+      c->setAttr("goldengate.tokenIrrevocabilityAssertions",
+                 builder.getBoolAttr(true));
+      std::string error;
+      require(succeeded(goldengate::addFAMEReadyValidChannel(c, width, error)),
+              error);
+      unsigned checks = 0;
+      c.walk([&](AssertOp) { ++checks; });
+      require(checks == 4 && succeeded(verify(*root)),
+              "DefaultF2 forward/reverse token assertions missing");
+    }
     wrapper(context, argc > 1 ? argv[1] : nullptr);
     signedScalar(context);
     nestedPayload(context);

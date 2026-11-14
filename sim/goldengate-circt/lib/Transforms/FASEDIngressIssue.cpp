@@ -11,10 +11,12 @@
 #include "goldengate/FASEDIngressIssue.h"
 #include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::addFASEDIngressIssue(CircuitOp circuit,std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral helperName="GGFASEDIngressIssue";
   const bool selected = circuit.getName() == "GGSelectedPrintFASEDIngressOrderWrapper";
   const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressIssueWrapper"
@@ -38,7 +40,11 @@ LogicalResult goldengate::addFASEDIngressIssue(CircuitOp circuit,std::string &er
     SmallVector<BundleType::BundleElement> e;for(auto [n,w]:fields)e.push_back({b.getStringAttr(n),false,uint(w)});return BundleType::get(context,e);
   };
   auto address=bundle({{"user",1},{"id",4},{"region",4},{"qos",4},{"prot",3},{"cache",4},{"lock",1},{"burst",2},{"size",3},{"len",8},{"addr",35}});
-  auto data=bundle({{"user",1},{"strb",8},{"id",4},{"last",1},{"data",64}});
+  auto data = bundle({{"user", 1},
+                      {"strb", geometry.dataBits / 8},
+                      {"id", 4},
+                      {"last", 1},
+                      {"data", geometry.dataBits}});
   auto token=[&](FIRRTLBaseType t){return BundleType::get(context,{{b.getStringAttr("ready"),true,bit},{b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,t}});};
   auto status=bundle({{"awValue",countWidth},{"wValue",countWidth},{"awEmpty",1},{"wEmpty",1},{"writeReqDone",1}});
   auto transactions=bundle({{"arReady",1},{"arValid",1},{"rReady",1},{"rValid",1},{"rLast",1},{"awReady",1},{"awValid",1},{"bReady",1},{"bValid",1}});

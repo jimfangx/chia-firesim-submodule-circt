@@ -243,7 +243,9 @@ int main(int argc,char **argv) {
       auto t=top(c,"GGFASEDAddressTranslationWrapper");OpBuilder b(&ctx);
       if(bad<6){auto e=top(c,"GGFASEDTokenEngine");auto key=e->getAttrOfType<DictionaryAttr>("goldengate.bridgeConstructor");
         bool width=bad<3;StringRef ns[]{"addrBits","dataBits","idBits","maxReadTransfer","idReuse","maxFlight"};
-        StringRef dict=width?"axi4Widths":"axi4Edge";NamedAttrList d(key.getAs<DictionaryAttr>(dict));d.set(ns[bad],b.getI64IntegerAttr(bad==5?0:99));
+        StringRef dict = width ? "axi4Widths" : "axi4Edge";
+        NamedAttrList d(key.getAs<DictionaryAttr>(dict));
+        d.set(ns[bad], b.getI64IntegerAttr(bad >= 3 ? 0 : 99));
         NamedAttrList k(key);k.set(dict,d.getDictionary(&ctx));e->setAttr("goldengate.bridgeConstructor",k.getDictionary(&ctx));
       } else if(bad==6)c->removeAttr("rawAnnotations");
       else if(bad==7){for(auto x:t.getOps<ConnectOp>())if(auto i=x.getDest().getDefiningOp<InstanceOp>())if(i.getName()=="translation"&&cast<OpResult>(x.getDest()).getResultNumber()==2){x.erase();break;}}

@@ -12,12 +12,14 @@
 #include "goldengate/FASEDIngressAWQueue.h"
 #include "goldengate/FASEDRequestLimits.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include "llvm/Support/MathExtras.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDIngressAWQueue(CircuitOp circuit, std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral gateName = "GGFASEDIngressAW";
   const bool selected = circuit.getName() == "GGSelectedPrintFASEDHostOutstandingWrapper";
   const llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDIngressAWWrapper" : "GGFASEDIngressAWWrapper";
@@ -49,7 +51,11 @@ LogicalResult goldengate::addFASEDIngressAWQueue(CircuitOp circuit, std::string 
   };
   auto address = payload({{"user",1}, {"id",4}, {"region",4}, {"qos",4}, {"prot",3}, {"cache",4},
       {"lock",1}, {"burst",2}, {"size",3}, {"len",8}, {"addr",35}});
-  auto data = payload({{"user",1}, {"strb",8}, {"id",4}, {"last",1}, {"data",64}});
+  auto data = payload({{"user", 1},
+                       {"strb", geometry.dataBits / 8},
+                       {"id", 4},
+                       {"last", 1},
+                       {"data", geometry.dataBits}});
   auto validToken = [&](FIRRTLBaseType bits) { return BundleType::get(ctx, {{b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, bits}}); };
   auto decoupled = [&](FIRRTLBaseType bits) { return BundleType::get(ctx, {{b.getStringAttr("ready"), true, bit}, {b.getStringAttr("valid"), false, bit}, {b.getStringAttr("bits"), false, bits}}); };
   auto addressToken = decoupled(address), dataToken = decoupled(data);

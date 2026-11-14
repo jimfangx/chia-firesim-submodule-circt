@@ -434,10 +434,7 @@ void rejects(MLIRContext &ctx) {
                 : mode == 5 ? "maxReadTransfer"
                 : mode == 6 ? "maxWriteTransfer"
                             : "addrBits",
-                b.getI64IntegerAttr(mode == 3   ? 20
-                                    : mode == 4 ? 2
-                                    : mode == 7 ? 34
-                                                : 4));
+                b.getI64IntegerAttr(mode == 7 ? 34 : 0));
       key.set(group, attrs.getDictionary(&ctx));
       e->setAttr("goldengate.bridgeConstructor", key.getDictionary(&ctx));
     }

@@ -103,11 +103,14 @@ OwningOpRef<ModuleOp> fixture(MLIRContext &context, unsigned variant = 0, bool s
   auto replace=[&](llvm::StringRef a,llvm::StringRef z) {
     auto p=text.find(a.str()); require(p!=std::string::npos,"missing replacement");text.replace(p,a.size(),z.str());
   };
-  if (variant==1) replace("maxReadTransfer = 8","maxReadTransfer = 9");
-  if (variant==2) replace("idReuse = 1","idReuse = 3");
+  if (variant == 1)
+    replace("maxReadTransfer = 8", "maxReadTransfer = 0");
+  if (variant == 2)
+    replace("idReuse = 1", "idReuse = 0");
   if (variant==3) replace("maxFlight = 10","maxFlight = 0");
   if (variant==4) replace("addrBits = 35","addrBits = 34");
-  if (variant==5) replace("dataBits = 64","dataBits = 128");
+  if (variant == 5)
+    replace("dataBits = 64", "dataBits = 96");
   if (variant==6) replace("idBits = 4","idBits = 5");
   if (variant==7) replace("in %hostClock: !firrtl.clock","out %hostClock: !firrtl.clock");
   if (variant==8) replace("!firrtl.clock","!firrtl.uint<1>");

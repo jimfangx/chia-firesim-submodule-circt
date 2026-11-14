@@ -7,6 +7,7 @@
 // RAM is asynchronous read, synchronous write; reset flushes pointers only.
 #include "goldengate/FASEDReadDeinterleaver.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <map>
 using namespace mlir;
 using namespace circt::firrtl;
@@ -15,7 +16,17 @@ LogicalResult goldengate::addFASEDReadDeinterleaver(CircuitOp circuit,
                                                   std::string &error) {
   constexpr StringLiteral topName="GGFASEDAddressTranslationWrapper";
   constexpr StringLiteral helperName="GGFASEDReadDeinterleaver";
-  constexpr StringLiteral queueName="GGFASEDDeinterleaveQueue8";
+  auto geometry = getFASEDGeometry(circuit);
+  if (!validFASEDGeometry(geometry)) {
+    error = "invalid FASED deinterleaver geometry";
+    return failure();
+  }
+  unsigned queueDepth = llvm::PowerOf2Ceil(
+      uint64_t(geometry.readBeats) * std::max(1u, geometry.dataBits / 64));
+  unsigned queueBits = std::max(1u, llvm::Log2_64(queueDepth));
+  unsigned pendingBits = llvm::Log2_64_Ceil(queueDepth + 1);
+  std::string queueName =
+      "GGFASEDDeinterleaveQueue" + std::to_string(queueDepth);
   auto reject=[&](StringRef s){error=s.str();return failure();};
   FModuleOp top,inner,translation,engine;
   unsigned engines=0;
@@ -47,8 +58,10 @@ LogicalResult goldengate::addFASEDReadDeinterleaver(CircuitOp circuit,
     auto a=d?d.getAs<IntegerAttr>(n):IntegerAttr();
     return a&&a.getValue().getBitWidth()<=64&&!a.getValue().isNegative()&&!a.getValue().isZero();
   };
-  if(!has(widths,"addrBits",35)||!has(widths,"dataBits",64)||!has(widths,"idBits",4)||
-     !has(edge,"maxReadTransfer",8)||(!has(edge,"idReuse",1)&&!has(edge,"idReuse",2))||!positive(edge,"maxFlight"))
+  if (!has(widths, "addrBits", 35) ||
+      !validFASEDGeometry(getFASEDGeometry(circuit)) ||
+      !has(widths, "idBits", 4) || !positive(edge, "maxReadTransfer") ||
+      !positive(edge, "idReuse") || !positive(edge, "maxFlight"))
     return reject("FASED deinterleaver supports the recorded sixteen-ID eight-beat profile");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w){return UIntType::get(ctx,w,false);};
@@ -119,21 +132,37 @@ LogicalResult goldengate::addFASEDReadDeinterleaver(CircuitOp circuit,
   auto reg=[&](FModuleOp m,unsigned w,StringRef n)->Value {
     return b.create<RegResetOp>(loc,uint(w),arg(m,0),arg(m,1),k(w,0),n).getResult();
   };
-  Value ep=reg(queue,3,"enq_ptr_value"),dp=reg(queue,3,"deq_ptr_value"),mf=reg(queue,1,"maybe_full");
+  Value ep = reg(queue, queueBits, "enq_ptr_value"),
+        dp = reg(queue, queueBits, "deq_ptr_value"),
+        mf = reg(queue, 1, "maybe_full");
   Value eq=b.create<EQPrimOp>(loc,ep,dp),ready=inv(both(eq,mf)),valid=inv(both(eq,inv(mf)));
   Value enq=arg(queue,2),deq=arg(queue,3);
   Value push=both(ready,f(enq,"valid")),pop=both(valid,f(deq,"ready"));
   c(f(enq,"ready"),ready);c(f(deq,"valid"),valid);
-  auto incPtr=[&](Value v)->Value{return b.create<BitsPrimOp>(loc,b.create<AddPrimOp>(loc,v,k(3,1)),2,0);};
+  auto incPtr = [&](Value v) -> Value {
+    return queueDepth == 1 ? k(queueBits, 0)
+                           : Value(b.create<BitsPrimOp>(
+                                 loc,
+                                 b.create<AddPrimOp>(loc, v, k(queueBits, 1)),
+                                 queueBits - 1,
+                                 0));
+  };
   c(ep,mux(push,incPtr(ep),ep));c(dp,mux(pop,incPtr(dp),dp));
   c(mf,mux(b.create<XorPrimOp>(loc,push,pop),push,mf));
-  SmallVector<Type> mt{MemOp::getTypeForPort(8,uint(71),MemOp::PortKind::Read),
-                      MemOp::getTypeForPort(8,uint(71),MemOp::PortKind::Write)};
+  SmallVector<Type> mt{
+      MemOp::getTypeForPort(queueDepth, uint(71), MemOp::PortKind::Read),
+      MemOp::getTypeForPort(queueDepth, uint(71), MemOp::PortKind::Write)};
   SmallVector<Attribute> mn{b.getStringAttr("read"),b.getStringAttr("write")};
-  auto ram=b.create<MemOp>(loc,mt,0,1,8,RUWAttr::Undefined,mn,"ram");
+  auto ram =
+      b.create<MemOp>(loc, mt, 0, 1, queueDepth, RUWAttr::Undefined, mn, "ram");
   Value rd=ram.getResult(0),wr=ram.getResult(1);
-  c(f(rd,"clk"),arg(queue,0));c(f(rd,"en"),k(1,1));c(f(rd,"addr"),dp);
-  c(f(wr,"clk"),arg(queue,0));c(f(wr,"en"),push);c(f(wr,"addr"),ep);c(f(wr,"mask"),k(1,1));
+  c(f(rd, "clk"), arg(queue, 0));
+  c(f(rd, "en"), k(1, 1));
+  c(f(rd, "addr"), queueDepth == 1 ? k(0, 0) : dp);
+  c(f(wr, "clk"), arg(queue, 0));
+  c(f(wr, "en"), push);
+  c(f(wr, "addr"), queueDepth == 1 ? k(0, 0) : ep);
+  c(f(wr, "mask"), k(1, 1));
   Value packed;for(auto e:payload.getElements()) {
     Value v=f(f(enq,"bits"),e.name);packed=packed?b.create<CatPrimOp>(loc,packed,v).getResult():v;
   }
@@ -182,12 +211,15 @@ LogicalResult goldengate::addFASEDReadDeinterleaver(CircuitOp circuit,
   Value enabled=inv(arg(helper,1));SmallVector<Value> pending;
   for(unsigned j=0;j<16;++j) {
     c(f(qs[j].getResult(3),"ready"),both(selected[j],inFire));
-    Value count=reg(helper,4,"pending_count_"+std::to_string(j));
+    Value count =
+        reg(helper, pendingBits, "pending_count_" + std::to_string(j));
     Value inc=both(b.create<EQPrimOp>(loc,eid,k(4,j)),incomingLast),dec=both(selected[j],done);
     Value sum=b.create<AddPrimOp>(loc,count,inc),diff=b.create<SubPrimOp>(loc,sum,dec);
-    Value next=b.create<BitsPrimOp>(loc,diff,3,0);c(count,next);
-    pending.push_back(b.create<NEQPrimOp>(loc,next,k(4,0)));
-    Value nonzero=b.create<NEQPrimOp>(loc,count,k(4,0)),nonfull=b.create<NEQPrimOp>(loc,count,k(4,8));
+    Value next = b.create<BitsPrimOp>(loc, diff, pendingBits - 1, 0);
+    c(count, next);
+    pending.push_back(b.create<NEQPrimOp>(loc, next, k(pendingBits, 0)));
+    Value nonzero = b.create<NEQPrimOp>(loc, count, k(pendingBits, 0)),
+          nonfull = b.create<NEQPrimOp>(loc, count, k(pendingBits, queueDepth));
     b.create<AssertOp>(loc,arg(helper,0),b.create<OrPrimOp>(loc,inv(dec),nonzero),enabled,
       "deinterleaver pending burst count underflow",ValueRange{},"");
     b.create<AssertOp>(loc,arg(helper,0),b.create<OrPrimOp>(loc,inv(inc),nonfull),enabled,

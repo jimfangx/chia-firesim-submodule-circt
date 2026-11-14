@@ -3,14 +3,16 @@
 // RRArbiter and Queue, widgets/Lib.scala SatUpDownCounter.
 #include "goldengate/FASEDUnifiedTransactionScheduler.h"
 #include "mlir/IR/Builders.h"
+#include "llvm/Support/MathExtras.h"
 #include <array>
 using namespace mlir;
 using namespace circt::firrtl;
 LogicalResult goldengate::materializeFASEDUnifiedTransactionScheduler(
     CircuitOp circuit, unsigned maxWrites, FModuleOp &result,
     std::string &error) {
-  if (maxWrites != 10 && maxWrites != 20) {
-    error = "selected FASED unified scheduler supports maxWrites 10 or 20";
+  if (maxWrites == 0 || maxWrites > 32) {
+    error = "selected FASED unified scheduler supports maxWrites one through "
+            "thirty-two";
     return failure();
   }
   std::string name = "GGFASEDUnifiedTransactionScheduler" + std::to_string(maxWrites);
@@ -55,7 +57,7 @@ LogicalResult goldengate::materializeFASEDUnifiedTransactionScheduler(
   auto update=[&](Value r,Value x){con(r,mux(arg(2),x,r));};
   auto enqPtr=reg("enqPtr",3,true),deqPtr=reg("deqPtr",3,true);
   auto maybeFull=reg("maybeFull",1,true),lastGrant=reg("lastGrant",1,false);
-  unsigned cw=maxWrites==10?4:5;
+  unsigned cw = llvm::Log2_64_Ceil(maxWrites + 1);
   auto completed=reg("completedWrites",cw,true);
   auto ptrMatch=eq(enqPtr,deqPtr),empty=a(ptrMatch,n(maybeFull));
   auto ready=n(a(ptrMatch,maybeFull));

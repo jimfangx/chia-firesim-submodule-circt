@@ -71,7 +71,9 @@ int main(int argc,char **argv) {
     auto saved=print(root->getOperation());auto sentinel=helper;
     require(failed(goldengate::materializeFASEDFRFCFSController(c,capacity,sentinel,error)),"duplicate accepted");
     require(saved==print(root->getOperation())&&sentinel==helper,"collision mutated circuit");
-    require(failed(goldengate::materializeFASEDFRFCFSController(c,11,sentinel,error)),"invalid capacity accepted");
+    require(failed(goldengate::materializeFASEDFRFCFSController(
+                c, 33, sentinel, error)),
+            "invalid capacity accepted");
     require(saved==print(root->getOperation()),"invalid capacity mutated circuit");
     for(auto name:{std::string("GGFASEDFRFCFSController")+std::to_string(capacity),
         std::string("GGFASEDUnifiedTransactionScheduler")+std::to_string(capacity),

@@ -15,11 +15,13 @@
 // explicit timing-model request/response ports and qualified reset/token fire.
 #include "goldengate/FASEDReadScheduler.h"
 #include "mlir/IR/Builders.h"
+#include "goldengate/FASEDGeometry.h"
 #include <functional>
 using namespace mlir;
 using namespace circt::firrtl;
 
 LogicalResult goldengate::addFASEDReadScheduler(CircuitOp circuit, std::string &error) {
+  auto geometry = goldengate::getFASEDGeometry(circuit);
   constexpr llvm::StringLiteral helperName = "GGFASEDReadScheduler";
   bool selected = circuit.getName() == "GGSelectedPrintFASEDReadBufferWrapper";
   llvm::StringRef wrapperName = selected ? "GGSelectedPrintFASEDReadSchedulerWrapper"
@@ -45,17 +47,21 @@ LogicalResult goldengate::addFASEDReadScheduler(CircuitOp circuit, std::string &
   // ReadEgress selects direct AXI IDs when virtualState <= 0x20000 bits.
   // For these constructors virtualState is at most 2 * 16 * 8 * 64;
   // maxFlight cannot enable translation or alter request scheduling.
-  if (!has(edge,"maxReadTransfer",8)||!reuse||reuse.getValue().getBitWidth()>64||
-      (reuse.getInt()!=1&&reuse.getInt()!=2)||!flight||
-      flight.getValue().getBitWidth()>64||flight.getInt()<=0||
-      !has(widths,"addrBits",35)||!has(widths,"dataBits",64)||!has(widths,"idBits",4))
-    return reject("FASED read scheduler supports 35/64/4-bit, 8-beat, one or two requests per ID with positive maxFlight");
+  if (!reuse || !flight || !edge.getAs<IntegerAttr>("maxReadTransfer") ||
+      !validFASEDGeometry(geometry) || !has(widths, "addrBits", 35) ||
+      !has(widths, "idBits", 4))
+    return reject("FASED requires a valid byte-addressable AXI data width, "
+                  "transfer lengths, ID reuse and maxFlight");
+
+  if (needsFASEDReadTranslation(geometry, getFASEDEffectiveCapacity(circuit)))
+    return reject(
+        "FASED read ID translation is required for this constructor geometry");
   auto *ctx=circuit.getContext();OpBuilder b(ctx);auto loc=circuit.getLoc();
   auto uint=[&](unsigned w) {return UIntType::get(ctx,w,false);};auto bit=uint(1);
   auto bundle=[&](std::initializer_list<std::pair<llvm::StringRef,unsigned>> es) {
     SmallVector<BundleType::BundleElement> fields;for(auto [n,w]:es) fields.push_back({b.getStringAttr(n),false,uint(w)});return BundleType::get(ctx,fields);
   };
-  auto stored=bundle({{"data",64},{"last",1}});
+  auto stored = bundle({{"data", geometry.dataBits}, {"last", 1}});
   auto token=BundleType::get(ctx,{{b.getStringAttr("ready"),true,bit},{b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,stored}});
   auto readiness=bundle({{"readValid",1},{"writeValid",1}});
   const llvm::StringRef names[]{"hostClock","fased_egress_reset","fased_tfire","fased_egress_readiness","fased_read_buffer_address","fased_read_buffer_deq"};
@@ -72,7 +78,11 @@ LogicalResult goldengate::addFASEDReadScheduler(CircuitOp circuit, std::string &
   bool used=false;circuit.walk([&](InstanceOp i){used|=i.getModuleName()==inner.getName();});
   if(used) return reject("FASED read scheduler needs an uninstantiated top");
   auto req=BundleType::get(ctx,{{b.getStringAttr("valid"),false,bit},{b.getStringAttr("bits"),false,uint(4)}});
-  auto read=bundle({{"user",1},{"id",4},{"last",1},{"data",64},{"resp",2}});
+  auto read = bundle({{"user", 1},
+                      {"id", 4},
+                      {"last", 1},
+                      {"data", geometry.dataBits},
+                      {"resp", 2}});
   auto resp=BundleType::get(ctx,{{b.getStringAttr("tReady"),true,bit},{b.getStringAttr("hValid"),false,bit},{b.getStringAttr("tBits"),false,read}});
   b.setInsertionPointToEnd(circuit.getBodyBlock());
   SmallVector<PortInfo> hp{{b.getStringAttr("clock"),types[0],Direction::In},
