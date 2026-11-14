@@ -7,6 +7,7 @@
 #include "goldengate/CPUStreamRead.h"
 #include "goldengate/AutoCounterBridge.h"
 #include "goldengate/AssertionBridge.h"
+#include "goldengate/FASEDDRAMProfile.h"
 #include "mlir/IR/Builders.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/ADT/StringSet.h"
@@ -230,9 +231,9 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
       failed(bank("ResetPulseBridgeModule_0", "GGResetPulseBridgeMCRFile", {"GGResetPulseBridge"})) ||
       failed(bank("BlockDevBridgeModule_0", "GGBlockDevMMIOBank", {"GGBlockDevMMIOBank"}, Direction::Out)) ||
       failed(bank("UARTBridgeModule_0", "GGUARTMCRFile", {"GGUARTMMIOBank"}))) return failure();
-  // FASED's adapter is assembled later. Explicit platform capacity selects the
-  // FRFCFS bank; maxFlight alone cannot distinguish Shuttle FRFCFS from LBP.
-  // Its 68 words allocate 512 bytes and reorder the complete widget address map.
+  // FASED's adapter is assembled later. FCFS and LatencyPipe both use base16;
+  // the explicit DDR profile distinguishes their programming banks. Preserve
+  // the legacy base32 selection for callers without an explicit DDR profile.
   ControlMMIOWidget fased;
   auto capacityRaw = circuit->getAttr("goldengate.fasedBaseCapacity");
   auto capacity = dyn_cast_or_null<IntegerAttr>(capacityRaw);
@@ -241,9 +242,22 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
     error = "control catalog requires a validated FASED base capacity 16 or 32";
     return failure();
   }
-  bool frfcfs = capacity && capacity.getInt() == 32;
+  auto profileRaw = circuit->getAttr("goldengate.fasedDRAMProfile");
+  auto profile = dyn_cast_or_null<StringAttr>(profileRaw);
+  if (profileRaw && (!profile ||
+      (profile.getValue() != "fcfs" && profile.getValue() != "frfcfs" &&
+       profile.getValue() != "frfcfs-llc"))) {
+    error = "control catalog requires a validated FASED DDR profile";
+    return failure();
+  }
+  if (profile && capacity &&
+      capacity.getInt() != getFASEDDRAMBaseCapacity(circuit)) {
+    error = "FASED DDR profile conflicts with the explicit base capacity";
+    return failure();
+  }
+  bool dram = profile || (capacity && capacity.getInt() == 32);
   for (auto m : circuit.getOps<FModuleLike>()) {
-    bool wrongBank = frfcfs ? m.getModuleName() == "GGFASEDLatencyRegisters" ||
+    bool wrongBank = dram ? m.getModuleName() == "GGFASEDLatencyRegisters" ||
                             m.getModuleName() == "GGFASEDRequestLimits"
                           : m.getModuleName() == "GGFASEDFRFCFSMMIO";
     if (wrongBank) {
@@ -251,12 +265,15 @@ LogicalResult goldengate::deriveRocketControlMMIOCatalog(CircuitOp circuit,
       return failure();
     }
   }
-  if (frfcfs) {
+  if (dram) {
     if (failed(deriveControlMMIOWidget(circuit, "FASEDMemoryTimingModel_0",
         "GGFASEDFRFCFSMMIO", {"GGFASEDFRFCFSMMIO"}, fased, error,
         Direction::Out))) return failure();
-    if (fased.registerCount != 68) {
-      error = "selected FRFCFS control bank requires 68 implemented register words";
+    unsigned expectedWords = isFASEDFCFS(circuit) ? 58
+                             : hasFASEDLLC(circuit) ? 68 : 60;
+    if (fased.registerCount != expectedWords) {
+      error = "selected DDR control bank requires " +
+              std::to_string(expectedWords) + " implemented register words";
       return failure();
     }
   } else if (failed(deriveControlMMIORegistry(circuit, "FASEDMemoryTimingModel_0",

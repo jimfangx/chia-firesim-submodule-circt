@@ -53,8 +53,9 @@ mlir::LogicalResult validateNICControlMMIOMode(circt::firrtl::CircuitOp circuit,
 // supplied in constructor order; their queued metadata identifies each bank.
 // This pre-binding catalog does not imply CPU stream or control attachment.
 // Leave the result and IR unchanged on failure; names borrow MLIR attributes.
-// FASED explicit base32 selects the materialized 68-word FRFCFS bank; absent
-// or base16 selects the six LatencyPipe fragments. Mixed profiles reject.
+// An explicit DDR profile selects its 58/60/68-word bank. Without a profile,
+// base32 selects the legacy 68-word FRFCFS bank; base16 selects LatencyPipe.
+// Mixed banks and conflicting profile/capacity selections reject.
 mlir::LogicalResult deriveRocketControlMMIOCatalog(
     circt::firrtl::CircuitOp circuit,
     llvm::ArrayRef<circt::firrtl::FModuleOp> printHosts,

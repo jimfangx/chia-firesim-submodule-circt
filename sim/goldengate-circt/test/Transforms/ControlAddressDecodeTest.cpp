@@ -434,6 +434,46 @@ void multiNICCatalog(MLIRContext &ctx) {
       for (const auto &widget : catalog)
         require(!widget.name.starts_with("TracerV") && widget.name!="CPUManagedStreamEngine_0",
                 "no-stream catalog allocated disabled widgets");
+      // Exercise production allocation after DDR-bank materialization. FCFS
+      // shares base16 with LatencyPipe but has a different register catalog.
+      auto dump = [](Operation *op) {
+        std::string text; llvm::raw_string_ostream os(text); op->print(os); return text;
+      };
+      for (auto name : fased) named(c, name).erase();
+      for (StringRef profile : {"fcfs", "frfcfs", "frfcfs-llc", ""}) {
+        unsigned capacity = profile == "fcfs" ? 16 : 32;
+        unsigned words = profile == "fcfs" ? 58 : profile == "frfcfs" ? 60 : 68;
+        if (profile.empty()) c->removeAttr("goldengate.fasedDRAMProfile");
+        else c->setAttr("goldengate.fasedDRAMProfile", b.getStringAttr(profile));
+        c->setAttr("goldengate.fasedBaseCapacity", b.getI32IntegerAttr(capacity));
+        auto ddr = add("GGFASEDFRFCFSMMIO", words, Direction::Out);
+        auto before = dump(*root);
+        require(succeeded(goldengate::allocateRocketControlMMIORegions(
+            c,32,{},catalog,regions,error)), error);
+        require(before == dump(*root), "DDR catalog allocation mutated IR");
+        auto widget = llvm::find_if(catalog, [](const auto &w) {
+          return w.name == "FASEDMemoryTimingModel_0";
+        });
+        auto region = llvm::find_if(regions, [](const auto &r) {
+          return r.name == "FASEDMemoryTimingModel_0";
+        });
+        require(widget != catalog.end() && widget->registerCount == words &&
+            region != regions.end() && region->size == (words == 68 ? 512 : 256),
+            "DDR register count or region size differs from selected profile");
+        // A stale LatencyPipe fragment must not be silently ignored.
+        auto stale = add("GGFASEDRequestLimits",1,Direction::Out,0,false);
+        require(failed(goldengate::allocateRocketControlMMIORegions(
+            c,32,{},catalog,regions,error)), "mixed DDR/LatencyPipe banks accepted");
+        stale.erase();
+        ddr.erase();
+        ddr = add("GGFASEDFRFCFSMMIO", words-1, Direction::Out);
+        require(failed(goldengate::allocateRocketControlMMIORegions(
+            c,32,{},catalog,regions,error)), "wrong DDR register count accepted");
+        ddr.erase();
+      }
+      c->removeAttr("goldengate.fasedDRAMProfile");
+      c->removeAttr("goldengate.fasedBaseCapacity");
+      for(unsigned i=0;i<6;++i)add(fased[i],1,Direction::Out,i,false);
       add("GGTracerVMCRFile",15,Direction::In);
       require(failed(goldengate::allocateRocketControlMMIORegions(c,32,{},catalog,regions,error)),
               "orphan TracerV adapter accepted as a tracing-disabled target");
