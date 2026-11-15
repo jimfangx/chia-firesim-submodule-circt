@@ -1236,6 +1236,63 @@ static LogicalResult describeNativeMemoryOrigins(
 }
 } // namespace
 
+// CIRCT's depth-one memory canonicalization slices write data with BitsPrimOp,
+// producing UInt even for SInt storage, then strict-connects it to a signed
+// register. Use unsigned storage with bit-preserving casts at the port boundary
+// on the backend clone. Keep the memory and its metadata for standard lowering.
+static void normalizeSingleEntrySignedMemories(ModuleOp module) {
+  module.walk([](firrtl::MemOp memory) {
+    auto dataType = dyn_cast<firrtl::SIntType>(memory.getDataType());
+    if (memory.getDepth() != 1 || !dataType || dataType.getWidth() <= 0 ||
+        llvm::any_of(memory.getResults(), [](Value port) {
+          return !isa<firrtl::BundleType>(port.getType());
+        }))
+      return;
+    OpBuilder builder(memory);
+    auto loc = memory.getLoc();
+    auto unsignedType = firrtl::UIntType::get(memory.getContext(),
+                                             dataType.getWidth());
+    SmallVector<Value> proxies;
+    for (auto port : memory.getResults()) {
+      auto oldType = cast<firrtl::BundleType>(port.getType());
+      auto proxy = builder.create<firrtl::WireOp>(loc, oldType).getResult();
+      proxies.push_back(proxy);
+      port.replaceAllUsesWith(proxy);
+      SmallVector<firrtl::BundleType::BundleElement> elements;
+      for (auto element : oldType.getElements()) {
+        if (element.type == dataType)
+          element.type = unsignedType;
+        elements.push_back(element);
+      }
+      port.setType(firrtl::BundleType::get(memory.getContext(), elements));
+    }
+    // Materialize every port accessor before adding casts. The depth-one fold
+    // inserts its register at a write accessor; read casts must follow it even
+    // when the memory's read port precedes its write port.
+    builder.setInsertionPointAfter(memory);
+    SmallVector<std::pair<Value, Value>> connections;
+    for (auto [port, proxy] : llvm::zip(memory.getResults(), proxies)) {
+      auto oldType = cast<firrtl::BundleType>(proxy.getType());
+      for (auto [index, element] : llvm::enumerate(oldType.getElements())) {
+        Value external = builder.create<firrtl::SubfieldOp>(loc, proxy, index);
+        Value storage = builder.create<firrtl::SubfieldOp>(loc, port, index);
+        Value dest = element.isFlip ? external : storage;
+        Value src = element.isFlip ? storage : external;
+        connections.push_back({dest, src});
+      }
+    }
+    for (auto [dest, src] : connections) {
+      if (dest.getType() != src.getType()) {
+        if (dest.getType() == dataType)
+          src = builder.create<firrtl::AsSIntPrimOp>(loc, src);
+        else
+          src = builder.create<firrtl::AsUIntPrimOp>(loc, src);
+      }
+      builder.create<firrtl::StrictConnectOp>(loc, dest, src);
+    }
+  });
+}
+
 // SFC's VerilogEmitter emits an asynchronous reader as an unconditional array
 // access, including when its read enable is low. CIRCT otherwise inserts an X
 // mux on that output. Refine only this unspecified disabled-read value to the
@@ -1610,6 +1667,7 @@ LogicalResult goldengate::emitSimulatorRTL(ModuleOp source,
   if (invalidSnapshot)
     return reject("ClockBridge snapshot marks require the exact two unreset UInt64 registers per module");
   circuit->removeAttr("rawAnnotations");
+  normalizeSingleEntrySignedMemories(*lowered);
   normalizeSynchronousReadWritePorts(*lowered);
   normalizeAsynchronousReadEnables(*lowered);
   // Keep the exclusions above for RW ports already present in the source

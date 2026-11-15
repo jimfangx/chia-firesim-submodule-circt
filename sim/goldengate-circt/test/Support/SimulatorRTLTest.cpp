@@ -458,6 +458,67 @@ int main(int argc, char **argv) {
     require(bool(fixture), "fixture parse");
     std::string error, before = dump(*fixture);
     std::string unitPath = std::string(argv[2]) + ".fixture.sv";
+    // CIRCT's depth-one memory fold used unsigned slices for signed write muxes.
+    for (unsigned latency : {0u, 1u}) {
+      for (bool combined : {false, true}) {
+        if (combined && latency == 0) continue;
+        for (unsigned maskBits : {1u, 4u}) {
+          auto signedMemory = parseSourceString<ModuleOp>(R"mlir(module {
+            firrtl.circuit "SignedQueue" {
+              firrtl.module @SignedQueue(in %clock: !firrtl.clock, in %en: !firrtl.uint<1>, in %write: !firrtl.uint<1>, in %data: !firrtl.sint<32>, in %mask: !firrtl.uint<4>, out %result: !firrtl.sint<32>) {}
+            }
+          })mlir", &context);
+          require(bool(signedMemory), "signed queue fixture parse");
+          auto circuit = *signedMemory->getOps<CircuitOp>().begin();
+          auto owner = *circuit.getOps<FModuleOp>().begin();
+          OpBuilder builder(owner.getBodyBlock(), owner.getBodyBlock()->end());
+          auto loc = owner.getLoc();
+          auto dataType = SIntType::get(&context, 32);
+          auto portType = [&](MemOp::PortKind kind) {
+            return MemOp::getTypeForPort(1, dataType, kind, maskBits);
+          };
+          SmallVector<Type> types = combined
+              ? SmallVector<Type>{portType(MemOp::PortKind::ReadWrite)}
+              : SmallVector<Type>{portType(MemOp::PortKind::Read),
+                                  portType(MemOp::PortKind::Write)};
+          SmallVector<Attribute> names{builder.getStringAttr("R")};
+          if (!combined) names.push_back(builder.getStringAttr("W"));
+          auto memory = builder.create<MemOp>(loc, types, latency, 1, 1,
+              RUWAttr::Undefined, names, "signed_queue");
+          auto zero = builder.create<ConstantOp>(loc, UIntType::get(&context, 1), APInt(1, 0));
+          auto one = builder.create<ConstantOp>(loc, UIntType::get(&context, 1), APInt(1, 1));
+          auto field = [&](Value port, StringRef name) -> Value {
+            return builder.create<SubfieldOp>(loc, port, name);
+          };
+          auto connect = [&](Value dest, Value src) {
+            builder.create<StrictConnectOp>(loc, dest, src);
+          };
+          for (auto port : memory.getResults()) {
+            connect(field(port, "clk"), owner.getArgument(0));
+            connect(field(port, "addr"), zero);
+            connect(field(port, "en"), owner.getArgument(1));
+          }
+          Value reader = memory.getResult(0);
+          Value writer = combined ? reader : memory.getResult(1);
+          if (combined) connect(field(writer, "wmode"), owner.getArgument(2));
+          connect(field(writer, combined ? "wdata" : "data"), owner.getArgument(3));
+          connect(field(writer, combined ? "wmask" : "mask"),
+                  maskBits == 1 ? Value(one) : owner.getArgument(4));
+          connect(owner.getArgument(5), field(reader, combined ? "rdata" : "data"));
+          require(succeeded(verify(*signedMemory)), "signed queue fixture invalid");
+          auto source = dump(*signedMemory);
+          std::string path = std::string(argv[2]) + ".signed-queue-" +
+              std::to_string(latency) + "-" + std::to_string(combined) + "-" +
+              std::to_string(maskBits) + ".sv";
+          auto result = goldengate::emitSimulatorRTL(*signedMemory, "", path, error);
+          require(succeeded(result), error);
+          require(source == dump(*signedMemory), "signed queue source changed by backend");
+          require(read(path).find("module SignedQueue") != std::string::npos,
+                  "signed queue RTL missing");
+        }
+      }
+    }
+    llvm::outs() << "Signed single-entry memories: asynchronous/synchronous and combined ports, full/byte write masks lower without changing source IR\n";
     for (unsigned readLatency : {0u, 1u, 2u}) {
       for (unsigned writeLatency : {1u, 2u}) {
         for (bool aggregateReader : {false, true}) {
